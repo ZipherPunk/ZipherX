@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xcodegen generate:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(rustup target add:*)",
+      "Bash(cargo build:*)",
+      "Bash(lipo:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:explorer.zcl.zelcore.io)",
+      "WebFetch(domain:zcash.readthedocs.io)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:zips.z.cash)",
+      "Bash(cargo run:*)",
+      "Bash(clang++:*)",
+      "Bash(./test_decrypt:*)",
+      "WebFetch(domain:nakamotoinstitute.org)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

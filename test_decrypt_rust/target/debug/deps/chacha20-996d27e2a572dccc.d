@@ -1,0 +1,11 @@
+/Users/chris/ZipherX/test_decrypt_rust/target/debug/deps/chacha20-996d27e2a572dccc.d: /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/lib.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/legacy.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/xchacha.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends/soft.rs
+
+/Users/chris/ZipherX/test_decrypt_rust/target/debug/deps/libchacha20-996d27e2a572dccc.rlib: /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/lib.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/legacy.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/xchacha.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends/soft.rs
+
+/Users/chris/ZipherX/test_decrypt_rust/target/debug/deps/libchacha20-996d27e2a572dccc.rmeta: /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/lib.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/legacy.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/xchacha.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends/soft.rs
+
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/lib.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/legacy.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/xchacha.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.9.1/src/backends/soft.rs:

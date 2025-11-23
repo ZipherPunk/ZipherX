@@ -1,0 +1,55 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace
+!default.xcworkspace
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Rust
+Libraries/zipherx-ffi/target/
+Libraries/librustzcash/target/
+**/*.rs.bk
+Cargo.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# Swift Package Manager
+.build/
+Package.resolved
+
+# Sapling parameters (large files)
+*.params
+
+# Sensitive data
+*.p12
+*.mobileprovision
+*.env
+secrets/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Test outputs
+*.log
+*.tmp
+Libraries/librustzcash/

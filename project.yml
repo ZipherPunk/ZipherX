@@ -1,0 +1,90 @@
+name: ZipherX
+options:
+  bundleIdPrefix: com.zipherx
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    ENABLE_BITCODE: false
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  ZipherX:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - "**/.DS_Store"
+    resources:
+      - path: Resources
+        excludes:
+          - "**/.DS_Store"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ZipherX
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: LaunchScreenColor
+        NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
+        NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
+        UIBackgroundModes:
+          - fetch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: ZipherX.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Bridging header for Rust FFI
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/ZipherX-Bridging-Header.h
+        # Link resolver library
+        OTHER_LDFLAGS:
+          - "-lresolv"
+    dependencies:
+      - framework: Libraries/ZipherXFFI.xcframework
+        embed: false
+    entitlements:
+      path: ZipherX.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.zipherx.wallet
+        com.apple.developer.default-data-protection: NSFileProtectionComplete
+
+  ZipherXTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - target: ZipherX
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet.tests
+
+schemes:
+  ZipherX:
+    build:
+      targets:
+        ZipherX: all
+        ZipherXTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ZipherXTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

@@ -1,0 +1,772 @@
+load_eligibility_plist: Failed to open /Users/chris/Library/Developer/CoreSimulator/Devices/3165D57B-40F8-43F7-A110-474EF8B84473/data/Containers/Data/Application/DBB83B1B-4EBA-4B30-9BB7-5AE7072265F4/private/var/db/eligibilityd/eligibility.plist: No such file or directory(2)
+🔌 Starting network connection...
+📡 DNS discovery found 2 peers
+📋 Total peers to try: 15
+🔄 Trying to connect to 37.187.76.79:8033...
+🔄 Trying to connect to 140.174.189.17:8033...
+🔄 Trying to connect to 74.50.74.102:8033...
+🔄 Trying to connect to 162.55.92.62:8033...
+🔄 Trying to connect to 157.90.223.151:8033...
+🔄 Trying to connect to 51.178.179.75:8033...
+🔄 Trying to connect to 140.174.189.3:8033...
+🔄 Trying to connect to 205.209.104.118:8033...
+nw_socket_handle_socket_event [C4:1] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:1] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+❌ Failed to connect to 51.178.179.75:8033 - Request timed out
+nw_socket_handle_socket_event [C7:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C7:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_reset_linger [C7:1] setsockopt SO_LINGER failed [22: Invalid argument]
+✅ Connected to 37.187.76.79:8033
+✅ Connected to 74.50.74.102:8033
+✅ Connected to 205.209.104.118:8033
+✅ Connected to 140.174.189.3:8033
+✅ Connected to 140.174.189.17:8033
+📊 Fetching network stats...
+📊 Peer version: /MagicBean:2.1.1-9/
+📊 Chain height: 2918512
+📊 Last block txns: 4
+📊 Updated chainHeight to: 2918512
+nw_connection_copy_connected_local_endpoint_block_invoke [C10] Connection has no local endpoint
+nw_connection_copy_connected_local_endpoint_block_invoke [C10] Connection has no local endpoint
+API call with NULL database connection pointer
+misuse at line 148791 of [1b37c146ee]
+🔄 Reset scan state - will rescan from checkpoint
+📡 Getting chain height...
+📊 Chain height: 2918512
+🆕 New wallet - starting from recent checkpoint 2916559
+🔍 Scanning from 2916559 to 2918512
+🔑 Derived IVK: 32 bytes
+📦 Downloading blocks 2916559 to 2916658 via Insight API...
+📥 Fetching 20 blocks starting at 2916559...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916579...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916599...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916619...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916639...
+📥 Processed 20 blocks
+📦 Processed blocks 2916559 to 2916658
+📦 Downloading blocks 2916659 to 2916758 via Insight API...
+📥 Fetching 20 blocks starting at 2916659...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916679...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916699...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916719...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916739...
+📥 Processed 20 blocks
+📦 Processed blocks 2916659 to 2916758
+📦 Downloading blocks 2916759 to 2916858 via Insight API...
+📥 Fetching 20 blocks starting at 2916759...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916779...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916799...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916819...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916839...
+📥 Processed 20 blocks
+📦 Processed blocks 2916759 to 2916858
+📦 Downloading blocks 2916859 to 2916958 via Insight API...
+📥 Fetching 20 blocks starting at 2916859...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916879...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916899...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916919...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916939...
+📥 Processed 20 blocks
+📦 Processed blocks 2916859 to 2916958
+📦 Downloading blocks 2916959 to 2917058 via Insight API...
+📥 Fetching 20 blocks starting at 2916959...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916979...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2916999...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917019...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917039...
+📥 Processed 20 blocks
+📦 Processed blocks 2916959 to 2917058
+📦 Downloading blocks 2917059 to 2917158 via Insight API...
+📥 Fetching 20 blocks starting at 2917059...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917079...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917099...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917119...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917139...
+📥 Processed 20 blocks
+📦 Processed blocks 2917059 to 2917158
+📦 Downloading blocks 2917159 to 2917258 via Insight API...
+📥 Fetching 20 blocks starting at 2917159...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917179...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917199...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917219...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917239...
+📥 Processed 20 blocks
+📦 Processed blocks 2917159 to 2917258
+📦 Downloading blocks 2917259 to 2917358 via Insight API...
+📥 Fetching 20 blocks starting at 2917259...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917279...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917299...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917319...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917339...
+📥 Processed 20 blocks
+📦 Processed blocks 2917259 to 2917358
+📦 Downloading blocks 2917359 to 2917458 via Insight API...
+📥 Fetching 20 blocks starting at 2917359...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917379...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917399...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917419...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917439...
+📥 Processed 20 blocks
+📦 Processed blocks 2917359 to 2917458
+📦 Downloading blocks 2917459 to 2917558 via Insight API...
+📥 Fetching 20 blocks starting at 2917459...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917479...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917499...
+nw_read_request_report [C10] Receive failed with error "Operation timed out"
+nw_read_request_report [C10] Receive failed with error "Operation timed out"
+nw_read_request_report [C10] Receive failed with error "Operation timed out"
+nw_endpoint_flow_fillout_data_transfer_snapshot copy_info() returned NULL
+nw_connection_copy_connected_local_endpoint_block_invoke [C10] Connection has no local endpoint
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917519...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917539...
+📥 Processed 20 blocks
+📦 Processed blocks 2917459 to 2917558
+📦 Downloading blocks 2917559 to 2917658 via Insight API...
+📥 Fetching 20 blocks starting at 2917559...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917579...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917599...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917619...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917639...
+📥 Processed 20 blocks
+📦 Processed blocks 2917559 to 2917658
+📦 Downloading blocks 2917659 to 2917758 via Insight API...
+📥 Fetching 20 blocks starting at 2917659...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917679...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917699...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917719...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917739...
+📥 Processed 20 blocks
+📦 Processed blocks 2917659 to 2917758
+📦 Downloading blocks 2917759 to 2917858 via Insight API...
+📥 Fetching 20 blocks starting at 2917759...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917779...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917799...
+nw_socket_handle_socket_event [C4:3] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:3] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:5] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:5] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:5] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:5] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917819...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917839...
+📥 Processed 20 blocks
+📦 Processed blocks 2917759 to 2917858
+📦 Downloading blocks 2917859 to 2917958 via Insight API...
+📥 Fetching 20 blocks starting at 2917859...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917879...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917899...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917919...
+Cache storage usage (13576112) still exceeds limit after cache shrinking. Purging persistent cache.
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917939...
+📥 Processed 20 blocks
+📦 Processed blocks 2917859 to 2917958
+📦 Downloading blocks 2917959 to 2918058 via Insight API...
+📥 Fetching 20 blocks starting at 2917959...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917979...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2917999...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918019...
+nw_socket_handle_socket_event [C9.1.1.1:3] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C9.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C9] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_set_no_wake_from_sleep [C9.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep [C9.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:7] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:7] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:7] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:7] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918039...
+📥 Processed 20 blocks
+📦 Processed blocks 2917959 to 2918058
+📦 Downloading blocks 2918059 to 2918158 via Insight API...
+📥 Fetching 20 blocks starting at 2918059...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918079...
+nw_socket_handle_socket_event [C6:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C6:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C6] Receive failed with error "Connection reset by peer"
+nw_read_request_report [C6] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_reset_linger [C6:1] setsockopt SO_LINGER failed [22: Invalid argument]
+nw_socket_handle_socket_event [C5:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C5:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_reset_linger [C5:1] setsockopt SO_LINGER failed [22: Invalid argument]
+nw_socket_handle_socket_event [C1:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C1:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C1] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_reset_linger [C1:1] setsockopt SO_LINGER failed [22: Invalid argument]
+nw_socket_handle_socket_event [C3:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C3:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C3] Receive failed with error "Connection reset by peer"
+nw_read_request_report [C3] Receive failed with error "Connection reset by peer"
+nw_read_request_report [C3] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_reset_linger [C3:1] setsockopt SO_LINGER failed [22: Invalid argument]
+nw_socket_handle_socket_event [C8:1] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C8:1] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_reset_linger [C8:1] setsockopt SO_LINGER failed [22: Invalid argument]
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918099...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918119...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918139...
+📥 Processed 20 blocks
+📦 Processed blocks 2918059 to 2918158
+📦 Downloading blocks 2918159 to 2918258 via Insight API...
+📥 Fetching 20 blocks starting at 2918159...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918179...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918199...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918219...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918239...
+📥 Processed 20 blocks
+📦 Processed blocks 2918159 to 2918258
+📦 Downloading blocks 2918259 to 2918358 via Insight API...
+📥 Fetching 20 blocks starting at 2918259...
+nw_socket_handle_socket_event [C13.1.1.1:3] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C13.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C13] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_set_no_wake_from_sleep [C13.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep [C13.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C4:9] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:9] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:9] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:9] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:11] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:11] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918279...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918299...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918319...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918339...
+📥 Processed 20 blocks
+📦 Processed blocks 2918259 to 2918358
+📦 Downloading blocks 2918359 to 2918458 via Insight API...
+📥 Fetching 20 blocks starting at 2918359...
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C3 140.174.189.3:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C3] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918379...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918399...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918419...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918439...
+📥 Processed 20 blocks
+📦 Processed blocks 2918359 to 2918458
+📦 Downloading blocks 2918459 to 2918512 via Insight API...
+📥 Fetching 20 blocks starting at 2918459...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918479...
+Cache storage usage (12843392) still exceeds limit after cache shrinking. Purging persistent cache.
+📥 Processed 20 blocks
+📥 Fetching 14 blocks starting at 2918499...
+nw_socket_handle_socket_event [C14.1.1.1:3] Socket SO_ERROR [54: Connection reset by peer]
+nw_protocol_socket_set_no_wake_from_sleep [C14.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_read_request_report [C14] Receive failed with error "Connection reset by peer"
+nw_protocol_socket_set_no_wake_from_sleep [C14.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep [C14.1.1.1:3] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C4:13] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:13] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:11] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:11] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+📥 Processed 14 blocks
+📦 Processed blocks 2918459 to 2918512
+✅ Scan complete
+💰 Balance updated: 0 zatoshis (0 pending)
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C3 140.174.189.3:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C3] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:15] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:15] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:13] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:13] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:17] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:17] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:15] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:15] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:19] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:19] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:17] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:17] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C3 140.174.189.3:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C3] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:21] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:21] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:19] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:19] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C3 140.174.189.3:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C3] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:23] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:23] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:21] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:21] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:25] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:25] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:23] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:23] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:27] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:27] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:25] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:25] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:29] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:29] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:27] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:27] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:31] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:31] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:29] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:29] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:33] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:33] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:31] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:31] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:35] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:35] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:33] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:33] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:37] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:37] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:35] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:35] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:39] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:39] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:41] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:41] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:37] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:37] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C1 205.209.104.118:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C1] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:43] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:43] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:39] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:39] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+Banned peer 37.187.76.79: Too many consecutive failures
+Banned peer 205.209.104.118: Too many consecutive failures
+nw_flow_add_write_request [C6 37.187.76.79:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C6] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:45] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:45] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:41] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:41] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:47] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:47] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:43] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:43] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:49] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:49] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:45] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:45] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:51] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:51] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:47] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:47] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C17:5] Socket SO_ERROR [51: Network is unreachable]
+nw_protocol_socket_set_no_wake_from_sleep [C17:5] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:53] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:53] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:49] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:49] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:55] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:55] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:57] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:57] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:51] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:51] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:59] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:59] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:53] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:53] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:61] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:61] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:55] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:55] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_flow_add_write_request [C5 74.50.74.102:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C5] Send failed with error "Socket is not connected"
+nw_flow_add_write_request [C8 140.174.189.17:8033 failed socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] cannot accept write requests
+nw_write_request_report [C8] Send failed with error "Socket is not connected"
+nw_socket_handle_socket_event [C4:63] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:63] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:57] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:57] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C17:11] Socket SO_ERROR [51: Network is unreachable]
+nw_protocol_socket_set_no_wake_from_sleep [C17:11] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:65] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:65] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:59] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:59] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+Banned peer 74.50.74.102: Too many consecutive failures
+Banned peer 140.174.189.17: Too many consecutive failures
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:67] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:67] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C2:61] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:61] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:69] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:69] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:63] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:63] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C17 ::255.255.37.221.49494 waiting parent-flow (unsatisfied (No network route))] already failing, returning
+nw_socket_handle_socket_event [C4:71] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:71] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:65] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:65] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_socket_handle_socket_event [C4:73] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C4:73] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_socket_handle_socket_event [C2:67] Socket SO_ERROR [61: Connection refused]
+nw_protocol_socket_set_no_wake_from_sleep [C2:67] setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_protocol_socket_set_no_wake_from_sleep setsockopt SO_NOWAKEFROMSLEEP failed [22: Invalid argument]
+nw_endpoint_flow_failed_with_error [C4 157.90.223.151:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+nw_endpoint_flow_failed_with_error [C2 162.55.92.62:8033 in_progress socket-flow (satisfied (Path is satisfied), interface: en0[802.11], uses wifi)] already failing, returning
+📡 Getting chain height...
+📊 Chain height: 2918675
+🔍 Scanning from 2918513 to 2918675
+🔑 Derived IVK: 32 bytes
+📦 Downloading blocks 2918513 to 2918612 via Insight API...
+📥 Fetching 20 blocks starting at 2918513...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918533...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918553...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918573...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918593...
+📊 Fetching network stats...
+📊 Chain height: 2918675
+📊 Last block txns: 1
+📊 Updated chainHeight to: 2918675
+nw_connection_copy_connected_local_endpoint_block_invoke [C20] Connection has no local endpoint
+nw_connection_copy_connected_local_endpoint_block_invoke [C20] Connection has no local endpoint
+📥 Processed 20 blocks
+📦 Processed blocks 2918513 to 2918612
+📦 Downloading blocks 2918613 to 2918675 via Insight API...
+📥 Fetching 20 blocks starting at 2918613...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918633...
+📥 Processed 20 blocks
+📥 Fetching 20 blocks starting at 2918653...
+📥 Processed 20 blocks
+📥 Fetching 3 blocks starting at 2918673...
+📥 Processed 3 blocks
+📦 Processed blocks 2918613 to 2918675
+✅ Scan complete
+💰 Balance updated: 0 zatoshis (0 pending)

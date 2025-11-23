@@ -1,0 +1,685 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 54;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
+		081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
+		19D558691C9ED092DBA470FB /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
+		1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */; };
+		27CCF442814D053CBF8F12A9 /* RustBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD65941062D3050BEA2765F9 /* RustBridge.swift */; };
+		2A310DACA7C2E48D320A1600 /* WalletSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */; };
+		2D96C7EA7C24EED23DBAFFCD /* ZipherXFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */; };
+		3742555859851725FDC9B9DE /* Peer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D92FD9B357E6379040DA58 /* Peer.swift */; };
+		415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32F58618190CB98DA9E3EB4B /* BalanceView.swift */; };
+		416268C8206067F62AE5C1B4 /* WalletDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */; };
+		4331F01B9D809A6E140AC797 /* SendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0A89DDCE7B836E49AF56B4 /* SendView.swift */; };
+		596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */; };
+		6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */; };
+		745902783803843898150674 /* TransactionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */; };
+		7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
+		7EC2BE84340E3513C2F738E6 /* ZipherXFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068F236B88339FCE75878F8B /* ZipherXFFI.swift */; };
+		8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 630CFD90F45505D02500501A /* ContentView.swift */; };
+		8F90F1D58322A43F385FB321 /* ZipherXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69E10579679A9004FDC0EDFB /* ZipherXApp.swift */; };
+		9FD32BA2B7B7580EF8769869 /* PrivacyQuotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 901F6C3D55300924BAF8DA44 /* PrivacyQuotes.swift */; };
+		A1B2C3D4E5F6A7B8C9D0E1F2 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2C3D4E5F6A7B8C9D0E1F2A3 /* InsightAPI.swift */; };
+		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
+		B41F9AB5A86EE2A32D4B61E2 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1076531AEA0567FCDC6311AE /* NotificationManager.swift */; };
+		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
+		C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
+		D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235376F572F89B6D83EDA88C /* WalletTests.swift */; };
+		DE294F3601D0FC4C50B5C260 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4DD009C52BE7CFA580135ECA /* SettingsView.swift */; };
+		E1A2B3C4D5E6F7A8B9C0D1E2 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3C4D5E6F7A8B9C0D1E3 /* SaplingParams.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		FFED36558D52B13D3CA919D1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AC576674C9B0B957F65B131A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C54306F64C1E460E338C880B;
+			remoteInfo = ZipherX;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
+		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1076531AEA0567FCDC6311AE /* NotificationManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeyStorage.swift; sourceTree = "<group>"; };
+		18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
+		235376F572F89B6D83EDA88C /* WalletTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletTests.swift; sourceTree = "<group>"; };
+		32F58618190CB98DA9E3EB4B /* BalanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BalanceView.swift; sourceTree = "<group>"; };
+		48D92FD9B357E6379040DA58 /* Peer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Peer.swift; sourceTree = "<group>"; };
+		4DD009C52BE7CFA580135ECA /* SettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZipherXFFI.xcframework; path = Libraries/ZipherXFFI.xcframework; sourceTree = "<group>"; };
+		5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterScanner.swift; sourceTree = "<group>"; };
+		630CFD90F45505D02500501A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Checkpoints.swift; sourceTree = "<group>"; };
+		69E10579679A9004FDC0EDFB /* ZipherXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXApp.swift; sourceTree = "<group>"; };
+		79B539975C988B8093FB4106 /* System7Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Components.swift; sourceTree = "<group>"; };
+		7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletDatabase.swift; sourceTree = "<group>"; };
+		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
+		901F6C3D55300924BAF8DA44 /* PrivacyQuotes.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Data/PrivacyQuotes.swift; sourceTree = "<group>"; };
+		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
+		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
+		B2C3D4E5F6A7B8C9D0E1F2A3 /* InsightAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InsightAPI.swift; sourceTree = "<group>"; };
+		BC0A89DDCE7B836E49AF56B4 /* SendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SendView.swift; sourceTree = "<group>"; };
+		C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BIP39Wordlist.swift; sourceTree = "<group>"; };
+		CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
+		DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ZipherXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionBuilder.swift; sourceTree = "<group>"; };
+		ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletSetupView.swift; sourceTree = "<group>"; };
+		ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Theme.swift; sourceTree = "<group>"; };
+		ED775F7A258C12CD4FDBF173 /* ZipherX-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "ZipherX-Bridging-Header.h"; sourceTree = "<group>"; };
+		F1A2B3C4D5E6F7A8B9C0D1E3 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B73DC56CA3AB8DFBF7D968C9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2D96C7EA7C24EED23DBAFFCD /* ZipherXFFI.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		02445EE7D9E99A6488E201EA /* Wallet */ = {
+			isa = PBXGroup;
+			children = (
+				C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */,
+				84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */,
+				9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */,
+			);
+			path = Wallet;
+			sourceTree = "<group>";
+		};
+		09CCC4CE13F9688905FC13C9 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				630CFD90F45505D02500501A /* ContentView.swift */,
+				ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */,
+				69E10579679A9004FDC0EDFB /* ZipherXApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		1475AFA394F4459F1E0D0535 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				A57133D73210DCD2789FEF97 /* Crypto */,
+				7A12B43495B930D9722D1AB2 /* Network */,
+				741F678816701EA43E8FB889 /* Storage */,
+				02445EE7D9E99A6488E201EA /* Wallet */,
+				A24CB2E16DB5D1556C6BEF51 /* Services */,
+				8EFCA7DC688071E265AEBDF5 /* Data */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		161A18C9C133A606FA3248B5 /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				4DD009C52BE7CFA580135ECA /* SettingsView.swift */,
+			);
+			name = Settings;
+			path = Settings;
+			sourceTree = "<group>";
+		};
+		1E0AB0F916282FFBD8E5F74E = {
+			isa = PBXGroup;
+			children = (
+				2399E776D535082F71A346B3 /* Sources */,
+				9F3A33E9612EA4CDB1AB6050 /* Tests */,
+				BF076F58239E016FB50CB85E /* Frameworks */,
+				82E642B10362D811DF05A7AC /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		2399E776D535082F71A346B3 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				ED775F7A258C12CD4FDBF173 /* ZipherX-Bridging-Header.h */,
+				09CCC4CE13F9688905FC13C9 /* App */,
+				1475AFA394F4459F1E0D0535 /* Core */,
+				B52F1406E794C2365FB7E074 /* Features */,
+				6272A90D701022C36D41F8F3 /* UI */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		37CE221B67C8B25B9DA36161 /* Receive */ = {
+			isa = PBXGroup;
+			children = (
+				CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */,
+			);
+			path = Receive;
+			sourceTree = "<group>";
+		};
+		4866F8A9016A25DA1224B42D /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		4B0FBF8C9D7E46913504EAA0 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				79B539975C988B8093FB4106 /* System7Components.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		5727696387602FA13C042A0F /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Settings;
+			sourceTree = "<group>";
+		};
+		60C3F0DA87160E18F368F2DC /* UnitTests */ = {
+			isa = PBXGroup;
+			children = (
+				235376F572F89B6D83EDA88C /* WalletTests.swift */,
+			);
+			path = UnitTests;
+			sourceTree = "<group>";
+		};
+		6272A90D701022C36D41F8F3 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				4B0FBF8C9D7E46913504EAA0 /* Components */,
+				4866F8A9016A25DA1224B42D /* Theme */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		640FB86003DCF9588473D848 /* IntegrationTests */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = IntegrationTests;
+			sourceTree = "<group>";
+		};
+		6CB48D9BAC0C161146685651 /* Send */ = {
+			isa = PBXGroup;
+			children = (
+				BC0A89DDCE7B836E49AF56B4 /* SendView.swift */,
+			);
+			path = Send;
+			sourceTree = "<group>";
+		};
+		741F678816701EA43E8FB889 /* Storage */ = {
+			isa = PBXGroup;
+			children = (
+				1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */,
+				7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */,
+			);
+			path = Storage;
+			sourceTree = "<group>";
+		};
+		7A12B43495B930D9722D1AB2 /* Network */ = {
+			isa = PBXGroup;
+			children = (
+				682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */,
+				5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */,
+				B2C3D4E5F6A7B8C9D0E1F2A3 /* InsightAPI.swift */,
+				18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */,
+				48D92FD9B357E6379040DA58 /* Peer.swift */,
+			);
+			path = Network;
+			sourceTree = "<group>";
+		};
+		82E642B10362D811DF05A7AC /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0837DEEA3809706DF9DC68F2 /* ZipherX.app */,
+				DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		8EFCA7DC688071E265AEBDF5 /* Data */ = {
+			isa = PBXGroup;
+			children = (
+				901F6C3D55300924BAF8DA44 /* PrivacyQuotes.swift */,
+			);
+			name = Data;
+			sourceTree = "<group>";
+		};
+		953B086A66376CB050286B36 /* Balance */ = {
+			isa = PBXGroup;
+			children = (
+				32F58618190CB98DA9E3EB4B /* BalanceView.swift */,
+			);
+			path = Balance;
+			sourceTree = "<group>";
+		};
+		9F3A33E9612EA4CDB1AB6050 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				640FB86003DCF9588473D848 /* IntegrationTests */,
+				60C3F0DA87160E18F368F2DC /* UnitTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		A24CB2E16DB5D1556C6BEF51 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				1076531AEA0567FCDC6311AE /* NotificationManager.swift */,
+			);
+			name = Services;
+			path = Services;
+			sourceTree = "<group>";
+		};
+		A57133D73210DCD2789FEF97 /* Crypto */ = {
+			isa = PBXGroup;
+			children = (
+				AD65941062D3050BEA2765F9 /* RustBridge.swift */,
+				F1A2B3C4D5E6F7A8B9C0D1E3 /* SaplingParams.swift */,
+				EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */,
+				068F236B88339FCE75878F8B /* ZipherXFFI.swift */,
+			);
+			path = Crypto;
+			sourceTree = "<group>";
+		};
+		B52F1406E794C2365FB7E074 /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				953B086A66376CB050286B36 /* Balance */,
+				37CE221B67C8B25B9DA36161 /* Receive */,
+				6CB48D9BAC0C161146685651 /* Send */,
+				5727696387602FA13C042A0F /* Settings */,
+				161A18C9C133A606FA3248B5 /* Settings */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		BF076F58239E016FB50CB85E /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		C54306F64C1E460E338C880B /* ZipherX */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F6FBE901B5FB23D358A35555 /* Build configuration list for PBXNativeTarget "ZipherX" */;
+			buildPhases = (
+				E4731A0B0BE655DD3F49DDF1 /* Sources */,
+				B73DC56CA3AB8DFBF7D968C9 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ZipherX;
+			productName = ZipherX;
+			productReference = 0837DEEA3809706DF9DC68F2 /* ZipherX.app */;
+			productType = "com.apple.product-type.application";
+		};
+		D162EC22BDD1CAFF4A7D9821 /* ZipherXTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = EFCE3C575BA1F3F3BBF6A18C /* Build configuration list for PBXNativeTarget "ZipherXTests" */;
+			buildPhases = (
+				EFEECCD085734CD3202C15B0 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				DEFA5FC9E0582D122B25C4B2 /* PBXTargetDependency */,
+			);
+			name = ZipherXTests;
+			productName = ZipherXTests;
+			productReference = DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AC576674C9B0B957F65B131A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					C54306F64C1E460E338C880B = {
+						DevelopmentTeam = "";
+					};
+					D162EC22BDD1CAFF4A7D9821 = {
+						DevelopmentTeam = "";
+					};
+				};
+			};
+			buildConfigurationList = 9FA28E39F8A7666CE1D4D1E5 /* Build configuration list for PBXProject "ZipherX" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 1E0AB0F916282FFBD8E5F74E;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 54;
+			productRefGroup = 82E642B10362D811DF05A7AC /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C54306F64C1E460E338C880B /* ZipherX */,
+				D162EC22BDD1CAFF4A7D9821 /* ZipherXTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E4731A0B0BE655DD3F49DDF1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */,
+				415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */,
+				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
+				8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */,
+				19D558691C9ED092DBA470FB /* FilterScanner.swift in Sources */,
+				A1B2C3D4E5F6A7B8C9D0E1F2 /* InsightAPI.swift in Sources */,
+				B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */,
+				B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */,
+				3742555859851725FDC9B9DE /* Peer.swift in Sources */,
+				596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */,
+				27CCF442814D053CBF8F12A9 /* RustBridge.swift in Sources */,
+				E1A2B3C4D5E6F7A8B9C0D1E2 /* SaplingParams.swift in Sources */,
+				081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */,
+				4331F01B9D809A6E140AC797 /* SendView.swift in Sources */,
+				0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */,
+				C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */,
+				745902783803843898150674 /* TransactionBuilder.swift in Sources */,
+				416268C8206067F62AE5C1B4 /* WalletDatabase.swift in Sources */,
+				7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */,
+				2A310DACA7C2E48D320A1600 /* WalletSetupView.swift in Sources */,
+				8F90F1D58322A43F385FB321 /* ZipherXApp.swift in Sources */,
+				7EC2BE84340E3513C2F738E6 /* ZipherXFFI.swift in Sources */,
+				DE294F3601D0FC4C50B5C260 /* SettingsView.swift in Sources */,
+				B41F9AB5A86EE2A32D4B61E2 /* NotificationManager.swift in Sources */,
+				9FD32BA2B7B7580EF8769869 /* PrivacyQuotes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EFEECCD085734CD3202C15B0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		DEFA5FC9E0582D122B25C4B2 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C54306F64C1E460E338C880B /* ZipherX */;
+			targetProxy = FFED36558D52B13D3CA919D1 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		246765A8021CDA6BE7C37FED /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZipherX.app/ZipherX";
+			};
+			name = Release;
+		};
+		2B882A05FB2967C835601825 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZipherX.app/ZipherX";
+			};
+			name = Debug;
+		};
+		35F5F1A2EF1CB00E4C9A5D1F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Libraries\"",
+				);
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/Libraries";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+					"-force_load",
+					"$(PROJECT_DIR)/Libraries/libzipherx_ffi_sim.a",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C1B0B9C97882ADCE7A893DAF /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Libraries\"",
+				);
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/Libraries";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+					"-force_load",
+					"$(PROJECT_DIR)/Libraries/libzipherx_ffi_sim.a",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D5FB568910977C9FD0FF6E21 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		F7DAEC8E1A61BFDDEE60B50B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9FA28E39F8A7666CE1D4D1E5 /* Build configuration list for PBXProject "ZipherX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D5FB568910977C9FD0FF6E21 /* Debug */,
+				F7DAEC8E1A61BFDDEE60B50B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		EFCE3C575BA1F3F3BBF6A18C /* Build configuration list for PBXNativeTarget "ZipherXTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2B882A05FB2967C835601825 /* Debug */,
+				246765A8021CDA6BE7C37FED /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F6FBE901B5FB23D358A35555 /* Build configuration list for PBXNativeTarget "ZipherX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				35F5F1A2EF1CB00E4C9A5D1F /* Debug */,
+				C1B0B9C97882ADCE7A893DAF /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AC576674C9B0B957F65B131A /* Project object */;
+}
