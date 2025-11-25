@@ -16,6 +16,7 @@ struct SyncTask: Identifiable {
     let title: String
     var status: SyncTaskStatus
     var detail: String?
+    var progress: Double? // 0.0 to 1.0 for progress bar
 }
 
 /// Main wallet manager for ZipherX
@@ -213,6 +214,11 @@ final class WalletManager: ObservableObject {
                 Task { @MainActor in
                     if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
                         self?.syncTasks[index].detail = "\(progress.currentHeight) / \(progress.totalHeight)"
+                        // Calculate progress percentage (0.0 to 1.0)
+                        let progressPercentage = progress.totalHeight > 0
+                            ? Double(progress.currentHeight) / Double(progress.totalHeight)
+                            : 0.0
+                        self?.syncTasks[index].progress = progressPercentage
                     }
                 }
             }

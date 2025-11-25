@@ -175,19 +175,18 @@ struct BalanceView: View {
                 .padding(.vertical, 6)
             }
 
-            // Sync tasks list - hidden during auto-refresh for cleaner UX
-            // Keep code but don't display during automatic background refresh
-            // if isRefreshing && !walletManager.syncTasks.isEmpty {
-            //     Divider()
-            //         .background(System7Theme.black)
-            //
-            //     VStack(spacing: 4) {
-            //         ForEach(walletManager.syncTasks) { task in
-            //             syncTaskRow(task)
-            //         }
-            //     }
-            //     .padding(8)
-            // }
+            // Sync tasks list - show when syncing
+            if isRefreshing && !walletManager.syncTasks.isEmpty {
+                Divider()
+                    .background(System7Theme.black)
+
+                VStack(spacing: 4) {
+                    ForEach(walletManager.syncTasks) { task in
+                        syncTaskRow(task)
+                    }
+                }
+                .padding(8)
+            }
         }
         .background(System7Theme.lightGray)
         .overlay(
@@ -197,45 +196,78 @@ struct BalanceView: View {
     }
 
     private func syncTaskRow(_ task: SyncTask) -> some View {
-        HStack(spacing: 8) {
-            // Status icon
-            Group {
-                switch task.status {
-                case .pending:
-                    Image(systemName: "circle")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                // Status icon
+                Group {
+                    switch task.status {
+                    case .pending:
+                        Image(systemName: "circle")
+                            .foregroundColor(System7Theme.darkGray)
+                    case .inProgress:
+                        ProgressView()
+                            .scaleEffect(0.5)
+                    case .completed:
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    case .failed:
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.red)
+                    }
+                }
+                .frame(width: 16, height: 16)
+
+                // Task title
+                Text(task.title)
+                    .font(System7Theme.bodyFont(size: 9))
+                    .foregroundColor(task.status == .pending ? System7Theme.darkGray : System7Theme.black)
+
+                Spacer()
+
+                // Detail or error
+                if let detail = task.detail {
+                    Text(detail)
+                        .font(System7Theme.bodyFont(size: 8))
                         .foregroundColor(System7Theme.darkGray)
-                case .inProgress:
-                    ProgressView()
-                        .scaleEffect(0.5)
-                case .completed:
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                case .failed:
-                    Image(systemName: "xmark.circle.fill")
+                }
+
+                if case .failed(let error) = task.status {
+                    Text(error)
+                        .font(System7Theme.bodyFont(size: 8))
                         .foregroundColor(.red)
+                        .lineLimit(1)
                 }
             }
-            .frame(width: 16, height: 16)
 
-            // Task title
-            Text(task.title)
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(task.status == .pending ? System7Theme.darkGray : System7Theme.black)
+            // Progress bar (if available)
+            if let progress = task.progress, progress > 0 {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        // Background
+                        Rectangle()
+                            .fill(System7Theme.white)
+                            .frame(height: 8)
+                            .overlay(
+                                Rectangle()
+                                    .stroke(System7Theme.black, lineWidth: 1)
+                            )
 
-            Spacer()
+                        // Progress fill
+                        Rectangle()
+                            .fill(System7Theme.black)
+                            .frame(width: geometry.size.width * min(progress, 1.0), height: 6)
+                            .padding(.leading, 1)
+                            .padding(.top, 1)
 
-            // Detail or error
-            if let detail = task.detail {
-                Text(detail)
-                    .font(System7Theme.bodyFont(size: 8))
-                    .foregroundColor(System7Theme.darkGray)
-            }
-
-            if case .failed(let error) = task.status {
-                Text(error)
-                    .font(System7Theme.bodyFont(size: 8))
-                    .foregroundColor(.red)
-                    .lineLimit(1)
+                        // Percentage text
+                        Text("\(Int(progress * 100))%")
+                            .font(System7Theme.bodyFont(size: 7))
+                            .foregroundColor(progress > 0.5 ? System7Theme.white : System7Theme.black)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .frame(height: 8)
+                .padding(.leading, 24) // Indent to align with title
             }
         }
     }
