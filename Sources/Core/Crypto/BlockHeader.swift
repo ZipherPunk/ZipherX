@@ -35,7 +35,7 @@ struct ZclassicBlockHeader {
     /// - nBits (4 bytes)
     /// - nNonce (32 bytes)
     /// Total: 140 bytes
-    static func parse(data: Data, height: UInt64) throws -> BlockHeader {
+    static func parse(data: Data, height: UInt64) throws -> ZclassicBlockHeader {
         guard data.count >= 140 else {
             throw ParseError.insufficientData(expected: 140, got: data.count)
         }
