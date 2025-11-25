@@ -3,9 +3,9 @@
 
 import Foundation
 
-/// Zclassic block header (80 bytes base + extended data)
+/// Zclassic block header (140 bytes for Zcash/Zclassic)
 /// Contains the critical finalsaplingroot field from zcashd
-struct BlockHeader {
+struct ZclassicBlockHeader {
     // Standard 80-byte header fields
     let version: UInt32
     let hashPrevBlock: Data       // 32 bytes
