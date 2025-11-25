@@ -378,12 +378,21 @@ final class HeaderSyncManager {
 // MARK: - Extensions
 
 extension NetworkManager {
-    /// Get at least min connected peers
+    /// Get at least min connected peers for header sync
     func getConnectedPeers(min: Int) async throws -> [Peer] {
-        // This should query the existing peer pool and return connected peers
-        // Implementation depends on NetworkManager's structure
-        // For now, placeholder - will be implemented based on NetworkManager
-        fatalError("Not implemented - needs NetworkManager integration")
+        // If we don't have enough peers, try to connect
+        if peers.count < min {
+            print("⚠️ Only \(peers.count) peers connected, need at least \(min). Attempting to connect...")
+            try await connect()
+        }
+
+        // Check if we have enough peers now
+        guard peers.count >= min else {
+            throw SyncError.insufficientPeers(got: peers.count, need: min)
+        }
+
+        print("✅ Using \(peers.count) connected peers for header sync")
+        return peers
     }
 }
 

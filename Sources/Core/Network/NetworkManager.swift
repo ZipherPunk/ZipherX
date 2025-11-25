@@ -30,7 +30,7 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
 
     // MARK: - Private Properties
-    private var peers: [Peer] = []
+    internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
 
     /// Get a connected peer for block downloads
     func getConnectedPeer() -> Peer? {
