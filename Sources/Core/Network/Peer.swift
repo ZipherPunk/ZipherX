@@ -302,7 +302,7 @@ final class Peer {
 
     // MARK: - Message Protocol
 
-    private func sendMessage(command: String, payload: Data) async throws {
+    func sendMessage(command: String, payload: Data) async throws {
         var message = Data()
 
         // Magic bytes
@@ -327,7 +327,7 @@ final class Peer {
         try await send(message)
     }
 
-    private func receiveMessage() async throws -> (String, Data) {
+    func receiveMessage() async throws -> (String, Data) {
         // Read header (24 bytes)
         let header = try await receive(count: 24)
 

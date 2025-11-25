@@ -377,20 +377,6 @@ final class HeaderSyncManager {
 
 // MARK: - Extensions
 
-extension Peer {
-    /// Send a P2P message (wrapper for existing sendMessage method)
-    func sendMessage(command: String, payload: Data) async throws {
-        // This should already exist in Peer.swift
-        // If not, we'll need to make the existing sendMessage method public
-    }
-
-    /// Receive a P2P message (wrapper for existing receiveMessage method)
-    func receiveMessage() async throws -> (String, Data) {
-        // This should already exist in Peer.swift
-        // If not, we'll need to make the existing receiveMessage method public
-    }
-}
-
 extension NetworkManager {
     /// Get at least min connected peers
     func getConnectedPeers(min: Int) async throws -> [Peer] {
