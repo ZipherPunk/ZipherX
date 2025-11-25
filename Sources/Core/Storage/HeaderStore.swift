@@ -1,4 +1,4 @@
-// Copyright (c) 2025 ZipherX Development Team
+// Copyright (c) 2025 Zipherpunk.com dev team
 // Block header storage for header-sync approach
 
 import Foundation

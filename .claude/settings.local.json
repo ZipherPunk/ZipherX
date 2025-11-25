@@ -19,7 +19,11 @@
       "Bash(zclassic-cli getblock:*)",
       "Bash(zclassic-cli getrawtransaction:*)",
       "Bash(zclassic-cli z_listreceivedbyaddress:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git config:*)",
+      "Bash(git push:*)",
+      "Bash(protoc:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 ZipherX Development Team
+// Copyright (c) 2025 Zipherpunk.com dev team
 // Header synchronization with multi-peer consensus
 
 import Foundation
