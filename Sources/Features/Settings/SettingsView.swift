@@ -44,6 +44,9 @@ struct SettingsView: View {
             // Rescan section
             rescanSection
 
+            // Debug section (for testing header sync)
+            debugSection
+
             Spacer()
         }
         .padding()
@@ -608,7 +611,69 @@ struct SettingsView: View {
         .background(System7Theme.lightGray)
     }
 
+    // MARK: - Debug Section
+
+    private var debugSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "hammer")
+                    .font(.system(size: 12))
+                Text("Debug Tools")
+                    .font(System7Theme.titleFont(size: 12))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+
+            // Clear headers button
+            Button(action: {
+                clearHeaders()
+            }) {
+                HStack {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12))
+                    Text("Clear Block Headers")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.purple)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.purple.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            // Info text
+            Text("Clears all cached block headers. Use this to test header sync progress bar. Headers will re-sync on next balance refresh.")
+                .font(System7Theme.bodyFont(size: 9))
+                .foregroundColor(System7Theme.darkGray)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+        }
+        .padding(12)
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
+    }
+
     // MARK: - Actions
+
+    private func clearHeaders() {
+        do {
+            try HeaderStore.shared.open()
+            try HeaderStore.shared.clearAllHeaders()
+            print("🗑️ Cleared all block headers")
+            errorMessage = "Block headers cleared! Tap refresh to re-sync and see the progress bar."
+            showError = true
+        } catch {
+            errorMessage = "Failed to clear headers: \(error.localizedDescription)"
+            showError = true
+        }
+    }
 
     private func exportPrivateKey() {
         do {
