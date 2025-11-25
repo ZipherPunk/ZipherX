@@ -31,25 +31,27 @@ struct SettingsView: View {
     @State private var showRebuildWitnessesWarning = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            // History section
-            historySection
+        ScrollView {
+            VStack(spacing: 16) {
+                // History section
+                historySection
 
-            // Security section
-            securitySection
+                // Security section
+                securitySection
 
-            // Export section
-            exportSection
+                // Export section
+                exportSection
 
-            // Rescan section
-            rescanSection
+                // Rescan section
+                rescanSection
 
-            // Debug section (for testing header sync)
-            debugSection
+                // Debug section (for testing header sync)
+                debugSection
 
-            Spacer()
+                Spacer()
+            }
+            .padding()
         }
-        .padding()
         .onAppear {
             checkBiometricAvailability()
         }
