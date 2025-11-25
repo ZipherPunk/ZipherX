@@ -367,7 +367,7 @@ final class HeaderStore {
 
         let version = UInt32(sqlite3_column_int64(stmt, 8))
 
-        return BlockHeader(
+        return ZclassicBlockHeader(
             version: version,
             hashPrevBlock: prevHash,
             hashMerkleRoot: merkleRoot,
