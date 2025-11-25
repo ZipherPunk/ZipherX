@@ -10,8 +10,8 @@ final class HeaderSyncManager {
     private let networkManager: NetworkManager
 
     // Consensus parameters
-    private let minPeers = 8
-    private let consensusThreshold = 6  // 75% agreement required
+    private let minPeers = 6
+    private let consensusThreshold = 5  // 83% agreement required (5/6)
 
     // Sync state
     private var isSyncing = false
