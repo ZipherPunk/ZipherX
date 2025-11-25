@@ -269,7 +269,7 @@ final class HeaderSyncManager {
             // Parse header
             // Height is unknown from payload - will be computed by caller
             let height = UInt64(i)  // Temporary, will be updated
-            let header = try BlockHeader.parse(data: headerData, height: height)
+            let header = try ZclassicBlockHeader.parse(data: headerData, height: height)
             headers.append(header)
         }
 
