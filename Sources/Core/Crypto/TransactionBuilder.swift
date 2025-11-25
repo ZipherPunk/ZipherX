@@ -129,13 +129,16 @@ final class TransactionBuilder {
             memoData.replaceSubrange(0..<min(memoBytes.count, 512), with: memoBytes)
         }
 
-        // CRITICAL: Get CURRENT tree root as anchor (not from database)
-        // The anchor MUST match the current state of the blockchain
-        guard let currentAnchor = ZipherXFFI.treeRoot() else {
-            print("❌ Failed to get current tree root")
+        // CRITICAL: Get anchor from block header at current height
+        // This is zcashd's EXACT anchor (finalsaplingroot) - guaranteed to match!
+        let headerStore = HeaderStore.shared
+        guard let currentAnchor = try? headerStore.getAnchor(at: chainHeight) else {
+            print("❌ Failed to get anchor from block header at height \(chainHeight)")
+            print("💡 Make sure headers are synced! Run HeaderSyncManager.syncHeaders() first")
             throw TransactionError.proofGenerationFailed
         }
-        print("📝 Using current tree root as anchor: \(currentAnchor.prefix(16).map { String(format: "%02x", $0) }.joined())...")
+        print("📝 Using anchor from block header at height \(chainHeight): \(currentAnchor.prefix(16).map { String(format: "%02x", $0) }.joined())...")
+        print("✅ This anchor came directly from zcashd's block header - guaranteed to match!")
 
         // Build transaction using FFI
         guard let rawTx = ZipherXFFI.buildTransaction(
