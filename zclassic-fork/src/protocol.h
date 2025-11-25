@@ -154,6 +154,8 @@ enum {
     // Nodes may always request a MSG_FILTERED_BLOCK in a getdata, however,
     // MSG_FILTERED_BLOCK should not appear in any invs except as a part of getdata.
     MSG_FILTERED_BLOCK,
+    // ZIP-307: Compact block format for light clients
+    MSG_COMPACT_BLOCK,
 };
 
 #endif // BITCOIN_PROTOCOL_H

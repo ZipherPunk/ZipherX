@@ -30,6 +30,7 @@
 #include "validationinterface.h"
 #include "wallet/asyncrpcoperation_sendmany.h"
 #include "wallet/asyncrpcoperation_shieldcoinbase.h"
+#include "lightclient/compactblock.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6183,6 +6184,74 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
         }
 
+    }
+
+    // ZIP-307: getcompactblock - request a compact block by hash
+    else if (strCommand == "getcompactblock")
+    {
+        uint256 blockHash;
+        vRecv >> blockHash;
+
+        LogPrint("lightclient", "Received getcompactblock request for %s from peer=%d\n",
+                 blockHash.ToString(), pfrom->id);
+
+        // Find the block index
+        BlockMap::iterator mi = mapBlockIndex.find(blockHash);
+        if (mi == mapBlockIndex.end() || !mi->second) {
+            LogPrint("lightclient", "Block not found: %s\n", blockHash.ToString());
+            return true;
+        }
+
+        CBlockIndex* pindex = mi->second;
+
+        // Load the full block from disk
+        CBlock block;
+        if (!ReadBlockFromDisk(block, pindex, Params().GetConsensus())) {
+            LogPrint("lightclient", "Failed to read block %s from disk\n", blockHash.ToString());
+            return error("getcompactblock: ReadBlockFromDisk failed for %s", blockHash.ToString());
+        }
+
+        // Convert to compact block
+        cash::z::wallet::sdk::rpc::CompactBlock compactBlock =
+            lightclient::BlockToCompactBlock(block, pindex->nHeight);
+
+        // Serialize protobuf to string
+        std::string serialized;
+        if (!compactBlock.SerializeToString(&serialized)) {
+            LogPrint("lightclient", "Failed to serialize compact block\n");
+            return error("getcompactblock: Failed to serialize CompactBlock");
+        }
+
+        LogPrint("lightclient", "Sending compact block %s (%d bytes) to peer=%d\n",
+                 blockHash.ToString(), serialized.size(), pfrom->id);
+
+        // Send compact block response
+        pfrom->PushMessage("compactblock", serialized);
+
+        return true;
+    }
+
+    // ZIP-307: compactblock - receive a compact block response
+    else if (strCommand == "compactblock")
+    {
+        std::string serialized;
+        vRecv >> serialized;
+
+        cash::z::wallet::sdk::rpc::CompactBlock compactBlock;
+        if (!compactBlock.ParseFromString(serialized)) {
+            return error("Failed to parse CompactBlock from peer=%d", pfrom->id);
+        }
+
+        LogPrint("lightclient", "Received compact block height=%d hash=%s with %d transactions from peer=%d\n",
+                 compactBlock.id().blockheight(),
+                 HexStr(compactBlock.id().blockhash()).c_str(),
+                 compactBlock.vtx_size(),
+                 pfrom->id);
+
+        // TODO: Store compact block for light client processing
+        // For now, just log receipt
+
+        return true;
     }
 
 
