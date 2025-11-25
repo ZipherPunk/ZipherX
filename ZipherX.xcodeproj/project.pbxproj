@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		9B2268AD0298446AB1C23409 /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1816CC9CBEA94310A57C5692 /* BlockHeader.swift */; };
+		53E554CE57D84A5DBC0F4B87 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97F354B06C454230A8F65B73 /* HeaderStore.swift */; };
+		1D5AFE60831A4B8FACE5D779 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AAD895D9D4341C0BDFA276D /* HeaderSyncManager.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
 		173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */; };
@@ -50,6 +53,9 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		1816CC9CBEA94310A57C5692 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
+		97F354B06C454230A8F65B73 /* HeaderStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderStore.swift; sourceTree = "<group>"; };
+		8AAD895D9D4341C0BDFA276D /* HeaderSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderSyncManager.swift; sourceTree = "<group>"; };
 		04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyQuotes.swift; sourceTree = "<group>"; };
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
 		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -228,6 +234,7 @@
 		741F678816701EA43E8FB889 /* Storage */ = {
 			isa = PBXGroup;
 			children = (
+				97F354B06C454230A8F65B73 /* HeaderStore.swift */,
 				1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */,
 				7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */,
 			);
@@ -237,6 +244,7 @@
 		7A12B43495B930D9722D1AB2 /* Network */ = {
 			isa = PBXGroup;
 			children = (
+				8AAD895D9D4341C0BDFA276D /* HeaderSyncManager.swift */,
 				682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */,
 				5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */,
 				710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */,
@@ -422,6 +430,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9B2268AD0298446AB1C23409 /* BlockHeader.swift in Sources */,
+				53E554CE57D84A5DBC0F4B87 /* HeaderStore.swift in Sources */,
+				1D5AFE60831A4B8FACE5D779 /* HeaderSyncManager.swift in Sources */,
 				6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */,
 				415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
