@@ -27,6 +27,10 @@ enum System7Theme {
         .system(size: size, weight: .regular, design: .monospaced)
     }
 
+    static func monoFont(size: CGFloat = 10) -> Font {
+        .system(size: size, weight: .regular, design: .monospaced)
+    }
+
     // MARK: - Desktop Pattern
     static var desktopPattern: some View {
         Canvas { context, size in

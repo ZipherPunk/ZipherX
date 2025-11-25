@@ -161,6 +161,52 @@ Before any release:
 - [Zcash Protocol Spec](https://zips.z.cash/protocol/protocol.pdf)
 - [Apple Secure Enclave](https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/protecting_keys_with_the_secure_enclave)
 
+## Current Implementation Status
+
+### Completed Features
+
+1. **BIP-39 Mnemonic Support** - Generate/validate 24-word seed phrases
+2. **Sapling Key Derivation** - ExtendedSpendingKey, IVK, payment addresses
+3. **Note Decryption** - Trial decryption with IVK/SK (fixed EPK byte order)
+4. **Nullifier Computation** - Track spent notes
+5. **Transaction Scanning** - Via Insight API with shielded output detection
+6. **Commitment Tree** - Full implementation for witness generation
+   - Tree init/append/serialize/deserialize
+   - IncrementalWitness creation and updates
+   - Database persistence of tree state
+7. **Witness Generation** - Real Merkle path witnesses (1028 bytes)
+8. **Database Layer** - SQLite with tree state persistence
+9. **UI** - System 7-inspired interface with balance display, send/receive
+
+### In Progress / Needs Testing
+
+1. **Transaction Building** - Spend proof generation needs testing with real witnesses
+2. **Spend Detection** - Nullifier tracking during rescan
+3. **GitHub Repository** - Created but push needs retry (HTTP 400 error)
+
+### Remaining Tasks
+
+1. **Rescan for Existing Wallet** - Must delete old tree state and rescan from beginning to build proper commitment tree
+2. **Test Full Send Flow** - With new witness generation
+3. **Add Checkpoint Support** - Pre-computed tree state for faster initial sync
+4. **Multi-Peer Consensus** - Currently single API endpoint
+5. **Background Sync** - iOS background fetch
+6. **Secure Enclave Integration** - Currently keys in memory
+7. **Security Audit** - Required before any real use
+
+### Technical Notes
+
+- **Witness Format**: 4 bytes (u32 LE position) + 32×32 bytes (Merkle path) = 1028 bytes
+- **Tree State Size**: ~350KB - 1.7MB depending on network usage
+- **Full Sync Time**: ~30-60 minutes without checkpoint (sequential block processing required)
+- **FFI Header**: `/Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h`
+
+### Known Issues
+
+- Sequential block processing slower than parallel (required for tree ordering)
+- Existing notes may have placeholder witnesses - need rescan
+- Nullifier computation uses tree position (must match witness)
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

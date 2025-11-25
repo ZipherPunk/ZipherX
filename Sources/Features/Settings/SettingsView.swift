@@ -15,14 +15,34 @@ struct SettingsView: View {
     @State private var pinCode = ""
     @State private var confirmPIN = ""
     @State private var biometricAvailable = false
+    @State private var showRescanWarning = false
+    @State private var showRescanProgress = false
+    @State private var rescanProgress: Double = 0
+    @State private var rescanCurrentHeight: UInt64 = 0
+    @State private var rescanMaxHeight: UInt64 = 0
+    @State private var rescanStartTime: Date?
+    @State private var rescanElapsedTime: TimeInterval = 0
+    @State private var rescanTimer: Timer?
+    @State private var showQuickScan = false
+    @State private var quickScanHeight = ""
+    @State private var showFullRescanFromHeight = false
+    @State private var fullRescanHeight = ""
+    @State private var showHistory = false
+    @State private var showRebuildWitnessesWarning = false
 
     var body: some View {
         VStack(spacing: 16) {
+            // History section
+            historySection
+
             // Security section
             securitySection
 
             // Export section
             exportSection
+
+            // Rescan section
+            rescanSection
 
             Spacer()
         }
@@ -46,6 +66,100 @@ struct SettingsView: View {
         .sheet(isPresented: $showPINSetup) {
             pinSetupSheet
         }
+        .alert("Full Blockchain Rescan", isPresented: $showRescanWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Rescan", role: .destructive) {
+                startFullRescan()
+            }
+        } message: {
+            Text("WARNING: This will delete all cached data and rescan the entire blockchain from scratch.\n\nThis process can take 30-60 minutes and uses significant data.\n\nYour funds are safe - only cached data is deleted.\n\nDo you want to continue?")
+        }
+        .sheet(isPresented: $showRescanProgress) {
+            rescanProgressView
+        }
+        .alert("Quick Scan for Notes", isPresented: $showQuickScan) {
+            TextField("Start Height", text: $quickScanHeight)
+                .keyboardType(.numberPad)
+            Button("Cancel", role: .cancel) {
+                quickScanHeight = ""
+            }
+            Button("Scan") {
+                if let height = UInt64(quickScanHeight) {
+                    startQuickScan(from: height)
+                }
+                quickScanHeight = ""
+            }
+        } message: {
+            Text("Enter block height to start scanning for notes.\n\nThis uses the bundled tree and only scans for YOUR notes.\n\nExample: 2918000")
+        }
+        .alert("Full Rescan from Height", isPresented: $showFullRescanFromHeight) {
+            TextField("Start Height", text: $fullRescanHeight)
+                .keyboardType(.numberPad)
+            Button("Cancel", role: .cancel) {
+                fullRescanHeight = ""
+            }
+            Button("Rescan") {
+                if let height = UInt64(fullRescanHeight) {
+                    startFullRescanFromHeight(height)
+                }
+                fullRescanHeight = ""
+            }
+        } message: {
+            Text("Enter block height to start full rescan.\n\nThis rebuilds the commitment tree and creates proper witnesses so notes can be SPENT.\n\nExample: 2918000")
+        }
+        .alert("Rebuild Witnesses", isPresented: $showRebuildWitnessesWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Rebuild", role: .destructive) {
+                startRebuildWitnesses()
+            }
+        } message: {
+            Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
+        }
+        .sheet(isPresented: $showHistory) {
+            HistoryView()
+        }
+    }
+
+    // MARK: - History Section
+
+    private var historySection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12))
+                Text("Transaction History")
+                    .font(System7Theme.titleFont(size: 12))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+
+            // History button
+            Button(action: {
+                showHistory = true
+            }) {
+                HStack {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.system(size: 12))
+                    Text("View History")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.blue)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.blue.opacity(0.8), lineWidth: 2)
+                )
+            }
+        }
+        .padding(12)
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
     }
 
     // MARK: - Security Section
@@ -179,6 +293,282 @@ struct SettingsView: View {
         )
     }
 
+    // MARK: - Rescan Section
+
+    private var rescanSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12))
+                Text("Blockchain Data")
+                    .font(System7Theme.titleFont(size: 12))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+
+            // Warning box
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                        .font(.system(size: 14))
+
+                    Text("DANGER ZONE")
+                        .font(System7Theme.titleFont(size: 10))
+                        .foregroundColor(.red)
+
+                    Spacer()
+                }
+
+                Text("Full rescan rebuilds the commitment tree from scratch. Required if witnesses are invalid. This takes 30-60 minutes.")
+                    .font(System7Theme.bodyFont(size: 9))
+                    .foregroundColor(System7Theme.darkGray)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+            .background(Color.red.opacity(0.1))
+            .overlay(
+                Rectangle()
+                    .stroke(Color.red.opacity(0.5), lineWidth: 1)
+            )
+
+            // Quick Scan button - BLUE (fast but notes not spendable)
+            Button(action: {
+                showQuickScan = true
+            }) {
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 12))
+                    Text("Quick Scan (view only)")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.blue)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.blue.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            // Rebuild Witnesses button - GREEN (make notes spendable)
+            Button(action: {
+                showRebuildWitnessesWarning = true
+            }) {
+                HStack {
+                    Image(systemName: "checkmark.shield")
+                        .font(.system(size: 12))
+                    Text("Rebuild Witnesses (for spending)")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.green)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.green.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            // Full Rescan from Height button - ORANGE (spendable notes)
+            Button(action: {
+                showFullRescanFromHeight = true
+            }) {
+                HStack {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .font(.system(size: 12))
+                    Text("Full Rescan from Height")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.orange)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.orange.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            // Full Rescan button - RED (from scratch)
+            Button(action: {
+                showRescanWarning = true
+            }) {
+                HStack {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12))
+                    Text("Full Rescan (from scratch)")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.red)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.red.opacity(0.8), lineWidth: 2)
+                )
+            }
+        }
+        .padding(12)
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
+    }
+
+    // MARK: - Rescan Progress View
+
+    private var rescanProgressView: some View {
+        VStack(spacing: 20) {
+            Text("Full Blockchain Rescan")
+                .font(System7Theme.titleFont(size: 16))
+                .foregroundColor(System7Theme.black)
+
+            // Progress bar
+            VStack(spacing: 8) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(System7Theme.white)
+                            .frame(height: 20)
+                            .overlay(
+                                Rectangle()
+                                    .stroke(System7Theme.black, lineWidth: 1)
+                            )
+
+                        Rectangle()
+                            .fill(Color.blue)
+                            .frame(width: geometry.size.width * rescanProgress, height: 18)
+                            .offset(x: 1)
+                    }
+                }
+                .frame(height: 20)
+
+                Text("\(Int(rescanProgress * 100))%")
+                    .font(System7Theme.titleFont(size: 14))
+                    .foregroundColor(System7Theme.black)
+            }
+
+            // Block progress
+            VStack(spacing: 4) {
+                HStack {
+                    Text("Block:")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                    Text("\(rescanCurrentHeight) / \(rescanMaxHeight)")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.black)
+                }
+
+                HStack {
+                    Text("Elapsed:")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                    Text(formatDuration(rescanElapsedTime))
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.black)
+                }
+
+                HStack {
+                    Text("Estimated:")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                    Text(estimatedTimeRemaining)
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.black)
+                }
+
+                HStack {
+                    Text("Tree Size:")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                    Text("\(ZipherXFFI.treeSize()) commitments")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.black)
+                }
+            }
+            .padding(12)
+            .background(System7Theme.white)
+            .overlay(
+                Rectangle()
+                    .stroke(System7Theme.black, lineWidth: 1)
+            )
+
+            // Status message
+            if rescanProgress < 0 {
+                // Error state
+                VStack(spacing: 8) {
+                    Text("Rescan failed!")
+                        .font(System7Theme.titleFont(size: 12))
+                        .foregroundColor(.red)
+                    Text(errorMessage)
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                        .multilineTextAlignment(.center)
+                }
+            } else {
+                Text(rescanProgress >= 1.0 ? "Rescan complete!" : "Building commitment tree...")
+                    .font(System7Theme.bodyFont(size: 10))
+                    .foregroundColor(rescanProgress >= 1.0 ? .green : System7Theme.darkGray)
+            }
+
+            if rescanProgress >= 1.0 || rescanProgress < 0 {
+                Button(rescanProgress < 0 ? "Close" : "Done") {
+                    showRescanProgress = false
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                .background(rescanProgress < 0 ? Color.red : Color.blue)
+                .foregroundColor(.white)
+                .overlay(
+                    Rectangle()
+                        .stroke(System7Theme.black, lineWidth: 1)
+                )
+            }
+        }
+        .padding(30)
+        .background(System7Theme.lightGray)
+        .interactiveDismissDisabled(rescanProgress >= 0 && rescanProgress < 1.0)
+    }
+
+    private var estimatedTimeRemaining: String {
+        guard rescanProgress > 0.01, rescanElapsedTime > 5 else {
+            return "Calculating..."
+        }
+
+        let totalEstimate = rescanElapsedTime / rescanProgress
+        let remaining = totalEstimate - rescanElapsedTime
+
+        if remaining < 60 {
+            return "< 1 minute"
+        } else {
+            return formatDuration(remaining)
+        }
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let hours = Int(seconds) / 3600
+        let minutes = (Int(seconds) % 3600) / 60
+        let secs = Int(seconds) % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        } else {
+            return String(format: "%d:%02d", minutes, secs)
+        }
+    }
+
     // MARK: - PIN Setup Sheet
 
     private var pinSetupSheet: some View {
@@ -307,6 +697,204 @@ struct SettingsView: View {
         pinCode = ""
         confirmPIN = ""
         showPINSetup = false
+    }
+
+    private func startFullRescan() {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = 0
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform rescan in background
+        Task {
+            do {
+                print("🔄 Starting full rescan...")
+
+                try await walletManager.performFullRescan { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ Full rescan complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    // Keep progress sheet open but show error in it
+                    errorMessage = "Rescan failed: \(error.localizedDescription)"
+                    print("❌ Rescan error: \(error)")
+                    // Set progress to -1 to indicate error state
+                    rescanProgress = -1
+                }
+            }
+        }
+    }
+
+    private func startRebuildWitnesses() {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = 0
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform rebuild in background
+        Task {
+            do {
+                print("🔄 Starting witness rebuild...")
+
+                try await walletManager.rebuildWitnessesForSpending { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ Witness rebuild complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    errorMessage = "Witness rebuild failed: \(error.localizedDescription)"
+                    print("❌ Rebuild error: \(error)")
+                    rescanProgress = -1
+                }
+            }
+        }
+    }
+
+    private func startQuickScan(from startHeight: UInt64) {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = startHeight
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform quick scan in background
+        Task {
+            do {
+                print("🔍 Starting quick scan from height \(startHeight)...")
+
+                try await walletManager.performQuickScan(fromHeight: startHeight) { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ Quick scan complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    errorMessage = "Quick scan failed: \(error.localizedDescription)"
+                    print("❌ Quick scan error: \(error)")
+                    rescanProgress = -1
+                }
+            }
+        }
+    }
+
+    private func startFullRescanFromHeight(_ startHeight: UInt64) {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = startHeight
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform full rescan from specified height in background
+        Task {
+            do {
+                print("🔄 Starting full rescan from height \(startHeight)...")
+
+                try await walletManager.performFullRescan(fromHeight: startHeight) { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ Full rescan from height complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    errorMessage = "Full rescan failed: \(error.localizedDescription)"
+                    print("❌ Full rescan error: \(error)")
+                    rescanProgress = -1
+                }
+            }
+        }
     }
 }
 

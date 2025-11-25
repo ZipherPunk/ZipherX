@@ -77,6 +77,134 @@ final class InsightAPI {
         return txData
     }
 
+    /// Get shielded outputs from raw transaction (full encCiphertext, not truncated)
+    func getShieldedOutputsFromRaw(txid: String) async throws -> [ShieldedOutput] {
+        let rawTx = try await getRawTransaction(txid: txid)
+        return parseShieldedOutputs(from: rawTx)
+    }
+
+    /// Parse Sapling shielded outputs from raw transaction data
+    /// This extracts the full 580-byte encCiphertext that the /api/tx endpoint truncates
+    private func parseShieldedOutputs(from txData: Data) -> [ShieldedOutput] {
+        var outputs: [ShieldedOutput] = []
+
+        // Sapling transaction structure (v4):
+        // - header (4 bytes)
+        // - nVersionGroupId (4 bytes)
+        // - vin (varint + inputs)
+        // - vout (varint + outputs)
+        // - nLockTime (4 bytes)
+        // - nExpiryHeight (4 bytes)
+        // - valueBalance (8 bytes)
+        // - vShieldedSpend (varint + spends)
+        // - vShieldedOutput (varint + outputs)
+        // - bindingSig (64 bytes)
+
+        guard txData.count > 20 else { return outputs }
+
+        var offset = 0
+
+        // Skip header (4 bytes) and nVersionGroupId (4 bytes)
+        offset += 8
+
+        // Skip transparent inputs
+        let vinCount = readCompactSize(from: txData, at: &offset)
+        for _ in 0..<vinCount {
+            offset += 36 // prevout (32 + 4)
+            let scriptLen = readCompactSize(from: txData, at: &offset)
+            offset += Int(scriptLen) // scriptSig
+            offset += 4 // sequence
+        }
+
+        // Skip transparent outputs
+        let voutCount = readCompactSize(from: txData, at: &offset)
+        for _ in 0..<voutCount {
+            offset += 8 // value
+            let scriptLen = readCompactSize(from: txData, at: &offset)
+            offset += Int(scriptLen) // scriptPubKey
+        }
+
+        // Skip nLockTime (4) + nExpiryHeight (4) + valueBalance (8)
+        offset += 16
+
+        // Skip shielded spends
+        let spendCount = readCompactSize(from: txData, at: &offset)
+        for _ in 0..<spendCount {
+            offset += 384 // cv(32) + anchor(32) + nullifier(32) + rk(32) + proof(192) + spendAuthSig(64)
+        }
+
+        // Read shielded outputs
+        let outputCount = readCompactSize(from: txData, at: &offset)
+        for _ in 0..<outputCount {
+            guard offset + 948 <= txData.count else { break }
+
+            let cv = txData[offset..<offset+32]
+            offset += 32
+
+            let cmu = txData[offset..<offset+32]
+            offset += 32
+
+            let ephemeralKey = txData[offset..<offset+32]
+            offset += 32
+
+            let encCiphertext = txData[offset..<offset+580]
+            offset += 580
+
+            let outCiphertext = txData[offset..<offset+80]
+            offset += 80
+
+            let proof = txData[offset..<offset+192]
+            offset += 192
+
+            // Convert to hex strings
+            // cv, cmu, ephemeralKey need to be reversed to match display format (big-endian)
+            // that the original API returns, since FilterScanner reverses them back
+            // encCiphertext should NOT be reversed - it's raw ciphertext bytes
+            let output = ShieldedOutput(
+                cv: Data(cv.reversed()).map { String(format: "%02x", $0) }.joined(),
+                cmu: Data(cmu.reversed()).map { String(format: "%02x", $0) }.joined(),
+                ephemeralKey: Data(ephemeralKey.reversed()).map { String(format: "%02x", $0) }.joined(),
+                encCiphertext: Data(encCiphertext).map { String(format: "%02x", $0) }.joined(),
+                outCiphertext: Data(outCiphertext).map { String(format: "%02x", $0) }.joined(),
+                proof: Data(proof).map { String(format: "%02x", $0) }.joined()
+            )
+
+            outputs.append(output)
+        }
+
+        return outputs
+    }
+
+    /// Read Bitcoin-style compact size (varint)
+    private func readCompactSize(from data: Data, at offset: inout Int) -> UInt64 {
+        guard offset < data.count else { return 0 }
+
+        let first = data[offset]
+        offset += 1
+
+        if first < 253 {
+            return UInt64(first)
+        } else if first == 253 {
+            guard offset + 2 <= data.count else { return 0 }
+            let value = UInt16(data[offset]) | (UInt16(data[offset+1]) << 8)
+            offset += 2
+            return UInt64(value)
+        } else if first == 254 {
+            guard offset + 4 <= data.count else { return 0 }
+            let value = UInt32(data[offset]) | (UInt32(data[offset+1]) << 8) | (UInt32(data[offset+2]) << 16) | (UInt32(data[offset+3]) << 24)
+            offset += 4
+            return UInt64(value)
+        } else {
+            guard offset + 8 <= data.count else { return 0 }
+            var value: UInt64 = 0
+            for i in 0..<8 {
+                value |= UInt64(data[offset+i]) << (i * 8)
+            }
+            offset += 8
+            return value
+        }
+    }
+
     /// Broadcast transaction
     func broadcastTransaction(rawTx: Data) async throws -> String {
         let url = URL(string: "\(baseURL)/api/tx/send")!

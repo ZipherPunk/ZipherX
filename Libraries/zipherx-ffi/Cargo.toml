@@ -29,6 +29,10 @@ rand = "0.8"
 sha2 = "0.10"
 bls12_381 = "0.8"
 
+[[bin]]
+name = "verify_tree"
+path = "src/bin/verify_tree.rs"
+
 [profile.release]
 lto = true
 opt-level = "z"

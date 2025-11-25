@@ -171,6 +171,24 @@ final class WalletManager: ObservableObject {
         do {
             let dbKey = Data(SHA256.hash(data: spendingKey))
             try WalletDatabase.shared.open(encryptionKey: dbKey)
+
+            // Ensure account exists in database
+            if try WalletDatabase.shared.getAccount(index: 0) == nil {
+                // Derive viewing key for storage
+                let saplingKey = SaplingSpendingKey(data: spendingKey)
+                let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
+
+                // Insert account with current address
+                _ = try WalletDatabase.shared.insertAccount(
+                    accountIndex: 0,
+                    spendingKey: spendingKey,
+                    viewingKey: fvk.data,
+                    address: self.zAddress,
+                    birthdayHeight: 559500 // Sapling activation for ZCL
+                )
+                print("👤 Created account in database")
+            }
+
             await updateTask("database", status: .completed)
         } catch {
             await updateTask("database", status: .failed(error.localizedDescription))
@@ -192,9 +210,15 @@ final class WalletManager: ObservableObject {
             }
         }
 
+        // Get account ID for scanning (database row id starts at 1)
+        let database = WalletDatabase.shared
+        guard let account = try database.getAccount(index: 0) else {
+            throw WalletError.walletNotCreated
+        }
+
         do {
             // Pass spending key (169 bytes) so scanner can derive IVK properly
-            try await scanner.startScan(for: 0, viewingKey: spendingKey)
+            try await scanner.startScan(for: account.id, viewingKey: spendingKey)
             await updateTask("height", status: .completed)
             await updateTask("scan", status: .completed)
         } catch {
@@ -204,8 +228,11 @@ final class WalletManager: ObservableObject {
 
         // Task 5: Calculate balance
         await updateTask("balance", status: .inProgress)
-        let database = WalletDatabase.shared
-        var unspentNotes = try database.getUnspentNotes(accountId: 0)
+
+        // Debug: List all notes in database to diagnose balance discrepancy
+        try? database.debugListAllNotes(accountId: account.id)
+
+        var unspentNotes = try database.getUnspentNotes(accountId: account.id)
 
         // Get current chain height to calculate confirmations
         let chainHeight = scanner.currentChainHeight
@@ -255,6 +282,169 @@ final class WalletManager: ObservableObject {
         try await refreshBalance()
     }
 
+    /// Perform a full blockchain rescan from a specific height
+    /// This rebuilds the commitment tree and finds notes with proper witnesses
+    /// - Parameters:
+    ///   - fromHeight: Optional start height (defaults to loading bundled tree height)
+    ///   - onProgress: Callback with (progress, currentHeight, maxHeight)
+    func performFullRescan(fromHeight startHeight: UInt64? = nil, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+        guard isWalletCreated else {
+            throw WalletError.walletNotCreated
+        }
+
+        // Get spending key
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+
+        // Ensure database is open
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        try WalletDatabase.shared.open(encryptionKey: dbKey)
+        print("📂 Database opened")
+
+        // Get account ID
+        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+            print("❌ No account found in database")
+            throw WalletError.walletNotCreated
+        }
+        print("👤 Account ID: \(account.id)")
+
+        // Clear existing notes but keep tree if we're starting from a specific height
+        if let startHeight = startHeight {
+            // For Full Rescan from Height: must scan from Sapling activation to build proper witnesses
+            // The bundled tree is a frontier-only tree and cannot generate witnesses for past positions
+            print("⚠️ Full rescan from height \(startHeight) requires scanning from Sapling activation")
+            print("⚠️ This is necessary to build proper Merkle witnesses for spending")
+
+            // Reset everything and start fresh
+            try WalletDatabase.shared.resetSyncState()
+            _ = ZipherXFFI.treeInit()
+            print("🌳 Initialized empty tree - will build from Sapling activation")
+            print("🔄 Starting full rescan from Sapling activation (559500)")
+        } else {
+            // Reset all sync state (notes, nullifiers, tree)
+            try WalletDatabase.shared.resetSyncState()
+            print("🔄 Reset complete - starting full rescan from Sapling activation")
+        }
+
+        // Create scanner with progress callback
+        let scanner = FilterScanner()
+        scanner.onProgress = onProgress
+
+        // Start scan (sequential mode for tree building)
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey)
+
+        // Refresh balance after scan
+        try await refreshBalance()
+        print("✅ Full rescan complete")
+    }
+
+    /// Rebuild witnesses from bundled tree height
+    /// This is needed when witnesses are invalid (e.g., after quick scan)
+    /// Uses bundled CMUs and scans sequentially to build proper witnesses
+    func rebuildWitnessesForSpending(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+        guard isWalletCreated else {
+            throw WalletError.walletNotCreated
+        }
+
+        // Get spending key
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+
+        // Ensure database is open
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        try WalletDatabase.shared.open(encryptionKey: dbKey)
+        print("📂 Database opened")
+
+        // Get account ID
+        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+            print("❌ No account found in database")
+            throw WalletError.walletNotCreated
+        }
+        print("👤 Account ID: \(account.id)")
+
+        // Clear tree state and witnesses to force rebuild
+        try WalletDatabase.shared.clearTreeStateForRebuild()
+        print("🔄 Cleared tree state and witnesses")
+
+        // Create scanner with progress callback
+        let scanner = FilterScanner()
+        scanner.onProgress = onProgress
+
+        // Start scan WITHOUT fromHeight - this triggers sequential mode
+        // which builds proper tree and witnesses
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey)
+
+        // Refresh balance after scan
+        try await refreshBalance()
+        print("✅ Witness rebuild complete - notes can now be spent")
+    }
+
+    /// Perform a quick scan for notes starting from a specific height
+    /// Uses bundled tree - only scans for notes, doesn't rebuild tree
+    func performQuickScan(fromHeight startHeight: UInt64, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+        guard isWalletCreated else {
+            throw WalletError.walletNotCreated
+        }
+
+        // Get spending key
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+
+        // Ensure database is open
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        try WalletDatabase.shared.open(encryptionKey: dbKey)
+        print("📂 Database opened")
+
+        // Get account ID
+        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+            print("❌ No account found in database")
+            throw WalletError.walletNotCreated
+        }
+        print("👤 Account ID: \(account.id)")
+
+        // Tree initialization depends on scan start height
+        // For full rescans (from Sapling activation), start with empty tree
+        // For recent scans, load pre-built tree
+        let saplingActivation: UInt64 = 476969
+        let prebuiltTreeHeight: UInt64 = 2920561
+
+        if startHeight <= saplingActivation + 1000 {
+            // Full rescan - start with empty tree to build witnesses correctly
+            _ = ZipherXFFI.treeInit()
+            print("🌳 Initialized empty tree for full rescan from \(startHeight)")
+        } else if startHeight >= prebuiltTreeHeight {
+            // Recent scan - load pre-built tree
+            if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+               let bundledData = try? Data(contentsOf: bundledTreeURL) {
+                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("🌳 Loaded bundled commitment tree (CMU format) with \(treeSize) commitments")
+                } else {
+                    print("❌ Failed to load bundled tree from CMU format")
+                    _ = ZipherXFFI.treeInit()
+                }
+            } else {
+                _ = ZipherXFFI.treeInit()
+                print("🌳 Initialized empty tree (no bundled tree found)")
+            }
+        } else {
+            // Partial scan from middle - need empty tree to build correctly
+            _ = ZipherXFFI.treeInit()
+            print("🌳 Initialized empty tree for partial scan from \(startHeight)")
+        }
+
+        // Create scanner with progress callback
+        let scanner = FilterScanner()
+        scanner.onProgress = onProgress
+
+        // Start scan from specified height
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: startHeight)
+
+        // Refresh balance after scan
+        try await refreshBalance()
+        print("✅ Quick scan complete")
+    }
+
     /// Update a sync task status
     @MainActor
     private func updateTask(_ id: String, status: SyncTaskStatus, detail: String? = nil) {
@@ -299,7 +489,7 @@ final class WalletManager: ObservableObject {
 
         // Build shielded transaction
         let txBuilder = TransactionBuilder()
-        let rawTx = try await txBuilder.buildShieldedTransaction(
+        let (rawTx, spentNullifier) = try await txBuilder.buildShieldedTransaction(
             from: zAddress,
             to: toAddress,
             amount: amount,
@@ -310,6 +500,17 @@ final class WalletManager: ObservableObject {
         // Broadcast through multi-peer network
         let networkManager = NetworkManager.shared
         let txId = try await networkManager.broadcastTransaction(rawTx)
+
+        // CRITICAL: Mark the spent note immediately to prevent double-spending
+        // Don't wait for blockchain confirmation - mark it now
+        print("📝 Marking note as spent (nullifier: \(spentNullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
+        // Convert txid hex string to Data
+        guard let txidData = Data(hexString: txId) else {
+            print("⚠️ Failed to convert txid to Data, skipping mark as spent")
+            throw WalletError.transactionFailed("Invalid transaction ID format")
+        }
+        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
+        print("✅ Note marked as spent in database")
 
         // Refresh balance
         try await refreshBalance()

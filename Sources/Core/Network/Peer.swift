@@ -411,7 +411,36 @@ final class Peer {
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
         try await sendMessage(command: "tx", payload: rawTx)
 
-        let (_, response) = try await receiveMessage()
+        let (command, response) = try await receiveMessage()
+
+        // Check for rejection
+        if command == "reject" {
+            // Parse reject message: varint message_type + reason_code + varint reason_text
+            var offset = 0
+            // Skip message type (varint + string)
+            if response.count > 0 {
+                let msgLen = Int(response[0])
+                offset = 1 + msgLen
+            }
+            if offset < response.count {
+                let rejectCode = response[offset]
+                let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
+                let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
+
+                // Get reason text
+                var reason = ""
+                if offset + 1 < response.count {
+                    let reasonLen = Int(response[offset + 1])
+                    if offset + 2 + reasonLen <= response.count {
+                        reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
+                    }
+                }
+                print("❌ Transaction rejected: \(codeName) - \(reason)")
+                throw NetworkError.transactionRejected
+            }
+        }
+
+        print("📨 Broadcast response: \(command)")
 
         // TX ID is the double SHA256 hash of the raw transaction
         let txId = rawTx.doubleSHA256().reversed()

@@ -362,7 +362,8 @@ enum ZipherXFFI {
         witness: Data,
         noteValue: UInt64,
         noteRcm: Data,
-        noteDiversifier: Data
+        noteDiversifier: Data,
+        chainHeight: UInt64
     ) -> Data? {
         guard spendingKey.count == 169,
               toAddress.count == 43,
@@ -396,6 +397,7 @@ enum ZipherXFFI {
                                         noteValue,
                                         rcmPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
                                         divPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                        chainHeight,
                                         &txOutput,
                                         &txLen
                                     )
@@ -500,6 +502,18 @@ enum ZipherXFFI {
         }
     }
 
+    /// Add a note commitment from raw pointer (for bulk loading)
+    /// Returns the position of the added commitment, or UInt64.max on error
+    static func treeAppendRaw(cmu: UnsafePointer<UInt8>) -> UInt64 {
+        return zipherx_tree_append(cmu)
+    }
+
+    /// Load a witness into memory for tracking/updating
+    /// Returns the witness index or UInt64.max on error
+    static func treeLoadWitness(witnessData: UnsafePointer<UInt8>, witnessLen: Int) -> UInt64 {
+        return zipherx_tree_load_witness(witnessData, witnessLen)
+    }
+
     /// Create a witness for the current position in the tree
     /// Call this right after appending a note that belongs to us
     /// Returns the witness index, or UInt64.max on error
@@ -555,5 +569,113 @@ enum ZipherXFFI {
                 data.count
             )
         }
+    }
+
+    /// Load tree from raw CMUs file format
+    /// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+    static func treeLoadFromCMUs(data: Data) -> Bool {
+        return data.withUnsafeBytes { ptr in
+            zipherx_tree_load_from_cmus(
+                ptr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                data.count
+            )
+        }
+    }
+
+    // MARK: - OVK Output Recovery (Transaction History)
+
+    /// Derive outgoing viewing key from spending key
+    static func deriveOVK(from spendingKey: Data) -> Data? {
+        guard spendingKey.count == 169 else {
+            return nil
+        }
+
+        var ovk = [UInt8](repeating: 0, count: 32)
+
+        let success = spendingKey.withUnsafeBytes { skPtr in
+            zipherx_derive_ovk(
+                skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                &ovk
+            )
+        }
+
+        guard success else {
+            return nil
+        }
+
+        return Data(ovk)
+    }
+
+    /// Recovered output data from OVK decryption
+    struct RecoveredOutput {
+        let diversifier: Data   // 11 bytes
+        let pkd: Data          // 32 bytes
+        let value: UInt64      // zatoshis
+        let rcm: Data          // 32 bytes
+        let memo: Data         // 512 bytes
+    }
+
+    /// Try to recover a sent note using the outgoing viewing key
+    /// Returns decrypted output data if this was a note we sent
+    static func tryRecoverOutputWithOVK(
+        ovk: Data,
+        cv: Data,
+        cmu: Data,
+        epk: Data,
+        encCiphertext: Data,
+        outCiphertext: Data
+    ) -> RecoveredOutput? {
+        guard ovk.count == 32,
+              cv.count == 32,
+              cmu.count == 32,
+              epk.count == 32,
+              encCiphertext.count >= 580,
+              outCiphertext.count >= 80 else {
+            return nil
+        }
+
+        // Output buffer: 11 div + 32 pk_d + 8 value + 32 rcm + 512 memo = 595 bytes
+        var output = [UInt8](repeating: 0, count: 620)
+
+        let length = ovk.withUnsafeBytes { ovkPtr in
+            cv.withUnsafeBytes { cvPtr in
+                cmu.withUnsafeBytes { cmuPtr in
+                    epk.withUnsafeBytes { epkPtr in
+                        encCiphertext.withUnsafeBytes { encPtr in
+                            outCiphertext.withUnsafeBytes { outPtr in
+                                zipherx_try_recover_output_with_ovk(
+                                    ovkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    cvPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    epkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    encPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    outPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    &output
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        guard length > 0 else {
+            return nil
+        }
+
+        // Parse output: 11 div + 32 pk_d + 8 value + 32 rcm + 512 memo
+        let diversifier = Data(output[0..<11])
+        let pkd = Data(output[11..<43])
+        let value = output[43..<51].withUnsafeBytes { $0.load(as: UInt64.self) }
+        let rcm = Data(output[51..<83])
+        let memo = Data(output[83..<595])
+
+        return RecoveredOutput(
+            diversifier: diversifier,
+            pkd: pkd,
+            value: value,
+            rcm: rcm,
+            memo: memo
+        )
     }
 }

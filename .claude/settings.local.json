@@ -15,7 +15,11 @@
       "Bash(cargo run:*)",
       "Bash(clang++:*)",
       "Bash(./test_decrypt:*)",
-      "WebFetch(domain:nakamotoinstitute.org)"
+      "WebFetch(domain:nakamotoinstitute.org)",
+      "Bash(zclassic-cli getblock:*)",
+      "Bash(zclassic-cli getrawtransaction:*)",
+      "Bash(zclassic-cli z_listreceivedbyaddress:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

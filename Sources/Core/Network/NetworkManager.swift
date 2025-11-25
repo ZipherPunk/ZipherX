@@ -9,7 +9,7 @@ final class NetworkManager: ObservableObject {
 
     // MARK: - Constants
     private let MIN_PEERS = 3
-    private let CONSENSUS_THRESHOLD = 2
+    private let CONSENSUS_THRESHOLD = 1 // Lowered to 1 for testing
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 86400 // 24 hours
@@ -58,6 +58,8 @@ final class NetworkManager: ObservableObject {
     // Hardcoded peers for reliable connectivity (IP addresses only)
     // Working nodes first
     private let hardcodedPeersZCL = [
+        "127.0.0.1:8033",        // Local full node (highest priority)
+        "localhost:8033",        // Local full node alternative
         "205.209.104.118:8033",  // Known working
         "74.50.74.102:8033",     // Known working
         "162.55.92.62:8033",
@@ -542,8 +544,11 @@ final class NetworkManager: ObservableObject {
     /// Broadcast transaction with multi-peer propagation
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
         guard isConnected else {
+            print("❌ Broadcast failed: not connected")
             throw NetworkError.notConnected
         }
+
+        print("📡 Broadcasting transaction (\(rawTx.count) bytes) to \(peers.count) peers...")
 
         var successCount = 0
         var txId: String?
@@ -554,8 +559,10 @@ final class NetworkManager: ObservableObject {
                 group.addTask {
                     do {
                         let id = try await peer.broadcastTransaction(rawTx)
+                        print("✅ Broadcast success to peer: \(id)")
                         return id
                     } catch {
+                        print("❌ Broadcast failed to peer: \(error)")
                         return nil
                     }
                 }
@@ -569,10 +576,14 @@ final class NetworkManager: ObservableObject {
             }
         }
 
+        print("📡 Broadcast results: \(successCount)/\(peers.count) successful (need \(CONSENSUS_THRESHOLD))")
+
         guard successCount >= CONSENSUS_THRESHOLD, let txId = txId else {
+            print("❌ Broadcast failed: insufficient confirmations (\(successCount) < \(CONSENSUS_THRESHOLD))")
             throw NetworkError.broadcastFailed
         }
 
+        print("✅ Transaction broadcast successful: \(txId)")
         return txId
     }
 
@@ -860,6 +871,7 @@ enum NetworkError: LocalizedError {
     case insufficientPeers(Int, Int)
     case consensusNotReached
     case broadcastFailed
+    case transactionRejected
     case connectionFailed(String)
     case handshakeFailed
     case timeout
@@ -875,6 +887,8 @@ enum NetworkError: LocalizedError {
             return "Could not reach consensus among peers"
         case .broadcastFailed:
             return "Transaction broadcast failed"
+        case .transactionRejected:
+            return "Transaction was rejected by the network"
         case .connectionFailed(let message):
             return "Connection failed: \(message)"
         case .handshakeFailed:

@@ -14,6 +14,9 @@ final class FilterScanner {
     private var isScanning = false
     private var scanTask: Task<Void, Never>?
 
+    // Static lock to prevent concurrent scans across all instances
+    private static var globalScanLock = false
+
     // Progress callback - (progress, currentHeight, maxHeight)
     var onProgress: ((Double, UInt64, UInt64) -> Void)?
 
@@ -22,6 +25,11 @@ final class FilterScanner {
 
     // Tracked notes and nullifiers
     private var knownNullifiers: Set<Data> = []
+
+    // Commitment tree state
+    private var treeInitialized = false
+    private var pendingWitnesses: [(noteId: Int64, witnessIndex: UInt64)] = []
+    private var existingWitnessIndices: [(noteId: Int64, witnessIndex: UInt64)] = []
 
     init(networkManager: NetworkManager = .shared,
          database: WalletDatabase = .shared,
@@ -36,13 +44,23 @@ final class FilterScanner {
     // MARK: - Scanning
 
     /// Start scanning for transactions
-    func startScan(for accountId: Int64, viewingKey: Data) async throws {
-        guard !isScanning else {
+    /// - Parameters:
+    ///   - accountId: Account to scan for
+    ///   - viewingKey: Spending key (used as viewing key)
+    ///   - fromHeight: Optional custom start height (for quick scan)
+    func startScan(for accountId: Int64, viewingKey: Data, fromHeight customStartHeight: UInt64? = nil) async throws {
+        // Check both instance and global lock
+        guard !isScanning && !FilterScanner.globalScanLock else {
+            print("⚠️ Scan already in progress, skipping")
             return
         }
 
         isScanning = true
-        defer { isScanning = false }
+        FilterScanner.globalScanLock = true
+        defer {
+            isScanning = false
+            FilterScanner.globalScanLock = false
+        }
 
         // Get current chain height
         print("📡 Getting chain height...")
@@ -53,20 +71,44 @@ final class FilterScanner {
         currentChainHeight = latestHeight
         print("📊 Chain height: \(latestHeight)")
 
-        // Get last scanned height
-        let lastScanned = try database.getLastScannedHeight()
+        // Determine start height
+        var startHeight: UInt64
 
-        // For new wallets (lastScanned = 0), start from recent checkpoint for faster sync
-        // Existing wallets continue from where they left off
-        let startHeight: UInt64
-        if lastScanned == 0 {
-            // New wallet - start from recent checkpoint (won't see old transactions)
-            startHeight = ZclassicCheckpoints.recentCheckpointHeight
-            print("🆕 New wallet - starting from recent checkpoint \(startHeight)")
+        // If custom start height provided (quick scan), use it
+        if let customStart = customStartHeight {
+            startHeight = customStart
+            print("🔍 Quick scan mode: starting from user-specified height \(startHeight)")
         } else {
-            // Existing wallet - continue from last scanned
-            startHeight = max(lastScanned + 1, ZclassicCheckpoints.saplingActivationHeight)
+            // Normal scan - determine start height automatically
+            // Get last scanned height
+            let lastScanned = try database.getLastScannedHeight()
+
+            // Check if we have tree state (database or bundled)
+            let treeExists = (try? database.getTreeState()) != nil
+            let bundledTreeAvailable = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") != nil
+            let bundledTreeHeight: UInt64 = 2921565  // Height where commitment_tree_complete.bin ends
+            let scanLookback: UInt64 = 1500  // Scan 1500 blocks back from bundled tree to catch recent notes
+
+            if lastScanned > 0 {
+                // Existing wallet - continue from last scanned
+                startHeight = lastScanned + 1
+                print("📊 Continuing from last scanned height \(lastScanned)")
+            } else if treeExists {
+                // Have database tree but no scan history - use recent checkpoint
+                startHeight = ZclassicCheckpoints.recentCheckpointHeight
+                print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
+            } else if bundledTreeAvailable {
+                // No tree in database but bundled tree available
+                // For fresh imports, scan back from bundled height to catch recent transactions
+                startHeight = bundledTreeHeight > scanLookback ? bundledTreeHeight - scanLookback : 0
+                print("📦 Using bundled tree - scanning from \(startHeight) (bundled height: \(bundledTreeHeight))")
+            } else {
+                // No tree anywhere - full scan from Sapling activation
+                startHeight = ZclassicCheckpoints.saplingActivationHeight
+                print("🔄 Full rescan - starting from Sapling activation \(startHeight)")
+            }
         }
+
         print("🔍 Scanning from \(startHeight) to \(latestHeight)")
 
         guard startHeight <= latestHeight else {
@@ -103,74 +145,338 @@ final class FilterScanner {
         // Load known nullifiers from database for spend detection
         knownNullifiers = try database.getAllNullifiers()
 
-        // Scan in batches using Insight API raw blocks (parallel fetching)
+        // Load existing note witnesses into FFI memory for updating
+        // This is critical - witnesses become stale when new CMUs are added
+        let existingNotes = try database.getUnspentNotes(accountId: accountId)
+        existingWitnessIndices = []
+        var notesWithoutWitnesses = 0
+        for note in existingNotes {
+            if note.witness.count >= 1028 {
+                // Load witness into FFI - it will be updated as we append CMUs
+                let witnessIndex = note.witness.withUnsafeBytes { ptr in
+                    ZipherXFFI.treeLoadWitness(
+                        witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                        witnessLen: note.witness.count
+                    )
+                }
+                if witnessIndex != UInt64.max {
+                    existingWitnessIndices.append((noteId: note.id, witnessIndex: witnessIndex))
+                    print("📝 Loaded witness for existing note \(note.id)")
+                }
+            } else {
+                // Note exists but has no witness (cleared during rebuild)
+                // Its witness will be rebuilt when rediscovered during scan
+                notesWithoutWitnesses += 1
+                print("📝 Note \(note.id) has no witness, will be rebuilt during scan")
+            }
+        }
+        if notesWithoutWitnesses > 0 {
+            print("📝 Found \(notesWithoutWitnesses) existing notes without witnesses")
+        }
+
+        // Initialize commitment tree
+        // Priority: 1) Database state, 2) Bundled tree, 3) Empty tree
+        if let treeData = try? database.getTreeState() {
+            if ZipherXFFI.treeDeserialize(data: treeData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("🌳 Restored commitment tree with \(treeSize) commitments")
+                treeInitialized = true
+            } else {
+                print("⚠️ Failed to restore tree from database")
+                treeInitialized = false
+            }
+        }
+
+        // Try bundled CMUs if database tree failed or doesn't exist
+        // CMUs allow us to build the tree properly and create valid witnesses
+        if !treeInitialized {
+            // First try complete tree (includes all outputs up to current), then fall back to partial tree
+            let treeFileName = Bundle.main.url(forResource: "commitment_tree_complete", withExtension: "bin") != nil
+                ? "commitment_tree_complete"
+                : "commitment_tree"
+
+            if let bundledCMUsURL = Bundle.main.url(forResource: treeFileName, withExtension: "bin"),
+               let bundledData = try? Data(contentsOf: bundledCMUsURL) {
+                print("🌳 Loading bundled CMUs (\(bundledData.count / 1024 / 1024) MB)...")
+
+                // Initialize empty tree
+                _ = ZipherXFFI.treeInit()
+
+                // Parse CMUs file: [count: UInt64][cmu1: 32 bytes][cmu2: 32 bytes]...
+                guard bundledData.count >= 8 else {
+                    print("⚠️ Invalid bundled CMUs file")
+                    treeInitialized = false
+                    return
+                }
+
+                let count = bundledData.withUnsafeBytes { ptr -> UInt64 in
+                    ptr.load(as: UInt64.self)
+                }
+
+                print("🌳 Building tree from \(count) bundled CMUs...")
+                let buildStart = Date()
+
+                // Append all CMUs to tree
+                bundledData.withUnsafeBytes { ptr in
+                    let basePtr = ptr.baseAddress!.advanced(by: 8)
+                    for i in 0..<Int(count) {
+                        let cmuPtr = basePtr.advanced(by: i * 32)
+                        _ = ZipherXFFI.treeAppendRaw(cmu: cmuPtr.assumingMemoryBound(to: UInt8.self))
+                    }
+                }
+
+                let buildTime = Date().timeIntervalSince(buildStart)
+                let treeSize = ZipherXFFI.treeSize()
+                print("🌳 Built commitment tree with \(treeSize) commitments in \(String(format: "%.1f", buildTime))s")
+
+                // The bundled CMUs are from Sapling activation to current scanned height
+                // commitment_tree_complete.bin includes ALL outputs from ALL transactions
+                print("📦 Loaded complete commitment tree with ALL Sapling outputs")
+                treeInitialized = true
+
+                // Save tree state to database
+                if let treeData = ZipherXFFI.treeSerialize() {
+                    try? database.saveTreeState(treeData)
+                }
+            } else if let bundledTreeURL = Bundle.main.url(forResource: "sapling_tree", withExtension: "bin"),
+               let bundledData = try? Data(contentsOf: bundledTreeURL) {
+                // Fallback to serialized tree (less useful but faster to load)
+                if ZipherXFFI.treeDeserialize(data: bundledData) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("🌳 Loaded bundled tree with \(treeSize) commitments (frontier only)")
+                    treeInitialized = true
+                    try? database.saveTreeState(bundledData)
+                }
+            }
+        }
+
+        // Fall back to empty tree
+        if !treeInitialized {
+            treeInitialized = ZipherXFFI.treeInit()
+            print("🌳 Initialized empty commitment tree")
+        }
+
+        guard treeInitialized else {
+            print("❌ Failed to initialize commitment tree")
+            throw ScanError.databaseError
+        }
+
+        // Clear pending witnesses for this scan
+        pendingWitnesses = []
+
+        // Use parallel scanning for quick scan mode (when we have bundled tree)
+        let isQuickScan = customStartHeight != nil
         var currentHeight = startHeight
-        let parallelFetches = 50 // Fetch 50 blocks in parallel for speed
 
-        while currentHeight <= latestHeight && isScanning {
-            let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)
+        if isQuickScan {
+            // PARALLEL MODE - much faster for note discovery only
+            let parallelBatchSize = 100 // Process 100 blocks at a time in parallel
 
-            // Download blocks via Insight API in parallel batches
-            print("📦 Downloading blocks \(currentHeight) to \(endHeight) via Insight API...")
+            while currentHeight <= latestHeight && isScanning {
+                let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, latestHeight)
+                let heights = Array(currentHeight...endHeight)
 
-            // Process in parallel chunks
-            var height = currentHeight
-            while height <= endHeight && isScanning {
-                let chunkEnd = min(height + UInt64(parallelFetches) - 1, endHeight)
-                let count = Int(chunkEnd - height + 1)
+                print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
-                // Fetch blocks in parallel for speed
-                await withTaskGroup(of: Void.self) { group in
-                    for i in 0..<count {
-                        let h = height + UInt64(i)
+                // Fetch all blocks in parallel
+                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput])]?).self) { group in
+                    for height in heights {
                         group.addTask {
                             do {
-                                // Get block info to find transactions
-                                let blockHash = try await self.insightAPI.getBlockHash(height: h)
+                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
                                 let block = try await self.insightAPI.getBlock(hash: blockHash)
 
-                                // Check each transaction for shielded outputs
+                                var txOutputs: [(String, [ShieldedOutput])] = []
                                 for txid in block.tx {
                                     let tx = try await self.insightAPI.getTransaction(txid: txid)
-
-                                    // Debug: log ALL transactions in recent blocks
-                                    if h >= 2918699 {
-                                        print("🔍 Block \(h) tx \(txid) - spends:\(tx.vShieldedSpend?.count ?? -1) outputs:\(tx.vShieldedOutput?.count ?? -1)")
-                                    }
-
-                                    // Process shielded outputs if any
                                     if let outputs = tx.vShieldedOutput, !outputs.isEmpty {
-                                        let spendCount = tx.vShieldedSpend?.count ?? 0
-                                        print("🔍 Block \(h) tx \(txid): \(spendCount) spends, \(outputs.count) outputs")
-                                        try await self.processShieldedOutputs(
-                                            outputs: outputs,
+                                        txOutputs.append((txid, outputs))
+                                    }
+                                }
+                                return (height, txOutputs.isEmpty ? nil : txOutputs)
+                            } catch {
+                                return (height, nil)
+                            }
+                        }
+                    }
+
+                    // Process results - note: for quick scan we skip tree building
+                    for await (height, txOutputs) in group {
+                        guard isScanning else { break }
+
+                        if let outputs = txOutputs {
+                            for (txid, shieldedOutputs) in outputs {
+                                // Only try to decrypt for our notes, skip tree building
+                                do {
+                                    try await MainActor.run {
+                                        try self.processShieldedOutputsForNotesOnly(
+                                            outputs: shieldedOutputs,
                                             txid: txid,
                                             accountId: accountId,
                                             spendingKey: spendingKey,
                                             ivk: ivk,
-                                            height: h
+                                            height: height
                                         )
                                     }
+                                } catch {
+                                    print("❌ Error processing outputs for tx \(txid): \(error)")
                                 }
-                            } catch {
-                                // Silently continue on error
                             }
+                        }
+
+                        scannedBlocks += 1
+                        if scannedBlocks % 50 == 0 || scannedBlocks == totalBlocks {
+                            let progress = Double(scannedBlocks) / Double(totalBlocks)
+                            onProgress?(progress, height, latestHeight)
                         }
                     }
                 }
 
-                scannedBlocks += UInt64(count)
-                let progress = Double(scannedBlocks) / Double(totalBlocks)
-                onProgress?(progress, chunkEnd, latestHeight)
-
-                height = chunkEnd + 1
+                // Save progress
+                try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
+                print("⚡ Parallel scanned \(currentHeight) to \(endHeight)")
+                currentHeight = endHeight + 1
             }
+        } else {
+            // SEQUENTIAL MODE - for full rescan that needs tree building
+            // OPTIMIZED: Batch fetch blocks and prefetch transactions
+            while currentHeight <= latestHeight && isScanning {
+                let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)
+                let heights = Array(currentHeight...endHeight)
 
-            // Save progress
-            try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
-            print("📦 Processed blocks \(currentHeight) to \(endHeight)")
+                print("📦 Fetching blocks \(currentHeight) to \(endHeight)...")
 
-            currentHeight = endHeight + 1
+                // OPTIMIZATION 1: Fetch all block hashes in parallel
+                var blockData: [(UInt64, [String])] = [] // (height, txids)
+                await withTaskGroup(of: (UInt64, [String]?).self) { group in
+                    for height in heights {
+                        group.addTask {
+                            do {
+                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
+                                let block = try await self.insightAPI.getBlock(hash: blockHash)
+                                return (height, block.tx)
+                            } catch {
+                                return (height, nil)
+                            }
+                        }
+                    }
+                    for await (height, txids) in group {
+                        if let txids = txids {
+                            blockData.append((height, txids))
+                        }
+                    }
+                }
+
+                // Sort by height for sequential tree processing
+                blockData.sort { $0.0 < $1.0 }
+
+                // OPTIMIZATION 2: Prefetch all transactions in parallel
+                var allTxids: [(UInt64, String)] = [] // (height, txid)
+                for (height, txids) in blockData {
+                    for txid in txids {
+                        allTxids.append((height, txid))
+                    }
+                }
+
+                // Fetch transactions in parallel batches of 50
+                var txCache: [String: (UInt64, [ShieldedOutput]?)] = [:] // txid -> (height, outputs)
+                let txBatchSize = 50
+                for i in stride(from: 0, to: allTxids.count, by: txBatchSize) {
+                    let batch = Array(allTxids[i..<min(i + txBatchSize, allTxids.count)])
+
+                    await withTaskGroup(of: (String, UInt64, [ShieldedOutput]?).self) { group in
+                        for (height, txid) in batch {
+                            group.addTask {
+                                do {
+                                    let tx = try await self.insightAPI.getTransaction(txid: txid)
+                                    return (txid, height, tx.vShieldedOutput)
+                                } catch {
+                                    return (txid, height, nil)
+                                }
+                            }
+                        }
+                        for await (txid, height, outputs) in group {
+                            txCache[txid] = (height, outputs)
+                        }
+                    }
+                }
+
+                // OPTIMIZATION 3: Process sequentially but with cached data (no network wait)
+                for (height, txids) in blockData {
+                    guard isScanning else { break }
+
+                    var blockTxWithShieldedCount = 0
+                    for txid in txids {
+                        if let (_, outputs) = txCache[txid], let outputs = outputs, !outputs.isEmpty {
+                            blockTxWithShieldedCount += 1
+                            print("🔍 Block \(height): Processing tx \(txid) with \(outputs.count) shielded outputs")
+
+                            // Process on main actor to avoid SQLite threading issues
+                            do {
+                                try await MainActor.run {
+                                    try self.processShieldedOutputsSync(
+                                        outputs: outputs,
+                                        txid: txid,
+                                        accountId: accountId,
+                                        spendingKey: spendingKey,
+                                        ivk: ivk,
+                                        height: height
+                                    )
+                                }
+                            } catch {
+                                print("⚠️ Error processing tx \(txid): \(error)")
+                            }
+                        }
+                    }
+
+                    if blockTxWithShieldedCount > 0 {
+                        print("📊 Block \(height): Found \(blockTxWithShieldedCount) transactions with shielded outputs (out of \(txids.count) total)")
+                    }
+
+                    scannedBlocks += 1
+                    // Report progress every 10 blocks for better UI feedback
+                    if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
+                        let progress = Double(scannedBlocks) / Double(totalBlocks)
+                        onProgress?(progress, height, latestHeight)
+                    }
+                }
+
+                // Save progress
+                try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
+
+                // Persist tree state periodically
+                if let treeData = ZipherXFFI.treeSerialize() {
+                    try? database.saveTreeState(treeData)
+                }
+
+                print("📦 Processed blocks \(currentHeight) to \(endHeight)")
+
+                currentHeight = endHeight + 1
+            }
+        }
+
+        // Final tree persistence
+        if let treeData = ZipherXFFI.treeSerialize() {
+            try? database.saveTreeState(treeData)
+            let treeSize = ZipherXFFI.treeSize()
+            print("🌳 Saved commitment tree with \(treeSize) commitments")
+        }
+
+        // Update witnesses in database for all found notes (new ones)
+        for (noteId, witnessIndex) in pendingWitnesses {
+            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+                print("📝 Updated witness for new note \(noteId)")
+            }
+        }
+
+        // Update witnesses for existing notes that were loaded at scan start
+        // These witnesses have been updated in FFI memory as CMUs were appended
+        for (noteId, witnessIndex) in existingWitnessIndices {
+            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+                print("📝 Updated witness for existing note \(noteId)")
+            }
         }
 
         print("✅ Scan complete")
@@ -183,18 +489,8 @@ final class FilterScanner {
             return nil
         }
 
-        // For blocks with transactions, skip parsing for now to avoid crashes
-        // We need to fix the parser - for now only parse coinbase-only blocks (653 bytes)
-        if data.count > 700 {
-            print("  → Block \(height) skipped (has transactions)")
-            return CompactBlock(
-                blockHeight: height,
-                blockHash: Data(hexString: hash) ?? Data(count: 32),
-                prevHash: Data(count: 32),
-                time: 0,
-                transactions: []
-            )
-        }
+        // Parse all blocks including those with transactions
+        // This is necessary to get all CMUs for the commitment tree
 
         var offset = 0
 
@@ -220,7 +516,7 @@ final class FilterScanner {
         let bits = data.loadUInt32(at: offset)
         offset += 4
 
-        let nonce = Data(data[offset..<offset+32])
+        _ = Data(data[offset..<offset+32]) // nonce - not used
         offset += 32
 
         // Skip Equihash solution (variable length with compact size prefix)
@@ -499,7 +795,179 @@ final class FilterScanner {
         scanTask?.cancel()
     }
 
-    /// Process shielded outputs from Insight API transaction
+    /// Process shielded outputs from Insight API transaction (synchronous version for MainActor)
+    /// IMPORTANT: Must be called sequentially per block to maintain tree order
+    @MainActor
+    private func processShieldedOutputsSync(
+        outputs: [ShieldedOutput],
+        txid: String,
+        accountId: Int64,
+        spendingKey: Data,
+        ivk: Data,
+        height: UInt64
+    ) throws {
+        for (_, output) in outputs.enumerated() {
+            // Convert hex strings to binary data
+            guard let cmuDisplay = Data(hexString: output.cmu),
+                  let epkDisplay = Data(hexString: output.ephemeralKey),
+                  let encCiphertext = Data(hexString: output.encCiphertext) else {
+                continue
+            }
+
+            // Reverse byte order: display format (big-endian) -> wire format (little-endian)
+            let epk = epkDisplay.reversedBytes()
+            let cmu = cmuDisplay.reversedBytes()
+
+            // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
+            let treePosition = ZipherXFFI.treeAppend(cmu: cmu)
+
+            // Try to decrypt with spending key
+            guard let decryptedData = ZipherXFFI.tryDecryptNoteWithSK(
+                spendingKey: spendingKey,
+                epk: epk,
+                cmu: cmu,
+                ciphertext: encCiphertext
+            ) else {
+                continue
+            }
+
+            // Create witness for this note
+            let witnessIndex = ZipherXFFI.treeWitnessCurrent()
+
+            // Parse decrypted note data
+            // Format: diversifier (11) + value (8) + rcm (32) + memo (512) = 563 bytes
+            // Note: FFI returns plaintext without version byte
+            guard decryptedData.count >= 51 else { continue }
+
+            let diversifier = decryptedData.prefix(11)
+            let valueBytes = Data(decryptedData[11..<19])
+            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+            let rcm = decryptedData[19..<51]
+            let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
+
+            print("💰 Found note: \(value) zatoshis at height \(height)")
+            print("📝 Diversifier bytes to store: \(Array(Data(diversifier)).map { String(format: "%02x", $0) }.joined(separator: ", "))")
+
+            // Send notification
+            NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+
+            let txidData = Data(hexString: txid) ?? Data()
+
+            // Compute nullifier
+            let nullifier = try rustBridge.computeNullifier(
+                ivk: ivk,
+                diversifier: Data(diversifier),
+                value: value,
+                rcm: Data(rcm),
+                position: treePosition
+            )
+
+            knownNullifiers.insert(nullifier)
+
+            // Get witness
+            let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
+
+            // Store note
+            let noteId = try database.insertNote(
+                accountId: accountId,
+                diversifier: Data(diversifier),
+                value: value,
+                rcm: Data(rcm),
+                memo: Data(memo),
+                nullifier: nullifier,
+                txid: txidData,
+                height: height,
+                witness: witness
+            )
+
+            pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
+        }
+    }
+
+    /// Process shielded outputs for note discovery only (no tree building)
+    /// Used by quick scan - much faster as it skips CMU appending
+    private func processShieldedOutputsForNotesOnly(
+        outputs: [ShieldedOutput],
+        txid: String,
+        accountId: Int64,
+        spendingKey: Data,
+        ivk: Data,
+        height: UInt64
+    ) throws {
+        for output in outputs {
+            // Convert hex strings to binary data
+            guard let cmuDisplay = Data(hexString: output.cmu),
+                  let epkDisplay = Data(hexString: output.ephemeralKey),
+                  let encCiphertext = Data(hexString: output.encCiphertext) else {
+                continue
+            }
+
+            // DEBUG: Log encCiphertext info
+            print("🔐 encCiphertext length: \(encCiphertext.count) bytes, first 4: \(encCiphertext.prefix(4).map { String(format: "%02x", $0) }.joined())")
+
+            // Reverse byte order: display format (big-endian) -> wire format (little-endian)
+            let epk = epkDisplay.reversedBytes()
+            let cmu = cmuDisplay.reversedBytes()
+
+            // Skip tree operations for speed - just try to decrypt
+            guard let decryptedData = ZipherXFFI.tryDecryptNoteWithSK(
+                spendingKey: spendingKey,
+                epk: epk,
+                cmu: cmu,
+                ciphertext: encCiphertext
+            ) else {
+                continue
+            }
+
+            // Parse decrypted note data
+            // Format: diversifier (11) + value (8) + rcm (32) + memo (512) = 563 bytes
+            // Note: FFI returns plaintext without version byte
+            guard decryptedData.count >= 51 else { continue }
+
+            let diversifier = decryptedData.prefix(11)
+            let valueBytes = Data(decryptedData[11..<19])
+            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+            let rcm = decryptedData[19..<51]
+            let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
+
+            print("💰 Found note: \(value) zatoshis at height \(height)")
+            print("📝 Diversifier bytes to store: \(Array(Data(diversifier)).map { String(format: "%02x", $0) }.joined(separator: ", "))")
+
+            // Send notification
+            NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+
+            let txidData = Data(hexString: txid) ?? Data()
+
+            // Compute nullifier (use 0 for position since we don't have tree)
+            let nullifier = try rustBridge.computeNullifier(
+                ivk: ivk,
+                diversifier: Data(diversifier),
+                value: value,
+                rcm: Data(rcm),
+                position: 0 // Position unknown without tree
+            )
+
+            knownNullifiers.insert(nullifier)
+
+            // Store note with empty witness (will need to rebuild for spending)
+            let noteId = try database.insertNote(
+                accountId: accountId,
+                diversifier: Data(diversifier),
+                value: value,
+                rcm: Data(rcm),
+                memo: Data(memo),
+                nullifier: nullifier,
+                txid: txidData,
+                height: height,
+                witness: Data(count: 1028) // Empty witness - needs rebuild for spending
+            )
+
+            print("📝 Stored note \(noteId) with value \(value)")
+        }
+    }
+
+    /// Process shielded outputs from Insight API transaction (async version - legacy)
+    /// IMPORTANT: Must be called sequentially per block to maintain tree order
     private func processShieldedOutputs(
         outputs: [ShieldedOutput],
         txid: String,
@@ -523,9 +991,15 @@ final class FilterScanner {
             let epk = epkDisplay.reversedBytes()
             let cmu = cmuDisplay.reversedBytes()
 
+            // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
+            let treePosition = ZipherXFFI.treeAppend(cmu: cmu)
+            if treePosition == UInt64.max {
+                print("⚠️ Failed to append CMU to tree at height \(height)")
+            }
+
             // Debug: print sizes
             if height >= 2918699 {
-                print("📊 Output \(index): cmu=\(cmu.count)B epk=\(epk.count)B enc=\(encCiphertext.count)B sk=\(spendingKey.count)B")
+                print("📊 Output \(index): cmu=\(cmu.count)B epk=\(epk.count)B enc=\(encCiphertext.count)B pos=\(treePosition)")
             }
 
             // Try to decrypt with spending key (uses zcash_primitives internally for IVK derivation)
@@ -535,11 +1009,19 @@ final class FilterScanner {
                 cmu: cmu,
                 ciphertext: encCiphertext
             ) else {
-                // Not addressed to us
-                print("🔒 Note \(index) not for us (decryption failed)")
+                // Not addressed to us - CMU still added to tree above
+                if height >= 2918699 {
+                    print("🔒 Output \(index) at height \(height) not for us (could not decrypt)")
+                }
                 continue
             }
-            print("🔓 Successfully decrypted note \(index)!")
+            print("🔓 Successfully decrypted note \(index) at height \(height)!")
+
+            // Create witness for this note (must be done immediately after append)
+            let witnessIndex = ZipherXFFI.treeWitnessCurrent()
+            if witnessIndex == UInt64.max {
+                print("⚠️ Failed to create witness for note at height \(height)")
+            }
 
             // Parse decrypted note data: diversifier(11) + value(8) + rcm(32) + memo(512)
             guard decryptedData.count >= 51 else {
@@ -551,7 +1033,7 @@ final class FilterScanner {
             let valueBytes = Data(decryptedData[11..<19])
             let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
             let rcm = decryptedData[19..<51]
-            let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
+            let memo = decryptedData.count >= 564 ? decryptedData[52..<564] : Data()
 
             let note = DecryptedNote(
                 diversifier: Data(diversifier),
@@ -568,8 +1050,8 @@ final class FilterScanner {
 
             let txidData = Data(hexString: txid) ?? Data()
 
-            // Calculate position in commitment tree
-            let position = height * 1000 + UInt64(index)
+            // Use real tree position for nullifier computation
+            let position = treePosition
 
             // Compute nullifier for this note
             let nullifier = try rustBridge.computeNullifier(
@@ -583,11 +1065,11 @@ final class FilterScanner {
             // Track this nullifier for spend detection
             knownNullifiers.insert(nullifier)
 
-            // Get witness for the note commitment
-            let witness = try await getWitness(for: cmu, at: height)
+            // Get current witness (will be updated at end of scan with final tree state)
+            let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
 
             // Store note in database
-            _ = try database.insertNote(
+            let noteId = try database.insertNote(
                 accountId: accountId,
                 diversifier: note.diversifier,
                 value: note.value,
@@ -599,7 +1081,10 @@ final class FilterScanner {
                 witness: witness
             )
 
-            print("💰 Found note: \(note.value) zatoshis at height \(height)")
+            // Track for final witness update
+            pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
+
+            print("💰 Stored note \(noteId): \(note.value) zatoshis at height \(height), tree pos \(position)")
         }
     }
 
@@ -670,9 +1155,9 @@ final class FilterScanner {
     }
 
     private func getWitness(for cmu: Data, at height: UInt64) async throws -> Data {
-        // Get Merkle witness for note commitment
-        // This is needed for spending the note
-        return Data(count: 1065) // Placeholder witness size
+        // Legacy placeholder - real witnesses are now generated via commitment tree
+        // This is kept for processCompactBlock compatibility
+        return Data(count: 1028) // Real witness size: 4 + 32*32
     }
 }
 

@@ -12,11 +12,11 @@ use bech32::{ToBase32, FromBase32, Variant};
 use zcash_primitives::{
     consensus::{Parameters, MainNetwork, BlockHeight, NetworkUpgrade},
     sapling::{
-        keys::FullViewingKey,
+        keys::{FullViewingKey, OutgoingViewingKey},
         Diversifier, PaymentAddress,
         value::NoteValue,
         Rseed,
-        note_encryption::{try_sapling_note_decryption, PreparedIncomingViewingKey, SaplingDomain},
+        note_encryption::{try_sapling_note_decryption, try_sapling_output_recovery, PreparedIncomingViewingKey, SaplingDomain},
     },
     zip32::{ChildIndex, sapling::ExtendedSpendingKey},
     transaction::{
@@ -29,7 +29,7 @@ use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput, ENC_CIPHERTEXT_SI
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
 use chacha20poly1305::aead::generic_array::GenericArray;
 use incrementalmerkletree::{MerklePath, Position, frontier::CommitmentTree, witness::IncrementalWitness, Hashable};
-use zcash_primitives::merkle_tree::{read_commitment_tree, write_commitment_tree, HashSer};
+use zcash_primitives::merkle_tree::{read_commitment_tree, write_commitment_tree, read_incremental_witness, write_incremental_witness, HashSer};
 use zcash_proofs::prover::LocalTxProver;
 use group::{GroupEncoding, cofactor::CofactorGroup, Curve};
 use ff::{PrimeField, Field};
@@ -551,10 +551,10 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     let epk_point = epk_point_opt.unwrap();
 
     // Manual KDF to debug decryption
-    // ka = [8] * (ivk * epk) - matches zcash_primitives spec.rs line 135
-    // The library does: (b * sk).clear_cofactor()
-    let ka = (epk_point * ivk.0).clear_cofactor();
-    let ka_bytes = jubjub::ExtendedPoint::from(ka).to_affine().to_bytes();
+    // Clear cofactor on EPK first, then multiply by IVK (matches working test)
+    let epk_cleared = epk_point.clear_cofactor();
+    let ka = jubjub::ExtendedPoint::from(epk_cleared) * ivk.0;
+    let ka_bytes = ka.to_affine().to_bytes();
     eprintln!("DEBUG: KA (shared secret) first 4 bytes: {:02x?}", &ka_bytes[0..4]);
 
     // Also print full EPK and IVK for verification
@@ -629,6 +629,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
             // Successfully decrypted! Pack the result
             // Format: diversifier(11) + value(8) + rcm(32) + memo(512)
             let diversifier = address.diversifier().0;
+            eprintln!("DEBUG: Returned diversifier from zcash_primitives: {:02x?}", diversifier);
             let value: u64 = note.value().inner();
             let rcm = match note.rseed() {
                 Rseed::BeforeZip212(rcm) => rcm.to_repr(),
@@ -836,6 +837,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     note_value: u64,
     note_rcm: *const u8,
     note_diversifier: *const u8,
+    chain_height: u64,
     tx_out: *mut u8,
     tx_out_len: *mut usize,
 ) -> bool {
@@ -889,9 +891,18 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     let mut div_bytes = [0u8; 11];
     div_bytes.copy_from_slice(div_slice);
     let diversifier = Diversifier(div_bytes);
+    eprintln!("DEBUG: Received diversifier for spending: {:02x?}", div_bytes);
 
-    // Get sender's address
-    let (_, from_addr) = extsk.default_address();
+    // Get the address that received this note using the note's diversifier
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("❌ Invalid diversifier for note address");
+            eprintln!("DEBUG: Expected valid diversifier like [c7, 99, e1, e4, 37, 90, fa, a5, 04, bd, df]");
+            return false;
+        }
+    };
 
     // Calculate fee
     let fee = 10000u64;
@@ -902,64 +913,59 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         return false;
     }
 
-    // Create note to spend
+    // Create note to spend using the diversifier's address
     let note = zcash_primitives::sapling::Note::from_parts(
-        from_addr,
+        note_addr,
         NoteValue::from_raw(note_value),
         Rseed::BeforeZip212(rcm),
     );
 
-    // Deserialize merkle path from witness data
-    // Format: 4 bytes position (little endian) + 32 * 32 bytes for path elements
-    if witness_slice.len() < 4 + 32 * 32 {
-        eprintln!("❌ Witness data too short: {} bytes", witness_slice.len());
-        return false;
-    }
-
-    let position = u32::from_le_bytes(witness_slice[0..4].try_into().unwrap());
-    let mut path_hashes = Vec::with_capacity(32);
-
-    for i in 0..32 {
-        let start = 4 + i * 32;
-        let end = start + 32;
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&witness_slice[start..end]);
-
-        // Convert to Node (Sapling commitment tree node)
-        let scalar = match Option::<bls12_381::Scalar>::from(bls12_381::Scalar::from_repr(hash)) {
-            Some(s) => s,
-            None => {
-                eprintln!("❌ Invalid merkle path scalar at index {}", i);
+    // Deserialize the IncrementalWitness from standard format
+    let mut reader = std::io::Cursor::new(witness_slice);
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("❌ Failed to deserialize witness: {:?}", e);
                 return false;
             }
         };
-        let node = zcash_primitives::sapling::Node::from_scalar(scalar);
-        path_hashes.push(node);
-    }
 
-    let merkle_path = match MerklePath::from_parts(path_hashes, Position::from(position as u64)) {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("❌ Failed to create merkle path");
+    // Get the merkle path from the witness
+    let merkle_path = match witness.path() {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ Failed to get merkle path from witness");
             return false;
         }
     };
 
+    let position = u64::from(witness.tip_position()) as u32;
+
     // Create transaction builder
-    // Use a recent block height for Sapling
-    let target_height = BlockHeight::from_u32(2900000);
+    // Use current chain height for proper expiry calculation
+    let target_height = BlockHeight::from_u32(chain_height as u32);
     let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Debug: print note details
+    eprintln!("🔍 Note value: {}", note_value);
+    eprintln!("🔍 Note position: {}", position);
+    eprintln!("🔍 Diversifier: {:02x?}", div_bytes);
+    eprintln!("🔍 Witness length: {} bytes", witness_len);
+    eprintln!("🔍 RCM: {:02x?}", &rcm_bytes[..8]);
 
     // Add spend
     if let Err(e) = builder.add_sapling_spend(
         extsk.clone(),
         diversifier,
-        note,
+        note.clone(),
         merkle_path,
     ) {
         eprintln!("❌ Failed to add spend: {:?}", e);
+        eprintln!("❌ Error details: This usually means the witness/merkle path doesn't match the tree state");
         return false;
     }
+    eprintln!("✅ Spend added successfully");
 
     // Prepare memo
     let memo_bytes = if memo.is_null() {
@@ -991,9 +997,11 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     if change > 0 {
         let change_memo = MemoBytes::empty();
         let change_amount = Amount::from_i64(change as i64).unwrap();
+        // Send change back to sender's default address
+        let (_, change_addr) = extsk.default_address();
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
-            from_addr,
+            change_addr,
             change_amount,
             change_memo,
         ) {
@@ -1003,10 +1011,15 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     }
 
     // Build the transaction with proofs
+    eprintln!("🔨 Building transaction with prover...");
     let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Failed to build transaction: {:?}", e);
+            eprintln!("❌ This error typically occurs when:");
+            eprintln!("   1. The merkle witness doesn't match the note position");
+            eprintln!("   2. The Sapling parameters are invalid or corrupted");
+            eprintln!("   3. The note commitment doesn't exist at the given position");
             return false;
         }
     };
@@ -1229,6 +1242,41 @@ pub extern "C" fn zipherx_tree_witness_current() -> u64 {
     index as u64
 }
 
+/// Load a witness from serialized data into the WITNESSES array
+/// This allows us to track and update previously saved witnesses
+/// Returns the witness index or u64::MAX on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_witness(
+    witness_data: *const u8,
+    witness_len: usize,
+) -> u64 {
+    if witness_len < 1028 {
+        eprintln!("❌ Witness data too short: {} bytes", witness_len);
+        return u64::MAX;
+    }
+
+    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+
+    // Deserialize the IncrementalWitness directly
+    // Format: serialized IncrementalWitness (variable length)
+    let mut reader = std::io::Cursor::new(witness_slice);
+
+    let witness = match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("❌ Failed to deserialize witness: {:?}", e);
+            return u64::MAX;
+        }
+    };
+
+    let mut witnesses_guard = WITNESSES.lock().unwrap();
+    let index = witnesses_guard.len();
+    witnesses_guard.push(witness);
+
+    eprintln!("📝 Loaded witness at index {}", index);
+    index as u64
+}
+
 /// Get the root of the tree
 /// root_out: 32-byte output buffer for the root
 #[no_mangle]
@@ -1245,6 +1293,64 @@ pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     true
+}
+
+/// Update a witness with a new CMU
+/// This is used to keep witnesses current as new notes are added
+/// witness_data: Current witness data (1028 bytes)
+/// cmu: New commitment to append (32 bytes)
+/// witness_out: Output buffer for updated witness (1028 bytes)
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_update(
+    witness_data: *const u8,
+    witness_len: usize,
+    cmu: *const u8,
+    witness_out: *mut u8,
+) -> bool {
+    if witness_len < 1028 {
+        return false;
+    }
+
+    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+    let cmu_slice = slice::from_raw_parts(cmu, 32);
+
+    // Parse position from witness
+    let position = u32::from_le_bytes(witness_slice[0..4].try_into().unwrap());
+
+    // Parse CMU as node
+    let mut cmu_bytes = [0u8; 32];
+    cmu_bytes.copy_from_slice(cmu_slice);
+    let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+        Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+        None => return false,
+    };
+
+    // Parse merkle path from witness
+    let mut path_hashes = Vec::with_capacity(32);
+    for i in 0..32 {
+        let start = 4 + i * 32;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&witness_slice[start..start+32]);
+        let scalar = match bls12_381::Scalar::from_repr(hash).into() {
+            Some(s) => s,
+            None => return false,
+        };
+        path_hashes.push(zcash_primitives::sapling::Node::from_scalar(scalar));
+    }
+
+    // Create incremental witness from path
+    // Note: This is a simplified update - for a full implementation we'd need
+    // to properly reconstruct the IncrementalWitness and call append()
+    // For now, we'll update the path based on the new leaf position
+
+    // The witness needs the IncrementalWitness::append method which requires
+    // the full witness state. Since we only have the path, we can't easily update.
+    //
+    // The proper solution is to keep witnesses in memory and update them during scan.
+    // For now, return false to indicate this needs the full witness updating approach.
+
+    false
 }
 
 /// Get witness data for a specific witness index
@@ -1265,39 +1371,26 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
         }
     };
 
-    // Get merkle path from witness
-    let path = match witness.path() {
-        Some(p) => p,
-        None => {
-            eprintln!("❌ Failed to get path from witness");
-            return false;
-        }
-    };
-
-    // Serialize witness
-    // Format: 4 bytes position (little endian) + 32 * 32 bytes for path elements
-    let position = u64::from(witness.tip_position()) as u32;
-    let pos_bytes = position.to_le_bytes();
-    std::ptr::copy_nonoverlapping(pos_bytes.as_ptr(), witness_out, 4);
-
-    // Get path hashes
-    let path_hashes = path.path_elems();
-
-    for (i, node) in path_hashes.iter().enumerate() {
-        let mut node_bytes = Vec::new();
-        node.write(&mut node_bytes).unwrap();
-        std::ptr::copy_nonoverlapping(
-            node_bytes.as_ptr(),
-            witness_out.add(4 + i * 32),
-            32
-        );
+    // Serialize the IncrementalWitness using zcash standard format
+    let mut serialized = Vec::new();
+    if zcash_primitives::merkle_tree::write_incremental_witness(witness, &mut serialized).is_err() {
+        eprintln!("❌ Failed to serialize witness");
+        return false;
     }
 
-    // Pad remaining slots with zeros if path is shorter than 32
-    for i in path_hashes.len()..32 {
-        std::ptr::write_bytes(witness_out.add(4 + i * 32), 0, 32);
+    // Copy to output buffer (must be at least 1028 bytes)
+    if serialized.len() > 1028 {
+        eprintln!("❌ Serialized witness too large: {} bytes", serialized.len());
+        return false;
     }
 
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_out, serialized.len());
+    // Zero-pad remaining bytes
+    if serialized.len() < 1028 {
+        std::ptr::write_bytes(witness_out.add(serialized.len()), 0, 1028 - serialized.len());
+    }
+
+    eprintln!("📝 Serialized witness: {} bytes", serialized.len());
     true
 }
 
@@ -1380,3 +1473,247 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
 
     true
 }
+
+/// Load tree from raw CMUs file format
+/// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
+    data: *const u8,
+    data_len: usize,
+) -> bool {
+    if data_len < 8 {
+        eprintln!("❌ Data too short for CMU file");
+        return false;
+    }
+
+    let bytes = slice::from_raw_parts(data, data_len);
+
+    // Read count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if data_len < expected_len {
+        eprintln!("❌ Data too short: expected {} bytes for {} CMUs, got {}", expected_len, count, data_len);
+        return false;
+    }
+
+    eprintln!("📦 Loading {} CMUs into tree...", count);
+
+    // Initialize empty tree
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+
+    // Append all CMUs
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // Parse as Node
+        let node = match zcash_primitives::sapling::Node::read(cmu_bytes) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("❌ Failed to parse CMU at position {}: {:?}", i, e);
+                return false;
+            }
+        };
+
+        // Append to tree
+        if tree.append(node).is_err() {
+            eprintln!("❌ Failed to append CMU at position {}", i);
+            return false;
+        }
+
+        if i > 0 && i % 100000 == 0 {
+            eprintln!("   Progress: {}/{}", i, count);
+        }
+    }
+
+    // Store in global
+    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    *pos_guard = count;
+
+    eprintln!("✅ Tree loaded with {} commitments", count);
+
+    true
+}
+
+// =============================================================================
+// OVK Output Recovery (for viewing sent transactions)
+// =============================================================================
+
+/// Try to recover a sent note using the outgoing viewing key
+/// This allows the sender to see what they sent
+///
+/// Parameters:
+/// - ovk: 32-byte outgoing viewing key
+/// - cv: 32-byte value commitment
+/// - cmu: 32-byte note commitment
+/// - epk: 32-byte ephemeral public key
+/// - enc_ciphertext: 580-byte encrypted ciphertext
+/// - out_ciphertext: 80-byte output ciphertext
+/// - output: Buffer for result (at least 620 bytes: 11 div + 32 pk_d + 8 value + 32 rcm + 512 memo + padding)
+///
+/// Returns: Length of output on success, 0 on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
+    ovk: *const u8,
+    cv: *const u8,
+    cmu: *const u8,
+    epk: *const u8,
+    enc_ciphertext: *const u8,
+    out_ciphertext: *const u8,
+    output: *mut u8,
+) -> usize {
+    use zcash_primitives::sapling::value::ValueCommitment;
+
+    // Parse OVK
+    let ovk_bytes = slice::from_raw_parts(ovk, 32);
+    let ovk = OutgoingViewingKey(ovk_bytes.try_into().unwrap());
+
+    // Parse value commitment (cv)
+    let cv_bytes: [u8; 32] = slice::from_raw_parts(cv, 32).try_into().unwrap();
+    let cv = match ValueCommitment::from_bytes_not_small_order(&cv_bytes).into() {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    // Parse cmu
+    let cmu_bytes: [u8; 32] = slice::from_raw_parts(cmu, 32).try_into().unwrap();
+    let cmu = match zcash_primitives::sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes).into() {
+        Some(c) => c,
+        None => return 0,
+    };
+
+    // Parse EPK
+    let epk_bytes: [u8; 32] = slice::from_raw_parts(epk, 32).try_into().unwrap();
+    let epk = EphemeralKeyBytes(epk_bytes);
+
+    // Get ciphertexts
+    let enc = slice::from_raw_parts(enc_ciphertext, 580);
+    let out = slice::from_raw_parts(out_ciphertext, 80);
+
+    let mut enc_arr = [0u8; 580];
+    enc_arr.copy_from_slice(enc);
+    let mut out_arr = [0u8; 80];
+    out_arr.copy_from_slice(out);
+
+    // Create a custom output structure that implements ShieldedOutput
+    struct RecoveryOutput {
+        cv: ValueCommitment,
+        cmu: zcash_primitives::sapling::note::ExtractedNoteCommitment,
+        epk: EphemeralKeyBytes,
+        enc: [u8; 580],
+        out: [u8; 80],
+    }
+
+    impl ShieldedOutput<SaplingDomain<ZclassicNetwork>, 580> for RecoveryOutput {
+        fn ephemeral_key(&self) -> EphemeralKeyBytes {
+            self.epk.clone()
+        }
+        fn cmstar_bytes(&self) -> [u8; 32] {
+            self.cmu.to_bytes()
+        }
+        fn enc_ciphertext(&self) -> &[u8; 580] {
+            &self.enc
+        }
+    }
+
+    // Also need to implement for output recovery which needs cv and out_ciphertext
+    impl RecoveryOutput {
+        fn cv(&self) -> &ValueCommitment {
+            &self.cv
+        }
+        fn out_ciphertext(&self) -> &[u8; 80] {
+            &self.out
+        }
+    }
+
+    let recovery_output = RecoveryOutput {
+        cv,
+        cmu,
+        epk,
+        enc: enc_arr,
+        out: out_arr,
+    };
+
+    // Use a recent height for recovery
+    let height = BlockHeight::from_u32(2900000);
+
+    // Use try_sapling_output_recovery_with_ovk which takes the components directly
+    let domain = SaplingDomain::for_height(ZclassicNetwork, height);
+
+    match zcash_note_encryption::try_output_recovery_with_ovk(
+        &domain,
+        &ovk,
+        &recovery_output,
+        recovery_output.cv(),
+        recovery_output.out_ciphertext(),
+    ) {
+        Some((note, payment_address, memo)) => {
+            // Successfully recovered! Pack the result
+            let mut result = Vec::with_capacity(620);
+
+            // Diversifier (11 bytes)
+            result.extend_from_slice(&payment_address.diversifier().0);
+
+            // pk_d (32 bytes) - use to_bytes on the underlying point
+            let pk_d_bytes: [u8; 32] = payment_address.to_bytes()[11..43].try_into().unwrap();
+            result.extend_from_slice(&pk_d_bytes);
+
+            // Value (8 bytes, little-endian)
+            result.extend_from_slice(&note.value().inner().to_le_bytes());
+
+            // Rcm (32 bytes)
+            let rcm_bytes = match note.rseed() {
+                Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                Rseed::AfterZip212(rseed) => {
+                    // For AfterZip212, we store the rseed directly
+                    *rseed
+                }
+            };
+            result.extend_from_slice(&rcm_bytes);
+
+            // Memo (512 bytes)
+            result.extend_from_slice(memo.as_array());
+
+            // Copy to output buffer
+            let len = result.len();
+            std::ptr::copy_nonoverlapping(result.as_ptr(), output, len);
+
+            len
+        }
+        None => 0,
+    }
+}
+
+/// Derive OVK from extended spending key
+/// sk: 169-byte extended spending key
+/// ovk_out: Buffer for 32-byte OVK
+/// Returns true on success
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_derive_ovk(
+    sk: *const u8,
+    ovk_out: *mut u8,
+) -> bool {
+    let sk_bytes = slice::from_raw_parts(sk, 169);
+
+    // Deserialize the extended spending key
+    let extsk = match ExtendedSpendingKey::read(&sk_bytes[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+
+    // Get the OVK from the extended spending key
+    let ovk = extsk.expsk.ovk;
+
+    // Copy to output
+    std::ptr::copy_nonoverlapping(ovk.0.as_ptr(), ovk_out, 32);
+
+    true
+}
+
+// Add debugging for anchor mismatch

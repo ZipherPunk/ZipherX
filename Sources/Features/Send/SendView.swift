@@ -49,12 +49,68 @@ struct SendView: View {
         } message: {
             Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
         }
-        .alert("Transaction Sent!", isPresented: $showSuccess) {
-            Button("OK") {
-                clearForm()
+        .sheet(isPresented: $showSuccess) {
+            VStack(spacing: 16) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 50))
+                    .foregroundColor(.green)
+
+                Text("Transaction Sent!")
+                    .font(System7Theme.titleFont(size: 16))
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Transaction ID:")
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+
+                    Text(txId)
+                        .font(System7Theme.monoFont(size: 9))
+                        .padding(8)
+                        .background(System7Theme.white)
+                        .overlay(
+                            Rectangle()
+                                .stroke(System7Theme.black, lineWidth: 1)
+                        )
+                        .lineLimit(3)
+                }
+                .padding(.horizontal)
+
+                HStack(spacing: 12) {
+                    Button(action: {
+                        UIPasteboard.general.string = txId
+                    }) {
+                        HStack {
+                            Image(systemName: "doc.on.doc")
+                            Text("Copy TxID")
+                        }
+                        .font(System7Theme.bodyFont(size: 11))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                    }
+                    .background(System7Theme.lightGray)
+                    .overlay(
+                        Rectangle()
+                            .stroke(System7Theme.black, lineWidth: 1)
+                    )
+
+                    Button(action: {
+                        showSuccess = false
+                        clearForm()
+                    }) {
+                        Text("Done")
+                            .font(System7Theme.bodyFont(size: 11))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                    }
+                    .background(System7Theme.lightGray)
+                    .overlay(
+                        Rectangle()
+                            .stroke(System7Theme.black, lineWidth: 1)
+                    )
+                }
             }
-        } message: {
-            Text("TX ID: \(txId.prefix(16))...")
+            .padding(24)
+            .background(System7Theme.lightGray)
         }
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}

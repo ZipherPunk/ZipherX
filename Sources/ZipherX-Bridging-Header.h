@@ -192,6 +192,7 @@ bool zipherx_build_transaction(const uint8_t *sk,
                                 uint64_t note_value,
                                 const uint8_t *note_rcm,
                                 const uint8_t *note_diversifier,
+                                uint64_t chain_height,
                                 uint8_t *tx_out,
                                 size_t *tx_out_len);
 
@@ -223,5 +224,89 @@ bool zipherx_encrypt_note(const uint8_t *diversifier,
                            const uint8_t *memo,
                            uint8_t *epk_out,
                            uint8_t *enc_out);
+
+// =============================================================================
+// Commitment Tree Functions
+// =============================================================================
+
+/// Initialize a new empty Sapling commitment tree
+/// @return true on success
+bool zipherx_tree_init(void);
+
+/// Append a note commitment to the tree
+/// @param cmu 32-byte note commitment
+/// @return Position of the added commitment, or UINT64_MAX on error
+uint64_t zipherx_tree_append(const uint8_t *cmu);
+
+/// Create a witness for the current position
+/// @return Witness index, or UINT64_MAX on error
+uint64_t zipherx_tree_witness_current(void);
+
+/// Load a witness from saved data into memory for updating
+/// @param witness_data Saved witness data (1028 bytes)
+/// @param witness_len Length of witness data
+/// @return Witness index, or UINT64_MAX on error
+uint64_t zipherx_tree_load_witness(const uint8_t *witness_data, size_t witness_len);
+
+/// Get the current tree root
+/// @param root_out Buffer for 32-byte root
+/// @return true on success
+bool zipherx_tree_root(uint8_t *root_out);
+
+/// Get witness data for a specific index
+/// @param witness_index Index from tree_witness_current
+/// @param witness_out Buffer for 1028 bytes (4 pos + 32*32 path)
+/// @return true on success
+bool zipherx_tree_get_witness(uint64_t witness_index, uint8_t *witness_out);
+
+/// Get current tree size
+/// @return Number of commitments in tree
+uint64_t zipherx_tree_size(void);
+
+/// Serialize tree state for persistence
+/// @param tree_out Buffer for serialized data
+/// @param tree_out_len Output for actual length
+/// @return true on success
+bool zipherx_tree_serialize(uint8_t *tree_out, size_t *tree_out_len);
+
+/// Deserialize tree state from persistence
+/// @param tree_data Serialized tree data
+/// @param tree_len Length of data
+/// @return true on success
+bool zipherx_tree_deserialize(const uint8_t *tree_data, size_t tree_len);
+
+/// Load tree from raw CMUs file format
+/// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+/// @param data CMU file data
+/// @param data_len Length of data
+/// @return true on success
+bool zipherx_tree_load_from_cmus(const uint8_t *data, size_t data_len);
+
+// =============================================================================
+// OVK Output Recovery (for viewing sent transactions)
+// =============================================================================
+
+/// Try to recover a sent note using the outgoing viewing key
+/// @param ovk 32-byte outgoing viewing key
+/// @param cv 32-byte value commitment
+/// @param cmu 32-byte note commitment
+/// @param epk 32-byte ephemeral public key
+/// @param enc_ciphertext 580-byte encrypted ciphertext
+/// @param out_ciphertext 80-byte output ciphertext
+/// @param output Buffer for result (at least 620 bytes)
+/// @return Length of output on success, 0 on failure
+size_t zipherx_try_recover_output_with_ovk(const uint8_t *ovk,
+                                            const uint8_t *cv,
+                                            const uint8_t *cmu,
+                                            const uint8_t *epk,
+                                            const uint8_t *enc_ciphertext,
+                                            const uint8_t *out_ciphertext,
+                                            uint8_t *output);
+
+/// Derive OVK from extended spending key
+/// @param sk 169-byte extended spending key
+/// @param ovk_out Buffer for 32-byte OVK
+/// @return true on success
+bool zipherx_derive_ovk(const uint8_t *sk, uint8_t *ovk_out);
 
 #endif /* ZipherX_Bridging_Header_h */
