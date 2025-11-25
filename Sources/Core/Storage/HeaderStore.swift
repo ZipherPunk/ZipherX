@@ -83,7 +83,7 @@ final class HeaderStore {
     // MARK: - Header Operations
 
     /// Insert or replace a block header
-    func insertHeader(_ header: BlockHeader) throws {
+    func insertHeader(_ header: ZclassicBlockHeader) throws {
         let sql = """
             INSERT OR REPLACE INTO headers
             (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version)
@@ -124,7 +124,7 @@ final class HeaderStore {
     }
 
     /// Batch insert headers (more efficient for syncing)
-    func insertHeaders(_ headers: [BlockHeader]) throws {
+    func insertHeaders(_ headers: [ZclassicBlockHeader]) throws {
         guard !headers.isEmpty else { return }
 
         // Use a transaction for batch inserts
@@ -147,7 +147,7 @@ final class HeaderStore {
     }
 
     /// Get header at specific height
-    func getHeader(at height: UInt64) throws -> BlockHeader? {
+    func getHeader(at height: UInt64) throws -> ZclassicBlockHeader? {
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
             FROM headers
@@ -170,7 +170,7 @@ final class HeaderStore {
     }
 
     /// Get header by block hash
-    func getHeader(hash: Data) throws -> BlockHeader? {
+    func getHeader(hash: Data) throws -> ZclassicBlockHeader? {
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
             FROM headers
@@ -258,7 +258,7 @@ final class HeaderStore {
     }
 
     /// Get headers in a range (for syncing)
-    func getHeaders(from startHeight: UInt64, to endHeight: UInt64) throws -> [BlockHeader] {
+    func getHeaders(from startHeight: UInt64, to endHeight: UInt64) throws -> [ZclassicBlockHeader] {
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
             FROM headers
@@ -275,7 +275,7 @@ final class HeaderStore {
         sqlite3_bind_int64(stmt, 1, Int64(startHeight))
         sqlite3_bind_int64(stmt, 2, Int64(endHeight))
 
-        var headers: [BlockHeader] = []
+        var headers: [ZclassicBlockHeader] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let header = try parseHeaderFromRow(stmt!)
             headers.append(header)
@@ -329,7 +329,7 @@ final class HeaderStore {
 
     // MARK: - Helper Methods
 
-    private func parseHeaderFromRow(_ stmt: OpaquePointer) throws -> BlockHeader {
+    private func parseHeaderFromRow(_ stmt: OpaquePointer) throws -> ZclassicBlockHeader {
         let height = UInt64(sqlite3_column_int64(stmt, 0))
 
         guard let hashPtr = sqlite3_column_blob(stmt, 1) else {

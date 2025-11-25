@@ -136,13 +136,13 @@ final class HeaderSyncManager {
     private func requestHeadersWithConsensus(
         from startHeight: UInt64,
         to endHeight: UInt64
-    ) async throws -> [BlockHeader] {
+    ) async throws -> [ZclassicBlockHeader] {
         let peers = try await networkManager.getConnectedPeers(min: minPeers)
 
         // Collect headers from each peer
-        var peerHeaders: [[BlockHeader]] = []
+        var peerHeaders: [[ZclassicBlockHeader]] = []
 
-        await withTaskGroup(of: [BlockHeader]?.self) { group in
+        await withTaskGroup(of: [ZclassicBlockHeader]?.self) { group in
             for peer in peers {
                 group.addTask {
                     do {
@@ -183,7 +183,7 @@ final class HeaderSyncManager {
         from peer: Peer,
         startHeight: UInt64,
         endHeight: UInt64
-    ) async throws -> [BlockHeader] {
+    ) async throws -> [ZclassicBlockHeader] {
         // Build getheaders payload
         let payload = buildGetHeadersPayload(startHeight: startHeight)
 
@@ -233,7 +233,7 @@ final class HeaderSyncManager {
 
     /// Parse headers from P2P message
     /// Format: count (varint) + headers (80 bytes each) + tx_count (varint, always 0)
-    private func parseHeadersPayload(_ data: Data) throws -> [BlockHeader] {
+    private func parseHeadersPayload(_ data: Data) throws -> [ZclassicBlockHeader] {
         var offset = 0
 
         // Read count (varint - simplified to single byte)
@@ -246,7 +246,7 @@ final class HeaderSyncManager {
 
         print("📦 Parsing \(count) headers from payload")
 
-        var headers: [BlockHeader] = []
+        var headers: [ZclassicBlockHeader] = []
 
         for i in 0..<count {
             // Each header is 140 bytes (Zcash format) + 1 byte tx count
@@ -277,19 +277,19 @@ final class HeaderSyncManager {
     }
 
     /// Verify that multiple peers agree on header data (consensus)
-    private func verifyHeaderConsensus(_ peerHeaders: [[BlockHeader]]) throws -> [BlockHeader] {
+    private func verifyHeaderConsensus(_ peerHeaders: [[ZclassicBlockHeader]]) throws -> [ZclassicBlockHeader] {
         guard let firstHeaders = peerHeaders.first else {
             throw SyncError.noHeadersReceived
         }
 
         let headerCount = firstHeaders.count
-        var consensusHeaders: [BlockHeader] = []
+        var consensusHeaders: [ZclassicBlockHeader] = []
 
         // Verify each header position
         for i in 0..<headerCount {
             var blockHashVotes: [Data: Int] = [:]
             var saplingRootVotes: [Data: Int] = [:]
-            var headersByHash: [Data: BlockHeader] = [:]
+            var headersByHash: [Data: ZclassicBlockHeader] = [:]
 
             // Count votes for each header
             for headers in peerHeaders {
@@ -342,7 +342,7 @@ final class HeaderSyncManager {
     }
 
     /// Verify header chain continuity (each header links to previous)
-    private func verifyHeaderChain(_ headers: [BlockHeader], startingAt height: UInt64) throws {
+    private func verifyHeaderChain(_ headers: [ZclassicBlockHeader], startingAt height: UInt64) throws {
         guard !headers.isEmpty else { return }
 
         var currentHeight = height
