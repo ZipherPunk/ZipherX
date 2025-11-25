@@ -82,7 +82,7 @@ struct ZclassicBlockHeader {
         let headerBytes = data.subdata(in: 0..<80)
         let blockHash = headerBytes.doubleSHA256()
 
-        return BlockHeader(
+        return ZclassicBlockHeader(
             version: version,
             hashPrevBlock: hashPrevBlock,
             hashMerkleRoot: hashMerkleRoot,
@@ -122,29 +122,4 @@ enum ParseError: Error {
     }
 }
 
-// MARK: - Data Extensions
-
-extension Data {
-    /// Double SHA256 hash (used for block hashes)
-    func doubleSHA256() -> Data {
-        let hash1 = self.sha256()
-        return hash1.sha256()
-    }
-
-    /// Single SHA256 hash
-    func sha256() -> Data {
-        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        self.withUnsafeBytes {
-            _ = CC_SHA256($0.baseAddress, CC_LONG(self.count), &hash)
-        }
-        return Data(hash)
-    }
-
-    /// Convert to hex string
-    func hexString() -> String {
-        return map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-// Import CommonCrypto for SHA256
-import CommonCrypto
+// Note: Data extensions (doubleSHA256, sha256, hexString) are defined in Peer.swift
