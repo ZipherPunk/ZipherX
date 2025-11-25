@@ -124,6 +124,7 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "params", title: "Fetch Sapling params", status: .pending),
                 SyncTask(id: "keys", title: "Load wallet keys", status: .pending),
                 SyncTask(id: "database", title: "Open database", status: .pending),
+                SyncTask(id: "headers", title: "Sync block headers", status: .pending),
                 SyncTask(id: "height", title: "Get chain height", status: .pending),
                 SyncTask(id: "scan", title: "Scan blockchain", status: .pending),
                 SyncTask(id: "balance", title: "Calculate balance", status: .pending)
@@ -195,7 +196,53 @@ final class WalletManager: ObservableObject {
             throw error
         }
 
-        // Task 3: Get chain height
+        // Task 3: Sync block headers
+        await updateTask("headers", status: .inProgress)
+        do {
+            print("📥 Opening header store...")
+            try HeaderStore.shared.open()
+
+            print("🔄 Starting header sync...")
+            let headerSync = HeaderSyncManager(
+                headerStore: HeaderStore.shared,
+                networkManager: NetworkManager.shared
+            )
+
+            // Track progress
+            headerSync.onProgress = { [weak self] progress in
+                Task { @MainActor in
+                    if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                        self?.syncTasks[index].detail = "\(progress.currentHeight) / \(progress.totalHeight)"
+                    }
+                }
+            }
+
+            // Get starting height for sync
+            let startHeight: UInt64
+            if let latestHeight = try HeaderStore.shared.getLatestHeight() {
+                // Resume from where we left off
+                startHeight = latestHeight + 1
+                print("📊 Resuming header sync from height \(startHeight)")
+            } else {
+                // Start from Sapling activation (block 559500 for Zclassic mainnet)
+                startHeight = 559500
+                print("📊 Starting fresh header sync from Sapling activation (height \(startHeight))")
+            }
+
+            try await headerSync.syncHeaders(from: startHeight)
+
+            let stats = try HeaderStore.shared.getStats()
+            print("✅ Header sync complete! Stored \(stats.count) headers (latest: \(stats.latestHeight ?? 0))")
+
+            await updateTask("headers", status: .completed)
+        } catch {
+            print("⚠️ Header sync failed: \(error.localizedDescription)")
+            await updateTask("headers", status: .failed(error.localizedDescription))
+            // Continue anyway - transactions will fail if headers aren't synced
+            // but user can still see the error and try again
+        }
+
+        // Task 4: Get chain height
         await updateTask("height", status: .inProgress)
 
         // Task 4: Scan blockchain
