@@ -201,7 +201,7 @@ final class HeaderSyncManager {
 
             if command == "headers" {
                 // Got the headers we requested!
-                headers = try parseHeadersPayload(response)
+                headers = try parseHeadersPayload(response, startingAt: startHeight)
             } else {
                 // Ignore other messages (inv, addr, ping, etc.)
                 print("📭 Peer sent '\(command)' message, waiting for headers...")
@@ -245,7 +245,7 @@ final class HeaderSyncManager {
 
     /// Parse headers from P2P message
     /// Format: count (varint) + headers (80 bytes each) + tx_count (varint, always 0)
-    private func parseHeadersPayload(_ data: Data) throws -> [ZclassicBlockHeader] {
+    private func parseHeadersPayload(_ data: Data, startingAt startHeight: UInt64) throws -> [ZclassicBlockHeader] {
         var offset = 0
 
         // Read count (varint - simplified to single byte)
@@ -279,8 +279,8 @@ final class HeaderSyncManager {
             offset += 1
 
             // Parse header
-            // Height is unknown from payload - will be computed by caller
-            let height = UInt64(i)  // Temporary, will be updated
+            // Assign actual block height (startHeight + index)
+            let height = startHeight + UInt64(i)
             let header = try ZclassicBlockHeader.parse(data: headerData, height: height)
             headers.append(header)
         }
