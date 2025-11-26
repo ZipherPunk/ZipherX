@@ -369,18 +369,30 @@ final class HeaderSyncManager {
             // Verify previous hash links correctly
             // Skip verification for the very first header if we don't have its previous block
             if let prevHash = prevHash {
+                // Debug: Print hash comparison
+                let prevHex = prevHash.map { String(format: "%02x", $0) }.joined()
+                let gotPrevHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined()
+                let currentBlockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
+
+                print("🔍 Height \(currentHeight): blockHash=\(currentBlockHex.prefix(16))... prevBlock=\(gotPrevHex.prefix(16))...")
+
                 guard header.hashPrevBlock == prevHash else {
-                    let prevHex = prevHash.map { String(format: "%02x", $0) }.joined().prefix(16)
-                    let gotHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined().prefix(16)
+                    print("❌ MISMATCH at height \(currentHeight)!")
+                    print("   Expected prevHash: \(prevHex.prefix(32))...")
+                    print("   Got prevHash:      \(gotPrevHex.prefix(32))...")
                     throw SyncError.chainDiscontinuity(
                         height: currentHeight,
-                        expectedPrevHash: String(prevHex),
-                        gotPrevHash: String(gotHex)
+                        expectedPrevHash: String(prevHex.prefix(16)),
+                        gotPrevHash: String(gotPrevHex.prefix(16))
                     )
                 }
             } else if index == 0 {
                 // First header and no previous - this is OK for initial sync
-                print("ℹ️ Skipping chain verification for first header at height \(currentHeight) (no previous header)")
+                let blockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
+                let prevHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined()
+                print("ℹ️ Skipping chain verification for first header at height \(currentHeight)")
+                print("   First block hash: \(blockHex.prefix(32))...")
+                print("   First prev hash:  \(prevHex.prefix(32))...")
             }
 
             prevHash = header.blockHash
