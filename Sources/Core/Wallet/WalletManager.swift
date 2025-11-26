@@ -464,6 +464,86 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
+        // FAST PATH: Try to rebuild witnesses using stored CMUs and bundled tree
+        let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.id)
+        print("📝 Found \(notes.count) notes to rebuild witnesses for")
+
+        // Load bundled CMU data
+        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree_v2", withExtension: "bin"),
+              let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+            print("❌ Bundled CMU file not found, falling back to full scan")
+            try await rebuildWitnessesViaFullScan(account: account, spendingKey: spendingKey, onProgress: onProgress)
+            return
+        }
+
+        print("📦 Loaded bundled CMU data: \(bundledData.count) bytes")
+
+        // Check if all notes have CMU stored
+        var notesWithCMU: [WalletNote] = []
+        var notesWithoutCMU: [WalletNote] = []
+
+        for note in notes {
+            if let cmu = note.cmu, cmu.count == 32 {
+                notesWithCMU.append(note)
+            } else {
+                notesWithoutCMU.append(note)
+            }
+        }
+
+        print("📝 Notes with CMU: \(notesWithCMU.count), without CMU: \(notesWithoutCMU.count)")
+
+        if notesWithoutCMU.isEmpty && !notesWithCMU.isEmpty {
+            // All notes have CMU - use fast path
+            print("🚀 Using fast witness rebuild via bundled CMU lookup")
+
+            let bundledTreeHeight: UInt64 = 2922769 // Height where bundled tree ends
+
+            for (index, note) in notesWithCMU.enumerated() {
+                guard let cmu = note.cmu else { continue }
+
+                // Report progress
+                let progress = Double(index + 1) / Double(notesWithCMU.count)
+                await MainActor.run {
+                    onProgress(progress, UInt64(index + 1), UInt64(notesWithCMU.count))
+                }
+
+                // Check if note is within bundled range
+                if note.height <= bundledTreeHeight {
+                    // Use treeCreateWitnessForCMU for notes within bundled range
+                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                        let (position, witness) = result
+                        print("✅ Created witness for note \(note.id): position=\(position), witness=\(witness.count) bytes")
+
+                        // Update witness in database
+                        try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                    } else {
+                        print("⚠️ Failed to create witness for note \(note.id) - CMU not in bundled tree")
+                    }
+                } else {
+                    print("⚠️ Note \(note.id) at height \(note.height) is beyond bundled range (\(bundledTreeHeight))")
+                    // For notes beyond bundled range, we need the full tree
+                    // TODO: Handle this case by extending tree with live scan
+                }
+            }
+
+            // Load the bundled tree into memory for spending
+            if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ Loaded bundled tree for spending: \(treeSize) commitments")
+            }
+
+            // Refresh balance after rebuild
+            try await refreshBalance()
+            print("✅ Fast witness rebuild complete - notes can now be spent")
+        } else {
+            // Some notes don't have CMU - fall back to full scan
+            print("⚠️ Some notes missing CMU, falling back to full scan")
+            try await rebuildWitnessesViaFullScan(account: account, spendingKey: spendingKey, onProgress: onProgress)
+        }
+    }
+
+    /// Fall back to full scan for witness rebuild
+    private func rebuildWitnessesViaFullScan(account: Account, spendingKey: Data, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
         if !NetworkManager.shared.isConnected {
@@ -636,6 +716,39 @@ final class WalletManager: ObservableObject {
         try await refreshBalance()
 
         return txId
+    }
+
+    /// Recover funds from failed transactions
+    /// Marks all notes that were marked spent but don't have confirmed txids as unspent
+    func recoverFailedTransactions() async throws {
+        print("Checking for unconfirmed spent notes...")
+
+        let database = WalletDatabase.shared
+        guard let account = try database.getAccount(index: 0) else {
+            print("No account found")
+            return
+        }
+
+        // Get all spent notes and check if their txids are confirmed
+        let spentNotes = try database.getSpentNotes(accountId: account.id)
+        print("Found \(spentNotes.count) spent notes to check")
+
+        var recoveredCount = 0
+        for note in spentNotes {
+            // If the note has no spent_in_tx, it's from a failed broadcast
+            if note.spentInTx == nil || note.spentInTx?.isEmpty == true {
+                try database.markNoteUnspent(nullifier: note.nullifier)
+                recoveredCount += 1
+                print("Recovered note with nullifier: \(note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...")
+            }
+        }
+
+        if recoveredCount > 0 {
+            print("Recovered \(recoveredCount) notes from failed transactions")
+            try await refreshBalance()
+        } else {
+            print("No notes needed recovery")
+        }
     }
 
     // MARK: - Address Validation

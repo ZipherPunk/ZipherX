@@ -84,6 +84,7 @@ final class WalletDatabase {
                 received_height INTEGER NOT NULL,
                 witness BLOB,
                 witness_height INTEGER,
+                cmu BLOB,
                 FOREIGN KEY (account_id) REFERENCES accounts(id)
             );
             """,
@@ -178,6 +179,39 @@ final class WalletDatabase {
             guard sqlite3_exec(db, schema, nil, nil, nil) == SQLITE_OK else {
                 throw DatabaseError.schemaCreationFailed(String(cString: sqlite3_errmsg(db)))
             }
+        }
+
+        // Run migrations for existing databases
+        try runMigrations()
+    }
+
+    /// Run database migrations for schema updates
+    private func runMigrations() throws {
+        // Migration 1: Add cmu column to notes table if it doesn't exist
+        // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so check column existence first
+        var pragmaStmt: OpaquePointer?
+        let pragmaSql = "PRAGMA table_info(notes);"
+        guard sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(pragmaStmt) }
+
+        var hasCmuColumn = false
+        while sqlite3_step(pragmaStmt) == SQLITE_ROW {
+            if let columnName = sqlite3_column_text(pragmaStmt, 1) {
+                if String(cString: columnName) == "cmu" {
+                    hasCmuColumn = true
+                    break
+                }
+            }
+        }
+
+        if !hasCmuColumn {
+            let alterSql = "ALTER TABLE notes ADD COLUMN cmu BLOB;"
+            guard sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.schemaCreationFailed("Migration failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            print("📂 Migration: Added cmu column to notes table")
         }
     }
 
@@ -280,13 +314,14 @@ final class WalletDatabase {
         nullifier: Data,
         txid: Data,
         height: UInt64,
-        witness: Data?
+        witness: Data?,
+        cmu: Data? = nil
     ) throws -> Int64 {
         // Use INSERT OR IGNORE to skip notes that already exist (by nullifier uniqueness)
         // This prevents duplicates during rescanning
         let sql = """
-            INSERT OR IGNORE INTO notes (account_id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, witness_height)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR IGNORE INTO notes (account_id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, witness_height, cmu)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -328,6 +363,14 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 9)
             sqlite3_bind_null(stmt, 10)
+        }
+        // Bind CMU (note commitment)
+        if let cmu = cmu {
+            cmu.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
+            }
+        } else {
+            sqlite3_bind_null(stmt, 11)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -422,7 +465,7 @@ final class WalletDatabase {
     /// Get all unspent notes (regardless of witness status) - for diagnostics
     func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu
             FROM notes
             WHERE account_id = ? AND is_spent = 0
             ORDER BY received_height ASC;
@@ -457,6 +500,14 @@ final class WalletDatabase {
                 witnessData = Data(bytes: witnessPtr!, count: Int(witnessLen))
             }
 
+            // CMU might be NULL
+            var cmuData: Data? = nil
+            if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
+                let cmuPtr = sqlite3_column_blob(stmt, 9)
+                let cmuLen = sqlite3_column_bytes(stmt, 9)
+                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+            }
+
             let note = WalletNote(
                 id: id,
                 diversifier: Data(bytes: divPtr!, count: Int(divLen)),
@@ -464,7 +515,8 @@ final class WalletDatabase {
                 rcm: Data(bytes: rcmPtr!, count: Int(rcmLen)),
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
-                witness: witnessData
+                witness: witnessData,
+                cmu: cmuData
             )
 
             notes.append(note)
@@ -476,7 +528,7 @@ final class WalletDatabase {
     /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu
             FROM notes
             WHERE account_id = ? AND is_spent = 0 AND witness IS NOT NULL
             ORDER BY received_height ASC;
@@ -505,6 +557,14 @@ final class WalletDatabase {
             let witnessPtr = sqlite3_column_blob(stmt, 8)
             let witnessLen = sqlite3_column_bytes(stmt, 8)
 
+            // CMU might be NULL
+            var cmuData: Data? = nil
+            if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
+                let cmuPtr = sqlite3_column_blob(stmt, 9)
+                let cmuLen = sqlite3_column_bytes(stmt, 9)
+                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+            }
+
             let note = WalletNote(
                 id: id,
                 diversifier: Data(bytes: divPtr!, count: Int(divLen)),
@@ -512,7 +572,8 @@ final class WalletDatabase {
                 rcm: Data(bytes: rcmPtr!, count: Int(rcmLen)),
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
-                witness: Data(bytes: witnessPtr!, count: Int(witnessLen))
+                witness: Data(bytes: witnessPtr!, count: Int(witnessLen)),
+                cmu: cmuData
             )
 
             notes.append(note)
@@ -560,6 +621,62 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+    }
+
+    /// Mark note as unspent (recover from failed broadcast)
+    func markNoteUnspent(nullifier: Data) throws {
+        let sql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL WHERE nf = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        nullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("Marked note as unspent (nullifier: \(nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
+    }
+
+    /// Get all spent notes for an account (for recovery from failed broadcasts)
+    func getSpentNotes(accountId: Int64) throws -> [SpentNote] {
+        let sql = "SELECT nf, spent_in_tx FROM notes WHERE account_id = ? AND is_spent = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        var notes: [SpentNote] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let nfPtr = sqlite3_column_blob(stmt, 0)
+            let nfLen = sqlite3_column_bytes(stmt, 0)
+            guard let ptr = nfPtr else { continue }
+            let nullifier = Data(bytes: ptr, count: Int(nfLen))
+
+            // Get spent_in_tx (may be null if broadcast failed)
+            var spentInTx: Data? = nil
+            if sqlite3_column_type(stmt, 1) != SQLITE_NULL {
+                let txPtr = sqlite3_column_blob(stmt, 1)
+                let txLen = sqlite3_column_bytes(stmt, 1)
+                if let txPtr = txPtr, txLen > 0 {
+                    spentInTx = Data(bytes: txPtr, count: Int(txLen))
+                }
+            }
+
+            notes.append(SpentNote(nullifier: nullifier, spentInTx: spentInTx))
+        }
+
+        return notes
     }
 
     /// Delete all notes (for rescan)
@@ -972,7 +1089,14 @@ struct WalletNote {
     let nullifier: Data
     let height: UInt64
     let witness: Data
+    let cmu: Data? // Note commitment - needed for witness rebuild
     var confirmations: Int = 0 // Set by caller based on current chain height
+}
+
+/// Represents a spent note (for recovery checks)
+struct SpentNote {
+    let nullifier: Data
+    let spentInTx: Data? // nil if transaction broadcast failed
 }
 
 enum TransactionType: String {

@@ -215,10 +215,34 @@ final class InsightAPI {
         let body = ["rawtx": rawTx.map { String(format: "%02x", $0) }.joined()]
         request.httpBody = try JSONEncoder().encode(body)
 
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let response = try JSONDecoder().decode(BroadcastResponse.self, from: data)
+        let (data, response) = try await URLSession.shared.data(for: request)
 
-        return response.txid
+        // Check HTTP status code
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode != 200 {
+                // Try to parse error message from response
+                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let errorMessage = errorJson["error"] as? String ?? errorJson["message"] as? String {
+                    print("Transaction broadcast rejected: \(errorMessage)")
+                    throw InsightError.transactionRejected(errorMessage)
+                }
+                throw InsightError.transactionRejected("HTTP \(httpResponse.statusCode)")
+            }
+        }
+
+        // Try to decode success response
+        do {
+            let broadcastResponse = try JSONDecoder().decode(BroadcastResponse.self, from: data)
+            return broadcastResponse.txid
+        } catch {
+            // Check if the response contains an error message instead
+            if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let errorMessage = errorJson["error"] as? String ?? errorJson["message"] as? String {
+                print("Transaction broadcast rejected: \(errorMessage)")
+                throw InsightError.transactionRejected(errorMessage)
+            }
+            throw error
+        }
     }
 
     // MARK: - Address
@@ -340,6 +364,7 @@ enum InsightError: LocalizedError {
     case invalidData
     case networkError
     case notFound
+    case transactionRejected(String)
 
     var errorDescription: String? {
         switch self {
@@ -349,6 +374,8 @@ enum InsightError: LocalizedError {
             return "Network error"
         case .notFound:
             return "Resource not found"
+        case .transactionRejected(let reason):
+            return "Transaction rejected: \(reason)"
         }
     }
 }
