@@ -175,8 +175,8 @@ struct BalanceView: View {
                 .padding(.vertical, 6)
             }
 
-            // Sync tasks list - show when syncing
-            if isRefreshing && !walletManager.syncTasks.isEmpty {
+            // Sync tasks list - always show when tasks exist
+            if !walletManager.syncTasks.isEmpty {
                 Divider()
                     .background(System7Theme.black)
 

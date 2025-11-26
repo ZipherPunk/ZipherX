@@ -230,9 +230,12 @@ final class WalletManager: ObservableObject {
                 startHeight = latestHeight + 1
                 print("📊 Resuming header sync from height \(startHeight)")
             } else {
-                // Start from Sapling activation (block 559500 for Zclassic mainnet)
-                startHeight = 559500
-                print("📊 Starting fresh header sync from Sapling activation (height \(startHeight))")
+                // Start from recent checkpoint (~6 months ago)
+                // Sapling activation 559500 is too old, peers don't keep those headers
+                // Start from ~26000 blocks ago (~6 months at 1 block/min)
+                let recentCheckpoint: UInt64 = 2896000
+                startHeight = recentCheckpoint
+                print("📊 Starting fresh header sync from recent checkpoint (height \(startHeight))")
             }
 
             try await headerSync.syncHeaders(from: startHeight)
