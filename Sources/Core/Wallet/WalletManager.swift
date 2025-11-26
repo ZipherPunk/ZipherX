@@ -230,12 +230,13 @@ final class WalletManager: ObservableObject {
                 startHeight = latestHeight + 1
                 print("📊 Resuming header sync from height \(startHeight)")
             } else {
-                // Start from recent checkpoint (~6 months ago)
-                // Sapling activation 559500 is too old, peers don't keep those headers
-                // Start from ~26000 blocks ago (~6 months at 1 block/min)
-                let recentCheckpoint: UInt64 = 2896000
-                startHeight = recentCheckpoint
-                print("📊 Starting fresh header sync from recent checkpoint (height \(startHeight))")
+                // Start from very recent - just last ~1000 blocks (~16 hours)
+                // This avoids chain discontinuity issues and syncs fast
+                // For transaction building, we only need recent anchors anyway
+                let chainTip = try await headerSync.getChainTip()
+                let blocksToSync: UInt64 = 5000
+                startHeight = chainTip > blocksToSync ? chainTip - blocksToSync : 0
+                print("📊 Starting fresh header sync from recent blocks (height \(startHeight), tip: \(chainTip))")
             }
 
             try await headerSync.syncHeaders(from: startHeight)

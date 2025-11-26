@@ -86,7 +86,7 @@ final class HeaderSyncManager {
     }
 
     /// Get the current chain tip height from consensus of peers
-    private func getChainTip() async throws -> UInt64 {
+    func getChainTip() async throws -> UInt64 {
         let peers = try await networkManager.getConnectedPeers(min: minPeers)
 
         var heights: [UInt64] = []
@@ -365,8 +365,9 @@ final class HeaderSyncManager {
             prevHash = prevHeader.blockHash
         }
 
-        for header in headers {
+        for (index, header) in headers.enumerated() {
             // Verify previous hash links correctly
+            // Skip verification for the very first header if we don't have its previous block
             if let prevHash = prevHash {
                 guard header.hashPrevBlock == prevHash else {
                     let prevHex = prevHash.map { String(format: "%02x", $0) }.joined().prefix(16)
@@ -377,6 +378,9 @@ final class HeaderSyncManager {
                         gotPrevHash: String(gotHex)
                     )
                 }
+            } else if index == 0 {
+                // First header and no previous - this is OK for initial sync
+                print("ℹ️ Skipping chain verification for first header at height \(currentHeight) (no previous header)")
             }
 
             prevHash = header.blockHash
