@@ -190,15 +190,27 @@ final class HeaderSyncManager {
         // Send getheaders message
         try await peer.sendMessage(command: "getheaders", payload: payload)
 
-        // Receive headers response
-        let (command, response) = try await peer.receiveMessage()
+        // Loop until we receive headers response (peers may send inv/addr/ping first)
+        var headers: [ZclassicBlockHeader]?
+        let maxAttempts = 10
+        var attempts = 0
 
-        guard command == "headers" else {
-            throw SyncError.unexpectedMessage(expected: "headers", got: command)
+        while headers == nil && attempts < maxAttempts {
+            attempts += 1
+            let (command, response) = try await peer.receiveMessage()
+
+            if command == "headers" {
+                // Got the headers we requested!
+                headers = try parseHeadersPayload(response)
+            } else {
+                // Ignore other messages (inv, addr, ping, etc.)
+                print("📭 Peer sent '\(command)' message, waiting for headers...")
+            }
         }
 
-        // Parse headers from response
-        let headers = try parseHeadersPayload(response)
+        guard let headers = headers else {
+            throw SyncError.unexpectedMessage(expected: "headers", got: "timeout after \(maxAttempts) messages")
+        }
 
         peer.recordSuccess()
 
