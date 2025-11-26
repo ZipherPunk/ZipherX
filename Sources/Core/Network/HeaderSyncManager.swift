@@ -90,7 +90,10 @@ final class HeaderSyncManager {
 
     /// Get the current chain tip height from consensus of peers
     func getChainTip() async throws -> UInt64 {
-        let peers = try await networkManager.getConnectedPeers(min: minPeers)
+        // For local full node, only need 1 peer; otherwise need minPeers
+        let isLocalNode = networkManager.hasLocalNodePeer()
+        let requiredPeers = isLocalNode ? 1 : minPeers
+        let peers = try await networkManager.getConnectedPeers(min: requiredPeers)
 
         var heights: [UInt64] = []
 
@@ -117,13 +120,22 @@ final class HeaderSyncManager {
             }
         }
 
-        guard heights.count >= consensusThreshold else {
-            throw SyncError.insufficientPeers(got: heights.count, need: consensusThreshold)
+        // For local full node, only need 1 height; otherwise need consensusThreshold
+        let requiredHeights = isLocalNode ? 1 : consensusThreshold
+
+        guard heights.count >= requiredHeights else {
+            throw SyncError.insufficientPeers(got: heights.count, need: requiredHeights)
         }
 
         // Use median height for consensus
         let sortedHeights = heights.sorted()
         let medianHeight = sortedHeights[sortedHeights.count / 2]
+
+        // For local node, skip consensus check (we trust it)
+        if isLocalNode {
+            print("🏠 Using chain tip from LOCAL FULL NODE: \(medianHeight)")
+            return medianHeight
+        }
 
         // Verify consensus (at least consensusThreshold peers within 10 blocks)
         let consensusHeights = sortedHeights.filter { abs(Int64($0) - Int64(medianHeight)) <= 10 }
@@ -140,7 +152,10 @@ final class HeaderSyncManager {
         from startHeight: UInt64,
         to endHeight: UInt64
     ) async throws -> [ZclassicBlockHeader] {
-        let peers = try await networkManager.getConnectedPeers(min: minPeers)
+        // For local full node, only need 1 peer; otherwise need minPeers
+        let isLocalNode = networkManager.hasLocalNodePeer()
+        let requiredPeers = isLocalNode ? 1 : minPeers
+        let peers = try await networkManager.getConnectedPeers(min: requiredPeers)
 
         // Collect headers from each peer
         var peerHeaders: [[ZclassicBlockHeader]] = []
@@ -169,11 +184,17 @@ final class HeaderSyncManager {
             }
         }
 
-        guard peerHeaders.count >= consensusThreshold else {
-            throw SyncError.insufficientPeers(got: peerHeaders.count, need: consensusThreshold)
+        // For local full node, accept headers from single trusted source
+        let requiredCount = isLocalNode ? 1 : consensusThreshold
+        guard peerHeaders.count >= requiredCount else {
+            throw SyncError.insufficientPeers(got: peerHeaders.count, need: requiredCount)
         }
 
-        print("📊 Received headers from \(peerHeaders.count) peers")
+        if isLocalNode {
+            print("🏠 Received headers from LOCAL FULL NODE (trusted)")
+        } else {
+            print("📊 Received headers from \(peerHeaders.count) peers")
+        }
 
         // Verify consensus - all peers should return same headers
         let consensusHeaders = try verifyHeaderConsensus(peerHeaders)
@@ -297,6 +318,12 @@ final class HeaderSyncManager {
             throw SyncError.noHeadersReceived
         }
 
+        // For local full node, just return headers directly (trusted mode)
+        if networkManager.hasLocalNodePeer() {
+            print("🏠 Using headers from LOCAL FULL NODE without consensus check (trusted)")
+            return firstHeaders
+        }
+
         let headerCount = firstHeaders.count
         var consensusHeaders: [ZclassicBlockHeader] = []
 
@@ -409,15 +436,44 @@ final class HeaderSyncManager {
 // MARK: - Extensions
 
 extension NetworkManager {
+    /// Check if any peer is the local full node (directly check peer hosts)
+    func hasLocalNodePeer() -> Bool {
+        let result = peers.contains { $0.host == LOCAL_NODE_HOST && $0.port == LOCAL_NODE_PORT }
+        if !result && peers.count > 0 {
+            // Debug: print all peer hosts to see why matching fails
+            print("🔍 DEBUG: Checking peers for local node:")
+            for peer in peers {
+                print("   - Peer: \(peer.host):\(peer.port)")
+            }
+            print("   - Looking for: \(LOCAL_NODE_HOST):\(LOCAL_NODE_PORT)")
+        }
+        return result
+    }
+
     /// Get at least min connected peers for header sync
     func getConnectedPeers(min: Int) async throws -> [Peer] {
+        // Directly check if local node is connected (don't rely on stale flag)
+        let localNodeConnected = hasLocalNodePeer()
+
+        // If connected to local full node, trust it fully (no minimum peer requirement)
+        if localNodeConnected && peers.count > 0 {
+            print("🏠 Using LOCAL FULL NODE for header sync (trusted mode)")
+            return peers
+        }
+
         // If we don't have enough peers, try to connect
         if peers.count < min {
             print("⚠️ Only \(peers.count) peers connected, need at least \(min). Attempting to connect...")
             try await connect()
         }
 
-        // Check if we have enough peers now
+        // Re-check for local node after connection attempt
+        let localNodeConnectedAfterRetry = hasLocalNodePeer()
+        if localNodeConnectedAfterRetry && peers.count > 0 {
+            print("🏠 Connected to LOCAL FULL NODE after retry (trusted mode)")
+            return peers
+        }
+
         guard peers.count >= min else {
             throw SyncError.insufficientPeers(got: peers.count, need: min)
         }

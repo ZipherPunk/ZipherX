@@ -17,6 +17,11 @@ final class FilterScanner {
     // Static lock to prevent concurrent scans across all instances
     private static var globalScanLock = false
 
+    /// Check if any scan is currently in progress
+    static var isScanInProgress: Bool {
+        return globalScanLock
+    }
+
     // Progress callback - (progress, currentHeight, maxHeight)
     var onProgress: ((Double, UInt64, UInt64) -> Void)?
 
@@ -74,10 +79,22 @@ final class FilterScanner {
         // Determine start height
         var startHeight: UInt64
 
+        // Height where bundled commitment tree ends (verified root matches chain)
+        let bundledTreeHeight: UInt64 = 2922769
+
+        // Track if we're scanning within bundled tree range (notes only, no tree building)
+        var scanWithinBundledRange = false
+
         // If custom start height provided (quick scan), use it
         if let customStart = customStartHeight {
             startHeight = customStart
-            print("🔍 Quick scan mode: starting from user-specified height \(startHeight)")
+            // Check if this is within bundled tree range
+            if startHeight <= bundledTreeHeight {
+                scanWithinBundledRange = true
+                print("🔍 Scan mode: starting from user-specified height \(startHeight) (within bundled tree range)")
+            } else {
+                print("🔍 Scan mode: starting from user-specified height \(startHeight)")
+            }
         } else {
             // Normal scan - determine start height automatically
             // Get last scanned height
@@ -86,8 +103,6 @@ final class FilterScanner {
             // Check if we have tree state (database or bundled)
             let treeExists = (try? database.getTreeState()) != nil
             let bundledTreeAvailable = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") != nil
-            let bundledTreeHeight: UInt64 = 2921565  // Height where commitment_tree_complete.bin ends
-            let scanLookback: UInt64 = 1500  // Scan 1500 blocks back from bundled tree to catch recent notes
 
             if lastScanned > 0 {
                 // Existing wallet - continue from last scanned
@@ -99,9 +114,10 @@ final class FilterScanner {
                 print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
             } else if bundledTreeAvailable {
                 // No tree in database but bundled tree available
-                // For fresh imports, scan back from bundled height to catch recent transactions
-                startHeight = bundledTreeHeight > scanLookback ? bundledTreeHeight - scanLookback : 0
-                print("📦 Using bundled tree - scanning from \(startHeight) (bundled height: \(bundledTreeHeight))")
+                // CRITICAL: Start from bundledTreeHeight + 1 to avoid adding duplicate CMUs
+                // The bundled tree already contains all CMUs up to bundledTreeHeight
+                startHeight = bundledTreeHeight + 1
+                print("📦 Using bundled tree - scanning from \(startHeight) (bundled tree ends at \(bundledTreeHeight))")
             } else {
                 // No tree anywhere - full scan from Sapling activation
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -264,11 +280,104 @@ final class FilterScanner {
         // Clear pending witnesses for this scan
         pendingWitnesses = []
 
-        // Use parallel scanning for quick scan mode (when we have bundled tree)
-        let isQuickScan = customStartHeight != nil
+        // Determine scanning strategy:
+        // - If scanning within bundled tree range: use PARALLEL mode (note discovery only)
+        // - If scanning after bundled tree: use SEQUENTIAL mode (tree building + note discovery)
         var currentHeight = startHeight
 
-        if isQuickScan {
+        // PHASE 1: If we're scanning within bundled tree range, scan those blocks first (parallel/fast)
+        if scanWithinBundledRange && startHeight <= bundledTreeHeight {
+            print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(bundledTreeHeight) for notes (parallel, no tree building)")
+
+            let parallelEndHeight = min(bundledTreeHeight, latestHeight)
+            let parallelTotalBlocks = parallelEndHeight - startHeight + 1
+            var parallelScannedBlocks: UInt64 = 0
+            let parallelBatchSize = 100
+
+            while currentHeight <= parallelEndHeight && isScanning {
+                let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, parallelEndHeight)
+                let heights = Array(currentHeight...endHeight)
+
+                print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
+
+                // Fetch all blocks in parallel
+                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput])]?).self) { group in
+                    for height in heights {
+                        group.addTask {
+                            do {
+                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
+                                let block = try await self.insightAPI.getBlock(hash: blockHash)
+
+                                var txOutputs: [(String, [ShieldedOutput])] = []
+                                for txid in block.tx {
+                                    let tx = try await self.insightAPI.getTransaction(txid: txid)
+                                    if let outputs = tx.vShieldedOutput, !outputs.isEmpty {
+                                        txOutputs.append((txid, outputs))
+                                    }
+                                }
+                                return (height, txOutputs.isEmpty ? nil : txOutputs)
+                            } catch {
+                                return (height, nil)
+                            }
+                        }
+                    }
+
+                    // Process results - for bundled range we skip tree building but DO find notes
+                    for await (height, txOutputs) in group {
+                        guard isScanning else { break }
+
+                        if let outputs = txOutputs {
+                            for (txid, shieldedOutputs) in outputs {
+                                do {
+                                    try await MainActor.run {
+                                        // Use note-discovery-only mode (no tree append)
+                                        try self.processShieldedOutputsForNotesOnly(
+                                            outputs: shieldedOutputs,
+                                            txid: txid,
+                                            accountId: accountId,
+                                            spendingKey: spendingKey,
+                                            ivk: ivk,
+                                            height: height
+                                        )
+                                    }
+                                } catch {
+                                    print("❌ Error processing outputs for tx \(txid): \(error)")
+                                }
+                            }
+                        }
+
+                        parallelScannedBlocks += 1
+                        if parallelScannedBlocks % 50 == 0 || parallelScannedBlocks == parallelTotalBlocks {
+                            let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
+                            onProgress?(progress * 0.5, height, latestHeight) // 50% for phase 1
+                        }
+                    }
+                }
+
+                // Save progress for bundled range scan
+                try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
+                print("⚡ Parallel scanned \(currentHeight) to \(endHeight)")
+                currentHeight = endHeight + 1
+            }
+
+            print("✅ PHASE 1 complete: scanned \(startHeight) to \(parallelEndHeight)")
+
+            // Move to blocks after bundled tree
+            currentHeight = bundledTreeHeight + 1
+        }
+
+        // PHASE 2: Continue scanning blocks after bundled tree (tree building mode)
+        // This runs if:
+        // - We did PHASE 1 and there are more blocks after bundledTreeHeight
+        // - OR no custom start height was provided (normal auto-scan)
+        let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= latestHeight
+        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange
+
+        if continueAfterBundledRange {
+            print("⚡ PHASE 2: Scanning blocks \(currentHeight) to \(latestHeight) for notes + tree building (sequential)")
+        }
+
+        if isQuickScanOnly {
             // PARALLEL MODE - much faster for note discovery only
             let parallelBatchSize = 100 // Process 100 blocks at a time in parallel
 
@@ -337,8 +446,9 @@ final class FilterScanner {
                 print("⚡ Parallel scanned \(currentHeight) to \(endHeight)")
                 currentHeight = endHeight + 1
             }
-        } else {
+        } else if !isQuickScanOnly || continueAfterBundledRange {
             // SEQUENTIAL MODE - for full rescan that needs tree building
+            // Runs when: no custom start OR after PHASE 1 for blocks beyond bundled tree
             // OPTIMIZED: Batch fetch blocks and prefetch transactions
             while currentHeight <= latestHeight && isScanning {
                 let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)

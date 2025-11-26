@@ -177,35 +177,192 @@ Before any release:
 7. **Witness Generation** - Real Merkle path witnesses (1028 bytes)
 8. **Database Layer** - SQLite with tree state persistence
 9. **UI** - System 7-inspired interface with balance display, send/receive
+10. **Pre-built Bundled Commitment Tree** - Fast initial sync (see below)
+11. **Local Full Node Trust Mode** - Connect to local zcashd for trusted sync
+12. **Two-Phase Scanning** - Parallel note discovery + sequential tree building
 
 ### In Progress / Needs Testing
 
-1. **Transaction Building** - Spend proof generation needs testing with real witnesses
-2. **Spend Detection** - Nullifier tracking during rescan
-3. **GitHub Repository** - Created but push needs retry (HTTP 400 error)
+1. **Transaction Building** - Spend proof generation with real witnesses
+2. **Full Send Flow** - End-to-end shielded transaction
 
 ### Remaining Tasks
 
-1. **Rescan for Existing Wallet** - Must delete old tree state and rescan from beginning to build proper commitment tree
-2. **Test Full Send Flow** - With new witness generation
-3. **Add Checkpoint Support** - Pre-computed tree state for faster initial sync
-4. **Multi-Peer Consensus** - Currently single API endpoint
-5. **Background Sync** - iOS background fetch
-6. **Secure Enclave Integration** - Currently keys in memory
-7. **Security Audit** - Required before any real use
+1. **Multi-Peer Consensus** - Currently single API endpoint
+2. **Background Sync** - iOS background fetch
+3. **Secure Enclave Integration** - Currently keys in memory
+4. **Security Audit** - Required before any real use
 
-### Technical Notes
+---
+
+## Pre-built Bundled Commitment Tree
+
+### Overview
+
+The app includes a pre-built Sapling commitment tree (`commitment_tree_v2.bin`) containing all CMUs from Sapling activation to a checkpoint height. This enables instant balance display without hours of sequential scanning.
+
+### Bundled Tree Specifications
+
+| Property | Value |
+|----------|-------|
+| **File** | `Resources/commitment_tree_v2.bin` |
+| **Format** | `[count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...` |
+| **CMU Count** | 1,041,667 commitments |
+| **End Height** | 2,922,769 |
+| **File Size** | ~31 MB |
+| **Tree Root** | Must match chain's `finalsaplingroot` at end height |
+
+### How to Generate/Update the Bundled Tree
+
+1. **Export CMUs from local node:**
+```bash
+cd /Users/chris/ZipherX/Libraries/zipherx-ffi
+cargo run --bin export_cmus -- \
+    --start 476969 \
+    --end 2922769 \
+    --output /Users/chris/ZipherX/Resources/commitment_tree_v2.bin
+```
+
+2. **Verify the tree root matches chain:**
+```bash
+# Get expected root from chain
+zclassic-cli getblockheader $(zclassic-cli getblockhash 2922769) true | grep finalsaplingroot
+
+# Verify our tree produces the same root
+cargo run --bin verify_tree /Users/chris/ZipherX/Resources/commitment_tree_v2.bin
+```
+
+3. **Update `bundledTreeHeight` in code:**
+   - `FilterScanner.swift` line ~83: `let bundledTreeHeight: UInt64 = 2922769`
+   - `TransactionBuilder.swift` line ~98: `let bundledTreeHeight: UInt64 = 2922769`
+
+### Critical Requirements
+
+- **CMU Order**: Must be in exact blockchain order (Sapling activation → end height)
+- **No Duplicates**: Each CMU appears exactly once
+- **Root Verification**: Tree root MUST match `finalsaplingroot` from zcashd
+- **Little-Endian**: CMUs stored in wire format (little-endian), not display format
+
+### Troubleshooting Tree Root Mismatch
+
+If tree root doesn't match chain's `finalsaplingroot`:
+
+1. **Check CMU count**: Must include ALL shielded outputs, not just those to known addresses
+2. **Check byte order**: CMUs must be little-endian (wire format)
+3. **Check height**: Verify end height matches where you stopped export
+4. **Re-export**: Delete and regenerate from scratch
+
+---
+
+## Two-Phase Scanning Architecture
+
+### Problem Solved
+
+Notes received within the bundled tree range (e.g., height 2918000) were not found because the scanner skipped to `bundledTreeHeight + 1`.
+
+### Solution: PHASE 1 + PHASE 2
+
+**PHASE 1** (Parallel, Note Discovery Only):
+- Scans blocks from `fromHeight` to `bundledTreeHeight`
+- Uses `processShieldedOutputsForNotesOnly()` - NO tree modification
+- Fast parallel scanning for note decryption only
+- Notes stored with empty witnesses (need rebuild later)
+
+**PHASE 2** (Sequential, Tree Building):
+- Scans blocks from `bundledTreeHeight + 1` to chain tip
+- Uses `processShieldedOutputsSync()` - appends CMUs to tree
+- Sequential to maintain correct tree order
+- Witnesses created as CMUs are appended
+
+### Code Flow (FilterScanner.swift)
+
+```swift
+// Detect if scanning within bundled range
+if customStartHeight <= bundledTreeHeight {
+    scanWithinBundledRange = true
+}
+
+// PHASE 1: Parallel scan within bundled range
+if scanWithinBundledRange {
+    // Scan fromHeight → bundledTreeHeight (parallel, no tree append)
+    processShieldedOutputsForNotesOnly(...)
+}
+
+// PHASE 2: Sequential scan after bundled range
+// Scan bundledTreeHeight+1 → chainTip (sequential, tree building)
+processShieldedOutputsSync(...)
+```
+
+---
+
+## Local Full Node Trust Mode
+
+### Purpose
+
+When running a local Zclassic full node (`zcashd`), the app can trust it completely for faster sync without multi-peer consensus.
+
+### Configuration
+
+In `NetworkManager.swift`:
+```swift
+// Check if we have a local full node connection
+var hasLocalFullNode: Bool {
+    return connectedPeers.contains { peer in
+        peer.host == "192.168.178.86" || peer.host == "localhost" || peer.host == "127.0.0.1"
+    }
+}
+```
+
+### Behavior When Local Node Detected
+
+- Header sync uses single peer (no consensus required)
+- Block data fetched directly from local node
+- Transaction broadcast goes to local node first
+- Logs show: `🏠 Using LOCAL FULL NODE (trusted mode)`
+
+---
+
+## Bug Fixes (November 2025)
+
+### 1. Scan Lock Blocking Issue
+**Problem**: "Scan already in progress, skipping" when user initiates scan
+**Fix**: Added `FilterScanner.isScanInProgress` static property and wait logic in `WalletManager.performFullRescan()` (up to 60 seconds timeout)
+
+### 2. Notes Not Found Within Bundled Range
+**Problem**: Notes at height ~2918000 not found because scan started at 2922770
+**Fix**: Added PHASE 1 scanning for blocks within bundled tree range using parallel note-discovery-only mode
+
+### 3. Witness Destruction During Rebuild
+**Problem**: "Rebuild Witnesses" cleared note records, losing balance
+**Fix**: Modified to only clear witnesses, not notes. `WalletDatabase.getAllUnspentNotes()` added to find notes regardless of witness status
+
+### 4. TransactionBuilder Tree Loading
+**Problem**: Used wrong FFI function `loadBundledCMUs` which doesn't exist
+**Fix**: Changed to `ZipherXFFI.treeLoadFromCMUs(data:)` with proper Bundle resource loading
+
+---
+
+## Technical Notes
 
 - **Witness Format**: 4 bytes (u32 LE position) + 32×32 bytes (Merkle path) = 1028 bytes
 - **Tree State Size**: ~350KB - 1.7MB depending on network usage
+- **Bundled Tree Load Time**: ~54 seconds to build tree from 1M+ CMUs
 - **Full Sync Time**: ~30-60 minutes without checkpoint (sequential block processing required)
 - **FFI Header**: `/Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h`
 
+### Key Constants
+
+| Constant | Value | Location |
+|----------|-------|----------|
+| Sapling Activation | 476,969 | `ZclassicCheckpoints.swift` |
+| Bundled Tree Height | 2,922,769 | `FilterScanner.swift`, `TransactionBuilder.swift` |
+| Bundled CMU Count | 1,041,667 | Verified via `verify_tree` tool |
+| Default Fee | 10,000 zatoshis | `TransactionBuilder.swift` |
+
 ### Known Issues
 
-- Sequential block processing slower than parallel (required for tree ordering)
-- Existing notes may have placeholder witnesses - need rescan
-- Nullifier computation uses tree position (must match witness)
+- Equihash verification temporarily disabled (need implementation)
+- Header store may get out of sync - use "Rebuild Witnesses" to fix
 
 ## Contact
 

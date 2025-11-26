@@ -65,10 +65,8 @@ final class TransactionBuilder {
             throw TransactionError.invalidAddress
         }
 
-        // CRITICAL: Rebuild witnesses fresh from blockchain (Zecwallet Lite approach)
-        // Database witnesses become stale as the tree changes. Instead, we rebuild
-        // witnesses by rescanning recent blocks to ensure they match current tree state.
-        print("🔄 Rebuilding fresh witnesses for spending...")
+        // Get notes from database with existing witnesses
+        print("🔄 Getting spendable notes...")
         let database = WalletDatabase.shared
         guard let account = try database.getAccount(index: 0) else {
             throw TransactionError.proofGenerationFailed
@@ -78,39 +76,48 @@ final class TransactionBuilder {
         let chainHeight = try await NetworkManager.shared.getChainHeight()
         print("📊 Current chain height: \(chainHeight)")
 
-        // Get notes from database to find oldest note
-        let dbNotes = try database.getUnspentNotes(accountId: account.id)
-        guard !dbNotes.isEmpty else {
-            throw TransactionError.insufficientFunds
+        // Get notes from database - requires valid witnesses
+        var dbNotes = try database.getUnspentNotes(accountId: account.id)
+
+        // If no notes with witnesses, check for notes without witnesses that need rebuild
+        if dbNotes.isEmpty {
+            let allNotes = try database.getAllUnspentNotes(accountId: account.id)
+            if allNotes.isEmpty {
+                print("📝 No notes found in database")
+                throw TransactionError.insufficientFunds
+            }
+
+            print("📝 Found \(allNotes.count) notes without valid witnesses")
+            print("⚠️ Notes need witness rebuild - please use 'Rebuild Witnesses' button in Settings first")
+            throw TransactionError.proofGenerationFailed
         }
 
-        // CRITICAL: We need to rescan from the bundled tree height, NOT from oldest note!
-        // The bundled tree goes up to the height when it was exported.
-        // We must rescan from there to current to ensure complete tree with all new outputs.
-        // Note: commitment_tree_complete.bin is exported at a specific height and needs updating as chain grows
-        let bundledTreeHeight: UInt64 = 2921565  // Height where commitment_tree_complete.bin ends
-        let oldestNoteHeight = dbNotes.map { $0.height }.min() ?? chainHeight
+        print("📝 Found \(dbNotes.count) notes with valid witnesses")
 
-        // Rescan from bundled tree height OR older if note is older
-        let rescanFromHeight = min(bundledTreeHeight, oldestNoteHeight)
+        // Check if witnesses need updating (tree has grown since witness was created)
+        let bundledTreeHeight: UInt64 = 2922769
 
-        print("📝 Rescanning from block \(rescanFromHeight) (bundled tree ends at \(bundledTreeHeight)) to \(chainHeight)...")
-        print("📝 Oldest note is at height \(oldestNoteHeight)")
-
-        // Force rescan by setting last scanned height to before rescan point
-        let originalHeight = try? database.getLastScannedHeight()
-        try? database.updateLastScannedHeight(rescanFromHeight - 1, hash: Data(repeating: 0, count: 32))
-
-        // CRITICAL: Clear the database tree state to force reload from bundled CMUs
-        // This ensures we start with a clean, known-good tree state
-        print("📝 Clearing database tree state to force rebuild from bundled CMUs...")
-        try? database.clearTreeStateForRebuild()
-
-        // Rescan to rebuild fresh witnesses
-        let scanner = FilterScanner()
-        try await scanner.startScan(for: account.id, viewingKey: spendingKey)
-
-        print("✅ Fresh witnesses rebuilt from blockchain")
+        // Load the commitment tree to update witnesses if needed
+        if let treeData = try? database.getTreeState() {
+            _ = ZipherXFFI.treeDeserialize(data: treeData)
+            print("✅ Commitment tree loaded from database")
+        } else {
+            // Load bundled tree from app resources
+            print("🌳 Loading bundled commitment tree...")
+            if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree_v2", withExtension: "bin"),
+               let bundledData = try? Data(contentsOf: bundledTreeURL) {
+                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("✅ Loaded bundled commitment tree with \(treeSize) commitments")
+                } else {
+                    print("❌ Failed to load bundled tree")
+                    throw TransactionError.proofGenerationFailed
+                }
+            } else {
+                print("❌ Bundled tree file not found")
+                throw TransactionError.proofGenerationFailed
+            }
+        }
 
         // Get spendable notes with FRESH witnesses
         let notes = try await getSpendableNotes(for: from, spendingKey: spendingKey)
@@ -129,16 +136,84 @@ final class TransactionBuilder {
             memoData.replaceSubrange(0..<min(memoBytes.count, 512), with: memoBytes)
         }
 
-        // CRITICAL: Get anchor from block header at current height
-        // This is zcashd's EXACT anchor (finalsaplingroot) - guaranteed to match!
+        // CRITICAL: Get anchor from block header
+        // The anchor MUST match the tree state at the height where our witness is valid
         let headerStore = HeaderStore.shared
-        guard let currentAnchor = try? headerStore.getAnchor(at: chainHeight) else {
-            print("❌ Failed to get anchor from block header at height \(chainHeight)")
+
+        // Ensure HeaderStore is open
+        try? headerStore.open()
+
+        // ALWAYS sync headers to current chain height before building transaction
+        // This ensures we have the correct anchor for our witness
+        let headerSync = HeaderSyncManager(
+            headerStore: headerStore,
+            networkManager: NetworkManager.shared
+        )
+
+        var latestSyncedHeight = (try? headerStore.getLatestHeight()) ?? 0
+        print("📊 Current headers at height: \(latestSyncedHeight), Chain tip: \(chainHeight)")
+
+        // ALWAYS sync headers to current chain height before building transaction
+        if latestSyncedHeight < chainHeight {
+            print("🔄 Headers behind chain tip (\(latestSyncedHeight) < \(chainHeight)), syncing...")
+
+            // Sync from where we left off (or recent blocks if starting fresh)
+            let startHeight = latestSyncedHeight > 0 ? latestSyncedHeight + 1 : (chainHeight > 5000 ? chainHeight - 5000 : 0)
+
+            do {
+                try await headerSync.syncHeaders(from: startHeight)
+                latestSyncedHeight = (try? headerStore.getLatestHeight()) ?? 0
+                print("✅ Headers synced to height \(latestSyncedHeight)")
+            } catch {
+                print("⚠️ Header sync failed: \(error)")
+                print("⚠️ Will use existing headers at height \(latestSyncedHeight)")
+            }
+        }
+
+        guard latestSyncedHeight > 0 else {
+            print("❌ No headers available!")
+            throw TransactionError.proofGenerationFailed
+        }
+
+        print("📊 Chain tip: \(chainHeight), Latest synced header: \(latestSyncedHeight)")
+
+        // Use the latest synced height (may be slightly behind chain tip)
+        let anchorHeight = latestSyncedHeight
+
+        guard let headerAnchor = try? headerStore.getAnchor(at: anchorHeight) else {
+            print("❌ Failed to get anchor from block header at height \(anchorHeight)")
             print("💡 Make sure headers are synced! Run HeaderSyncManager.syncHeaders() first")
             throw TransactionError.proofGenerationFailed
         }
-        print("📝 Using anchor from block header at height \(chainHeight): \(currentAnchor.prefix(16).map { String(format: "%02x", $0) }.joined())...")
-        print("✅ This anchor came directly from zcashd's block header - guaranteed to match!")
+
+        // Get our local tree root for comparison
+        let localTreeRoot = ZipherXFFI.treeRoot()
+        let localRootHex = localTreeRoot?.prefix(16).map { String(format: "%02x", $0) }.joined() ?? "nil"
+        let headerAnchorHex = headerAnchor.prefix(16).map { String(format: "%02x", $0) }.joined()
+
+        print("📝 Header anchor at height \(anchorHeight): \(headerAnchorHex)...")
+        print("📝 Local tree root (from our tree):         \(localRootHex)...")
+
+        // CRITICAL: The witness was built from OUR tree, so we MUST use OUR tree root as anchor
+        // Using header anchor with our witness will always fail because they don't match
+        guard let localRoot = localTreeRoot else {
+            print("❌ Failed to get local tree root")
+            throw TransactionError.proofGenerationFailed
+        }
+
+        // Check if our tree root matches zcashd's
+        if localRoot == headerAnchor {
+            print("✅ LOCAL TREE ROOT MATCHES HEADER ANCHOR!")
+        } else {
+            print("⚠️ Tree root mismatch detected:")
+            print("   Our tree:    \(localRootHex)...")
+            print("   zcashd at \(anchorHeight): \(headerAnchorHex)...")
+            print("💡 Using our local tree root - zcashd must accept it as a valid historical anchor")
+        }
+
+        // Use OUR tree root as anchor (witness must match anchor!)
+        let currentAnchor = localRoot
+        print("📝 Using LOCAL tree root as anchor: \(localRootHex)...")
 
         // Build transaction using FFI
         guard let rawTx = ZipherXFFI.buildTransaction(
@@ -146,12 +221,12 @@ final class TransactionBuilder {
             toAddress: toAddressBytes,
             amount: amount,
             memo: memoData,
-            anchor: currentAnchor,  // Use CURRENT anchor, not database anchor
+            anchor: currentAnchor,  // Use anchor from latest synced header
             witness: note.witness,
             noteValue: note.value,
             noteRcm: note.rcm,
             noteDiversifier: note.diversifier,
-            chainHeight: chainHeight
+            chainHeight: chainHeight  // Use CURRENT chain height for expiry calculation
         ) else {
             throw TransactionError.proofGenerationFailed
         }

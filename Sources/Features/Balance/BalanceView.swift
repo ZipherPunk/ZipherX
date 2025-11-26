@@ -115,19 +115,39 @@ struct BalanceView: View {
 
     private var networkStatus: some View {
         VStack(spacing: 0) {
-            // Connection status
+            // Connection status with more details
             HStack(spacing: 8) {
+                // Animated connection indicator
                 Circle()
-                    .fill(networkManager.isConnected ? Color.green : Color.red)
+                    .fill(connectionColor)
                     .frame(width: 8, height: 8)
 
-                Text(networkManager.isConnected
-                    ? "Connected to \(networkManager.connectedPeers) peers"
-                    : "Disconnected")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(connectionStatusText)
+                        .font(System7Theme.bodyFont(size: 10))
+                        .foregroundColor(System7Theme.black)
+
+                    if networkManager.knownAddressCount > 0 {
+                        Text("\(networkManager.knownAddressCount) known addresses")
+                            .font(System7Theme.bodyFont(size: 8))
+                            .foregroundColor(System7Theme.darkGray)
+                    }
+                }
 
                 Spacer()
+
+                // Retry button when disconnected
+                if !networkManager.isConnected && !isRefreshing {
+                    Button(action: { retryConnection() }) {
+                        Text("Retry")
+                            .font(System7Theme.bodyFont(size: 9))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(System7Theme.lightGray)
+                            .overlay(Rectangle().stroke(System7Theme.black, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -175,15 +195,73 @@ struct BalanceView: View {
                 .padding(.vertical, 6)
             }
 
-            // Sync tasks list - always show when tasks exist
-            if !walletManager.syncTasks.isEmpty {
+            // Sync tasks list - always show when tasks exist or syncing
+            if !walletManager.syncTasks.isEmpty || walletManager.isSyncing {
                 Divider()
                     .background(System7Theme.black)
 
-                VStack(spacing: 4) {
+                VStack(spacing: 6) {
+                    // Sync status header
+                    if walletManager.isSyncing {
+                        HStack {
+                            ProgressView()
+                                .scaleEffect(0.5)
+                            Text("Syncing...")
+                                .font(System7Theme.bodyFont(size: 9))
+                                .foregroundColor(System7Theme.black)
+                            Spacer()
+                            if walletManager.syncProgress > 0 {
+                                Text("\(Int(walletManager.syncProgress * 100))%")
+                                    .font(System7Theme.bodyFont(size: 9))
+                                    .foregroundColor(System7Theme.darkGray)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.top, 4)
+
+                        // Overall progress bar
+                        if walletManager.syncProgress > 0 {
+                            GeometryReader { geometry in
+                                ZStack(alignment: .leading) {
+                                    Rectangle()
+                                        .fill(System7Theme.white)
+                                        .frame(height: 10)
+                                        .overlay(Rectangle().stroke(System7Theme.black, lineWidth: 1))
+
+                                    Rectangle()
+                                        .fill(Color.blue.opacity(0.7))
+                                        .frame(width: geometry.size.width * min(walletManager.syncProgress, 1.0), height: 8)
+                                        .padding(.leading, 1)
+                                        .padding(.top, 1)
+                                }
+                            }
+                            .frame(height: 10)
+                            .padding(.horizontal, 8)
+                        }
+                    }
+
+                    // Individual tasks
                     ForEach(walletManager.syncTasks) { task in
                         syncTaskRow(task)
                     }
+                }
+                .padding(.vertical, 4)
+            }
+
+            // Show "synced" message when up to date
+            if !walletManager.isSyncing && networkManager.chainHeight > 0 &&
+               networkManager.walletHeight >= networkManager.chainHeight {
+                Divider()
+                    .background(System7Theme.black)
+
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 10))
+                    Text("Wallet synced")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
                 }
                 .padding(8)
             }
@@ -272,7 +350,44 @@ struct BalanceView: View {
         }
     }
 
+    // MARK: - Computed Properties
+
+    private var connectionColor: Color {
+        if networkManager.isConnectedToLocalNode {
+            return .green  // Local full node = always green (trusted)
+        } else if networkManager.isConnected {
+            return networkManager.connectedPeers >= 3 ? .green : .yellow
+        } else if isRefreshing {
+            return .orange
+        } else {
+            return .red
+        }
+    }
+
+    private var connectionStatusText: String {
+        if isRefreshing && !networkManager.isConnected {
+            return "Connecting..."
+        } else if networkManager.isConnectedToLocalNode {
+            return "Local Full Node (trusted)"
+        } else if networkManager.isConnected {
+            let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
+            return "Connected to \(networkManager.connectedPeers) \(peerWord)"
+        } else {
+            return "Disconnected"
+        }
+    }
+
     // MARK: - Actions
+
+    private func retryConnection() {
+        Task {
+            do {
+                try await networkManager.connect()
+            } catch {
+                print("Connection retry failed: \(error)")
+            }
+        }
+    }
 
     private func refreshBalance() {
         isRefreshing = true

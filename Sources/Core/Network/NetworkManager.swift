@@ -16,9 +16,16 @@ final class NetworkManager: ObservableObject {
     private let MAX_KNOWN_ADDRESSES = 1000
     private let GETADDR_INTERVAL: TimeInterval = 60 // Request addresses every minute initially
 
+    // MARK: - Local Full Node Support
+    // When connected to local full node, trust it fully (no multi-peer consensus needed)
+    // Local full node configuration (internal for extension access)
+    let LOCAL_NODE_HOST = "192.168.178.86"
+    let LOCAL_NODE_PORT: UInt16 = 8033
+
     // MARK: - Published Properties
     @Published private(set) var connectedPeers: Int = 0
     @Published private(set) var isConnected: Bool = false
+    @Published private(set) var isConnectedToLocalNode: Bool = false  // True when local full node is connected
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var lastBlockHeight: UInt64 = 0
     @Published private(set) var knownAddressCount: Int = 0
@@ -56,18 +63,17 @@ final class NetworkManager: ObservableObject {
     ]
 
     // Hardcoded peers for reliable connectivity (IP addresses only)
-    // Working nodes first
+    // Local node first (use LAN IP for iOS Simulator), then peers from our full node
     private let hardcodedPeersZCL = [
-        "127.0.0.1:8033",        // Local full node (highest priority)
-        "localhost:8033",        // Local full node alternative
-        "205.209.104.118:8033",  // Known working
-        "74.50.74.102:8033",     // Known working
+        "192.168.178.86:8033",   // Local full node via LAN IP (for iOS Simulator)
+        "185.205.246.161:8033",  // Connected peer from our full node
+        "140.174.189.3:8033",    // Connected peer from our full node
+        "205.209.104.118:8033",
+        "74.50.74.102:8033",
         "162.55.92.62:8033",
         "157.90.223.151:8033",
         "37.187.76.79:8033",
         "51.178.179.75:8033",
-        "140.174.189.3:8033",
-        "185.205.246.161:8033",
         "54.37.81.148:8033",
         "67.183.29.123:8033",
         "116.202.13.16:8033",
@@ -348,9 +354,17 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.insufficientPeers(connectedCount, MIN_PEERS)
         }
 
+        // Check if we're connected to local full node
+        let localNodeConnected = peers.contains { $0.host == LOCAL_NODE_HOST && $0.port == LOCAL_NODE_PORT }
+
         DispatchQueue.main.async {
             self.connectedPeers = connectedCount
             self.isConnected = connectedCount > 0
+            self.isConnectedToLocalNode = localNodeConnected
+        }
+
+        if localNodeConnected {
+            print("🏠 Connected to LOCAL FULL NODE - trusted mode enabled")
         }
 
         // Persist good addresses for next launch
@@ -367,6 +381,7 @@ final class NetworkManager: ObservableObject {
         DispatchQueue.main.async {
             self.connectedPeers = 0
             self.isConnected = false
+            self.isConnectedToLocalNode = false
         }
     }
 
@@ -576,10 +591,13 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        print("📡 Broadcast results: \(successCount)/\(peers.count) successful (need \(CONSENSUS_THRESHOLD))")
+        // For local full node, only need 1 successful broadcast; otherwise need CONSENSUS_THRESHOLD
+        let requiredConfirmations = isConnectedToLocalNode ? 1 : CONSENSUS_THRESHOLD
 
-        guard successCount >= CONSENSUS_THRESHOLD, let txId = txId else {
-            print("❌ Broadcast failed: insufficient confirmations (\(successCount) < \(CONSENSUS_THRESHOLD))")
+        print("📡 Broadcast results: \(successCount)/\(peers.count) successful (need \(requiredConfirmations))")
+
+        guard successCount >= requiredConfirmations, let txId = txId else {
+            print("❌ Broadcast failed: insufficient confirmations (\(successCount) < \(requiredConfirmations))")
             throw NetworkError.broadcastFailed
         }
 

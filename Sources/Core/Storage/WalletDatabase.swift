@@ -419,7 +419,61 @@ final class WalletDatabase {
         print("📊 ================================")
     }
 
-    /// Get unspent notes for account
+    /// Get all unspent notes (regardless of witness status) - for diagnostics
+    func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
+        let sql = """
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness
+            FROM notes
+            WHERE account_id = ? AND is_spent = 0
+            ORDER BY received_height ASC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        var notes: [WalletNote] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let divPtr = sqlite3_column_blob(stmt, 1)
+            let divLen = sqlite3_column_bytes(stmt, 1)
+            let value = UInt64(sqlite3_column_int64(stmt, 2))
+            let rcmPtr = sqlite3_column_blob(stmt, 3)
+            let rcmLen = sqlite3_column_bytes(stmt, 3)
+            let nfPtr = sqlite3_column_blob(stmt, 5)
+            let nfLen = sqlite3_column_bytes(stmt, 5)
+            let height = UInt64(sqlite3_column_int64(stmt, 7))
+
+            // Witness might be NULL
+            var witnessData = Data()
+            if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
+                let witnessPtr = sqlite3_column_blob(stmt, 8)
+                let witnessLen = sqlite3_column_bytes(stmt, 8)
+                witnessData = Data(bytes: witnessPtr!, count: Int(witnessLen))
+            }
+
+            let note = WalletNote(
+                id: id,
+                diversifier: Data(bytes: divPtr!, count: Int(divLen)),
+                value: value,
+                rcm: Data(bytes: rcmPtr!, count: Int(rcmLen)),
+                nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
+                height: height,
+                witness: witnessData
+            )
+
+            notes.append(note)
+        }
+
+        return notes
+    }
+
+    /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
             SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness
@@ -736,6 +790,35 @@ final class WalletDatabase {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("🗑️ Deleted transaction history")
+    }
+
+    /// Clear notes for rescan WITHOUT affecting tree state
+    /// Used when rescanning within bundled tree range - preserves tree but clears notes for rediscovery
+    func clearNotesForRescan() throws {
+        // Delete all notes (they will be re-discovered during scan)
+        var sql = "DELETE FROM notes;"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Deleted all notes (tree preserved)")
+
+        // Delete all nullifiers
+        sql = "DELETE FROM nullifiers;"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Deleted all nullifiers")
+
+        // Delete transaction history
+        sql = "DELETE FROM transaction_history;"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Deleted transaction history")
+
+        // Note: We intentionally do NOT clear tree_state or last_scanned_height
+        // The tree remains intact for spending proofs
+        print("📝 Tree state preserved for spending")
     }
 
     // MARK: - Transaction History

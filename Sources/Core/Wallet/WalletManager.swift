@@ -365,18 +365,63 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
-        // Clear existing notes but keep tree if we're starting from a specific height
-        if let startHeight = startHeight {
-            // For Full Rescan from Height: must scan from Sapling activation to build proper witnesses
-            // The bundled tree is a frontier-only tree and cannot generate witnesses for past positions
-            print("⚠️ Full rescan from height \(startHeight) requires scanning from Sapling activation")
-            print("⚠️ This is necessary to build proper Merkle witnesses for spending")
+        // Ensure network connection before scanning
+        print("📡 Ensuring network connection...")
+        if !NetworkManager.shared.isConnected {
+            try await NetworkManager.shared.connect()
+            // Wait a moment for connection to stabilize
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+        }
+        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
-            // Reset everything and start fresh
-            try WalletDatabase.shared.resetSyncState()
-            _ = ZipherXFFI.treeInit()
-            print("🌳 Initialized empty tree - will build from Sapling activation")
-            print("🔄 Starting full rescan from Sapling activation (559500)")
+        // Clear existing notes but keep tree if we're starting from a specific height
+        let bundledTreeHeight: UInt64 = 2922769  // Height where bundled tree ends
+
+        // Wait for any existing scan to complete (with timeout)
+        if FilterScanner.isScanInProgress {
+            print("⏳ Another scan is in progress, waiting for it to complete...")
+            var waitCount = 0
+            let maxWait = 60 // Maximum 60 seconds wait
+            while FilterScanner.isScanInProgress && waitCount < maxWait {
+                try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+                waitCount += 1
+                if waitCount % 5 == 0 {
+                    print("⏳ Still waiting for scan to complete... (\(waitCount)s)")
+                }
+            }
+            if FilterScanner.isScanInProgress {
+                print("⚠️ Existing scan still running after \(maxWait)s, forcing new scan anyway")
+            } else {
+                print("✅ Previous scan completed, proceeding with new scan")
+            }
+        }
+
+        if let startHeight = startHeight {
+            // Check if the requested height is within the bundled tree range
+            if startHeight <= bundledTreeHeight {
+                // For heights within bundled tree: use quick scan (note detection only, no tree changes)
+                // This preserves the correct bundled tree while finding notes
+                // NOTE: We do NOT clear existing notes - just scan for additional ones
+                print("🔍 Quick scan mode: height \(startHeight) is within bundled tree range (ends at \(bundledTreeHeight))")
+                print("🔍 Will scan for notes WITHOUT modifying the commitment tree or existing notes")
+
+                // Create scanner with progress callback
+                let scanner = FilterScanner()
+                scanner.onProgress = onProgress
+
+                // Pass fromHeight to trigger quick scan mode (parallel, no CMU additions)
+                try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: startHeight)
+
+                // Refresh balance after scan
+                try await refreshBalance()
+                print("✅ Quick scan complete from height \(startHeight)")
+                return
+            } else {
+                // Height is beyond bundled tree - do sequential scan from bundled tree end
+                print("⚠️ Full rescan from height \(startHeight) is beyond bundled tree (\(bundledTreeHeight))")
+                print("🔄 Will continue sequential scan from bundled tree end")
+                try WalletDatabase.shared.resetSyncState()
+            }
         } else {
             // Reset all sync state (notes, nullifiers, tree)
             try WalletDatabase.shared.resetSyncState()
@@ -419,6 +464,15 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
+        // Ensure network connection before scanning
+        print("📡 Ensuring network connection...")
+        if !NetworkManager.shared.isConnected {
+            try await NetworkManager.shared.connect()
+            // Wait a moment for connection to stabilize
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+        }
+        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+
         // Clear tree state and witnesses to force rebuild
         try WalletDatabase.shared.clearTreeStateForRebuild()
         print("🔄 Cleared tree state and witnesses")
@@ -458,6 +512,15 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
         print("👤 Account ID: \(account.id)")
+
+        // Ensure network connection before scanning
+        print("📡 Ensuring network connection...")
+        if !NetworkManager.shared.isConnected {
+            try await NetworkManager.shared.connect()
+            // Wait a moment for connection to stabilize
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+        }
+        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
         // Tree initialization depends on scan start height
         // For full rescans (from Sapling activation), start with empty tree
