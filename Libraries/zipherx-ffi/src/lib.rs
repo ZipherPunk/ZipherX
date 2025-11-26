@@ -1509,8 +1509,16 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // Parse as Node
-        let node = match zcash_primitives::sapling::Node::read(cmu_bytes) {
+        // CRITICAL: CMUs in bundled file are stored in little-endian (reversed) byte order
+        // zcashd RPC returns them in big-endian (display) format, but our export tool
+        // stored them wrong. We need to reverse the bytes.
+        let mut cmu_reversed = [0u8; 32];
+        for j in 0..32 {
+            cmu_reversed[j] = cmu_bytes[31 - j];
+        }
+
+        // Parse as Node (expects big-endian format)
+        let node = match zcash_primitives::sapling::Node::read(&cmu_reversed[..]) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("❌ Failed to parse CMU at position {}: {:?}", i, e);
@@ -1539,6 +1547,147 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     eprintln!("✅ Tree loaded with {} commitments", count);
 
     true
+}
+
+/// Create a witness for a specific CMU from bundled CMU data
+/// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
+///
+/// Parameters:
+/// - cmu_data: Pointer to bundled CMU file data [count: u64][cmu1: 32]...
+/// - cmu_data_len: Length of CMU data
+/// - target_cmu: The 32-byte CMU to create witness for
+/// - witness_out: Output buffer for serialized witness (at least 2000 bytes)
+/// - witness_out_len: Output for actual witness length
+///
+/// Returns: The position (0-indexed) of the CMU, or u64::MAX on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmu: *const u8,
+    witness_out: *mut u8,
+    witness_out_len: *mut usize,
+) -> u64 {
+    if cmu_data_len < 8 {
+        eprintln!("❌ CMU data too short");
+        return u64::MAX;
+    }
+
+    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
+    let target_bytes = slice::from_raw_parts(target_cmu, 32);
+
+    // Read count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        eprintln!("❌ CMU data too short for {} CMUs", count);
+        return u64::MAX;
+    }
+
+    // Reverse target_bytes to match bundled file format (little-endian storage)
+    let mut target_reversed = [0u8; 32];
+    for j in 0..32 {
+        target_reversed[j] = target_bytes[31 - j];
+    }
+
+    // Find target CMU position (compare against reversed format in file)
+    let mut target_pos: Option<u64> = None;
+    let mut offset = 8;
+    for i in 0..count {
+        if &bytes[offset..offset + 32] == &target_reversed[..] {
+            target_pos = Some(i);
+            break;
+        }
+        offset += 32;
+    }
+
+    let target_pos = match target_pos {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ Target CMU not found in bundled data");
+            eprintln!("   Target (big-endian): {:02x?}...", &target_bytes[0..8]);
+            eprintln!("   Target (reversed):   {:02x?}...", &target_reversed[0..8]);
+            return u64::MAX;
+        }
+    };
+
+    eprintln!("📍 Found target CMU at position {}", target_pos);
+
+    // Build tree up to target position, creating witness there
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+
+    offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // CRITICAL: Reverse bytes from little-endian storage to big-endian for parsing
+        let mut cmu_reversed = [0u8; 32];
+        for j in 0..32 {
+            cmu_reversed[j] = cmu_bytes[31 - j];
+        }
+
+        // Parse as Node (expects big-endian format)
+        let node = match zcash_primitives::sapling::Node::read(&cmu_reversed[..]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("❌ Failed to parse CMU at position {}: {:?}", i, e);
+                return u64::MAX;
+            }
+        };
+
+        // Append to tree
+        if tree.append(node).is_err() {
+            eprintln!("❌ Failed to append CMU at position {}", i);
+            return u64::MAX;
+        }
+
+        // Create witness at target position
+        if i == target_pos {
+            witness = Some(IncrementalWitness::from_tree(tree.clone()));
+            eprintln!("📝 Created witness at position {}", i);
+        } else if i > target_pos {
+            // Update existing witness with new nodes
+            if let Some(ref mut w) = witness {
+                w.append(node).ok();
+            }
+        }
+
+        // Progress logging
+        if i > 0 && i % 200000 == 0 {
+            eprintln!("   Progress: {}/{}", i, count);
+        }
+    }
+
+    // Serialize witness
+    let witness = match witness {
+        Some(w) => w,
+        None => {
+            eprintln!("❌ Witness not created");
+            return u64::MAX;
+        }
+    };
+
+    let mut serialized = Vec::new();
+    if write_incremental_witness(&witness, &mut serialized).is_err() {
+        eprintln!("❌ Failed to serialize witness");
+        return u64::MAX;
+    }
+
+    eprintln!("📝 Serialized witness: {} bytes", serialized.len());
+
+    // Copy to output
+    if serialized.len() > 2000 {
+        eprintln!("❌ Witness too large: {} bytes", serialized.len());
+        return u64::MAX;
+    }
+
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_out, serialized.len());
+    *witness_out_len = serialized.len();
+
+    target_pos
 }
 
 // =============================================================================

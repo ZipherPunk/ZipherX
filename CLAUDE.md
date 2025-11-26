@@ -340,6 +340,33 @@ var hasLocalFullNode: Bool {
 **Problem**: Used wrong FFI function `loadBundledCMUs` which doesn't exist
 **Fix**: Changed to `ZipherXFFI.treeLoadFromCMUs(data:)` with proper Bundle resource loading
 
+### 5. CRITICAL: CMU Byte Order in Bundled Tree (causing spend failures)
+**Problem**: Transaction building failed with "bad-txns-sapling-spend-description-invalid"
+- Tree root mismatch: Our tree produced different root than zcashd
+- Root cause: CMUs in `commitment_tree_v2.bin` were stored with REVERSED byte order
+- The export tool stored CMUs in little-endian (internal) format but the tree loader expected big-endian (display/RPC) format
+
+**Diagnosis Steps Used**:
+1. Compared first CMU in bundled file with first CMU from zcashd RPC
+2. Found bytes were reversed: File had `43391df0...5a` while chain had `5a8d47a7...43`
+3. Confirmed `bytes.reverse()` produces matching values
+
+**Fix** (in `lib.rs`):
+- `zipherx_tree_load_from_cmus()`: Reverse each 32-byte CMU before parsing
+- `zipherx_tree_create_witness_for_cmu()`: Reverse target CMU for comparison, then reverse each CMU during tree building
+
+```rust
+// CRITICAL: Reverse bytes from little-endian storage to big-endian for parsing
+let mut cmu_reversed = [0u8; 32];
+for j in 0..32 {
+    cmu_reversed[j] = cmu_bytes[31 - j];
+}
+let node = zcash_primitives::sapling::Node::read(&cmu_reversed[..])?;
+```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - lines ~1512-1520 and ~1588-1638
+
 ---
 
 ## Technical Notes
