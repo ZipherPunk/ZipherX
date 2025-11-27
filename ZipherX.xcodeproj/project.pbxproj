@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		BIOM002A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */; };
+		ASST002A2B3C4D5E6F7G8H9I /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
 		12FB4AE1B988C5445B1DF517 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 233F470A9D31A763B0F2EA5D /* HeaderStore.swift */; };
@@ -56,6 +58,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiometricAuthManager.swift; sourceTree = "<group>"; };
+		ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyQuotes.swift; sourceTree = "<group>"; };
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
 		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -132,6 +136,7 @@
 				A57133D73210DCD2789FEF97 /* Crypto */,
 				89B060A782EF443EA7627E21 /* Data */,
 				7A12B43495B930D9722D1AB2 /* Network */,
+				SECU001A2B3C4D5E6F7G8H9I /* Security */,
 				1BB02293A68E4F3B9A692C67 /* Services */,
 				741F678816701EA43E8FB889 /* Storage */,
 				02445EE7D9E99A6488E201EA /* Wallet */,
@@ -147,9 +152,18 @@
 			path = Services;
 			sourceTree = "<group>";
 		};
+		SECU001A2B3C4D5E6F7G8H9I /* Security */ = {
+			isa = PBXGroup;
+			children = (
+				BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */,
+			);
+			path = Security;
+			sourceTree = "<group>";
+		};
 		1E0AB0F916282FFBD8E5F74E = {
 			isa = PBXGroup;
 			children = (
+				ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */,
 				2399E776D535082F71A346B3 /* Sources */,
 				9F3A33E9612EA4CDB1AB6050 /* Tests */,
 				BF076F58239E016FB50CB85E /* Frameworks */,
@@ -422,6 +436,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				ASST002A2B3C4D5E6F7G8H9I /* Assets.xcassets in Resources */,
 				7C38AF6C374A0F3FC5A6B5AA /* commitment_tree.bin in Resources */,
 				EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */,
 			);
@@ -434,6 +449,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				BIOM002A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift in Sources */,
 				6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */,
 				415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,

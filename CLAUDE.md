@@ -502,6 +502,46 @@ Created `/Users/chris/ZipherX/Libraries/zcash_primitives_zcl/` with native `Zcla
 - `Libraries/zipherx-ffi/Cargo.toml` - uses local zcash_primitives fork
 - `Libraries/zipherx-ffi/src/lib.rs` - ZclassicNetwork activates ZclassicButtercup at height 707,000
 
+### 7. CRITICAL: Fresh Install Shows Old Balance - Nullifier Detection (November 2025)
+
+**Problem**: After reinstalling app and importing private key, balance showed OLD value (spent notes appeared unspent)
+
+**Root Cause**:
+- Fresh install with bundled tree started scanning from `bundledTreeHeight + 1` (2,923,124)
+- Blocks within bundled range (up to 2,923,123) were NEVER scanned
+- Nullifiers (which mark notes as spent) in those blocks were never checked
+- Old spent notes appeared as unspent → incorrect balance
+
+**Fix Applied** (in `FilterScanner.swift`):
+
+1. **Fresh install now scans entire bundled range** (lines 115-130):
+   - Changed from `startHeight = bundledTreeHeight + 1` to `startHeight = saplingActivationHeight`
+   - Set `scanWithinBundledRange = true` for fresh installs with bundled tree
+   - Triggers PHASE 1 parallel scanning for notes AND nullifiers
+
+2. **Added nullifier checking to all scanning modes**:
+   - `processShieldedOutputsForNotesOnly()` now accepts `spends: [ShieldedSpend]?`
+   - `processShieldedOutputsSync()` now accepts `spends: [ShieldedSpend]?`
+   - Both functions check each spend's nullifier against `knownNullifiers`
+   - Matching notes are marked as spent in database
+
+3. **Updated all scan paths to fetch spends**:
+   - PHASE 1 parallel scan fetches `vShieldedSpend` from Insight API
+   - Quick scan mode fetches spends
+   - Sequential mode fetches spends
+
+**Behavior After Fix**:
+```
+📦 Fresh install with bundled tree - scanning from Sapling activation 476969
+   PHASE 1: Will scan 476969 to 2923123 for notes + nullifiers (parallel, no tree changes)
+   PHASE 2: Will scan 2923124 to chain tip (sequential, tree building)
+💸 Note spent at height 2919000 - nullifier: abc123...
+```
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - added nullifier detection, fixed fresh install scan range
+- `Sources/Core/Wallet/WalletManager.swift` - added cypherpunk progress messages
+
 ---
 
 ## Technical Notes

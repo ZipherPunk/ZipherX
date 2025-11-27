@@ -31,6 +31,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var zAddress: String = ""
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var isSyncing: Bool = false
+    @Published private(set) var syncStatus: String = ""
     @Published private(set) var lastError: WalletError?
     @Published private(set) var syncTasks: [SyncTask] = []
 
@@ -67,7 +68,7 @@ final class WalletManager: ObservableObject {
         print("🌳 Preloading commitment tree...")
 
         await MainActor.run {
-            self.treeLoadStatus = "Opening database..."
+            self.treeLoadStatus = "Initializing secure vault..."
         }
 
         // Open database if needed
@@ -82,7 +83,7 @@ final class WalletManager: ObservableObject {
 
         // Try to load from database first (fast path)
         await MainActor.run {
-            self.treeLoadStatus = "Loading from cache..."
+            self.treeLoadStatus = "Restoring Merkle state..."
         }
 
         if let treeData = try? WalletDatabase.shared.getTreeState() {
@@ -92,7 +93,7 @@ final class WalletManager: ObservableObject {
                 await MainActor.run {
                     self.isTreeLoaded = true
                     self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Tree loaded (\(treeSize.formatted()) CMUs)"
+                    self.treeLoadStatus = "Privacy state restored\n\(treeSize.formatted()) commitments ready"
                 }
                 return
             }
@@ -101,12 +102,24 @@ final class WalletManager: ObservableObject {
         // Fall back to loading bundled CMUs (slow path, only first time)
         print("🌳 Loading bundled commitment tree (first time)...")
         await MainActor.run {
-            self.treeLoadStatus = "Loading bundled tree (first time)..."
+            self.treeLoadStatus = "Building cryptographic foundation..."
             self.treeLoadProgress = 0.0
         }
 
         if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
            let bundledData = try? Data(contentsOf: bundledTreeURL) {
+
+            // Cypherpunk messages for tree building
+            let treeLoadMessages = [
+                "Constructing zero-knowledge tree...",
+                "Assembling cryptographic proofs...",
+                "Building Merkle commitments...",
+                "Weaving the privacy lattice...",
+                "Forging shielded infrastructure...",
+                "Computing Pedersen hashes...",
+                "Anchoring the privacy chain...",
+                "Establishing trust anchors..."
+            ]
 
             // Use progress callback version
             let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { [weak self] current, total in
@@ -114,10 +127,14 @@ final class WalletManager: ObservableObject {
                 let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
                 let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
 
+                // Rotate through cypherpunk messages
+                let messageIndex = Int(current / 100000) % treeLoadMessages.count
+                let statusMessage = treeLoadMessages[messageIndex]
+
                 // Update UI on main thread
                 DispatchQueue.main.async {
                     self?.treeLoadProgress = progress
-                    self?.treeLoadStatus = "\(currentFormatted) / \(totalFormatted) CMUs"
+                    self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
                 }
             }
 
@@ -134,18 +151,18 @@ final class WalletManager: ObservableObject {
                 await MainActor.run {
                     self.isTreeLoaded = true
                     self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Tree loaded (\(treeSize.formatted()) CMUs)"
+                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
                 }
             } else {
                 print("❌ Failed to load bundled tree")
                 await MainActor.run {
-                    self.treeLoadStatus = "Failed to load tree"
+                    self.treeLoadStatus = "Cryptographic tree build failed"
                 }
             }
         } else {
             print("❌ Bundled tree file not found")
             await MainActor.run {
-                self.treeLoadStatus = "Tree file not found"
+                self.treeLoadStatus = "Privacy data not found"
             }
         }
     }
@@ -223,6 +240,7 @@ final class WalletManager: ObservableObject {
         await MainActor.run {
             self.isSyncing = true
             self.syncProgress = 0.0
+            self.syncStatus = "Initializing privacy shield..."
             self.syncTasks = [
                 SyncTask(id: "params", title: "Fetch Sapling params", status: .pending),
                 SyncTask(id: "keys", title: "Load wallet keys", status: .pending),
@@ -360,11 +378,44 @@ final class WalletManager: ObservableObject {
         // Task 4: Scan blockchain
         await updateTask("scan", status: .inProgress)
         let scanner = FilterScanner()
+
+        // Bundled tree height for PHASE detection
+        let bundledTreeHeight: UInt64 = 2923123
+
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
                 self?.syncProgress = progress
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     self?.syncTasks[index].detail = "\(currentHeight) / \(maxHeight)"
+                }
+
+                // Update syncStatus with cypherpunk messages based on scan phase
+                if currentHeight <= bundledTreeHeight {
+                    // PHASE 1: Scanning within bundled tree range
+                    let phase1Messages = [
+                        "Hunting for your shielded notes...",
+                        "Decrypting the shadows...",
+                        "Scanning the privacy chain...",
+                        "Detecting spent nullifiers...",
+                        "Unveiling your hidden funds...",
+                        "Cypherpunk reconnaissance...",
+                        "Mining your transaction history...",
+                        "Privacy audit in progress..."
+                    ]
+                    let messageIndex = Int(currentHeight / 50000) % phase1Messages.count
+                    self?.syncStatus = phase1Messages[messageIndex]
+                } else {
+                    // PHASE 2: Sequential tree building
+                    let phase2Messages = [
+                        "Building commitment tree...",
+                        "Extending the Merkle frontier...",
+                        "Cryptographic tree expansion...",
+                        "Securing new commitments...",
+                        "Zero-knowledge sync active..."
+                    ]
+                    let blocksAfterBundled = currentHeight - bundledTreeHeight
+                    let messageIndex = Int(blocksAfterBundled / 1000) % phase2Messages.count
+                    self?.syncStatus = phase2Messages[messageIndex]
                 }
             }
         }
@@ -453,7 +504,7 @@ final class WalletManager: ObservableObject {
 
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
-        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+        // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
         let dbKey = Data(SHA256.hash(data: spendingKey))
@@ -552,7 +603,7 @@ final class WalletManager: ObservableObject {
 
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
-        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+        // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
         let dbKey = Data(SHA256.hash(data: spendingKey))
@@ -684,7 +735,7 @@ final class WalletManager: ObservableObject {
 
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
-        print("🔑 Retrieved spending key: \(spendingKey.count) bytes")
+        // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
         let dbKey = Data(SHA256.hash(data: spendingKey))
@@ -758,6 +809,32 @@ final class WalletManager: ObservableObject {
             if let detail = detail {
                 syncTasks[index].detail = detail
             }
+
+            // Update syncStatus with cypherpunk messages
+            if case .inProgress = status {
+                switch id {
+                case "params":
+                    self.syncStatus = "Loading cryptographic parameters..."
+                case "keys":
+                    self.syncStatus = "Unlocking your keys..."
+                case "database":
+                    self.syncStatus = "Opening secure vault..."
+                case "headers":
+                    self.syncStatus = "Syncing block headers..."
+                case "height":
+                    self.syncStatus = "Checking network state..."
+                case "scan":
+                    self.syncStatus = "Scanning for shielded notes..."
+                case "balance":
+                    self.syncStatus = "Calculating your sovereignty..."
+                default:
+                    self.syncStatus = "Processing..."
+                }
+            } else if case .completed = status {
+                // Update progress based on completed tasks
+                let completedCount = syncTasks.filter { if case .completed = $0.status { return true }; return false }.count
+                self.syncProgress = Double(completedCount) / Double(syncTasks.count)
+            }
         }
     }
 
@@ -814,6 +891,9 @@ final class WalletManager: ObservableObject {
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
+
+        // Send notification for successful transaction
+        NotificationManager.shared.notifySent(amount: amount, txid: txId)
 
         // Refresh balance
         try await refreshBalance()
@@ -874,6 +954,9 @@ final class WalletManager: ObservableObject {
         }
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
         print("✅ Note marked as spent in database")
+
+        // Send notification for successful transaction
+        NotificationManager.shared.notifySent(amount: amount, txid: txId)
 
         // Refresh balance
         try await refreshBalance()
@@ -1045,11 +1128,11 @@ final class WalletManager: ObservableObject {
         // Check if it's Bech32 format (secret-extended-key-main1...)
         if cleanKey.hasPrefix("secret-extended-key-main") {
             guard let keyData = ZipherXFFI.decodeSpendingKey(cleanKey) else {
-                print("❌ Failed to decode Bech32 spending key")
+                // Key decode failed
                 throw WalletError.invalidSeed
             }
             spendingKey = keyData
-            print("✅ Decoded Bech32 spending key")
+            // SECURITY: Key decoded - not logged
         }
         // Legacy hex format (338 chars)
         else if cleanKey.count == 338 {
@@ -1058,7 +1141,7 @@ final class WalletManager: ObservableObject {
                 throw WalletError.invalidSeed
             }
             spendingKey = keyData
-            print("✅ Decoded hex spending key")
+            // SECURITY: Key decoded - not logged
         }
         else {
             print("❌ Invalid key format: expected Bech32 (secret-extended-key-main1...) or hex (338 chars)")

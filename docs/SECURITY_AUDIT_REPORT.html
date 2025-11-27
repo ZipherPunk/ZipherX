@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZipherX Security Audit Report</title>
+    <style>
+        @font-face {
+            font-family: 'Chicago';
+            src: local('Chicago'), local('ChicagoFLF');
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #666699;
+            font-family: 'Chicago', 'Geneva', 'Helvetica Neue', sans-serif;
+            font-size: 12px;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            background-image:
+                linear-gradient(90deg, rgba(0,0,0,0.03) 1px, transparent 1px),
+                linear-gradient(rgba(0,0,0,0.03) 1px, transparent 1px);
+            background-size: 2px 2px;
+        }
+
+        .window {
+            background: #c0c0c0;
+            border: 2px solid #000;
+            box-shadow:
+                inset -1px -1px 0 #808080,
+                inset 1px 1px 0 #fff,
+                2px 2px 0 #000;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .title-bar {
+            background: linear-gradient(90deg, #000080, #1084d0);
+            color: #fff;
+            padding: 2px 4px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 2px solid #000;
+        }
+
+        .title-bar-text {
+            font-weight: bold;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+        }
+
+        .window-controls {
+            display: flex;
+            gap: 2px;
+        }
+
+        .window-button {
+            width: 13px;
+            height: 13px;
+            background: #c0c0c0;
+            border: 1px solid #000;
+            font-size: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        .content {
+            padding: 16px;
+            background: #fff;
+            border: 2px inset #808080;
+            margin: 8px;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 0 0 8px 0;
+            padding: 12px 16px;
+            background: #000;
+            color: #00ff00;
+            border: 2px solid #00ff00;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'Courier New', monospace;
+            text-shadow: 0 0 10px #00ff00;
+        }
+
+        h2 {
+            font-size: 14px;
+            margin: 16px 0 8px 0;
+            padding: 4px 8px;
+            background: #000;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+        }
+
+        h3 {
+            font-size: 12px;
+            margin: 12px 0 6px 0;
+            color: #000080;
+        }
+
+        .meta-info {
+            background: #ffffcc;
+            border: 1px solid #000;
+            padding: 8px;
+            margin-bottom: 16px;
+            font-size: 11px;
+        }
+
+        .meta-row {
+            display: flex;
+            margin: 2px 0;
+        }
+
+        .meta-label {
+            font-weight: bold;
+            width: 120px;
+        }
+
+        .severity-critical {
+            background: #ff0000;
+            color: #fff;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #800000;
+        }
+
+        .severity-high {
+            background: #ff8800;
+            color: #000;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #884400;
+        }
+
+        .severity-medium {
+            background: #ffcc00;
+            color: #000;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #886600;
+        }
+
+        .severity-low {
+            background: #88cc00;
+            color: #000;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #448800;
+        }
+
+        .status-fixed {
+            background: #00aa00;
+            color: #fff;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #006600;
+            margin-left: 8px;
+        }
+
+        .status-pending {
+            background: #888888;
+            color: #fff;
+            padding: 2px 6px;
+            font-weight: bold;
+            display: inline-block;
+            border: 1px solid #444444;
+            margin-left: 8px;
+        }
+
+        .finding {
+            border: 1px solid #000;
+            margin: 8px 0;
+            background: #f8f8f8;
+        }
+
+        .finding-header {
+            background: #c0c0c0;
+            padding: 4px 8px;
+            border-bottom: 1px solid #000;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .finding-body {
+            padding: 8px;
+        }
+
+        .code-block {
+            background: #000;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+            padding: 8px;
+            margin: 8px 0;
+            border: 1px solid #0f0;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .file-path {
+            color: #00ffff;
+        }
+
+        .line-number {
+            color: #ffff00;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 8px 0;
+            font-size: 11px;
+        }
+
+        th, td {
+            border: 1px solid #000;
+            padding: 4px 8px;
+            text-align: left;
+        }
+
+        th {
+            background: #000080;
+            color: #fff;
+        }
+
+        tr:nth-child(even) {
+            background: #e8e8e8;
+        }
+
+        .summary-box {
+            border: 2px solid #000;
+            margin: 16px 0;
+            background: #000;
+            color: #0f0;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .summary-box h3 {
+            color: #0f0;
+            margin-top: 0;
+            border-bottom: 1px solid #0f0;
+            padding-bottom: 4px;
+        }
+
+        .summary-box table {
+            background: #000;
+        }
+
+        .summary-box table tr,
+        .summary-box table td {
+            background: #000 !important;
+            color: #0f0;
+            border-color: #0f0;
+        }
+
+        .ascii-art {
+            font-family: 'Courier New', monospace;
+            font-size: 8px;
+            color: #0f0;
+            white-space: pre;
+            line-height: 1;
+            margin: 8px 0;
+            background: #000;
+            padding: 12px;
+            border: 1px solid #0f0;
+            text-shadow: 0 0 5px #0f0;
+        }
+
+        .cypherpunk-quote {
+            border-left: 3px solid #0f0;
+            padding: 8px 12px;
+            margin: 16px 0;
+            font-style: italic;
+            color: #00ff00;
+            background: #000;
+        }
+
+        .feature-added {
+            background: #e8ffe8;
+            border: 1px solid #00aa00;
+            padding: 8px;
+            margin: 8px 0;
+        }
+
+        .feature-icon {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            background: #00aa00;
+            color: #fff;
+            text-align: center;
+            line-height: 16px;
+            margin-right: 8px;
+            font-size: 10px;
+        }
+
+        footer {
+            margin-top: 16px;
+            padding-top: 8px;
+            border-top: 2px solid #000;
+            font-size: 10px;
+            color: #666;
+            text-align: center;
+        }
+
+        .blink {
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0%, 49% { opacity: 1; }
+            50%, 100% { opacity: 0; }
+        }
+
+        .matrix-bg {
+            background: #000;
+            color: #0f0;
+            padding: 4px 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="window">
+        <div class="title-bar">
+            <div class="window-controls">
+                <div class="window-button">-</div>
+                <div class="window-button">[]</div>
+            </div>
+            <span class="title-bar-text">ZipherX Security Audit Report v1.0</span>
+            <div class="window-button">X</div>
+        </div>
+
+        <div class="content">
+            <h1>
+                <span style="font-size: 24px;">&#128274;</span>
+                ZIPHERX SECURITY AUDIT
+            </h1>
+
+            <div class="ascii-art">
+ _______ _____ ____  _   _ ______ _____  __   __
+|___  (_)  __ \|  | | | |  ____|  __ \ \ \ / /
+   / / | |__) | |__| | |__  | |__) | \ V /
+  / /  |  ___/|  __  |  __| |  _  /   > <
+ / /__ | |    | |  | | |____| | \ \  / . \
+/_____|_|    |_|  |_|______|_|  \_\/_/ \_\
+            </div>
+
+            <div class="cypherpunk-quote">
+                "Privacy is necessary for an open society in the electronic age."
+                <br>- Eric Hughes, A Cypherpunk's Manifesto, 1993
+            </div>
+
+            <div class="meta-info">
+                <div class="meta-row">
+                    <span class="meta-label">Project:</span>
+                    <span>ZipherX iOS Wallet for Zclassic (ZCL)</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Audit Date:</span>
+                    <span>November 27, 2025</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Auditor:</span>
+                    <span>Claude (Anthropic AI)</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Scope:</span>
+                    <span>Source code review - /Users/chris/ZipherX/Sources/</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Status:</span>
+                    <span style="background: #000; color: #00ff00; font-weight: bold; padding: 2px 6px;">CRITICAL ISSUES RESOLVED</span>
+                </div>
+            </div>
+
+            <!-- EXECUTIVE SUMMARY -->
+            <h2>> EXECUTIVE SUMMARY</h2>
+
+            <div class="summary-box">
+                <h3>FINDINGS OVERVIEW</h3>
+                <table style="color: #0f0; border-color: #0f0;">
+                    <tr>
+                        <td>CRITICAL</td>
+                        <td>3 found</td>
+                        <td style="background: #000; color: #00ff00;">3 FIXED</td>
+                    </tr>
+                    <tr>
+                        <td>HIGH</td>
+                        <td>2 found</td>
+                        <td style="background: #000; color: #00ff00;">2 FIXED</td>
+                    </tr>
+                    <tr>
+                        <td>MEDIUM</td>
+                        <td>3 found</td>
+                        <td style="color: #ffff00;">PENDING</td>
+                    </tr>
+                    <tr>
+                        <td>LOW</td>
+                        <td>3 found</td>
+                        <td style="color: #ffff00;">PENDING</td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- CRITICAL FINDINGS -->
+            <h2>> CRITICAL FINDINGS [FIXED]</h2>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-critical">CRITICAL</span> CRT-001: Private Key Logged to Console</span>
+                    <span class="status-fixed">FIXED</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">ReceiveView.swift</span>:<span class="line-number">174</span></div>
+
+                    <p><strong>Vulnerability:</strong> Extended spending key was printed to system console in plaintext.</p>
+
+                    <p><strong>Original Code (REMOVED):</strong></p>
+                    <div class="code-block">print("&#128273; PRIVATE KEY (KEEP SECRET!): \(exportedKey)")</div>
+
+                    <p><strong>Impact:</strong> Any process with console access could capture the spending key, allowing complete theft of funds.</p>
+
+                    <p><strong>Fix Applied:</strong> Removed all private key logging statements. Key export now only displays to UI without console output.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-critical">CRITICAL</span> CRT-002: Incoming Viewing Key (IVK) Logged</span>
+                    <span class="status-fixed">FIXED</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">FilterScanner.swift</span>:<span class="line-number">142-148</span></div>
+
+                    <p><strong>Vulnerability:</strong> IVK was logged as hex string during blockchain scanning.</p>
+
+                    <p><strong>Original Code (REMOVED):</strong></p>
+                    <div class="code-block">print("&#128273; IVK hex (\(ivkData.count) bytes): \(ivkHex)")</div>
+
+                    <p><strong>Impact:</strong> IVK allows viewing all incoming transactions. Attacker could monitor wallet activity.</p>
+
+                    <p><strong>Fix Applied:</strong> Removed IVK hex logging. Only non-sensitive operation logs remain.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-critical">CRITICAL</span> CRT-003: Spending Key Logged in WalletManager</span>
+                    <span class="status-fixed">FIXED</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">WalletManager.swift</span>:<span class="line-number">multiple locations</span></div>
+
+                    <p><strong>Vulnerability:</strong> Spending key retrieval was logged during transaction operations.</p>
+
+                    <p><strong>Original Code (REMOVED):</strong></p>
+                    <div class="code-block">print("&#128273; Retrieved spending key: \(spendingKey.count) bytes")</div>
+
+                    <p><strong>Impact:</strong> Size disclosure could aid timing attacks; log exposure risks key compromise.</p>
+
+                    <p><strong>Fix Applied:</strong> All spending key related log statements removed.</p>
+                </div>
+            </div>
+
+            <!-- HIGH FINDINGS -->
+            <h2>> HIGH SEVERITY FINDINGS [FIXED]</h2>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-high">HIGH</span> HGH-001: Insufficient Consensus Threshold</span>
+                    <span class="status-fixed">FIXED</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">NetworkManager.swift</span>:<span class="line-number">~line 50</span></div>
+
+                    <p><strong>Vulnerability:</strong> CONSENSUS_THRESHOLD was set to 1, allowing single peer to dictate network state.</p>
+
+                    <p><strong>Original Code:</strong></p>
+                    <div class="code-block">private let CONSENSUS_THRESHOLD = 1</div>
+
+                    <p><strong>Fixed Code:</strong></p>
+                    <div class="code-block">private let CONSENSUS_THRESHOLD = 2</div>
+
+                    <p><strong>Impact:</strong> Malicious peer could provide false balance/transaction data.</p>
+
+                    <p><strong>Fix Applied:</strong> Increased to 2. Production should use 6+ with 8+ peers.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-high">HIGH</span> HGH-002: Transaction Not Verified On-Chain</span>
+                    <span class="status-fixed">FIXED</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">NetworkManager.swift</span>:<span class="line-number">broadcastTransaction()</span></div>
+
+                    <p><strong>Vulnerability:</strong> After broadcast, transaction was assumed successful if any peer accepted it. Transaction could still be rejected by network.</p>
+
+                    <p><strong>Fix Applied:</strong> Added on-chain verification via Insight API:</p>
+                    <div class="code-block">// InsightAPI.swift - NEW FUNCTIONS
+func verifyTransactionExists(txid: String) async throws -> (exists: Bool, confirmations: Int)
+func waitForTransaction(txid: String, maxAttempts: Int = 10, delaySeconds: Double = 3.0) async throws -> Bool
+
+// NetworkManager.swift - VERIFICATION ADDED
+let verified = try await InsightAPI.shared.waitForTransaction(txid: txId, maxAttempts: 10, delaySeconds: 3.0)
+guard verified else {
+    throw NetworkError.transactionNotVerified
+}</div>
+
+                    <p><strong>Impact:</strong> User could believe transaction succeeded when it was rejected.</p>
+                </div>
+            </div>
+
+            <!-- MEDIUM FINDINGS -->
+            <h2>> MEDIUM SEVERITY FINDINGS [PENDING]</h2>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-medium">MEDIUM</span> MED-001: Hardcoded Peer IP Addresses</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">NetworkManager.swift</span>:<span class="line-number">BOOTSTRAP_PEERS array</span></div>
+
+                    <p><strong>Finding:</strong> Peer list contains hardcoded IP addresses including local network IPs (192.168.x.x).</p>
+
+                    <p><strong>Risk:</strong> Reduces decentralization; hardcoded peers become single points of failure.</p>
+
+                    <p><strong>Recommendation:</strong> Implement DNS seed discovery for production release.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-medium">MEDIUM</span> MED-002: No Certificate Pinning</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">InsightAPI.swift</span>:<span class="line-number">URLSession usage</span></div>
+
+                    <p><strong>Finding:</strong> HTTPS connections use default certificate validation without pinning.</p>
+
+                    <p><strong>Risk:</strong> MITM attacks possible with compromised CA or corporate proxy.</p>
+
+                    <p><strong>Recommendation:</strong> Pin explorer.zcl.zelcore.io certificate for production.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-medium">MEDIUM</span> MED-003: Database Encryption</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Location:</strong></p>
+                    <div class="code-block"><span class="file-path">WalletDatabase.swift</span></div>
+
+                    <p><strong>Current State:</strong> iOS Data Protection applied (FileProtectionType.completeUnlessOpen).</p>
+
+                    <p><strong>Finding:</strong> Database uses SQLite without SQLCipher encryption. iOS Data Protection provides file-level encryption but does not protect against jailbroken device access.</p>
+
+                    <p><strong>Mitigation Applied:</strong></p>
+                    <div class="code-block">try FileManager.default.setAttributes(
+    [.protectionKey: FileProtectionType.completeUnlessOpen],
+    ofItemAtPath: fileURL.path
+)</div>
+
+                    <p><strong>Recommendation:</strong> Implement SQLCipher for database-level encryption in production.</p>
+                </div>
+            </div>
+
+            <!-- LOW FINDINGS -->
+            <h2>> LOW SEVERITY FINDINGS [PENDING]</h2>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-low">LOW</span> LOW-001: Debug Logging in Production Code</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Finding:</strong> Extensive debug print statements remain in codebase (non-sensitive).</p>
+                    <p><strong>Recommendation:</strong> Use os_log with appropriate log levels; disable verbose logging in release builds.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-low">LOW</span> LOW-002: No Jailbreak Detection</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Finding:</strong> App does not detect jailbroken devices where Secure Enclave protections may be bypassed.</p>
+                    <p><strong>Recommendation:</strong> Add jailbreak detection with user warning for production.</p>
+                </div>
+            </div>
+
+            <div class="finding">
+                <div class="finding-header">
+                    <span><span class="severity-low">LOW</span> LOW-003: Secure Enclave Not Yet Implemented</span>
+                    <span class="status-pending">PENDING</span>
+                </div>
+                <div class="finding-body">
+                    <p><strong>Finding:</strong> Keys currently stored in memory/keychain without Secure Enclave hardware protection.</p>
+                    <p><strong>Recommendation:</strong> Implement SecureKeyStorage.swift with Secure Enclave for spending key operations before production.</p>
+                </div>
+            </div>
+
+            <!-- SECURITY FEATURES ADDED -->
+            <h2>> SECURITY FEATURES IMPLEMENTED</h2>
+
+            <div class="feature-added">
+                <span class="feature-icon">+</span>
+                <strong>BiometricAuthManager.swift</strong> - Face ID / Touch ID Authentication
+                <div class="code-block">final class BiometricAuthManager {
+    static let shared = BiometricAuthManager()
+    private let authTimeout: TimeInterval = 300 // 5 minutes
+
+    func authenticate(reason: String, completion: @escaping (Bool, Error?) -> Void)
+    func authenticateForSend(amount: UInt64, completion: @escaping (Bool, Error?) -> Void)
+    func lockApp()
+    var needsReauthentication: Bool { get }
+}</div>
+            </div>
+
+            <div class="feature-added">
+                <span class="feature-icon">+</span>
+                <strong>iOS Data Protection</strong> - File-level encryption for database
+                <div class="code-block">FileProtectionType.completeUnlessOpen
+// Database file encrypted when device locked</div>
+            </div>
+
+            <div class="feature-added">
+                <span class="feature-icon">+</span>
+                <strong>Transaction Verification</strong> - On-chain confirmation
+                <div class="code-block">// Verifies tx exists in mempool or blockchain after broadcast
+// Retries up to 10 times with 3 second intervals
+// Fails if tx not found (may have been rejected by network)</div>
+            </div>
+
+            <!-- CRYPTOGRAPHIC VERIFICATION -->
+            <h2>> CRYPTOGRAPHIC IMPLEMENTATION STATUS</h2>
+
+            <table>
+                <tr>
+                    <th>Component</th>
+                    <th>Implementation</th>
+                    <th>Status</th>
+                </tr>
+                <tr>
+                    <td>BIP-39 Mnemonic</td>
+                    <td>24-word seed phrase generation/validation</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>ZIP-32 Key Derivation</td>
+                    <td>ExtendedSpendingKey, IVK, payment addresses</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>Sapling Note Decryption</td>
+                    <td>Trial decryption with IVK</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>Nullifier Computation</td>
+                    <td>Track spent notes</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>Commitment Tree</td>
+                    <td>Merkle tree with witnesses</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>Groth16 Proofs</td>
+                    <td>Spend/Output proof generation</td>
+                    <td style="background: #000; color: #00ff00;">IMPLEMENTED</td>
+                </tr>
+                <tr>
+                    <td>Branch ID</td>
+                    <td>Buttercup (0x930b540d)</td>
+                    <td style="background: #000; color: #00ff00;">VERIFIED</td>
+                </tr>
+            </table>
+
+            <!-- RECOMMENDATIONS -->
+            <h2>> PRODUCTION CHECKLIST</h2>
+
+            <div class="summary-box">
+                <h3>BEFORE MAINNET RELEASE</h3>
+                <pre style="color: #0f0; font-size: 10px;">
+[ ] Implement Secure Enclave for key storage
+[ ] Add SQLCipher database encryption
+[ ] Implement certificate pinning
+[ ] Add DNS seed peer discovery
+[ ] Increase CONSENSUS_THRESHOLD to 6
+[ ] Connect to 8+ peers minimum
+[ ] Add jailbreak detection
+[ ] Remove debug logging or use os_log
+[ ] Third-party security audit
+[ ] Penetration testing
+                </pre>
+            </div>
+
+            <footer>
+                <div class="matrix-bg">
+                    Generated by Claude (Anthropic) | November 27, 2025<br>
+                    ZipherX - Trustless Privacy for the Digital Age<br>
+                    <span class="blink">_</span>
+                </div>
+                <p style="margin-top: 8px;">
+                    "Cypherpunks write code. We know that someone has to write software to defend privacy,
+                    and we're going to write it."
+                </p>
+            </footer>
+        </div>
+    </div>
+</body>
+</html>

@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
     @State private var selectedTab: Tab = .balance
+    @State private var isFirstLaunch: Bool = false
 
     enum Tab {
         case balance, send, receive, settings
@@ -18,6 +19,9 @@ struct ContentView: View {
             if walletManager.isWalletCreated {
                 mainWalletView
                     .task {
+                        // Check if this is first launch (tree not yet cached)
+                        isFirstLaunch = !walletManager.isTreeLoaded && walletManager.treeLoadProgress < 1.0
+
                         // Connect first, then fetch stats
                         if !networkManager.isConnected {
                             do {
@@ -40,6 +44,25 @@ struct ContentView: View {
                             }
                         }
                     }
+
+                // Tree loading overlay (shown during first launch)
+                if !walletManager.isTreeLoaded && walletManager.treeLoadProgress > 0 {
+                    CypherpunkLoadingView(
+                        progress: walletManager.treeLoadProgress,
+                        status: walletManager.treeLoadStatus,
+                        isFirstLaunch: isFirstLaunch
+                    )
+                    .transition(.opacity)
+                }
+
+                // Sync overlay (shown during blockchain sync after tree is loaded)
+                if walletManager.isTreeLoaded && walletManager.isSyncing {
+                    CypherpunkSyncView(
+                        progress: walletManager.syncProgress,
+                        status: walletManager.syncStatus
+                    )
+                    .transition(.opacity)
+                }
             } else {
                 WalletSetupView()
             }

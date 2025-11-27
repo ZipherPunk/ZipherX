@@ -80,7 +80,7 @@ final class FilterScanner {
         var startHeight: UInt64
 
         // Height where bundled commitment tree ends (verified root matches chain)
-        let bundledTreeHeight: UInt64 = 2922769
+        let bundledTreeHeight: UInt64 = 2923123
 
         // Track if we're scanning within bundled tree range (notes only, no tree building)
         var scanWithinBundledRange = false
@@ -113,11 +113,21 @@ final class FilterScanner {
                 startHeight = ZclassicCheckpoints.recentCheckpointHeight
                 print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
             } else if bundledTreeAvailable {
-                // No tree in database but bundled tree available
-                // CRITICAL: Start from bundledTreeHeight + 1 to avoid adding duplicate CMUs
-                // The bundled tree already contains all CMUs up to bundledTreeHeight
-                startHeight = bundledTreeHeight + 1
-                print("📦 Using bundled tree - scanning from \(startHeight) (bundled tree ends at \(bundledTreeHeight))")
+                // CRITICAL FIX: Fresh install with bundled tree
+                // We need to scan the ENTIRE bundled range to find:
+                // 1. Notes addressed to us (via trial decryption)
+                // 2. Nullifiers that mark our notes as spent
+                //
+                // The bundled tree has all CMUs, but we haven't scanned for OUR notes yet!
+                // Without this, imported keys will show old balance (spent notes appear unspent)
+                //
+                // Strategy: Use PHASE 1 (parallel note discovery) from Sapling activation
+                // to bundledTreeHeight, then PHASE 2 from bundledTreeHeight+1 to current
+                startHeight = ZclassicCheckpoints.saplingActivationHeight
+                scanWithinBundledRange = true
+                print("📦 Fresh install with bundled tree - scanning from Sapling activation \(startHeight)")
+                print("   PHASE 1: Will scan \(startHeight) to \(bundledTreeHeight) for notes + nullifiers (parallel, no tree changes)")
+                print("   PHASE 2: Will scan \(bundledTreeHeight + 1) to chain tip (sequential, tree building)")
             } else {
                 // No tree anywhere - full scan from Sapling activation
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -139,24 +149,14 @@ final class FilterScanner {
 
         // Keep spending key for direct decryption (uses zcash_primitives internally)
         let spendingKey = viewingKey
-        print("🔑 Using spending key: \(spendingKey.count) bytes")
+        // SECURITY: Never log keys or IVK
 
-        // Also derive IVK for nullifier computation
+        // Derive IVK for nullifier computation
         let ivk = deriveIncomingViewingKey(from: viewingKey)
-        let ivkHex = ivk.map { String(format: "%02x", $0) }.joined()
-        print("🔑 Derived IVK: \(ivk.count) bytes")
-        print("🔑 IVK hex: \(ivkHex)")
+        // SECURITY: IVK and address details not logged
 
-        // Debug: Also print the z-address we're scanning for
         let walletAddress = WalletManager.shared.zAddress
-        print("🏠 Scanning for address: \(walletAddress)")
-
-        // Decode address to see its diversifier
-        if let addrBytes = ZipherXFFI.decodeAddress(walletAddress) {
-            let divBytes = Array(addrBytes.prefix(11))
-            let divHex = divBytes.map { String(format: "%02x", $0) }.joined()
-            print("🏠 Address diversifier: \(divHex)")
-        }
+        _ = ZipherXFFI.decodeAddress(walletAddress) // Decode for internal use only
 
         // Load known nullifiers from database for spend detection
         knownNullifiers = try database.getAllNullifiers()
@@ -300,39 +300,44 @@ final class FilterScanner {
 
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
-                // Fetch all blocks in parallel
-                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput])]?).self) { group in
+                // Fetch all blocks in parallel - now also fetch spends for nullifier detection
+                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
                     for height in heights {
                         group.addTask {
                             do {
                                 let blockHash = try await self.insightAPI.getBlockHash(height: height)
                                 let block = try await self.insightAPI.getBlock(hash: blockHash)
 
-                                var txOutputs: [(String, [ShieldedOutput])] = []
+                                var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
                                 for txid in block.tx {
                                     let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    if let outputs = tx.vShieldedOutput, !outputs.isEmpty {
-                                        txOutputs.append((txid, outputs))
+                                    // Fetch both outputs AND spends (for nullifier detection)
+                                    let hasOutputs = tx.vShieldedOutput?.isEmpty == false
+                                    let hasSpends = tx.vShieldedSpend?.isEmpty == false
+                                    if hasOutputs || hasSpends {
+                                        txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
                                     }
                                 }
-                                return (height, txOutputs.isEmpty ? nil : txOutputs)
+                                return (height, txData.isEmpty ? nil : txData)
                             } catch {
                                 return (height, nil)
                             }
                         }
                     }
 
-                    // Process results - for bundled range we skip tree building but DO find notes
-                    for await (height, txOutputs) in group {
+                    // Process results - for bundled range we skip tree building but DO find notes AND detect spent notes
+                    for await (height, txData) in group {
                         guard isScanning else { break }
 
-                        if let outputs = txOutputs {
-                            for (txid, shieldedOutputs) in outputs {
+                        if let transactions = txData {
+                            for (txid, shieldedOutputs, shieldedSpends) in transactions {
                                 do {
                                     try await MainActor.run {
                                         // Use note-discovery-only mode (no tree append)
+                                        // Now also passes spends for nullifier detection
                                         try self.processShieldedOutputsForNotesOnly(
                                             outputs: shieldedOutputs,
+                                            spends: shieldedSpends,
                                             txid: txid,
                                             accountId: accountId,
                                             spendingKey: spendingKey,
@@ -341,7 +346,7 @@ final class FilterScanner {
                                         )
                                     }
                                 } catch {
-                                    print("❌ Error processing outputs for tx \(txid): \(error)")
+                                    print("❌ Error processing tx \(txid): \(error)")
                                 }
                             }
                         }
@@ -379,6 +384,7 @@ final class FilterScanner {
 
         if isQuickScanOnly {
             // PARALLEL MODE - much faster for note discovery only
+            // Now also fetches spends for nullifier detection
             let parallelBatchSize = 100 // Process 100 blocks at a time in parallel
 
             while currentHeight <= latestHeight && isScanning {
@@ -387,39 +393,44 @@ final class FilterScanner {
 
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
-                // Fetch all blocks in parallel
-                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput])]?).self) { group in
+                // Fetch all blocks in parallel - also fetch spends for nullifier detection
+                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
                     for height in heights {
                         group.addTask {
                             do {
                                 let blockHash = try await self.insightAPI.getBlockHash(height: height)
                                 let block = try await self.insightAPI.getBlock(hash: blockHash)
 
-                                var txOutputs: [(String, [ShieldedOutput])] = []
+                                var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
                                 for txid in block.tx {
                                     let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    if let outputs = tx.vShieldedOutput, !outputs.isEmpty {
-                                        txOutputs.append((txid, outputs))
+                                    // Fetch both outputs AND spends (for nullifier detection)
+                                    let hasOutputs = tx.vShieldedOutput?.isEmpty == false
+                                    let hasSpends = tx.vShieldedSpend?.isEmpty == false
+                                    if hasOutputs || hasSpends {
+                                        txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
                                     }
                                 }
-                                return (height, txOutputs.isEmpty ? nil : txOutputs)
+                                return (height, txData.isEmpty ? nil : txData)
                             } catch {
                                 return (height, nil)
                             }
                         }
                     }
 
-                    // Process results - note: for quick scan we skip tree building
-                    for await (height, txOutputs) in group {
+                    // Process results - note: for quick scan we skip tree building but DO check nullifiers
+                    for await (height, txData) in group {
                         guard isScanning else { break }
 
-                        if let outputs = txOutputs {
-                            for (txid, shieldedOutputs) in outputs {
+                        if let transactions = txData {
+                            for (txid, shieldedOutputs, shieldedSpends) in transactions {
                                 // Only try to decrypt for our notes, skip tree building
+                                // Now also checks spends for nullifiers
                                 do {
                                     try await MainActor.run {
                                         try self.processShieldedOutputsForNotesOnly(
                                             outputs: shieldedOutputs,
+                                            spends: shieldedSpends,
                                             txid: txid,
                                             accountId: accountId,
                                             spendingKey: spendingKey,
@@ -428,7 +439,7 @@ final class FilterScanner {
                                         )
                                     }
                                 } catch {
-                                    print("❌ Error processing outputs for tx \(txid): \(error)")
+                                    print("❌ Error processing tx \(txid): \(error)")
                                 }
                             }
                         }
@@ -489,24 +500,25 @@ final class FilterScanner {
                 }
 
                 // Fetch transactions in parallel batches of 50
-                var txCache: [String: (UInt64, [ShieldedOutput]?)] = [:] // txid -> (height, outputs)
+                // Now also fetches spends for nullifier detection
+                var txCache: [String: (UInt64, [ShieldedOutput]?, [ShieldedSpend]?)] = [:] // txid -> (height, outputs, spends)
                 let txBatchSize = 50
                 for i in stride(from: 0, to: allTxids.count, by: txBatchSize) {
                     let batch = Array(allTxids[i..<min(i + txBatchSize, allTxids.count)])
 
-                    await withTaskGroup(of: (String, UInt64, [ShieldedOutput]?).self) { group in
+                    await withTaskGroup(of: (String, UInt64, [ShieldedOutput]?, [ShieldedSpend]?).self) { group in
                         for (height, txid) in batch {
                             group.addTask {
                                 do {
                                     let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    return (txid, height, tx.vShieldedOutput)
+                                    return (txid, height, tx.vShieldedOutput, tx.vShieldedSpend)
                                 } catch {
-                                    return (txid, height, nil)
+                                    return (txid, height, nil, nil)
                                 }
                             }
                         }
-                        for await (txid, height, outputs) in group {
-                            txCache[txid] = (height, outputs)
+                        for await (txid, height, outputs, spends) in group {
+                            txCache[txid] = (height, outputs, spends)
                         }
                     }
                 }
@@ -517,24 +529,32 @@ final class FilterScanner {
 
                     var blockTxWithShieldedCount = 0
                     for txid in txids {
-                        if let (_, outputs) = txCache[txid], let outputs = outputs, !outputs.isEmpty {
-                            blockTxWithShieldedCount += 1
-                            print("🔍 Block \(height): Processing tx \(txid) with \(outputs.count) shielded outputs")
+                        if let (_, outputs, spends) = txCache[txid] {
+                            // Process if there are outputs OR spends (for nullifier detection)
+                            let hasOutputs = outputs?.isEmpty == false
+                            let hasSpends = spends?.isEmpty == false
+                            if hasOutputs || hasSpends {
+                                blockTxWithShieldedCount += 1
+                                let outputCount = outputs?.count ?? 0
+                                let spendCount = spends?.count ?? 0
+                                print("🔍 Block \(height): Processing tx \(txid) with \(outputCount) outputs, \(spendCount) spends")
 
-                            // Process on main actor to avoid SQLite threading issues
-                            do {
-                                try await MainActor.run {
-                                    try self.processShieldedOutputsSync(
-                                        outputs: outputs,
-                                        txid: txid,
-                                        accountId: accountId,
-                                        spendingKey: spendingKey,
-                                        ivk: ivk,
-                                        height: height
-                                    )
+                                // Process on main actor to avoid SQLite threading issues
+                                do {
+                                    try await MainActor.run {
+                                        try self.processShieldedOutputsSync(
+                                            outputs: outputs ?? [],
+                                            spends: spends,
+                                            txid: txid,
+                                            accountId: accountId,
+                                            spendingKey: spendingKey,
+                                            ivk: ivk,
+                                            height: height
+                                        )
+                                    }
+                                } catch {
+                                    print("⚠️ Error processing tx \(txid): \(error)")
                                 }
-                            } catch {
-                                print("⚠️ Error processing tx \(txid): \(error)")
                             }
                         }
                     }
@@ -572,21 +592,38 @@ final class FilterScanner {
             print("🌳 Saved commitment tree with \(treeSize) commitments")
         }
 
-        // Update witnesses in database for all found notes (new ones)
-        for (noteId, witnessIndex) in pendingWitnesses {
-            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
-                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
-                print("📝 Updated witness for new note \(noteId)")
-            }
-        }
+        // IMPORTANT: Do NOT update witnesses for NEW notes here!
+        // New notes already have the correct witness saved at discovery time (insertNote).
+        // The witness at discovery time corresponds to the tree root at that block,
+        // which is the anchor we need when spending.
+        // Updating witnesses here would give them the FINAL tree root, which is wrong.
+        //
+        // pendingWitnesses is only used to track witness indices in FFI memory,
+        // NOT for updating database. The witnesses were already saved correctly.
+        print("📝 Serialized witness: \(pendingWitnesses.count > 0 ? "saved at discovery" : "none") for \(pendingWitnesses.count) new note(s)")
 
-        // Update witnesses for existing notes that were loaded at scan start
-        // These witnesses have been updated in FFI memory as CMUs were appended
-        for (noteId, witnessIndex) in existingWitnessIndices {
-            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
-                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
-                print("📝 Updated witness for existing note \(noteId)")
-            }
+        // CRITICAL FIX: Do NOT update existing note witnesses either!
+        //
+        // Previous logic assumed we'd use the "current" tree root as anchor,
+        // which required updating witnesses to match. But this is WRONG because:
+        // 1. We now get the anchor from block header at NOTE's received height
+        // 2. The witness must match that specific anchor (tree state at note height)
+        // 3. Updating witness here would make it point to CURRENT tree root
+        // 4. This causes anchor/witness mismatch → transaction rejection
+        //
+        // The correct approach:
+        // - Witness is saved at note discovery time (points to tree root at that block)
+        // - Anchor is retrieved from block header at note's height
+        // - Both match → valid transaction
+        //
+        // for (noteId, witnessIndex) in existingWitnessIndices {
+        //     if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+        //         try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+        //         print("📝 Updated witness for existing note \(noteId)")
+        //     }
+        // }
+        if !existingWitnessIndices.isEmpty {
+            print("📝 Preserved \(existingWitnessIndices.count) existing witness(es) - NOT updated to maintain anchor consistency")
         }
 
         print("✅ Scan complete")
@@ -907,15 +944,32 @@ final class FilterScanner {
 
     /// Process shielded outputs from Insight API transaction (synchronous version for MainActor)
     /// IMPORTANT: Must be called sequentially per block to maintain tree order
+    /// Also checks spends for nullifiers to detect spent notes
     @MainActor
     private func processShieldedOutputsSync(
         outputs: [ShieldedOutput],
+        spends: [ShieldedSpend]? = nil,
         txid: String,
         accountId: Int64,
         spendingKey: Data,
         ivk: Data,
         height: UInt64
     ) throws {
+        // CRITICAL: Check for spent notes (nullifier detection) FIRST
+        // This must be done before processing outputs
+        if let spends = spends {
+            for spend in spends {
+                guard let nullifierData = Data(hexString: spend.nullifier) else {
+                    continue
+                }
+                if knownNullifiers.contains(nullifierData) {
+                    // One of our notes was spent!
+                    try database.markNoteSpent(nullifier: nullifierData, spentHeight: height)
+                    print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
+                }
+            }
+        }
+
         for (_, output) in outputs.enumerated() {
             // Convert hex strings to binary data
             guard let cmuDisplay = Data(hexString: output.cmu),
@@ -977,7 +1031,7 @@ final class FilterScanner {
             // Get witness
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
 
-            // Store note
+            // Store note with CMU
             let noteId = try database.insertNote(
                 accountId: accountId,
                 diversifier: Data(diversifier),
@@ -987,7 +1041,8 @@ final class FilterScanner {
                 nullifier: nullifier,
                 txid: txidData,
                 height: height,
-                witness: witness
+                witness: witness,
+                cmu: cmu // Store CMU for potential witness rebuild
             )
 
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
@@ -996,14 +1051,31 @@ final class FilterScanner {
 
     /// Process shielded outputs for note discovery only (no tree building)
     /// Used by quick scan - much faster as it skips CMU appending
+    /// Also checks spends for nullifiers to detect spent notes
     private func processShieldedOutputsForNotesOnly(
         outputs: [ShieldedOutput],
+        spends: [ShieldedSpend]? = nil,
         txid: String,
         accountId: Int64,
         spendingKey: Data,
         ivk: Data,
         height: UInt64
     ) throws {
+        // CRITICAL: Check for spent notes (nullifier detection) FIRST
+        // This must be done before processing outputs so we can catch spends
+        // of notes we already know about
+        if let spends = spends {
+            for spend in spends {
+                guard let nullifierData = Data(hexString: spend.nullifier) else {
+                    continue
+                }
+                if knownNullifiers.contains(nullifierData) {
+                    // One of our notes was spent!
+                    try database.markNoteSpent(nullifier: nullifierData, spentHeight: height)
+                    print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
+                }
+            }
+        }
         for output in outputs {
             // Convert hex strings to binary data
             guard let cmuDisplay = Data(hexString: output.cmu),
@@ -1059,7 +1131,7 @@ final class FilterScanner {
 
             knownNullifiers.insert(nullifier)
 
-            // Store note with empty witness (will need to rebuild for spending)
+            // Store note with CMU and empty witness (will need to rebuild for spending)
             let noteId = try database.insertNote(
                 accountId: accountId,
                 diversifier: Data(diversifier),
@@ -1069,7 +1141,8 @@ final class FilterScanner {
                 nullifier: nullifier,
                 txid: txidData,
                 height: height,
-                witness: Data(count: 1028) // Empty witness - needs rebuild for spending
+                witness: Data(count: 1028), // Empty witness - needs rebuild for spending
+                cmu: cmu // Store CMU for witness rebuild
             )
 
             print("📝 Stored note \(noteId) with value \(value)")
@@ -1178,7 +1251,7 @@ final class FilterScanner {
             // Get current witness (will be updated at end of scan with final tree state)
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
 
-            // Store note in database
+            // Store note in database with CMU
             let noteId = try database.insertNote(
                 accountId: accountId,
                 diversifier: note.diversifier,
@@ -1188,7 +1261,8 @@ final class FilterScanner {
                 nullifier: nullifier,
                 txid: txidData,
                 height: height,
-                witness: witness
+                witness: witness,
+                cmu: cmu // Store CMU for potential witness rebuild
             )
 
             // Track for final witness update
