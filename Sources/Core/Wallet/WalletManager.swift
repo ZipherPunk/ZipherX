@@ -52,7 +52,32 @@ final class WalletManager: ObservableObject {
         if isWalletCreated {
             Task {
                 await preloadCommitmentTree()
+                // Pre-initialize prover for faster first transaction
+                await preloadProver()
             }
+        }
+    }
+
+    /// Pre-initialize the Groth16 prover for faster transactions
+    /// This loads the 50MB+ Sapling params files once at startup
+    private func preloadProver() async {
+        print("⚡ Pre-initializing Groth16 prover...")
+
+        // Check if params are ready
+        let params = SaplingParams.shared
+        guard params.areParamsReady else {
+            print("⏳ Sapling params not ready yet, will initialize at send time")
+            return
+        }
+
+        let spendPath = params.spendParamsPath.path
+        let outputPath = params.outputParamsPath.path
+
+        // Initialize prover in background
+        if ZipherXFFI.initProver(spendParamsPath: spendPath, outputParamsPath: outputPath) {
+            print("✅ Groth16 prover pre-initialized (faster first transaction!)")
+        } else {
+            print("⚠️ Failed to pre-initialize prover, will retry at send time")
         }
     }
 
