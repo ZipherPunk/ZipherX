@@ -46,6 +46,108 @@ final class WalletManager: ObservableObject {
         self.secureStorage = SecureKeyStorage()
         self.mnemonicGenerator = MnemonicGenerator()
         loadWalletState()
+
+        // Preload commitment tree in background if wallet exists
+        if isWalletCreated {
+            Task {
+                await preloadCommitmentTree()
+            }
+        }
+    }
+
+    // MARK: - Tree Preloading
+
+    /// Preload commitment tree at startup for faster transactions
+    /// This loads from database (if saved) or bundled CMUs (first time)
+    @Published private(set) var isTreeLoaded: Bool = false
+    @Published private(set) var treeLoadProgress: Double = 0.0
+    @Published private(set) var treeLoadStatus: String = ""
+
+    private func preloadCommitmentTree() async {
+        print("🌳 Preloading commitment tree...")
+
+        await MainActor.run {
+            self.treeLoadStatus = "Opening database..."
+        }
+
+        // Open database if needed
+        do {
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+            let dbKey = Data(SHA256.hash(data: spendingKey))
+            try WalletDatabase.shared.open(encryptionKey: dbKey)
+        } catch {
+            print("⚠️ Failed to open database for tree preload: \(error)")
+            return
+        }
+
+        // Try to load from database first (fast path)
+        await MainActor.run {
+            self.treeLoadStatus = "Loading from cache..."
+        }
+
+        if let treeData = try? WalletDatabase.shared.getTreeState() {
+            if ZipherXFFI.treeDeserialize(data: treeData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
+                await MainActor.run {
+                    self.isTreeLoaded = true
+                    self.treeLoadProgress = 1.0
+                    self.treeLoadStatus = "Tree loaded (\(treeSize.formatted()) CMUs)"
+                }
+                return
+            }
+        }
+
+        // Fall back to loading bundled CMUs (slow path, only first time)
+        print("🌳 Loading bundled commitment tree (first time)...")
+        await MainActor.run {
+            self.treeLoadStatus = "Loading bundled tree (first time)..."
+            self.treeLoadProgress = 0.0
+        }
+
+        if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+           let bundledData = try? Data(contentsOf: bundledTreeURL) {
+
+            // Use progress callback version
+            let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { [weak self] current, total in
+                let progress = Double(current) / Double(total)
+                let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
+                let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
+
+                // Update UI on main thread
+                DispatchQueue.main.async {
+                    self?.treeLoadProgress = progress
+                    self?.treeLoadStatus = "\(currentFormatted) / \(totalFormatted) CMUs"
+                }
+            }
+
+            if success {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ Bundled commitment tree loaded: \(treeSize) commitments")
+
+                // Save to database for next time
+                if let serializedTree = ZipherXFFI.treeSerialize() {
+                    try? WalletDatabase.shared.saveTreeState(serializedTree)
+                    print("💾 Tree state saved to database for future use")
+                }
+
+                await MainActor.run {
+                    self.isTreeLoaded = true
+                    self.treeLoadProgress = 1.0
+                    self.treeLoadStatus = "Tree loaded (\(treeSize.formatted()) CMUs)"
+                }
+            } else {
+                print("❌ Failed to load bundled tree")
+                await MainActor.run {
+                    self.treeLoadStatus = "Failed to load tree"
+                }
+            }
+        } else {
+            print("❌ Bundled tree file not found")
+            await MainActor.run {
+                self.treeLoadStatus = "Tree file not found"
+            }
+        }
     }
 
     // MARK: - Wallet Creation
@@ -375,7 +477,7 @@ final class WalletManager: ObservableObject {
         print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
         // Clear existing notes but keep tree if we're starting from a specific height
-        let bundledTreeHeight: UInt64 = 2922769  // Height where bundled tree ends
+        let bundledTreeHeight: UInt64 = 2923123  // Height where bundled tree ends
 
         // Wait for any existing scan to complete (with timeout)
         if FilterScanner.isScanInProgress {
@@ -469,7 +571,7 @@ final class WalletManager: ObservableObject {
         print("📝 Found \(notes.count) notes to rebuild witnesses for")
 
         // Load bundled CMU data
-        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree_v2", withExtension: "bin"),
+        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
               let bundledData = try? Data(contentsOf: bundledTreeURL) else {
             print("❌ Bundled CMU file not found, falling back to full scan")
             try await rebuildWitnessesViaFullScan(account: account, spendingKey: spendingKey, onProgress: onProgress)
@@ -496,7 +598,7 @@ final class WalletManager: ObservableObject {
             // All notes have CMU - use fast path
             print("🚀 Using fast witness rebuild via bundled CMU lookup")
 
-            let bundledTreeHeight: UInt64 = 2922769 // Height where bundled tree ends
+            let bundledTreeHeight: UInt64 = 2923123 // Height where bundled tree ends
 
             for (index, note) in notesWithCMU.enumerated() {
                 guard let cmu = note.cmu else { continue }
@@ -561,9 +663,12 @@ final class WalletManager: ObservableObject {
         let scanner = FilterScanner()
         scanner.onProgress = onProgress
 
-        // Start scan WITHOUT fromHeight - this triggers sequential mode
-        // which builds proper tree and witnesses
-        try await scanner.startScan(for: account.id, viewingKey: spendingKey)
+        // CRITICAL: For rebuild, we need to scan from Sapling activation to find ALL notes
+        // Don't let it use bundled tree height as start - that would skip notes within bundled range
+        let saplingActivation: UInt64 = 476969
+        print("🔄 Starting full rescan from Sapling activation (\(saplingActivation)) to rediscover all notes")
+
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: saplingActivation)
 
         // Refresh balance after scan
         try await refreshBalance()
@@ -658,6 +763,64 @@ final class WalletManager: ObservableObject {
 
     // MARK: - Transactions
 
+    /// Progress callback type for transaction building
+    typealias SendProgressCallback = (_ step: String, _ detail: String?, _ progress: Double?) -> Void
+
+    /// Send shielded ZCL with progress reporting
+    /// - Parameters:
+    ///   - toAddress: Destination z-address (must be shielded)
+    ///   - amount: Amount in zatoshis
+    ///   - memo: Optional encrypted memo
+    ///   - onProgress: Callback for progress updates
+    /// - Returns: Transaction ID
+    func sendShieldedWithProgress(to toAddress: String, amount: UInt64, memo: String? = nil, onProgress: @escaping SendProgressCallback) async throws -> String {
+        // Validate destination is a z-address (shielded only!)
+        guard isValidZAddress(toAddress) else {
+            throw WalletError.invalidAddress("ZipherX only supports z-addresses. t-addresses are not allowed.")
+        }
+
+        // Check balance
+        let fee: UInt64 = 10_000
+        let totalRequired = amount + fee
+        let currentBalance = await MainActor.run { shieldedBalance }
+
+        guard totalRequired <= currentBalance else {
+            throw WalletError.insufficientFunds
+        }
+
+        // Get spending key from Secure Enclave
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        onProgress("prover", nil, nil)
+
+        // Build shielded transaction with progress
+        let txBuilder = TransactionBuilder()
+        let (rawTx, spentNullifier) = try await txBuilder.buildShieldedTransactionWithProgress(
+            from: zAddress,
+            to: toAddress,
+            amount: amount,
+            memo: memo,
+            spendingKey: spendingKey,
+            onProgress: onProgress
+        )
+
+        onProgress("broadcast", nil, nil)
+
+        // Broadcast through multi-peer network
+        let networkManager = NetworkManager.shared
+        let txId = try await networkManager.broadcastTransaction(rawTx)
+
+        // Mark the spent note immediately
+        guard let txidData = Data(hexString: txId) else {
+            throw WalletError.transactionFailed("Invalid transaction ID format")
+        }
+        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
+
+        // Refresh balance
+        try await refreshBalance()
+
+        return txId
+    }
+
     /// Send shielded ZCL to another z-address
     /// - Parameters:
     ///   - toAddress: Destination z-address (must be shielded)
@@ -749,6 +912,37 @@ final class WalletManager: ObservableObject {
         } else {
             print("No notes needed recovery")
         }
+    }
+
+    /// Force recover ALL spent notes back to unspent
+    /// Use this when a transaction was rejected by the network but the note was marked as spent
+    func forceRecoverAllSpentNotes() async throws -> Int {
+        print("Force recovering ALL spent notes...")
+
+        let database = WalletDatabase.shared
+        guard let account = try database.getAccount(index: 0) else {
+            print("No account found")
+            return 0
+        }
+
+        // Get all spent notes
+        let spentNotes = try database.getSpentNotes(accountId: account.id)
+        print("Found \(spentNotes.count) spent notes to recover")
+
+        var recoveredCount = 0
+        for note in spentNotes {
+            try database.markNoteUnspent(nullifier: note.nullifier)
+            recoveredCount += 1
+            let nfHex = note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16)
+            print("Recovered note: \(nfHex)...")
+        }
+
+        if recoveredCount > 0 {
+            print("Force recovered \(recoveredCount) notes")
+            try await refreshBalance()
+        }
+
+        return recoveredCount
     }
 
     // MARK: - Address Validation

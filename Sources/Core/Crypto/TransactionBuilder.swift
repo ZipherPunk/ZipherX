@@ -118,18 +118,29 @@ final class TransactionBuilder {
         // Check if witnesses need updating (tree has grown since witness was created)
         let bundledTreeHeight: UInt64 = 2923123
 
-        // Load the commitment tree to update witnesses if needed
-        if let treeData = try? database.getTreeState() {
+        // Check if tree is already loaded in memory (from startup preload)
+        let currentTreeSize = ZipherXFFI.treeSize()
+        if currentTreeSize > 0 {
+            print("✅ Commitment tree already in memory: \(currentTreeSize) commitments")
+        } else if let treeData = try? database.getTreeState() {
+            // Load from database (fast)
             _ = ZipherXFFI.treeDeserialize(data: treeData)
             print("✅ Commitment tree loaded from database")
         } else {
-            // Load bundled tree from app resources
+            // Load bundled tree from app resources (slow, first time only)
             print("🌳 Loading bundled commitment tree...")
             if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
                let bundledData = try? Data(contentsOf: bundledTreeURL) {
                 if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
                     let treeSize = ZipherXFFI.treeSize()
                     print("✅ Loaded bundled commitment tree with \(treeSize) commitments")
+
+                    // CRITICAL: Save to database so we don't need to reload next time
+                    // This saves ~50 seconds on subsequent transactions
+                    if let serializedTree = ZipherXFFI.treeSerialize() {
+                        try? database.saveTreeState(serializedTree)
+                        print("💾 Tree state saved to database for future use")
+                    }
                 } else {
                     print("❌ Failed to load bundled tree")
                     throw TransactionError.proofGenerationFailed
@@ -325,15 +336,19 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        onProgress("tree", "Loading bundled tree...", 0.0)
-
         let bundledTreeHeight: UInt64 = 2923123
 
-        // Load commitment tree with progress
-        if let treeData = try? database.getTreeState() {
+        // Check if tree is already loaded in memory (from startup preload)
+        let currentTreeSize = ZipherXFFI.treeSize()
+        if currentTreeSize > 0 {
+            onProgress("tree", "Tree ready (\(currentTreeSize.formatted()) CMUs)", 1.0)
+        } else if let treeData = try? database.getTreeState() {
+            onProgress("tree", "Loading from cache...", 0.5)
             _ = ZipherXFFI.treeDeserialize(data: treeData)
             onProgress("tree", "Tree loaded from cache", 1.0)
         } else {
+            onProgress("tree", "Loading bundled tree...", 0.0)
+
             if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
                let bundledData = try? Data(contentsOf: bundledTreeURL) {
 
@@ -352,6 +367,12 @@ final class TransactionBuilder {
 
                 if !success {
                     throw TransactionError.proofGenerationFailed
+                }
+
+                // CRITICAL: Save to database so we don't need to reload next time
+                if let serializedTree = ZipherXFFI.treeSerialize() {
+                    try? database.saveTreeState(serializedTree)
+                    print("💾 Tree state saved to database for future use")
                 }
 
                 onProgress("tree", "\(totalCMUs.formatted()) CMUs loaded", 1.0)
@@ -684,6 +705,13 @@ final class TransactionBuilder {
 
         let rootHex = anchor.map { String(format: "%02x", $0) }.joined()
         print("📝 Computed anchor from rebuilt tree: \(rootHex.prefix(16))...")
+
+        // 7. CRITICAL: Save updated tree to database for future transactions
+        // This avoids re-fetching CMUs from chain next time
+        if let serializedTree = ZipherXFFI.treeSerialize() {
+            try? WalletDatabase.shared.saveTreeState(serializedTree)
+            print("💾 Updated tree state saved to database")
+        }
 
         return (witness: witness, anchor: anchor)
     }
