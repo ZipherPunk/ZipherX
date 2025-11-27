@@ -231,6 +231,14 @@ final class WalletDatabase {
             }
             print("📂 Migration: Added cmu column to notes table")
         }
+
+        // Migration 2: Add unique index on CMU to prevent duplicate notes
+        // CMU is the true unique identifier of a note (nullifier can be computed incorrectly)
+        let createIndexSql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_cmu ON notes(cmu) WHERE cmu IS NOT NULL;"
+        if sqlite3_exec(db, createIndexSql, nil, nil, nil) != SQLITE_OK {
+            // Index might already exist or CMU column doesn't exist yet, not critical
+            print("📂 Note: CMU unique index already exists or could not be created")
+        }
     }
 
     // MARK: - Account Operations

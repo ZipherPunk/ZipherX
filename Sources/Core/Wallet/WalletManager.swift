@@ -31,6 +31,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var zAddress: String = ""
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var isSyncing: Bool = false
+    @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
     @Published private(set) var lastError: WalletError?
     @Published private(set) var syncTasks: [SyncTask] = []
@@ -677,10 +678,42 @@ final class WalletManager: ObservableObject {
         print("📝 Notes with CMU: \(notesWithCMU.count), without CMU: \(notesWithoutCMU.count)")
 
         if notesWithoutCMU.isEmpty && !notesWithCMU.isEmpty {
-            // All notes have CMU - use fast path
-            print("🚀 Using fast witness rebuild via bundled CMU lookup")
+            // All notes have CMU - check if any are beyond bundled range
+            print("🚀 Checking notes for witness rebuild...")
 
             let bundledTreeHeight: UInt64 = 2923123 // Height where bundled tree ends
+
+            // Check if ANY note is beyond bundled range
+            let notesBeyondBundled = notesWithCMU.filter { $0.height > bundledTreeHeight }
+            if !notesBeyondBundled.isEmpty {
+                print("⚠️ Found \(notesBeyondBundled.count) notes beyond bundled range - need live scan")
+                print("📡 Scanning from bundled height to chain tip...")
+
+                // Load bundled tree first
+                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("✅ Loaded bundled tree: \(treeSize) commitments")
+                }
+
+                // Ensure network connection
+                if !NetworkManager.shared.isConnected {
+                    try await NetworkManager.shared.connect()
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                }
+
+                // Scan from bundled tree height to find notes AND detect spent nullifiers
+                let scanner = FilterScanner()
+                scanner.onProgress = onProgress
+                try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: bundledTreeHeight + 1)
+
+                // Refresh balance after scan (will detect spent notes)
+                try await refreshBalance()
+                print("✅ Live scan complete - witnesses built and spent notes detected")
+                return
+            }
+
+            // All notes within bundled range - use fast path
+            print("🚀 All notes within bundled range - using fast witness rebuild")
 
             for (index, note) in notesWithCMU.enumerated() {
                 guard let cmu = note.cmu else { continue }
@@ -691,22 +724,15 @@ final class WalletManager: ObservableObject {
                     onProgress(progress, UInt64(index + 1), UInt64(notesWithCMU.count))
                 }
 
-                // Check if note is within bundled range
-                if note.height <= bundledTreeHeight {
-                    // Use treeCreateWitnessForCMU for notes within bundled range
-                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
-                        let (position, witness) = result
-                        print("✅ Created witness for note \(note.id): position=\(position), witness=\(witness.count) bytes")
+                // Use treeCreateWitnessForCMU for notes within bundled range
+                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                    let (position, witness) = result
+                    print("✅ Created witness for note \(note.id): position=\(position), witness=\(witness.count) bytes")
 
-                        // Update witness in database
-                        try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                    } else {
-                        print("⚠️ Failed to create witness for note \(note.id) - CMU not in bundled tree")
-                    }
+                    // Update witness in database
+                    try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
                 } else {
-                    print("⚠️ Note \(note.id) at height \(note.height) is beyond bundled range (\(bundledTreeHeight))")
-                    // For notes beyond bundled range, we need the full tree
-                    // TODO: Handle this case by extending tree with live scan
+                    print("⚠️ Failed to create witness for note \(note.id) - CMU not in bundled tree")
                 }
             }
 
@@ -1105,6 +1131,15 @@ final class WalletManager: ObservableObject {
     }
 
     // MARK: - Persistence
+
+    /// Set connecting state (called from ContentView during network connection)
+    @MainActor
+    func setConnecting(_ connecting: Bool, status: String?) {
+        isConnecting = connecting
+        if let status = status {
+            syncStatus = status
+        }
+    }
 
     private func loadWalletState() {
         let defaults = UserDefaults.standard

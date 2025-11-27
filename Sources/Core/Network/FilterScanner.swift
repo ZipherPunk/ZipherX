@@ -36,6 +36,9 @@ final class FilterScanner {
     private var pendingWitnesses: [(noteId: Int64, witnessIndex: UInt64)] = []
     private var existingWitnessIndices: [(noteId: Int64, witnessIndex: UInt64)] = []
 
+    // Bundled CMU data for position lookup during parallel scan
+    private var bundledCMUData: Data?
+
     init(networkManager: NetworkManager = .shared,
          database: WalletDatabase = .shared,
          rustBridge: RustBridge = .shared,
@@ -131,6 +134,7 @@ final class FilterScanner {
         guard startHeight <= latestHeight else {
             // Already fully synced
             print("✅ Already synced")
+            onProgress?(1.0, latestHeight, latestHeight) // Report 100% completion
             return
         }
 
@@ -205,6 +209,8 @@ final class FilterScanner {
             if let bundledCMUsURL = Bundle.main.url(forResource: treeFileName, withExtension: "bin"),
                let bundledData = try? Data(contentsOf: bundledCMUsURL) {
                 print("🌳 Loading bundled CMUs (\(bundledData.count / 1024 / 1024) MB)...")
+                // Store bundled CMU data for position lookup during parallel scan
+                self.bundledCMUData = bundledData
 
                 // Initialize empty tree
                 _ = ZipherXFFI.treeInit()
@@ -271,6 +277,9 @@ final class FilterScanner {
         // Clear pending witnesses for this scan
         pendingWitnesses = []
 
+        // Report initial progress immediately so UI shows progress bar
+        onProgress?(0.01, startHeight, latestHeight)
+
         // Determine scanning strategy:
         // - If scanning within bundled tree range: use PARALLEL mode (note discovery only)
         // - If scanning after bundled tree: use SEQUENTIAL mode (tree building + note discovery)
@@ -326,6 +335,7 @@ final class FilterScanner {
                                     try await MainActor.run {
                                         // Use note-discovery-only mode (no tree append)
                                         // Now also passes spends for nullifier detection
+                                        // Pass bundled CMU data for real position lookup
                                         try self.processShieldedOutputsForNotesOnly(
                                             outputs: shieldedOutputs,
                                             spends: shieldedSpends,
@@ -333,7 +343,8 @@ final class FilterScanner {
                                             accountId: accountId,
                                             spendingKey: spendingKey,
                                             ivk: ivk,
-                                            height: height
+                                            height: height,
+                                            bundledCMUData: self.bundledCMUData
                                         )
                                     }
                                 } catch {
@@ -343,7 +354,8 @@ final class FilterScanner {
                         }
 
                         parallelScannedBlocks += 1
-                        if parallelScannedBlocks % 50 == 0 || parallelScannedBlocks == parallelTotalBlocks {
+                        // Report progress every 50 blocks, at start, and at end
+                        if parallelScannedBlocks == 1 || parallelScannedBlocks % 50 == 0 || parallelScannedBlocks == parallelTotalBlocks {
                             let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
                             onProgress?(progress * 0.5, height, latestHeight) // 50% for phase 1
                         }
@@ -645,7 +657,8 @@ final class FilterScanner {
         let merkleRoot = Data(data[offset..<offset+32])
         offset += 32
 
-        // Skip reserved hash
+        // Final Sapling Root (the anchor!) - NOT "reserved"
+        let finalSaplingRoot = Data(data[offset..<offset+32])
         offset += 32
 
         let time = data.loadUInt32(at: offset)
@@ -675,6 +688,7 @@ final class FilterScanner {
                 blockHeight: height,
                 blockHash: Data(hexString: hash) ?? Data(count: 32),
                 prevHash: prevHash,
+                finalSaplingRoot: finalSaplingRoot,
                 time: time,
                 transactions: []
             )
@@ -710,6 +724,7 @@ final class FilterScanner {
             blockHeight: height,
             blockHash: Data(hexString: hash) ?? Data(count: 32),
             prevHash: prevHash,
+            finalSaplingRoot: finalSaplingRoot,
             time: time,
             transactions: transactions
         )
@@ -873,7 +888,7 @@ final class FilterScanner {
     }
 
     /// Process a ZIP-307 compact block using trial decryption
-    private func processCompactBlock(_ block: CompactBlock, accountId: Int64, ivk: Data, height: UInt64) async throws {
+    private func processCompactBlock(_ block: CompactBlock, accountId: Int64, ivk: Data, spendingKey: Data, height: UInt64) async throws {
         // Check for spent notes (nullifier detection)
         for tx in block.transactions {
             for spend in tx.spends {
@@ -909,7 +924,7 @@ final class FilterScanner {
                         outputIndex: UInt32(outputIndex),
                         accountId: accountId,
                         height: height,
-                        ivk: ivk
+                        spendingKey: spendingKey
                     )
                 }
             }
@@ -948,7 +963,8 @@ final class FilterScanner {
     ) throws {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs
-        if let spends = spends {
+        if let spends = spends, !spends.isEmpty {
+            print("🔍 Checking \(spends.count) spend(s) at height \(height) against \(knownNullifiers.count) known nullifiers")
             for spend in spends {
                 guard let nullifierData = Data(hexString: spend.nullifier) else {
                     continue
@@ -1008,9 +1024,9 @@ final class FilterScanner {
 
             let txidData = Data(hexString: txid) ?? Data()
 
-            // Compute nullifier
+            // Compute nullifier using spending key (required for proper PRF_nf)
             let nullifier = try rustBridge.computeNullifier(
-                ivk: ivk,
+                spendingKey: spendingKey,
                 diversifier: Data(diversifier),
                 value: value,
                 rcm: Data(rcm),
@@ -1043,6 +1059,7 @@ final class FilterScanner {
     /// Process shielded outputs for note discovery only (no tree building)
     /// Used by quick scan - much faster as it skips CMU appending
     /// Also checks spends for nullifiers to detect spent notes
+    /// bundledCMUData: Optional bundled CMU data for looking up real positions
     private func processShieldedOutputsForNotesOnly(
         outputs: [ShieldedOutput],
         spends: [ShieldedSpend]? = nil,
@@ -1050,7 +1067,8 @@ final class FilterScanner {
         accountId: Int64,
         spendingKey: Data,
         ivk: Data,
-        height: UInt64
+        height: UInt64,
+        bundledCMUData: Data? = nil
     ) throws {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs so we can catch spends
@@ -1110,13 +1128,24 @@ final class FilterScanner {
 
             let txidData = Data(hexString: txid) ?? Data()
 
-            // Compute nullifier (use 0 for position since we don't have tree)
+            // Try to find real position from bundled CMU data
+            var position: UInt64 = 0
+            if let bundledData = bundledCMUData {
+                if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
+                    position = realPos
+                    print("📍 Found CMU position in bundled tree: \(position)")
+                } else {
+                    print("⚠️ CMU not found in bundled tree, using position 0 (nullifier may be wrong)")
+                }
+            }
+
+            // Compute nullifier using spending key with real position if available
             let nullifier = try rustBridge.computeNullifier(
-                ivk: ivk,
+                spendingKey: spendingKey,
                 diversifier: Data(diversifier),
                 value: value,
                 rcm: Data(rcm),
-                position: 0 // Position unknown without tree
+                position: position
             )
 
             knownNullifiers.insert(nullifier)
@@ -1226,9 +1255,9 @@ final class FilterScanner {
             // Use real tree position for nullifier computation
             let position = treePosition
 
-            // Compute nullifier for this note
+            // Compute nullifier for this note using spending key
             let nullifier = try rustBridge.computeNullifier(
-                ivk: ivk,
+                spendingKey: spendingKey,
                 diversifier: note.diversifier,
                 value: note.value,
                 rcm: note.rcm,
@@ -1271,14 +1300,14 @@ final class FilterScanner {
         outputIndex: UInt32,
         accountId: Int64,
         height: UInt64,
-        ivk: Data
+        spendingKey: Data
     ) async throws {
         // Calculate position in commitment tree (simplified)
         let position = height * 1000 + UInt64(outputIndex)
 
-        // Compute nullifier for this note
+        // Compute nullifier for this note using spending key
         let nullifier = try rustBridge.computeNullifier(
-            ivk: ivk,
+            spendingKey: spendingKey,
             diversifier: note.diversifier,
             value: note.value,
             rcm: note.rcm,

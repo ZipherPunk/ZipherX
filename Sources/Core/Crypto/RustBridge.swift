@@ -158,16 +158,17 @@ final class RustBridge {
 
     // MARK: - Nullifier Computation
 
-    /// Compute nullifier for a note
+    /// Compute nullifier for a note using proper Sapling cryptography
+    /// Requires the spending key (169 bytes) to derive nk for PRF_nf
     func computeNullifier(
-        ivk: Data,
+        spendingKey: Data,  // Changed: now takes spending key (169 bytes)
         diversifier: Data,
         value: UInt64,
         rcm: Data,
         position: UInt64
     ) throws -> Data {
         guard let nullifier = ZipherXFFI.computeNullifier(
-            viewingKey: ivk,
+            spendingKey: spendingKey,
             diversifier: diversifier,
             value: value,
             rcm: rcm,

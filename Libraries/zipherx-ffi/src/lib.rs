@@ -259,34 +259,74 @@ pub unsafe extern "C" fn zipherx_derive_ivk(
 }
 
 
-/// Compute nullifier for a note
+/// Compute nullifier for a note using proper Sapling cryptography
+/// Requires the spending key (169 bytes) to derive nk for PRF_nf
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_compute_nullifier(
-    viewing_key: *const u8,
+    spending_key: *const u8,  // Extended spending key (169 bytes)
     diversifier: *const u8,
     value: u64,
     rcm: *const u8,
     position: u64,
     nf_out: *mut u8,
 ) -> bool {
-    let vk_slice = slice::from_raw_parts(viewing_key, 32);
+    use zcash_primitives::sapling::{Diversifier, Rseed};
+    use zcash_primitives::zip32::ExtendedSpendingKey;
+    use jubjub::Fr;
+    use ff::PrimeField;
+
+    let sk_slice = slice::from_raw_parts(spending_key, 169);
     let div_slice = slice::from_raw_parts(diversifier, 11);
     let rcm_slice = slice::from_raw_parts(rcm, 32);
 
-    // Compute nullifier using BLAKE2b with Zcash personalization
-    let mut hasher = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(b"Zcash_nf")
-        .to_state();
+    // Parse the extended spending key
+    let extsk = match ExtendedSpendingKey::read(&sk_slice[..]) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Failed to parse spending key for nullifier: {:?}", e);
+            return false;
+        }
+    };
 
-    hasher.update(vk_slice);
-    hasher.update(div_slice);
-    hasher.update(&value.to_le_bytes());
-    hasher.update(rcm_slice);
-    hasher.update(&position.to_le_bytes());
+    // Get the diversifiable full viewing key
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
 
-    let hash = hasher.finalize();
-    std::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), nf_out, 32);
+    // Get the nullifier deriving key (nk) from fvk.vk
+    let nk = dfvk.fvk().vk.nk;
+
+    // Parse diversifier
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    // Get payment address from the viewing key and diversifier
+    let payment_address = match dfvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("Invalid diversifier for nullifier computation");
+            return false;
+        }
+    };
+
+    // Parse rcm as a scalar
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm_scalar: Fr = match Option::<Fr>::from(Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => {
+            eprintln!("Invalid rcm for nullifier computation");
+            return false;
+        }
+    };
+
+    // Create the note using the PaymentAddress convenience method
+    let note = payment_address.create_note(value, Rseed::BeforeZip212(rcm_scalar));
+
+    // Compute nullifier using proper PRF_nf
+    let nullifier = note.nf(&nk, position);
+
+    // Copy nullifier to output
+    std::ptr::copy_nonoverlapping(nullifier.0.as_ptr(), nf_out, 32);
 
     true
 }
@@ -1774,6 +1814,41 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     *witness_out_len = serialized.len();
 
     target_pos
+}
+
+/// Find the position of a CMU in bundled CMU data (fast - no tree building)
+/// Returns the 0-indexed position, or u64::MAX if not found
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_find_cmu_position(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmu: *const u8,
+) -> u64 {
+    if cmu_data_len < 8 {
+        return u64::MAX;
+    }
+
+    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
+    let target_bytes = slice::from_raw_parts(target_cmu, 32);
+
+    // Read count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        return u64::MAX;
+    }
+
+    // Linear search for target CMU
+    let mut offset = 8;
+    for i in 0..count {
+        if &bytes[offset..offset + 32] == target_bytes {
+            return i;
+        }
+        offset += 32;
+    }
+
+    u64::MAX
 }
 
 // =============================================================================

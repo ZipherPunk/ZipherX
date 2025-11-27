@@ -83,4 +83,21 @@ uint64_t zipherx_tree_create_witness_for_cmu(
     size_t *witness_out_len
 );
 
+// Find position of a CMU in bundled data (fast, no tree building)
+uint64_t zipherx_find_cmu_position(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmu
+);
+
+// Compute nullifier for a note
+bool zipherx_compute_nullifier(
+    const uint8_t *spending_key,
+    const uint8_t *diversifier,
+    uint64_t value,
+    const uint8_t *rcm,
+    uint64_t position,
+    uint8_t *nf_out
+);
+
 #endif // ZIPHERX_FFI_H

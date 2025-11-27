@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @State private var selectedTab: Tab = .balance
     @State private var isFirstLaunch: Bool = false
+    @State private var isInitialSync: Bool = true  // Track initial sync state
 
     enum Tab {
         case balance, send, receive, settings
@@ -22,7 +23,12 @@ struct ContentView: View {
                         // Check if this is first launch (tree not yet cached)
                         isFirstLaunch = !walletManager.isTreeLoaded && walletManager.treeLoadProgress < 1.0
 
-                        // Connect first, then fetch stats
+                        // Show connecting status immediately at app launch
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Connecting to network...")
+                        }
+
+                        // Connect if needed
                         if !networkManager.isConnected {
                             do {
                                 try await networkManager.connect()
@@ -37,11 +43,25 @@ struct ContentView: View {
 
                         // Auto-sync on launch (downloads params if needed, syncs blockchain)
                         if networkManager.isConnected {
+                            // Clear connecting state before sync starts (sync will show its own status)
+                            await MainActor.run {
+                                walletManager.setConnecting(false, status: nil)
+                            }
                             do {
                                 try await walletManager.refreshBalance()
                             } catch {
                                 print("⚠️ Auto-sync failed: \(error.localizedDescription)")
                             }
+                        } else {
+                            // Clear connecting state if not connected
+                            await MainActor.run {
+                                walletManager.setConnecting(false, status: nil)
+                            }
+                        }
+
+                        // Mark initial sync as complete
+                        await MainActor.run {
+                            isInitialSync = false
                         }
                     }
 
@@ -55,11 +75,12 @@ struct ContentView: View {
                     .transition(.opacity)
                 }
 
-                // Sync overlay (shown during blockchain sync after tree is loaded)
-                if walletManager.isTreeLoaded && walletManager.isSyncing {
+                // Sync overlay (shown during blockchain sync, connecting, or initial sync after tree is loaded)
+                if walletManager.isTreeLoaded && (walletManager.isSyncing || walletManager.isConnecting || isInitialSync) {
                     CypherpunkSyncView(
-                        progress: walletManager.syncProgress,
-                        status: walletManager.syncStatus
+                        progress: walletManager.isSyncing ? walletManager.syncProgress : 0.0,
+                        status: walletManager.isConnecting ? "Connecting to network..." :
+                               (walletManager.isSyncing ? walletManager.syncStatus : "Initializing...")
                     )
                     .transition(.opacity)
                 }

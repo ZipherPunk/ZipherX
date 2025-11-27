@@ -147,27 +147,29 @@ enum ZipherXFFI {
         return Data(ivk)
     }
 
-    /// Compute nullifier for a note
+    /// Compute nullifier for a note using proper Sapling cryptography
+    /// Requires the spending key (169 bytes) to derive nk for PRF_nf
     static func computeNullifier(
-        viewingKey: Data,
+        spendingKey: Data,  // Changed: now takes spending key (169 bytes) not viewing key
         diversifier: Data,
         value: UInt64,
         rcm: Data,
         position: UInt64
     ) -> Data? {
-        guard viewingKey.count == 32,
+        guard spendingKey.count == 169,
               diversifier.count == 11,
               rcm.count == 32 else {
+            print("⚠️ computeNullifier: invalid input sizes - sk=\(spendingKey.count), div=\(diversifier.count), rcm=\(rcm.count)")
             return nil
         }
 
         var nullifier = [UInt8](repeating: 0, count: 32)
 
-        let success = viewingKey.withUnsafeBytes { vkPtr in
+        let success = spendingKey.withUnsafeBytes { skPtr in
             diversifier.withUnsafeBytes { divPtr in
                 rcm.withUnsafeBytes { rcmPtr in
                     zipherx_compute_nullifier(
-                        vkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
                         divPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
                         value,
                         rcmPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -179,6 +181,7 @@ enum ZipherXFFI {
         }
 
         guard success else {
+            print("⚠️ computeNullifier: FFI returned false")
             return nil
         }
 
@@ -310,6 +313,32 @@ enum ZipherXFFI {
         }
 
         return Data(output.prefix(length))
+    }
+
+    // MARK: - CMU Position Lookup
+
+    /// Find the position of a CMU in bundled CMU data (fast, no tree building)
+    /// Returns the 0-indexed position, or nil if not found
+    static func findCMUPosition(cmuData: Data, targetCMU: Data) -> UInt64? {
+        guard targetCMU.count == 32 else {
+            return nil
+        }
+
+        let position = cmuData.withUnsafeBytes { dataPtr in
+            targetCMU.withUnsafeBytes { cmuPtr in
+                zipherx_find_cmu_position(
+                    dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    cmuData.count,
+                    cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                )
+            }
+        }
+
+        guard position != UInt64.max else {
+            return nil
+        }
+
+        return position
     }
 
     // MARK: - Utility Functions

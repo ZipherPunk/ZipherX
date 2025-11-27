@@ -497,7 +497,43 @@ Created `/Users/chris/ZipherX/Libraries/zcash_primitives_zcl/` with native `Zcla
 - `Sources/Core/Network/FilterScanner.swift` - fast startup, nullifier detection
 - `Sources/Core/Wallet/WalletManager.swift` - cypherpunk progress messages
 
-### 8. P2P-First Data Fetching for Mobile Users (November 2025)
+### 8. Progress Bar Not Showing at Launch (November 2025)
+
+**Problem**: Users reported "no progress bar at launch during scan"
+
+**Root Cause Analysis**:
+1. Tree loading from database cache is very fast (<1 second)
+2. `isTreeLoaded` becomes true quickly
+3. Gap exists between tree loaded and network connection/sync starting
+4. Sync overlay only showed when `isSyncing` was true (set inside `refreshBalance()`)
+
+**Solution: Multi-state Loading Overlay**
+
+Added `isConnecting` state and `isInitialSync` local state to ensure continuous visual feedback:
+
+1. **WalletManager.swift**:
+   - Added `@Published private(set) var isConnecting: Bool = false`
+   - Added `setConnecting(_ connecting: Bool, status: String?)` method
+
+2. **ContentView.swift**:
+   - Added `@State private var isInitialSync: Bool = true`
+   - Sync overlay now shows when: `isTreeLoaded && (isSyncing || isConnecting || isInitialSync)`
+   - Shows "Connecting to network..." during connection phase
+   - Shows "Initializing..." before sync starts
+   - `isInitialSync = false` only after sync completes
+
+**Loading Sequence Now**:
+1. Tree loading overlay (if tree not cached)
+2. Sync overlay with "Connecting to network..." during connection
+3. Sync overlay with actual progress during blockchain scan
+4. Overlay disappears when sync complete
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - added `isConnecting` state
+- `Sources/App/ContentView.swift` - multi-state overlay logic
+- `Sources/ZipherX-Bridging-Header.h` - added `zipherx_find_cmu_position` declaration
+
+### 9. P2P-First Data Fetching for Mobile Users (November 2025)
 
 **Problem**: Transaction building failed when fetching CMUs for notes beyond bundled tree height
 - Insight API timeout when fetching blocks

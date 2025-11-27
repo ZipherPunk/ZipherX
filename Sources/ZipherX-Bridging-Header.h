@@ -321,6 +321,17 @@ uint64_t zipherx_tree_create_witness_for_cmu(
     size_t *witness_out_len
 );
 
+/// Find the position of a CMU in bundled CMU data (fast binary search, no tree building)
+/// @param cmu_data Pointer to bundled CMU file data [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param target_cmu The 32-byte CMU to find
+/// @return The position (0-indexed) of the CMU, or UINT64_MAX if not found
+uint64_t zipherx_find_cmu_position(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmu
+);
+
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)
 // =============================================================================
