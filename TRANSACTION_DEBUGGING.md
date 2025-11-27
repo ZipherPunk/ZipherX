@@ -403,3 +403,6 @@ zclassic-cli decoderawtransaction <hex>
 | 2025-11-27 | **TRANSACTIONS NOW WORKING**: Successfully broadcast shielded transactions to mainnet |
 | 2025-11-27 | Fixed broadcast success detection - now only requires 1 peer acceptance |
 | 2025-11-27 | Removed excessive debug logs from FFI library for production |
+| 2025-11-27 | Added tree preloading at wallet startup with real-time progress |
+| 2025-11-27 | Tree state now cached in database - subsequent loads are instant |
+| 2025-11-27 | Rebuilt iOS libraries with optimizations enabled |

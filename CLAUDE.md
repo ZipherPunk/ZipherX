@@ -186,11 +186,12 @@ Before any release:
 13. **Transaction Building** - Spend proof generation with real witnesses ✅
 14. **Full Send Flow** - End-to-end shielded transactions working on mainnet ✅
 15. **ZclassicButtercup Branch ID** - Local fork of zcash_primitives with correct branch ID (0x930b540d) ✅
+16. **Tree Caching & Preloading** - Tree loaded at startup, cached in database for instant subsequent loads ✅
+17. **Debug Logs Disabled** - Production build with conditional logging via `DEBUG_LOGGING` flag ✅
 
 ### In Progress / Needs Testing
 
-1. **Balance Tracking** - Update balance immediately after successful transaction
-2. **Tree Loading Optimization** - Load CMU bundle at wallet startup instead of per-transaction
+1. **Balance UI Update** - Show tree loading progress in main wallet view
 
 ### Remaining Tasks
 
