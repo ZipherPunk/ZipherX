@@ -9,9 +9,9 @@ final class HeaderSyncManager {
     private let headerStore: HeaderStore
     private let networkManager: NetworkManager
 
-    // Consensus parameters
-    private let minPeers = 3
-    private let consensusThreshold = 3  // 100% agreement required (3/3) - most secure!
+    // Consensus parameters - relaxed for better connectivity
+    private let minPeers = 1  // Reduced from 3 - even 1 peer is enough to sync
+    private let consensusThreshold = 1  // Use whatever peers we have
 
     // Sync state
     private var isSyncing = false

@@ -112,6 +112,12 @@ final class WalletManager: ObservableObject {
         }
 
         if let treeData = try? WalletDatabase.shared.getTreeState() {
+            // Show brief loading state even for cached tree
+            await MainActor.run {
+                self.treeLoadProgress = 0.5
+                self.treeLoadStatus = "Restoring Merkle state..."
+            }
+
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
                 print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
