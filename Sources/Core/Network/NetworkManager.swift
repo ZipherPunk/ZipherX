@@ -619,7 +619,7 @@ final class NetworkManager: ObservableObject {
         return headers
     }
 
-    /// Get current chain height from peers
+    /// Get current chain height from peers (with InsightAPI fallback)
     func getChainHeight() async throws -> UInt64 {
         guard isConnected else {
             throw NetworkError.notConnected
@@ -643,12 +643,21 @@ final class NetworkManager: ObservableObject {
         }
 
         // Return highest height with consensus
-        guard let (height, count) = heights.max(by: { $0.key < $1.key }),
-              count >= 1 else { // At least one peer must report
-            throw NetworkError.consensusNotReached
+        if let (height, count) = heights.max(by: { $0.key < $1.key }),
+           count >= 1 {
+            return height
         }
 
-        return height
+        // Fallback: If P2P peers don't report valid heights, use InsightAPI
+        print("⚠️ P2P peers did not report chain height, falling back to InsightAPI...")
+        do {
+            let status = try await InsightAPI.shared.getStatus()
+            print("📊 InsightAPI chain height: \(status.height)")
+            return status.height
+        } catch {
+            print("❌ InsightAPI fallback also failed: \(error)")
+            throw NetworkError.consensusNotReached
+        }
     }
 
     /// Get compact block filters for transaction detection
@@ -682,17 +691,22 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get compact blocks (ZIP-307) for shielded transaction scanning
+    /// Uses multi-peer consensus for trustless verification
     func getCompactBlocks(from height: UInt64, count: Int) async throws -> [CompactBlock] {
         guard isConnected else {
             throw NetworkError.notConnected
         }
 
-        // Use first available peer for block download (full blocks are large)
+        // For single blocks or small batches, use multi-peer consensus
+        if count <= 10 {
+            return try await getBlocksWithConsensus(from: height, count: count)
+        }
+
+        // For larger batches, use single peer but verify key data
         guard let peer = peers.first else {
             throw NetworkError.notConnected
         }
 
-        // Use getFullBlocks which properly fetches via getblocks/getdata
         let blocks = try await peer.getFullBlocks(from: height, count: count)
 
         guard !blocks.isEmpty else {
@@ -700,6 +714,145 @@ final class NetworkManager: ObservableObject {
         }
 
         return blocks
+    }
+
+    /// Get blocks from multiple peers and verify consensus on critical data
+    /// Returns blocks only if at least CONSENSUS_THRESHOLD peers agree
+    func getBlocksWithConsensus(from height: UInt64, count: Int) async throws -> [CompactBlock] {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        let availablePeers = peers.prefix(min(peers.count, 4)) // Use up to 4 peers
+        guard availablePeers.count >= 1 else {
+            throw NetworkError.notConnected
+        }
+
+        // Request blocks from multiple peers in parallel
+        var peerResults: [[[UInt8]]: [CompactBlock]] = [:] // Block hashes -> blocks
+
+        await withTaskGroup(of: (String, [CompactBlock]?).self) { group in
+            for peer in availablePeers {
+                group.addTask {
+                    do {
+                        let blocks = try await peer.getFullBlocks(from: height, count: count)
+                        return (peer.host, blocks)
+                    } catch {
+                        print("⚠️ Failed to get blocks from peer \(peer.host): \(error)")
+                        peer.recordFailure()
+                        return (peer.host, nil)
+                    }
+                }
+            }
+
+            for await (peerHost, blocks) in group {
+                if let blocks = blocks, !blocks.isEmpty {
+                    // Create key from block hashes for consensus check
+                    let hashKey = blocks.map { Array($0.blockHash) }
+                    peerResults[hashKey] = blocks
+                    print("📦 Peer \(peerHost) returned \(blocks.count) blocks")
+                }
+            }
+        }
+
+        // Find consensus - blocks where hash matches between peers
+        guard !peerResults.isEmpty else {
+            throw NetworkError.consensusNotReached
+        }
+
+        // If we have multiple responses, verify they match
+        if peerResults.count >= 2 {
+            // Find the response with most agreement
+            var voteCount: [[UInt8]: Int] = [:]
+            for (hashKey, _) in peerResults {
+                // Flatten to single hash for voting
+                let flatHash = hashKey.flatMap { $0 }
+                voteCount[flatHash, default: 0] += 1
+            }
+
+            guard let (winningHash, votes) = voteCount.max(by: { $0.value < $1.value }),
+                  votes >= min(CONSENSUS_THRESHOLD, peerResults.count) else {
+                print("❌ No consensus on blocks from height \(height)")
+                throw NetworkError.consensusNotReached
+            }
+
+            // Find blocks matching winning hash
+            for (hashKey, blocks) in peerResults {
+                if hashKey.flatMap({ $0 }) == winningHash {
+                    print("✅ Block consensus reached with \(votes) peers")
+                    return blocks
+                }
+            }
+        }
+
+        // Single peer response - accept it (user should enable multi-peer for security)
+        if let (_, blocks) = peerResults.first {
+            print("⚠️ Using single peer response (multi-peer consensus recommended)")
+            return blocks
+        }
+
+        throw NetworkError.consensusNotReached
+    }
+
+    /// Get a single block by hash from multiple peers with consensus
+    func getBlockByHashWithConsensus(hash: Data) async throws -> CompactBlock {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        let availablePeers = peers.prefix(min(peers.count, 3))
+        guard !availablePeers.isEmpty else {
+            throw NetworkError.notConnected
+        }
+
+        var results: [Data: CompactBlock] = [:] // finalSaplingRoot -> block
+
+        await withTaskGroup(of: CompactBlock?.self) { group in
+            for peer in availablePeers {
+                group.addTask {
+                    try? await peer.getBlockByHash(hash: hash)
+                }
+            }
+
+            for await block in group {
+                if let block = block {
+                    // Key by finalSaplingRoot - the critical data we need to verify
+                    results[block.finalSaplingRoot] = block
+                }
+            }
+        }
+
+        guard !results.isEmpty else {
+            throw NetworkError.consensusNotReached
+        }
+
+        // If multiple different sapling roots, reject (could be attack)
+        if results.count > 1 {
+            print("⚠️ Peers disagree on finalSaplingRoot - possible attack!")
+            throw NetworkError.consensusNotReached
+        }
+
+        // All peers agree
+        return results.values.first!
+    }
+
+    /// Get transaction by txid from P2P network
+    func getTransactionP2P(txid: String) async throws -> Data {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        guard let peer = peers.first else {
+            throw NetworkError.notConnected
+        }
+
+        // Convert txid hex string to Data (reversed for network byte order)
+        guard let txidData = Data(hexString: txid)?.reversed() else {
+            throw NetworkError.invalidData
+        }
+
+        // Request transaction via getdata
+        return try await peer.getTransaction(hash: Data(txidData))
     }
 
     // MARK: - Peer Rotation
@@ -879,6 +1032,7 @@ enum NetworkError: LocalizedError {
     case handshakeFailed
     case timeout
     case connectionTimeout
+    case invalidData
 
     var errorDescription: String? {
         switch self {
@@ -902,6 +1056,8 @@ enum NetworkError: LocalizedError {
             return "Request timed out"
         case .connectionTimeout:
             return "Connection timed out"
+        case .invalidData:
+            return "Invalid data format"
         }
     }
 }

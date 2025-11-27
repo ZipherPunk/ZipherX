@@ -359,4 +359,50 @@ size_t zipherx_try_recover_output_with_ovk(const uint8_t *ovk,
 /// @return true on success
 bool zipherx_derive_ovk(const uint8_t *sk, uint8_t *ovk_out);
 
+// =============================================================================
+// Equihash Proof-of-Work Verification (trustless header validation)
+// =============================================================================
+
+/// Verify Equihash(200,9) solution for a block header
+/// @param header_bytes 140-byte block header (includes 32-byte nonce at end)
+/// @param solution Equihash solution bytes (typically 1344 bytes)
+/// @param solution_len Length of solution
+/// @return true if solution is valid
+bool zipherx_verify_equihash(const uint8_t *header_bytes,
+                              const uint8_t *solution,
+                              size_t solution_len);
+
+/// Compute block hash (double SHA256) from header + solution
+/// @param header_bytes 140-byte block header
+/// @param solution Equihash solution bytes
+/// @param solution_len Length of solution
+/// @param hash_out Output buffer for 32-byte hash (internal byte order)
+/// @return true on success
+bool zipherx_compute_block_hash(const uint8_t *header_bytes,
+                                 const uint8_t *solution,
+                                 size_t solution_len,
+                                 uint8_t *hash_out);
+
+/// Verify a chain of block headers for continuity and valid PoW
+/// @param headers_data Concatenated header data (140 bytes + varint + solution each)
+/// @param headers_count Number of headers
+/// @param expected_prev_hash Expected prevHash of first header (32 bytes), or NULL
+/// @param header_offsets Array of byte offsets for each header
+/// @param header_sizes Array of total sizes for each header
+/// @return true if all headers valid and chain is continuous
+bool zipherx_verify_header_chain(const uint8_t *headers_data,
+                                  size_t headers_count,
+                                  const uint8_t *expected_prev_hash,
+                                  const size_t *header_offsets,
+                                  const size_t *header_sizes);
+
+/// Verify a single block header and get its hash
+/// @param header_and_solution Full header data (140 bytes + varint + solution)
+/// @param total_len Total length of data
+/// @param hash_out Output buffer for 32-byte block hash
+/// @return true if header is valid
+bool zipherx_verify_block_header(const uint8_t *header_and_solution,
+                                  size_t total_len,
+                                  uint8_t *hash_out);
+
 #endif /* ZipherX_Bridging_Header_h */

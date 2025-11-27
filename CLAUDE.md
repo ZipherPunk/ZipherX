@@ -187,17 +187,26 @@ Before any release:
 15. **ZclassicButtercup Branch ID** - Local fork of zcash_primitives with correct branch ID (0x930b540d) ✅
 16. **Tree Caching & Preloading** - Tree loaded at startup, cached in database for instant subsequent loads ✅
 17. **Debug Logs Disabled** - Production build with conditional logging via `DEBUG_LOGGING` flag ✅
+18. **Equihash PoW Verification** - Trustless header validation via FFI (November 2025) ✅
+    - `zipherx_verify_equihash()` - Verify Equihash(200,9) solutions
+    - `zipherx_compute_block_hash()` - Compute block hash from header + solution
+    - `zipherx_verify_header_chain()` - Verify chain of headers
+    - Headers with invalid PoW are rejected during sync
+19. **Multi-Peer Block Consensus** - Request blocks from multiple peers, verify agreement ✅
+    - `getBlocksWithConsensus()` - Multi-peer block fetching
+    - `getBlockByHashWithConsensus()` - Single block with consensus
+    - Reject blocks if peers disagree on finalSaplingRoot
 
 ### In Progress / Needs Testing
 
-1. **Balance UI Update** - Show tree loading progress in main wallet view
+1. **P2P-Only Mode** - Replace remaining InsightAPI calls with P2P
+2. **Balance UI Update** - Show tree loading progress in main wallet view
 
 ### Remaining Tasks
 
-1. **Multi-Peer Consensus** - Currently single API endpoint
-2. **Background Sync** - iOS background fetch
-3. **Secure Enclave Integration** - Currently keys in memory
-4. **Security Audit** - Required before any real use
+1. **Background Sync** - iOS background fetch
+2. **Secure Enclave Integration** - Currently keys in memory
+3. **Security Audit** - Required before any real use
 
 ---
 
@@ -586,6 +595,110 @@ if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
 - `Sources/Core/Network/HeaderSyncManager.swift` - Removed local node trust mode
 - `Sources/Features/Balance/BalanceView.swift` - Removed isConnectedToLocalNode UI
 - **Deleted**: `Sources/Core/Network/LocalNodeRPC.swift`
+
+### 10. "Could not reach consensus among peers" When Sending (November 2025)
+
+**Problem**: Users with 2 connected P2P peers could not send transactions - error "Could not reach consensus among peers"
+
+**Root Cause**: `NetworkManager.getChainHeight()` was throwing `consensusNotReached` when:
+1. P2P peers don't report `peerStartHeight` in version message (returns 0)
+2. Heights dictionary ends up empty (0 values filtered out)
+
+**Solution: InsightAPI Fallback**
+
+Added InsightAPI fallback when P2P peers don't report valid heights:
+
+```swift
+// getChainHeight() now falls back to InsightAPI
+if let (height, count) = heights.max(by: { $0.key < $1.key }), count >= 1 {
+    return height
+}
+
+// Fallback: If P2P peers don't report valid heights, use InsightAPI
+print("⚠️ P2P peers did not report chain height, falling back to InsightAPI...")
+let status = try await InsightAPI.shared.getStatus()
+return status.height
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - added InsightAPI fallback to `getChainHeight()`
+
+### 11. CRITICAL: Nullifier Byte Order Mismatch - Spent Detection Failing (November 2025)
+
+**Problem**: Notes showing as "UNSPENT" when they were actually spent on blockchain. Balance displayed 0.0087 ZCL but real balance is 0 ZCL.
+
+**Root Cause**: Nullifier byte order mismatch during spend detection comparison:
+- API returns nullifiers in **big-endian (display format)**: `9150bff548d3328acc4468e316d701e8b370f64348dbb58d4ba8f2e885d2c8ab`
+- Our `knownNullifiers` set stores in **little-endian (wire format)**: `abc8d285e8f2a84b8db5db4843f670b3e801d716e36844cc8a32d348f5bf5091`
+- These are byte-reversed of each other!
+- `knownNullifiers.contains(nullifierData)` was comparing big-endian vs little-endian - never matches
+
+**Solution**: Reverse the API nullifier before comparison:
+
+```swift
+// In processShieldedOutputsSync and processShieldedOutputsForNotesOnly:
+guard let nullifierDisplay = Data(hexString: spend.nullifier) else { continue }
+// CRITICAL FIX: API returns nullifier in big-endian (display format)
+// but our knownNullifiers are stored in little-endian (wire format)
+let nullifierWire = nullifierDisplay.reversedBytes()
+if knownNullifiers.contains(nullifierWire) {
+    try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - fixed nullifier byte order in `processShieldedOutputsSync()` and `processShieldedOutputsForNotesOnly()`
+
+### 12. Unified Cypherpunk Progress View for All Startup Scenarios (November 2025)
+
+**Problem**:
+1. Progress bar disappeared after a few seconds during sync
+2. Different progress views for tree loading vs syncing
+3. Tasks not displayed in the cypherpunk progress view
+4. Progress bar missing on private key import
+
+**Solution**: Unified cypherpunk sync view for ALL startup scenarios:
+
+1. **Single overlay for entire initial sync** - shows from wallet creation/import until sync complete
+2. **Combined progress tracking** - tree loading (0-30%), connecting (30-35%), sync (35-100%)
+3. **Task list display** - shows all tasks with progress bars and status indicators
+4. **`isInitialSync` flag** - only set to `false` after EVERYTHING completes
+
+```swift
+// Single overlay condition - stays visible for entire initial sync
+if isInitialSync {
+    CypherpunkSyncView(
+        progress: currentSyncProgress,
+        status: currentSyncStatus,
+        tasks: currentSyncTasks  // Combined tasks including tree loading
+    )
+}
+
+// Combined tasks computed property
+private var currentSyncTasks: [SyncTask] {
+    var tasks: [SyncTask] = []
+    // Tree loading task
+    if !walletManager.isTreeLoaded {
+        tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .inProgress, ...))
+    } else {
+        tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .completed))
+    }
+    // Add sync tasks from WalletManager
+    tasks.append(contentsOf: walletManager.syncTasks)
+    return tasks
+}
+```
+
+**CypherpunkSyncView now shows**:
+- SYNCING title with glitch effect
+- Rotating cypherpunk messages
+- Task list with individual progress bars
+- Overall progress bar with percentage
+- Cypherpunk's Manifesto quote
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - unified overlay, combined progress/tasks computed properties
+- `Sources/UI/Components/System7Components.swift` - `CypherpunkSyncView` now accepts `tasks` parameter, added `CypherpunkSyncTaskRow`
 
 ---
 

@@ -896,20 +896,62 @@ pub unsafe extern "C" fn zipherx_init_prover(
 ) -> bool {
     let spend = match std::ffi::CStr::from_ptr(spend_path).to_str() {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("❌ Invalid spend path string: {:?}", e);
+            return false;
+        }
     };
 
     let output = match std::ffi::CStr::from_ptr(output_path).to_str() {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("❌ Invalid output path string: {:?}", e);
+            return false;
+        }
     };
 
-    // Load the prover with Sapling parameters
-    let prover = LocalTxProver::new(Path::new(spend), Path::new(output));
-    let mut global_prover = PROVER.lock().unwrap();
-    *global_prover = Some(prover);
-    debug_log!("✅ Prover initialized with Sapling parameters");
-    true
+    eprintln!("📁 Loading Sapling params from:");
+    eprintln!("   Spend:  {}", spend);
+    eprintln!("   Output: {}", output);
+
+    // Check if files exist
+    let spend_path = Path::new(spend);
+    let output_path = Path::new(output);
+
+    if !spend_path.exists() {
+        eprintln!("❌ Spend params file does not exist: {}", spend);
+        return false;
+    }
+    if !output_path.exists() {
+        eprintln!("❌ Output params file does not exist: {}", output);
+        return false;
+    }
+
+    // Get file sizes for verification
+    if let Ok(metadata) = std::fs::metadata(spend_path) {
+        eprintln!("   Spend file size: {} bytes", metadata.len());
+    }
+    if let Ok(metadata) = std::fs::metadata(output_path) {
+        eprintln!("   Output file size: {} bytes", metadata.len());
+    }
+
+    // Load the prover with Sapling parameters (can panic on invalid files)
+    let prover = std::panic::catch_unwind(|| {
+        LocalTxProver::new(spend_path, output_path)
+    });
+
+    match prover {
+        Ok(p) => {
+            let mut global_prover = PROVER.lock().unwrap();
+            *global_prover = Some(p);
+            eprintln!("✅ Prover initialized with Sapling parameters");
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Prover initialization panicked: {:?}", e);
+            false
+        }
+    }
 }
 
 /// Build a complete shielded transaction
@@ -2026,4 +2068,256 @@ pub unsafe extern "C" fn zipherx_derive_ovk(
     true
 }
 
-// Add debugging for anchor mismatch
+// =============================================================================
+// Equihash Verification for Block Header Validation
+// =============================================================================
+
+/// Verify an Equihash solution for a Zclassic block header
+/// This is CRITICAL for trustless P2P operation - validates proof-of-work
+///
+/// Parameters:
+/// - header_bytes: The 140-byte block header (version through nonce)
+/// - solution: The Equihash solution bytes
+/// - solution_len: Length of the solution
+///
+/// Returns true if the Equihash solution is valid
+///
+/// Zclassic uses Equihash(200, 9) - same as Zcash
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_equihash(
+    header_bytes: *const u8,
+    solution: *const u8,
+    solution_len: usize,
+) -> bool {
+    // Zclassic/Zcash Equihash parameters
+    const N: u32 = 200;
+    const K: u32 = 9;
+
+    // Header is 140 bytes total:
+    // - First 108 bytes: header data (input for Equihash)
+    // - Last 32 bytes: nonce
+    let header = slice::from_raw_parts(header_bytes, 140);
+    let solution_slice = slice::from_raw_parts(solution, solution_len);
+
+    // Split header into input (108 bytes) and nonce (32 bytes)
+    let input = &header[..108];
+    let nonce = &header[108..140];
+
+    // Verify the Equihash solution
+    // is_valid_solution returns Result<(), Error> - Ok means valid, Err means invalid
+    match equihash::is_valid_solution(N, K, input, nonce, solution_slice) {
+        Ok(()) => {
+            debug_log!("✅ Equihash solution is valid");
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Equihash verification failed: {:?}", e);
+            false
+        }
+    }
+}
+
+/// Compute the block hash for a Zclassic block header
+/// The block hash is double SHA256 of: header (140 bytes) + solution length (varint) + solution
+///
+/// Parameters:
+/// - header_bytes: The 140-byte block header
+/// - solution: The Equihash solution bytes
+/// - solution_len: Length of the solution
+/// - hash_out: Output buffer for 32-byte hash (will be in internal byte order)
+///
+/// Returns true on success
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_block_hash(
+    header_bytes: *const u8,
+    solution: *const u8,
+    solution_len: usize,
+    hash_out: *mut u8,
+) -> bool {
+    use sha2::{Sha256, Digest};
+
+    let header = slice::from_raw_parts(header_bytes, 140);
+    let solution_slice = slice::from_raw_parts(solution, solution_len);
+
+    // Build the data to hash: header + compact size + solution
+    let mut data = Vec::with_capacity(140 + 5 + solution_len);
+    data.extend_from_slice(header);
+
+    // Write compact size (varint) for solution length
+    // Equihash(200,9) solution is 1344 bytes, so we need 3-byte encoding
+    if solution_len < 253 {
+        data.push(solution_len as u8);
+    } else if solution_len < 0x10000 {
+        data.push(253);
+        data.push((solution_len & 0xff) as u8);
+        data.push(((solution_len >> 8) & 0xff) as u8);
+    } else {
+        data.push(254);
+        data.push((solution_len & 0xff) as u8);
+        data.push(((solution_len >> 8) & 0xff) as u8);
+        data.push(((solution_len >> 16) & 0xff) as u8);
+        data.push(((solution_len >> 24) & 0xff) as u8);
+    }
+
+    data.extend_from_slice(solution_slice);
+
+    // Double SHA256
+    let hash1 = Sha256::digest(&data);
+    let hash2 = Sha256::digest(&hash1);
+
+    // Copy to output (in internal byte order - NOT reversed for display)
+    std::ptr::copy_nonoverlapping(hash2.as_ptr(), hash_out, 32);
+
+    true
+}
+
+/// Verify a chain of block headers for continuity and valid PoW
+/// Checks that each header's prevHash matches the previous header's hash
+/// and that each Equihash solution is valid
+///
+/// Parameters:
+/// - headers_data: Concatenated header data (each header is 140 bytes + varint solution_len + solution)
+/// - headers_count: Number of headers in the chain
+/// - expected_prev_hash: The expected prevHash of the first header (32 bytes), or null to skip first check
+/// - header_offsets: Array of byte offsets where each header starts (count entries)
+/// - header_sizes: Array of total sizes for each header including solution (count entries)
+///
+/// Returns true if all headers are valid and chain is continuous
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_header_chain(
+    headers_data: *const u8,
+    headers_count: usize,
+    expected_prev_hash: *const u8,
+    header_offsets: *const usize,
+    header_sizes: *const usize,
+) -> bool {
+    if headers_count == 0 {
+        return true;
+    }
+
+    let offsets = slice::from_raw_parts(header_offsets, headers_count);
+    let sizes = slice::from_raw_parts(header_sizes, headers_count);
+
+    let mut prev_hash: [u8; 32] = [0; 32];
+    let has_expected_prev = !expected_prev_hash.is_null();
+
+    if has_expected_prev {
+        let expected = slice::from_raw_parts(expected_prev_hash, 32);
+        prev_hash.copy_from_slice(expected);
+    }
+
+    for i in 0..headers_count {
+        let offset = offsets[i];
+        let size = sizes[i];
+
+        if size < 140 {
+            eprintln!("❌ Header {} too small: {} bytes", i, size);
+            return false;
+        }
+
+        let header_ptr = headers_data.add(offset);
+        let header = slice::from_raw_parts(header_ptr, 140);
+
+        // Extract prevHash from header (bytes 4-36)
+        let header_prev_hash = &header[4..36];
+
+        // Check chain continuity (skip first if no expected_prev_hash provided)
+        if i > 0 || has_expected_prev {
+            if header_prev_hash != prev_hash {
+                eprintln!("❌ Header {} prevHash mismatch - chain broken!", i);
+                eprintln!("   Expected: {}", hex::encode(&prev_hash));
+                eprintln!("   Got:      {}", hex::encode(header_prev_hash));
+                return false;
+            }
+        }
+
+        // Get solution (after 140-byte header)
+        let solution_start = offset + 140;
+        let solution_data = headers_data.add(solution_start);
+
+        // Read compact size for solution length
+        let first_byte = *solution_data;
+        let (solution_len, solution_offset) = if first_byte < 253 {
+            (first_byte as usize, 1)
+        } else if first_byte == 253 {
+            let len = (*solution_data.add(1) as usize) | ((*solution_data.add(2) as usize) << 8);
+            (len, 3)
+        } else {
+            eprintln!("❌ Header {} has invalid solution length encoding", i);
+            return false;
+        };
+
+        let solution_ptr = solution_data.add(solution_offset);
+
+        // Verify Equihash
+        if !zipherx_verify_equihash(header_ptr, solution_ptr, solution_len) {
+            eprintln!("❌ Header {} failed Equihash verification", i);
+            return false;
+        }
+
+        // Compute this block's hash for next iteration
+        let mut hash_out: [u8; 32] = [0; 32];
+        zipherx_compute_block_hash(header_ptr, solution_ptr, solution_len, hash_out.as_mut_ptr());
+        prev_hash = hash_out;
+
+        debug_log!("✅ Header {} verified, hash: {}", i, hex::encode(&prev_hash));
+    }
+
+    eprintln!("✅ All {} headers verified successfully", headers_count);
+    true
+}
+
+/// Verify a single block header's Equihash and return its hash
+/// Simpler interface for single header verification
+///
+/// Parameters:
+/// - header_and_solution: Full header data (140 bytes header + varint + solution)
+/// - total_len: Total length of the data
+/// - hash_out: Output buffer for 32-byte block hash
+///
+/// Returns true if header is valid
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_block_header(
+    header_and_solution: *const u8,
+    total_len: usize,
+    hash_out: *mut u8,
+) -> bool {
+    if total_len < 141 {
+        eprintln!("❌ Header data too small: {} bytes", total_len);
+        return false;
+    }
+
+    let header = slice::from_raw_parts(header_and_solution, 140);
+    let solution_data = header_and_solution.add(140);
+
+    // Read compact size for solution length
+    let first_byte = *solution_data;
+    let (solution_len, solution_offset) = if first_byte < 253 {
+        (first_byte as usize, 1)
+    } else if first_byte == 253 {
+        let len = (*solution_data.add(1) as usize) | ((*solution_data.add(2) as usize) << 8);
+        (len, 3)
+    } else {
+        eprintln!("❌ Invalid solution length encoding");
+        return false;
+    };
+
+    // Verify expected total length
+    let expected_len = 140 + solution_offset + solution_len;
+    if total_len < expected_len {
+        eprintln!("❌ Header data truncated: got {} bytes, expected {}", total_len, expected_len);
+        return false;
+    }
+
+    let solution_ptr = solution_data.add(solution_offset);
+
+    // Verify Equihash
+    if !zipherx_verify_equihash(header_and_solution, solution_ptr, solution_len) {
+        return false;
+    }
+
+    // Compute and return hash
+    zipherx_compute_block_hash(header_and_solution, solution_ptr, solution_len, hash_out);
+
+    true
+}

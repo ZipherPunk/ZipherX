@@ -803,4 +803,125 @@ enum ZipherXFFI {
             memo: memo
         )
     }
+
+    // MARK: - Equihash Proof-of-Work Verification
+
+    /// Verify Equihash(200,9) solution for a block header
+    /// - Parameters:
+    ///   - header: 140-byte block header (includes 32-byte nonce at end)
+    ///   - solution: Equihash solution bytes (typically 1344 bytes)
+    /// - Returns: true if the Equihash solution is valid
+    static func verifyEquihash(header: Data, solution: Data) -> Bool {
+        guard header.count == 140 else {
+            print("❌ verifyEquihash: header must be 140 bytes, got \(header.count)")
+            return false
+        }
+
+        return header.withUnsafeBytes { headerPtr in
+            solution.withUnsafeBytes { solutionPtr in
+                zipherx_verify_equihash(
+                    headerPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    solutionPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    solution.count
+                )
+            }
+        }
+    }
+
+    /// Compute block hash (double SHA256) from header + solution
+    /// - Parameters:
+    ///   - header: 140-byte block header
+    ///   - solution: Equihash solution bytes
+    /// - Returns: 32-byte block hash in internal byte order, or nil on failure
+    static func computeBlockHash(header: Data, solution: Data) -> Data? {
+        guard header.count == 140 else {
+            return nil
+        }
+
+        var hashOutput = [UInt8](repeating: 0, count: 32)
+
+        let success = header.withUnsafeBytes { headerPtr in
+            solution.withUnsafeBytes { solutionPtr in
+                zipherx_compute_block_hash(
+                    headerPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    solutionPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    solution.count,
+                    &hashOutput
+                )
+            }
+        }
+
+        guard success else { return nil }
+        return Data(hashOutput)
+    }
+
+    /// Verify a single block header (Equihash + compute hash)
+    /// - Parameters:
+    ///   - headerAndSolution: Full header data (140 bytes header + varint + solution)
+    /// - Returns: 32-byte block hash if valid, or nil if invalid
+    static func verifyBlockHeader(headerAndSolution: Data) -> Data? {
+        guard headerAndSolution.count >= 141 else {
+            print("❌ verifyBlockHeader: data too small (\(headerAndSolution.count) bytes)")
+            return nil
+        }
+
+        var hashOutput = [UInt8](repeating: 0, count: 32)
+
+        let success = headerAndSolution.withUnsafeBytes { dataPtr in
+            zipherx_verify_block_header(
+                dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                headerAndSolution.count,
+                &hashOutput
+            )
+        }
+
+        guard success else { return nil }
+        return Data(hashOutput)
+    }
+
+    /// Verify a chain of block headers for continuity and valid PoW
+    /// - Parameters:
+    ///   - headers: Array of full header data (140 bytes + varint + solution each)
+    ///   - expectedPrevHash: Expected prevHash of first header (32 bytes), or nil to skip first check
+    /// - Returns: true if all headers valid and chain is continuous
+    static func verifyHeaderChain(headers: [Data], expectedPrevHash: Data?) -> Bool {
+        guard !headers.isEmpty else { return true }
+
+        // Concatenate all headers into single buffer
+        var concatenated = Data()
+        var offsets: [Int] = []
+        var sizes: [Int] = []
+
+        for header in headers {
+            offsets.append(concatenated.count)
+            sizes.append(header.count)
+            concatenated.append(header)
+        }
+
+        return concatenated.withUnsafeBytes { dataPtr in
+            offsets.withUnsafeBytes { offsetsPtr in
+                sizes.withUnsafeBytes { sizesPtr in
+                    if let prevHash = expectedPrevHash, prevHash.count == 32 {
+                        return prevHash.withUnsafeBytes { prevHashPtr in
+                            zipherx_verify_header_chain(
+                                dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                headers.count,
+                                prevHashPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                offsetsPtr.baseAddress?.assumingMemoryBound(to: Int.self),
+                                sizesPtr.baseAddress?.assumingMemoryBound(to: Int.self)
+                            )
+                        }
+                    } else {
+                        return zipherx_verify_header_chain(
+                            dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            headers.count,
+                            nil,
+                            offsetsPtr.baseAddress?.assumingMemoryBound(to: Int.self),
+                            sizesPtr.baseAddress?.assumingMemoryBound(to: Int.self)
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

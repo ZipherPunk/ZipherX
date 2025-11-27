@@ -3,10 +3,10 @@
 
 import Foundation
 
-/// Zclassic block header (140 bytes for Zcash/Zclassic)
+/// Zclassic block header (140 bytes + Equihash solution)
 /// Contains the critical finalsaplingroot field from zcashd
 struct ZclassicBlockHeader {
-    // Standard 80-byte header fields
+    // Standard 140-byte header fields (Zcash format)
     let version: UInt32
     let hashPrevBlock: Data       // 32 bytes
     let hashMerkleRoot: Data      // 32 bytes
@@ -15,9 +15,12 @@ struct ZclassicBlockHeader {
     let bits: UInt32
     let nonce: Data               // 32 bytes
 
+    // Equihash solution (typically 1344 bytes for Equihash(200,9))
+    let solution: Data
+
     // Metadata
     let height: UInt64
-    let blockHash: Data           // 32 bytes (computed from header)
+    let blockHash: Data           // 32 bytes (computed from header + solution)
 
     /// The Sapling anchor from zcashd's tree state
     /// This is guaranteed to match zcashd's internal computation
@@ -25,7 +28,21 @@ struct ZclassicBlockHeader {
         return hashFinalSaplingRoot
     }
 
-    /// Parse block header from network bytes
+    /// The raw 140-byte header without solution
+    var headerBytes: Data {
+        var data = Data()
+        withUnsafeBytes(of: version.littleEndian) { data.append(contentsOf: $0) }
+        data.append(hashPrevBlock)
+        data.append(hashMerkleRoot)
+        data.append(hashFinalSaplingRoot)
+        withUnsafeBytes(of: time.littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: bits.littleEndian) { data.append(contentsOf: $0) }
+        data.append(nonce)
+        return data
+    }
+
+    /// Parse block header from network bytes (140-byte header only, no solution)
+    /// Use parseWithSolution for full header with Equihash verification
     /// Zcash/Zclassic header format:
     /// - nVersion (4 bytes)
     /// - hashPrevBlock (32 bytes)
@@ -76,11 +93,9 @@ struct ZclassicBlockHeader {
         let nonce = data.subdata(in: offset..<offset+32)
         offset += 32
 
-        // Compute block hash (double SHA256 of first 80 bytes for standard Bitcoin-like headers)
-        // Note: Zcash uses Equihash, so this is a simplified version
-        // The actual block hash should come from the network
-        let headerBytes = data.subdata(in: 0..<80)
-        let blockHash = headerBytes.doubleSHA256()
+        // Without solution, we can't compute the real block hash
+        // Use a placeholder or zero hash
+        let blockHash = Data(count: 32)
 
         return ZclassicBlockHeader(
             version: version,
@@ -90,12 +105,109 @@ struct ZclassicBlockHeader {
             time: time,
             bits: bits,
             nonce: nonce,
+            solution: Data(),
             height: height,
             blockHash: blockHash
         )
     }
 
-    /// Serialize header to bytes for storage
+    /// Parse block header WITH Equihash solution and verify PoW
+    /// Format: header (140 bytes) + solution_len (varint) + solution
+    /// Returns nil if Equihash verification fails
+    static func parseWithSolution(data: Data, height: UInt64, verifyEquihash: Bool = true) throws -> ZclassicBlockHeader {
+        guard data.count >= 141 else {
+            throw ParseError.insufficientData(expected: 141, got: data.count)
+        }
+
+        var offset = 0
+
+        // Parse header fields (140 bytes)
+        let version = data.withUnsafeBytes { bytes in
+            bytes.load(fromByteOffset: offset, as: UInt32.self)
+        }
+        offset += 4
+
+        let hashPrevBlock = data.subdata(in: offset..<offset+32)
+        offset += 32
+
+        let hashMerkleRoot = data.subdata(in: offset..<offset+32)
+        offset += 32
+
+        let hashFinalSaplingRoot = data.subdata(in: offset..<offset+32)
+        offset += 32
+
+        let time = data.withUnsafeBytes { bytes in
+            bytes.load(fromByteOffset: offset, as: UInt32.self)
+        }
+        offset += 4
+
+        let bits = data.withUnsafeBytes { bytes in
+            bytes.load(fromByteOffset: offset, as: UInt32.self)
+        }
+        offset += 4
+
+        let nonce = data.subdata(in: offset..<offset+32)
+        offset += 32
+
+        // Parse solution length (varint)
+        guard offset < data.count else {
+            throw ParseError.insufficientData(expected: offset + 1, got: data.count)
+        }
+
+        let firstByte = data[offset]
+        let solutionLen: Int
+        let varintSize: Int
+
+        if firstByte < 253 {
+            solutionLen = Int(firstByte)
+            varintSize = 1
+        } else if firstByte == 253 {
+            guard offset + 3 <= data.count else {
+                throw ParseError.insufficientData(expected: offset + 3, got: data.count)
+            }
+            solutionLen = Int(data[offset + 1]) | (Int(data[offset + 2]) << 8)
+            varintSize = 3
+        } else {
+            throw ParseError.invalidSolutionLength
+        }
+        offset += varintSize
+
+        // Parse solution
+        guard offset + solutionLen <= data.count else {
+            throw ParseError.insufficientData(expected: offset + solutionLen, got: data.count)
+        }
+        let solution = data.subdata(in: offset..<offset+solutionLen)
+
+        // Extract 140-byte header for Equihash verification
+        let headerOnly = data.subdata(in: 0..<140)
+
+        // Verify Equihash if requested
+        if verifyEquihash {
+            guard ZipherXFFI.verifyEquihash(header: headerOnly, solution: solution) else {
+                throw ParseError.equihashVerificationFailed(height: height)
+            }
+        }
+
+        // Compute block hash using FFI
+        guard let blockHash = ZipherXFFI.computeBlockHash(header: headerOnly, solution: solution) else {
+            throw ParseError.hashComputationFailed
+        }
+
+        return ZclassicBlockHeader(
+            version: version,
+            hashPrevBlock: hashPrevBlock,
+            hashMerkleRoot: hashMerkleRoot,
+            hashFinalSaplingRoot: hashFinalSaplingRoot,
+            time: time,
+            bits: bits,
+            nonce: nonce,
+            solution: solution,
+            height: height,
+            blockHash: blockHash
+        )
+    }
+
+    /// Serialize header to bytes for storage (without solution)
     func serialize() -> Data {
         var data = Data()
 
@@ -109,15 +221,42 @@ struct ZclassicBlockHeader {
 
         return data
     }
+
+    /// Serialize header with solution for full verification
+    func serializeWithSolution() -> Data {
+        var data = serialize()
+
+        // Add solution length as varint
+        if solution.count < 253 {
+            data.append(UInt8(solution.count))
+        } else {
+            data.append(253)
+            data.append(UInt8(solution.count & 0xff))
+            data.append(UInt8((solution.count >> 8) & 0xff))
+        }
+
+        data.append(solution)
+
+        return data
+    }
 }
 
-enum ParseError: Error {
+enum ParseError: Error, LocalizedError {
     case insufficientData(expected: Int, got: Int)
+    case invalidSolutionLength
+    case equihashVerificationFailed(height: UInt64)
+    case hashComputationFailed
 
-    var localizedDescription: String {
+    var errorDescription: String? {
         switch self {
         case .insufficientData(let expected, let got):
             return "Insufficient data for block header: expected \(expected) bytes, got \(got) bytes"
+        case .invalidSolutionLength:
+            return "Invalid Equihash solution length encoding"
+        case .equihashVerificationFailed(let height):
+            return "Equihash proof-of-work verification failed at height \(height)"
+        case .hashComputationFailed:
+            return "Failed to compute block hash"
         }
     }
 }

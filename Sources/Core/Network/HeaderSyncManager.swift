@@ -63,11 +63,9 @@ final class HeaderSyncManager {
                 to: endHeight
             )
 
-            // TEMPORARILY DISABLED: Chain verification requires proper Equihash block hash computation
-            // For now, we trust peer consensus and skip verification
-            // The critical data (hashFinalSaplingRoot) doesn't depend on this
-            print("⚠️ Chain verification temporarily disabled (need Equihash implementation)")
-            // try verifyHeaderChain(headers, startingAt: currentHeight)
+            // Verify chain continuity (each header's prevHash matches previous block's hash)
+            // Equihash is verified during parsing in parseHeadersPayload
+            try verifyHeaderChain(headers, startingAt: currentHeight)
 
             // Store headers
             try headerStore.insertHeaders(headers)
@@ -241,27 +239,75 @@ final class HeaderSyncManager {
         return payload
     }
 
-    /// Parse headers from P2P message
-    /// Format: count (varint) + headers (80 bytes each) + tx_count (varint, always 0)
+    /// Parse headers from P2P message with Equihash verification
+    /// Format: count (varint) + headers (140 bytes + varint solution_len + solution each) + tx_count (varint, always 0)
     private func parseHeadersPayload(_ data: Data, startingAt startHeight: UInt64) throws -> [ZclassicBlockHeader] {
         var offset = 0
 
-        // Read count (varint - simplified to single byte)
+        // Read count (varint)
         guard data.count > 0 else {
             throw SyncError.invalidHeadersPayload(reason: "Empty payload")
         }
 
-        let count = Int(data[offset])
-        offset += 1
+        let firstByte = data[offset]
+        let count: Int
+        if firstByte < 253 {
+            count = Int(firstByte)
+            offset += 1
+        } else if firstByte == 253 {
+            guard offset + 3 <= data.count else {
+                throw SyncError.invalidHeadersPayload(reason: "Truncated count varint")
+            }
+            count = Int(data[offset + 1]) | (Int(data[offset + 2]) << 8)
+            offset += 3
+        } else {
+            throw SyncError.invalidHeadersPayload(reason: "Invalid count varint")
+        }
 
-        print("📦 Parsing \(count) headers from payload")
+        print("📦 Parsing \(count) headers from payload with Equihash verification")
 
         var headers: [ZclassicBlockHeader] = []
 
         for i in 0..<count {
-            // Each header is 140 bytes (Zcash format) + 1 byte tx count
-            let headerSize = 140
-            let entrySize = headerSize + 1  // + tx_count
+            // Zcash/Zclassic header format in "headers" P2P message:
+            // - 140 bytes header (4 version + 32 prevhash + 32 merkle + 32 sapling + 4 time + 4 bits + 32 nonce)
+            // - varint solution_len (typically 3 bytes for 1344)
+            // - solution (typically 1344 bytes for Equihash(200,9))
+            // - varint tx_count (always 0 in headers message, so 1 byte)
+
+            guard offset + 140 <= data.count else {
+                throw SyncError.invalidHeadersPayload(
+                    reason: "Insufficient data for header \(i) base: need 140, have \(data.count - offset)"
+                )
+            }
+
+            // Read solution length varint at offset 140
+            let solLenOffset = offset + 140
+            guard solLenOffset < data.count else {
+                throw SyncError.invalidHeadersPayload(
+                    reason: "No solution length for header \(i)"
+                )
+            }
+
+            let solFirstByte = data[solLenOffset]
+            let solutionLen: Int
+            let varintLen: Int
+
+            if solFirstByte < 253 {
+                solutionLen = Int(solFirstByte)
+                varintLen = 1
+            } else if solFirstByte == 253 {
+                guard solLenOffset + 3 <= data.count else {
+                    throw SyncError.invalidHeadersPayload(reason: "Truncated solution varint for header \(i)")
+                }
+                solutionLen = Int(data[solLenOffset + 1]) | (Int(data[solLenOffset + 2]) << 8)
+                varintLen = 3
+            } else {
+                throw SyncError.invalidHeadersPayload(reason: "Invalid solution varint for header \(i)")
+            }
+
+            // Total entry size: 140 + varint + solution + 1 (tx_count)
+            let entrySize = 140 + varintLen + solutionLen + 1
 
             guard offset + entrySize <= data.count else {
                 throw SyncError.invalidHeadersPayload(
@@ -269,19 +315,23 @@ final class HeaderSyncManager {
                 )
             }
 
-            // Extract header bytes (140 bytes)
-            let headerData = data.subdata(in: offset..<(offset + headerSize))
-            offset += headerSize
+            // Extract full header with solution (exclude tx_count)
+            let fullHeaderData = data.subdata(in: offset..<(offset + 140 + varintLen + solutionLen))
 
-            // Skip tx_count (always 0 for headers message)
-            offset += 1
-
-            // Parse header
-            // Assign actual block height (startHeight + index)
+            // Parse with Equihash verification
             let height = startHeight + UInt64(i)
-            let header = try ZclassicBlockHeader.parse(data: headerData, height: height)
-            headers.append(header)
+            do {
+                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: true)
+                headers.append(header)
+            } catch ParseError.equihashVerificationFailed(let failHeight) {
+                throw SyncError.invalidHeadersPayload(reason: "Equihash verification failed for header at height \(failHeight)")
+            }
+
+            // Skip past this header entry (including tx_count)
+            offset += entrySize
         }
+
+        print("✅ All \(count) headers verified with valid Equihash proofs")
 
         return headers
     }

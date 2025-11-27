@@ -805,6 +805,85 @@ final class Peer {
         payload.append(addressData)
         return payload
     }
+
+    // MARK: - Block/Transaction P2P Methods
+
+    /// Get a single block by its hash via P2P getdata
+    func getBlockByHash(hash: Data) async throws -> CompactBlock {
+        guard hash.count == 32 else {
+            throw PeerError.invalidData
+        }
+
+        // Build getdata message for single block
+        var payload = Data()
+        payload.append(1) // count = 1
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(2).littleEndian) { Array($0) }) // MSG_BLOCK = 2
+        payload.append(hash)
+
+        try await sendMessage(command: "getdata", payload: payload)
+
+        // Wait for block response
+        var attempts = 0
+        while attempts < 10 {
+            attempts += 1
+            let (command, response) = try await receiveMessage()
+
+            if command == "block" {
+                if let block = parseCompactBlock(response) {
+                    return block
+                }
+                throw PeerError.invalidData
+            }
+            // Ignore other messages
+        }
+
+        throw PeerError.timeout
+    }
+
+    /// Get a transaction by its hash via P2P getdata
+    func getTransaction(hash: Data) async throws -> Data {
+        guard hash.count == 32 else {
+            throw PeerError.invalidData
+        }
+
+        // Build getdata message for single transaction
+        var payload = Data()
+        payload.append(1) // count = 1
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(1).littleEndian) { Array($0) }) // MSG_TX = 1
+        payload.append(hash)
+
+        try await sendMessage(command: "getdata", payload: payload)
+
+        // Wait for tx response
+        var attempts = 0
+        while attempts < 10 {
+            attempts += 1
+            let (command, response) = try await receiveMessage()
+
+            if command == "tx" {
+                return response
+            }
+            // Ignore other messages
+        }
+
+        throw PeerError.timeout
+    }
+}
+
+// MARK: - Peer Errors
+
+enum PeerError: Error, LocalizedError {
+    case invalidData
+    case timeout
+    case connectionClosed
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidData: return "Invalid data received from peer"
+        case .timeout: return "Peer request timed out"
+        case .connectionClosed: return "Peer connection closed"
+        }
+    }
 }
 
 // MARK: - Data Extensions
