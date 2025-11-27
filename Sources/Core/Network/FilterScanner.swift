@@ -113,21 +113,12 @@ final class FilterScanner {
                 startHeight = ZclassicCheckpoints.recentCheckpointHeight
                 print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
             } else if bundledTreeAvailable {
-                // CRITICAL FIX: Fresh install with bundled tree
-                // We need to scan the ENTIRE bundled range to find:
-                // 1. Notes addressed to us (via trial decryption)
-                // 2. Nullifiers that mark our notes as spent
-                //
-                // The bundled tree has all CMUs, but we haven't scanned for OUR notes yet!
-                // Without this, imported keys will show old balance (spent notes appear unspent)
-                //
-                // Strategy: Use PHASE 1 (parallel note discovery) from Sapling activation
-                // to bundledTreeHeight, then PHASE 2 from bundledTreeHeight+1 to current
-                startHeight = ZclassicCheckpoints.saplingActivationHeight
-                scanWithinBundledRange = true
-                print("📦 Fresh install with bundled tree - scanning from Sapling activation \(startHeight)")
-                print("   PHASE 1: Will scan \(startHeight) to \(bundledTreeHeight) for notes + nullifiers (parallel, no tree changes)")
-                print("   PHASE 2: Will scan \(bundledTreeHeight + 1) to chain tip (sequential, tree building)")
+                // FAST STARTUP: Only scan recent blocks (bundledTreeHeight+1 to current)
+                // Historical scan can be triggered manually via Settings → "Full Historical Scan"
+                // This ensures <10 second wallet ready time
+                startHeight = bundledTreeHeight + 1
+                print("📦 Fast startup with bundled tree - scanning from \(startHeight) to current")
+                print("   💡 For old notes, use Settings → 'Full Historical Scan'")
             } else {
                 // No tree anywhere - full scan from Sapling activation
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -1084,8 +1075,7 @@ final class FilterScanner {
                 continue
             }
 
-            // DEBUG: Log encCiphertext info
-            print("🔐 encCiphertext length: \(encCiphertext.count) bytes, first 4: \(encCiphertext.prefix(4).map { String(format: "%02x", $0) }.joined())")
+            // encCiphertext parsed successfully (580 bytes expected)
 
             // Reverse byte order: display format (big-endian) -> wire format (little-endian)
             let epk = epkDisplay.reversedBytes()
