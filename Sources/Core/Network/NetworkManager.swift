@@ -557,27 +557,23 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Broadcast transaction with multi-peer propagation
+    /// Success = at least one peer accepted the transaction (returned txid)
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
         guard isConnected else {
-            print("❌ Broadcast failed: not connected")
             throw NetworkError.notConnected
         }
-
-        print("📡 Broadcasting transaction (\(rawTx.count) bytes) to \(peers.count) peers...")
 
         var successCount = 0
         var txId: String?
 
-        // Broadcast to all peers
+        // Broadcast to all peers in parallel
         await withTaskGroup(of: String?.self) { group in
             for peer in peers {
                 group.addTask {
                     do {
                         let id = try await peer.broadcastTransaction(rawTx)
-                        print("✅ Broadcast success to peer: \(id)")
                         return id
                     } catch {
-                        print("❌ Broadcast failed to peer: \(error)")
                         return nil
                     }
                 }
@@ -591,17 +587,13 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // For local full node, only need 1 successful broadcast; otherwise need CONSENSUS_THRESHOLD
-        let requiredConfirmations = isConnectedToLocalNode ? 1 : CONSENSUS_THRESHOLD
-
-        print("📡 Broadcast results: \(successCount)/\(peers.count) successful (need \(requiredConfirmations))")
-
-        guard successCount >= requiredConfirmations, let txId = txId else {
-            print("❌ Broadcast failed: insufficient confirmations (\(successCount) < \(requiredConfirmations))")
+        // Success if ANY peer accepted the transaction
+        // The peer returns txid when it responds with "inv" message (accepted into mempool)
+        guard successCount >= 1, let txId = txId else {
             throw NetworkError.broadcastFailed
         }
 
-        print("✅ Transaction broadcast successful: \(txId)")
+        print("✅ Transaction broadcast: \(txId) (\(successCount)/\(peers.count) peers)")
         return txId
     }
 

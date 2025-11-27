@@ -16,7 +16,8 @@ hex = "0.4"
 bech32 = "0.9"
 
 # Real Zcash/Sapling cryptography
-zcash_primitives = "0.13"
+# Using local fork with Zclassic Buttercup branch ID support
+zcash_primitives = { path = "../zcash_primitives_zcl" }
 zcash_proofs = "0.13"
 zcash_address = "0.3"
 zcash_note_encryption = "0.4"
@@ -36,3 +37,7 @@ path = "src/bin/verify_tree.rs"
 [profile.release]
 lto = true
 opt-level = "z"
+
+[patch.crates-io]
+# Override all zcash_primitives dependencies to use our local fork with Zclassic Buttercup support
+zcash_primitives = { path = "../zcash_primitives_zcl" }

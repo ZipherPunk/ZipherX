@@ -3,6 +3,44 @@ import Foundation
 /// Swift wrapper for ZipherX Rust FFI functions
 enum ZipherXFFI {
 
+    // MARK: - Library Info & Verification
+
+    /// Get library version (3 = with ZclassicButtercup support)
+    static func version() -> UInt32 {
+        return zipherx_version()
+    }
+
+    /// Get the consensus branch ID for a given block height
+    /// Returns 0x930b540d for heights >= 707,000 (ZclassicButtercup)
+    static func getBranchId(height: UInt64) -> UInt32 {
+        return zipherx_get_branch_id(height)
+    }
+
+    /// Verify the library supports ZclassicButtercup branch ID
+    /// Returns true if the library is built with the correct local fork
+    static func verifyButtercupSupport() -> Bool {
+        return zipherx_verify_buttercup_support()
+    }
+
+    /// Debug: Print branch ID info for current chain height
+    static func debugBranchId(chainHeight: UInt64) {
+        let branchId = getBranchId(height: chainHeight)
+        let version = version()
+
+        print("🔐 ZipherXFFI Branch ID Debug:")
+        print("   Library version: \(version)")
+        print("   Chain height: \(chainHeight)")
+        print("   Branch ID: 0x\(String(format: "%08x", branchId))")
+
+        if branchId == 0x930b540d {
+            print("   ✅ CORRECT: Using ZclassicButtercup (0x930b540d)")
+        } else if chainHeight >= 707000 {
+            print("   ❌ ERROR: Expected 0x930b540d but got 0x\(String(format: "%08x", branchId))")
+        } else {
+            print("   ℹ️ Using pre-Buttercup branch ID (height < 707000)")
+        }
+    }
+
     // MARK: - Mnemonic Functions
 
     /// Generate a new 24-word BIP-39 mnemonic
@@ -275,11 +313,6 @@ enum ZipherXFFI {
     }
 
     // MARK: - Utility Functions
-
-    /// Get FFI library version
-    static var version: UInt32 {
-        zipherx_version()
-    }
 
     /// Double hash data
     static func doubleHash(_ data: Data) -> Data? {
@@ -580,6 +613,69 @@ enum ZipherXFFI {
                 data.count
             )
         }
+    }
+
+    /// Progress callback type for tree loading: (currentCMU, totalCMUs)
+    typealias TreeLoadProgressCallback = (UInt64, UInt64) -> Void
+
+    /// Global storage for progress callback (needed for C callback bridge)
+    private static var treeLoadProgressCallback: TreeLoadProgressCallback?
+
+    /// Load tree from raw CMUs file format with progress reporting
+    /// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+    /// - Parameters:
+    ///   - data: The bundled CMU file data
+    ///   - onProgress: Called with (currentCMU, totalCMUs) approximately every 10000 CMUs
+    /// - Returns: true if tree was loaded successfully
+    static func treeLoadFromCMUsWithProgress(data: Data, onProgress: @escaping TreeLoadProgressCallback) -> Bool {
+        // Store callback globally so C callback can access it
+        treeLoadProgressCallback = onProgress
+
+        // C callback that forwards to Swift
+        let cCallback: @convention(c) (UInt64, UInt64) -> Void = { current, total in
+            ZipherXFFI.treeLoadProgressCallback?(current, total)
+        }
+
+        let result = data.withUnsafeBytes { ptr in
+            zipherx_tree_load_from_cmus_with_progress(
+                ptr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                data.count,
+                cCallback
+            )
+        }
+
+        // Clear callback
+        treeLoadProgressCallback = nil
+
+        return result
+    }
+
+    /// Create a witness for a specific CMU from bundled CMU data
+    /// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
+    /// - Parameters:
+    ///   - cmuData: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - targetCMU: The 32-byte CMU to create witness for
+    /// - Returns: Tuple of (position, witness data) or nil on error
+    static func treeCreateWitnessForCMU(cmuData: Data, targetCMU: Data) -> (position: UInt64, witness: Data)? {
+        guard targetCMU.count == 32 else { return nil }
+
+        var witnessBuffer = [UInt8](repeating: 0, count: 2000)
+        var witnessLen: Int = 0
+
+        let position = cmuData.withUnsafeBytes { cmuPtr in
+            targetCMU.withUnsafeBytes { targetPtr in
+                zipherx_tree_create_witness_for_cmu(
+                    cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    cmuData.count,
+                    targetPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    &witnessBuffer,
+                    &witnessLen
+                )
+            }
+        }
+
+        guard position != UInt64.max, witnessLen > 0 else { return nil }
+        return (position: position, witness: Data(witnessBuffer.prefix(witnessLen)))
     }
 
     // MARK: - OVK Output Recovery (Transaction History)

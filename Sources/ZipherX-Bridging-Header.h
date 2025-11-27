@@ -127,8 +127,17 @@ size_t zipherx_try_decrypt_note_with_sk(const uint8_t *sk,
 // =============================================================================
 
 /// Get library version
-/// @return Version number
+/// @return Version number (3 = with Buttercup support)
 uint32_t zipherx_version(void);
+
+/// Get the consensus branch ID for a given height on Zclassic
+/// @param height Block height
+/// @return Branch ID as u32 (e.g., 0x930b540d for Buttercup at height >= 707000)
+uint32_t zipherx_get_branch_id(uint64_t height);
+
+/// Verify the library is using the correct ZclassicButtercup fork
+/// @return true if using local fork with Buttercup support (0x930b540d)
+bool zipherx_verify_buttercup_support(void);
 
 /// Double hash (BLAKE2b)
 /// @param data Input data
@@ -281,6 +290,36 @@ bool zipherx_tree_deserialize(const uint8_t *tree_data, size_t tree_len);
 /// @param data_len Length of data
 /// @return true on success
 bool zipherx_tree_load_from_cmus(const uint8_t *data, size_t data_len);
+
+/// Progress callback type for tree loading: (current, total)
+typedef void (*TreeLoadProgressCallback)(uint64_t current, uint64_t total);
+
+/// Load tree from raw CMUs file format with progress callback
+/// @param data CMU file data
+/// @param data_len Length of data
+/// @param progress_callback Callback called with (current, total) during loading
+/// @return true on success
+bool zipherx_tree_load_from_cmus_with_progress(
+    const uint8_t *data,
+    size_t data_len,
+    TreeLoadProgressCallback progress_callback
+);
+
+/// Create a witness for a specific CMU from bundled CMU data
+/// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
+/// @param cmu_data Pointer to bundled CMU file data [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param target_cmu The 32-byte CMU to create witness for
+/// @param witness_out Output buffer for serialized witness (at least 2000 bytes)
+/// @param witness_out_len Output for actual witness length
+/// @return The position (0-indexed) of the CMU, or UINT64_MAX on error
+uint64_t zipherx_tree_create_witness_for_cmu(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmu,
+    uint8_t *witness_out,
+    size_t *witness_out_len
+);
 
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)

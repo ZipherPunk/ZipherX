@@ -61,4 +61,26 @@ uint64_t zipherx_tree_size(void);
 bool zipherx_tree_serialize(uint8_t *tree_out, size_t *tree_out_len);
 bool zipherx_tree_deserialize(const uint8_t *tree_data, size_t tree_len);
 
+// Load commitment tree from bundled CMU file
+bool zipherx_tree_load_from_cmus(const uint8_t *data, size_t data_len);
+
+// Progress callback type for tree loading: (current, total)
+typedef void (*TreeLoadProgressCallback)(uint64_t current, uint64_t total);
+
+// Load commitment tree from bundled CMU file with progress callback
+bool zipherx_tree_load_from_cmus_with_progress(
+    const uint8_t *data,
+    size_t data_len,
+    TreeLoadProgressCallback progress_callback
+);
+
+// Create witness for a specific CMU from bundled data
+uint64_t zipherx_tree_create_witness_for_cmu(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmu,
+    uint8_t *witness_out,
+    size_t *witness_out_len
+);
+
 #endif // ZIPHERX_FFI_H

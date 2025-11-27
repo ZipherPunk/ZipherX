@@ -181,10 +181,16 @@ Before any release:
 11. **Local Full Node Trust Mode** - Connect to local zcashd for trusted sync
 12. **Two-Phase Scanning** - Parallel note discovery + sequential tree building
 
+### Completed Features (continued)
+
+13. **Transaction Building** - Spend proof generation with real witnesses ✅
+14. **Full Send Flow** - End-to-end shielded transactions working on mainnet ✅
+15. **ZclassicButtercup Branch ID** - Local fork of zcash_primitives with correct branch ID (0x930b540d) ✅
+
 ### In Progress / Needs Testing
 
-1. **Transaction Building** - Spend proof generation with real witnesses
-2. **Full Send Flow** - End-to-end shielded transaction
+1. **Balance Tracking** - Update balance immediately after successful transaction
+2. **Tree Loading Optimization** - Load CMU bundle at wallet startup instead of per-transaction
 
 ### Remaining Tasks
 
@@ -199,42 +205,42 @@ Before any release:
 
 ### Overview
 
-The app includes a pre-built Sapling commitment tree (`commitment_tree_v2.bin`) containing all CMUs from Sapling activation to a checkpoint height. This enables instant balance display without hours of sequential scanning.
+The app includes a pre-built Sapling commitment tree (`commitment_tree_v3.bin`) containing all CMUs from Sapling activation to a checkpoint height. This enables instant balance display without hours of sequential scanning.
 
 ### Bundled Tree Specifications
 
 | Property | Value |
 |----------|-------|
-| **File** | `Resources/commitment_tree_v2.bin` |
+| **File** | `Resources/commitment_tree_v4.bin` |
 | **Format** | `[count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...` |
-| **CMU Count** | 1,041,667 commitments |
-| **End Height** | 2,922,769 |
-| **File Size** | ~31 MB |
-| **Tree Root** | Must match chain's `finalsaplingroot` at end height |
+| **CMU Count** | 1,041,688 commitments |
+| **End Height** | 2,923,123 |
+| **File Size** | 31.8 MB |
+| **Tree Root** | `42d6a11f937de8a27060ad683a632be73d08fae9ff421145f58e16a282c702f3` |
 
 ### How to Generate/Update the Bundled Tree
 
 1. **Export CMUs from local node:**
 ```bash
-cd /Users/chris/ZipherX/Libraries/zipherx-ffi
-cargo run --bin export_cmus -- \
-    --start 476969 \
-    --end 2922769 \
-    --output /Users/chris/ZipherX/Resources/commitment_tree_v2.bin
+cd /Users/chris/ZipherX/Tools
+python3 export_tree_ultrafast_v2.py
+# Outputs to Resources/commitment_tree_v4.bin
+# Uses batch RPC for 100x faster export (2000+ blocks/sec)
 ```
 
 2. **Verify the tree root matches chain:**
 ```bash
 # Get expected root from chain
-zclassic-cli getblockheader $(zclassic-cli getblockhash 2922769) true | grep finalsaplingroot
+zclassic-cli getblockheader $(zclassic-cli getblockhash 2923123) true | grep finalsaplingroot
 
 # Verify our tree produces the same root
-cargo run --bin verify_tree /Users/chris/ZipherX/Resources/commitment_tree_v2.bin
+cd /Users/chris/ZipherX/Libraries/zipherx-ffi
+cargo run --bin verify_tree_correct /Users/chris/ZipherX/Resources/commitment_tree_v4.bin
 ```
 
 3. **Update `bundledTreeHeight` in code:**
-   - `FilterScanner.swift` line ~83: `let bundledTreeHeight: UInt64 = 2922769`
-   - `TransactionBuilder.swift` line ~98: `let bundledTreeHeight: UInt64 = 2922769`
+   - `FilterScanner.swift` line ~83: `let bundledTreeHeight: UInt64 = 2923123`
+   - `TransactionBuilder.swift` line ~98: `let bundledTreeHeight: UInt64 = 2923123`
 
 ### Critical Requirements
 
@@ -340,32 +346,160 @@ var hasLocalFullNode: Bool {
 **Problem**: Used wrong FFI function `loadBundledCMUs` which doesn't exist
 **Fix**: Changed to `ZipherXFFI.treeLoadFromCMUs(data:)` with proper Bundle resource loading
 
-### 5. CRITICAL: CMU Byte Order in Bundled Tree (causing spend failures)
+### 5. CRITICAL: CMU Byte Order Investigation (November 2025)
+
 **Problem**: Transaction building failed with "bad-txns-sapling-spend-description-invalid"
-- Tree root mismatch: Our tree produced different root than zcashd
-- Root cause: CMUs in `commitment_tree_v2.bin` were stored with REVERSED byte order
-- The export tool stored CMUs in little-endian (internal) format but the tree loader expected big-endian (display/RPC) format
+- Tree root mismatch: Our tree produced different root than zcashd's `finalsaplingroot`
 
-**Diagnosis Steps Used**:
-1. Compared first CMU in bundled file with first CMU from zcashd RPC
-2. Found bytes were reversed: File had `43391df0...5a` while chain had `5a8d47a7...43`
-3. Confirmed `bytes.reverse()` produces matching values
+**Investigation Timeline**:
 
-**Fix** (in `lib.rs`):
-- `zipherx_tree_load_from_cmus()`: Reverse each 32-byte CMU before parsing
-- `zipherx_tree_create_witness_for_cmu()`: Reverse target CMU for comparison, then reverse each CMU during tree building
+1. **Initial hypothesis (WRONG)**: CMUs needed byte reversal before parsing
+   - Bundled file CMU 0: `43391df0dc0983da7ad647a8cd4c3a2575dcccda3da44158ceef484ba7478d5a`
+   - zcashd RPC CMU 0:   `5a8d47a74b48efce5841a43ddaccdc75253a4ccda847d67ada8309dcf01d3943`
+   - These ARE byte-reversed of each other
+
+2. **Key discovery**: The bundled file is in **wire format (little-endian)** which is CORRECT
+   - `Node::read()` expects little-endian (wire format) input
+   - zcashd RPC displays CMUs in big-endian (display format)
+   - The bundled file was actually correct all along!
+
+3. **First CMU verification (PASSED)**:
+   ```
+   First CMU in wire format: 43391df0dc0983da7ad647a8cd4c3a2575dcccda3da44158ceef484ba7478d5a
+   Tree root with 1 CMU:     4fa518c5b25bb460710ba5e42d83b549100193abb5a895a20717dfeaf96116d4
+   zcashd finalsaplingroot at height 476977: 4fa518c5b25bb460710ba5e42d83b549100193abb5a895a20717dfeaf96116d4
+   MATCH!
+   ```
+
+4. **Full tree verification (FAILED)**:
+   ```
+   CMU count: 1,040,540
+   Our computed root (display): 6faf1a19cb75a31cb085766cbdaf98af4a0d208308637bd2a6e9a0946f9afd79
+   Expected at height 2922769:  28725db1847d9c6aaab88184b52ef99f60975adfdd90321a57ace5f99304912b
+   MISMATCH - bundled file has data issues
+   ```
+
+**Root Cause Analysis**:
+- The byte order in the bundled file is CORRECT (wire format)
+- The Rust code was INCORRECTLY reversing bytes before `Node::read()`
+- But even after removing reversal, full tree root doesn't match
+- **Conclusion**: Bundled file has missing/incorrect CMUs - needs complete regeneration
+
+**Fix Applied** (in `lib.rs`):
+- `zipherx_tree_load_from_cmus()`: REMOVED byte reversal - pass CMUs directly to `Node::read()`
+- `zipherx_tree_create_witness_for_cmu()`: REMOVED byte reversal - pass CMUs directly
 
 ```rust
-// CRITICAL: Reverse bytes from little-endian storage to big-endian for parsing
-let mut cmu_reversed = [0u8; 32];
-for j in 0..32 {
-    cmu_reversed[j] = cmu_bytes[31 - j];
-}
-let node = zcash_primitives::sapling::Node::read(&cmu_reversed[..])?;
+// CORRECT: CMUs in bundled file are in wire format (little-endian)
+// Node::read() expects wire format - pass directly, NO reversal needed
+let node = zcash_primitives::sapling::Node::read(&cmu_bytes[..])?;
+```
+
+**Resolution**:
+- The `commitment_tree_v3.bin` file is CORRECT and VERIFIED!
+- CMU count: 1,041,667
+- Tree root: `28725db1847d9c6aaab88184b52ef99f60975adfdd90321a57ace5f99304912b`
+- Matches zcashd finalsaplingroot at height 2922769
+- The old v2 file was incorrect (1,040,540 CMUs, wrong root)
+
+**Byte Order Summary**:
+```
+zcashd RPC returns:     BIG-ENDIAN (display format)     5a8d47a7...43
+Bundled file stores:    LITTLE-ENDIAN (wire format)     43391df0...5a
+Node::read() expects:   LITTLE-ENDIAN (wire format)     43391df0...5a
+Node::write() returns:  LITTLE-ENDIAN (wire format)
+zcashd displays root:   BIG-ENDIAN (display format)
+
+Export script: Reverses RPC CMUs from big-endian to little-endian (CORRECT)
+Rust lib.rs:   Passes CMUs directly to Node::read() without reversal (CORRECT)
 ```
 
 **Files Modified**:
-- `Libraries/zipherx-ffi/src/lib.rs` - lines ~1512-1520 and ~1588-1638
+- `Libraries/zipherx-ffi/src/lib.rs` - removed byte reversal in tree loading functions
+
+### 6. CRITICAL: Wrong Consensus Branch ID - ROOT CAUSE FIXED (November 27, 2025)
+
+**Problem**: Transaction broadcasts failed with error code 16: `bad-txns-sapling-spend-description-invalid`
+
+Despite all cryptographic values being verified correct:
+- ✅ Note CMU matches tree CMU
+- ✅ Anchor matches zcashd finalsaplingroot
+- ✅ Witness root matches computed anchor
+- ✅ Note position correct (1041691)
+
+**Root Cause Found**: The wallet was using **Sapling branch ID (0x76b809bb)** but the Zclassic node's current active consensus requires **Buttercup branch ID (0x930b540d)**.
+
+Verified by running: `zclassic-cli getblockchaininfo` shows `"chaintip": "930b540d"`
+
+**Zclassic Network Upgrade History**:
+
+| Upgrade | Branch ID | Activation Height | Notes |
+|---------|-----------|-------------------|-------|
+| Overwinter | `0x5ba81b19` | 476,969 | Same as Zcash |
+| Sapling | `0x76b809bb` | 476,969 | Same as Zcash |
+| Bubbles | `0x821a451c` | 585,318 | Zclassic-specific (≠ Zcash Blossom) |
+| **Buttercup** | `0x930b540d` | **707,000** | **CURRENTLY ACTIVE** (≠ Zcash Heartwood) |
+
+The `zcash_primitives` Rust library **hardcodes Zcash's branch IDs**. We cannot use Zcash's Blossom/Heartwood variants because they have different branch IDs.
+
+**Impact**: Per ZIP-243, the consensus branch ID is hashed into the transaction sighash:
+```
+BLAKE2b(personalization = "ZcashSigHash" || BRANCH_ID_LE, ...)
+```
+Wrong branch ID → wrong sighash → invalid `spendAuthSig` → transaction rejected.
+
+**SOLUTION APPLIED: Local Fork of zcash_primitives**
+
+Created `/Users/chris/ZipherX/Libraries/zcash_primitives_zcl/` with native `ZclassicButtercup` support:
+
+1. **consensus.rs modifications**:
+   - Added `BranchId::ZclassicButtercup` with value `0x930b540d`
+   - Added `NetworkUpgrade::ZclassicButtercup`
+   - Added to `UPGRADES_IN_ORDER` array
+   - Added `branch_id()` and `height_bounds()` implementations
+
+2. **Cargo.toml change**:
+   ```toml
+   # Using local fork with Zclassic Buttercup branch ID support
+   zcash_primitives = { path = "../zcash_primitives_zcl" }
+   ```
+
+3. **lib.rs ZclassicNetwork update**:
+   ```rust
+   match nu {
+       NetworkUpgrade::Overwinter => Some(BlockHeight::from_u32(476969)),
+       NetworkUpgrade::Sapling => Some(BlockHeight::from_u32(476969)),
+       // Skip Zcash-specific upgrades with wrong branch IDs
+       NetworkUpgrade::Blossom => None,
+       NetworkUpgrade::Heartwood => None,
+       NetworkUpgrade::Canopy => None,
+       NetworkUpgrade::Nu5 => None,
+       // ZclassicButtercup uses correct branch ID (0x930b540d)
+       NetworkUpgrade::ZclassicButtercup => Some(BlockHeight::from_u32(707000)),
+       _ => None,
+   }
+   ```
+
+**How It Works**:
+1. `BranchId::for_height()` iterates `UPGRADES_IN_ORDER` in reverse
+2. For Zclassic at height 2,923,000+:
+   - Nu5, Canopy, Heartwood, Blossom return `None` (not activated)
+   - ZclassicButtercup returns `Some(707000)` and is active
+3. Transaction builder uses `BranchId::ZclassicButtercup` (0x930b540d)
+4. Sighash personalization matches node's expected branch ID
+5. spendAuthSig verification passes
+
+**Sources**:
+- [ZIP-243: Transaction Signature Validation for Sapling](https://zips.z.cash/zip-0243)
+- [Ledger PR for Zclassic branch IDs](https://github.com/LedgerHQ/app-bitcoin/pull/133/files)
+- Local Zclassic source: `/Users/chris/zclassic/zclassic/src/consensus/upgrades.cpp`
+- Local Zclassic source: `/Users/chris/zclassic/zclassic/src/chainparams.cpp`
+- zcashd verification: `ContextualCheckTransaction()` → `librustzcash_sapling_check_spend()`
+
+**Files Modified**:
+- `Libraries/zcash_primitives_zcl/src/consensus.rs` - added ZclassicButtercup branch ID
+- `Libraries/zipherx-ffi/Cargo.toml` - uses local zcash_primitives fork
+- `Libraries/zipherx-ffi/src/lib.rs` - ZclassicNetwork activates ZclassicButtercup at height 707,000
 
 ---
 
@@ -382,8 +516,8 @@ let node = zcash_primitives::sapling::Node::read(&cmu_reversed[..])?;
 | Constant | Value | Location |
 |----------|-------|----------|
 | Sapling Activation | 476,969 | `ZclassicCheckpoints.swift` |
-| Bundled Tree Height | 2,922,769 | `FilterScanner.swift`, `TransactionBuilder.swift` |
-| Bundled CMU Count | 1,041,667 | Verified via `verify_tree` tool |
+| Bundled Tree Height | 2,923,123 | `FilterScanner.swift`, `TransactionBuilder.swift` |
+| Bundled CMU Count | 1,041,688 | Verified via `verify_tree` tool |
 | Default Fee | 10,000 zatoshis | `TransactionBuilder.swift` |
 
 ### Known Issues
@@ -394,3 +528,4 @@ let node = zcash_primitives::sapling::Node::read(&cmu_reversed[..])?;
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
+- z.log is available as usual here : /Users/chris/ZipherX

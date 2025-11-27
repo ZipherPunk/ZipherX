@@ -3,6 +3,18 @@
 //! This crate provides C-compatible functions for iOS integration
 //! Using real librustzcash for proper Sapling operations
 
+// Set to true for verbose debug output, false for production
+const DEBUG_LOGGING: bool = false;
+
+// Macro for conditional debug output
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if DEBUG_LOGGING {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 use std::slice;
 use std::sync::Mutex;
 use std::path::Path;
@@ -48,14 +60,23 @@ struct ZclassicNetwork;
 impl Parameters for ZclassicNetwork {
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         // Zclassic-specific activation heights
-        // Zclassic does NOT have Canopy - this is critical for note decryption!
+        // Using local fork of zcash_primitives with ZclassicButtercup branch ID (0x930b540d)
+        //
+        // Zclassic activation heights from chainparams.cpp:
+        // - Overwinter: 476,969
+        // - Sapling: 476,969
+        // - Bubbles: 585,318 (Zclassic-specific, branch ID 0x821a451c)
+        // - Buttercup: 707,000 (Zclassic-specific, branch ID 0x930b540d) - CURRENTLY ACTIVE
         match nu {
             NetworkUpgrade::Overwinter => Some(BlockHeight::from_u32(476969)),
             NetworkUpgrade::Sapling => Some(BlockHeight::from_u32(476969)),
-            NetworkUpgrade::Blossom => Some(BlockHeight::from_u32(585318)), // "Bubbles"
-            NetworkUpgrade::Heartwood => Some(BlockHeight::from_u32(707000)), // "Buttercup"
-            NetworkUpgrade::Canopy => None, // NOT activated on Zclassic!
-            NetworkUpgrade::Nu5 => None, // NOT activated
+            // Skip Blossom/Heartwood - these are Zcash-specific with wrong branch IDs
+            NetworkUpgrade::Blossom => None,
+            NetworkUpgrade::Heartwood => None,
+            NetworkUpgrade::Canopy => None,
+            NetworkUpgrade::Nu5 => None,
+            // ZclassicButtercup uses the correct branch ID (0x930b540d)
+            NetworkUpgrade::ZclassicButtercup => Some(BlockHeight::from_u32(707000)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -323,7 +344,7 @@ pub unsafe extern "C" fn zipherx_decode_address(
     };
 
     // Debug: print the diversifier from this address
-    eprintln!("DEBUG decode_address: diversifier = {:02x?}", &bytes[0..11]);
+    debug_log!("DEBUG decode_address: diversifier = {:02x?}", &bytes[0..11]);
 
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 43);
     true
@@ -482,13 +503,13 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
         Ok(key) => key,
         Err(e) => {
-            eprintln!("DEBUG: ❌ Failed to deserialize ExtendedSpendingKey: {:?}", e);
+            debug_log!("DEBUG: ❌ Failed to deserialize ExtendedSpendingKey: {:?}", e);
             return 0;
         }
     };
 
     // Debug: print SK first bytes
-    eprintln!("DEBUG: SK bytes[0..8] = {:02x?}", &sk_slice[0..8]);
+    debug_log!("DEBUG: SK bytes[0..8] = {:02x?}", &sk_slice[0..8]);
 
     // Derive IVK using zcash_primitives
     let fvk = FullViewingKey::from_expanded_spending_key(&extsk.expsk);
@@ -496,31 +517,31 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
 
     // Debug: print ak to verify FVK
-    eprintln!("DEBUG: ak[0..4] = {:02x?}", &fvk.vk.ak.to_bytes()[0..4]);
+    debug_log!("DEBUG: ak[0..4] = {:02x?}", &fvk.vk.ak.to_bytes()[0..4]);
 
     // Debug: derive default address and print its diversifier
     let (_, default_addr) = extsk.default_address();
     let div_bytes = default_addr.diversifier().0;
-    eprintln!("DEBUG: IVK scalar = {:?}", ivk.0.to_repr());
-    eprintln!("DEBUG: Default diversifier = {:02x?}", div_bytes);
+    debug_log!("DEBUG: IVK scalar = {:?}", ivk.0.to_repr());
+    debug_log!("DEBUG: Default diversifier = {:02x?}", div_bytes);
 
     // Debug: print the full address bytes and pk_d to verify
     let addr_bytes = default_addr.to_bytes();
-    eprintln!("DEBUG: Full address bytes[0..8] = {:02x?}", &addr_bytes[0..8]);
+    debug_log!("DEBUG: Full address bytes[0..8] = {:02x?}", &addr_bytes[0..8]);
     // Use GroupEncoding trait to get bytes
     let pk_d_bytes = default_addr.pk_d().inner().to_bytes();
-    eprintln!("DEBUG: pk_d bytes = {:02x?}", pk_d_bytes);
+    debug_log!("DEBUG: pk_d bytes = {:02x?}", pk_d_bytes);
 
     // Verify IVK by manually computing [ivk] g_d and comparing to pk_d
     if let Some(g_d) = default_addr.diversifier().g_d() {
         let computed_pk_d = g_d * ivk.0;
         let computed_pk_d_bytes = computed_pk_d.to_bytes();
         if computed_pk_d_bytes == pk_d_bytes {
-            eprintln!("DEBUG: ✅ IVK verification: [ivk] g_d == pk_d");
+            debug_log!("DEBUG: ✅ IVK verification: [ivk] g_d == pk_d");
         } else {
-            eprintln!("DEBUG: ❌ IVK verification FAILED!");
-            eprintln!("DEBUG: Expected pk_d = {:02x?}", pk_d_bytes);
-            eprintln!("DEBUG: Computed pk_d = {:02x?}", computed_pk_d_bytes);
+            debug_log!("DEBUG: ❌ IVK verification FAILED!");
+            debug_log!("DEBUG: Expected pk_d = {:02x?}", pk_d_bytes);
+            debug_log!("DEBUG: Computed pk_d = {:02x?}", computed_pk_d_bytes);
         }
     }
 
@@ -533,19 +554,19 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     enc_bytes.copy_from_slice(ciphertext_slice);
 
     // Debug: print first bytes of each input
-    eprintln!("DEBUG: EPK[0..4] = {:02x?}", &epk_bytes[0..4]);
-    eprintln!("DEBUG: CMU[0..4] = {:02x?}", &cmu_bytes[0..4]);
-    eprintln!("DEBUG: ENC[0..4] = {:02x?}", &enc_bytes[0..4]);
-    eprintln!("DEBUG: About to parse EPK as curve point...");
+    debug_log!("DEBUG: EPK[0..4] = {:02x?}", &epk_bytes[0..4]);
+    debug_log!("DEBUG: CMU[0..4] = {:02x?}", &cmu_bytes[0..4]);
+    debug_log!("DEBUG: ENC[0..4] = {:02x?}", &enc_bytes[0..4]);
+    debug_log!("DEBUG: About to parse EPK as curve point...");
 
     // Debug: try to parse EPK as a curve point
     let epk_point_opt = jubjub::ExtendedPoint::from_bytes(&epk_bytes);
-    eprintln!("DEBUG: EPK parsing complete");
+    debug_log!("DEBUG: EPK parsing complete");
     let epk_valid: bool = epk_point_opt.is_some().into();
     if epk_valid {
-        eprintln!("DEBUG: ✅ EPK is valid curve point");
+        debug_log!("DEBUG: ✅ EPK is valid curve point");
     } else {
-        eprintln!("DEBUG: ❌ EPK is NOT a valid curve point!");
+        debug_log!("DEBUG: ❌ EPK is NOT a valid curve point!");
         return 0;
     }
     let epk_point = epk_point_opt.unwrap();
@@ -555,11 +576,11 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     let epk_cleared = epk_point.clear_cofactor();
     let ka = jubjub::ExtendedPoint::from(epk_cleared) * ivk.0;
     let ka_bytes = ka.to_affine().to_bytes();
-    eprintln!("DEBUG: KA (shared secret) first 4 bytes: {:02x?}", &ka_bytes[0..4]);
+    debug_log!("DEBUG: KA (shared secret) first 4 bytes: {:02x?}", &ka_bytes[0..4]);
 
     // Also print full EPK and IVK for verification
-    eprintln!("DEBUG: Full EPK = {:02x?}", epk_bytes);
-    eprintln!("DEBUG: Full IVK = {:02x?}", ivk.0.to_repr());
+    debug_log!("DEBUG: Full EPK = {:02x?}", epk_bytes);
+    debug_log!("DEBUG: Full IVK = {:02x?}", ivk.0.to_repr());
 
     // KDF: derive symmetric key using BLAKE2b
     let mut kdf_input = [0u8; 64];
@@ -573,7 +594,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
         .update(&kdf_input)
         .finalize();
 
-    eprintln!("DEBUG: KDF key first 4 bytes: {:02x?}", &key.as_bytes()[0..4]);
+    debug_log!("DEBUG: KDF key first 4 bytes: {:02x?}", &key.as_bytes()[0..4]);
 
     // Try ChaCha20Poly1305 decryption
     let cipher_key = GenericArray::from_slice(key.as_bytes());
@@ -583,31 +604,31 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     // The enc_ciphertext is 580 bytes = 564 plaintext + 16 tag
     match cipher.decrypt(nonce, &enc_bytes[..]) {
         Ok(plaintext) => {
-            eprintln!("DEBUG: ✅ Manual decryption succeeded! Plaintext len: {}", plaintext.len());
-            eprintln!("DEBUG: Plaintext version byte: 0x{:02x}", plaintext[0]);
-            eprintln!("DEBUG: Plaintext diversifier: {:02x?}", &plaintext[1..12]);
+            debug_log!("DEBUG: ✅ Manual decryption succeeded! Plaintext len: {}", plaintext.len());
+            debug_log!("DEBUG: Plaintext version byte: 0x{:02x}", plaintext[0]);
+            debug_log!("DEBUG: Plaintext diversifier: {:02x?}", &plaintext[1..12]);
 
             // Check version byte
             if plaintext[0] != 0x01 && plaintext[0] != 0x02 {
-                eprintln!("DEBUG: ❌ Invalid version byte!");
+                debug_log!("DEBUG: ❌ Invalid version byte!");
             }
 
             // Extract value (bytes 12-20, little-endian u64)
             let value = u64::from_le_bytes(plaintext[12..20].try_into().unwrap());
-            eprintln!("DEBUG: Decrypted value: {} zatoshis ({} ZCL)", value, value as f64 / 100_000_000.0);
+            debug_log!("DEBUG: Decrypted value: {} zatoshis ({} ZCL)", value, value as f64 / 100_000_000.0);
 
             // Check if diversifier matches our address
             let our_div = default_addr.diversifier().0;
             if plaintext[1..12] == our_div {
-                eprintln!("DEBUG: ✅ Diversifier MATCHES! This note is for us!");
+                debug_log!("DEBUG: ✅ Diversifier MATCHES! This note is for us!");
             } else {
-                eprintln!("DEBUG: ❌ Diversifier does not match. Note is for someone else.");
-                eprintln!("DEBUG: Expected: {:02x?}", our_div);
-                eprintln!("DEBUG: Got:      {:02x?}", &plaintext[1..12]);
+                debug_log!("DEBUG: ❌ Diversifier does not match. Note is for someone else.");
+                debug_log!("DEBUG: Expected: {:02x?}", our_div);
+                debug_log!("DEBUG: Got:      {:02x?}", &plaintext[1..12]);
             }
         }
         Err(_e) => {
-            eprintln!("DEBUG: ❌ ChaCha20Poly1305 auth tag verification failed");
+            debug_log!("DEBUG: ❌ ChaCha20Poly1305 auth tag verification failed");
         }
     }
 
@@ -621,15 +642,15 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     let height = BlockHeight::from_u32(2918700);
 
     // Try to decrypt using zcash_primitives
-    eprintln!("DEBUG: Now trying zcash_primitives decryption...");
+    debug_log!("DEBUG: Now trying zcash_primitives decryption...");
 
     match try_sapling_note_decryption(&ZclassicNetwork, height, &prepared_ivk, &shielded_output) {
         Some((note, address, memo)) => {
-            eprintln!("✅ DECRYPTION SUCCESS! Value: {} zatoshis", note.value().inner());
+            debug_log!("✅ DECRYPTION SUCCESS! Value: {} zatoshis", note.value().inner());
             // Successfully decrypted! Pack the result
             // Format: diversifier(11) + value(8) + rcm(32) + memo(512)
             let diversifier = address.diversifier().0;
-            eprintln!("DEBUG: Returned diversifier from zcash_primitives: {:02x?}", diversifier);
+            debug_log!("DEBUG: Returned diversifier from zcash_primitives: {:02x?}", diversifier);
             let value: u64 = note.value().inner();
             let rcm = match note.rseed() {
                 Rseed::BeforeZip212(rcm) => rcm.to_repr(),
@@ -660,7 +681,48 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
 /// Get the library version
 #[no_mangle]
 pub extern "C" fn zipherx_version() -> u32 {
-    2 // Version 2 with real crypto
+    3 // Version 3 with ZclassicButtercup branch ID support (0x930b540d)
+}
+
+/// Get the consensus branch ID for a given height on Zclassic
+/// This is useful for debugging to verify the correct branch ID is being used
+/// @param height Block height
+/// @return Branch ID as u32 (e.g., 0x930b540d for Buttercup)
+#[no_mangle]
+pub extern "C" fn zipherx_get_branch_id(height: u64) -> u32 {
+    let block_height = BlockHeight::from_u32(height as u32);
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, block_height);
+    let branch_id_u32: u32 = branch_id.into();
+
+    debug_log!("🔍 zipherx_get_branch_id({}) = 0x{:08x} ({:?})", height, branch_id_u32, branch_id);
+
+    branch_id_u32
+}
+
+/// Verify the library is using the correct ZclassicButtercup fork
+/// @return true if using local fork with Buttercup support
+#[no_mangle]
+pub extern "C" fn zipherx_verify_buttercup_support() -> bool {
+    // Test at height 2,923,000 (current chain)
+    let test_height = BlockHeight::from_u32(2_923_000);
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, test_height);
+    let branch_id_u32: u32 = branch_id.into();
+
+    let has_buttercup = branch_id_u32 == 0x930b540d;
+
+    debug_log!("🔐 BUTTERCUP VERIFICATION:");
+    debug_log!("   Test height: 2,923,000");
+    debug_log!("   Branch ID: 0x{:08x}", branch_id_u32);
+    debug_log!("   Expected: 0x930b540d (ZclassicButtercup)");
+    debug_log!("   Match: {}", if has_buttercup { "✅ YES" } else { "❌ NO" });
+
+    if has_buttercup {
+        debug_log!("   ✅ Library correctly uses local zcash_primitives fork with Buttercup!");
+    } else {
+        debug_log!("   ❌ ERROR: Library NOT using local fork! Got {:?} instead of ZclassicButtercup", branch_id);
+    }
+
+    has_buttercup
 }
 
 /// Double SHA256 hash
@@ -806,7 +868,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
     let prover = LocalTxProver::new(Path::new(spend), Path::new(output));
     let mut global_prover = PROVER.lock().unwrap();
     *global_prover = Some(prover);
-    eprintln!("✅ Prover initialized with Sapling parameters");
+    debug_log!("✅ Prover initialized with Sapling parameters");
     true
 }
 
@@ -891,7 +953,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     let mut div_bytes = [0u8; 11];
     div_bytes.copy_from_slice(div_slice);
     let diversifier = Diversifier(div_bytes);
-    eprintln!("DEBUG: Received diversifier for spending: {:02x?}", div_bytes);
+    debug_log!("DEBUG: Received diversifier for spending: {:02x?}", div_bytes);
 
     // Get the address that received this note using the note's diversifier
     let fvk = extsk.to_diversifiable_full_viewing_key();
@@ -899,7 +961,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         Some(addr) => addr,
         None => {
             eprintln!("❌ Invalid diversifier for note address");
-            eprintln!("DEBUG: Expected valid diversifier like [c7, 99, e1, e4, 37, 90, fa, a5, 04, bd, df]");
+            debug_log!("DEBUG: Expected valid diversifier like [c7, 99, e1, e4, 37, 90, fa, a5, 04, bd, df]");
             return false;
         }
     };
@@ -919,6 +981,11 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         NoteValue::from_raw(note_value),
         Rseed::BeforeZip212(rcm),
     );
+
+    // Compute note CMU for verification
+    let computed_cmu = note.cmu();
+    let cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+    debug_log!("🔍 Computed note CMU: {}", hex::encode(&cmu_bytes));
 
     // Deserialize the IncrementalWitness from standard format
     let mut reader = std::io::Cursor::new(witness_slice);
@@ -941,18 +1008,22 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     };
 
     let position = u64::from(witness.tip_position()) as u32;
+    debug_log!("🔍 Witness position: {}", position);
 
     // Create transaction builder
     // Use current chain height for proper expiry calculation
     let target_height = BlockHeight::from_u32(chain_height as u32);
     let mut builder = Builder::new(ZclassicNetwork, target_height, None);
 
-    // Debug: print note details
-    eprintln!("🔍 Note value: {}", note_value);
-    eprintln!("🔍 Note position: {}", position);
-    eprintln!("🔍 Diversifier: {:02x?}", div_bytes);
-    eprintln!("🔍 Witness length: {} bytes", witness_len);
-    eprintln!("🔍 RCM: {:02x?}", &rcm_bytes[..8]);
+    // Verify branch ID (only log errors for wrong branch ID)
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔑 Branch ID: 0x{:08x} at height {}", branch_id_u32, chain_height);
+
+    // Only warn if branch ID is wrong for current height
+    if chain_height >= 707000 && branch_id_u32 != 0x930b540d {
+        eprintln!("❌ ERROR: At height {}, expected branch ID 0x930b540d (Buttercup) but got 0x{:08x}", chain_height, branch_id_u32);
+    }
 
     // Add spend
     if let Err(e) = builder.add_sapling_spend(
@@ -962,10 +1033,9 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         merkle_path,
     ) {
         eprintln!("❌ Failed to add spend: {:?}", e);
-        eprintln!("❌ Error details: This usually means the witness/merkle path doesn't match the tree state");
         return false;
     }
-    eprintln!("✅ Spend added successfully");
+    debug_log!("✅ Spend added successfully");
 
     // Prepare memo
     let memo_bytes = if memo.is_null() {
@@ -1011,15 +1081,11 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     }
 
     // Build the transaction with proofs
-    eprintln!("🔨 Building transaction with prover...");
+    debug_log!("🔨 Building transaction...");
     let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Failed to build transaction: {:?}", e);
-            eprintln!("❌ This error typically occurs when:");
-            eprintln!("   1. The merkle witness doesn't match the note position");
-            eprintln!("   2. The Sapling parameters are invalid or corrupted");
-            eprintln!("   3. The note commitment doesn't exist at the given position");
             return false;
         }
     };
@@ -1031,7 +1097,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         return false;
     }
 
-    eprintln!("✅ Transaction built: {} bytes", tx_bytes.len());
+    debug_log!("✅ Transaction built: {} bytes", tx_bytes.len());
 
     // Copy to output
     if tx_bytes.len() > 10000 {
@@ -1183,7 +1249,7 @@ pub extern "C" fn zipherx_tree_init() -> bool {
 }
 
 /// Add a note commitment (cmu) to the tree
-/// cmu: 32-byte note commitment
+/// cmu: 32-byte note commitment in WIRE FORMAT (little-endian)
 /// Returns the position of the added commitment
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
@@ -1195,13 +1261,12 @@ pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
         None => return u64::MAX, // Tree not initialized
     };
 
-    // Parse cmu as a Sapling Node
-    let mut cmu_bytes = [0u8; 32];
-    cmu_bytes.copy_from_slice(cmu_slice);
-
-    let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
-        Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
-        None => return u64::MAX,
+    // Parse cmu as a Sapling Node using Node::read()
+    // IMPORTANT: CMU must be in wire format (little-endian), same as treeLoadFromCMUs
+    // This ensures consistency - both functions parse CMUs the same way
+    let node = match zcash_primitives::sapling::Node::read(cmu_slice) {
+        Ok(n) => n,
+        Err(_) => return u64::MAX,
     };
 
     // Append to tree
@@ -1251,7 +1316,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     witness_len: usize,
 ) -> u64 {
     if witness_len < 1028 {
-        eprintln!("❌ Witness data too short: {} bytes", witness_len);
+        debug_log!("❌ Witness data too short: {} bytes", witness_len);
         return u64::MAX;
     }
 
@@ -1264,7 +1329,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     let witness = match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("❌ Failed to deserialize witness: {:?}", e);
+            debug_log!("❌ Failed to deserialize witness: {:?}", e);
             return u64::MAX;
         }
     };
@@ -1273,7 +1338,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     let index = witnesses_guard.len();
     witnesses_guard.push(witness);
 
-    eprintln!("📝 Loaded witness at index {}", index);
+    debug_log!("📝 Loaded witness at index {}", index);
     index as u64
 }
 
@@ -1366,21 +1431,27 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
     let witness = match witnesses_guard.get(witness_index as usize) {
         Some(w) => w,
         None => {
-            eprintln!("❌ Invalid witness index {}", witness_index);
+            debug_log!("❌ Invalid witness index {}", witness_index);
             return false;
         }
     };
 
+    // Debug: Print the root that this witness produces
+    let witness_root = witness.root();
+    let mut witness_root_bytes = [0u8; 32];
+    witness_root.write(&mut witness_root_bytes[..]).unwrap();
+    debug_log!("🔍 Witness root (wire format): {}", hex::encode(&witness_root_bytes));
+
     // Serialize the IncrementalWitness using zcash standard format
     let mut serialized = Vec::new();
     if zcash_primitives::merkle_tree::write_incremental_witness(witness, &mut serialized).is_err() {
-        eprintln!("❌ Failed to serialize witness");
+        debug_log!("❌ Failed to serialize witness");
         return false;
     }
 
     // Copy to output buffer (must be at least 1028 bytes)
     if serialized.len() > 1028 {
-        eprintln!("❌ Serialized witness too large: {} bytes", serialized.len());
+        debug_log!("❌ Serialized witness too large: {} bytes", serialized.len());
         return false;
     }
 
@@ -1390,7 +1461,7 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
         std::ptr::write_bytes(witness_out.add(serialized.len()), 0, 1028 - serialized.len());
     }
 
-    eprintln!("📝 Serialized witness: {} bytes", serialized.len());
+    debug_log!("📝 Serialized witness: {} bytes", serialized.len());
     true
 }
 
@@ -1428,7 +1499,7 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
     }
 
     if data.len() > 100_000 {
-        eprintln!("❌ Tree too large to serialize");
+        debug_log!("❌ Tree too large to serialize");
         return false;
     }
 
@@ -1483,7 +1554,6 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     data_len: usize,
 ) -> bool {
     if data_len < 8 {
-        eprintln!("❌ Data too short for CMU file");
         return false;
     }
 
@@ -1494,46 +1564,27 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     let expected_len = 8 + (count as usize * 32);
 
     if data_len < expected_len {
-        eprintln!("❌ Data too short: expected {} bytes for {} CMUs, got {}", expected_len, count, data_len);
         return false;
     }
 
-    eprintln!("📦 Loading {} CMUs into tree...", count);
+    debug_log!("📦 Loading {} CMUs into tree...", count);
 
     // Initialize empty tree
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
 
-    // Append all CMUs
+    // Append all CMUs - CMUs are stored in wire format (little-endian)
     let mut offset = 8;
     for i in 0..count {
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // CRITICAL: CMUs in bundled file are stored in little-endian (reversed) byte order
-        // zcashd RPC returns them in big-endian (display) format, but our export tool
-        // stored them wrong. We need to reverse the bytes.
-        let mut cmu_reversed = [0u8; 32];
-        for j in 0..32 {
-            cmu_reversed[j] = cmu_bytes[31 - j];
-        }
-
-        // Parse as Node (expects big-endian format)
-        let node = match zcash_primitives::sapling::Node::read(&cmu_reversed[..]) {
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
             Ok(n) => n,
-            Err(e) => {
-                eprintln!("❌ Failed to parse CMU at position {}: {:?}", i, e);
-                return false;
-            }
+            Err(_) => return false,
         };
 
-        // Append to tree
         if tree.append(node).is_err() {
-            eprintln!("❌ Failed to append CMU at position {}", i);
             return false;
-        }
-
-        if i > 0 && i % 100000 == 0 {
-            eprintln!("   Progress: {}/{}", i, count);
         }
     }
 
@@ -1544,7 +1595,75 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     let mut pos_guard = TREE_POSITION.lock().unwrap();
     *pos_guard = count;
 
-    eprintln!("✅ Tree loaded with {} commitments", count);
+    debug_log!("✅ Tree loaded with {} commitments", count);
+
+    true
+}
+
+/// Progress callback type for tree loading
+/// Parameters: current CMU index, total CMU count
+pub type TreeLoadProgressCallback = extern "C" fn(current: u64, total: u64);
+
+/// Load commitment tree from bundled CMU data with progress callback
+/// This allows Swift to show real-time progress during tree loading
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
+    data: *const u8,
+    data_len: usize,
+    progress_callback: TreeLoadProgressCallback,
+) -> bool {
+    if data_len < 8 {
+        return false;
+    }
+
+    let bytes = slice::from_raw_parts(data, data_len);
+
+    // Read count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if data_len < expected_len {
+        return false;
+    }
+
+    // Report initial progress
+    progress_callback(0, count);
+
+    // Initialize empty tree
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+
+    // Append all CMUs
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+
+        if tree.append(node).is_err() {
+            return false;
+        }
+
+        // Report progress every 10000 CMUs (about 100 updates for 1M CMUs)
+        if i > 0 && i % 10000 == 0 {
+            progress_callback(i, count);
+        }
+    }
+
+    // Final progress
+    progress_callback(count, count);
+
+    // Store in global
+    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    *pos_guard = count;
+
+    debug_log!("✅ Tree loaded with {} commitments", count);
 
     true
 }
@@ -1569,7 +1688,6 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     witness_out_len: *mut usize,
 ) -> u64 {
     if cmu_data_len < 8 {
-        eprintln!("❌ CMU data too short");
         return u64::MAX;
     }
 
@@ -1581,21 +1699,14 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     let expected_len = 8 + (count as usize * 32);
 
     if cmu_data_len < expected_len {
-        eprintln!("❌ CMU data too short for {} CMUs", count);
         return u64::MAX;
     }
 
-    // Reverse target_bytes to match bundled file format (little-endian storage)
-    let mut target_reversed = [0u8; 32];
-    for j in 0..32 {
-        target_reversed[j] = target_bytes[31 - j];
-    }
-
-    // Find target CMU position (compare against reversed format in file)
+    // Find target CMU position (compare against wire format in file)
     let mut target_pos: Option<u64> = None;
     let mut offset = 8;
     for i in 0..count {
-        if &bytes[offset..offset + 32] == &target_reversed[..] {
+        if &bytes[offset..offset + 32] == target_bytes {
             target_pos = Some(i);
             break;
         }
@@ -1605,14 +1716,12 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     let target_pos = match target_pos {
         Some(p) => p,
         None => {
-            eprintln!("❌ Target CMU not found in bundled data");
-            eprintln!("   Target (big-endian): {:02x?}...", &target_bytes[0..8]);
-            eprintln!("   Target (reversed):   {:02x?}...", &target_reversed[0..8]);
+            debug_log!("❌ Target CMU not found in bundled data");
             return u64::MAX;
         }
     };
 
-    eprintln!("📍 Found target CMU at position {}", target_pos);
+    debug_log!("📍 Found target CMU at position {}", target_pos);
 
     // Build tree up to target position, creating witness there
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
@@ -1623,64 +1732,41 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // CRITICAL: Reverse bytes from little-endian storage to big-endian for parsing
-        let mut cmu_reversed = [0u8; 32];
-        for j in 0..32 {
-            cmu_reversed[j] = cmu_bytes[31 - j];
-        }
-
-        // Parse as Node (expects big-endian format)
-        let node = match zcash_primitives::sapling::Node::read(&cmu_reversed[..]) {
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
             Ok(n) => n,
-            Err(e) => {
-                eprintln!("❌ Failed to parse CMU at position {}: {:?}", i, e);
-                return u64::MAX;
-            }
+            Err(_) => return u64::MAX,
         };
 
-        // Append to tree
         if tree.append(node).is_err() {
-            eprintln!("❌ Failed to append CMU at position {}", i);
             return u64::MAX;
         }
 
         // Create witness at target position
         if i == target_pos {
             witness = Some(IncrementalWitness::from_tree(tree.clone()));
-            eprintln!("📝 Created witness at position {}", i);
         } else if i > target_pos {
             // Update existing witness with new nodes
             if let Some(ref mut w) = witness {
                 w.append(node).ok();
             }
         }
-
-        // Progress logging
-        if i > 0 && i % 200000 == 0 {
-            eprintln!("   Progress: {}/{}", i, count);
-        }
     }
 
     // Serialize witness
     let witness = match witness {
         Some(w) => w,
-        None => {
-            eprintln!("❌ Witness not created");
-            return u64::MAX;
-        }
+        None => return u64::MAX,
     };
 
     let mut serialized = Vec::new();
     if write_incremental_witness(&witness, &mut serialized).is_err() {
-        eprintln!("❌ Failed to serialize witness");
         return u64::MAX;
     }
 
-    eprintln!("📝 Serialized witness: {} bytes", serialized.len());
+    debug_log!("📝 Serialized witness: {} bytes", serialized.len());
 
     // Copy to output
     if serialized.len() > 2000 {
-        eprintln!("❌ Witness too large: {} bytes", serialized.len());
         return u64::MAX;
     }
 
