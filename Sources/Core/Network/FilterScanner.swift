@@ -1342,6 +1342,7 @@ struct CompactBlock: Hashable {
     let blockHeight: UInt64
     let blockHash: Data
     let prevHash: Data
+    let finalSaplingRoot: Data  // The anchor! (32 bytes)
     let time: UInt32
     let transactions: [CompactTx]
 }

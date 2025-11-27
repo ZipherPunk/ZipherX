@@ -29,6 +29,8 @@ struct SettingsView: View {
     @State private var fullRescanHeight = ""
     @State private var showHistory = false
     @State private var showRebuildWitnessesWarning = false
+    @State private var showRecoverySuccess = false
+    @State private var recoveryMessage = ""
 
     var body: some View {
         ScrollView {
@@ -67,6 +69,11 @@ struct SettingsView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(errorMessage)
+        }
+        .alert("Funds Recovered!", isPresented: $showRecoverySuccess) {
+            Button("Nice!", role: .cancel) {}
+        } message: {
+            Text(recoveryMessage)
         }
         .sheet(isPresented: $showPINSetup) {
             pinSetupSheet
@@ -627,6 +634,32 @@ struct SettingsView: View {
             }
             .foregroundColor(System7Theme.black)
 
+            // Recover Spent Notes button - for failed transaction recovery
+            Button(action: {
+                recoverSpentNotes()
+            }) {
+                HStack {
+                    Image(systemName: "arrow.uturn.backward.circle")
+                        .font(.system(size: 12))
+                    Text("Recover Stuck Funds")
+                        .font(System7Theme.titleFont(size: 11))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.green)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.green.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            Text("If a transaction failed but your balance shows 0, this will recover any stuck funds back to spendable.")
+                .font(System7Theme.bodyFont(size: 9))
+                .foregroundColor(System7Theme.darkGray)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+
             // Clear headers button
             Button(action: {
                 clearHeaders()
@@ -664,6 +697,36 @@ struct SettingsView: View {
 
     // MARK: - Actions
 
+    private func recoverSpentNotes() {
+        Task {
+            do {
+                let recoveredCount = try await walletManager.forceRecoverAllSpentNotes()
+                await MainActor.run {
+                    if recoveredCount > 0 {
+                        // Cypherpunk success messages
+                        let messages = [
+                            "Your shielded ZCL has been liberated from the void.\n\nThe blockchain never forgets, but it forgives.\n\n\(recoveredCount) note(s) restored to your control.",
+                            "Zero-knowledge proofs don't lie.\n\nYour \(recoveredCount) note(s) were never truly lost - just temporarily displaced in the merkle tree of time.",
+                            "Transaction reversed in the shadows.\n\n\(recoveredCount) shielded note(s) have returned to sender.\n\nPrivacy preserved. Funds restored.",
+                            "The ciphertext remembers.\n\n\(recoveredCount) note(s) decrypted and recovered.\n\nYour keys, your coins.",
+                            "Nullifier rejected. Notes reclaimed.\n\n\(recoveredCount) shielded output(s) back in your wallet.\n\nNot your keys? Not your problem anymore."
+                        ]
+                        recoveryMessage = messages.randomElement() ?? messages[0]
+                        showRecoverySuccess = true
+                    } else {
+                        errorMessage = "No stuck funds found.\n\nIf your balance is still 0, try a full rescan from Settings."
+                        showError = true
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = "Recovery failed: \(error.localizedDescription)"
+                    showError = true
+                }
+            }
+        }
+    }
+
     private func clearHeaders() {
         do {
             try HeaderStore.shared.open()
@@ -681,9 +744,9 @@ struct SettingsView: View {
         do {
             exportedKey = try walletManager.exportSpendingKey()
             showExportAlert = true
-            print("🔑 Private key exported (shown in alert)")
+            // SECURITY: Never log private key operations
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = "Failed to export key"
             showError = true
         }
     }

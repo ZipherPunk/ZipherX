@@ -9,23 +9,16 @@ final class NetworkManager: ObservableObject {
 
     // MARK: - Constants
     private let MIN_PEERS = 3
-    private let CONSENSUS_THRESHOLD = 1 // Lowered to 1 for testing
+    private let CONSENSUS_THRESHOLD = 2 // SECURITY: Require at least 2 peers to agree
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 86400 // 24 hours
     private let MAX_KNOWN_ADDRESSES = 1000
     private let GETADDR_INTERVAL: TimeInterval = 60 // Request addresses every minute initially
 
-    // MARK: - Local Full Node Support
-    // When connected to local full node, trust it fully (no multi-peer consensus needed)
-    // Local full node configuration (internal for extension access)
-    let LOCAL_NODE_HOST = "192.168.178.86"
-    let LOCAL_NODE_PORT: UInt16 = 8033
-
     // MARK: - Published Properties
     @Published private(set) var connectedPeers: Int = 0
     @Published private(set) var isConnected: Bool = false
-    @Published private(set) var isConnectedToLocalNode: Bool = false  // True when local full node is connected
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var lastBlockHeight: UInt64 = 0
     @Published private(set) var knownAddressCount: Int = 0
@@ -63,11 +56,9 @@ final class NetworkManager: ObservableObject {
     ]
 
     // Hardcoded peers for reliable connectivity (IP addresses only)
-    // Local node first (use LAN IP for iOS Simulator), then peers from our full node
     private let hardcodedPeersZCL = [
-        "192.168.178.86:8033",   // Local full node via LAN IP (for iOS Simulator)
-        "185.205.246.161:8033",  // Connected peer from our full node
-        "140.174.189.3:8033",    // Connected peer from our full node
+        "185.205.246.161:8033",  // Known ZCL peer
+        "140.174.189.3:8033",    // Known ZCL peer
         "205.209.104.118:8033",
         "74.50.74.102:8033",
         "162.55.92.62:8033",
@@ -354,17 +345,9 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.insufficientPeers(connectedCount, MIN_PEERS)
         }
 
-        // Check if we're connected to local full node
-        let localNodeConnected = peers.contains { $0.host == LOCAL_NODE_HOST && $0.port == LOCAL_NODE_PORT }
-
         DispatchQueue.main.async {
             self.connectedPeers = connectedCount
             self.isConnected = connectedCount > 0
-            self.isConnectedToLocalNode = localNodeConnected
-        }
-
-        if localNodeConnected {
-            print("🏠 Connected to LOCAL FULL NODE - trusted mode enabled")
         }
 
         // Persist good addresses for next launch
@@ -381,7 +364,6 @@ final class NetworkManager: ObservableObject {
         DispatchQueue.main.async {
             self.connectedPeers = 0
             self.isConnected = false
-            self.isConnectedToLocalNode = false
         }
     }
 
@@ -587,13 +569,23 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // Success if ANY peer accepted the transaction
-        // The peer returns txid when it responds with "inv" message (accepted into mempool)
+        // Check if any peer accepted the transaction
         guard successCount >= 1, let txId = txId else {
             throw NetworkError.broadcastFailed
         }
 
-        print("✅ Transaction broadcast: \(txId) (\(successCount)/\(peers.count) peers)")
+        print("📡 Transaction sent to \(successCount)/\(peers.count) peers, verifying on-chain...")
+
+        // CRITICAL: Verify the transaction actually made it to the blockchain/mempool
+        // Peer acceptance (inv) doesn't guarantee the tx is valid or accepted by miners
+        let verified = try await InsightAPI.shared.waitForTransaction(txid: txId, maxAttempts: 10, delaySeconds: 3.0)
+
+        guard verified else {
+            print("❌ Transaction NOT found on-chain after broadcast - may have been rejected")
+            throw NetworkError.transactionNotVerified
+        }
+
+        print("✅ Transaction VERIFIED on-chain: \(txId)")
         return txId
     }
 
@@ -882,6 +874,7 @@ enum NetworkError: LocalizedError {
     case consensusNotReached
     case broadcastFailed
     case transactionRejected
+    case transactionNotVerified
     case connectionFailed(String)
     case handshakeFailed
     case timeout
@@ -899,6 +892,8 @@ enum NetworkError: LocalizedError {
             return "Transaction broadcast failed"
         case .transactionRejected:
             return "Transaction was rejected by the network"
+        case .transactionNotVerified:
+            return "Transaction not found on blockchain - may have been rejected"
         case .connectionFailed(let message):
             return "Connection failed: \(message)"
         case .handshakeFailed:

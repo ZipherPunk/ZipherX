@@ -170,10 +170,9 @@ struct ReceiveView: View {
         do {
             exportedKey = try walletManager.exportSpendingKey()
             showExportAlert = true
-            // Also print to console for easy access in Simulator
-            print("🔑 PRIVATE KEY (KEEP SECRET!): \(exportedKey)")
+            // SECURITY: Never log private keys
         } catch {
-            print("Failed to export key: \(error)")
+            print("❌ Key export failed")
         }
     }
 }

@@ -65,6 +65,53 @@ final class InsightAPI {
         return try JSONDecoder().decode(InsightTransaction.self, from: data)
     }
 
+    /// Verify transaction exists in mempool or blockchain
+    /// Returns: (exists: Bool, confirmations: Int)
+    /// - exists = true if tx is in mempool (0 confirmations) or blockchain (1+ confirmations)
+    /// - exists = false if tx not found (rejected or never broadcast)
+    func verifyTransactionExists(txid: String) async throws -> (exists: Bool, confirmations: Int) {
+        do {
+            let tx = try await getTransaction(txid: txid)
+            return (exists: true, confirmations: tx.confirmations)
+        } catch {
+            // Check if it's a 404 (tx not found) vs network error
+            if let urlError = error as? URLError {
+                if urlError.code == .fileDoesNotExist || urlError.code == .resourceUnavailable {
+                    return (exists: false, confirmations: 0)
+                }
+            }
+            // For other errors, the tx might exist but we can't verify
+            throw error
+        }
+    }
+
+    /// Wait for transaction to appear in mempool/blockchain with retries
+    /// - Parameters:
+    ///   - txid: Transaction ID to check
+    ///   - maxAttempts: Maximum number of retries (default 10)
+    ///   - delaySeconds: Delay between retries (default 3 seconds)
+    /// - Returns: True if tx found, false if not found after all attempts
+    func waitForTransaction(txid: String, maxAttempts: Int = 10, delaySeconds: Double = 3.0) async throws -> Bool {
+        for attempt in 1...maxAttempts {
+            do {
+                let (exists, confirmations) = try await verifyTransactionExists(txid: txid)
+                if exists {
+                    print("✅ Transaction verified on-chain: \(txid) (\(confirmations) confirmations)")
+                    return true
+                }
+            } catch {
+                // Ignore errors during retry, just continue
+            }
+
+            if attempt < maxAttempts {
+                print("⏳ Waiting for tx to propagate... (attempt \(attempt)/\(maxAttempts))")
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            }
+        }
+
+        return false
+    }
+
     /// Get raw transaction
     func getRawTransaction(txid: String) async throws -> Data {
         let url = URL(string: "\(baseURL)/api/rawtx/\(txid)")!

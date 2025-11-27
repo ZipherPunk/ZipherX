@@ -635,11 +635,12 @@ final class Peer {
 
             // Parse the full block
             if var block = parseCompactBlock(response) {
-                // Set correct height
+                // Set correct height and preserve finalSaplingRoot
                 block = CompactBlock(
                     blockHeight: height + UInt64(index),
                     blockHash: hash,
                     prevHash: block.prevHash,
+                    finalSaplingRoot: block.finalSaplingRoot,
                     time: block.time,
                     transactions: block.transactions
                 )
@@ -652,32 +653,45 @@ final class Peer {
     }
 
     /// Parse a compact block from raw data
+    /// Zcash/Zclassic uses 140-byte headers (not 80 like Bitcoin!)
+    /// Format: version(4) + prevHash(32) + merkleRoot(32) + finalSaplingRoot(32) + time(4) + bits(4) + nonce(32)
     private func parseCompactBlock(_ data: Data) -> CompactBlock? {
-        guard data.count >= 80 else { return nil }
+        // Zcash/Zclassic header is 140 bytes, not 80!
+        guard data.count >= 140 else { return nil }
 
         var offset = 0
 
-        // Block header (80 bytes)
+        // Version (4 bytes)
         let version = data.loadUInt32(at: offset)
         offset += 4
 
+        // Previous block hash (32 bytes)
         let prevHash = Data(data[offset..<offset+32])
         offset += 32
 
+        // Merkle root (32 bytes)
         let merkleRoot = Data(data[offset..<offset+32])
         offset += 32
 
+        // *** CRITICAL: Final Sapling Root (32 bytes) - THIS IS THE ANCHOR! ***
+        let finalSaplingRoot = Data(data[offset..<offset+32])
+        offset += 32
+
+        // Time (4 bytes)
         let time = data.loadUInt32(at: offset)
         offset += 4
 
+        // Bits (4 bytes)
         let bits = data.loadUInt32(at: offset)
         offset += 4
 
-        let nonce = data.loadUInt32(at: offset)
-        offset += 4
+        // Nonce (32 bytes for Equihash)
+        let nonce = Data(data[offset..<offset+32])
+        offset += 32
 
-        // Compute block hash from header
-        let headerData = data.prefix(80)
+        // Compute block hash from full 140-byte header
+        // Note: Zcash uses Equihash, so this might not be exactly right for display
+        let headerData = data.prefix(140)
         let blockHash = headerData.doubleSHA256()
 
         // Parse transactions
@@ -686,9 +700,10 @@ final class Peer {
         // Read tx count (varint)
         guard offset < data.count else {
             return CompactBlock(
-                blockHeight: 0, // Will be set by caller
+                blockHeight: 0,
                 blockHash: blockHash,
                 prevHash: prevHash,
+                finalSaplingRoot: finalSaplingRoot,
                 time: time,
                 transactions: []
             )
@@ -715,9 +730,10 @@ final class Peer {
         }
 
         return CompactBlock(
-            blockHeight: 0, // Will be set by caller based on request
+            blockHeight: 0,
             blockHash: blockHash,
             prevHash: prevHash,
+            finalSaplingRoot: finalSaplingRoot,
             time: time,
             transactions: transactions
         )

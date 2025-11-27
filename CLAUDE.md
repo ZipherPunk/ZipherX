@@ -178,8 +178,7 @@ Before any release:
 8. **Database Layer** - SQLite with tree state persistence
 9. **UI** - System 7-inspired interface with balance display, send/receive
 10. **Pre-built Bundled Commitment Tree** - Fast initial sync (see below)
-11. **Local Full Node Trust Mode** - Connect to local zcashd for trusted sync
-12. **Two-Phase Scanning** - Parallel note discovery + sequential tree building
+11. **Two-Phase Scanning** - Parallel note discovery + sequential tree building
 
 ### Completed Features (continued)
 
@@ -299,33 +298,6 @@ if scanWithinBundledRange {
 // Scan bundledTreeHeight+1 → chainTip (sequential, tree building)
 processShieldedOutputsSync(...)
 ```
-
----
-
-## Local Full Node Trust Mode
-
-### Purpose
-
-When running a local Zclassic full node (`zcashd`), the app can trust it completely for faster sync without multi-peer consensus.
-
-### Configuration
-
-In `NetworkManager.swift`:
-```swift
-// Check if we have a local full node connection
-var hasLocalFullNode: Bool {
-    return connectedPeers.contains { peer in
-        peer.host == "192.168.178.86" || peer.host == "localhost" || peer.host == "127.0.0.1"
-    }
-}
-```
-
-### Behavior When Local Node Detected
-
-- Header sync uses single peer (no consensus required)
-- Block data fetched directly from local node
-- Transaction broadcast goes to local node first
-- Logs show: `🏠 Using LOCAL FULL NODE (trusted mode)`
 
 ---
 
@@ -524,6 +496,60 @@ Created `/Users/chris/ZipherX/Libraries/zcash_primitives_zcl/` with native `Zcla
 **Files Modified**:
 - `Sources/Core/Network/FilterScanner.swift` - fast startup, nullifier detection
 - `Sources/Core/Wallet/WalletManager.swift` - cypherpunk progress messages
+
+### 8. P2P-First Data Fetching for Mobile Users (November 2025)
+
+**Problem**: Transaction building failed when fetching CMUs for notes beyond bundled tree height
+- Insight API timeout when fetching blocks
+- Mobile users cannot connect to local zcashd node
+
+**Root Cause**: The app was configured to use a local full node at `192.168.178.86:8232` for trusted sync, but mobile users on public networks don't have access to this node.
+
+**Solution: Decentralized P2P-First Architecture**
+
+All block data (CMUs, anchors) now fetched via connected P2P peers first, with Insight API as fallback:
+
+1. **CMU Fetching** (`TransactionBuilder.swift`):
+   - Primary: Use P2P peer's `getFullBlocks()` to fetch block data
+   - Fallback: Insight API with parallel fetching and 30-second timeout
+
+2. **Anchor Fetching** (`TransactionBuilder.swift`):
+   - Block headers contain `finalSaplingRoot` (32 bytes) which IS the anchor
+   - Fetch via P2P `getFullBlocks()` - headers include anchor directly
+
+3. **140-Byte Zcash Header Parsing** (`Peer.swift`):
+   - Fixed: Was parsing 80-byte Bitcoin headers, now parses 140-byte Zcash format
+   - Header format: version(4) + prevHash(32) + merkleRoot(32) + **finalSaplingRoot(32)** + time(4) + bits(4) + nonce(32)
+
+4. **Removed All Local Node References**:
+   - Deleted `LocalNodeRPC.swift`
+   - Removed `192.168.178.86` from hardcoded peers
+   - Removed `isConnectedToLocalNode`, `hasLocalNodePeer()`, `LOCAL_NODE_*` constants
+
+**Code Example** (P2P-first CMU fetch):
+```swift
+// FIRST: Try P2P peers (faster and decentralized!)
+if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
+    let blocks = try await peer.getFullBlocks(from: height, count: 1)
+    if let block = blocks.first {
+        for tx in block.transactions {
+            for output in tx.outputs {
+                cmus.append(output.cmu)
+            }
+        }
+    }
+}
+// FALLBACK: Insight API with parallel fetching
+```
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - P2P-first CMU/anchor fetching
+- `Sources/Core/Network/Peer.swift` - 140-byte header parsing with finalSaplingRoot
+- `Sources/Core/Network/FilterScanner.swift` - Added finalSaplingRoot to CompactBlock
+- `Sources/Core/Network/NetworkManager.swift` - Removed local node constants
+- `Sources/Core/Network/HeaderSyncManager.swift` - Removed local node trust mode
+- `Sources/Features/Balance/BalanceView.swift` - Removed isConnectedToLocalNode UI
+- **Deleted**: `Sources/Core/Network/LocalNodeRPC.swift`
 
 ---
 

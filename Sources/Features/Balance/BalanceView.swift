@@ -353,9 +353,7 @@ struct BalanceView: View {
     // MARK: - Computed Properties
 
     private var connectionColor: Color {
-        if networkManager.isConnectedToLocalNode {
-            return .green  // Local full node = always green (trusted)
-        } else if networkManager.isConnected {
+        if networkManager.isConnected {
             return networkManager.connectedPeers >= 3 ? .green : .yellow
         } else if isRefreshing {
             return .orange
@@ -367,8 +365,6 @@ struct BalanceView: View {
     private var connectionStatusText: String {
         if isRefreshing && !networkManager.isConnected {
             return "Connecting..."
-        } else if networkManager.isConnectedToLocalNode {
-            return "Local Full Node (trusted)"
         } else if networkManager.isConnected {
             let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
             return "Connected to \(networkManager.connectedPeers) \(peerWord)"
