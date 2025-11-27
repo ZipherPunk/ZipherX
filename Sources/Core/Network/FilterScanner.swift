@@ -185,9 +185,13 @@ final class FilterScanner {
             print("📝 Found \(notesWithoutWitnesses) existing notes without witnesses")
         }
 
+        // Determine if we need to reset tree for a rescan
+        // If starting from bundledTreeHeight+1, we need bundled tree, not database state
+        let needsFreshBundledTree = customStartHeight != nil && customStartHeight! > bundledTreeHeight
+
         // Initialize commitment tree
-        // Priority: 1) Database state, 2) Bundled tree, 3) Empty tree
-        if let treeData = try? database.getTreeState() {
+        // Priority: 1) Database state (unless rescanning), 2) Bundled tree, 3) Empty tree
+        if !needsFreshBundledTree, let treeData = try? database.getTreeState() {
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
                 print("🌳 Restored commitment tree with \(treeSize) commitments")
@@ -196,6 +200,12 @@ final class FilterScanner {
                 print("⚠️ Failed to restore tree from database")
                 treeInitialized = false
             }
+        }
+
+        // Force load bundled tree for rescans starting after bundled height
+        if needsFreshBundledTree {
+            print("🌳 Rescan mode: loading fresh bundled tree (ignoring database state)")
+            treeInitialized = false // Force reload from bundled data
         }
 
         // Try bundled CMUs if database tree failed or doesn't exist
@@ -378,10 +388,17 @@ final class FilterScanner {
         // This runs if:
         // - We did PHASE 1 and there are more blocks after bundledTreeHeight
         // - OR no custom start height was provided (normal auto-scan)
+        // - OR custom start height is AFTER bundled tree (must use sequential for correct positions)
         let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= latestHeight
-        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange
 
-        if continueAfterBundledRange {
+        // Quick scan is ONLY safe when scanning WITHIN bundled tree range where positions are known
+        // If starting AFTER bundled tree, we MUST use sequential mode for correct nullifier computation
+        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange && customStartHeight! <= bundledTreeHeight
+
+        // If custom start is AFTER bundled tree, force sequential mode
+        let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > bundledTreeHeight
+
+        if continueAfterBundledRange || forceSequentialAfterBundled {
             print("⚡ PHASE 2: Scanning blocks \(currentHeight) to \(latestHeight) for notes + tree building (sequential)")
         }
 
@@ -460,9 +477,10 @@ final class FilterScanner {
                 print("⚡ Parallel scanned \(currentHeight) to \(endHeight)")
                 currentHeight = endHeight + 1
             }
-        } else if !isQuickScanOnly || continueAfterBundledRange {
+        } else if !isQuickScanOnly || continueAfterBundledRange || forceSequentialAfterBundled {
             // SEQUENTIAL MODE - for full rescan that needs tree building
             // Runs when: no custom start OR after PHASE 1 for blocks beyond bundled tree
+            // OR when custom start is AFTER bundled tree (need sequential for correct positions)
             // OPTIMIZED: Batch fetch blocks and prefetch transactions
             while currentHeight <= latestHeight && isScanning {
                 let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)
@@ -892,6 +910,15 @@ final class FilterScanner {
         // Check for spent notes (nullifier detection)
         for tx in block.transactions {
             for spend in tx.spends {
+                // Debug: Log nullifier comparison when we have known nullifiers
+                if !knownNullifiers.isEmpty {
+                    let spendNfHex = spend.nullifier.hexString
+                    let matched = knownNullifiers.contains(spend.nullifier)
+                    if matched {
+                        print("💸 MATCH! Spend nullifier \(spendNfHex) matches our note!")
+                    }
+                }
+
                 if knownNullifiers.contains(spend.nullifier) {
                     // One of our notes was spent!
                     try database.markNoteSpent(nullifier: spend.nullifier, spentHeight: height)
@@ -966,12 +993,16 @@ final class FilterScanner {
         if let spends = spends, !spends.isEmpty {
             print("🔍 Checking \(spends.count) spend(s) at height \(height) against \(knownNullifiers.count) known nullifiers")
             for spend in spends {
-                guard let nullifierData = Data(hexString: spend.nullifier) else {
+                guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
                     continue
                 }
-                if knownNullifiers.contains(nullifierData) {
+                // CRITICAL FIX: API returns nullifier in big-endian (display format)
+                // but our knownNullifiers are stored in little-endian (wire format)
+                // Must reverse before comparison!
+                let nullifierWire = nullifierDisplay.reversedBytes()
+                if knownNullifiers.contains(nullifierWire) {
                     // One of our notes was spent!
-                    try database.markNoteSpent(nullifier: nullifierData, spentHeight: height)
+                    try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
                 }
             }
@@ -1033,6 +1064,9 @@ final class FilterScanner {
                 position: treePosition
             )
 
+            // Debug: Log the computed nullifier and position
+            print("🔐 Computed nullifier for note at position \(treePosition): \(nullifier.hexString)")
+
             knownNullifiers.insert(nullifier)
 
             // Get witness
@@ -1075,12 +1109,16 @@ final class FilterScanner {
         // of notes we already know about
         if let spends = spends {
             for spend in spends {
-                guard let nullifierData = Data(hexString: spend.nullifier) else {
+                guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
                     continue
                 }
-                if knownNullifiers.contains(nullifierData) {
+                // CRITICAL FIX: API returns nullifier in big-endian (display format)
+                // but our knownNullifiers are stored in little-endian (wire format)
+                // Must reverse before comparison!
+                let nullifierWire = nullifierDisplay.reversedBytes()
+                if knownNullifiers.contains(nullifierWire) {
                     // One of our notes was spent!
-                    try database.markNoteSpent(nullifier: nullifierData, spentHeight: height)
+                    try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
                 }
             }
@@ -1147,6 +1185,9 @@ final class FilterScanner {
                 rcm: Data(rcm),
                 position: position
             )
+
+            // Debug: Log the computed nullifier and position
+            print("🔐 Computed nullifier for note at position \(position): \(nullifier.hexString)")
 
             knownNullifiers.insert(nullifier)
 
@@ -1333,13 +1374,42 @@ final class FilterScanner {
             witness: witness
         )
 
+        // Record transaction history for received note
+        // Extract memo string from memo data (filter null bytes, convert to UTF8)
+        let memoString: String? = {
+            let truncated = note.memo.prefix(512)
+            let filtered = truncated.filter { $0 != 0 }
+            guard !filtered.isEmpty else { return nil }
+            return String(data: Data(filtered), encoding: .utf8)
+        }()
+        _ = try database.insertTransactionHistory(
+            txid: txid,
+            height: height,
+            blockTime: nil, // Could fetch from block header if available
+            type: .received,
+            value: note.value,
+            fee: nil,
+            toAddress: nil, // We received it, so our address
+            fromDiversifier: note.diversifier,
+            memo: memoString
+        )
+
         print("💰 Found note: \(note.value) zatoshis at height \(height)")
     }
 
     // MARK: - Helper Methods
 
     private func getChainHeight() async throws -> UInt64 {
-        // Query current chain height from Insight API (more reliable)
+        // Try P2P first (trustless, decentralized)
+        do {
+            let p2pHeight = try await networkManager.getChainHeightP2POnly()
+            print("📡 P2P chain height: \(p2pHeight)")
+            return p2pHeight
+        } catch {
+            print("⚠️ P2P height unavailable, falling back to InsightAPI...")
+        }
+
+        // Fallback to InsightAPI if P2P fails
         let status = try await insightAPI.getStatus()
         return status.height
     }

@@ -855,6 +855,64 @@ final class NetworkManager: ObservableObject {
         return try await peer.getTransaction(hash: Data(txidData))
     }
 
+    // MARK: - P2P Block Scanning
+
+    /// Get block data for a specific height via P2P (used by FilterScanner)
+    /// Returns CompactBlock with transactions including shielded outputs
+    func getBlockForScanning(height: UInt64) async throws -> CompactBlock {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        // Use multi-peer consensus for single block
+        let blocks = try await getBlocksWithConsensus(from: height, count: 1)
+        guard let block = blocks.first else {
+            throw NetworkError.consensusNotReached
+        }
+
+        return block
+    }
+
+    /// Get multiple blocks for scanning via P2P
+    func getBlocksForScanning(from height: UInt64, count: Int) async throws -> [CompactBlock] {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        // For larger batches, use getCompactBlocks which handles consensus
+        return try await getCompactBlocks(from: height, count: count)
+    }
+
+    /// Get chain height from P2P peers only (no InsightAPI fallback)
+    func getChainHeightP2POnly() async throws -> UInt64 {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        var heights: [UInt64: Int] = [:]
+
+        await withTaskGroup(of: UInt64?.self) { group in
+            for peer in peers {
+                group.addTask {
+                    return UInt64(peer.peerStartHeight)
+                }
+            }
+
+            for await result in group {
+                if let height = result, height > 0 {
+                    heights[height, default: 0] += 1
+                }
+            }
+        }
+
+        // Return highest height with at least one peer
+        guard let (height, _) = heights.max(by: { $0.key < $1.key }) else {
+            throw NetworkError.consensusNotReached
+        }
+
+        return height
+    }
+
     // MARK: - Peer Rotation
 
     private func setupPeerRotation() {

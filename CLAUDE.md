@@ -200,6 +200,9 @@ Before any release:
 ### In Progress / Needs Testing
 
 1. **P2P-Only Mode** - Replace remaining InsightAPI calls with P2P
+   - Chain height now uses P2P first, InsightAPI as fallback ✅
+   - Block scanning still uses InsightAPI for transaction parsing
+   - Full P2P mode requires raw transaction parsing (complex refactor)
 2. **Balance UI Update** - Show tree loading progress in main wallet view
 
 ### Remaining Tasks
