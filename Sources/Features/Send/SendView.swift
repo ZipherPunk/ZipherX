@@ -1,6 +1,12 @@
 import SwiftUI
 import AVFoundation
 import AudioToolbox
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Transaction sending progress step
 struct SendProgressStep: Identifiable {
@@ -108,7 +114,7 @@ struct SendView: View {
 
                 HStack(spacing: 12) {
                     Button(action: {
-                        UIPasteboard.general.string = txId
+                        copyToClipboard(txId)
                     }) {
                         HStack {
                             Image(systemName: "doc.on.doc")
@@ -159,7 +165,8 @@ struct SendView: View {
 
                 Spacer()
 
-                // QR Code scanner button
+                #if os(iOS)
+                // QR Code scanner button (iOS only)
                 Button(action: {
                     showQRScanner = true
                 }) {
@@ -179,6 +186,7 @@ struct SendView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                #endif
             }
 
             TextField("zs1...", text: $recipientAddress)
@@ -227,6 +235,7 @@ struct SendView: View {
                 addressValidationText
             }
         }
+        #if os(iOS)
         .sheet(isPresented: $showQRScanner, onDismiss: {
             // Apply scanned address after sheet dismisses
             if !scannedAddress.isEmpty {
@@ -244,6 +253,7 @@ struct SendView: View {
                 showQRScanner = false
             }
         }
+        #endif
     }
 
     /// Extract address from QR code string (handles zcash: URIs and plain addresses)
@@ -483,7 +493,7 @@ struct SendView: View {
             SendProgressStep(id: "tree", title: "Loading commitment tree", status: .pending, detail: "1M+ secrets"),
             SendProgressStep(id: "witness", title: "Building merkle witness", status: .pending),
             SendProgressStep(id: "proof", title: "Generating zk-SNARK proof", status: .pending),
-            SendProgressStep(id: "broadcast", title: "Broadcasting to network", status: .pending)
+            SendProgressStep(id: "broadcast", title: "Broadcasting & verifying", status: .pending)
         ]
         currentStepIndex = 0
 
@@ -555,13 +565,25 @@ struct SendView: View {
                 updateStepSync("witness", status: .inProgress)
             }
         case "witness":
-            updateStepSync("witness", status: .completed)
-            updateStepSync("proof", status: .inProgress, detail: "This may take 30-60 seconds...")
+            // Witness step can have sub-progress for rebuilding (fetching blocks)
+            if let p = progress, p < 1.0 {
+                updateStepSync("witness", status: .inProgress, detail: detail, progress: p)
+            } else {
+                updateStepSync("witness", status: .completed)
+                updateStepSync("proof", status: .inProgress, detail: "This may take 30-60 seconds...")
+            }
         case "proof":
             updateStepSync("proof", status: .completed)
             updateStepSync("broadcast", status: .inProgress)
         case "broadcast":
-            updateStepSync("broadcast", status: .completed)
+            // Broadcast step has sub-progress for peer propagation and verification
+            if let p = progress, p < 1.0 {
+                updateStepSync("broadcast", status: .inProgress, detail: detail, progress: p)
+            } else if progress == 1.0 || detail?.contains("Confirmed") == true {
+                updateStepSync("broadcast", status: .completed, detail: "Transaction confirmed!")
+            } else {
+                updateStepSync("broadcast", status: .inProgress, detail: detail)
+            }
         default:
             break
         }
@@ -600,6 +622,15 @@ struct SendView: View {
         recipientAddress = ""
         amount = ""
         memo = ""
+    }
+
+    private func copyToClipboard(_ string: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = string
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+        #endif
     }
 
     // MARK: - Progress Overlay
@@ -694,8 +725,9 @@ struct SendView: View {
         .environmentObject(NetworkManager.shared)
 }
 
-// MARK: - QR Scanner View
+// MARK: - QR Scanner View (iOS only)
 
+#if os(iOS)
 /// Camera-based QR code scanner view
 struct QRScannerView: UIViewControllerRepresentable {
     let onCodeScanned: (String?) -> Void
@@ -862,3 +894,4 @@ class QRScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsD
         previewLayer?.frame = view.layer.bounds
     }
 }
+#endif

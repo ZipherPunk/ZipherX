@@ -85,6 +85,18 @@ final class InsightAPI {
         }
     }
 
+    /// Quick check if transaction exists (single attempt, no retries)
+    /// Returns true if tx found in mempool or blockchain
+    func checkTransactionExists(txid: String) async throws -> Bool {
+        do {
+            let (exists, _) = try await verifyTransactionExists(txid: txid)
+            return exists
+        } catch {
+            // On error, assume it doesn't exist (could be network issue)
+            return false
+        }
+    }
+
     /// Wait for transaction to appear in mempool/blockchain with retries
     /// - Parameters:
     ///   - txid: Transaction ID to check

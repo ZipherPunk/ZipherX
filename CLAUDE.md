@@ -913,6 +913,110 @@ DO NOT try to optimize transaction building by using the current synced tree sta
 
 ---
 
+### 15. Tree Corruption Auto-Detection and Recovery (November 28, 2025)
+
+**Problem**: Commitment tree in FFI memory could become corrupted (too many CMUs, wrong root), causing all transactions to fail with error code 18.
+
+**Root Cause**: The tree state was saved to database after a corrupted scan, then reloaded on subsequent launches.
+
+**Solution**: Added tree validation in `WalletManager.preloadCommitmentTree()`:
+
+```swift
+// VALIDATION: Check if tree size is reasonable
+let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
+let blocksAfterBundled = max(0, Int64(lastScanned) - Int64(bundledTreeHeight))
+let maxExpectedCMUs = bundledTreeCMUCount + UInt64(blocksAfterBundled) * 50
+
+if treeSize < bundledTreeCMUCount || treeSize > maxExpectedCMUs {
+    print("⚠️ Tree size \(treeSize) seems invalid")
+    // Clear corrupted state and reload from bundled CMUs
+    try? WalletDatabase.shared.saveTreeState(nil)
+    try? WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - added tree size validation on load
+
+---
+
+### 16. Transaction Propagation Progress Bar (November 28, 2025)
+
+**Problem**: User requested progress bar during transaction broadcast and mempool verification.
+
+**Solution**: Added progress reporting to broadcast phase:
+
+1. **NetworkManager.broadcastTransactionWithProgress()** - New function with progress callback:
+   - Reports peer acceptance progress: "Accepted by X/Y peers"
+   - Reports verification progress: "Checking mempool (attempt X/10)"
+
+2. **SendView broadcast step** - Now shows sub-progress during:
+   - Peer broadcast phase
+   - Mempool verification phase
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - added `broadcastTransactionWithProgress()`
+- `Sources/Core/Network/InsightAPI.swift` - added `checkTransactionExists()`
+- `Sources/Core/Wallet/WalletManager.swift` - uses new broadcast with progress
+- `Sources/Features/Send/SendView.swift` - displays broadcast sub-progress
+
+---
+
+### 17. CRITICAL: Tree Corruption Race Condition Fix (November 28, 2025)
+
+**Problem**: Commitment tree was corrupted with ~70,000 extra CMUs (1,111,878 instead of expected ~1,055,998), causing transactions to fail with error code 18 (bad-txns-sapling-spend-description-invalid).
+
+**Root Cause**: Race condition - three concurrent tree loading operations were all appending to the same global `COMMITMENT_TREE` in Rust:
+1. `WalletManager.init()` → `preloadCommitmentTree()`
+2. `ContentView.task` → `ensureTreeLoaded()`
+3. `FilterScanner.startScan()` → tree initialization
+
+When all three ran concurrently, CMUs were being appended multiple times, corrupting the tree.
+
+**Solution: Two-Level Locking**
+
+1. **WalletManager loading lock** - Prevents duplicate calls within WalletManager:
+   ```swift
+   private var isTreeLoading = false
+   private let treeLoadLock = NSLock()
+
+   private func preloadCommitmentTree() async {
+       treeLoadLock.lock()
+       if isTreeLoading || isTreeLoaded {
+           treeLoadLock.unlock()
+           // Wait for other load to complete
+           while !isTreeLoaded { try? await Task.sleep(...) }
+           return
+       }
+       isTreeLoading = true
+       treeLoadLock.unlock()
+       // ... load tree ...
+   }
+   ```
+
+2. **FilterScanner wait for WalletManager** - FilterScanner waits for WalletManager's tree to be loaded before proceeding:
+   ```swift
+   // In FilterScanner.startScan(), before tree initialization:
+   if !needsFreshBundledTree {
+       let walletManager = WalletManager.shared
+       while !walletManager.isTreeLoaded && waitAttempts < 300 {
+           try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+           waitAttempts += 1
+       }
+   }
+   ```
+
+**Tree Validation** (already added in fix #15):
+- On startup, validates tree size is within expected range
+- If corrupted, clears database tree state and rescans from bundled tree
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - loading lock, validation
+- `Sources/Core/Network/FilterScanner.swift` - wait for WalletManager tree
+- `Sources/Core/Storage/WalletDatabase.swift` - `clearTreeState()` function
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

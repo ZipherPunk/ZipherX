@@ -613,15 +613,20 @@ final class NetworkManager: ObservableObject {
         return balance
     }
 
-    /// Broadcast transaction with multi-peer propagation
+    /// Broadcast progress callback type
+    typealias BroadcastProgressCallback = (_ phase: String, _ detail: String?, _ progress: Double?) -> Void
+
+    /// Broadcast transaction with multi-peer propagation and progress reporting
     /// Success = at least one peer accepted the transaction (returned txid)
-    func broadcastTransaction(_ rawTx: Data) async throws -> String {
+    func broadcastTransactionWithProgress(_ rawTx: Data, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         guard isConnected else {
             throw NetworkError.notConnected
         }
 
         var successCount = 0
         var txId: String?
+
+        onProgress?("peers", "Sending to \(peers.count) peers...", 0.0)
 
         // Broadcast to all peers in parallel
         await withTaskGroup(of: String?.self) { group in
@@ -640,6 +645,7 @@ final class NetworkManager: ObservableObject {
                 if let id = result {
                     successCount += 1
                     txId = id
+                    onProgress?("peers", "Accepted by \(successCount)/\(peers.count) peers", Double(successCount) / Double(peers.count))
                 }
             }
         }
@@ -650,18 +656,34 @@ final class NetworkManager: ObservableObject {
         }
 
         print("📡 Transaction sent to \(successCount)/\(peers.count) peers, verifying on-chain...")
+        onProgress?("verify", "Verifying on-chain...", 0.0)
 
         // CRITICAL: Verify the transaction actually made it to the blockchain/mempool
         // Peer acceptance (inv) doesn't guarantee the tx is valid or accepted by miners
-        let verified = try await InsightAPI.shared.waitForTransaction(txid: txId, maxAttempts: 10, delaySeconds: 3.0)
+        let maxAttempts = 10
+        for attempt in 1...maxAttempts {
+            let progress = Double(attempt) / Double(maxAttempts)
+            onProgress?("verify", "Checking mempool (attempt \(attempt)/\(maxAttempts))...", progress)
 
-        guard verified else {
-            print("❌ Transaction NOT found on-chain after broadcast - may have been rejected")
-            throw NetworkError.transactionNotVerified
+            if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
+                print("✅ Transaction VERIFIED on-chain: \(txId)")
+                onProgress?("verify", "Confirmed!", 1.0)
+                return txId
+            }
+
+            if attempt < maxAttempts {
+                try await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+            }
         }
 
-        print("✅ Transaction VERIFIED on-chain: \(txId)")
-        return txId
+        print("❌ Transaction NOT found on-chain after broadcast - may have been rejected")
+        throw NetworkError.transactionNotVerified
+    }
+
+    /// Broadcast transaction with multi-peer propagation (without progress)
+    /// Success = at least one peer accepted the transaction (returned txid)
+    func broadcastTransaction(_ rawTx: Data) async throws -> String {
+        return try await broadcastTransactionWithProgress(rawTx, onProgress: nil)
     }
 
     /// Get block headers for chain verification

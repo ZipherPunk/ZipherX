@@ -226,6 +226,24 @@ final class FilterScanner {
         // If starting from bundledTreeHeight+1, we need bundled tree, not database state
         let needsFreshBundledTree = customStartHeight != nil && customStartHeight! > bundledTreeHeight
 
+        // CRITICAL: Wait for WalletManager to finish loading tree before proceeding
+        // This prevents race condition where both load concurrently and corrupt the global tree
+        if !needsFreshBundledTree {
+            let walletManager = WalletManager.shared
+            var waitAttempts = 0
+            let maxWaitAttempts = 300 // 30 seconds max wait
+            while !walletManager.isTreeLoaded && waitAttempts < maxWaitAttempts {
+                if waitAttempts == 0 {
+                    print("⏳ Waiting for WalletManager to finish loading tree...")
+                }
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                waitAttempts += 1
+            }
+            if waitAttempts > 0 && walletManager.isTreeLoaded {
+                print("✅ WalletManager tree loading complete, proceeding with scan")
+            }
+        }
+
         // CRITICAL: Check if tree is already loaded in FFI memory (WalletManager may have loaded it)
         // This prevents race condition where FilterScanner loads again while WalletManager is loading
         let existingTreeSize = ZipherXFFI.treeSize()

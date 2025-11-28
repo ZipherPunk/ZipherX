@@ -90,6 +90,15 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
+    // Expected values for bundled tree validation
+    private let bundledTreeCMUCount: UInt64 = 1_041_688
+    private let bundledTreeHeight: UInt64 = 2_923_123
+    // Expected root (display format): 42d6a11f937de8a27060ad683a632be73d08fae9ff421145f58e16a282c702f3
+
+    // Lock to prevent concurrent tree loading
+    private var isTreeLoading = false
+    private let treeLoadLock = NSLock()
+
     /// Public method to ensure tree is loaded - called from ContentView
     /// Handles case where wallet was just created/imported and tree wasn't preloaded in init()
     func ensureTreeLoaded() async {
@@ -104,6 +113,26 @@ final class WalletManager: ObservableObject {
     }
 
     private func preloadCommitmentTree() async {
+        // Prevent concurrent tree loading
+        treeLoadLock.lock()
+        if isTreeLoading || isTreeLoaded {
+            treeLoadLock.unlock()
+            print("🌳 Tree already loading or loaded, skipping duplicate load")
+            // Wait for the other load to complete
+            while !isTreeLoaded {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+            return
+        }
+        isTreeLoading = true
+        treeLoadLock.unlock()
+
+        defer {
+            treeLoadLock.lock()
+            isTreeLoading = false
+            treeLoadLock.unlock()
+        }
+
         print("🌳 Preloading commitment tree...")
 
         await MainActor.run {
@@ -134,13 +163,31 @@ final class WalletManager: ObservableObject {
 
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
-                print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
-                await MainActor.run {
-                    self.isTreeLoaded = true
-                    self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Privacy state restored\n\(treeSize.formatted()) commitments ready"
+
+                // VALIDATION: Check if tree size is reasonable
+                // The tree should have bundledTreeCMUCount plus CMUs from blocks scanned after bundledTreeHeight
+                // A typical block has 0-30 shielded outputs, so expect ~30 CMUs per block max
+                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
+                let blocksAfterBundled = max(0, Int64(lastScanned) - Int64(bundledTreeHeight))
+                let maxExpectedCMUs = bundledTreeCMUCount + UInt64(blocksAfterBundled) * 20 // realistic max ~20 per block
+
+                if treeSize < bundledTreeCMUCount || treeSize > maxExpectedCMUs {
+                    print("⚠️ Tree size \(treeSize) seems invalid (expected \(bundledTreeCMUCount)-\(maxExpectedCMUs))")
+                    print("🔄 Clearing corrupted tree state, will reload from bundled CMUs...")
+                    // Clear the corrupted state from database
+                    try? WalletDatabase.shared.clearTreeState()
+                    try? WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+                    // Fall through to reload from bundled CMUs
+                    // (treeLoadFromCMUs will replace the tree in FFI memory)
+                } else {
+                    print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
+                    await MainActor.run {
+                        self.isTreeLoaded = true
+                        self.treeLoadProgress = 1.0
+                        self.treeLoadStatus = "Privacy state restored\n\(treeSize.formatted()) commitments ready"
+                    }
+                    return
                 }
-                return
             }
         }
 
@@ -299,6 +346,7 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "headers", title: "Sync block headers", status: .pending),
                 SyncTask(id: "height", title: "Get chain height", status: .pending),
                 SyncTask(id: "scan", title: "Scan blocks since checkpoint", status: .pending),
+                SyncTask(id: "witnesses", title: "Sync Merkle witnesses", status: .pending),
                 SyncTask(id: "balance", title: "Calculate balance", status: .pending)
             ]
         }
@@ -491,7 +539,12 @@ final class WalletManager: ObservableObject {
             throw error
         }
 
-        // Task 5: Calculate balance
+        // Task 5: Witnesses already synced by FilterScanner during scan
+        // FilterScanner loads existing witnesses, updates them as CMUs are appended,
+        // and saves updated witnesses back to the database.
+        await updateTask("witnesses", status: .completed, detail: "Synced during scan")
+
+        // Task 6: Calculate balance
         await updateTask("balance", status: .inProgress, detail: "Loading notes...")
 
         // Debug: List all notes in database to diagnose balance discrepancy
@@ -543,6 +596,86 @@ final class WalletManager: ObservableObject {
             self.syncProgress = 1.0
             print("💰 Balance updated: \(totalBalance) zatoshis (\(pendingBalance) pending)")
         }
+    }
+
+    /// Sync witnesses for notes beyond bundled tree to match current tree state
+    /// This ensures witnesses are ready for spending without rebuild at transaction time
+    private func syncWitnesses(accountId: Int64, bundledTreeHeight: UInt64) async throws {
+        let database = WalletDatabase.shared
+
+        // Get all unspent notes
+        let notes = try database.getUnspentNotes(accountId: accountId)
+
+        // Filter notes beyond bundled tree that might need witness update
+        let notesNeedingSync = notes.filter { note in
+            // Notes beyond bundled tree need witness sync
+            note.height > bundledTreeHeight &&
+            // Only if they have valid witness that might be stale
+            note.witness.count >= 1028 &&
+            // Must have CMU for rebuild
+            note.cmu != nil && note.cmu!.count == 32
+        }
+
+        if notesNeedingSync.isEmpty {
+            await MainActor.run {
+                self.syncStatus = "All witnesses up to date"
+                if let index = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                    self.syncTasks[index].detail = "All current"
+                    self.syncTasks[index].progress = 1.0
+                }
+            }
+            print("✅ No witnesses need syncing")
+            return
+        }
+
+        print("🔄 Syncing \(notesNeedingSync.count) witness(es) beyond bundled tree...")
+
+        // Cypherpunk messages for witness sync
+        let witnessMessages = [
+            "Updating Merkle proofs...",
+            "Synchronizing witness paths...",
+            "Refreshing cryptographic anchors...",
+            "Aligning zero-knowledge proofs...",
+            "Calibrating witness roots..."
+        ]
+
+        for (index, note) in notesNeedingSync.enumerated() {
+            let progress = Double(index + 1) / Double(notesNeedingSync.count)
+            let messageIndex = index % witnessMessages.count
+
+            await MainActor.run {
+                self.syncStatus = witnessMessages[messageIndex]
+                if let taskIndex = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                    self.syncTasks[taskIndex].detail = "Note \(index + 1)/\(notesNeedingSync.count)"
+                    self.syncTasks[taskIndex].progress = progress
+                }
+            }
+
+            // Rebuild witness to current tree state
+            guard let cmu = note.cmu else { continue }
+
+            if let result = try await TransactionBuilder.shared.rebuildWitnessForNote(
+                cmu: cmu,
+                noteHeight: note.height,
+                bundledTreeHeight: bundledTreeHeight
+            ) {
+                // Save updated witness to database
+                try? database.updateNoteWitness(noteId: note.id, witness: result.witness)
+                print("✅ Synced witness for note \(note.id) at height \(note.height)")
+            } else {
+                print("⚠️ Could not sync witness for note \(note.id)")
+            }
+        }
+
+        await MainActor.run {
+            self.syncStatus = "Witnesses synchronized"
+            if let taskIndex = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                self.syncTasks[taskIndex].detail = "\(notesNeedingSync.count) synced"
+                self.syncTasks[taskIndex].progress = 1.0
+            }
+        }
+
+        print("✅ Witness sync complete - \(notesNeedingSync.count) updated")
     }
 
     /// Rescan blockchain from checkpoint to find missing transactions
@@ -986,11 +1119,14 @@ final class WalletManager: ObservableObject {
             onProgress: onProgress
         )
 
-        onProgress("broadcast", nil, nil)
+        onProgress("broadcast", "Preparing to broadcast...", 0.0)
 
-        // Broadcast through multi-peer network
+        // Broadcast through multi-peer network with progress
         let networkManager = NetworkManager.shared
-        let txId = try await networkManager.broadcastTransaction(rawTx)
+        let txId = try await networkManager.broadcastTransactionWithProgress(rawTx) { phase, detail, progress in
+            // Forward broadcast progress to the UI
+            onProgress("broadcast", detail, progress)
+        }
 
         // Mark the spent note immediately
         guard let txidData = Data(hexString: txId) else {

@@ -880,6 +880,21 @@ final class WalletDatabase {
         }
     }
 
+    /// Clear commitment tree state (set to NULL)
+    func clearTreeState() throws {
+        let sql = "UPDATE sync_state SET tree_state = NULL WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// Get commitment tree state
     func getTreeState() throws -> Data? {
         let sql = "SELECT tree_state FROM sync_state WHERE id = 1;"
