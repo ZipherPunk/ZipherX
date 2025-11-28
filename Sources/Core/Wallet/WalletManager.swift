@@ -144,7 +144,8 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // Fall back to loading bundled CMUs (slow path, only first time)
+        // Load full commitment tree from CMUs (required for witness generation)
+        // This takes ~53 seconds but ensures all spending operations are instant
         print("🌳 Loading bundled commitment tree (first time)...")
         await MainActor.run {
             self.treeLoadStatus = "Building cryptographic foundation..."
@@ -297,7 +298,7 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "database", title: "Open database", status: .pending),
                 SyncTask(id: "headers", title: "Sync block headers", status: .pending),
                 SyncTask(id: "height", title: "Get chain height", status: .pending),
-                SyncTask(id: "scan", title: "Scan blockchain", status: .pending),
+                SyncTask(id: "scan", title: "Scan blocks since checkpoint", status: .pending),
                 SyncTask(id: "balance", title: "Calculate balance", status: .pending)
             ]
         }
@@ -436,7 +437,11 @@ final class WalletManager: ObservableObject {
             Task { @MainActor in
                 self?.syncProgress = progress
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
-                    self?.syncTasks[index].detail = "\(currentHeight) / \(maxHeight)"
+                    // Show context: scanning from checkpoint to current
+                    let blocksToScan = maxHeight > bundledTreeHeight ? maxHeight - bundledTreeHeight : 0
+                    let blocksScanned = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
+                    self?.syncTasks[index].detail = "Block \(currentHeight.formatted()) / \(maxHeight.formatted())"
+                    self?.syncTasks[index].progress = blocksToScan > 0 ? Double(blocksScanned) / Double(blocksToScan) : progress
                 }
 
                 // Update syncStatus with cypherpunk messages based on scan phase
@@ -487,12 +492,16 @@ final class WalletManager: ObservableObject {
         }
 
         // Task 5: Calculate balance
-        await updateTask("balance", status: .inProgress)
+        await updateTask("balance", status: .inProgress, detail: "Loading notes...")
 
         // Debug: List all notes in database to diagnose balance discrepancy
         try? database.debugListAllNotes(accountId: account.id)
 
         var unspentNotes = try database.getUnspentNotes(accountId: account.id)
+        let totalNotes = unspentNotes.count
+
+        // Update with note count
+        await updateTaskWithProgress("balance", detail: "Processing \(totalNotes) notes...", progress: 0.1)
 
         // Get current chain height to calculate confirmations
         let chainHeight = scanner.currentChainHeight
@@ -511,8 +520,21 @@ final class WalletManager: ObservableObject {
             } else {
                 pendingBalance += unspentNotes[i].value
             }
+
+            // Update progress every few notes
+            if totalNotes > 0 && (i + 1) % max(1, totalNotes / 10) == 0 {
+                let progress = Double(i + 1) / Double(totalNotes)
+                await updateTaskWithProgress("balance", detail: "Verifying note \(i + 1)/\(totalNotes)...", progress: 0.1 + progress * 0.8)
+            }
         }
-        await updateTask("balance", status: .completed, detail: "\(unspentNotes.count) notes")
+
+        // Final verification step
+        await updateTaskWithProgress("balance", detail: "Finalizing balance...", progress: 0.95)
+
+        // Brief pause to show the progress (balance calc is very fast)
+        try? await Task.sleep(nanoseconds: 200_000_000) // 0.2 sec
+
+        await updateTask("balance", status: .completed, detail: "\(unspentNotes.count) notes verified")
 
         // Update UI
         DispatchQueue.main.async {
@@ -910,6 +932,15 @@ final class WalletManager: ObservableObject {
                 let completedCount = syncTasks.filter { if case .completed = $0.status { return true }; return false }.count
                 self.syncProgress = Double(completedCount) / Double(syncTasks.count)
             }
+        }
+    }
+
+    /// Update a sync task with progress (keeps inProgress status)
+    @MainActor
+    private func updateTaskWithProgress(_ id: String, detail: String, progress: Double) {
+        if let index = syncTasks.firstIndex(where: { $0.id == id }) {
+            syncTasks[index].detail = detail
+            syncTasks[index].progress = progress
         }
     }
 

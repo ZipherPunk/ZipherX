@@ -198,16 +198,23 @@ final class NetworkManager: ObservableObject {
 
     /// Request addresses from all connected peers
     private func discoverMoreAddresses() async {
+        var discoveredCount = 0
         for peer in peers {
             do {
                 let addresses = try await peer.getAddresses()
                 for addr in addresses {
                     addAddress(addr, source: peer.host)
+                    discoveredCount += 1
                 }
                 peer.recordSuccess()
             } catch {
                 peer.recordFailure()
             }
+        }
+
+        // Persist addresses if we discovered new ones
+        if discoveredCount > 0 {
+            persistAddresses()
         }
     }
 
@@ -219,13 +226,77 @@ final class NetworkManager: ObservableObject {
         }
     }
 
+    private let persistedAddressesKey = "ZipherX.KnownPeerAddresses"
+    private let maxPersistedAddresses = 100
+
     private func loadPersistedAddresses() {
-        // TODO: Load from UserDefaults or database
-        // For now, start fresh each launch
+        guard let data = UserDefaults.standard.data(forKey: persistedAddressesKey),
+              let savedAddresses = try? JSONDecoder().decode([PersistedAddress].self, from: data) else {
+            print("📡 No persisted peer addresses found")
+            return
+        }
+
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        var loadedCount = 0
+        for saved in savedAddresses {
+            let address = PeerAddress(host: saved.host, port: saved.port)
+            let key = "\(saved.host):\(saved.port)"
+
+            // Skip if banned or already known
+            if isBanned(saved.host) || knownAddresses[key] != nil {
+                continue
+            }
+
+            knownAddresses[key] = AddressInfo(
+                address: address,
+                source: "persisted",
+                firstSeen: saved.firstSeen,
+                lastSeen: saved.lastSeen,
+                attempts: saved.attempts,
+                successes: saved.successes
+            )
+
+            // Good addresses go to tried set, others to new
+            if saved.successes > 0 {
+                triedAddresses.insert(key)
+            } else {
+                newAddresses.insert(key)
+            }
+            loadedCount += 1
+        }
+
+        let count = knownAddresses.count
+        DispatchQueue.main.async {
+            self.knownAddressCount = count
+        }
+
+        print("📡 Loaded \(loadedCount) persisted peer addresses")
     }
 
     private func persistAddresses() {
-        // TODO: Save good addresses to UserDefaults or database
+        addressLock.lock()
+        let addresses = knownAddresses.values
+            .filter { $0.successes > 0 || $0.attempts < 3 } // Only save good or untried addresses
+            .sorted { $0.successes > $1.successes } // Best first
+            .prefix(maxPersistedAddresses)
+            .map { info in
+                PersistedAddress(
+                    host: info.address.host,
+                    port: info.address.port,
+                    firstSeen: info.firstSeen,
+                    lastSeen: info.lastSeen,
+                    attempts: info.attempts,
+                    successes: info.successes
+                )
+            }
+        addressLock.unlock()
+
+        if let data = try? JSONEncoder().encode(Array(addresses)) {
+            UserDefaults.standard.set(data, forKey: persistedAddressesKey)
+            print("📡 Persisted \(addresses.count) peer addresses")
+        }
     }
 
     // MARK: - Connection Management
@@ -328,12 +399,16 @@ final class NetworkManager: ObservableObject {
                             for addr in addresses {
                                 self.addAddress(addr, source: peer.host)
                             }
+                            // Persist addresses after discovering from new peer
+                            self.persistAddresses()
                         }
                     }
                 }
             }
         }
 
+        // Persist after successful connections
+        persistAddresses()
         print("📊 Connected to \(connectedCount) peers")
 
         // We can work with fewer peers, just warn
@@ -1001,6 +1076,8 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get multiple blocks' data for P2P scanning
+    /// NOTE: This is not used for normal scanning (uses InsightAPI instead to avoid peer spam)
+    /// Kept for potential future use with trusted peers or local nodes
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
         guard isConnected else {
             throw NetworkError.notConnected
@@ -1218,6 +1295,16 @@ struct AddressInfo {
 
         return false
     }
+}
+
+/// Codable version of AddressInfo for persistence
+struct PersistedAddress: Codable {
+    let host: String
+    let port: UInt16
+    let firstSeen: Date
+    let lastSeen: Date
+    let attempts: Int
+    let successes: Int
 }
 
 struct ShieldedBalance: Equatable {

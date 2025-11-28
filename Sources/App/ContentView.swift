@@ -66,13 +66,61 @@ struct ContentView: View {
                             }
                         }
 
+                        // WAIT for sync to actually complete (isSyncing = false)
+                        // This handles cases where refreshBalance() returns but sync continues
+                        while walletManager.isSyncing {
+                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                        }
+
+                        // ALSO wait for wallet height to match chain height
+                        // This ensures we're truly synced, not just "not syncing"
+                        var syncWaitCount = 0
+                        let maxSyncWait = 300 // 30 seconds max wait for height sync
+                        while networkManager.chainHeight > 0 &&
+                              networkManager.walletHeight < networkManager.chainHeight &&
+                              syncWaitCount < maxSyncWait {
+                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                            syncWaitCount += 1
+                            // Re-fetch stats periodically to update heights
+                            if syncWaitCount % 20 == 0 {
+                                await networkManager.fetchNetworkStats()
+                            }
+                        }
+
+                        // CATCH-UP: Check for blocks that arrived during setup
+                        // Re-fetch current chain height and sync any new blocks
+                        await networkManager.fetchNetworkStats()
+                        let currentChainHeight = networkManager.chainHeight
+                        let currentWalletHeight = networkManager.walletHeight
+
+                        if currentChainHeight > currentWalletHeight {
+                            let missedBlocks = currentChainHeight - currentWalletHeight
+                            print("🔄 Catch-up: \(missedBlocks) new block(s) arrived during setup")
+
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Catching up \(missedBlocks) new block(s)...")
+                            }
+
+                            // Quick sync to catch up missed blocks
+                            do {
+                                try await walletManager.refreshBalance()
+                            } catch {
+                                print("⚠️ Catch-up sync failed: \(error.localizedDescription)")
+                            }
+
+                            // Wait for catch-up to complete
+                            while walletManager.isSyncing {
+                                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                            }
+                        }
+
                         // Clear connecting state after everything is done
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
                         }
 
-                        // Brief pause to show completion before dismissing overlay
-                        try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 sec
+                        // Brief pause to show completion
+                        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
 
                         // Mark initial sync as complete ONLY after everything finishes
                         await MainActor.run {

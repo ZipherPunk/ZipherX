@@ -218,6 +218,25 @@ Before any release:
     - Falls back to download from z.cash if bundle copy fails
     - Enables instant transaction sending without network delay
 
+23. **Peer Address Persistence** - Save discovered peers between launches (November 2025) ✅
+    - `PersistedAddress` struct for peer serialization
+    - Save to UserDefaults with connection stats (attempts, successes)
+    - Load persisted addresses on startup for faster reconnection
+    - Prioritize reliable peers based on historical success rate
+
+24. **P2P Zcash Transaction Parsing** - Full v4 Sapling transaction support (November 2025) ✅
+    - `parseZcashTransaction()` - Parse Zcash v4 overwintered transactions
+    - Correctly handles 140-byte Zcash headers (vs 80-byte Bitcoin)
+    - Extracts SpendDescription (384 bytes): cv + anchor + nullifier + rk + zkproof + spendAuthSig
+    - Extracts OutputDescription (948 bytes): cv + cmu + ephemeralKey + encCiphertext + outCiphertext + zkproof
+    - Validates P2P data with InsightAPI fallback for corrupted blocks
+
+25. **Catch-up Sync on Startup** - Sync blocks arrived during setup (November 2025) ✅
+    - After initial sync completes, re-check chain height
+    - If new blocks arrived during setup → sync them before showing main screen
+    - Ensures balance screen shows accurate data with no missed blocks
+    - Progress message: "Catching up X new block(s)..."
+
 ### In Progress / Needs Testing
 
 1. **Balance UI Update** - Show tree loading progress in main wallet view

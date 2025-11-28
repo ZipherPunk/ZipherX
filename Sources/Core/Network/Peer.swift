@@ -656,13 +656,16 @@ final class Peer {
     /// Zcash/Zclassic uses 140-byte headers (not 80 like Bitcoin!)
     /// Format: version(4) + prevHash(32) + merkleRoot(32) + finalSaplingRoot(32) + time(4) + bits(4) + nonce(32)
     private func parseCompactBlock(_ data: Data) -> CompactBlock? {
-        // Zcash/Zclassic header is 140 bytes, not 80!
+        // Zcash/Zclassic block format:
+        // - Header (140 bytes): version(4) + prevHash(32) + merkleRoot(32) + finalSaplingRoot(32) + time(4) + bits(4) + nonce(32)
+        // - Equihash solution (compactSize + solution)
+        // - Transaction count (compactSize)
+        // - Transactions
         guard data.count >= 140 else { return nil }
 
         var offset = 0
 
         // Version (4 bytes)
-        let version = data.loadUInt32(at: offset)
         offset += 4
 
         // Previous block hash (32 bytes)
@@ -670,7 +673,6 @@ final class Peer {
         offset += 32
 
         // Merkle root (32 bytes)
-        let merkleRoot = Data(data[offset..<offset+32])
         offset += 32
 
         // *** CRITICAL: Final Sapling Root (32 bytes) - THIS IS THE ANCHOR! ***
@@ -682,51 +684,49 @@ final class Peer {
         offset += 4
 
         // Bits (4 bytes)
-        let bits = data.loadUInt32(at: offset)
         offset += 4
 
         // Nonce (32 bytes for Equihash)
-        let nonce = Data(data[offset..<offset+32])
         offset += 32
 
-        // Compute block hash from full 140-byte header
-        // Note: Zcash uses Equihash, so this might not be exactly right for display
-        let headerData = data.prefix(140)
-        let blockHash = headerData.doubleSHA256()
+        // Now at end of 140-byte header
+        // Equihash solution follows: compactSize + solution data
+        let (solutionSize, solutionSizeBytes) = readCompactSize(data, at: offset)
+        offset += solutionSizeBytes
+        offset += Int(solutionSize) // Skip solution data
+
+        // Compute block hash from header + solution
+        let headerAndSolution = data.prefix(offset)
+        let blockHash = headerAndSolution.doubleSHA256()
 
         // Parse transactions
         var transactions: [CompactTx] = []
 
-        // Read tx count (varint)
         guard offset < data.count else {
-            return CompactBlock(
-                blockHeight: 0,
-                blockHash: blockHash,
-                prevHash: prevHash,
-                finalSaplingRoot: finalSaplingRoot,
-                time: time,
-                transactions: []
-            )
+            return CompactBlock(blockHeight: 0, blockHash: blockHash, prevHash: prevHash,
+                                finalSaplingRoot: finalSaplingRoot, time: time, transactions: [])
         }
 
-        let txCount = Int(data[offset])
-        offset += 1
+        // Read transaction count (compactSize)
+        let (txCount, txCountBytes) = readCompactSize(data, at: offset)
+        offset += txCountBytes
 
-        for txIndex in 0..<txCount {
+        for txIndex in 0..<Int(txCount) {
             guard offset < data.count else { break }
 
-            // Parse Sapling bundle from transaction
-            let (spends, outputs, newOffset) = parseSaplingBundle(data, offset: offset)
+            // Parse full Zcash v4 transaction
+            let (txHash, spends, outputs, newOffset) = parseZcashTransaction(data, offset: offset)
             offset = newOffset
 
-            // Create compact transaction
-            let txHash = Data(repeating: 0, count: 32) // Placeholder
-            transactions.append(CompactTx(
-                txIndex: UInt64(txIndex),
-                txHash: txHash,
-                spends: spends,
-                outputs: outputs
-            ))
+            // Only add if we successfully parsed something
+            if !spends.isEmpty || !outputs.isEmpty || txHash != Data(repeating: 0, count: 32) {
+                transactions.append(CompactTx(
+                    txIndex: UInt64(txIndex),
+                    txHash: txHash,
+                    spends: spends,
+                    outputs: outputs
+                ))
+            }
         }
 
         return CompactBlock(
@@ -739,61 +739,229 @@ final class Peer {
         )
     }
 
-    /// Parse Sapling spends and outputs from transaction data
-    private func parseSaplingBundle(_ data: Data, offset: Int) -> ([CompactSpend], [CompactOutput], Int) {
-        var currentOffset = offset
+    /// Read a Bitcoin-style compactSize varint
+    private func readCompactSize(_ data: Data, at offset: Int) -> (UInt64, Int) {
+        guard offset < data.count else { return (0, 0) }
+
+        let first = data[offset]
+        if first < 253 {
+            return (UInt64(first), 1)
+        } else if first == 253 {
+            guard offset + 2 < data.count else { return (0, 1) }
+            return (UInt64(data.loadUInt16(at: offset + 1)), 3)
+        } else if first == 254 {
+            guard offset + 4 < data.count else { return (0, 1) }
+            return (UInt64(data.loadUInt32(at: offset + 1)), 5)
+        } else {
+            guard offset + 8 < data.count else { return (0, 1) }
+            return (data.loadUInt64(at: offset + 1), 9)
+        }
+    }
+
+    /// Parse a Zcash v4 (Sapling) transaction
+    /// Returns: (txHash, spends, outputs, newOffset)
+    private func parseZcashTransaction(_ data: Data, offset: Int) -> (Data, [CompactSpend], [CompactOutput], Int) {
+        var pos = offset
+        let txStart = offset
         var spends: [CompactSpend] = []
         var outputs: [CompactOutput] = []
 
-        guard currentOffset + 1 <= data.count else {
-            return (spends, outputs, currentOffset)
+        guard pos + 4 <= data.count else {
+            return (Data(repeating: 0, count: 32), [], [], pos)
         }
 
-        // Number of Sapling spends
-        let spendCount = Int(data[currentOffset])
-        currentOffset += 1
+        // Header (4 bytes): version and fOverwintered flag
+        let header = data.loadUInt32(at: pos)
+        let version = header & 0x7FFFFFFF
+        let fOverwintered = (header & 0x80000000) != 0
+        pos += 4
+
+        // Check for Sapling transaction (v4 with overwintered)
+        guard fOverwintered && version >= 4 else {
+            // Not a Sapling transaction - skip it entirely
+            // For older versions, we can't reliably parse, so skip
+            return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
+        }
+
+        // nVersionGroupId (4 bytes)
+        guard pos + 4 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
+        pos += 4
+
+        // vin (transparent inputs)
+        let (vinCount, vinBytes) = readCompactSize(data, at: pos)
+        pos += vinBytes
+        for _ in 0..<vinCount {
+            pos = skipTransparentInput(data, offset: pos)
+        }
+
+        // vout (transparent outputs)
+        let (voutCount, voutBytes) = readCompactSize(data, at: pos)
+        pos += voutBytes
+        for _ in 0..<voutCount {
+            pos = skipTransparentOutput(data, offset: pos)
+        }
+
+        // nLockTime (4 bytes)
+        guard pos + 4 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
+        pos += 4
+
+        // nExpiryHeight (4 bytes)
+        guard pos + 4 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
+        pos += 4
+
+        // valueBalance (8 bytes)
+        guard pos + 8 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
+        pos += 8
+
+        // vShieldedSpend
+        let (spendCount, spendBytes) = readCompactSize(data, at: pos)
+        pos += spendBytes
 
         for _ in 0..<spendCount {
-            guard currentOffset + 32 <= data.count else { break }
-            // Nullifier (32 bytes)
-            let nullifier = Data(data[currentOffset..<currentOffset+32])
-            currentOffset += 32
+            // SpendDescription: cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
+            // Total: 384 bytes
+            guard pos + 384 <= data.count else { break }
+
+            // cv (32 bytes) - skip
+            pos += 32
+
+            // anchor (32 bytes) - skip
+            pos += 32
+
+            // nullifier (32 bytes) - EXTRACT THIS
+            let nullifier = Data(data[pos..<pos+32])
+            pos += 32
             spends.append(CompactSpend(nullifier: nullifier))
 
-            // Skip rest of spend description (cv, anchor, rk, proof, sig)
-            currentOffset += 32 + 32 + 32 + 192 + 64 // Approximate
+            // rk (32 bytes) - skip
+            pos += 32
+
+            // zkproof (192 bytes) - skip
+            pos += 192
+
+            // spendAuthSig (64 bytes) - skip
+            pos += 64
         }
 
-        guard currentOffset + 1 <= data.count else {
-            return (spends, outputs, currentOffset)
-        }
-
-        // Number of Sapling outputs
-        let outputCount = Int(data[currentOffset])
-        currentOffset += 1
+        // vShieldedOutput
+        let (outputCount, outputBytes) = readCompactSize(data, at: pos)
+        pos += outputBytes
 
         for _ in 0..<outputCount {
-            guard currentOffset + 32 + 32 + 580 <= data.count else { break }
+            // OutputDescription: cv(32) + cmu(32) + ephemeralKey(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
+            // Total: 948 bytes
+            guard pos + 948 <= data.count else { break }
 
-            // cmu - note commitment (32 bytes)
-            let cmu = Data(data[currentOffset..<currentOffset+32])
-            currentOffset += 32
+            // cv (32 bytes) - skip
+            pos += 32
 
-            // epk - ephemeral key (32 bytes)
-            let epk = Data(data[currentOffset..<currentOffset+32])
-            currentOffset += 32
+            // cmu (32 bytes) - EXTRACT THIS
+            let cmu = Data(data[pos..<pos+32])
+            pos += 32
 
-            // enc_ciphertext (580 bytes)
-            let ciphertext = Data(data[currentOffset..<currentOffset+580])
-            currentOffset += 580
+            // ephemeralKey (32 bytes) - EXTRACT THIS
+            let epk = Data(data[pos..<pos+32])
+            pos += 32
+
+            // encCiphertext (580 bytes) - EXTRACT THIS
+            let ciphertext = Data(data[pos..<pos+580])
+            pos += 580
 
             outputs.append(CompactOutput(cmu: cmu, epk: epk, ciphertext: ciphertext))
 
-            // Skip rest of output (out_ciphertext, proof)
-            currentOffset += 80 + 192 // Approximate
+            // outCiphertext (80 bytes) - skip
+            pos += 80
+
+            // zkproof (192 bytes) - skip
+            pos += 192
         }
 
-        return (spends, outputs, currentOffset)
+        // JoinSplits (usually empty for Sapling era)
+        let (jsCount, jsBytes) = readCompactSize(data, at: pos)
+        pos += jsBytes
+        if jsCount > 0 {
+            // Skip JoinSplit data (each is 1698 bytes + 64 byte sig if any)
+            pos += Int(jsCount) * 1698
+            if jsCount > 0 {
+                pos += 64 // joinsplitSig
+            }
+        }
+
+        // Binding signature (64 bytes) - only if spends or outputs exist
+        if spendCount > 0 || outputCount > 0 {
+            pos += 64
+        }
+
+        // Compute txHash (double SHA256 of the raw transaction)
+        let txEnd = pos
+        guard txEnd > txStart && txEnd <= data.count else {
+            return (Data(repeating: 0, count: 32), spends, outputs, pos)
+        }
+        let txData = data[txStart..<txEnd]
+        let txHash = Data(txData).doubleSHA256()
+
+        return (txHash, spends, outputs, pos)
+    }
+
+    /// Skip a legacy (pre-Sapling) transaction
+    private func skipLegacyTransaction(_ data: Data, offset: Int) -> Int {
+        var pos = offset
+
+        // Version (4 bytes)
+        pos += 4
+
+        // For non-overwintered, standard Bitcoin-like format
+        // vin
+        let (vinCount, vinBytes) = readCompactSize(data, at: pos)
+        pos += vinBytes
+        for _ in 0..<vinCount {
+            pos = skipTransparentInput(data, offset: pos)
+        }
+
+        // vout
+        let (voutCount, voutBytes) = readCompactSize(data, at: pos)
+        pos += voutBytes
+        for _ in 0..<voutCount {
+            pos = skipTransparentOutput(data, offset: pos)
+        }
+
+        // nLockTime (4 bytes)
+        pos += 4
+
+        return pos
+    }
+
+    /// Skip a transparent input
+    private func skipTransparentInput(_ data: Data, offset: Int) -> Int {
+        var pos = offset
+
+        // prevout: txid (32) + vout index (4)
+        pos += 36
+
+        // scriptSig length + scriptSig
+        let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+        pos += scriptBytes
+        pos += Int(scriptLen)
+
+        // sequence (4 bytes)
+        pos += 4
+
+        return pos
+    }
+
+    /// Skip a transparent output
+    private func skipTransparentOutput(_ data: Data, offset: Int) -> Int {
+        var pos = offset
+
+        // value (8 bytes)
+        pos += 8
+
+        // scriptPubKey length + scriptPubKey
+        let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+        pos += scriptBytes
+        pos += Int(scriptLen)
+
+        return pos
     }
 
     // MARK: - Helpers

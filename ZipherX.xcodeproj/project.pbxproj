@@ -43,11 +43,11 @@
 		D48A42CCAB7B7BF4DB4E9AA6 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6F84FADA54C4AD5876556D4 /* HeaderSyncManager.swift */; };
 		D4974928AC9E28FB2A647F9F /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEB4ED1807CF70EAAE11D5C /* BlockHeader.swift */; };
 		D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235376F572F89B6D83EDA88C /* WalletTests.swift */; };
-		DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119FB9D2179DC1425CABD79E /* NotificationManager.swift */; };
 		DBGL001A2B3C4D5E6F7G8H9I /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */; };
+		DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119FB9D2179DC1425CABD79E /* NotificationManager.swift */; };
 		EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 716A65BFF58BBC7334E13C13 /* sapling_tree.bin */; };
-		SAPSP001A2B3C4D5E6F7G8H9I /* sapling-spend.params in Resources */ = {isa = PBXBuildFile; fileRef = SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */; };
 		SAPOU001A2B3C4D5E6F7G8H9I /* sapling-output.params in Resources */ = {isa = PBXBuildFile; fileRef = SAPOU002A2B3C4D5E6F7G8H9I /* sapling-output.params */; };
+		SAPSP001A2B3C4D5E6F7G8H9I /* sapling-spend.params in Resources */ = {isa = PBXBuildFile; fileRef = SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,7 +65,6 @@
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
 		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		119FB9D2179DC1425CABD79E /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
-		DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeyStorage.swift; sourceTree = "<group>"; };
 		18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
 		233F470A9D31A763B0F2EA5D /* HeaderStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HeaderStore.swift; path = Sources/Core/Storage/HeaderStore.swift; sourceTree = SOURCE_ROOT; };
@@ -94,14 +93,15 @@
 		CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
 		D8734EC25838585488804B01 /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
 		DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ZipherXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		E6F84FADA54C4AD5876556D4 /* HeaderSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HeaderSyncManager.swift; path = Sources/Core/Network/HeaderSyncManager.swift; sourceTree = SOURCE_ROOT; };
 		EAEB4ED1807CF70EAAE11D5C /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = BlockHeader.swift; path = Sources/Core/Crypto/BlockHeader.swift; sourceTree = SOURCE_ROOT; };
 		EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionBuilder.swift; sourceTree = "<group>"; };
 		ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletSetupView.swift; sourceTree = "<group>"; };
 		ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Theme.swift; sourceTree = "<group>"; };
 		ED775F7A258C12CD4FDBF173 /* ZipherX-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "ZipherX-Bridging-Header.h"; sourceTree = "<group>"; };
-		SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */ = {isa = PBXFileReference; lastKnownFileType = file; name = "sapling-spend.params"; path = "Resources/sapling-spend.params"; sourceTree = SOURCE_ROOT; };
 		SAPOU002A2B3C4D5E6F7G8H9I /* sapling-output.params */ = {isa = PBXFileReference; lastKnownFileType = file; name = "sapling-output.params"; path = "Resources/sapling-output.params"; sourceTree = SOURCE_ROOT; };
+		SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */ = {isa = PBXFileReference; lastKnownFileType = file; name = "sapling-spend.params"; path = "Resources/sapling-spend.params"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
