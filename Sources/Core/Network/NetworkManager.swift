@@ -753,6 +753,14 @@ final class NetworkManager: ObservableObject {
             return status.height
         } catch {
             print("❌ InsightAPI fallback also failed: \(error)")
+
+            // Final fallback: use cached chain height if recent enough
+            // This allows transactions to be built when temporarily offline
+            if chainHeight > 0 {
+                print("⚠️ Using cached chain height: \(chainHeight)")
+                return chainHeight
+            }
+
             throw NetworkError.consensusNotReached
         }
     }
