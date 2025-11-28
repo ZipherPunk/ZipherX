@@ -228,19 +228,24 @@ final class FilterScanner {
 
         // CRITICAL: Wait for WalletManager to finish loading tree before proceeding
         // This prevents race condition where both load concurrently and corrupt the global tree
+        // Tree loading takes ~53 seconds, so we wait up to 120 seconds
         if !needsFreshBundledTree {
             let walletManager = WalletManager.shared
             var waitAttempts = 0
-            let maxWaitAttempts = 300 // 30 seconds max wait
+            let maxWaitAttempts = 1200 // 120 seconds max wait (tree takes ~53s)
             while !walletManager.isTreeLoaded && waitAttempts < maxWaitAttempts {
                 if waitAttempts == 0 {
                     print("⏳ Waiting for WalletManager to finish loading tree...")
+                } else if waitAttempts % 100 == 0 {
+                    print("⏳ Still waiting for tree... (\(waitAttempts / 10)s)")
                 }
                 try await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 waitAttempts += 1
             }
             if waitAttempts > 0 && walletManager.isTreeLoaded {
-                print("✅ WalletManager tree loading complete, proceeding with scan")
+                print("✅ WalletManager tree loading complete after \(waitAttempts / 10)s, proceeding with scan")
+            } else if waitAttempts >= maxWaitAttempts {
+                print("⚠️ Timeout waiting for WalletManager tree load - will check tree state")
             }
         }
 
