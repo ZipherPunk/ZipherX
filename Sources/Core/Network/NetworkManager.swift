@@ -926,19 +926,31 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
-        // Get the block via P2P
-        let blocks = try await peer.getFullBlocks(from: height, count: 1)
-        guard let block = blocks.first else {
+        // Get block hash from HeaderStore (already synced)
+        guard let header = try? HeaderStore.shared.getHeader(at: height) else {
+            print("⚠️ P2P: No header found at height \(height)")
             throw NetworkError.consensusNotReached
         }
 
+        // Get the block by hash via P2P
+        let block = try await peer.getBlockByHash(hash: header.blockHash)
+        // Set correct height on the returned block (getBlockByHash doesn't know the height)
+        let blockWithHeight = CompactBlock(
+            blockHeight: height,
+            blockHash: block.blockHash,
+            prevHash: block.prevHash,
+            finalSaplingRoot: block.finalSaplingRoot,
+            time: block.time,
+            transactions: block.transactions
+        )
+
         // Convert block hash to hex string
-        let blockHashHex = block.blockHash.map { String(format: "%02x", $0) }.joined()
+        let blockHashHex = blockWithHeight.blockHash.map { String(format: "%02x", $0) }.joined()
 
         // Parse each transaction in the block
         var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
 
-        for (index, tx) in block.transactions.enumerated() {
+        for (_, tx) in blockWithHeight.transactions.enumerated() {
             // Convert CompactOutput to ShieldedOutput format
             var shieldedOutputs: [ShieldedOutput] = []
             for output in tx.outputs {
@@ -998,12 +1010,23 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
-        let blocks = try await peer.getFullBlocks(from: height, count: count)
-
         var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
-        for (index, block) in blocks.enumerated() {
-            let blockHeight = height + UInt64(index)
+        // Fetch blocks one by one using HeaderStore hashes
+        for i in 0..<count {
+            let blockHeight = height + UInt64(i)
+
+            // Get block hash from HeaderStore
+            guard let header = try? HeaderStore.shared.getHeader(at: blockHeight) else {
+                print("⚠️ P2P batch: No header found at height \(blockHeight)")
+                continue
+            }
+
+            // Get block by hash
+            guard let block = try? await peer.getBlockByHash(hash: header.blockHash) else {
+                print("⚠️ P2P batch: Failed to get block at height \(blockHeight)")
+                continue
+            }
             let blockHashHex = block.blockHash.map { String(format: "%02x", $0) }.joined()
 
             var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
