@@ -40,50 +40,19 @@ final class TransactionBuilder {
         guard !proverInitialized else { return }
 
         let params = SaplingParams.shared
-
-        // Check if params are ready with detailed logging
-        let spendPath = params.spendParamsPath.path
-        let outputPath = params.outputParamsPath.path
-
-        debugLog(.params, "📋 Checking Sapling params...")
-        debugLog(.params, "   Spend path: \(spendPath)")
-        debugLog(.params, "   Output path: \(outputPath)")
-
-        let spendExists = FileManager.default.fileExists(atPath: spendPath)
-        let outputExists = FileManager.default.fileExists(atPath: outputPath)
-
-        debugLog(.params, "   Spend exists: \(spendExists)")
-        debugLog(.params, "   Output exists: \(outputExists)")
-
-        if spendExists, let spendAttrs = try? FileManager.default.attributesOfItem(atPath: spendPath) {
-            let size = (spendAttrs[.size] as? Int) ?? 0
-            debugLog(.params, "   Spend size: \(size) bytes (expected: 47958396)")
-            if size != 47_958_396 {
-                debugLog(.error, "❌ Spend params file has wrong size!")
-            }
-        }
-
-        if outputExists, let outputAttrs = try? FileManager.default.attributesOfItem(atPath: outputPath) {
-            let size = (outputAttrs[.size] as? Int) ?? 0
-            debugLog(.params, "   Output size: \(size) bytes (expected: 3592860)")
-            if size != 3_592_860 {
-                debugLog(.error, "❌ Output params file has wrong size!")
-            }
-        }
-
         guard params.areParamsReady else {
-            debugLog(.error, "❌ Sapling params NOT ready - files missing!")
             throw TransactionError.proofGenerationFailed
         }
 
-        debugLog(.params, "📦 Initializing prover with Sapling parameters...")
+        let spendPath = params.spendParamsPath.path
+        let outputPath = params.outputParamsPath.path
+
         guard ZipherXFFI.initProver(spendParamsPath: spendPath, outputParamsPath: outputPath) else {
-            debugLog(.error, "❌ ZipherXFFI.initProver returned false - check Rust logs")
             throw TransactionError.proofGenerationFailed
         }
 
         proverInitialized = true
-        debugLog(.params, "✅ Prover initialized with Sapling parameters")
+        print("✅ Prover initialized with Sapling parameters")
     }
 
     // MARK: - Transaction Building
@@ -186,20 +155,9 @@ final class TransactionBuilder {
         let notes = try await getSpendableNotes(for: from, spendingKey: spendingKey)
 
         // Select notes to spend
-        let (selectedNotes, totalSelected) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
+        let (selectedNotes, _) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
 
         guard let note = selectedNotes.first else {
-            throw TransactionError.insufficientFunds
-        }
-
-        // LIMITATION: Current FFI only supports single-spend transactions
-        // Check if we need multiple notes but can only use one
-        if selectedNotes.count > 1 {
-            let largestNote = notes.max(by: { $0.value < $1.value })!
-            let maxSpendable = largestNote.value > DEFAULT_FEE ? largestNote.value - DEFAULT_FEE : 0
-            print("⚠️ Multi-spend not yet supported. Largest single note: \(largestNote.value) zatoshis")
-            print("⚠️ Maximum spendable in one transaction: \(maxSpendable) zatoshis")
-            print("❌ Insufficient funds: have \(note.value), need \(amount + DEFAULT_FEE)")
             throw TransactionError.insufficientFunds
         }
 
@@ -226,35 +184,17 @@ final class TransactionBuilder {
         // This is the anchor that zcashd knows about for this note
         var anchorFromHeader: Data
 
-        // Priority 1: Local header store (fastest)
         if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
             anchorFromHeader = noteHeader.hashFinalSaplingRoot
             let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
-            print("📝 Using anchor from local header store at height \(noteHeight)")
+            print("📝 Using anchor from block header at height \(noteHeight)")
             print("📝 Anchor: \(anchorHex)...")
+            print("✅ This anchor matches zcashd's tree state at the note's block")
         } else {
-            // Priority 2: P2P peers (decentralized!)
-            print("⚠️ Header not in local store, fetching from P2P peers...")
-            do {
-                let anchor = try await fetchAnchorFromPeers(height: noteHeight)
-                anchorFromHeader = anchor
-                let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
-                print("✅ Got anchor from P2P peers: \(anchorHex)...")
-            } catch {
-                // Priority 3: Insight API as last resort
-                print("⚠️ P2P failed, trying Insight API...")
-                do {
-                    let anchor = try await fetchAnchorFromInsight(height: noteHeight)
-                    anchorFromHeader = anchor
-                    let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
-                    print("✅ Got anchor from Insight API: \(anchorHex)...")
-                } catch {
-                    print("⚠️ Insight API also failed: \(error)")
-                    print("📝 Will compute anchor by building tree to note height...")
-                    // anchorFromHeader will be set after rebuilding witness
-                    anchorFromHeader = Data(count: 32) // placeholder
-                }
-            }
+            print("⚠️ Block header not available at height \(noteHeight)")
+            print("📝 Will compute anchor by building tree to note height...")
+            // anchorFromHeader will be set after rebuilding witness
+            anchorFromHeader = Data(count: 32) // placeholder
         }
 
         // CRITICAL: Rebuild witness to match anchor
@@ -689,79 +629,55 @@ final class TransactionBuilder {
 
         // 4. Fetch additional CMUs from blocks between bundledTreeHeight+1 and noteHeight
         let startHeight = bundledTreeHeight + 1
-        let blockCount = Int(noteHeight - startHeight + 1)
-        print("📡 Fetching CMUs from \(blockCount) blocks (\(startHeight) to \(noteHeight))...")
+        print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight)...")
 
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
 
-        // Fetch all blocks in PARALLEL for much faster performance
-        var blockCMUsByHeight: [UInt64: [Data]] = [:]
-
-        print("⚡ Parallel fetching CMUs from Insight API...")
-        await withTaskGroup(of: (UInt64, [Data])?.self) { group in
-            for height in startHeight...noteHeight {
-                group.addTask {
-                    do {
-                        let cmus = try await self.fetchCMUsViaInsightWithTimeout(height: height)
-                        return (height, cmus)
-                    } catch {
-                        print("⚠️ Failed to fetch block \(height): \(error.localizedDescription)")
-                        return nil
-                    }
-                }
-            }
-
-            for await result in group {
-                if let (height, cmus) = result {
-                    blockCMUsByHeight[height] = cmus
-                }
-            }
-        }
-
-        print("✅ Fetched CMUs from \(blockCMUsByHeight.count)/\(blockCount) blocks")
-
-        // Process blocks in order (required for tree building)
         for height in startHeight...noteHeight {
-            guard let blockCMUs = blockCMUsByHeight[height] else {
-                print("⚠️ Missing CMUs for block \(height)")
-                continue
-            }
+            // Fetch block data via NetworkManager
+            do {
+                let blockCMUs = try await fetchCMUsViaInsight(height: height)
+                for blockCMU in blockCMUs {
+                    // Check if this is our note's CMU
+                    if blockCMU == cmu {
+                        // Found our note! Append it and capture witness
+                        let position = ZipherXFFI.treeAppend(cmu: blockCMU)
+                        if position == UInt64.max {
+                            print("❌ Failed to append note CMU")
+                            return nil
+                        }
 
-            for blockCMU in blockCMUs {
-                // Check if this is our note's CMU
-                if blockCMU == cmu {
-                    // Found our note! Append it and capture witness
-                    let position = ZipherXFFI.treeAppend(cmu: blockCMU)
-                    if position == UInt64.max {
-                        print("❌ Failed to append note CMU")
-                        return nil
+                        // Create witness immediately after appending our note
+                        let witnessIndex = ZipherXFFI.treeWitnessCurrent()
+                        if witnessIndex == UInt64.max {
+                            print("❌ Failed to create witness at note position")
+                            return nil
+                        }
+
+                        // Continue adding remaining CMUs to update the witness
+                        notePosition = position
+                        print("✅ Found note CMU at position \(position) in block \(height)")
+
+                        // Get witness data after finishing this block's CMUs
+                        // (we need to continue to end of block)
+                        additionalCMUs.append(blockCMU)
+                    } else if notePosition != nil {
+                        // After finding note, continue appending to update witness
+                        _ = ZipherXFFI.treeAppend(cmu: blockCMU)
+                        additionalCMUs.append(blockCMU)
+                    } else {
+                        // Before finding note, just append
+                        let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
+                        if pos == UInt64.max {
+                            print("⚠️ Failed to append CMU at height \(height)")
+                        }
+                        additionalCMUs.append(blockCMU)
                     }
-
-                    // Create witness immediately after appending our note
-                    let witnessIndex = ZipherXFFI.treeWitnessCurrent()
-                    if witnessIndex == UInt64.max {
-                        print("❌ Failed to create witness at note position")
-                        return nil
-                    }
-
-                    // Continue adding remaining CMUs to update the witness
-                    notePosition = position
-                    print("✅ Found note CMU at position \(position) in block \(height)")
-
-                    additionalCMUs.append(blockCMU)
-                } else if notePosition != nil {
-                    // After finding note, continue appending to update witness
-                    _ = ZipherXFFI.treeAppend(cmu: blockCMU)
-                    additionalCMUs.append(blockCMU)
-                } else {
-                    // Before finding note, just append
-                    let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
-                    if pos == UInt64.max {
-                        print("⚠️ Failed to append CMU at height \(height)")
-                    }
-                    additionalCMUs.append(blockCMU)
                 }
+            } catch {
+                print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
+                // Continue anyway - maybe note is in earlier block
             }
         }
 
@@ -800,156 +716,40 @@ final class TransactionBuilder {
         return (witness: witness, anchor: anchor)
     }
 
-    /// Fetch CMUs from blocks using P2P peers (preferred - decentralized!)
-    /// Falls back to Insight API if P2P fails
-    private func fetchCMUsViaInsightWithTimeout(height: UInt64) async throws -> [Data] {
-        // FIRST: Try P2P peers (faster and decentralized!)
-        let networkManager = NetworkManager.shared
-        if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
+    /// Fetch CMUs from a specific block height via Insight API
+    private func fetchCMUsViaInsight(height: UInt64) async throws -> [Data] {
+        let insightAPI = InsightAPI.shared
+
+        // Get block hash
+        let blockHash = try await insightAPI.getBlockHash(height: height)
+
+        // Get block to get transaction IDs
+        let block = try await insightAPI.getBlock(hash: blockHash)
+
+        // Extract CMUs from shielded outputs of each transaction
+        var cmus: [Data] = []
+
+        for txid in block.tx {
             do {
-                // Get block via P2P
-                let blocks = try await peer.getFullBlocks(from: height, count: 1)
-                if let block = blocks.first {
-                    var cmus: [Data] = []
-                    for tx in block.transactions {
-                        for output in tx.outputs {
-                            // CMU from P2P is already in wire format (little-endian)
-                            cmus.append(output.cmu)
+                let tx = try await insightAPI.getTransaction(txid: txid)
+                if let outputs = tx.vShieldedOutput {
+                    for output in outputs {
+                        if let cmuData = Data(hex: output.cmu) {
+                            // CMU from Insight API is in big-endian (display format)
+                            // Need to reverse to little-endian (wire format) for tree
+                            let cmuLE = Data(cmuData.reversed())
+                            cmus.append(cmuLE)
                         }
-                    }
-                    if !cmus.isEmpty {
-                        return cmus
                     }
                 }
             } catch {
-                print("⚠️ P2P block fetch failed: \(error.localizedDescription)")
-            }
-        }
-
-        // FALLBACK: Use Insight API with longer timeout
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30 // 30 seconds per request
-        config.timeoutIntervalForResource = 60 // 60 seconds total
-        let session = URLSession(configuration: config)
-
-        let baseURL = "https://explorer.zcl.zelcore.io"
-
-        // Get block hash
-        let hashURL = URL(string: "\(baseURL)/api/block-index/\(height)")!
-        let (hashData, _) = try await session.data(from: hashURL)
-        let hashResponse = try JSONDecoder().decode(BlockIndexResponse.self, from: hashData)
-        let blockHash = hashResponse.blockHash
-
-        // Get block to get transaction IDs
-        let blockURL = URL(string: "\(baseURL)/api/block/\(blockHash)")!
-        let (blockData, _) = try await session.data(from: blockURL)
-        let block = try JSONDecoder().decode(InsightBlock.self, from: blockData)
-
-        // Extract CMUs from shielded outputs - fetch transactions in PARALLEL
-        var cmus: [Data] = []
-
-        await withTaskGroup(of: [Data].self) { group in
-            for txid in block.tx {
-                group.addTask {
-                    do {
-                        let txURL = URL(string: "\(baseURL)/api/tx/\(txid)")!
-                        let (txData, _) = try await session.data(from: txURL)
-                        let tx = try JSONDecoder().decode(InsightTransaction.self, from: txData)
-
-                        var txCMUs: [Data] = []
-                        if let outputs = tx.vShieldedOutput {
-                            for output in outputs {
-                                if let cmuData = Data(hex: output.cmu) {
-                                    // CMU from Insight API is in big-endian (display format)
-                                    // Need to reverse to little-endian (wire format) for tree
-                                    let cmuLE = Data(cmuData.reversed())
-                                    txCMUs.append(cmuLE)
-                                }
-                            }
-                        }
-                        return txCMUs
-                    } catch {
-                        return []
-                    }
-                }
-            }
-
-            for await txCMUs in group {
-                cmus.append(contentsOf: txCMUs)
+                // Skip transactions that fail to fetch
+                continue
             }
         }
 
         return cmus
     }
-
-    /// Simple wrapper for backward compatibility
-    private func fetchCMUsViaInsight(height: UInt64) async throws -> [Data] {
-        return try await fetchCMUsViaInsightWithTimeout(height: height)
-    }
-
-    // MARK: - Anchor Fetching
-
-    /// Fetch anchor (finalSaplingRoot) from P2P peers via full block
-    /// This is the preferred decentralized method
-    private func fetchAnchorFromPeers(height: UInt64) async throws -> Data {
-        let networkManager = NetworkManager.shared
-
-        guard networkManager.isConnected, let peer = networkManager.getConnectedPeer() else {
-            throw TransactionError.proofGenerationFailed
-        }
-
-        // Get full block via P2P - CompactBlock now includes finalSaplingRoot from header
-        let blocks = try await peer.getFullBlocks(from: height, count: 1)
-
-        guard let block = blocks.first else {
-            throw TransactionError.proofGenerationFailed
-        }
-
-        // CompactBlock now has finalSaplingRoot extracted from the 140-byte Zcash header
-        let anchor = block.finalSaplingRoot
-
-        guard anchor.count == 32 else {
-            print("⚠️ Invalid anchor size from P2P: \(anchor.count) bytes")
-            throw TransactionError.proofGenerationFailed
-        }
-
-        return anchor
-    }
-
-    /// Fetch anchor from Insight API (fallback for when P2P doesn't work)
-    private func fetchAnchorFromInsight(height: UInt64) async throws -> Data {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        let session = URLSession(configuration: config)
-
-        let baseURL = "https://explorer.zcl.zelcore.io"
-
-        // Get block hash first
-        let hashURL = URL(string: "\(baseURL)/api/block-index/\(height)")!
-        let (hashData, _) = try await session.data(from: hashURL)
-        let hashResponse = try JSONDecoder().decode(BlockIndexResponse.self, from: hashData)
-
-        // Get block header which should contain finalSaplingRoot
-        let blockURL = URL(string: "\(baseURL)/api/block/\(hashResponse.blockHash)")!
-        let (blockData, _) = try await session.data(from: blockURL)
-
-        // Parse the block response to get finalSaplingRoot
-        if let json = try JSONSerialization.jsonObject(with: blockData) as? [String: Any],
-           let finalSaplingRoot = json["finalsaplingroot"] as? String,
-           let anchorData = Data(hex: finalSaplingRoot) {
-            // Anchor from API is in display format (big-endian)
-            // Need to convert to wire format for use in proofs? Let's keep it as-is for now
-            return anchorData
-        }
-
-        throw TransactionError.proofGenerationFailed
-    }
-}
-
-// MARK: - Private Response Types (for Insight API)
-
-private struct BlockIndexResponse: Codable {
-    let blockHash: String
 }
 
 // MARK: - Supporting Types

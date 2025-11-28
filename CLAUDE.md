@@ -801,6 +801,66 @@ private var currentSyncTasks: [SyncTask] {
 | Bundled CMU Count | 1,041,688 | Verified via `verify_tree` tool |
 | Default Fee | 10,000 zatoshis | `TransactionBuilder.swift` |
 
+### 14. Transaction Builder Optimization Attempt - REVERTED (November 28, 2025)
+
+**Problem**: Transaction building was slow because it reloaded the full bundled tree (1M+ CMUs) for notes beyond bundled height. Also, blocks could arrive during the rebuild causing race conditions.
+
+**Attempted Solutions** (all failed):
+
+1. **Use in-memory tree instead of rebuilding**:
+   - Modified `TransactionBuilder` to check if `WalletManager.shared.isTreeLoaded`
+   - Use `WalletManager.shared.getTreeSerializedData()` to get current tree state
+   - This avoided the 54-second tree load time
+
+2. **P2P batch fetch optimization**:
+   - Limited batch size to 50 blocks
+   - Added 30-second timeout to `getFullBlocks()`
+   - Added `withTimeout()` helper in `Peer.swift`
+   - Added `p2pFetchFailed` flag to prevent infinite retry loops
+
+3. **InsightAPI rate limiting**:
+   - Added parallel batch fetching with 30-second timeout
+   - Added fallback from P2P to InsightAPI
+
+4. **Progress bar fix**:
+   - Fixed progress bar showing 100% during initial sync
+   - Added `isInitialSync` to cap condition
+
+**Why All Optimizations Failed**:
+
+The root cause was **witness/anchor mismatch**. The transaction was rejected with error code 18 (`REJECT_INVALID`):
+
+```
+Log showed:
+- Header store anchor: ae6f5305aad161f31204e43701fdd35e...
+- Computed anchor from rebuilt tree: 0b0b15e40e80b035...
+```
+
+The witness was built from one tree state, but the anchor was from a different state. The spend proof is invalid if witness root ≠ anchor.
+
+**Working Solution** (what `987faaa` does correctly):
+
+The working version from commit `987faaa` uses the **anchor from header store** combined with a **rebuilt witness**. This works because:
+
+1. The header store contains `finalSaplingRoot` at each block height
+2. The witness is rebuilt by loading bundled CMUs + fetching additional CMUs
+3. The witness path is computed for the note's position in the tree
+4. The anchor from header store at the note's height matches zcashd's expected tree state
+5. Even if our rebuilt tree has slight timing differences, the anchor from header store is what zcashd expects
+
+**Files Restored**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - restored to commit `987faaa` (2025-11-27 15:18:09)
+
+**Key Insight**:
+DO NOT try to optimize transaction building by using the current synced tree state. The anchor MUST come from the header store (which contains the blockchain's canonical `finalSaplingRoot` values), not from a tree we compute ourselves. The witness can be rebuilt, but the anchor must match what the network expects.
+
+**Future Optimization Ideas** (if needed):
+- Pre-cache witnesses for known notes during sync
+- Store witness alongside note when appending to tree
+- Background tree update worker that doesn't block send
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
