@@ -112,6 +112,7 @@ final class WalletDatabase {
                 witness BLOB,
                 witness_height INTEGER,
                 cmu BLOB,
+                anchor BLOB,
                 FOREIGN KEY (account_id) REFERENCES accounts(id)
             );
             """,
@@ -249,6 +250,32 @@ final class WalletDatabase {
         if sqlite3_exec(db, createIndexSql, nil, nil, nil) != SQLITE_OK {
             // Index might already exist or CMU column doesn't exist yet, not critical
             print("📂 Note: CMU unique index already exists or could not be created")
+        }
+
+        // Migration 3: Add anchor column to notes table if it doesn't exist
+        // Re-check columns for anchor
+        var pragmaStmt2: OpaquePointer?
+        guard sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt2, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(pragmaStmt2) }
+
+        var hasAnchorColumn = false
+        while sqlite3_step(pragmaStmt2) == SQLITE_ROW {
+            if let columnName = sqlite3_column_text(pragmaStmt2, 1) {
+                if String(cString: columnName) == "anchor" {
+                    hasAnchorColumn = true
+                    break
+                }
+            }
+        }
+
+        if !hasAnchorColumn {
+            let alterSql = "ALTER TABLE notes ADD COLUMN anchor BLOB;"
+            guard sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.schemaCreationFailed("Migration failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            print("📂 Migration: Added anchor column to notes table")
         }
     }
 
@@ -502,7 +529,7 @@ final class WalletDatabase {
     /// Get all unspent notes (regardless of witness status) - for diagnostics
     func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
             FROM notes
             WHERE account_id = ? AND is_spent = 0
             ORDER BY received_height ASC;
@@ -545,6 +572,14 @@ final class WalletDatabase {
                 cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
             }
 
+            // Anchor might be NULL
+            var anchorData: Data? = nil
+            if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
+                let anchorPtr = sqlite3_column_blob(stmt, 10)
+                let anchorLen = sqlite3_column_bytes(stmt, 10)
+                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+            }
+
             let note = WalletNote(
                 id: id,
                 diversifier: Data(bytes: divPtr!, count: Int(divLen)),
@@ -553,7 +588,8 @@ final class WalletDatabase {
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
                 witness: witnessData,
-                cmu: cmuData
+                cmu: cmuData,
+                anchor: anchorData
             )
 
             notes.append(note)
@@ -565,7 +601,7 @@ final class WalletDatabase {
     /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
             FROM notes
             WHERE account_id = ? AND is_spent = 0 AND witness IS NOT NULL
             ORDER BY received_height ASC;
@@ -602,6 +638,14 @@ final class WalletDatabase {
                 cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
             }
 
+            // Anchor might be NULL
+            var anchorData: Data? = nil
+            if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
+                let anchorPtr = sqlite3_column_blob(stmt, 10)
+                let anchorLen = sqlite3_column_bytes(stmt, 10)
+                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+            }
+
             let note = WalletNote(
                 id: id,
                 diversifier: Data(bytes: divPtr!, count: Int(divLen)),
@@ -610,7 +654,8 @@ final class WalletDatabase {
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
                 witness: Data(bytes: witnessPtr!, count: Int(witnessLen)),
-                cmu: cmuData
+                cmu: cmuData,
+                anchor: anchorData
             )
 
             notes.append(note)
@@ -914,6 +959,26 @@ final class WalletDatabase {
         }
     }
 
+    /// Update anchor for a note (the tree root when witness was last updated)
+    func updateNoteAnchor(noteId: Int64, anchor: Data) throws {
+        let sql = "UPDATE notes SET anchor = ? WHERE id = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        anchor.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(anchor.count), nil)
+        }
+        sqlite3_bind_int64(stmt, 2, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// Reset sync state for full rescan
     /// Deletes notes, nullifiers, tree state, and resets scan height
     func resetSyncState() throws {
@@ -1044,6 +1109,17 @@ final class WalletDatabase {
 
     /// Get transaction history ordered by height (newest first)
     func getTransactionHistory(limit: Int = 100, offset: Int = 0) throws -> [TransactionHistoryItem] {
+        // First check total count
+        let countSql = "SELECT COUNT(*) FROM transaction_history;"
+        var countStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK {
+            if sqlite3_step(countStmt) == SQLITE_ROW {
+                let count = sqlite3_column_int(countStmt, 0)
+                print("📜 DB: transaction_history table has \(count) rows")
+            }
+            sqlite3_finalize(countStmt)
+        }
+
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo
             FROM transaction_history
@@ -1063,7 +1139,10 @@ final class WalletDatabase {
         var items: [TransactionHistoryItem] = []
 
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let txidPtr = sqlite3_column_blob(stmt, 0)
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else {
+                print("📜 DB: Skipping row with NULL txid")
+                continue
+            }
             let txidLen = sqlite3_column_bytes(stmt, 0)
             let height = UInt64(sqlite3_column_int64(stmt, 1))
             let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
@@ -1074,7 +1153,7 @@ final class WalletDatabase {
             let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
 
             let item = TransactionHistoryItem(
-                txid: Data(bytes: txidPtr!, count: Int(txidLen)),
+                txid: Data(bytes: txidPtr, count: Int(txidLen)),
                 height: height,
                 blockTime: blockTime,
                 type: TransactionType(rawValue: typeStr) ?? .received,
@@ -1087,6 +1166,7 @@ final class WalletDatabase {
             items.append(item)
         }
 
+        print("📜 DB: getTransactionHistory returning \(items.count) items")
         return items
     }
 
@@ -1105,6 +1185,138 @@ final class WalletDatabase {
         }
 
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Populate transaction history from existing notes
+    /// Call this once to backfill history for notes discovered before history tracking was added
+    func populateHistoryFromNotes() throws -> Int {
+        // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
+        let sql = """
+            SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf
+            FROM notes n
+            ORDER BY n.received_height ASC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var count = 0
+        var notesFound = 0
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            notesFound += 1
+            let diversifierPtr = sqlite3_column_blob(stmt, 0)
+            let diversifierLen = sqlite3_column_bytes(stmt, 0)
+            let value = UInt64(sqlite3_column_int64(stmt, 1))
+            let height = UInt64(sqlite3_column_int64(stmt, 2))
+            let txidPtr = sqlite3_column_type(stmt, 3) != SQLITE_NULL ? sqlite3_column_blob(stmt, 3) : nil
+            let txidLen = sqlite3_column_bytes(stmt, 3)
+            let isSpent = sqlite3_column_int(stmt, 4) != 0
+            let spentTxPtr = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? sqlite3_column_blob(stmt, 5) : nil
+            let spentTxLen = sqlite3_column_bytes(stmt, 5)
+            let nullifierPtr = sqlite3_column_blob(stmt, 6)
+            let nullifierLen = sqlite3_column_bytes(stmt, 6)
+
+            // Use actual txid if available, otherwise use nullifier as synthetic txid
+            let txid: Data
+            if let txidPtr = txidPtr, txidLen > 0 {
+                txid = Data(bytes: txidPtr, count: Int(txidLen))
+            } else if let nullifierPtr = nullifierPtr, nullifierLen > 0 {
+                // Use first 32 bytes of nullifier as synthetic txid
+                txid = Data(bytes: nullifierPtr, count: min(Int(nullifierLen), 32))
+            } else {
+                print("📜 Note at height \(height) has no txid or nullifier, skipping")
+                continue // Skip notes without txid or nullifier
+            }
+
+            let diversifier = diversifierPtr != nil ? Data(bytes: diversifierPtr!, count: Int(diversifierLen)) : nil
+
+            // Insert RECEIVED transaction using direct SQL to check actual insertion
+            let insertSql = """
+                INSERT OR REPLACE INTO transaction_history
+                (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+
+            var insertStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK else {
+                print("📜 Failed to prepare insert statement")
+                continue
+            }
+
+            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(insertStmt, 2, Int64(height))
+            sqlite3_bind_null(insertStmt, 3) // block_time
+            sqlite3_bind_text(insertStmt, 4, TransactionType.received.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(insertStmt, 5, Int64(value))
+            sqlite3_bind_null(insertStmt, 6) // fee
+            sqlite3_bind_null(insertStmt, 7) // to_address
+            if let diversifier = diversifier {
+                diversifier.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(insertStmt, 8, ptr.baseAddress, Int32(diversifier.count), SQLITE_TRANSIENT)
+                }
+            } else {
+                sqlite3_bind_null(insertStmt, 8)
+            }
+            sqlite3_bind_null(insertStmt, 9) // memo
+
+            let result = sqlite3_step(insertStmt)
+            if result == SQLITE_DONE {
+                count += 1
+                print("📜 Inserted received tx: height=\(height), value=\(value)")
+            } else {
+                print("📜 Insert failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            sqlite3_finalize(insertStmt)
+
+            // If spent, also insert SENT transaction
+            if isSpent {
+                let spentTxid: Data
+                if let spentTxPtr = spentTxPtr, spentTxLen > 0 {
+                    spentTxid = Data(bytes: spentTxPtr, count: Int(spentTxLen))
+                } else if let nullifierPtr = nullifierPtr, nullifierLen > 0 {
+                    // Use reversed nullifier as synthetic spent txid (different from receive)
+                    var nfData = Data(bytes: nullifierPtr, count: min(Int(nullifierLen), 32))
+                    nfData.reverse()
+                    spentTxid = nfData
+                } else {
+                    continue
+                }
+
+                var spentStmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, insertSql, -1, &spentStmt, nil) == SQLITE_OK else {
+                    continue
+                }
+
+                spentTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_bind_int64(spentStmt, 2, Int64(height))
+                sqlite3_bind_null(spentStmt, 3)
+                sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int64(spentStmt, 5, Int64(value))
+                sqlite3_bind_int64(spentStmt, 6, 10_000) // fee
+                sqlite3_bind_null(spentStmt, 7)
+                sqlite3_bind_null(spentStmt, 8)
+                sqlite3_bind_null(spentStmt, 9)
+
+                if sqlite3_step(spentStmt) == SQLITE_DONE {
+                    count += 1
+                    print("📜 Inserted sent tx: height=\(height), value=\(value)")
+                }
+                sqlite3_finalize(spentStmt)
+            }
+        }
+
+        print("📜 Found \(notesFound) notes, populated \(count) transaction history entries")
+        return count
     }
 }
 
@@ -1127,6 +1339,7 @@ struct WalletNote {
     let height: UInt64
     let witness: Data
     let cmu: Data? // Note commitment - needed for witness rebuild
+    let anchor: Data? // Tree root when witness was last updated
     var confirmations: Int = 0 // Set by caller based on current chain height
 }
 

@@ -782,6 +782,58 @@ private var currentSyncTasks: [SyncTask] {
 - `Sources/Core/Network/Checkpoints.swift` - added checkpoint at 2923123
 - `Sources/Core/Wallet/WalletManager.swift` - start at bundledTreeHeight + 1
 
+### 13. Auto-Rebuild Stale Witnesses with Anchor Tracking (November 2025)
+
+**Problem**: Transaction failed because stored witness didn't match current tree anchor. Notes discovered during scan had stale witnesses that weren't updated.
+
+**Root Cause**:
+1. FilterScanner wasn't updating `pendingWitnesses` (newly discovered notes) at end of scan
+2. No way to detect if stored witness matches current anchor
+3. TransactionBuilder assumed stored witness was always valid
+
+**Solution: Anchor Tracking System**
+
+Added `anchor` column to notes table to track when witness was last updated:
+
+1. **Database Schema** (`WalletDatabase.swift`):
+   - Added `anchor BLOB` column to notes table
+   - Added migration for existing databases
+   - Added `updateNoteAnchor()` function
+   - Updated `getUnspentNotes()` and `getAllUnspentNotes()` to return anchor
+
+2. **FilterScanner** (`FilterScanner.swift`):
+   - Fixed: Now updates BOTH `existingWitnessIndices` AND `pendingWitnesses` at end of scan
+   - Saves current tree root as anchor when updating witnesses
+
+3. **TransactionBuilder** (`TransactionBuilder.swift`):
+   - Checks if stored anchor matches current tree root
+   - If mismatch or empty → auto-rebuilds witness
+   - After rebuild → saves witness AND anchor to database
+   - Future sends find matching anchor → instant (no rebuild)
+
+**Flow**:
+```
+First send (anchor empty):
+  → Check: anchor empty → needsRebuild = true
+  → Rebuild witness from chain
+  → Save witness + anchor to database
+  → Transaction succeeds
+
+Second send (anchor matches):
+  → Check: anchor matches current tree root → needsRebuild = false
+  → Use stored witness directly (INSTANT!)
+  → Transaction succeeds
+
+Future send (anchor stale due to new blocks):
+  → Check: anchor differs → needsRebuild = true
+  → Rebuild witness, save, succeed
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - anchor column, migration, updateNoteAnchor()
+- `Sources/Core/Network/FilterScanner.swift` - update pendingWitnesses + save anchor
+- `Sources/Core/Crypto/TransactionBuilder.swift` - anchor check, auto-rebuild, save
+
 ---
 
 ## Technical Notes

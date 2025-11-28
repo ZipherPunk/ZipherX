@@ -410,6 +410,12 @@ final class FilterScanner {
 
             print("✅ PHASE 1 complete: scanned \(startHeight) to \(parallelEndHeight)")
 
+            // PHASE 1.5: Pre-compute witnesses for notes discovered in bundled range
+            // This runs in background so user doesn't wait at spend time
+            if let bundledData = bundledCMUData {
+                await computeWitnessesForBundledNotes(bundledData: bundledData)
+            }
+
             // Move to blocks after bundled tree
             currentHeight = bundledTreeHeight + 1
         }
@@ -590,38 +596,46 @@ final class FilterScanner {
             print("🌳 Saved commitment tree with \(treeSize) commitments")
         }
 
-        // IMPORTANT: Do NOT update witnesses for NEW notes here!
-        // New notes already have the correct witness saved at discovery time (insertNote).
-        // The witness at discovery time corresponds to the tree root at that block,
-        // which is the anchor we need when spending.
-        // Updating witnesses here would give them the FINAL tree root, which is wrong.
+        // CRITICAL: Update ALL note witnesses to match current tree state!
         //
-        // pendingWitnesses is only used to track witness indices in FFI memory,
-        // NOT for updating database. The witnesses were already saved correctly.
-        print("📝 Serialized witness: \(pendingWitnesses.count > 0 ? "saved at discovery" : "none") for \(pendingWitnesses.count) new note(s)")
+        // The FFI's treeAppend() automatically updates all loaded witnesses.
+        // We must save these updated witnesses back to the database so that:
+        // 1. Witness matches the CURRENT tree root (anchor)
+        // 2. At spend time, use current tree root as anchor
+        // 3. Witness + anchor are always consistent
+        //
+        // This applies to BOTH:
+        // - existingWitnessIndices: notes that existed before this scan
+        // - pendingWitnesses: notes discovered during this scan
+        //
+        // When a note is discovered at block N, the witness is for tree root at N.
+        // If more blocks are scanned (N+1, ..., latest), the tree grows and the
+        // witness becomes stale. We MUST update it to match the final tree root.
 
-        // CRITICAL FIX: Do NOT update existing note witnesses either!
-        //
-        // Previous logic assumed we'd use the "current" tree root as anchor,
-        // which required updating witnesses to match. But this is WRONG because:
-        // 1. We now get the anchor from block header at NOTE's received height
-        // 2. The witness must match that specific anchor (tree state at note height)
-        // 3. Updating witness here would make it point to CURRENT tree root
-        // 4. This causes anchor/witness mismatch → transaction rejection
-        //
-        // The correct approach:
-        // - Witness is saved at note discovery time (points to tree root at that block)
-        // - Anchor is retrieved from block header at note's height
-        // - Both match → valid transaction
-        //
-        // for (noteId, witnessIndex) in existingWitnessIndices {
-        //     if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
-        //         try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
-        //         print("📝 Updated witness for existing note \(noteId)")
-        //     }
-        // }
-        if !existingWitnessIndices.isEmpty {
-            print("📝 Preserved \(existingWitnessIndices.count) existing witness(es) - NOT updated to maintain anchor consistency")
+        // Get current tree root (anchor) to save with witnesses
+        let currentAnchor = ZipherXFFI.treeRoot() ?? Data()
+
+        // Update existing notes' witnesses and anchors
+        for (noteId, witnessIndex) in existingWitnessIndices {
+            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+                try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                print("📝 Updated witness for existing note \(noteId)")
+            }
+        }
+
+        // Update new notes' witnesses and anchors (discovered during this scan)
+        for (noteId, witnessIndex) in pendingWitnesses {
+            if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+                try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+                try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                print("📝 Updated witness for new note \(noteId)")
+            }
+        }
+
+        let totalUpdated = existingWitnessIndices.count + pendingWitnesses.count
+        if totalUpdated > 0 {
+            print("✅ Updated \(totalUpdated) witness(es) to match current tree state")
         }
 
         print("✅ Scan complete")
@@ -1580,6 +1594,59 @@ final class FilterScanner {
         }
 
         return results.sorted { $0.0 < $1.0 }
+    }
+
+    // MARK: - Witness Pre-computation
+
+    /// Pre-compute witnesses for notes discovered during PHASE 1 (bundled range)
+    /// This runs after parallel scanning to prepare witnesses for spending
+    private func computeWitnessesForBundledNotes(bundledData: Data) async {
+        print("🔧 PHASE 1.5: Pre-computing witnesses for notes in bundled range...")
+
+        do {
+            // Get the account ID
+            guard let account = try database.getAccount(index: 0) else {
+                print("⚠️ No account found, skipping witness pre-computation")
+                return
+            }
+
+            // Get all notes that have empty witnesses (from bundled range scanning)
+            let notes = try database.getAllUnspentNotes(accountId: account.id)
+            let notesNeedingWitness = notes.filter { note in
+                // Check if witness is empty (all zeros) or wrong size
+                note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
+            }
+
+            if notesNeedingWitness.isEmpty {
+                print("✅ All notes already have valid witnesses")
+                return
+            }
+
+            print("📝 Found \(notesNeedingWitness.count) note(s) needing witness computation")
+
+            for (index, note) in notesNeedingWitness.enumerated() {
+                guard let cmu = note.cmu, cmu.count == 32 else {
+                    print("⚠️ Note \(note.id) missing CMU, cannot compute witness")
+                    continue
+                }
+
+                print("🔧 Computing witness for note \(index + 1)/\(notesNeedingWitness.count)...")
+
+                // Use the FFI function to compute witness from bundled data
+                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                    // Update the note with the computed witness
+                    try database.updateNoteWitness(noteId: note.id, witness: result.witness)
+                    print("✅ Computed witness for note \(note.id) at position \(result.position)")
+                } else {
+                    print("⚠️ Could not compute witness for note \(note.id) - CMU may be beyond bundled tree")
+                }
+            }
+
+            print("✅ PHASE 1.5 complete: witness pre-computation finished")
+
+        } catch {
+            print("❌ Error pre-computing witnesses: \(error)")
+        }
     }
 }
 
