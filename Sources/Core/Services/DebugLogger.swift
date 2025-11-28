@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// Debug logging system that writes to a file for export
 /// Enable/disable via Settings or UserDefaults "debugLoggingEnabled"
