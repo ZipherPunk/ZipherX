@@ -1128,12 +1128,19 @@ final class NetworkManager: ObservableObject {
                     let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: blockHeight)
                     // Get shielded outputs via InsightAPI (uses raw tx parsing)
                     let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
-                    // Fetch shielded data from each transaction
+                    // Fetch shielded data from each transaction (including spends for nullifier detection!)
                     var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
                     for txid in insightBlock.tx {
+                        // Get full tx to check for spends (nullifier detection)
+                        let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
+                        let spends = txInfo?.spendDescs
+
+                        // Get outputs from raw tx (full encCiphertext)
                         let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
-                        if !outputs.isEmpty {
-                            txDataList.append((txid, outputs, nil))
+
+                        // Include tx if it has outputs OR spends (spends are for nullifier detection)
+                        if !outputs.isEmpty || (spends?.isEmpty == false) {
+                            txDataList.append((txid, outputs, spends))
                         }
                     }
                     results.append((blockHeight, hashFromAPI, txDataList))
