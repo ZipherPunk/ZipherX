@@ -1115,12 +1115,10 @@ final class NetworkManager: ObservableObject {
         for i in 0..<count {
             let blockHeight = height + UInt64(i)
 
-            var blockHashHex: String?
-            var block: P2PBlock?
+            var block: CompactBlock?
 
             // Try P2P first: Get block hash from HeaderStore
             if let header = try? HeaderStore.shared.getHeader(at: blockHeight) {
-                blockHashHex = header.blockHash
                 block = try? await peer.getBlockByHash(hash: header.blockHash)
             }
 
@@ -1128,16 +1126,15 @@ final class NetworkManager: ObservableObject {
             if block == nil {
                 do {
                     let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: blockHeight)
-                    blockHashHex = hashFromAPI
-                    // Get block data via InsightAPI raw block
-                    let rawBlock = try await InsightAPI.shared.getRawBlock(hash: hashFromAPI)
-                    // Parse the raw block for shielded data
-                    let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: hashFromAPI)
-                    // Create minimal result without full block parsing
-                    // The caller only needs shielded outputs/spends
+                    // Get shielded outputs via InsightAPI (uses raw tx parsing)
+                    let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
+                    // Fetch shielded data from each transaction
                     var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-                    if !outputs.isEmpty {
-                        txDataList.append(("insight_fallback", outputs, nil))
+                    for txid in insightBlock.tx {
+                        let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
+                        if !outputs.isEmpty {
+                            txDataList.append((txid, outputs, nil))
+                        }
                     }
                     results.append((blockHeight, hashFromAPI, txDataList))
                     continue
@@ -1151,7 +1148,7 @@ final class NetworkManager: ObservableObject {
                 print("⚠️ P2P batch: No block data at height \(blockHeight)")
                 continue
             }
-            // Use block hash from P2P block (more accurate than HeaderStore which may lag)
+            // Use block hash from P2P block
             let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
 
             var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
