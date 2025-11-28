@@ -1,4 +1,6 @@
 import SwiftUI
+import AVFoundation
+import AudioToolbox
 
 /// Transaction sending progress step
 struct SendProgressStep: Identifiable {
@@ -33,6 +35,8 @@ struct SendView: View {
     @State private var txId = ""
     @State private var isAddressValid = false
     @State private var isAddressTransparent = false
+    @State private var showQRScanner = false
+    @State private var scannedAddress: String = ""
 
     // Progress tracking
     @State private var sendProgress: [SendProgressStep] = []
@@ -148,12 +152,38 @@ struct SendView: View {
 
     private var addressField: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Recipient Address (z-address only)")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+            HStack {
+                Text("Recipient Address (z-address only)")
+                    .font(System7Theme.bodyFont(size: 10))
+                    .foregroundColor(System7Theme.darkGray)
 
-            TextField("zc...", text: $recipientAddress)
+                Spacer()
+
+                // QR Code scanner button
+                Button(action: {
+                    showQRScanner = true
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 12))
+                        Text("Scan")
+                            .font(System7Theme.bodyFont(size: 9))
+                    }
+                    .foregroundColor(System7Theme.black)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(System7Theme.lightGray)
+                    .overlay(
+                        Rectangle()
+                            .stroke(System7Theme.black, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
+            TextField("zs1...", text: $recipientAddress)
                 .font(System7Theme.bodyFont(size: 11))
+                .foregroundColor(System7Theme.black)
                 .autocapitalization(.none)
                 .disableAutocorrection(true)
                 .padding(8)
@@ -197,6 +227,46 @@ struct SendView: View {
                 addressValidationText
             }
         }
+        .sheet(isPresented: $showQRScanner, onDismiss: {
+            // Apply scanned address after sheet dismisses
+            if !scannedAddress.isEmpty {
+                recipientAddress = scannedAddress
+                scannedAddress = ""
+            }
+        }) {
+            QRScannerView { scannedCode in
+                // Store scanned address and dismiss
+                if let code = scannedCode {
+                    let address = extractAddressFromQR(code)
+                    print("📷 QR scanned: \(address)")
+                    scannedAddress = address
+                }
+                showQRScanner = false
+            }
+        }
+    }
+
+    /// Extract address from QR code string (handles zcash: URIs and plain addresses)
+    private func extractAddressFromQR(_ qrString: String) -> String {
+        // Handle zcash: URI format
+        if qrString.lowercased().hasPrefix("zcash:") {
+            let withoutPrefix = String(qrString.dropFirst(6))
+            // Remove any query parameters
+            if let questionMark = withoutPrefix.firstIndex(of: "?") {
+                return String(withoutPrefix[..<questionMark])
+            }
+            return withoutPrefix
+        }
+        // Handle zclassic: URI format
+        if qrString.lowercased().hasPrefix("zclassic:") {
+            let withoutPrefix = String(qrString.dropFirst(9))
+            if let questionMark = withoutPrefix.firstIndex(of: "?") {
+                return String(withoutPrefix[..<questionMark])
+            }
+            return withoutPrefix
+        }
+        // Plain address
+        return qrString.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var addressBorderColor: Color {
@@ -249,6 +319,7 @@ struct SendView: View {
             HStack {
                 TextField("0.00000000", text: $amount)
                     .font(System7Theme.bodyFont(size: 11))
+                    .foregroundColor(System7Theme.black)
                     .keyboardType(.decimalPad)
                     .padding(8)
                     .background(System7Theme.white)
@@ -298,6 +369,7 @@ struct SendView: View {
 
             TextField("Private message...", text: $memo)
                 .font(System7Theme.bodyFont(size: 11))
+                .foregroundColor(System7Theme.black)
                 .padding(8)
                 .background(System7Theme.white)
                 .overlay(
@@ -620,4 +692,173 @@ struct SendView: View {
     SendView()
         .environmentObject(WalletManager.shared)
         .environmentObject(NetworkManager.shared)
+}
+
+// MARK: - QR Scanner View
+
+/// Camera-based QR code scanner view
+struct QRScannerView: UIViewControllerRepresentable {
+    let onCodeScanned: (String?) -> Void
+
+    func makeUIViewController(context: Context) -> QRScannerViewController {
+        let controller = QRScannerViewController()
+        controller.onCodeScanned = onCodeScanned
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: QRScannerViewController, context: Context) {}
+}
+
+/// UIKit view controller for QR scanning
+class QRScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var captureSession: AVCaptureSession?
+    var previewLayer: AVCaptureVideoPreviewLayer?
+    var onCodeScanned: ((String?) -> Void)?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        setupCamera()
+        setupUI()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.captureSession?.startRunning()
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        captureSession?.stopRunning()
+    }
+
+    private func setupCamera() {
+        captureSession = AVCaptureSession()
+
+        guard let videoCaptureDevice = AVCaptureDevice.default(for: .video) else {
+            showError("No camera available")
+            return
+        }
+
+        let videoInput: AVCaptureDeviceInput
+
+        do {
+            videoInput = try AVCaptureDeviceInput(device: videoCaptureDevice)
+        } catch {
+            showError("Camera access denied")
+            return
+        }
+
+        if captureSession?.canAddInput(videoInput) == true {
+            captureSession?.addInput(videoInput)
+        } else {
+            showError("Could not add camera input")
+            return
+        }
+
+        let metadataOutput = AVCaptureMetadataOutput()
+
+        if captureSession?.canAddOutput(metadataOutput) == true {
+            captureSession?.addOutput(metadataOutput)
+            metadataOutput.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+            metadataOutput.metadataObjectTypes = [.qr]
+        } else {
+            showError("Could not add metadata output")
+            return
+        }
+
+        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession!)
+        previewLayer?.frame = view.layer.bounds
+        previewLayer?.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(previewLayer!)
+    }
+
+    private func setupUI() {
+        // Add scanning frame overlay
+        let overlayView = UIView()
+        overlayView.backgroundColor = .clear
+        overlayView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(overlayView)
+
+        NSLayoutConstraint.activate([
+            overlayView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            overlayView.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            overlayView.widthAnchor.constraint(equalToConstant: 250),
+            overlayView.heightAnchor.constraint(equalToConstant: 250)
+        ])
+
+        overlayView.layer.borderColor = UIColor.white.cgColor
+        overlayView.layer.borderWidth = 2
+        overlayView.layer.cornerRadius = 12
+
+        // Add close button
+        let closeButton = UIButton(type: .system)
+        closeButton.setTitle("Cancel", for: .normal)
+        closeButton.setTitleColor(.white, for: .normal)
+        closeButton.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        closeButton.layer.cornerRadius = 8
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        view.addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            closeButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30),
+            closeButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 120),
+            closeButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
+
+        // Add instruction label
+        let label = UILabel()
+        label.text = "Scan QR Code"
+        label.textColor = .white
+        label.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            label.bottomAnchor.constraint(equalTo: overlayView.topAnchor, constant: -20),
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor)
+        ])
+    }
+
+    @objc private func closeTapped() {
+        onCodeScanned?(nil)
+    }
+
+    private func showError(_ message: String) {
+        let label = UILabel()
+        label.text = message
+        label.textColor = .white
+        label.textAlignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        ])
+    }
+
+    // MARK: - AVCaptureMetadataOutputObjectsDelegate
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        captureSession?.stopRunning()
+
+        if let metadataObject = metadataObjects.first,
+           let readableObject = metadataObject as? AVMetadataMachineReadableCodeObject,
+           let stringValue = readableObject.stringValue {
+            AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_Vibrate))
+            onCodeScanned?(stringValue)
+        } else {
+            onCodeScanned?(nil)
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.layer.bounds
+    }
 }

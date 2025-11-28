@@ -40,19 +40,50 @@ final class TransactionBuilder {
         guard !proverInitialized else { return }
 
         let params = SaplingParams.shared
-        guard params.areParamsReady else {
-            throw TransactionError.proofGenerationFailed
-        }
 
+        // Check if params are ready with detailed logging
         let spendPath = params.spendParamsPath.path
         let outputPath = params.outputParamsPath.path
 
+        debugLog(.params, "📋 Checking Sapling params...")
+        debugLog(.params, "   Spend path: \(spendPath)")
+        debugLog(.params, "   Output path: \(outputPath)")
+
+        let spendExists = FileManager.default.fileExists(atPath: spendPath)
+        let outputExists = FileManager.default.fileExists(atPath: outputPath)
+
+        debugLog(.params, "   Spend exists: \(spendExists)")
+        debugLog(.params, "   Output exists: \(outputExists)")
+
+        if spendExists, let spendAttrs = try? FileManager.default.attributesOfItem(atPath: spendPath) {
+            let size = (spendAttrs[.size] as? Int) ?? 0
+            debugLog(.params, "   Spend size: \(size) bytes (expected: 47958396)")
+            if size != 47_958_396 {
+                debugLog(.error, "❌ Spend params file has wrong size!")
+            }
+        }
+
+        if outputExists, let outputAttrs = try? FileManager.default.attributesOfItem(atPath: outputPath) {
+            let size = (outputAttrs[.size] as? Int) ?? 0
+            debugLog(.params, "   Output size: \(size) bytes (expected: 3592860)")
+            if size != 3_592_860 {
+                debugLog(.error, "❌ Output params file has wrong size!")
+            }
+        }
+
+        guard params.areParamsReady else {
+            debugLog(.error, "❌ Sapling params NOT ready - files missing!")
+            throw TransactionError.proofGenerationFailed
+        }
+
+        debugLog(.params, "📦 Initializing prover with Sapling parameters...")
         guard ZipherXFFI.initProver(spendParamsPath: spendPath, outputParamsPath: outputPath) else {
+            debugLog(.error, "❌ ZipherXFFI.initProver returned false - check Rust logs")
             throw TransactionError.proofGenerationFailed
         }
 
         proverInitialized = true
-        print("✅ Prover initialized with Sapling parameters")
+        debugLog(.params, "✅ Prover initialized with Sapling parameters")
     }
 
     // MARK: - Transaction Building
@@ -155,9 +186,20 @@ final class TransactionBuilder {
         let notes = try await getSpendableNotes(for: from, spendingKey: spendingKey)
 
         // Select notes to spend
-        let (selectedNotes, _) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
+        let (selectedNotes, totalSelected) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
 
         guard let note = selectedNotes.first else {
+            throw TransactionError.insufficientFunds
+        }
+
+        // LIMITATION: Current FFI only supports single-spend transactions
+        // Check if we need multiple notes but can only use one
+        if selectedNotes.count > 1 {
+            let largestNote = notes.max(by: { $0.value < $1.value })!
+            let maxSpendable = largestNote.value > DEFAULT_FEE ? largestNote.value - DEFAULT_FEE : 0
+            print("⚠️ Multi-spend not yet supported. Largest single note: \(largestNote.value) zatoshis")
+            print("⚠️ Maximum spendable in one transaction: \(maxSpendable) zatoshis")
+            print("❌ Insufficient funds: have \(note.value), need \(amount + DEFAULT_FEE)")
             throw TransactionError.insufficientFunds
         }
 

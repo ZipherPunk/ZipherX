@@ -3,10 +3,38 @@ import UserNotifications
 import UIKit
 
 /// Manages local notifications for wallet events
-final class NotificationManager {
+final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
-    private init() {}
+    private override init() {
+        super.init()
+        // Set self as delegate to show notifications in foreground
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    /// Show notifications even when app is in foreground
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        // Show banner, sound, and badge even in foreground
+        completionHandler([.banner, .sound, .badge])
+    }
+
+    /// Handle notification tap
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        print("📬 Notification tapped: \(userInfo)")
+        // Could navigate to transaction details here
+        completionHandler()
+    }
 
     // MARK: - Permission
 
@@ -26,13 +54,21 @@ final class NotificationManager {
     // MARK: - Wallet Notifications
 
     /// Notify when ZCL is received (pending)
-    func notifyReceived(amount: UInt64, txid: String) {
+    func notifyReceived(amount: UInt64, txid: String, memo: String? = nil) {
         let zcl = Double(amount) / 100_000_000.0
         let content = UNMutableNotificationContent()
         content.title = "ZCL Received"
-        content.body = String(format: "+%.8f ZCL (pending)", zcl)
+
+        // Build body with optional memo
+        var body = String(format: "+%.8f ZCL (pending)", zcl)
+        if let memo = memo, !memo.isEmpty {
+            // Truncate memo for notification if too long
+            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
+            body += "\n📝 \(truncatedMemo)"
+        }
+        content.body = body
         content.sound = .default
-        content.userInfo = ["type": "received", "txid": txid, "amount": amount]
+        content.userInfo = ["type": "received", "txid": txid, "amount": amount, "memo": memo ?? ""]
 
         let request = UNNotificationRequest(
             identifier: "received-\(txid)",
@@ -70,13 +106,21 @@ final class NotificationManager {
     }
 
     /// Notify when ZCL is sent
-    func notifySent(amount: UInt64, txid: String) {
+    func notifySent(amount: UInt64, txid: String, memo: String? = nil) {
         let zcl = Double(amount) / 100_000_000.0
         let content = UNMutableNotificationContent()
         content.title = "ZCL Sent"
-        content.body = String(format: "-%.8f ZCL", zcl)
+
+        // Build body with optional memo
+        var body = String(format: "-%.8f ZCL", zcl)
+        if let memo = memo, !memo.isEmpty {
+            // Truncate memo for notification if too long
+            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
+            body += "\n📝 \(truncatedMemo)"
+        }
+        content.body = body
         content.sound = .default
-        content.userInfo = ["type": "sent", "txid": txid, "amount": amount]
+        content.userInfo = ["type": "sent", "txid": txid, "amount": amount, "memo": memo ?? ""]
 
         let request = UNNotificationRequest(
             identifier: "sent-\(txid)",

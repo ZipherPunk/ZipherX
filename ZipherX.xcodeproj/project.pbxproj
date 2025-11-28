@@ -3,12 +3,10 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 54;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		BIOM002A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */; };
-		ASST002A2B3C4D5E6F7G8H9I /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
 		12FB4AE1B988C5445B1DF517 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 233F470A9D31A763B0F2EA5D /* HeaderStore.swift */; };
@@ -36,15 +34,20 @@
 		8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 630CFD90F45505D02500501A /* ContentView.swift */; };
 		8F90F1D58322A43F385FB321 /* ZipherXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69E10579679A9004FDC0EDFB /* ZipherXApp.swift */; };
 		8F96DBBCEB07605710EF38BD /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6537E08D964E75E72B38163 /* SettingsView.swift */; };
+		ASST002A2B3C4D5E6F7G8H9I /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */; };
 		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
 		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
+		BIOM002A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */; };
 		C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
 		D48A42CCAB7B7BF4DB4E9AA6 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6F84FADA54C4AD5876556D4 /* HeaderSyncManager.swift */; };
 		D4974928AC9E28FB2A647F9F /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAEB4ED1807CF70EAAE11D5C /* BlockHeader.swift */; };
 		D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235376F572F89B6D83EDA88C /* WalletTests.swift */; };
 		DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119FB9D2179DC1425CABD79E /* NotificationManager.swift */; };
+		DBGL001A2B3C4D5E6F7G8H9I /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */; };
 		EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 716A65BFF58BBC7334E13C13 /* sapling_tree.bin */; };
+		SAPSP001A2B3C4D5E6F7G8H9I /* sapling-spend.params in Resources */ = {isa = PBXBuildFile; fileRef = SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */; };
+		SAPOU001A2B3C4D5E6F7G8H9I /* sapling-output.params in Resources */ = {isa = PBXBuildFile; fileRef = SAPOU002A2B3C4D5E6F7G8H9I /* sapling-output.params */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,12 +61,11 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiometricAuthManager.swift; sourceTree = "<group>"; };
-		ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyQuotes.swift; sourceTree = "<group>"; };
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
-		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		119FB9D2179DC1425CABD79E /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeyStorage.swift; sourceTree = "<group>"; };
 		18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
 		233F470A9D31A763B0F2EA5D /* HeaderStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HeaderStore.swift; path = Sources/Core/Storage/HeaderStore.swift; sourceTree = SOURCE_ROOT; };
@@ -84,7 +86,9 @@
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
+		ASST001A2B3C4D5E6F7G8H9I /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BC0A89DDCE7B836E49AF56B4 /* SendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SendView.swift; sourceTree = "<group>"; };
+		BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiometricAuthManager.swift; sourceTree = "<group>"; };
 		C6537E08D964E75E72B38163 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BIP39Wordlist.swift; sourceTree = "<group>"; };
 		CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
@@ -96,6 +100,8 @@
 		ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletSetupView.swift; sourceTree = "<group>"; };
 		ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Theme.swift; sourceTree = "<group>"; };
 		ED775F7A258C12CD4FDBF173 /* ZipherX-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "ZipherX-Bridging-Header.h"; sourceTree = "<group>"; };
+		SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */ = {isa = PBXFileReference; lastKnownFileType = file; name = "sapling-spend.params"; path = "Resources/sapling-spend.params"; sourceTree = SOURCE_ROOT; };
+		SAPOU002A2B3C4D5E6F7G8H9I /* sapling-output.params */ = {isa = PBXFileReference; lastKnownFileType = file; name = "sapling-output.params"; path = "Resources/sapling-output.params"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -147,17 +153,10 @@
 		1BB02293A68E4F3B9A692C67 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				DBGL002A2B3C4D5E6F7G8H9I /* DebugLogger.swift */,
 				119FB9D2179DC1425CABD79E /* NotificationManager.swift */,
 			);
 			path = Services;
-			sourceTree = "<group>";
-		};
-		SECU001A2B3C4D5E6F7G8H9I /* Security */ = {
-			isa = PBXGroup;
-			children = (
-				BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */,
-			);
-			path = Security;
 			sourceTree = "<group>";
 		};
 		1E0AB0F916282FFBD8E5F74E = {
@@ -350,8 +349,18 @@
 			children = (
 				81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */,
 				716A65BFF58BBC7334E13C13 /* sapling_tree.bin */,
+				SAPSP002A2B3C4D5E6F7G8H9I /* sapling-spend.params */,
+				SAPOU002A2B3C4D5E6F7G8H9I /* sapling-output.params */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		SECU001A2B3C4D5E6F7G8H9I /* Security */ = {
+			isa = PBXGroup;
+			children = (
+				BIOM001A2B3C4D5E6F7G8H9I /* BiometricAuthManager.swift */,
+			);
+			path = Security;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -403,9 +412,6 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
-					C54306F64C1E460E338C880B = {
-						DevelopmentTeam = "";
-					};
 					D162EC22BDD1CAFF4A7D9821 = {
 						DevelopmentTeam = "";
 					};
@@ -421,7 +427,6 @@
 			);
 			mainGroup = 1E0AB0F916282FFBD8E5F74E;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 54;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -439,6 +444,8 @@
 				ASST002A2B3C4D5E6F7G8H9I /* Assets.xcassets in Resources */,
 				7C38AF6C374A0F3FC5A6B5AA /* commitment_tree.bin in Resources */,
 				EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */,
+				SAPSP001A2B3C4D5E6F7G8H9I /* sapling-spend.params in Resources */,
+				SAPOU001A2B3C4D5E6F7G8H9I /* sapling-output.params in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -460,6 +467,7 @@
 				B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */,
 				B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */,
 				DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */,
+				DBGL001A2B3C4D5E6F7G8H9I /* DebugLogger.swift in Sources */,
 				3742555859851725FDC9B9DE /* Peer.swift in Sources */,
 				173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */,
 				596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */,
@@ -540,20 +548,24 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = 4YD8RW93H4;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"Libraries\"",
 				);
 				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ZipherX;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				MARKETING_VERSION = 1.0.1;
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -565,20 +577,24 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = 4YD8RW93H4;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"Libraries\"",
 				);
 				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ZipherX;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				MARKETING_VERSION = 1.0.1;
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";

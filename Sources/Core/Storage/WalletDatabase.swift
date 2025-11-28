@@ -36,8 +36,13 @@ final class WalletDatabase {
 
     // MARK: - Database Connection
 
-    /// Open database with encryption key
+    private let openLock = NSLock()
+
+    /// Open database with encryption key (thread-safe)
     func open(encryptionKey: Data) throws {
+        openLock.lock()
+        defer { openLock.unlock() }
+
         // Don't reopen if already open
         if db != nil {
             print("📂 Database already open")
@@ -72,6 +77,10 @@ final class WalletDatabase {
     // MARK: - Schema
 
     private func createTables() throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
         let schemas = [
             // Accounts table
             """
@@ -161,6 +170,10 @@ final class WalletDatabase {
                 last_scanned_hash BLOB,
                 tree_state BLOB
             );
+            """,
+
+            // Initialize sync state with default row
+            """
             INSERT OR IGNORE INTO sync_state (id, last_scanned_height) VALUES (1, 0);
             """,
 
@@ -183,14 +196,12 @@ final class WalletDatabase {
             """,
 
             // Indexes for performance
-            """
-            CREATE INDEX IF NOT EXISTS idx_notes_account ON notes(account_id);
-            CREATE INDEX IF NOT EXISTS idx_notes_spent ON notes(is_spent);
-            CREATE INDEX IF NOT EXISTS idx_notes_height ON notes(received_height);
-            CREATE INDEX IF NOT EXISTS idx_nullifiers_height ON nullifiers(block_height);
-            CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);
-            """
+            "CREATE INDEX IF NOT EXISTS idx_notes_account ON notes(account_id);",
+            "CREATE INDEX IF NOT EXISTS idx_notes_spent ON notes(is_spent);",
+            "CREATE INDEX IF NOT EXISTS idx_notes_height ON notes(received_height);",
+            "CREATE INDEX IF NOT EXISTS idx_nullifiers_height ON nullifiers(block_height);",
+            "CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);"
         ]
 
         for schema in schemas {
@@ -1179,6 +1190,7 @@ enum DatabaseError: LocalizedError {
     case updateFailed(String)
     case deleteFailed(String)
     case queryFailed(String)
+    case notOpened
 
     var errorDescription: String? {
         switch self {
@@ -1198,6 +1210,8 @@ enum DatabaseError: LocalizedError {
             return "Delete failed: \(msg)"
         case .queryFailed(let msg):
             return "Query failed: \(msg)"
+        case .notOpened:
+            return "Database not opened"
         }
     }
 }

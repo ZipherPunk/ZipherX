@@ -455,4 +455,9 @@ extension Data {
     func reversedBytes() -> Data {
         Data(self.reversed())
     }
+
+    /// Convert Data to hex string
+    var hexString: String {
+        map { String(format: "%02x", $0) }.joined()
+    }
 }

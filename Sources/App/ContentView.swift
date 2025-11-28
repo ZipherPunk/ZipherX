@@ -43,44 +43,32 @@ struct ContentView: View {
 
                         // Auto-sync on launch (downloads params if needed, syncs blockchain)
                         if networkManager.isConnected {
-                            // Clear connecting state before sync starts (sync will show its own status)
-                            await MainActor.run {
-                                walletManager.setConnecting(false, status: nil)
-                            }
+                            // Keep isConnecting true - sync status will update it
                             do {
                                 try await walletManager.refreshBalance()
                             } catch {
                                 print("⚠️ Auto-sync failed: \(error.localizedDescription)")
                             }
-                        } else {
-                            // Clear connecting state if not connected
-                            await MainActor.run {
-                                walletManager.setConnecting(false, status: nil)
-                            }
                         }
 
-                        // Mark initial sync as complete
+                        // Clear connecting state after everything is done
+                        await MainActor.run {
+                            walletManager.setConnecting(false, status: nil)
+                        }
+
+                        // Mark initial sync as complete ONLY after everything finishes
                         await MainActor.run {
                             isInitialSync = false
                         }
                     }
 
-                // Tree loading overlay (shown during first launch)
-                if !walletManager.isTreeLoaded && walletManager.treeLoadProgress > 0 {
-                    CypherpunkLoadingView(
-                        progress: walletManager.treeLoadProgress,
-                        status: walletManager.treeLoadStatus,
-                        isFirstLaunch: isFirstLaunch
-                    )
-                    .transition(.opacity)
-                }
-
-                // Sync overlay (shown during blockchain sync, connecting, or initial sync after tree is loaded)
-                if walletManager.isTreeLoaded && (walletManager.isSyncing || walletManager.isConnecting || isInitialSync) {
+                // SINGLE cypherpunk overlay for ALL initial sync phases
+                // Shows during: tree loading, connecting, syncing - until initial sync complete
+                if isInitialSync {
                     CypherpunkSyncView(
-                        progress: walletManager.isSyncing ? walletManager.syncProgress : 0.0,
-                        status: walletManager.isConnecting ? "Connecting to network..." :
-                               (walletManager.isSyncing ? walletManager.syncStatus : "Initializing...")
+                        progress: currentSyncProgress,
+                        status: currentSyncStatus,
+                        tasks: currentSyncTasks
                     )
                     .transition(.opacity)
                 }
@@ -88,6 +76,74 @@ struct ContentView: View {
                 WalletSetupView()
             }
         }
+    }
+
+    /// Combined progress for all sync phases
+    private var currentSyncProgress: Double {
+        // Tree loading phase (0-30%)
+        if !walletManager.isTreeLoaded {
+            return walletManager.treeLoadProgress * 0.3
+        }
+        // Connecting phase (30-35%)
+        if walletManager.isConnecting && !walletManager.isSyncing {
+            return 0.32
+        }
+        // Sync phase (35-100%)
+        if walletManager.isSyncing {
+            return 0.35 + (walletManager.syncProgress * 0.65)
+        }
+        // Tree loaded, not syncing yet
+        return 0.30
+    }
+
+    /// Combined status for all sync phases
+    private var currentSyncStatus: String {
+        // Tree loading
+        if !walletManager.isTreeLoaded {
+            return walletManager.treeLoadStatus.isEmpty ? "Loading commitment tree..." : walletManager.treeLoadStatus
+        }
+        // Connecting
+        if walletManager.isConnecting {
+            return "Connecting to network..."
+        }
+        // Syncing
+        if walletManager.isSyncing {
+            return walletManager.syncStatus
+        }
+        // Default
+        return "Initializing..."
+    }
+
+    /// Combined task list including tree loading
+    private var currentSyncTasks: [SyncTask] {
+        var tasks: [SyncTask] = []
+
+        // Add tree loading task if tree not loaded yet
+        if !walletManager.isTreeLoaded {
+            let treeTask = SyncTask(
+                id: "tree",
+                title: "Load commitment tree",
+                status: walletManager.treeLoadProgress > 0 ? .inProgress : .pending,
+                detail: walletManager.treeLoadStatus,
+                progress: walletManager.treeLoadProgress
+            )
+            tasks.append(treeTask)
+        } else {
+            // Tree loaded - show completed
+            tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .completed))
+        }
+
+        // Add connecting task
+        if walletManager.isConnecting && walletManager.syncTasks.isEmpty {
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .inProgress))
+        } else if walletManager.isTreeLoaded && walletManager.syncTasks.isEmpty {
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .pending))
+        }
+
+        // Add sync tasks from WalletManager
+        tasks.append(contentsOf: walletManager.syncTasks)
+
+        return tasks
     }
 
     private var mainWalletView: some View {

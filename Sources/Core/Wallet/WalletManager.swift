@@ -949,8 +949,22 @@ final class WalletManager: ObservableObject {
         }
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
 
+        // Record transaction in history
+        let chainHeight = try await networkManager.getChainHeight()
+        _ = try WalletDatabase.shared.insertTransactionHistory(
+            txid: txidData,
+            height: chainHeight,
+            blockTime: UInt64(Date().timeIntervalSince1970),
+            type: .sent,
+            value: amount,
+            fee: 10_000,
+            toAddress: toAddress,
+            fromDiversifier: nil,
+            memo: memo
+        )
+
         // Send notification for successful transaction
-        NotificationManager.shared.notifySent(amount: amount, txid: txId)
+        NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
         // Refresh balance
         try await refreshBalance()
@@ -1012,8 +1026,23 @@ final class WalletManager: ObservableObject {
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
         print("✅ Note marked as spent in database")
 
+        // Record transaction in history
+        let chainHeight = try await networkManager.getChainHeight()
+        _ = try WalletDatabase.shared.insertTransactionHistory(
+            txid: txidData,
+            height: chainHeight,
+            blockTime: UInt64(Date().timeIntervalSince1970),
+            type: .sent,
+            value: amount,
+            fee: 10_000,
+            toAddress: toAddress,
+            fromDiversifier: nil,
+            memo: memo
+        )
+        print("📜 Transaction recorded in history")
+
         // Send notification for successful transaction
-        NotificationManager.shared.notifySent(amount: amount, txid: txId)
+        NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
         // Refresh balance
         try await refreshBalance()

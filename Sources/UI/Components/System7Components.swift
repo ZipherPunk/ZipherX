@@ -129,7 +129,9 @@ struct System7TabButton: View {
             Text(title)
                 .font(System7Theme.bodyFont(size: 10))
                 .foregroundColor(System7Theme.black)
-                .padding(.horizontal, 10)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 8)
                 .padding(.vertical, 6)
         }
         .background(isSelected ? System7Theme.white : System7Theme.lightGray)
@@ -697,10 +699,11 @@ struct CypherpunkProgressStepRow: View {
     }
 }
 
-/// Full-screen cypherpunk sync overlay
+/// Full-screen cypherpunk sync overlay with task list
 struct CypherpunkSyncView: View {
     let progress: Double
     let status: String
+    var tasks: [SyncTask] = []
 
     @State private var currentMessage: String = "Synchronizing with the network..."
     @State private var glitchOffset: CGFloat = 0
@@ -728,19 +731,19 @@ struct CypherpunkSyncView: View {
             Color.black.opacity(0.92)
                 .ignoresSafeArea()
 
-            VStack(spacing: 24) {
+            VStack(spacing: 16) {
                 Spacer()
 
                 // Matrix-style title with glitch effect
                 ZStack {
                     Text("SYNCING")
-                        .font(.system(size: 32, weight: .bold, design: .monospaced))
+                        .font(.system(size: 28, weight: .bold, design: .monospaced))
                         .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
                         .offset(x: showGlitch ? glitchOffset : 0)
 
                     if showGlitch {
                         Text("SYNCING")
-                            .font(.system(size: 32, weight: .bold, design: .monospaced))
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
                             .foregroundColor(.red.opacity(0.5))
                             .offset(x: -glitchOffset)
                     }
@@ -748,22 +751,36 @@ struct CypherpunkSyncView: View {
 
                 // Subtitle
                 Text("PROTECTING YOUR PRIVACY")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(Color(red: 0, green: 0.7, blue: 0.2))
                     .tracking(3)
 
-                Spacer()
+                // Rotating cypherpunk message
+                Text(currentMessage)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .multilineTextAlignment(.center)
+                    .animation(.easeInOut(duration: 0.3), value: currentMessage)
+                    .padding(.top, 8)
 
-                // Loading content
-                VStack(spacing: 16) {
-                    // Rotating cypherpunk message
-                    Text(currentMessage)
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
-                        .multilineTextAlignment(.center)
-                        .animation(.easeInOut(duration: 0.3), value: currentMessage)
+                // Task list (if available)
+                if !tasks.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(tasks) { task in
+                            CypherpunkSyncTaskRow(task: task)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color.black.opacity(0.5))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color(red: 0, green: 0.4, blue: 0.1), lineWidth: 1)
+                    )
+                    .padding(.horizontal, 20)
+                }
 
-                    // Progress bar
+                // Progress bar
+                VStack(spacing: 8) {
                     GeometryReader { geometry in
                         ZStack(alignment: .leading) {
                             Rectangle()
@@ -781,7 +798,7 @@ struct CypherpunkSyncView: View {
                                         endPoint: .trailing
                                     )
                                 )
-                                .frame(width: geometry.size.width * min(max(progress, 0.05), 1.0), height: 12)
+                                .frame(width: geometry.size.width * min(max(progress, 0.02), 1.0), height: 12)
                                 .animation(.linear(duration: 0.3), value: progress)
 
                             Rectangle()
@@ -794,31 +811,32 @@ struct CypherpunkSyncView: View {
 
                     // Progress percentage
                     Text("\(Int(progress * 100))%")
-                        .font(.system(size: 24, weight: .bold, design: .monospaced))
+                        .font(.system(size: 20, weight: .bold, design: .monospaced))
                         .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
 
                     // Status text
                     if !status.isEmpty {
                         Text(status)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: 10, design: .monospaced))
                             .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
                     }
                 }
+                .padding(.top, 8)
 
                 Spacer()
 
                 // Footer quote
                 VStack(spacing: 4) {
                     Text("\"We must defend our own privacy\"")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(Color(red: 0, green: 0.4, blue: 0.1))
                         .italic()
 
                     Text("- Cypherpunk's Manifesto")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 8, design: .monospaced))
                         .foregroundColor(Color(red: 0, green: 0.3, blue: 0.08))
                 }
-                .padding(.bottom, 40)
+                .padding(.bottom, 30)
             }
         }
         .onReceive(timer) { _ in
@@ -834,6 +852,84 @@ struct CypherpunkSyncView: View {
                     showGlitch = false
                 }
             }
+        }
+    }
+}
+
+/// Individual sync task row with cypherpunk styling
+struct CypherpunkSyncTaskRow: View {
+    let task: SyncTask
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                // Status indicator
+                Group {
+                    switch task.status {
+                    case .pending:
+                        Circle()
+                            .stroke(Color(red: 0, green: 0.3, blue: 0.08), lineWidth: 1)
+                            .frame(width: 14, height: 14)
+                    case .inProgress:
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: Color(red: 0, green: 1, blue: 0.25)))
+                            .scaleEffect(0.6)
+                            .frame(width: 14, height: 14)
+                    case .completed:
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(Color(red: 0, green: 0.8, blue: 0.2))
+                            .font(.system(size: 14))
+                    case .failed:
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.red)
+                            .font(.system(size: 14))
+                    }
+                }
+
+                // Task title
+                Text(task.title)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(taskTextColor)
+
+                Spacer()
+
+                // Detail (e.g., "2923000 / 2924000")
+                if let detail = task.detail {
+                    Text(detail)
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                }
+            }
+
+            // Progress bar for in-progress tasks
+            if let progress = task.progress, case .inProgress = task.status, progress > 0 {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(Color(red: 0, green: 0.15, blue: 0.03))
+                            .frame(height: 3)
+
+                        Rectangle()
+                            .fill(Color(red: 0, green: 0.8, blue: 0.2))
+                            .frame(width: geometry.size.width * min(progress, 1.0), height: 3)
+                    }
+                }
+                .frame(height: 3)
+                .padding(.leading, 22)
+            }
+        }
+    }
+
+    private var taskTextColor: Color {
+        switch task.status {
+        case .pending:
+            return Color(red: 0, green: 0.3, blue: 0.08)
+        case .inProgress:
+            return Color(red: 0, green: 1, blue: 0.25)
+        case .completed:
+            return Color(red: 0, green: 0.7, blue: 0.2)
+        case .failed:
+            return .red
         }
     }
 }

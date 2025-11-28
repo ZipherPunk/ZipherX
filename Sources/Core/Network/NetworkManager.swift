@@ -913,6 +913,147 @@ final class NetworkManager: ObservableObject {
         return height
     }
 
+    // MARK: - P2P Block Data for Scanning (Full P2P Mode)
+
+    /// Get block data with shielded outputs in format compatible with FilterScanner
+    /// Returns: (blockHash, [(txid, [ShieldedOutput], [ShieldedSpend]?)])
+    func getBlockDataP2P(height: UInt64) async throws -> (String, [(String, [ShieldedOutput], [ShieldedSpend]?)]) {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        guard let peer = peers.first else {
+            throw NetworkError.notConnected
+        }
+
+        // Get the block via P2P
+        let blocks = try await peer.getFullBlocks(from: height, count: 1)
+        guard let block = blocks.first else {
+            throw NetworkError.consensusNotReached
+        }
+
+        // Convert block hash to hex string
+        let blockHashHex = block.blockHash.map { String(format: "%02x", $0) }.joined()
+
+        // Parse each transaction in the block
+        var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+        for (index, tx) in block.transactions.enumerated() {
+            // Convert CompactOutput to ShieldedOutput format
+            var shieldedOutputs: [ShieldedOutput] = []
+            for output in tx.outputs {
+                // Convert Data to hex strings in display format (big-endian for cmu/epk)
+                // Note: The wire format is little-endian, display format is big-endian (reversed)
+                let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                // Ciphertext is NOT reversed - it's raw bytes
+                let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+
+                let shieldedOutput = ShieldedOutput(
+                    cv: String(repeating: "0", count: 64), // Not used for decryption
+                    cmu: cmuHex,
+                    ephemeralKey: epkHex,
+                    encCiphertext: ciphertextHex,
+                    outCiphertext: String(repeating: "0", count: 160), // Not used for decryption
+                    proof: String(repeating: "0", count: 384) // Not used for decryption
+                )
+                shieldedOutputs.append(shieldedOutput)
+            }
+
+            // Convert CompactSpend to ShieldedSpend format
+            var shieldedSpends: [ShieldedSpend]? = nil
+            if !tx.spends.isEmpty {
+                shieldedSpends = tx.spends.map { spend in
+                    // Nullifier in display format (big-endian)
+                    let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                    return ShieldedSpend(
+                        cv: String(repeating: "0", count: 64),
+                        anchor: String(repeating: "0", count: 64),
+                        nullifier: nullifierHex,
+                        rk: String(repeating: "0", count: 64),
+                        proof: String(repeating: "0", count: 384),
+                        spendAuthSig: String(repeating: "0", count: 128)
+                    )
+                }
+            }
+
+            // Generate txid from transaction data (placeholder - would need real tx hash)
+            let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+
+            if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+            }
+        }
+
+        return (blockHashHex, txDataList)
+    }
+
+    /// Get multiple blocks' data for P2P scanning
+    func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+        guard isConnected else {
+            throw NetworkError.notConnected
+        }
+
+        guard let peer = peers.first else {
+            throw NetworkError.notConnected
+        }
+
+        let blocks = try await peer.getFullBlocks(from: height, count: count)
+
+        var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+
+        for (index, block) in blocks.enumerated() {
+            let blockHeight = height + UInt64(index)
+            let blockHashHex = block.blockHash.map { String(format: "%02x", $0) }.joined()
+
+            var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+            for tx in block.transactions {
+                var shieldedOutputs: [ShieldedOutput] = []
+                for output in tx.outputs {
+                    let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                    let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                    let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+
+                    let shieldedOutput = ShieldedOutput(
+                        cv: String(repeating: "0", count: 64),
+                        cmu: cmuHex,
+                        ephemeralKey: epkHex,
+                        encCiphertext: ciphertextHex,
+                        outCiphertext: String(repeating: "0", count: 160),
+                        proof: String(repeating: "0", count: 384)
+                    )
+                    shieldedOutputs.append(shieldedOutput)
+                }
+
+                var shieldedSpends: [ShieldedSpend]? = nil
+                if !tx.spends.isEmpty {
+                    shieldedSpends = tx.spends.map { spend in
+                        let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                        return ShieldedSpend(
+                            cv: String(repeating: "0", count: 64),
+                            anchor: String(repeating: "0", count: 64),
+                            nullifier: nullifierHex,
+                            rk: String(repeating: "0", count: 64),
+                            proof: String(repeating: "0", count: 384),
+                            spendAuthSig: String(repeating: "0", count: 128)
+                        )
+                    }
+                }
+
+                let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+
+                if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                    txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+                }
+            }
+
+            results.append((blockHeight, blockHashHex, txDataList))
+        }
+
+        return results
+    }
+
     // MARK: - Peer Rotation
 
     private func setupPeerRotation() {

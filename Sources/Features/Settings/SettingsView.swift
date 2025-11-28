@@ -32,6 +32,9 @@ struct SettingsView: View {
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
+    @State private var debugLoggingEnabled = DebugLogger.shared.isEnabled
+    @State private var showDebugLogShare = false
+    @State private var debugLogSize: String = "0 KB"
 
     var body: some View {
         ScrollView {
@@ -47,6 +50,9 @@ struct SettingsView: View {
 
                 // Export section
                 exportSection
+
+                // Debug section
+                debugLoggingSection
 
                 /* DISABLED: Blockchain data section
                 // Rescan section
@@ -386,6 +392,131 @@ struct SettingsView: View {
             Rectangle()
                 .stroke(System7Theme.black, lineWidth: 1)
         )
+    }
+
+    // MARK: - Debug Logging Section
+
+    private var debugLoggingSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "ladybug")
+                    .font(.system(size: 12))
+                Text("Debug Logging")
+                    .font(System7Theme.titleFont(size: 12))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+
+            // Debug toggle
+            HStack {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 14))
+                    .foregroundColor(System7Theme.black)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enable Debug Log")
+                        .font(System7Theme.bodyFont(size: 11))
+                        .foregroundColor(System7Theme.black)
+                    Text("Log size: \(debugLogSize)")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: $debugLoggingEnabled)
+                    .labelsHidden()
+                    .onChange(of: debugLoggingEnabled) { newValue in
+                        DebugLogger.shared.isEnabled = newValue
+                        if newValue {
+                            DebugLogger.shared.logSystemInfo()
+                        }
+                        updateDebugLogSize()
+                    }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(System7Theme.white)
+            .overlay(
+                Rectangle()
+                    .stroke(System7Theme.black, lineWidth: 1)
+            )
+
+            // Export and Clear buttons
+            HStack(spacing: 12) {
+                // Export button
+                Button(action: {
+                    showDebugLogShare = true
+                }) {
+                    HStack {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 12))
+                        Text("Export Log")
+                            .font(System7Theme.titleFont(size: 11))
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.blue)
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.blue.opacity(0.8), lineWidth: 2)
+                    )
+                }
+
+                // Clear button
+                Button(action: {
+                    DebugLogger.shared.clearLog()
+                    updateDebugLogSize()
+                }) {
+                    HStack {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                        Text("Clear")
+                            .font(System7Theme.titleFont(size: 11))
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.red)
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.red.opacity(0.8), lineWidth: 2)
+                    )
+                }
+            }
+
+            // Info text
+            Text("When enabled, all app logs are saved to debug.log file that you can export for troubleshooting.")
+                .font(System7Theme.bodyFont(size: 9))
+                .foregroundColor(System7Theme.darkGray)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+        }
+        .padding(12)
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
+        .onAppear {
+            updateDebugLogSize()
+        }
+        .sheet(isPresented: $showDebugLogShare) {
+            ShareSheet(activityItems: [DebugLogger.shared.getLogFileURL()])
+        }
+    }
+
+    private func updateDebugLogSize() {
+        let size = DebugLogger.shared.getLogFileSize()
+        if size < 1024 {
+            debugLogSize = "\(size) B"
+        } else if size < 1024 * 1024 {
+            debugLogSize = String(format: "%.1f KB", Double(size) / 1024.0)
+        } else {
+            debugLogSize = String(format: "%.1f MB", Double(size) / (1024.0 * 1024.0))
+        }
     }
 
     // MARK: - Rescan Section
@@ -1109,6 +1240,23 @@ struct SettingsView: View {
             }
         }
     }
+}
+
+// MARK: - Share Sheet
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    var applicationActivities: [UIActivity]? = nil
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(
+            activityItems: activityItems,
+            applicationActivities: applicationActivities
+        )
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {

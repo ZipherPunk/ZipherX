@@ -928,12 +928,39 @@ pub unsafe extern "C" fn zipherx_init_prover(
     }
 
     // Get file sizes for verification
-    if let Ok(metadata) = std::fs::metadata(spend_path) {
-        eprintln!("   Spend file size: {} bytes", metadata.len());
+    let spend_size = match std::fs::metadata(spend_path) {
+        Ok(m) => {
+            eprintln!("   Spend file size: {} bytes (expected: 47958396)", m.len());
+            m.len()
+        }
+        Err(e) => {
+            eprintln!("❌ Cannot read spend file metadata: {:?}", e);
+            return false;
+        }
+    };
+
+    let output_size = match std::fs::metadata(output_path) {
+        Ok(m) => {
+            eprintln!("   Output file size: {} bytes (expected: 3592860)", m.len());
+            m.len()
+        }
+        Err(e) => {
+            eprintln!("❌ Cannot read output file metadata: {:?}", e);
+            return false;
+        }
+    };
+
+    // Verify expected file sizes
+    if spend_size != 47958396 {
+        eprintln!("❌ Spend params file has wrong size! Got {}, expected 47958396", spend_size);
+        return false;
     }
-    if let Ok(metadata) = std::fs::metadata(output_path) {
-        eprintln!("   Output file size: {} bytes", metadata.len());
+    if output_size != 3592860 {
+        eprintln!("❌ Output params file has wrong size! Got {}, expected 3592860", output_size);
+        return false;
     }
+
+    eprintln!("📂 File sizes verified, loading prover...");
 
     // Load the prover with Sapling parameters (can panic on invalid files)
     let prover = std::panic::catch_unwind(|| {
@@ -949,6 +976,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
         }
         Err(e) => {
             eprintln!("❌ Prover initialization panicked: {:?}", e);
+            eprintln!("   This usually means the params files are corrupted or have wrong format");
             false
         }
     }

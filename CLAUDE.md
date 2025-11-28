@@ -204,6 +204,20 @@ Before any release:
     - Settings toggle: "P2P Only Mode" (UserDefaults: `useP2POnly`)
     - Trustless operation: No centralized API dependency when enabled
 
+21. **Debug Logging System** - File-based debug logging (November 2025) ✅
+    - `DebugLogger.swift` - Singleton logger with file output
+    - Toggle in Settings: "Enable Debug Logging" (UserDefaults: `debugLoggingEnabled`)
+    - Export debug log via share sheet
+    - Categorized logging: NET, CRYPTO, WALLET, SYNC, TX, FFI, UI, ERROR, PARAMS
+    - `debugLog()` global function for easy logging throughout codebase
+
+22. **Bundled Sapling Parameters** - No download required (November 2025) ✅
+    - `sapling-spend.params` (46 MB) - bundled in app
+    - `sapling-output.params` (3.4 MB) - bundled in app
+    - Copied from bundle to Documents on first launch
+    - Falls back to download from z.cash if bundle copy fails
+    - Enables instant transaction sending without network delay
+
 ### In Progress / Needs Testing
 
 1. **Balance UI Update** - Show tree loading progress in main wallet view

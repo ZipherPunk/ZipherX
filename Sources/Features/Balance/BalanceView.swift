@@ -195,6 +195,52 @@ struct BalanceView: View {
                 .padding(.vertical, 6)
             }
 
+            // Simplified wallet status - just show current state
+            Divider()
+                .background(System7Theme.black)
+
+            HStack {
+                if walletManager.isSyncing {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                    Text("Syncing...")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.black)
+                    Spacer()
+                    if walletManager.syncProgress > 0 {
+                        Text("\(Int(walletManager.syncProgress * 100))%")
+                            .font(System7Theme.bodyFont(size: 9))
+                            .foregroundColor(System7Theme.darkGray)
+                    }
+                } else if !networkManager.isConnected {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.red)
+                        .font(.system(size: 10))
+                    Text("Disconnected")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(.red)
+                    Spacer()
+                } else if networkManager.chainHeight > 0 && networkManager.walletHeight >= networkManager.chainHeight {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 10))
+                    Text("Synced")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                } else {
+                    Image(systemName: "clock")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                    Text("Waiting to sync")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                }
+            }
+            .padding(8)
+
+            /* DISABLED: Detailed sync tasks list
             // Sync tasks list - always show when tasks exist or syncing
             if !walletManager.syncTasks.isEmpty || walletManager.isSyncing {
                 Divider()
@@ -265,6 +311,7 @@ struct BalanceView: View {
                 }
                 .padding(8)
             }
+            */
         }
         .background(System7Theme.lightGray)
         .overlay(
