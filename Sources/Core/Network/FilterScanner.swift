@@ -84,6 +84,22 @@ final class FilterScanner {
         currentChainHeight = latestHeight
         print("📊 Chain height: \(latestHeight)")
 
+        // Test P2P block fetching before starting scan
+        // This determines if we can use P2P or need to fall back to InsightAPI
+        if FilterScanner.p2pBlockFetchingWorks == nil {
+            let p2pWorks = await testP2PBlockFetching()
+            FilterScanner.p2pBlockFetchingWorks = p2pWorks
+            if p2pWorks {
+                print("✅ P2P block fetching enabled")
+            } else {
+                if useP2POnly {
+                    print("❌ P2P-only mode enabled but P2P block fetch failed!")
+                    throw ScanError.networkError
+                }
+                print("⚠️ P2P block fetch failed, will use InsightAPI")
+            }
+        }
+
         // Determine start height
         var startHeight: UInt64
 
@@ -134,17 +150,33 @@ final class FilterScanner {
             }
         }
 
-        print("🔍 Scanning from \(startHeight) to \(latestHeight)")
+        // If startHeight > latestHeight, chain may have grown - refresh height
+        if startHeight > latestHeight {
+            print("⚠️ Start height \(startHeight) > chain height \(latestHeight), refreshing...")
+            // Try InsightAPI for more accurate height
+            if let apiHeight = try? await insightAPI.getStatus().height, apiHeight >= startHeight {
+                currentChainHeight = apiHeight
+                print("📊 Updated chain height from InsightAPI: \(apiHeight)")
+            } else {
+                // Truly already synced
+                print("✅ Already synced to chain tip")
+                onProgress?(1.0, latestHeight, latestHeight)
+                return
+            }
+        }
 
-        guard startHeight <= latestHeight else {
+        let targetHeight = currentChainHeight
+        print("🔍 Scanning from \(startHeight) to \(targetHeight)")
+
+        guard startHeight <= targetHeight else {
             // Already fully synced
             print("✅ Already synced")
-            onProgress?(1.0, latestHeight, latestHeight) // Report 100% completion
+            onProgress?(1.0, targetHeight, targetHeight) // Report 100% completion
             return
         }
 
         // Calculate total blocks to scan
-        let totalBlocks = latestHeight - startHeight + 1
+        let totalBlocks = targetHeight - startHeight + 1
         var scannedBlocks: UInt64 = 0
 
         // Keep spending key for direct decryption (uses zcash_primitives internally)
@@ -194,9 +226,22 @@ final class FilterScanner {
         // If starting from bundledTreeHeight+1, we need bundled tree, not database state
         let needsFreshBundledTree = customStartHeight != nil && customStartHeight! > bundledTreeHeight
 
+        // CRITICAL: Check if tree is already loaded in FFI memory (WalletManager may have loaded it)
+        // This prevents race condition where FilterScanner loads again while WalletManager is loading
+        let existingTreeSize = ZipherXFFI.treeSize()
+        if !needsFreshBundledTree && existingTreeSize > 0 {
+            print("🌳 Tree already loaded in memory with \(existingTreeSize) commitments")
+            treeInitialized = true
+            // Store bundled CMU data for position lookup during parallel scan
+            if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+               let bundledData = try? Data(contentsOf: bundledCMUsURL) {
+                self.bundledCMUData = bundledData
+            }
+        }
+
         // Initialize commitment tree
-        // Priority: 1) Database state (unless rescanning), 2) Bundled tree, 3) Empty tree
-        if !needsFreshBundledTree, let treeData = try? database.getTreeState() {
+        // Priority: 1) Already in memory, 2) Database state (unless rescanning), 3) Bundled tree, 4) Empty tree
+        if !treeInitialized && !needsFreshBundledTree, let treeData = try? database.getTreeState() {
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
                 print("🌳 Restored commitment tree with \(treeSize) commitments")
@@ -216,12 +261,8 @@ final class FilterScanner {
         // Try bundled CMUs if database tree failed or doesn't exist
         // CMUs allow us to build the tree properly and create valid witnesses
         if !treeInitialized {
-            // First try complete tree (includes all outputs up to current), then fall back to partial tree
-            let treeFileName = Bundle.main.url(forResource: "commitment_tree_complete", withExtension: "bin") != nil
-                ? "commitment_tree_complete"
-                : "commitment_tree"
-
-            if let bundledCMUsURL = Bundle.main.url(forResource: treeFileName, withExtension: "bin"),
+            // Use commitment_tree.bin (the only bundled tree file)
+            if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
                let bundledData = try? Data(contentsOf: bundledCMUsURL) {
                 print("🌳 Loading bundled CMUs (\(bundledData.count / 1024 / 1024) MB)...")
                 // Store bundled CMU data for position lookup during parallel scan
@@ -256,10 +297,6 @@ final class FilterScanner {
                 let buildTime = Date().timeIntervalSince(buildStart)
                 let treeSize = ZipherXFFI.treeSize()
                 print("🌳 Built commitment tree with \(treeSize) commitments in \(String(format: "%.1f", buildTime))s")
-
-                // The bundled CMUs are from Sapling activation to current scanned height
-                // commitment_tree_complete.bin includes ALL outputs from ALL transactions
-                print("📦 Loaded complete commitment tree with ALL Sapling outputs")
                 treeInitialized = true
 
                 // Save tree state to database
@@ -293,7 +330,7 @@ final class FilterScanner {
         pendingWitnesses = []
 
         // Report initial progress immediately so UI shows progress bar
-        onProgress?(0.01, startHeight, latestHeight)
+        onProgress?(0.01, startHeight, targetHeight)
 
         // Determine scanning strategy:
         // - If scanning within bundled tree range: use PARALLEL mode (note discovery only)
@@ -304,7 +341,7 @@ final class FilterScanner {
         if scanWithinBundledRange && startHeight <= bundledTreeHeight {
             print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(bundledTreeHeight) for notes (parallel, no tree building)")
 
-            let parallelEndHeight = min(bundledTreeHeight, latestHeight)
+            let parallelEndHeight = min(bundledTreeHeight, targetHeight)
             let parallelTotalBlocks = parallelEndHeight - startHeight + 1
             var parallelScannedBlocks: UInt64 = 0
             let parallelBatchSize = 100
@@ -360,7 +397,7 @@ final class FilterScanner {
                         // Report progress every 50 blocks, at start, and at end
                         if parallelScannedBlocks == 1 || parallelScannedBlocks % 50 == 0 || parallelScannedBlocks == parallelTotalBlocks {
                             let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
-                            onProgress?(progress * 0.5, height, latestHeight) // 50% for phase 1
+                            onProgress?(progress * 0.5, height, targetHeight) // 50% for phase 1
                         }
                     }
                 }
@@ -382,7 +419,7 @@ final class FilterScanner {
         // - We did PHASE 1 and there are more blocks after bundledTreeHeight
         // - OR no custom start height was provided (normal auto-scan)
         // - OR custom start height is AFTER bundled tree (must use sequential for correct positions)
-        let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= latestHeight
+        let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= targetHeight
 
         // Quick scan is ONLY safe when scanning WITHIN bundled tree range where positions are known
         // If starting AFTER bundled tree, we MUST use sequential mode for correct nullifier computation
@@ -392,7 +429,7 @@ final class FilterScanner {
         let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > bundledTreeHeight
 
         if continueAfterBundledRange || forceSequentialAfterBundled {
-            print("⚡ PHASE 2: Scanning blocks \(currentHeight) to \(latestHeight) for notes + tree building (sequential)")
+            print("⚡ PHASE 2: Scanning blocks \(currentHeight) to \(targetHeight) for notes + tree building (sequential)")
         }
 
         if isQuickScanOnly {
@@ -400,8 +437,8 @@ final class FilterScanner {
             // Now also fetches spends for nullifier detection
             let parallelBatchSize = 100 // Process 100 blocks at a time in parallel
 
-            while currentHeight <= latestHeight && isScanning {
-                let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, latestHeight)
+            while currentHeight <= targetHeight && isScanning {
+                let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, targetHeight)
                 let heights = Array(currentHeight...endHeight)
 
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
@@ -448,7 +485,7 @@ final class FilterScanner {
                         scannedBlocks += 1
                         if scannedBlocks % 50 == 0 || scannedBlocks == totalBlocks {
                             let progress = Double(scannedBlocks) / Double(totalBlocks)
-                            onProgress?(progress, height, latestHeight)
+                            onProgress?(progress, height, targetHeight)
                         }
                     }
                 }
@@ -463,8 +500,8 @@ final class FilterScanner {
             // Runs when: no custom start OR after PHASE 1 for blocks beyond bundled tree
             // OR when custom start is AFTER bundled tree (need sequential for correct positions)
             // P2P-FIRST: Uses P2P network with InsightAPI fallback (unless useP2POnly is true)
-            while currentHeight <= latestHeight && isScanning {
-                let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)
+            while currentHeight <= targetHeight && isScanning {
+                let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
                 let heights = Array(currentHeight...endHeight)
 
                 print("📦 Fetching blocks \(currentHeight) to \(endHeight) via \(useP2POnly ? "P2P only" : "P2P+fallback")...")
@@ -528,7 +565,7 @@ final class FilterScanner {
                     // Report progress every 10 blocks for better UI feedback
                     if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
                         let progress = Double(scannedBlocks) / Double(totalBlocks)
-                        onProgress?(progress, height, latestHeight)
+                        onProgress?(progress, height, targetHeight)
                     }
                 }
 
@@ -1379,22 +1416,67 @@ final class FilterScanner {
 
     // MARK: - P2P Block Data Fetching
 
-    /// Fetch block data for scanning - uses P2P first, InsightAPI as fallback
+    /// Track if P2P block fetching is working (to avoid repeated failures)
+    private static var p2pBlockFetchingWorks: Bool? = nil
+
+    /// Reset P2P status to re-test on next scan
+    static func resetP2PStatus() {
+        p2pBlockFetchingWorks = nil
+        print("🔄 P2P status reset - will re-test on next scan")
+    }
+
+    /// Test P2P block fetching by requesting a single recent block
+    /// Call this before starting scan to verify P2P is working
+    private func testP2PBlockFetching() async -> Bool {
+        guard networkManager.isConnected else {
+            print("⚠️ P2P test: Not connected to any peers")
+            return false
+        }
+
+        // Try to fetch a recent block via P2P to verify it works
+        // Use a block from HeaderStore (most recent one)
+        guard let latestHeight = try? HeaderStore.shared.getLatestHeight(),
+              let header = try? HeaderStore.shared.getHeader(at: latestHeight) else {
+            print("⚠️ P2P test: No headers in store to test with")
+            return false
+        }
+
+        print("🔍 Testing P2P block fetch at height \(latestHeight)...")
+
+        do {
+            // Try to get this block via P2P
+            guard let peer = networkManager.peers.first else {
+                print("⚠️ P2P test: No peers available")
+                return false
+            }
+
+            let block = try await peer.getBlockByHash(hash: header.blockHash)
+            print("✅ P2P test: Successfully fetched block at height \(latestHeight) with \(block.transactions.count) transactions")
+            return true
+        } catch {
+            print("❌ P2P test: Failed to fetch block - \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Fetch block data for scanning - tries P2P first, falls back to InsightAPI
     /// Returns: [(txid, [ShieldedOutput], [ShieldedSpend]?)]
     private func fetchBlockData(height: UInt64) async throws -> [(String, [ShieldedOutput], [ShieldedSpend]?)] {
-        // Try P2P first
-        if networkManager.isConnected {
+        // Try P2P if it's known to work or hasn't been tested yet
+        if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected {
             do {
                 let (_, txData) = try await networkManager.getBlockDataP2P(height: height)
-                if !txData.isEmpty {
-                    print("📡 P2P: Got \(txData.count) transactions at height \(height)")
-                    return txData
-                }
+                FilterScanner.p2pBlockFetchingWorks = true
+                return txData
             } catch {
-                if useP2POnly {
-                    throw error // Don't fallback if P2P-only mode
+                // P2P failed - mark it as not working and fall back
+                if FilterScanner.p2pBlockFetchingWorks == nil {
+                    print("⚠️ P2P block fetch failed, will use InsightAPI for remaining blocks")
+                    FilterScanner.p2pBlockFetchingWorks = false
                 }
-                print("⚠️ P2P failed at height \(height), trying InsightAPI...")
+                if useP2POnly {
+                    throw error
+                }
             }
         }
 
@@ -1419,11 +1501,11 @@ final class FilterScanner {
         return txData
     }
 
-    /// Fetch multiple blocks' data for scanning - uses P2P first, InsightAPI as fallback
+    /// Fetch multiple blocks' data for scanning - tries P2P batch first, falls back to InsightAPI
     /// Returns: [(height, [(txid, [ShieldedOutput], [ShieldedSpend]?)])]
     private func fetchBlocksData(heights: [UInt64]) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        // Try P2P batch fetch first
-        if networkManager.isConnected && !heights.isEmpty {
+        // Try P2P batch fetch if it's known to work or hasn't been tested
+        if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected && !heights.isEmpty {
             do {
                 let startHeight = heights.min()!
                 let count = heights.count
@@ -1431,37 +1513,73 @@ final class FilterScanner {
 
                 var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
                 for (h, _, txData) in results {
-                    if !txData.isEmpty {
-                        blockData.append((h, txData))
-                    }
+                    blockData.append((h, txData))
                 }
 
                 if !blockData.isEmpty {
-                    print("📡 P2P batch: Got data for \(blockData.count) blocks")
+                    FilterScanner.p2pBlockFetchingWorks = true
+                    print("📡 P2P: Got data for \(blockData.count) blocks")
                     return blockData
                 }
             } catch {
+                if FilterScanner.p2pBlockFetchingWorks == nil {
+                    print("⚠️ P2P batch fetch failed, switching to InsightAPI")
+                    FilterScanner.p2pBlockFetchingWorks = false
+                }
                 if useP2POnly {
                     throw error
                 }
-                print("⚠️ P2P batch failed, falling back to InsightAPI...")
             }
         }
 
-        // Fallback to InsightAPI individual fetches (unless P2P-only mode)
+        // Fallback to InsightAPI with parallel fetching
         if useP2POnly {
             throw ScanError.networkError
         }
 
         var results: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-        for height in heights {
-            let txData = try await fetchBlockData(height: height)
-            if !txData.isEmpty {
-                results.append((height, txData))
+        let batchSize = 10 // Parallel fetch 10 blocks at a time
+
+        for batchStart in stride(from: 0, to: heights.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, heights.count)
+            let batch = Array(heights[batchStart..<batchEnd])
+
+            let batchResults = await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])?.self) { group in
+                for height in batch {
+                    group.addTask {
+                        do {
+                            let blockHash = try await self.insightAPI.getBlockHash(height: height)
+                            let block = try await self.insightAPI.getBlock(hash: blockHash)
+
+                            var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+                            for txid in block.tx {
+                                let tx = try await self.insightAPI.getTransaction(txid: txid)
+                                let hasOutputs = tx.vShieldedOutput?.isEmpty == false
+                                let hasSpends = tx.vShieldedSpend?.isEmpty == false
+                                if hasOutputs || hasSpends {
+                                    txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
+                                }
+                            }
+                            return (height, txData)
+                        } catch {
+                            return nil
+                        }
+                    }
+                }
+
+                var collected: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                for await result in group {
+                    if let r = result {
+                        collected.append(r)
+                    }
+                }
+                return collected
             }
+
+            results.append(contentsOf: batchResults)
         }
 
-        return results
+        return results.sorted { $0.0 < $1.0 }
     }
 }
 

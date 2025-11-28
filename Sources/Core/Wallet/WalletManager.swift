@@ -90,6 +90,19 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
+    /// Public method to ensure tree is loaded - called from ContentView
+    /// Handles case where wallet was just created/imported and tree wasn't preloaded in init()
+    func ensureTreeLoaded() async {
+        // If already loaded, nothing to do
+        guard !isTreeLoaded else {
+            print("🌳 Tree already loaded, skipping")
+            return
+        }
+
+        // Call the private preload function
+        await preloadCommitmentTree()
+    }
+
     private func preloadCommitmentTree() async {
         print("🌳 Preloading commitment tree...")
 
@@ -153,20 +166,25 @@ final class WalletManager: ObservableObject {
                 "Establishing trust anchors..."
             ]
 
-            // Use progress callback version
-            let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { [weak self] current, total in
-                let progress = Double(current) / Double(total)
-                let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
-                let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
+            // Run the heavy FFI call on a background thread so UI updates can process
+            let success = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let result = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { current, total in
+                        let progress = Double(current) / Double(total)
+                        let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
+                        let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
 
-                // Rotate through cypherpunk messages
-                let messageIndex = Int(current / 100000) % treeLoadMessages.count
-                let statusMessage = treeLoadMessages[messageIndex]
+                        // Rotate through cypherpunk messages
+                        let messageIndex = Int(current / 100000) % treeLoadMessages.count
+                        let statusMessage = treeLoadMessages[messageIndex]
 
-                // Update UI on main thread
-                DispatchQueue.main.async {
-                    self?.treeLoadProgress = progress
-                    self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
+                        // Update UI on main thread
+                        DispatchQueue.main.async {
+                            self?.treeLoadProgress = progress
+                            self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
+                        }
+                    }
+                    continuation.resume(returning: result)
                 }
             }
 
@@ -376,17 +394,19 @@ final class WalletManager: ObservableObject {
             }
 
             // Get starting height for sync
-            // IMPORTANT: Must sync from bundledTreeHeight so P2P block fetching works
+            // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
+            // The getheaders protocol returns headers AFTER the locator hash
+            // Checkpoint at bundledTreeHeight (2923123) will be used as locator
             let bundledTreeHeight: UInt64 = 2923123
             let startHeight: UInt64
             if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
-                // Resume from where we left off (only if we already have headers past bundled tree)
+                // Resume from where we left off
                 startHeight = latestHeight + 1
                 print("📊 Resuming header sync from height \(startHeight)")
             } else {
-                // Start from bundled tree height so P2P scanning can use HeaderStore
-                startHeight = bundledTreeHeight
-                print("📊 Starting header sync from bundled tree height \(startHeight)")
+                // Start from bundledTreeHeight + 1 (checkpoint at bundledTreeHeight used as locator)
+                startHeight = bundledTreeHeight + 1
+                print("📊 Starting header sync from height \(startHeight) (checkpoint at \(bundledTreeHeight))")
             }
 
             try await headerSync.syncHeaders(from: startHeight)

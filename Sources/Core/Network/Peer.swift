@@ -822,19 +822,51 @@ final class Peer {
 
         try await sendMessage(command: "getdata", payload: payload)
 
-        // Wait for block response
+        // Wait for block response with timeout
+        // Peers may send ping, inv, addr messages - we need to handle them
         var attempts = 0
-        while attempts < 10 {
+        let maxAttempts = 30 // Increased from 10 - blocks can be large and slow
+        while attempts < maxAttempts {
             attempts += 1
-            let (command, response) = try await receiveMessage()
 
-            if command == "block" {
-                if let block = parseCompactBlock(response) {
-                    return block
+            // Add timeout for each receive attempt
+            do {
+                let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
+                    group.addTask {
+                        try await self.receiveMessage()
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
+                        throw PeerError.timeout
+                    }
+
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    return result
                 }
-                throw PeerError.invalidData
+
+                let (command, response) = result
+
+                if command == "block" {
+                    if let block = parseCompactBlock(response) {
+                        return block
+                    }
+                    throw PeerError.invalidData
+                } else if command == "notfound" {
+                    // Peer doesn't have this block
+                    throw PeerError.invalidData
+                } else if command == "ping" {
+                    // Respond to ping with pong
+                    try? await sendMessage(command: "pong", payload: response)
+                }
+                // Continue waiting for block message
+            } catch is CancellationError {
+                // Timeout on this attempt, continue to next
+                continue
+            } catch PeerError.timeout {
+                // Timeout, continue to next attempt
+                continue
             }
-            // Ignore other messages
         }
 
         throw PeerError.timeout

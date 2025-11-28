@@ -27,8 +27,13 @@ struct ContentView: View {
                         // Check if this is first launch (tree not yet cached)
                         isFirstLaunch = !walletManager.isTreeLoaded && walletManager.treeLoadProgress < 1.0
 
+                        // Trigger tree loading if not already loaded
+                        // This handles the case where wallet was just created/imported
+                        if !walletManager.isTreeLoaded {
+                            await walletManager.ensureTreeLoaded()
+                        }
+
                         // WAIT for tree to load before proceeding with network operations
-                        // Tree loading happens in WalletManager.init() background task
                         while !walletManager.isTreeLoaded {
                             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                         }
@@ -46,8 +51,8 @@ struct ContentView: View {
                                 print("⚠️ Auto-connect failed: \(error.localizedDescription)")
                             }
                         }
-                        // Wait for connection to stabilize
-                        try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 sec
+                        // Brief pause for UI feedback
+                        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
                         // Now fetch stats
                         await networkManager.fetchNetworkStats()
 
@@ -65,6 +70,9 @@ struct ContentView: View {
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
                         }
+
+                        // Brief pause to show completion before dismissing overlay
+                        try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 sec
 
                         // Mark initial sync as complete ONLY after everything finishes
                         await MainActor.run {
@@ -95,15 +103,19 @@ struct ContentView: View {
         if !walletManager.isTreeLoaded {
             return walletManager.treeLoadProgress * 0.3
         }
-        // Connecting phase (30-35%)
+        // Connecting phase (30-40%)
         if walletManager.isConnecting && !walletManager.isSyncing {
-            return 0.32
+            return 0.35
         }
-        // Sync phase (35-100%)
+        // Sync phase (40-100%)
         if walletManager.isSyncing {
-            return 0.35 + (walletManager.syncProgress * 0.65)
+            return 0.40 + (walletManager.syncProgress * 0.60)
         }
-        // Tree loaded, not syncing yet
+        // If we reach here during initial sync, we're between phases or completing
+        // Return high progress to show we're almost done
+        if isInitialSync && walletManager.isTreeLoaded {
+            return 0.95
+        }
         return 0.30
     }
 
@@ -114,12 +126,16 @@ struct ContentView: View {
             return walletManager.treeLoadStatus.isEmpty ? "Loading commitment tree..." : walletManager.treeLoadStatus
         }
         // Connecting
-        if walletManager.isConnecting {
-            return "Connecting to network..."
+        if walletManager.isConnecting && !walletManager.isSyncing {
+            return walletManager.syncStatus.isEmpty ? "Connecting to network..." : walletManager.syncStatus
         }
         // Syncing
         if walletManager.isSyncing {
             return walletManager.syncStatus
+        }
+        // Tree loaded, network connected, not syncing - wrapping up
+        if walletManager.isTreeLoaded && networkManager.isConnected {
+            return "Finalizing..."
         }
         // Default
         return "Initializing..."
@@ -145,14 +161,22 @@ struct ContentView: View {
         }
 
         // Add connecting task
-        if walletManager.isConnecting && walletManager.syncTasks.isEmpty {
+        if walletManager.isConnecting && walletManager.syncTasks.isEmpty && !networkManager.isConnected {
             tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .inProgress))
-        } else if walletManager.isTreeLoaded && walletManager.syncTasks.isEmpty {
+        } else if networkManager.isConnected {
+            // Already connected - show completed
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
+        } else if walletManager.isTreeLoaded && !networkManager.isConnected {
             tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .pending))
         }
 
         // Add sync tasks from WalletManager
-        tasks.append(contentsOf: walletManager.syncTasks)
+        if !walletManager.syncTasks.isEmpty {
+            tasks.append(contentsOf: walletManager.syncTasks)
+        } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
+            // Sync already complete or skipped - show completed scan task
+            tasks.append(SyncTask(id: "scan", title: "Scan blockchain", status: .completed))
+        }
 
         return tasks
     }

@@ -720,6 +720,49 @@ private var currentSyncTasks: [SyncTask] {
 - `Sources/App/ContentView.swift` - unified overlay, combined progress/tasks computed properties
 - `Sources/UI/Components/System7Components.swift` - `CypherpunkSyncView` now accepts `tasks` parameter, added `CypherpunkSyncTaskRow`
 
+### 13. Header Sync Only Received 160 Headers Instead of Full Range (November 2025)
+
+**Problem**: Header sync only received 160 headers but needed ~1900 to cover from bundled tree height (2923123) to chain tip (~2925030). Scan then failed with "No header found" errors at height 2923283+.
+
+**Root Causes**:
+1. **Batch loop exited early**: Loop incremented `currentHeight = endHeight + 1` regardless of actual headers received
+2. **No valid block locator**: When starting from height 2923123, needed hash at 2923122 as P2P "getheaders" locator, but no checkpoint existed
+3. **Off-by-one height assignment**: If using checkpoint at height N, `getheaders` returns headers AFTER that block (N+1), but heights were assigned starting at N
+
+**Solution**:
+
+1. **Fixed batch loop** (`HeaderSyncManager.swift`):
+   ```swift
+   // Now continues until all headers received
+   while currentHeight <= chainTip {
+       let headers = try await requestHeadersWithConsensus(from: currentHeight, to: chainTip)
+       guard !headers.isEmpty else { break }
+       // ...
+       currentHeight = headers.last!.height + 1  // Based on ACTUAL received
+   }
+   ```
+
+2. **Added checkpoint at bundled tree height** (`Checkpoints.swift`):
+   ```swift
+   2923123: "000004496018943355cdf6c313e2aac3f3356bb7f31a31d1a5b5b582dfe594ef"
+   ```
+
+3. **Use checkpoint as block locator** (`HeaderSyncManager.swift`):
+   ```swift
+   // buildGetHeadersPayload now checks ZclassicCheckpoints.mainnet[locatorHeight]
+   // Converts hex to wire format (reversed bytes) for P2P protocol
+   ```
+
+4. **Fixed start height** (`WalletManager.swift`):
+   - Now starts at `bundledTreeHeight + 1` (2923124)
+   - Checkpoint at 2923123 is used as locator
+   - Headers correctly assigned heights starting at 2923124
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - batch loop fix, checkpoint locator support
+- `Sources/Core/Network/Checkpoints.swift` - added checkpoint at 2923123
+- `Sources/Core/Wallet/WalletManager.swift` - start at bundledTreeHeight + 1
+
 ---
 
 ## Technical Notes
