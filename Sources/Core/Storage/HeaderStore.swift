@@ -375,6 +375,7 @@ final class HeaderStore {
             time: time,
             bits: bits,
             nonce: nonce,
+            solution: Data(),  // Not stored - headers from DB were already verified
             height: height,
             blockHash: blockHash
         )
