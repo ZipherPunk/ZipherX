@@ -376,19 +376,17 @@ final class WalletManager: ObservableObject {
             }
 
             // Get starting height for sync
+            // IMPORTANT: Must sync from bundledTreeHeight so P2P block fetching works
+            let bundledTreeHeight: UInt64 = 2923123
             let startHeight: UInt64
-            if let latestHeight = try HeaderStore.shared.getLatestHeight() {
-                // Resume from where we left off
+            if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
+                // Resume from where we left off (only if we already have headers past bundled tree)
                 startHeight = latestHeight + 1
                 print("📊 Resuming header sync from height \(startHeight)")
             } else {
-                // Start from very recent - just last ~1000 blocks (~16 hours)
-                // This avoids chain discontinuity issues and syncs fast
-                // For transaction building, we only need recent anchors anyway
-                let chainTip = try await headerSync.getChainTip()
-                let blocksToSync: UInt64 = 5000
-                startHeight = chainTip > blocksToSync ? chainTip - blocksToSync : 0
-                print("📊 Starting fresh header sync from recent blocks (height \(startHeight), tip: \(chainTip))")
+                // Start from bundled tree height so P2P scanning can use HeaderStore
+                startHeight = bundledTreeHeight
+                print("📊 Starting header sync from bundled tree height \(startHeight)")
             }
 
             try await headerSync.syncHeaders(from: startHeight)
