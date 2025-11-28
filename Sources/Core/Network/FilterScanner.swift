@@ -9,6 +9,11 @@ final class FilterScanner {
     private let rustBridge: RustBridge
     private let insightAPI: InsightAPI
 
+    // P2P-Only Mode: When true, uses P2P network exclusively (no InsightAPI)
+    // When false (default), tries P2P first then falls back to InsightAPI
+    // Reads from UserDefaults - can be changed in Settings
+    var useP2POnly: Bool = UserDefaults.standard.bool(forKey: "useP2POnly")
+
     // Scanning parameters
     private let batchSize = 500 // Larger batches for faster sync
     private var isScanning = false
@@ -310,24 +315,12 @@ final class FilterScanner {
 
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
-                // Fetch all blocks in parallel - now also fetch spends for nullifier detection
+                // Fetch all blocks in parallel using P2P-first approach
                 await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
                     for height in heights {
                         group.addTask {
                             do {
-                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
-                                let block = try await self.insightAPI.getBlock(hash: blockHash)
-
-                                var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-                                for txid in block.tx {
-                                    let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    // Fetch both outputs AND spends (for nullifier detection)
-                                    let hasOutputs = tx.vShieldedOutput?.isEmpty == false
-                                    let hasSpends = tx.vShieldedSpend?.isEmpty == false
-                                    if hasOutputs || hasSpends {
-                                        txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
-                                    }
-                                }
+                                let txData = try await self.fetchBlockData(height: height)
                                 return (height, txData.isEmpty ? nil : txData)
                             } catch {
                                 return (height, nil)
@@ -413,24 +406,12 @@ final class FilterScanner {
 
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
-                // Fetch all blocks in parallel - also fetch spends for nullifier detection
+                // Fetch all blocks in parallel using P2P-first approach
                 await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
                     for height in heights {
                         group.addTask {
                             do {
-                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
-                                let block = try await self.insightAPI.getBlock(hash: blockHash)
-
-                                var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-                                for txid in block.tx {
-                                    let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    // Fetch both outputs AND spends (for nullifier detection)
-                                    let hasOutputs = tx.vShieldedOutput?.isEmpty == false
-                                    let hasSpends = tx.vShieldedSpend?.isEmpty == false
-                                    if hasOutputs || hasSpends {
-                                        txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
-                                    }
-                                }
+                                let txData = try await self.fetchBlockData(height: height)
                                 return (height, txData.isEmpty ? nil : txData)
                             } catch {
                                 return (height, nil)
@@ -481,107 +462,66 @@ final class FilterScanner {
             // SEQUENTIAL MODE - for full rescan that needs tree building
             // Runs when: no custom start OR after PHASE 1 for blocks beyond bundled tree
             // OR when custom start is AFTER bundled tree (need sequential for correct positions)
-            // OPTIMIZED: Batch fetch blocks and prefetch transactions
+            // P2P-FIRST: Uses P2P network with InsightAPI fallback (unless useP2POnly is true)
             while currentHeight <= latestHeight && isScanning {
                 let endHeight = min(currentHeight + UInt64(batchSize) - 1, latestHeight)
                 let heights = Array(currentHeight...endHeight)
 
-                print("📦 Fetching blocks \(currentHeight) to \(endHeight)...")
+                print("📦 Fetching blocks \(currentHeight) to \(endHeight) via \(useP2POnly ? "P2P only" : "P2P+fallback")...")
 
-                // OPTIMIZATION 1: Fetch all block hashes in parallel
-                var blockData: [(UInt64, [String])] = [] // (height, txids)
-                await withTaskGroup(of: (UInt64, [String]?).self) { group in
-                    for height in heights {
-                        group.addTask {
-                            do {
-                                let blockHash = try await self.insightAPI.getBlockHash(height: height)
-                                let block = try await self.insightAPI.getBlock(hash: blockHash)
-                                return (height, block.tx)
-                            } catch {
-                                return (height, nil)
-                            }
-                        }
+                // Fetch all block data using P2P-first approach
+                var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                do {
+                    blockData = try await fetchBlocksData(heights: heights.map { UInt64($0) })
+                } catch {
+                    print("❌ Failed to fetch blocks \(currentHeight)-\(endHeight): \(error)")
+                    if useP2POnly {
+                        throw error
                     }
-                    for await (height, txids) in group {
-                        if let txids = txids {
-                            blockData.append((height, txids))
-                        }
-                    }
+                    // In fallback mode, continue with empty data for this batch
+                    currentHeight = endHeight + 1
+                    continue
                 }
 
                 // Sort by height for sequential tree processing
                 blockData.sort { $0.0 < $1.0 }
 
-                // OPTIMIZATION 2: Prefetch all transactions in parallel
-                var allTxids: [(UInt64, String)] = [] // (height, txid)
-                for (height, txids) in blockData {
-                    for txid in txids {
-                        allTxids.append((height, txid))
-                    }
-                }
-
-                // Fetch transactions in parallel batches of 50
-                // Now also fetches spends for nullifier detection
-                var txCache: [String: (UInt64, [ShieldedOutput]?, [ShieldedSpend]?)] = [:] // txid -> (height, outputs, spends)
-                let txBatchSize = 50
-                for i in stride(from: 0, to: allTxids.count, by: txBatchSize) {
-                    let batch = Array(allTxids[i..<min(i + txBatchSize, allTxids.count)])
-
-                    await withTaskGroup(of: (String, UInt64, [ShieldedOutput]?, [ShieldedSpend]?).self) { group in
-                        for (height, txid) in batch {
-                            group.addTask {
-                                do {
-                                    let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                    return (txid, height, tx.vShieldedOutput, tx.vShieldedSpend)
-                                } catch {
-                                    return (txid, height, nil, nil)
-                                }
-                            }
-                        }
-                        for await (txid, height, outputs, spends) in group {
-                            txCache[txid] = (height, outputs, spends)
-                        }
-                    }
-                }
-
-                // OPTIMIZATION 3: Process sequentially but with cached data (no network wait)
-                for (height, txids) in blockData {
+                // Process sequentially (data already fetched)
+                for (height, txList) in blockData {
                     guard isScanning else { break }
 
                     var blockTxWithShieldedCount = 0
-                    for txid in txids {
-                        if let (_, outputs, spends) = txCache[txid] {
-                            // Process if there are outputs OR spends (for nullifier detection)
-                            let hasOutputs = outputs?.isEmpty == false
-                            let hasSpends = spends?.isEmpty == false
-                            if hasOutputs || hasSpends {
-                                blockTxWithShieldedCount += 1
-                                let outputCount = outputs?.count ?? 0
-                                let spendCount = spends?.count ?? 0
-                                print("🔍 Block \(height): Processing tx \(txid) with \(outputCount) outputs, \(spendCount) spends")
+                    for (txid, outputs, spends) in txList {
+                        // Process if there are outputs OR spends (for nullifier detection)
+                        let hasOutputs = !outputs.isEmpty
+                        let hasSpends = spends?.isEmpty == false
+                        if hasOutputs || hasSpends {
+                            blockTxWithShieldedCount += 1
+                            let outputCount = outputs.count
+                            let spendCount = spends?.count ?? 0
+                            print("🔍 Block \(height): Processing tx \(txid) with \(outputCount) outputs, \(spendCount) spends")
 
-                                // Process on main actor to avoid SQLite threading issues
-                                do {
-                                    try await MainActor.run {
-                                        try self.processShieldedOutputsSync(
-                                            outputs: outputs ?? [],
-                                            spends: spends,
-                                            txid: txid,
-                                            accountId: accountId,
-                                            spendingKey: spendingKey,
-                                            ivk: ivk,
-                                            height: height
-                                        )
-                                    }
-                                } catch {
-                                    print("⚠️ Error processing tx \(txid): \(error)")
+                            // Process on main actor to avoid SQLite threading issues
+                            do {
+                                try await MainActor.run {
+                                    try self.processShieldedOutputsSync(
+                                        outputs: outputs,
+                                        spends: spends,
+                                        txid: txid,
+                                        accountId: accountId,
+                                        spendingKey: spendingKey,
+                                        ivk: ivk,
+                                        height: height
+                                    )
                                 }
+                            } catch {
+                                print("⚠️ Error processing tx \(txid): \(error)")
                             }
                         }
                     }
 
                     if blockTxWithShieldedCount > 0 {
-                        print("📊 Block \(height): Found \(blockTxWithShieldedCount) transactions with shielded outputs (out of \(txids.count) total)")
+                        print("📊 Block \(height): Found \(blockTxWithShieldedCount) shielded transactions")
                     }
 
                     scannedBlocks += 1
@@ -1406,10 +1346,14 @@ final class FilterScanner {
             print("📡 P2P chain height: \(p2pHeight)")
             return p2pHeight
         } catch {
+            if useP2POnly {
+                print("❌ P2P height unavailable and P2P-only mode enabled")
+                throw ScanError.networkError
+            }
             print("⚠️ P2P height unavailable, falling back to InsightAPI...")
         }
 
-        // Fallback to InsightAPI if P2P fails
+        // Fallback to InsightAPI if P2P fails (only in fallback mode)
         let status = try await insightAPI.getStatus()
         return status.height
     }
@@ -1431,6 +1375,93 @@ final class FilterScanner {
         // Legacy placeholder - real witnesses are now generated via commitment tree
         // This is kept for processCompactBlock compatibility
         return Data(count: 1028) // Real witness size: 4 + 32*32
+    }
+
+    // MARK: - P2P Block Data Fetching
+
+    /// Fetch block data for scanning - uses P2P first, InsightAPI as fallback
+    /// Returns: [(txid, [ShieldedOutput], [ShieldedSpend]?)]
+    private func fetchBlockData(height: UInt64) async throws -> [(String, [ShieldedOutput], [ShieldedSpend]?)] {
+        // Try P2P first
+        if networkManager.isConnected {
+            do {
+                let (_, txData) = try await networkManager.getBlockDataP2P(height: height)
+                if !txData.isEmpty {
+                    print("📡 P2P: Got \(txData.count) transactions at height \(height)")
+                    return txData
+                }
+            } catch {
+                if useP2POnly {
+                    throw error // Don't fallback if P2P-only mode
+                }
+                print("⚠️ P2P failed at height \(height), trying InsightAPI...")
+            }
+        }
+
+        // Fallback to InsightAPI (unless P2P-only mode)
+        if useP2POnly {
+            throw ScanError.networkError
+        }
+
+        let blockHash = try await insightAPI.getBlockHash(height: height)
+        let block = try await insightAPI.getBlock(hash: blockHash)
+
+        var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+        for txid in block.tx {
+            let tx = try await insightAPI.getTransaction(txid: txid)
+            let hasOutputs = tx.vShieldedOutput?.isEmpty == false
+            let hasSpends = tx.vShieldedSpend?.isEmpty == false
+            if hasOutputs || hasSpends {
+                txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
+            }
+        }
+
+        return txData
+    }
+
+    /// Fetch multiple blocks' data for scanning - uses P2P first, InsightAPI as fallback
+    /// Returns: [(height, [(txid, [ShieldedOutput], [ShieldedSpend]?)])]
+    private func fetchBlocksData(heights: [UInt64]) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+        // Try P2P batch fetch first
+        if networkManager.isConnected && !heights.isEmpty {
+            do {
+                let startHeight = heights.min()!
+                let count = heights.count
+                let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count)
+
+                var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                for (h, _, txData) in results {
+                    if !txData.isEmpty {
+                        blockData.append((h, txData))
+                    }
+                }
+
+                if !blockData.isEmpty {
+                    print("📡 P2P batch: Got data for \(blockData.count) blocks")
+                    return blockData
+                }
+            } catch {
+                if useP2POnly {
+                    throw error
+                }
+                print("⚠️ P2P batch failed, falling back to InsightAPI...")
+            }
+        }
+
+        // Fallback to InsightAPI individual fetches (unless P2P-only mode)
+        if useP2POnly {
+            throw ScanError.networkError
+        }
+
+        var results: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+        for height in heights {
+            let txData = try await fetchBlockData(height: height)
+            if !txData.isEmpty {
+                results.append((height, txData))
+            }
+        }
+
+        return results
     }
 }
 

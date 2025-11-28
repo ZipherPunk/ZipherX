@@ -197,13 +197,16 @@ Before any release:
     - `getBlockByHashWithConsensus()` - Single block with consensus
     - Reject blocks if peers disagree on finalSaplingRoot
 
+20. **Full P2P-Only Scanning** - Complete P2P network support (November 2025) ✅
+    - Raw transaction parsing from P2P `block` messages
+    - `getBlockDataP2P()` / `getBlocksDataP2P()` - Parse shielded outputs/spends from raw blocks
+    - P2P-first scanning with optional InsightAPI fallback
+    - Settings toggle: "P2P Only Mode" (UserDefaults: `useP2POnly`)
+    - Trustless operation: No centralized API dependency when enabled
+
 ### In Progress / Needs Testing
 
-1. **P2P-Only Mode** - Replace remaining InsightAPI calls with P2P
-   - Chain height now uses P2P first, InsightAPI as fallback ✅
-   - Block scanning still uses InsightAPI for transaction parsing
-   - Full P2P mode requires raw transaction parsing (complex refactor)
-2. **Balance UI Update** - Show tree loading progress in main wallet view
+1. **Balance UI Update** - Show tree loading progress in main wallet view
 
 ### Remaining Tasks
 

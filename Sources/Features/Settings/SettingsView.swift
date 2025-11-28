@@ -31,6 +31,7 @@ struct SettingsView: View {
     @State private var showRebuildWitnessesWarning = false
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
+    @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
 
     var body: some View {
         ScrollView {
@@ -41,14 +42,21 @@ struct SettingsView: View {
                 // Security section
                 securitySection
 
+                // Network section
+                networkSection
+
                 // Export section
                 exportSection
 
+                /* DISABLED: Blockchain data section
                 // Rescan section
                 rescanSection
+                */
 
+                /* DISABLED: Debug tools section
                 // Debug section (for testing header sync)
                 debugSection
+                */
 
                 Spacer()
             }
@@ -250,6 +258,81 @@ struct SettingsView: View {
             .overlay(
                 Rectangle()
                     .stroke(System7Theme.black, lineWidth: 1)
+            )
+        }
+        .padding(12)
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
+    }
+
+    // MARK: - Network Section
+
+    private var networkSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "network")
+                    .font(.system(size: 12))
+                Text("Network")
+                    .font(System7Theme.titleFont(size: 12))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+
+            // P2P Only toggle
+            HStack {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 14))
+                    .foregroundColor(System7Theme.black)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("P2P Only Mode")
+                        .font(System7Theme.bodyFont(size: 11))
+                        .foregroundColor(System7Theme.black)
+                    Text("No centralized API fallback")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: $useP2POnly)
+                    .labelsHidden()
+                    .onChange(of: useP2POnly) { newValue in
+                        UserDefaults.standard.set(newValue, forKey: "useP2POnly")
+                        // FilterScanner reads from UserDefaults on init
+                        print("🌐 P2P Only Mode: \(newValue ? "ENABLED" : "disabled")")
+                    }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(System7Theme.white)
+            .overlay(
+                Rectangle()
+                    .stroke(System7Theme.black, lineWidth: 1)
+            )
+
+            // Info text
+            HStack(spacing: 8) {
+                Image(systemName: useP2POnly ? "checkmark.shield.fill" : "info.circle")
+                    .foregroundColor(useP2POnly ? .green : .blue)
+                    .font(.system(size: 12))
+
+                Text(useP2POnly ?
+                    "Maximum security: All data verified via decentralized P2P network with multi-peer consensus." :
+                    "P2P first with InsightAPI fallback. Enable P2P-only for trustless operation.")
+                    .font(System7Theme.bodyFont(size: 9))
+                    .foregroundColor(System7Theme.darkGray)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+            .background(useP2POnly ? Color.green.opacity(0.1) : System7Theme.white)
+            .overlay(
+                Rectangle()
+                    .stroke(useP2POnly ? Color.green.opacity(0.5) : System7Theme.black.opacity(0.3), lineWidth: 1)
             )
         }
         .padding(12)
