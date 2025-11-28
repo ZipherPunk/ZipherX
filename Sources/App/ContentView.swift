@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var selectedTab: Tab = .balance
     @State private var isFirstLaunch: Bool = false
     @State private var isInitialSync: Bool = true  // Track initial sync state
+    @State private var hasCompletedInitialSync: Bool = false  // Prevent re-running
 
     enum Tab {
         case balance, send, receive, settings
@@ -20,10 +21,19 @@ struct ContentView: View {
             if walletManager.isWalletCreated {
                 mainWalletView
                     .task {
+                        // Only run initial sync once
+                        guard !hasCompletedInitialSync else { return }
+
                         // Check if this is first launch (tree not yet cached)
                         isFirstLaunch = !walletManager.isTreeLoaded && walletManager.treeLoadProgress < 1.0
 
-                        // Show connecting status immediately at app launch
+                        // WAIT for tree to load before proceeding with network operations
+                        // Tree loading happens in WalletManager.init() background task
+                        while !walletManager.isTreeLoaded {
+                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                        }
+
+                        // Show connecting status after tree is loaded
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Connecting to network...")
                         }
@@ -59,6 +69,7 @@ struct ContentView: View {
                         // Mark initial sync as complete ONLY after everything finishes
                         await MainActor.run {
                             isInitialSync = false
+                            hasCompletedInitialSync = true
                         }
                     }
 

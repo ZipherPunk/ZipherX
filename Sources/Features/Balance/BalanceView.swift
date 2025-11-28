@@ -506,20 +506,25 @@ struct BalanceView: View {
     }
 
     private func autoRefreshTick() {
-        // Don't refresh if already in progress
+        // Don't refresh if already in progress or if a scan is running
         guard !isRefreshing else { return }
+        guard !FilterScanner.isScanInProgress else { return }
+        guard !walletManager.isSyncing else { return }
 
         Task { @MainActor in
             // Prevent concurrent refresh
             guard !isRefreshing else { return }
+            guard !FilterScanner.isScanInProgress else { return }
 
             // Only fetch stats if already connected (don't auto-connect repeatedly)
             if networkManager.isConnected {
                 // Fetch network stats (block height, difficulty, etc.)
                 await networkManager.fetchNetworkStats()
 
-                // Check for new blocks and scan them
-                if networkManager.chainHeight > networkManager.walletHeight && networkManager.chainHeight > 0 {
+                // Check for new blocks and scan them - but NOT if scan is already running
+                if networkManager.chainHeight > networkManager.walletHeight &&
+                   networkManager.chainHeight > 0 &&
+                   !FilterScanner.isScanInProgress {
                     isRefreshing = true
                     do {
                         try await walletManager.refreshBalance()
