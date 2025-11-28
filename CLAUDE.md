@@ -1017,6 +1017,35 @@ When all three ran concurrently, CMUs were being appended multiple times, corrup
 
 ---
 
+### 18. InsightAPI Fallback Missing Spends - Wrong Balance (November 28, 2025)
+
+**Problem**: Balance showing 0.0618 ZCL instead of correct 0.0431 ZCL. Notes 1-3 should be marked as spent but weren't being detected.
+
+**Root Cause**: When P2P headers are missing (recent blocks), the InsightAPI fallback was only fetching shielded outputs, not spends:
+```swift
+// OLD CODE - missing spends!
+txDataList.append((txid, outputs, nil))
+```
+
+Without spends data, nullifier detection couldn't find spending transactions, so notes remained marked as "UNSPENT" even though they had been spent on-chain.
+
+**Solution**: Fetch full transaction details from InsightAPI including `spendDescs`:
+```swift
+// Get full tx to check for spends (nullifier detection)
+let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
+let spends = txInfo?.spendDescs
+
+// Include tx if it has outputs OR spends
+if !outputs.isEmpty || (spends?.isEmpty == false) {
+    txDataList.append((txid, outputs, spends))
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - `getBlocksDataP2P()` InsightAPI fallback now includes spends
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
