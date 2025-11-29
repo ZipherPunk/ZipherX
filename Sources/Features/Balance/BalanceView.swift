@@ -196,14 +196,32 @@ struct BalanceView: View {
     /// Estimate date/time from block height
     /// Zclassic has ~150 second block times (2.5 minutes)
     private func estimatedDateString(for height: UInt64) -> String {
-        // Reference point: block 2,923,123 on November 28, 2025
-        let referenceHeight: UInt64 = 2_923_123
-        let referenceDate = Date(timeIntervalSince1970: 1764284400) // Nov 28, 2025 00:00 local
+        // Use current time and current chain height as reference for accurate estimation
+        // This avoids stale reference points that drift over time
+        let currentHeight = networkManager.chainHeight
+        let currentDate = Date()
 
-        let blockDifference = Int64(height) - Int64(referenceHeight)
+        // If we don't have chain height yet, use a recent known reference
+        if currentHeight == 0 {
+            // Fallback: block 2,926,100 on November 29, 2025 ~12:00 UTC
+            let referenceHeight: UInt64 = 2_926_100
+            let referenceDate = Date(timeIntervalSince1970: 1732881600) // Nov 29, 2025 12:00 UTC
+
+            let blockDifference = Int64(height) - Int64(referenceHeight)
+            let secondsDifference = Double(blockDifference) * 150.0
+            let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+
+            let formatter = DateFormatter()
+            formatter.dateStyle = .short
+            formatter.timeStyle = .short
+            return formatter.string(from: estimatedDate)
+        }
+
+        // Calculate based on current chain tip (most accurate)
+        let blockDifference = Int64(height) - Int64(currentHeight)
         let secondsDifference = Double(blockDifference) * 150.0 // ~150 seconds per block
 
-        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+        let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
 
         let formatter = DateFormatter()
         formatter.dateStyle = .short

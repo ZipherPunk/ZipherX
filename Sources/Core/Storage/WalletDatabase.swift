@@ -1249,6 +1249,31 @@ final class WalletDatabase {
 
             let diversifier = diversifierPtr != nil ? Data(bytes: diversifierPtr!, count: Int(diversifierLen)) : nil
 
+            // IMPORTANT: Skip if this txid already exists as a SENT transaction
+            // This prevents change outputs from appearing as separate "received" entries
+            let checkSql = "SELECT COUNT(*) FROM transaction_history WHERE txid = ? AND tx_type = 'sent';"
+            var checkStmt: OpaquePointer?
+            var isChangeOutput = false
+
+            if sqlite3_prepare_v2(db, checkSql, -1, &checkStmt, nil) == SQLITE_OK {
+                txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+                }
+                if sqlite3_step(checkStmt) == SQLITE_ROW {
+                    let sentCount = sqlite3_column_int(checkStmt, 0)
+                    if sentCount > 0 {
+                        isChangeOutput = true
+                        print("📜 Skipping change output for txid (already has SENT entry)")
+                    }
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            // Skip inserting RECEIVED entry if this is a change output from our own send
+            if isChangeOutput {
+                continue
+            }
+
             // Insert RECEIVED transaction using direct SQL to check actual insertion
             let insertSql = """
                 INSERT OR REPLACE INTO transaction_history
