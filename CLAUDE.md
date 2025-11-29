@@ -1046,6 +1046,51 @@ if !outputs.isEmpty || (spends?.isEmpty == false) {
 
 ---
 
+### 19. Cached Chain Height Fallback for Transaction Building (November 28, 2025)
+
+**Problem**: Transaction building failed with "Could not reach consensus among peers" when:
+1. P2P peers don't report chain height (common)
+2. InsightAPI is temporarily unreachable (network glitch)
+
+**Solution**: Use cached `chainHeight` as final fallback in `getChainHeight()`:
+```swift
+// Final fallback: use cached chain height if recent enough
+if chainHeight > 0 {
+    print("⚠️ Using cached chain height: \(chainHeight)")
+    return chainHeight
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - added cached height fallback
+
+---
+
+## MILESTONE: First Successful Shielded Transaction! (November 28, 2025)
+
+**Transaction ID**: `db74f9f8fe5a0aff5cf04d7add01124320563ce8d5eb79c1e7308d32b5658c87`
+**Block**: 2,926,118 (3+ confirmations)
+**Type**: Fully shielded z-to-z transaction
+
+**What worked**:
+1. ✅ Bundled commitment tree loading (1,041,688 CMUs)
+2. ✅ Race condition fix (120s timeout + FilterScanner wait)
+3. ✅ Spent note detection via nullifier matching
+4. ✅ Witness generation from stored tree state
+5. ✅ Sapling spend proof generation (Groth16)
+6. ✅ Transaction building with correct Buttercup branch ID
+7. ✅ P2P broadcast to network peers
+8. ✅ On-chain verification via InsightAPI
+
+**Transaction details**:
+- 1 shielded spend (consumed Note 4: 0.0431 ZCL)
+- 2 shielded outputs (recipient + change)
+- 2373 bytes transaction size
+
+This proves the full shielded transaction flow works end-to-end on Zclassic mainnet!
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
