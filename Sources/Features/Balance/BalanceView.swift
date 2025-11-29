@@ -12,26 +12,42 @@ struct BalanceView: View {
     @State private var transactions: [TransactionHistoryItem] = []
     @State private var isLoadingHistory = true
 
+    // Fireworks state
+    @State private var showFireworks = false
+    @State private var fireworksAmount: Double = 0
+    @State private var previousBalance: UInt64 = 0
+
     var body: some View {
-        VStack(spacing: 16) {
-            // Balance display
-            balanceCard
+        ZStack {
+            VStack(spacing: 16) {
+                // Balance display
+                balanceCard
 
-            // Transaction history (compact)
-            transactionHistorySection
+                // Transaction history (compact)
+                transactionHistorySection
 
-            // Network status
-            networkStatus
+                // Network status
+                networkStatus
 
-            Spacer()
+                Spacer()
+            }
+            .padding()
+
+            // Fireworks overlay
+            if showFireworks {
+                FireworksView(isShowing: $showFireworks, amount: fireworksAmount)
+                    .transition(.opacity)
+                    .zIndex(100)
+            }
         }
-        .padding()
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(errorMessage)
         }
         .onAppear {
+            // Initialize previous balance
+            previousBalance = walletManager.shieldedBalance
             // Start automatic refresh every 3 seconds
             startAutoRefresh()
             // Load transaction history
@@ -40,6 +56,23 @@ struct BalanceView: View {
         .onDisappear {
             // Stop auto refresh when leaving view
             stopAutoRefresh()
+        }
+        .onChange(of: walletManager.shieldedBalance) { newValue in
+            // Balance changed - reload transaction history
+            if newValue != previousBalance {
+                loadTransactionHistory()
+            }
+
+            // Detect incoming ZCL - balance increased!
+            if newValue > previousBalance && previousBalance > 0 {
+                let increase = newValue - previousBalance
+                fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
+                withAnimation {
+                    showFireworks = true
+                }
+                print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+            }
+            previousBalance = newValue
         }
     }
 
@@ -73,6 +106,21 @@ struct BalanceView: View {
                         .font(System7Theme.bodyFont(size: 10))
                         .foregroundColor(System7Theme.darkGray)
                 }
+            }
+
+            // Mempool incoming (cypherpunk style!)
+            if networkManager.mempoolIncoming > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 10))
+                    Text("Mempool:")
+                        .font(System7Theme.bodyFont(size: 10))
+                    Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
+                        .font(System7Theme.bodyFont(size: 10))
+                    Text("(\(networkManager.mempoolTxCount) tx)")
+                        .font(System7Theme.bodyFont(size: 9))
+                }
+                .foregroundColor(.green)
             }
 
             // Privacy indicator
@@ -274,7 +322,7 @@ struct BalanceView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(connectionStatusText)
                         .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.black)
+                        .foregroundColor(connectionTextColor)
                 }
 
                 Spacer()
@@ -544,7 +592,8 @@ struct BalanceView: View {
 
     private var connectionColor: Color {
         if networkManager.isConnected {
-            return networkManager.connectedPeers >= 3 ? .green : .yellow
+            // RED if less than 3 peers (insufficient for trustless operation)
+            return networkManager.connectedPeers >= 3 ? .green : .red
         } else if isRefreshing {
             return .orange
         } else {
@@ -552,12 +601,21 @@ struct BalanceView: View {
         }
     }
 
+    /// Text color for connection status - RED when peers < 3
+    private var connectionTextColor: Color {
+        if networkManager.isConnected && networkManager.connectedPeers < 3 {
+            return .red
+        }
+        return System7Theme.black
+    }
+
     private var connectionStatusText: String {
         if isRefreshing && !networkManager.isConnected {
             return "Connecting..."
         } else if networkManager.isConnected {
             let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
-            return "Connected to \(networkManager.connectedPeers) \(peerWord)"
+            let warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
+            return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning)"
         } else {
             return "Disconnected"
         }

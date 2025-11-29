@@ -1282,6 +1282,136 @@ let needsFreshBundledTree = customStartHeight != nil
 
 ---
 
+### 25. Fast Broadcast Exit + Instant Send Optimization (November 29, 2025)
+
+**Problem 1**: Transaction broadcast waited for ALL peers to respond before checking mempool, causing unnecessary delays.
+
+**Problem 2**: `buildShieldedTransactionWithProgress` ALWAYS called `rebuildWitnessForNote()` for notes beyond bundled height, taking 2+ minutes even when witness was already valid.
+
+**Solutions**:
+
+1. **Fast Broadcast Exit** (`NetworkManager.swift`):
+   - Broadcasts to all peers in parallel
+   - Checks mempool as soon as 1 peer accepts
+   - Exits IMMEDIATELY when mempool confirms (cancels remaining peer tasks)
+   - Uses actor for thread-safe state management
+   - Max 3 mempool checks × 500ms = 1.5s verification
+
+2. **Instant Send Mode** (`TransactionBuilder.swift`):
+   - Added check: if `note.anchor == currentTreeRoot` → INSTANT mode
+   - Only calls `rebuildWitnessForNote()` if `needsRebuild == true`
+   - Previously, rebuild was called unconditionally for notes beyond bundled height
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - fast broadcast with early exit
+- `Sources/Core/Crypto/TransactionBuilder.swift` - instant mode check before rebuild
+
+---
+
+### 26. Transaction History Missing Sent Entries (November 29, 2025)
+
+**Problem**: After clean build, sent transactions weren't appearing in transaction history, even though balance was correct (0).
+
+**Root Cause**: `markNoteSpent(nullifier:txid:)` didn't set `spent_height`, which is required for `populateHistoryFromNotes()` to create SENT entries.
+
+**Solution**:
+
+1. **Updated `markNoteSpent`** (`WalletDatabase.swift`):
+   ```swift
+   // OLD: Only set is_spent and spent_in_tx
+   func markNoteSpent(nullifier: Data, txid: Data)
+
+   // NEW: Also set spent_height
+   func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64)
+   ```
+
+2. **Updated callers** (`WalletManager.swift`):
+   - Get `chainHeight` before marking note spent
+   - Pass `spentHeight: chainHeight` to `markNoteSpent`
+
+3. **Auto-refresh history on balance change** (`BalanceView.swift`):
+   - Added `loadTransactionHistory()` call in `onChange(of: walletManager.shieldedBalance)`
+   - History now refreshes when balance changes (not just on new blocks)
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - `markNoteSpent` now requires spentHeight
+- `Sources/Core/Wallet/WalletManager.swift` - passes chainHeight to markNoteSpent
+- `Sources/Features/Balance/BalanceView.swift` - history reload on balance change
+
+---
+
+### 27. Dynamic Peer Targeting (10%) with Temp Banning (November 29, 2025)
+
+**Problem**: Static peer count didn't scale with discovered addresses.
+
+**Solution**:
+- Connect to 10% of known peer addresses (min 3, max 20)
+- Batch connection until target reached
+- 24-hour temp banning for peers that timeout or send corrupted data
+- Ban reasons tracked: `.timeout`, `.corruptedData`
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - dynamic targeting, temp banning
+- `Sources/Core/Network/Peer.swift` - `PeerMessageLock` actor for exclusive access
+
+---
+
+### 28. P2P Message Queuing (November 29, 2025)
+
+**Problem**: Mempool scan conflicted with other P2P operations on same peer, causing "Peer handshake failed" errors.
+
+**Solution**: Added `PeerMessageLock` actor for serialized peer access:
+```swift
+actor PeerMessageLock {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async { ... }
+    func release() { ... }
+}
+```
+
+- `withExclusiveAccess()` method for safe peer operations
+- Mempool functions use exclusive access
+- Re-enabled automatic mempool scanning
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - `PeerMessageLock` actor
+
+---
+
+### 29. Fireworks Animation on Receive (November 29, 2025)
+
+**Feature**: Fireworks animation when ZCL is received.
+
+**Implementation**:
+- `FireworksView` with particle physics (gravity, fading, colors)
+- Triggers when `shieldedBalance` increases
+- Shows "+X.XXXX ZCL RECEIVED!" message
+- Auto-dismisses after 3 seconds, tap to dismiss early
+
+**Files Modified**:
+- `Sources/UI/Components/System7Components.swift` - `FireworksView`
+- `Sources/Features/Balance/BalanceView.swift` - fireworks trigger
+
+---
+
+### 30. Banned Peers Management UI (November 29, 2025)
+
+**Feature**: View and manage temporarily banned peers in Settings.
+
+**Implementation**:
+- "Banned Peers" button shows current count
+- Sheet displays list with IP, ban reason, time remaining
+- Checkbox selection for individual unbanning
+- "Unban Selected" and "Unban All" buttons
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - `getBannedPeers()`, `unbanPeer()`, `unbanAllPeers()`
+- `Sources/Features/Settings/SettingsView.swift` - banned peers sheet
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

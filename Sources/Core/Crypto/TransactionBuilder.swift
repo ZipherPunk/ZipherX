@@ -429,11 +429,23 @@ final class TransactionBuilder {
 
         let noteCMU = note.cmu
 
-        if noteHeight > bundledTreeHeight {
+        // OPTIMIZATION: If witness is valid AND anchor matches tree root → INSTANT mode!
+        // Only rebuild if witness is missing/invalid
+        if !needsRebuild && note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+            if let currentTreeRoot = ZipherXFFI.treeRoot(), note.anchor == currentTreeRoot {
+                print("✅ Witness is current (anchor matches tree root) - INSTANT mode!")
+                // Use stored witness and current tree root as anchor
+                anchorFromHeader = currentTreeRoot
+            }
+        }
+
+        // Only rebuild witness if needed (missing, invalid, or anchor mismatch)
+        if needsRebuild && noteHeight > bundledTreeHeight {
             guard let cmu = noteCMU else {
                 throw TransactionError.proofGenerationFailed
             }
 
+            print("⚠️ Witness needs rebuild for note at height \(noteHeight)")
             if let result = try await rebuildWitnessForNote(
                 cmu: cmu,
                 noteHeight: noteHeight,

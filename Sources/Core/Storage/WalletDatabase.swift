@@ -107,6 +107,7 @@ final class WalletDatabase {
                 nf BLOB NOT NULL UNIQUE,
                 is_spent INTEGER NOT NULL DEFAULT 0,
                 spent_in_tx BLOB,
+                spent_height INTEGER,
                 received_in_tx BLOB NOT NULL,
                 received_height INTEGER NOT NULL,
                 witness BLOB,
@@ -276,6 +277,31 @@ final class WalletDatabase {
                 throw DatabaseError.schemaCreationFailed("Migration failed: \(String(cString: sqlite3_errmsg(db)))")
             }
             print("📂 Migration: Added anchor column to notes table")
+        }
+
+        // Migration 4: Add spent_height column to notes table if it doesn't exist
+        var pragmaStmt3: OpaquePointer?
+        guard sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt3, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(pragmaStmt3) }
+
+        var hasSpentHeightColumn = false
+        while sqlite3_step(pragmaStmt3) == SQLITE_ROW {
+            if let columnName = sqlite3_column_text(pragmaStmt3, 1) {
+                if String(cString: columnName) == "spent_height" {
+                    hasSpentHeightColumn = true
+                    break
+                }
+            }
+        }
+
+        if !hasSpentHeightColumn {
+            let alterSql = "ALTER TABLE notes ADD COLUMN spent_height INTEGER;"
+            guard sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.schemaCreationFailed("Migration failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            print("📂 Migration: Added spent_height column to notes table")
         }
     }
 
@@ -665,8 +691,8 @@ final class WalletDatabase {
     }
 
     /// Mark note as spent
-    func markNoteSpent(nullifier: Data, txid: Data) throws {
-        let sql = "UPDATE notes SET is_spent = 1, spent_in_tx = ? WHERE nf = ?;"
+    func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64) throws {
+        let sql = "UPDATE notes SET is_spent = 1, spent_in_tx = ?, spent_height = ? WHERE nf = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -677,18 +703,20 @@ final class WalletDatabase {
         txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
+        sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
         nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(nullifier.count), nil)
+            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(nullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        print("📜 Marked note spent at height \(spentHeight) with txid")
     }
 
     /// Mark note as spent by height
     func markNoteSpent(nullifier: Data, spentHeight: UInt64) throws {
-        let sql = "UPDATE notes SET is_spent = 1 WHERE nf = ?;"
+        let sql = "UPDATE notes SET is_spent = 1, spent_height = ? WHERE nf = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -696,13 +724,15 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
+        sqlite3_bind_int64(stmt, 1, Int64(spentHeight))
         nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(nullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        print("📜 Marked note spent at height \(spentHeight)")
     }
 
     /// Mark note as unspent (recover from failed broadcast)
@@ -952,6 +982,54 @@ final class WalletDatabase {
         }
 
         print("🔄 Cleared tree state and witnesses for rebuild (preserved note records)")
+    }
+
+    /// Clear all notes from the database (for new wallet)
+    func clearAllNotes() throws {
+        let sql = "DELETE FROM notes;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Cleared all notes from database")
+    }
+
+    /// Clear transaction history from the database (for new wallet)
+    func clearTransactionHistory() throws {
+        let sql = "DELETE FROM transaction_history;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Cleared transaction history from database")
+    }
+
+    /// Clear all accounts from the database (for new wallet)
+    func clearAccounts() throws {
+        let sql = "DELETE FROM accounts;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🗑️ Cleared accounts from database")
     }
 
     /// Update witness for a note
@@ -1207,7 +1285,7 @@ final class WalletDatabase {
     func populateHistoryFromNotes() throws -> Int {
         // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
         let sql = """
-            SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf
+            SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf, n.spent_height
             FROM notes n
             ORDER BY n.received_height ASC;
         """
@@ -1226,7 +1304,7 @@ final class WalletDatabase {
             let diversifierPtr = sqlite3_column_blob(stmt, 0)
             let diversifierLen = sqlite3_column_bytes(stmt, 0)
             let value = UInt64(sqlite3_column_int64(stmt, 1))
-            let height = UInt64(sqlite3_column_int64(stmt, 2))
+            let receivedHeight = UInt64(sqlite3_column_int64(stmt, 2))
             let txidPtr = sqlite3_column_type(stmt, 3) != SQLITE_NULL ? sqlite3_column_blob(stmt, 3) : nil
             let txidLen = sqlite3_column_bytes(stmt, 3)
             let isSpent = sqlite3_column_int(stmt, 4) != 0
@@ -1234,6 +1312,10 @@ final class WalletDatabase {
             let spentTxLen = sqlite3_column_bytes(stmt, 5)
             let nullifierPtr = sqlite3_column_blob(stmt, 6)
             let nullifierLen = sqlite3_column_bytes(stmt, 6)
+            // spent_height is column 7 (may be NULL if not spent or old data)
+            let spentHeight: UInt64? = sqlite3_column_type(stmt, 7) != SQLITE_NULL
+                ? UInt64(sqlite3_column_int64(stmt, 7))
+                : nil
 
             // Use actual txid if available, otherwise use nullifier as synthetic txid
             let txid: Data
@@ -1243,7 +1325,7 @@ final class WalletDatabase {
                 // Use first 32 bytes of nullifier as synthetic txid
                 txid = Data(bytes: nullifierPtr, count: min(Int(nullifierLen), 32))
             } else {
-                print("📜 Note at height \(height) has no txid or nullifier, skipping")
+                print("📜 Note at height \(receivedHeight) has no txid or nullifier, skipping")
                 continue // Skip notes without txid or nullifier
             }
 
@@ -1292,7 +1374,7 @@ final class WalletDatabase {
             txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
-            sqlite3_bind_int64(insertStmt, 2, Int64(height))
+            sqlite3_bind_int64(insertStmt, 2, Int64(receivedHeight))
             sqlite3_bind_null(insertStmt, 3) // block_time
             sqlite3_bind_text(insertStmt, 4, TransactionType.received.rawValue, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(insertStmt, 5, Int64(value))
@@ -1310,7 +1392,7 @@ final class WalletDatabase {
             let result = sqlite3_step(insertStmt)
             if result == SQLITE_DONE {
                 count += 1
-                print("📜 Inserted received tx: height=\(height), value=\(value)")
+                print("📜 Inserted received tx: height=\(receivedHeight), value=\(value)")
             } else {
                 print("📜 Insert failed: \(String(cString: sqlite3_errmsg(db)))")
             }
@@ -1338,7 +1420,9 @@ final class WalletDatabase {
                 spentTxid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
                 }
-                sqlite3_bind_int64(spentStmt, 2, Int64(height))
+                // Use spent_height if available, fallback to received_height for old data
+                let txSpentHeight = spentHeight ?? receivedHeight
+                sqlite3_bind_int64(spentStmt, 2, Int64(txSpentHeight))
                 sqlite3_bind_null(spentStmt, 3)
                 sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_int64(spentStmt, 5, Int64(value))
@@ -1349,7 +1433,7 @@ final class WalletDatabase {
 
                 if sqlite3_step(spentStmt) == SQLITE_DONE {
                     count += 1
-                    print("📜 Inserted sent tx: height=\(height), value=\(value)")
+                    print("📜 Inserted sent tx: spentHeight=\(txSpentHeight), value=\(value)")
                 }
                 sqlite3_finalize(spentStmt)
             }

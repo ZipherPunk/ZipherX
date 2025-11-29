@@ -11,6 +11,7 @@ import AppKit
 /// Classic Macintosh System 7 design
 struct SettingsView: View {
     @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var networkManager: NetworkManager
     @State private var showExportAlert = false
     @State private var exportedKey = ""
     @State private var showError = false
@@ -41,6 +42,11 @@ struct SettingsView: View {
     @State private var showDebugLogShare = false
     @State private var debugLogSize: String = "0 KB"
 
+    // Banned peers management
+    @State private var showBannedPeers = false
+    @State private var bannedPeersList: [BannedPeer] = []
+    @State private var selectedBannedPeers: Set<String> = []
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -56,10 +62,8 @@ struct SettingsView: View {
                 // Debug section
                 debugLoggingSection
 
-                /* DISABLED: Blockchain data section
                 // Rescan section
                 rescanSection
-                */
 
                 /* DISABLED: Debug tools section
                 // Debug section (for testing header sync)
@@ -297,6 +301,35 @@ struct SettingsView: View {
                 Rectangle()
                     .stroke(useP2POnly ? Color.green.opacity(0.5) : System7Theme.black.opacity(0.3), lineWidth: 1)
             )
+
+            // Banned Peers button
+            Button(action: {
+                bannedPeersList = networkManager.getBannedPeers()
+                selectedBannedPeers.removeAll()
+                showBannedPeers = true
+            }) {
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.xmark")
+                        .font(.system(size: 14))
+                    Text("Banned Peers")
+                        .font(System7Theme.bodyFont(size: 11))
+                    Spacer()
+                    Text("\(networkManager.getBannedPeers().count)")
+                        .font(System7Theme.monoFont(size: 10))
+                        .foregroundColor(.red)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(System7Theme.darkGray)
+                }
+                .foregroundColor(System7Theme.black)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(System7Theme.white)
+                .overlay(
+                    Rectangle()
+                        .stroke(System7Theme.black, lineWidth: 1)
+                )
+            }
         }
         .padding(12)
         .background(System7Theme.lightGray)
@@ -304,6 +337,9 @@ struct SettingsView: View {
             Rectangle()
                 .stroke(System7Theme.black, lineWidth: 1)
         )
+        .sheet(isPresented: $showBannedPeers) {
+            bannedPeersSheet
+        }
     }
 
     // MARK: - Export Section
@@ -791,6 +827,114 @@ struct SettingsView: View {
         .background(System7Theme.lightGray)
     }
 
+    // MARK: - Banned Peers Sheet
+
+    private var bannedPeersSheet: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Header with count
+                HStack {
+                    Text("Banned Peers")
+                        .font(System7Theme.titleFont(size: 14))
+                    Spacer()
+                    Text("\(bannedPeersList.count) banned")
+                        .font(System7Theme.bodyFont(size: 11))
+                        .foregroundColor(.red)
+                }
+                .padding()
+                .background(System7Theme.lightGray)
+
+                if bannedPeersList.isEmpty {
+                    // Empty state
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.system(size: 40))
+                            .foregroundColor(.green)
+                        Text("No Banned Peers")
+                            .font(System7Theme.titleFont(size: 14))
+                        Text("All peers are currently allowed to connect.")
+                            .font(System7Theme.bodyFont(size: 11))
+                            .foregroundColor(System7Theme.darkGray)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(System7Theme.white)
+                } else {
+                    // List of banned peers
+                    List {
+                        ForEach(bannedPeersList, id: \.address) { peer in
+                            BannedPeerRow(
+                                peer: peer,
+                                isSelected: selectedBannedPeers.contains(peer.address),
+                                onToggle: {
+                                    if selectedBannedPeers.contains(peer.address) {
+                                        selectedBannedPeers.remove(peer.address)
+                                    } else {
+                                        selectedBannedPeers.insert(peer.address)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    .listStyle(PlainListStyle())
+                }
+
+                // Action buttons
+                if !bannedPeersList.isEmpty {
+                    VStack(spacing: 8) {
+                        // Unban selected
+                        Button(action: {
+                            for address in selectedBannedPeers {
+                                networkManager.unbanPeer(address: address)
+                            }
+                            bannedPeersList = networkManager.getBannedPeers()
+                            selectedBannedPeers.removeAll()
+                        }) {
+                            HStack {
+                                Image(systemName: "checkmark.circle")
+                                Text("Unban Selected (\(selectedBannedPeers.count))")
+                            }
+                            .font(System7Theme.bodyFont(size: 11))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(selectedBannedPeers.isEmpty ? Color.gray : Color.green)
+                            .cornerRadius(4)
+                        }
+                        .disabled(selectedBannedPeers.isEmpty)
+
+                        // Unban all
+                        Button(action: {
+                            networkManager.unbanAllPeers()
+                            bannedPeersList = []
+                            selectedBannedPeers.removeAll()
+                        }) {
+                            HStack {
+                                Image(systemName: "arrow.uturn.backward")
+                                Text("Unban All")
+                            }
+                            .font(System7Theme.bodyFont(size: 11))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.orange)
+                            .cornerRadius(4)
+                        }
+                    }
+                    .padding()
+                    .background(System7Theme.lightGray)
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        showBannedPeers = false
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Debug Section
 
     private var debugSection: some View {
@@ -1257,7 +1401,68 @@ struct ShareSheet: View {
 }
 #endif
 
+// MARK: - Banned Peer Row
+
+struct BannedPeerRow: View {
+    let peer: BannedPeer
+    let isSelected: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 12) {
+                // Selection indicator
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isSelected ? .green : .gray)
+                    .font(.system(size: 20))
+
+                // Peer info
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(peer.address)
+                        .font(System7Theme.monoFont(size: 11))
+                        .foregroundColor(System7Theme.black)
+
+                    HStack(spacing: 8) {
+                        // Ban reason
+                        Text(peer.reason.rawValue)
+                            .font(System7Theme.bodyFont(size: 9))
+                            .foregroundColor(.red)
+
+                        // Time remaining
+                        Text("• \(timeRemaining)")
+                            .font(System7Theme.bodyFont(size: 9))
+                            .foregroundColor(System7Theme.darkGray)
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    private var timeRemaining: String {
+        let expiresAt = peer.banTime.addingTimeInterval(peer.banDuration)
+        let remaining = expiresAt.timeIntervalSinceNow
+
+        if remaining <= 0 {
+            return "Expired"
+        }
+
+        let hours = Int(remaining / 3600)
+        let minutes = Int((remaining.truncatingRemainder(dividingBy: 3600)) / 60)
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m left"
+        } else {
+            return "\(minutes)m left"
+        }
+    }
+}
+
 #Preview {
     SettingsView()
         .environmentObject(WalletManager.shared)
+        .environmentObject(NetworkManager.shared)
 }

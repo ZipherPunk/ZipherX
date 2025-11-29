@@ -1272,14 +1272,16 @@ final class WalletManager: ObservableObject {
             onProgress("broadcast", detail, progress)
         }
 
-        // Mark the spent note immediately
+        // Get chain height for recording
+        let chainHeight = try await networkManager.getChainHeight()
+
+        // Mark the spent note immediately (with height for history)
         guard let txidData = Data(hexString: txId) else {
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
-        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
+        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
 
         // Record transaction in history
-        let chainHeight = try await networkManager.getChainHeight()
         _ = try WalletDatabase.shared.insertTransactionHistory(
             txid: txidData,
             height: chainHeight,
@@ -1344,6 +1346,9 @@ final class WalletManager: ObservableObject {
         let networkManager = NetworkManager.shared
         let txId = try await networkManager.broadcastTransaction(rawTx)
 
+        // Get chain height for recording
+        let chainHeight = try await networkManager.getChainHeight()
+
         // CRITICAL: Mark the spent note immediately to prevent double-spending
         // Don't wait for blockchain confirmation - mark it now
         print("📝 Marking note as spent (nullifier: \(spentNullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
@@ -1352,11 +1357,10 @@ final class WalletManager: ObservableObject {
             print("⚠️ Failed to convert txid to Data, skipping mark as spent")
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
-        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData)
-        print("✅ Note marked as spent in database")
+        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
+        print("✅ Note marked as spent in database at height \(chainHeight)")
 
         // Record transaction in history
-        let chainHeight = try await networkManager.getChainHeight()
         _ = try WalletDatabase.shared.insertTransactionHistory(
             txid: txidData,
             height: chainHeight,
@@ -1503,6 +1507,56 @@ final class WalletManager: ObservableObject {
         let defaults = UserDefaults.standard
         isWalletCreated = defaults.bool(forKey: "wallet_created")
         zAddress = defaults.string(forKey: "z_address") ?? ""
+
+        // Load balance from database on startup (async)
+        if isWalletCreated {
+            Task {
+                await loadBalanceFromDatabase()
+            }
+        }
+    }
+
+    /// Load balance from database using last scanned height for confirmations
+    /// This provides instant balance display on app restart
+    private func loadBalanceFromDatabase() async {
+        do {
+            // Open database if needed
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+            let dbKey = Data(SHA256.hash(data: spendingKey))
+            try WalletDatabase.shared.open(encryptionKey: dbKey)
+
+            // Get account
+            guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+                return
+            }
+
+            // Get last scanned height as chain height (best estimate before network)
+            let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
+            guard lastScanned > 0 else { return }
+
+            // Get notes and calculate balance
+            let notes = try WalletDatabase.shared.getUnspentNotes(accountId: account.id)
+            var confirmedBalance: UInt64 = 0
+            var pendingBal: UInt64 = 0
+
+            for note in notes {
+                // Use lastScanned as chainHeight - notes are confirmed if they're in the DB
+                let confirmations = lastScanned >= note.height ? Int(lastScanned - note.height + 1) : 0
+                if confirmations >= 1 {
+                    confirmedBalance += note.value
+                } else {
+                    pendingBal += note.value
+                }
+            }
+
+            await MainActor.run {
+                self.shieldedBalance = confirmedBalance
+                self.pendingBalance = pendingBal
+                print("💰 Loaded balance from database: \(confirmedBalance) zatoshis (\(pendingBal) pending)")
+            }
+        } catch {
+            print("⚠️ Failed to load balance from database: \(error.localizedDescription)")
+        }
     }
 
     private func saveWalletState() {

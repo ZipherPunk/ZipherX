@@ -999,3 +999,157 @@ struct CypherpunkSyncTaskRow: View {
         }
     }
 }
+
+// MARK: - Fireworks Animation for Incoming ZCL
+
+/// Individual firework particle
+struct FireworkParticle: Identifiable {
+    let id = UUID()
+    var x: CGFloat
+    var y: CGFloat
+    var velocityX: CGFloat
+    var velocityY: CGFloat
+    var color: Color
+    var size: CGFloat
+    var opacity: Double
+    var trail: [(CGFloat, CGFloat)] = []
+}
+
+/// Fireworks celebration view for incoming ZCL
+struct FireworksView: View {
+    @Binding var isShowing: Bool
+    let amount: Double // Amount in ZCL
+
+    @State private var particles: [FireworkParticle] = []
+    @State private var explosions: [(x: CGFloat, y: CGFloat, time: Date)] = []
+
+    private let colors: [Color] = [
+        .yellow, .orange, .red, .pink, .purple, .blue, .cyan, .green, .mint
+    ]
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Semi-transparent background
+                Color.black.opacity(0.6)
+                    .ignoresSafeArea()
+
+                // Particles
+                ForEach(particles) { particle in
+                    Circle()
+                        .fill(particle.color)
+                        .frame(width: particle.size, height: particle.size)
+                        .opacity(particle.opacity)
+                        .position(x: particle.x, y: particle.y)
+                        .shadow(color: particle.color, radius: 3)
+                }
+
+                // Amount display
+                VStack(spacing: 8) {
+                    Text("🎉")
+                        .font(.system(size: 60))
+
+                    Text("+\(String(format: "%.4f", amount)) ZCL")
+                        .font(System7Theme.titleFont(size: 28))
+                        .foregroundColor(.green)
+                        .shadow(color: .green, radius: 10)
+
+                    Text("RECEIVED!")
+                        .font(System7Theme.titleFont(size: 18))
+                        .foregroundColor(.white)
+                        .shadow(color: .white, radius: 5)
+                }
+                .scaleEffect(particles.isEmpty ? 0.5 : 1.0)
+                .animation(.spring(response: 0.5, dampingFraction: 0.6), value: particles.isEmpty)
+            }
+            .onAppear {
+                startFireworks(in: geometry.size)
+            }
+            .onTapGesture {
+                withAnimation {
+                    isShowing = false
+                }
+            }
+        }
+    }
+
+    private func startFireworks(in size: CGSize) {
+        // Launch multiple fireworks
+        for i in 0..<5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.3) {
+                launchFirework(in: size)
+            }
+        }
+
+        // Auto-dismiss after 3 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            withAnimation(.easeOut(duration: 0.5)) {
+                isShowing = false
+            }
+        }
+    }
+
+    private func launchFirework(in size: CGSize) {
+        let centerX = CGFloat.random(in: size.width * 0.2...size.width * 0.8)
+        let centerY = CGFloat.random(in: size.height * 0.2...size.height * 0.5)
+        let color = colors.randomElement() ?? .yellow
+
+        // Create explosion particles
+        let particleCount = Int.random(in: 20...35)
+        var newParticles: [FireworkParticle] = []
+
+        for _ in 0..<particleCount {
+            let angle = CGFloat.random(in: 0...(2 * .pi))
+            let speed = CGFloat.random(in: 2...8)
+
+            let particle = FireworkParticle(
+                x: centerX,
+                y: centerY,
+                velocityX: cos(angle) * speed,
+                velocityY: sin(angle) * speed,
+                color: color,
+                size: CGFloat.random(in: 3...6),
+                opacity: 1.0
+            )
+            newParticles.append(particle)
+        }
+
+        particles.append(contentsOf: newParticles)
+
+        // Animate particles
+        animateParticles()
+    }
+
+    private func animateParticles() {
+        // Physics update loop
+        Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { timer in
+            var allFaded = true
+
+            for i in particles.indices.reversed() {
+                // Apply gravity
+                particles[i].velocityY += 0.15
+
+                // Apply velocity
+                particles[i].x += particles[i].velocityX
+                particles[i].y += particles[i].velocityY
+
+                // Fade out
+                particles[i].opacity -= 0.015
+                particles[i].size *= 0.99
+
+                if particles[i].opacity > 0 {
+                    allFaded = false
+                }
+
+                // Remove faded particles
+                if particles[i].opacity <= 0 {
+                    particles.remove(at: i)
+                }
+            }
+
+            if allFaded || particles.isEmpty {
+                timer.invalidate()
+            }
+        }
+    }
+}

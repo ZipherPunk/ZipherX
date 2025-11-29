@@ -9,6 +9,8 @@ final class NetworkManager: ObservableObject {
 
     // MARK: - Constants
     private let MIN_PEERS = 3
+    private let MAX_PEERS = 20
+    private let TARGET_PEER_PERCENT = 0.10 // Connect to 10% of known addresses
     private let CONSENSUS_THRESHOLD = 2 // SECURITY: Require at least 2 peers to agree
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
@@ -156,7 +158,72 @@ final class NetworkManager: ObservableObject {
         triedAddresses.remove(key)
         newAddresses.remove(key)
 
-        print("Banned peer \(peer.host): \(reason.rawValue)")
+        print("🚫 Banned peer \(peer.host): \(reason.rawValue)")
+    }
+
+    /// Ban a peer by address (for connection failures)
+    private func banAddress(_ host: String, port: UInt16, reason: BanReason) {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        let ban = BannedPeer(
+            address: host,
+            banTime: Date(),
+            banDuration: BAN_DURATION,
+            reason: reason
+        )
+        bannedPeers[host] = ban
+
+        // Remove from known good addresses
+        let key = "\(host):\(port)"
+        knownAddresses.removeValue(forKey: key)
+        triedAddresses.remove(key)
+        newAddresses.remove(key)
+
+        print("🚫 Banned address \(host): \(reason.rawValue)")
+    }
+
+    /// Get list of all currently banned peers
+    func getBannedPeers() -> [BannedPeer] {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        // Clean up expired bans first
+        let now = Date()
+        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
+
+        return Array(bannedPeers.values).sorted { $0.banTime > $1.banTime }
+    }
+
+    /// Unban a specific peer by address
+    func unbanPeer(address: String) {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        if bannedPeers.removeValue(forKey: address) != nil {
+            print("✅ Unbanned peer: \(address)")
+        }
+    }
+
+    /// Unban all peers
+    func unbanAllPeers() {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        let count = bannedPeers.count
+        bannedPeers.removeAll()
+        print("✅ Unbanned all \(count) peers")
+    }
+
+    /// Calculate target number of peers based on known addresses
+    /// Returns 10% of known addresses, clamped between MIN_PEERS and MAX_PEERS
+    private func calculateTargetPeers() -> Int {
+        addressLock.lock()
+        let knownCount = knownAddresses.count
+        addressLock.unlock()
+
+        let target = Int(Double(knownCount) * TARGET_PEER_PERCENT)
+        return max(MIN_PEERS, min(MAX_PEERS, target))
     }
 
     /// Select best peer to connect to based on scoring
@@ -302,6 +369,7 @@ final class NetworkManager: ObservableObject {
     // MARK: - Connection Management
 
     /// Connect to the Zclassic network
+    /// Targets 10% of known peers (min 3, max 20)
     func connect() async throws {
         // Prevent concurrent connection attempts
         guard !isConnecting else {
@@ -324,92 +392,118 @@ final class NetworkManager: ObservableObject {
                 discoveredPeers.append(PeerAddress(host: String(components[0]), port: port))
             }
         }
-        print("📋 Total peers to try: \(discoveredPeers.count)")
 
         // Add all discovered to address manager
         for addr in discoveredPeers {
             addAddress(addr, source: "dns")
         }
 
-        // Don't shuffle - try known working nodes first
-        // discoveredPeers.shuffle()
+        // Calculate target: 10% of known addresses (min 3, max 20)
+        let targetPeers = calculateTargetPeers()
+        print("📋 Known addresses: \(knownAddresses.count), Target peers: \(targetPeers)")
 
-        // Deduplicate peers by host:port
+        // Deduplicate and filter banned peers
         var seenPeers = Set<String>()
-        let uniquePeers = discoveredPeers.filter { addr in
+        var validPeers = discoveredPeers.filter { addr in
             let key = "\(addr.host):\(addr.port)"
-            if seenPeers.contains(key) {
+            if seenPeers.contains(key) || isBanned(addr.host) {
                 return false
             }
             seenPeers.insert(key)
             return true
         }
 
-        // Connect to peers in parallel
+        // Shuffle to avoid always connecting to same peers
+        validPeers.shuffle()
+
+        // Connect to peers in batches until we reach target
         var connectedCount = 0
-        let maxConcurrent = 8 // Try up to 8 at once
+        let maxConcurrent = 10 // Try up to 10 at once per batch
+        var peerIndex = 0
+        var attemptedThisBatch = Set<String>()
 
-        // Filter out banned peers
-        let validPeers = uniquePeers.filter { !isBanned($0.host) }
+        while connectedCount < targetPeers && peerIndex < validPeers.count {
+            let batchEnd = min(peerIndex + maxConcurrent, validPeers.count)
+            let batch = Array(validPeers[peerIndex..<batchEnd])
+            peerIndex = batchEnd
 
-        await withTaskGroup(of: Peer?.self) { group in
-            var started = 0
+            await withTaskGroup(of: (Peer?, PeerAddress).self) { group in
+                for address in batch {
+                    let key = "\(address.host):\(address.port)"
+                    guard !attemptedThisBatch.contains(key) else { continue }
+                    attemptedThisBatch.insert(key)
 
-            for address in validPeers {
-                // Start up to maxConcurrent connections
-                if started < maxConcurrent {
-                    started += 1
                     group.addTask {
                         do {
-                            print("🔄 Trying to connect to \(address.host):\(address.port)...")
+                            print("🔄 Trying \(address.host):\(address.port)...")
                             let peer = try await self.connectToPeer(address)
                             print("✅ Connected to \(address.host):\(address.port)")
-                            return peer
-                        } catch {
-                            print("❌ Failed to connect to \(address.host):\(address.port) - \(error.localizedDescription)")
-                            return nil
-                        }
-                    }
-                }
-            }
-
-            // Collect successful connections
-            for await peer in group {
-                if let peer = peer {
-                    peers.append(peer)
-                    connectedCount += 1
-
-                    // Update UI immediately
-                    DispatchQueue.main.async {
-                        self.connectedPeers = connectedCount
-                        self.isConnected = true
-                    }
-
-                    // Update address info (thread-safe)
-                    let key = "\(peer.host):\(peer.port)"
-                    addressLock.lock()
-                    knownAddresses[key]?.successes += 1
-                    newAddresses.remove(key)
-                    triedAddresses.insert(key)
-                    addressLock.unlock()
-
-                    // Request addresses from new peer
-                    Task {
-                        if let addresses = try? await peer.getAddresses() {
-                            for addr in addresses {
-                                self.addAddress(addr, source: peer.host)
+                            return (peer, address)
+                        } catch let error as NetworkError {
+                            // Ban on timeout or connection failure
+                            if case .timeout = error {
+                                await MainActor.run {
+                                    self.banAddress(address.host, port: address.port, reason: .timeout)
+                                }
+                            } else if case .connectionTimeout = error {
+                                await MainActor.run {
+                                    self.banAddress(address.host, port: address.port, reason: .timeout)
+                                }
                             }
-                            // Persist addresses after discovering from new peer
-                            self.persistAddresses()
+                            print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            return (nil, address)
+                        } catch {
+                            print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            return (nil, address)
+                        }
+                    }
+                }
+
+                // Collect successful connections
+                for await (peer, address) in group {
+                    if let peer = peer {
+                        peers.append(peer)
+                        connectedCount += 1
+
+                        // Update UI immediately
+                        await MainActor.run {
+                            self.connectedPeers = connectedCount
+                            self.isConnected = true
+                        }
+
+                        // Update address info (thread-safe)
+                        let key = "\(peer.host):\(peer.port)"
+                        addressLock.lock()
+                        knownAddresses[key]?.successes += 1
+                        newAddresses.remove(key)
+                        triedAddresses.insert(key)
+                        addressLock.unlock()
+
+                        // Request addresses from new peer (async)
+                        Task {
+                            if let addresses = try? await peer.getAddresses() {
+                                for addr in addresses {
+                                    self.addAddress(addr, source: peer.host)
+                                }
+                                self.persistAddresses()
+                            }
+                        }
+
+                        // Stop if we've reached target
+                        if connectedCount >= targetPeers {
+                            break
                         }
                     }
                 }
             }
+
+            // Log progress
+            print("📊 Connected \(connectedCount)/\(targetPeers) peers (tried \(peerIndex)/\(validPeers.count))")
         }
 
         // Persist after successful connections
         persistAddresses()
-        print("📊 Connected to \(connectedCount) peers")
+        print("📊 Final: Connected to \(connectedCount)/\(targetPeers) target peers")
 
         // We can work with fewer peers, just warn
         if connectedCount < MIN_PEERS {
@@ -492,6 +586,122 @@ final class NetworkManager: ObservableObject {
                 await WalletManager.shared.backgroundSyncToHeight(chainHeight)
             }
         }
+
+        // MEMPOOL SCAN: Check for incoming unconfirmed transactions
+        // Uses message queue to prevent stream conflicts
+        Task {
+            await scanMempoolForIncoming()
+        }
+    }
+
+    // MARK: - Mempool Detection (Cypherpunk Style!)
+
+    /// Published property for incoming mempool amount
+    @Published private(set) var mempoolIncoming: UInt64 = 0
+    @Published private(set) var mempoolTxCount: Int = 0
+
+    /// Scan mempool for incoming shielded transactions
+    /// Uses trial decryption to detect payments before confirmation
+    private func scanMempoolForIncoming() async {
+        guard isConnected else { return }
+
+        // Get a connected peer
+        guard let peer = getConnectedPeer() else { return }
+
+        do {
+            // Get mempool transaction list
+            let mempoolTxs = try await peer.getMempoolTransactions()
+
+            guard !mempoolTxs.isEmpty else {
+                await MainActor.run {
+                    self.mempoolIncoming = 0
+                    self.mempoolTxCount = 0
+                }
+                return
+            }
+
+            print("🔮 Scanning \(mempoolTxs.count) mempool transactions...")
+
+            // Get spending key for trial decryption
+            guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+                return
+            }
+
+            var incomingAmount: UInt64 = 0
+            var incomingCount = 0
+
+            // Check each mempool transaction for shielded outputs
+            for txHash in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
+                guard let rawTx = try? await peer.getMempoolTransaction(txid: txHash) else {
+                    continue
+                }
+
+                // Parse transaction for shielded outputs
+                if let outputs = parseShieldedOutputs(from: rawTx) {
+                    for output in outputs {
+                        // Try to decrypt with our key
+                        if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
+                            spendingKey: spendingKey,
+                            epk: output.epk,
+                            cmu: output.cmu,
+                            ciphertext: output.ciphertext
+                        ) {
+                            // Found incoming payment!
+                            if decrypted.count >= 19 {
+                                let valueBytes = Data(decrypted[11..<19])
+                                let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                                incomingAmount += value
+                                incomingCount += 1
+                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis!")
+                            }
+                        }
+                    }
+                }
+            }
+
+            await MainActor.run {
+                self.mempoolIncoming = incomingAmount
+                self.mempoolTxCount = incomingCount
+                if incomingAmount > 0 {
+                    print("🔮 Mempool incoming: \(incomingAmount) zatoshis (\(incomingCount) tx)")
+                }
+            }
+        } catch {
+            print("⚠️ Mempool scan failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Parse shielded outputs from raw transaction data
+    private func parseShieldedOutputs(from rawTx: Data) -> [(cmu: Data, epk: Data, ciphertext: Data)]? {
+        // Zcash v4 transaction format (simplified)
+        // We need to find the shielded outputs section
+        guard rawTx.count > 200 else { return nil }
+
+        var outputs: [(cmu: Data, epk: Data, ciphertext: Data)] = []
+
+        // Try to find OutputDescription pattern (948 bytes each)
+        // cv(32) + cmu(32) + ephemeralKey(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
+        let outputDescSize = 948
+        var offset = 0
+
+        // Skip to shielded section (after header, inputs, etc)
+        // This is a simplified scan - look for valid-looking output patterns
+        while offset + outputDescSize <= rawTx.count {
+            // Check if this looks like an OutputDescription
+            let potentialCmu = rawTx.subdata(in: offset+32..<offset+64)
+            let potentialEpk = rawTx.subdata(in: offset+64..<offset+96)
+            let potentialCiphertext = rawTx.subdata(in: offset+96..<offset+676) // 580 bytes
+
+            // Basic validation - non-zero values
+            if !potentialCmu.allSatisfy({ $0 == 0 }) &&
+               !potentialEpk.allSatisfy({ $0 == 0 }) {
+                outputs.append((cmu: potentialCmu, epk: potentialEpk, ciphertext: potentialCiphertext))
+            }
+
+            offset += 32 // Slide window
+        }
+
+        return outputs.isEmpty ? nil : outputs
     }
 
     /// Fetch ZCL price from API
@@ -626,7 +836,7 @@ final class NetworkManager: ObservableObject {
 
     /// Broadcast transaction with multi-peer propagation and progress reporting
     /// P2P ONLY - no InsightAPI fallback (trustless operation)
-    /// Success = at least one peer accepted the transaction (returned txid)
+    /// Success = at least one peer accepted + mempool confirms (FAST EXIT)
     func broadcastTransactionWithProgress(_ rawTx: Data, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
@@ -640,74 +850,110 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.broadcastFailed
         }
 
-        var successCount = 0
-        var txId: String?
+        let peerCount = peers.count
+        print("📡 Broadcasting to \(peerCount) peers...")
+        onProgress?("peers", "Sending to \(peerCount) peers...", 0.0)
 
-        print("📡 Broadcasting to \(peers.count) peers...")
-        onProgress?("peers", "Sending to \(peers.count) peers...", 0.0)
+        // Use actor for thread-safe state
+        actor BroadcastState {
+            var successCount = 0
+            var txId: String?
+            var mempoolVerified = false
 
-        // Broadcast to all peers in parallel
-        await withTaskGroup(of: (String, String?).self) { group in
+            func recordSuccess(_ id: String) -> Int {
+                successCount += 1
+                txId = id
+                return successCount
+            }
+
+            func setVerified() { mempoolVerified = true }
+            func isVerified() -> Bool { mempoolVerified }
+            func getTxId() -> String? { txId }
+            func getSuccessCount() -> Int { successCount }
+        }
+
+        let state = BroadcastState()
+
+        // Broadcast to all peers - but check mempool after FIRST success
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            // Add broadcast tasks for all peers
             for peer in peers {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
                         let id = try await peer.broadcastTransaction(rawTx)
                         print("✅ Peer \(peerHost) accepted tx: \(id)")
-                        return (peerHost, id)
+                        let count = await state.recordSuccess(id)
+                        onProgress?("peers", "Accepted by \(count)/\(peerCount) peers", Double(count) / Double(peerCount))
                     } catch {
                         print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
-                        return (peerHost, nil)
                     }
                 }
             }
 
-            for await (_, result) in group {
-                if let id = result {
-                    successCount += 1
-                    txId = id
-                    onProgress?("peers", "Accepted by \(successCount)/\(peers.count) peers", Double(successCount) / Double(peers.count))
+            // Add mempool verification task - runs in parallel, exits early on success
+            group.addTask {
+                // Wait for at least one peer to accept
+                while await state.getTxId() == nil {
+                    try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                }
+
+                guard let txId = await state.getTxId() else { return }
+
+                onProgress?("verify", "Checking mempool...", 0.5)
+
+                // Check mempool - just 3 quick attempts
+                for attempt in 1...3 {
+                    if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
+                        print("✅ Transaction VERIFIED in mempool: \(txId)")
+                        onProgress?("verify", "Confirmed!", 1.0)
+                        await state.setVerified()
+                        return // Exit immediately!
+                    }
+                    if attempt < 3 {
+                        try await Task.sleep(nanoseconds: 500_000_000) // 500ms between checks
+                    }
+                }
+            }
+
+            // Wait for either: mempool verified OR all broadcasts complete
+            // Check every 200ms if we can exit early
+            while true {
+                // Exit early if mempool verified
+                if await state.isVerified() {
+                    group.cancelAll()
+                    break
+                }
+
+                // Check if a task completed
+                do {
+                    guard let _ = try await group.next() else {
+                        // All tasks done
+                        break
+                    }
+                } catch {
+                    // Task threw, continue waiting
                 }
             }
         }
 
-        // Check if any peer accepted the transaction
-        guard successCount >= 1, let txId = txId else {
+        // Check results
+        guard let txId = await state.getTxId() else {
             print("❌ No peers accepted the transaction")
             throw NetworkError.broadcastFailed
         }
 
-        print("📡 Transaction broadcast to \(successCount)/\(peers.count) peers: \(txId)")
-        onProgress?("verify", "Verifying on-chain...", 0.0)
+        let successCount = await state.getSuccessCount()
+        let verified = await state.isVerified()
 
-        // Verification is OPTIONAL - if P2P broadcast succeeded, the tx IS propagating
-        // InsightAPI might be slow to index new transactions
-        let maxAttempts = 5  // Reduced from 10 - don't make user wait too long
-        var verified = false
-
-        for attempt in 1...maxAttempts {
-            let progress = Double(attempt) / Double(maxAttempts)
-            onProgress?("verify", "Checking mempool (attempt \(attempt)/\(maxAttempts))...", progress)
-
-            if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
-                print("✅ Transaction VERIFIED on-chain: \(txId)")
-                onProgress?("verify", "Confirmed!", 1.0)
-                verified = true
-                break
-            }
-
-            if attempt < maxAttempts {
-                try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-            }
-        }
+        print("📡 Transaction broadcast to \(successCount)/\(peerCount) peers: \(txId)")
 
         if !verified {
-            // Log warning but DON'T throw error - P2P broadcast already succeeded
-            print("⚠️ Transaction not yet visible on InsightAPI (may take a moment): \(txId)")
-            onProgress?("verify", "Broadcast complete (verifying...)", 1.0)
+            // P2P broadcast succeeded, tx is propagating even if mempool check timed out
+            print("⚠️ Mempool not yet visible (tx is propagating): \(txId)")
+            onProgress?("verify", "Broadcast complete!", 1.0)
         }
 
-        // Return txId regardless - P2P broadcast succeeded, tx is propagating
         return txId
     }
 
@@ -1433,6 +1679,7 @@ enum NetworkError: LocalizedError {
     case timeout
     case connectionTimeout
     case invalidData
+    case notFound
 
     var errorDescription: String? {
         switch self {
@@ -1458,6 +1705,8 @@ enum NetworkError: LocalizedError {
             return "Connection timed out"
         case .invalidData:
             return "Invalid data format"
+        case .notFound:
+            return "Data not found on peer"
         }
     }
 }

@@ -2,6 +2,37 @@ import Foundation
 import Network
 import CommonCrypto
 
+/// Async lock for serializing peer message access
+/// Prevents concurrent operations from interfering with each other's message streams
+actor PeerMessageLock {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+        // Wait for lock to be released
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if let next = waiters.first {
+            waiters.removeFirst()
+            next.resume()
+        } else {
+            isLocked = false
+        }
+    }
+
+    var isBusy: Bool {
+        return isLocked
+    }
+}
+
 /// Individual peer connection for Zclassic P2P network
 final class Peer {
     let id: String
@@ -11,6 +42,9 @@ final class Peer {
     private let networkMagic: [UInt8]
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.zipherx.peer")
+
+    /// Message lock to serialize P2P operations
+    private let messageLock = PeerMessageLock()
 
     // Protocol version
     private let protocolVersion: Int32 = 170011 // Latest Sapling support
@@ -93,6 +127,59 @@ final class Peer {
         }
 
         return false
+    }
+
+    // MARK: - Message Queue
+
+    /// Check if peer is currently busy with another operation
+    var isBusy: Bool {
+        get async {
+            await messageLock.isBusy
+        }
+    }
+
+    /// Execute an operation with exclusive access to the peer's message stream
+    /// This prevents concurrent operations from interfering with each other
+    func withExclusiveAccess<T>(_ operation: () async throws -> T) async throws -> T {
+        await messageLock.acquire()
+        defer {
+            Task { await messageLock.release() }
+        }
+        return try await operation()
+    }
+
+    /// Send a request and wait for a specific response command
+    /// Handles the common pattern of send -> receive with exclusive access
+    func requestResponse(command: String, payload: Data, expectedResponse: String, maxAttempts: Int = 20) async throws -> Data {
+        return try await withExclusiveAccess {
+            try await sendMessage(command: command, payload: payload)
+
+            for attempt in 1...maxAttempts {
+                let (responseCommand, responseData) = try await receiveMessage()
+
+                if responseCommand == expectedResponse {
+                    return responseData
+                }
+
+                // Handle common unexpected messages
+                if responseCommand == "ping" {
+                    // Auto-respond to pings
+                    try await sendMessage(command: "pong", payload: responseData)
+                    continue
+                }
+
+                if responseCommand == "notfound" {
+                    throw NetworkError.notFound
+                }
+
+                // Log and continue waiting for expected response
+                if attempt % 5 == 0 {
+                    print("⏳ Waiting for \(expectedResponse), got \(responseCommand) (attempt \(attempt))")
+                }
+            }
+
+            throw NetworkError.timeout
+        }
     }
 
     // MARK: - Connection
@@ -1041,32 +1128,177 @@ final class Peer {
     }
 
     /// Get a transaction by its hash via P2P getdata
+    /// Uses exclusive access to prevent message stream conflicts
     func getTransaction(hash: Data) async throws -> Data {
         guard hash.count == 32 else {
             throw PeerError.invalidData
         }
 
-        // Build getdata message for single transaction
-        var payload = Data()
-        payload.append(1) // count = 1
-        payload.append(contentsOf: withUnsafeBytes(of: UInt32(1).littleEndian) { Array($0) }) // MSG_TX = 1
-        payload.append(hash)
+        return try await withExclusiveAccess {
+            // Build getdata message for single transaction
+            var payload = Data()
+            payload.append(1) // count = 1
+            payload.append(contentsOf: withUnsafeBytes(of: UInt32(1).littleEndian) { Array($0) }) // MSG_TX = 1
+            payload.append(hash)
 
-        try await sendMessage(command: "getdata", payload: payload)
+            try await sendMessage(command: "getdata", payload: payload)
 
-        // Wait for tx response
-        var attempts = 0
-        while attempts < 10 {
-            attempts += 1
-            let (command, response) = try await receiveMessage()
+            // Wait for tx response
+            var attempts = 0
+            while attempts < 10 {
+                attempts += 1
+                let (command, response) = try await receiveMessage()
 
-            if command == "tx" {
-                return response
+                // Handle ping automatically
+                if command == "ping" {
+                    try await sendMessage(command: "pong", payload: response)
+                    continue
+                }
+
+                if command == "tx" {
+                    return response
+                }
+                // Ignore other messages
             }
-            // Ignore other messages
-        }
 
-        throw PeerError.timeout
+            throw PeerError.timeout
+        }
+    }
+
+    // MARK: - Mempool Detection (Cypherpunk Style!)
+
+    /// Request mempool inventory from peer
+    /// Returns list of transaction hashes currently in peer's mempool
+    /// Uses exclusive access to prevent message stream conflicts
+    func getMempoolTransactions() async throws -> [Data] {
+        return try await withExclusiveAccess {
+            print("🔮 Requesting mempool inventory from peer...")
+
+            // Send mempool request (empty payload)
+            try await sendMessage(command: "mempool", payload: Data())
+
+            // Wait for inv response with transaction inventory
+            var txHashes: [Data] = []
+            var attempts = 0
+
+            while attempts < 20 {
+                attempts += 1
+                let (command, response) = try await receiveMessage()
+
+                // Handle ping automatically
+                if command == "ping" {
+                    try await sendMessage(command: "pong", payload: response)
+                    continue
+                }
+
+                if command == "inv" && response.count >= 1 {
+                    // Parse inv payload: [count: varint][inv_vector...]
+                    // Each inv_vector: [type: 4 bytes][hash: 32 bytes]
+                    var offset = 0
+
+                    // Read count (varint)
+                    let (count, countSize) = readVarInt(from: response, at: offset)
+                    offset += countSize
+
+                    for _ in 0..<count {
+                        guard offset + 36 <= response.count else { break }
+
+                        // Type: 1 = MSG_TX, 2 = MSG_BLOCK
+                        let invType = response.loadUInt32(at: offset)
+                        offset += 4
+
+                        // Hash (32 bytes)
+                        let hash = response.subdata(in: offset..<offset+32)
+                        offset += 32
+
+                        // Only collect transactions (type 1)
+                        if invType == 1 {
+                            txHashes.append(hash)
+                        }
+                    }
+
+                    print("🔮 Mempool contains \(txHashes.count) transactions")
+                    return txHashes
+                }
+
+                // Ignore other messages, keep waiting
+                if attempts % 5 == 0 {
+                    print("⏳ Still waiting for mempool inv... (attempt \(attempts))")
+                }
+            }
+
+            print("⏳ Mempool request timed out (peer may not support it)")
+            return txHashes
+        }
+    }
+
+    /// Check if a specific transaction is in the mempool
+    func isTransactionInMempool(txid: Data) async throws -> Bool {
+        let mempoolTxs = try await getMempoolTransactions()
+        // txid might be in display format (reversed), try both
+        let txidReversed = Data(txid.reversed())
+        return mempoolTxs.contains(txid) || mempoolTxs.contains(txidReversed)
+    }
+
+    /// Get raw transaction from mempool (for parsing shielded outputs)
+    /// Uses exclusive access to prevent message stream conflicts
+    func getMempoolTransaction(txid: Data) async throws -> Data? {
+        return try await withExclusiveAccess {
+            // Request the transaction
+            var payload = Data()
+            payload.append(1) // count = 1
+            payload.append(contentsOf: withUnsafeBytes(of: UInt32(1).littleEndian) { Array($0) }) // MSG_TX = 1
+            payload.append(txid)
+
+            try await sendMessage(command: "getdata", payload: payload)
+
+            // Wait for tx response
+            var attempts = 0
+            while attempts < 10 {
+                attempts += 1
+                let (command, response) = try await receiveMessage()
+
+                // Handle ping automatically
+                if command == "ping" {
+                    try await sendMessage(command: "pong", payload: response)
+                    continue
+                }
+
+                if command == "tx" && response.count > 0 {
+                    return response
+                }
+                if command == "notfound" {
+                    return nil
+                }
+            }
+
+            return nil
+        }
+    }
+
+    /// Helper to read variable length integer
+    private func readVarInt(from data: Data, at offset: Int) -> (UInt64, Int) {
+        guard offset < data.count else { return (0, 0) }
+
+        let first = data[offset]
+        if first < 0xFD {
+            return (UInt64(first), 1)
+        } else if first == 0xFD {
+            guard offset + 3 <= data.count else { return (0, 1) }
+            let value = UInt16(data[offset + 1]) | (UInt16(data[offset + 2]) << 8)
+            return (UInt64(value), 3)
+        } else if first == 0xFE {
+            guard offset + 5 <= data.count else { return (0, 1) }
+            let value = data.loadUInt32(at: offset + 1)
+            return (UInt64(value), 5)
+        } else {
+            guard offset + 9 <= data.count else { return (0, 1) }
+            var value: UInt64 = 0
+            for i in 0..<8 {
+                value |= UInt64(data[offset + 1 + i]) << (i * 8)
+            }
+            return (value, 9)
+        }
     }
 }
 
@@ -1167,4 +1399,6 @@ enum BanReason: String {
     case lowSuccessRate = "Very low success rate"
     case invalidMessages = "Sent invalid messages"
     case protocolViolation = "Protocol violation"
+    case timeout = "Connection/response timeout"
+    case corruptedData = "Sent corrupted or invalid data"
 }

@@ -4,6 +4,7 @@ import SwiftUI
 struct ZipherXApp: App {
     @StateObject private var walletManager = WalletManager.shared
     @StateObject private var networkManager = NetworkManager.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         // Initialize NotificationManager early to set delegate
@@ -18,6 +19,20 @@ struct ZipherXApp: App {
             ContentView()
                 .environmentObject(walletManager)
                 .environmentObject(networkManager)
+                .onChange(of: scenePhase) { newPhase in
+                    switch newPhase {
+                    case .background:
+                        // Lock app when going to background
+                        BiometricAuthManager.shared.lockApp()
+                    case .active:
+                        // App became active - Face ID handled by Secure Enclave
+                        break
+                    case .inactive:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
         }
     }
 }
