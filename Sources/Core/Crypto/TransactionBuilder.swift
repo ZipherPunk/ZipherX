@@ -771,10 +771,10 @@ final class TransactionBuilder {
         let batchSize = 50
         // If we reinitialized the tree, we need to fetch from bundled+1
         // Otherwise use the calculated startHeight
-        let actualStartHeight = (totalBlocks == 0 && noteHeight > bundledTreeHeight) ? (bundledTreeHeight + 1) : startHeight
-        var currentHeight = actualStartHeight
+        let loopStartHeight = (totalBlocks == 0 && noteHeight > bundledTreeHeight) ? (bundledTreeHeight + 1) : startHeight
+        var currentHeight = loopStartHeight
         let effectiveEndHeight = noteHeight
-        let effectiveTotalBlocks = noteHeight >= actualStartHeight ? Int(noteHeight - actualStartHeight + 1) : 0
+        let effectiveTotalBlocks = noteHeight >= loopStartHeight ? Int(noteHeight - loopStartHeight + 1) : 0
 
         // Skip the loop entirely if no blocks to fetch
         guard effectiveTotalBlocks > 0 else {
@@ -790,7 +790,8 @@ final class TransactionBuilder {
             let thisBatchSize = min(batchSize, remainingBlocks)
 
             // Report progress
-            let progressPct = effectiveTotalBlocks > 0 ? Double(currentHeight - actualStartHeight) / Double(effectiveTotalBlocks) : 0
+            let blocksProcessed = Int(currentHeight) - Int(loopStartHeight)
+            let progressPct = effectiveTotalBlocks > 0 ? Double(blocksProcessed) / Double(effectiveTotalBlocks) : 0.0
             let progressStr = String(format: "%.0f%%", progressPct * 100)
             print("📡 Fetching blocks \(currentHeight)-\(currentHeight + UInt64(thisBatchSize) - 1) (\(progressStr))")
             onProgress?("witness", "Fetching blocks... \(progressStr)", 0.05 + progressPct * 0.85)
