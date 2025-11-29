@@ -25,9 +25,6 @@ extension Data {
 /// Builds z-to-z transactions only (no transparent support)
 final class TransactionBuilder {
 
-    // MARK: - Singleton
-    static let shared = TransactionBuilder()
-
     // MARK: - Constants
     private let TX_VERSION: Int32 = 4 // Sapling transaction version
     private let VERSION_GROUP_ID: UInt32 = 0x892F2085 // Sapling
@@ -119,7 +116,7 @@ final class TransactionBuilder {
         print("📝 Found \(dbNotes.count) notes with valid witnesses")
 
         // Check if witnesses need updating (tree has grown since witness was created)
-        let bundledTreeHeight: UInt64 = 2923123
+        let bundledTreeHeight: UInt64 = 2926122
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -171,100 +168,112 @@ final class TransactionBuilder {
             memoData.replaceSubrange(0..<min(memoBytes.count, 512), with: memoBytes)
         }
 
-        // AUTO-REFRESH: Ensure witness is up-to-date with current tree state
-        // If stored witness is stale, we automatically refresh it
+        // CRITICAL: Get anchor from block header at NOTE HEIGHT
+        // The anchor MUST match the tree state at the height where the note was received
+        // NOT the current tree state!
+        let headerStore = HeaderStore.shared
 
+        // Ensure HeaderStore is open
+        try? headerStore.open()
+
+        // Get the note height (this is where the note was received)
         let noteHeight = note.height
         print("📝 Note received at height: \(noteHeight)")
 
-        var witnessToUse = note.witness
-        let needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
-        let noteCMU = note.cmu
+        // CRITICAL FIX: Get the Sapling tree root from the block header at note height
+        // This is the anchor that zcashd knows about for this note
+        var anchorFromHeader: Data
 
-        // Get current tree state
-        guard let currentAnchor = ZipherXFFI.treeRoot() else {
-            print("❌ Tree not loaded - cannot get anchor")
-            throw TransactionError.proofGenerationFailed
+        if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+            anchorFromHeader = noteHeader.hashFinalSaplingRoot
+            let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
+            print("📝 Using anchor from block header at height \(noteHeight)")
+            print("📝 Anchor: \(anchorHex)...")
+            print("✅ This anchor matches zcashd's tree state at the note's block")
+        } else {
+            print("⚠️ Block header not available at height \(noteHeight)")
+            print("📝 Will compute anchor by building tree to note height...")
+            // anchorFromHeader will be set after rebuilding witness
+            anchorFromHeader = Data(count: 32) // placeholder
         }
-        var anchor = currentAnchor
-        let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-        print("📝 Current tree: \(currentTreeSize) CMUs, root: \(anchorHex)...")
+
+        // OPTIMIZATION: Check if witness is already current (background sync keeps it updated)
+        // If note.anchor matches current tree root, we can use the stored witness directly!
+        var witnessToUse = note.witness
+        var needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
 
         if needsRebuild {
             print("⚠️ Witness invalid (\(note.witness.count) bytes), needs rebuild")
+        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+            // Check if stored anchor matches current tree root
+            if let currentTreeRoot = ZipherXFFI.treeRoot() {
+                if note.anchor == currentTreeRoot {
+                    print("✅ Witness is current (anchor matches tree root) - INSTANT mode!")
+                    // Use the current tree root as anchor since witness is already synced
+                    anchorFromHeader = currentTreeRoot
+                    needsRebuild = false
+                } else {
+                    let storedHex = note.anchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let currentHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("⚠️ Witness anchor (\(storedHex)...) differs from tree root (\(currentHex)...), rebuilding...")
+                    needsRebuild = true
+                }
+            }
+        }
+
+        let noteCMU = note.cmu
+
+        if noteCMU == nil && needsRebuild {
+            print("❌ Note CMU not stored - cannot rebuild witness")
+            print("💡 Tip: Do a full rescan to populate CMU field")
+            throw TransactionError.proofGenerationFailed
+        }
+
+        // For notes beyond bundled tree height, rebuild witness if needed
+        // OPTIMIZATION: Skip if witness is already current (background sync)
+        if noteHeight > bundledTreeHeight && needsRebuild {
+            print("📝 Note is beyond bundled tree height (\(bundledTreeHeight)), rebuilding witness...")
 
             guard let cmu = noteCMU else {
-                print("❌ Note CMU not stored - cannot rebuild witness")
-                print("💡 Tip: Do a full rescan to populate CMU field")
+                print("❌ Cannot rebuild witness without CMU")
                 throw TransactionError.proofGenerationFailed
             }
 
-            if noteHeight <= bundledTreeHeight {
-                // Note is within bundled tree range - use treeCreateWitnessForCMU
-                print("📝 Note is within bundled tree range, creating witness...")
+            // Rebuild witness using bundled tree + fetched CMUs
+            if let result = try await rebuildWitnessForNote(
+                cmu: cmu,
+                noteHeight: noteHeight,
+                bundledTreeHeight: bundledTreeHeight
+            ) {
+                print("✅ Successfully rebuilt witness for note at height \(noteHeight)")
+                witnessToUse = result.witness
 
-                guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                      let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                    print("❌ Failed to load bundled commitment tree")
-                    throw TransactionError.proofGenerationFailed
-                }
-
-                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
-                    print("✅ Created witness at position \(result.position)")
-                    witnessToUse = result.witness
-                } else {
-                    print("❌ Failed to find note CMU in bundled tree")
-                    throw TransactionError.proofGenerationFailed
-                }
-            } else {
-                // Note is beyond bundled tree - rebuild from chain
-                print("📝 Note is beyond bundled tree height (\(bundledTreeHeight)), rebuilding witness...")
-
-                if let result = try await rebuildWitnessForNote(
-                    cmu: cmu,
-                    noteHeight: noteHeight,
-                    bundledTreeHeight: bundledTreeHeight
-                ) {
-                    print("✅ Successfully rebuilt witness for note at height \(noteHeight)")
-                    witnessToUse = result.witness
-                    anchor = result.anchor
-                    let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
+                // Use computed anchor if we don't have it from header store
+                if anchorFromHeader.allSatisfy({ $0 == 0 }) {
+                    anchorFromHeader = result.anchor
+                    let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
                     print("📝 Using computed anchor: \(anchorHex)...")
-                } else {
-                    print("❌ Failed to rebuild witness")
-                    throw TransactionError.proofGenerationFailed
-                }
-            }
-        } else {
-            // Witness exists - but might be stale! Auto-refresh if needed.
-            // For notes beyond bundled tree, we need to ensure witness matches current tree.
-            print("📝 Stored witness has \(note.witness.count) bytes")
-
-            if noteHeight > bundledTreeHeight {
-                // Note is beyond bundled tree - witness might be stale
-                // Refresh it by loading into FFI and updating to current tree
-                print("🔄 Auto-refreshing witness to match current tree state...")
-
-                if let cmu = noteCMU,
-                   let result = try await rebuildWitnessForNote(
-                       cmu: cmu,
-                       noteHeight: noteHeight,
-                       bundledTreeHeight: bundledTreeHeight
-                   ) {
-                    print("✅ Witness refreshed to current tree state")
-                    witnessToUse = result.witness
-                    anchor = result.anchor
-
-                    // Save updated witness to database for future use
-                    try? database.updateNoteWitness(noteId: note.id, witness: witnessToUse)
-                    print("💾 Saved refreshed witness to database")
-                } else {
-                    print("⚠️ CMU missing or refresh failed - using stored witness (may fail)")
-                    witnessToUse = note.witness
                 }
             } else {
-                // Note within bundled range - witness should be stable
-                print("✅ Using stored witness (within bundled range)")
+                print("❌ Failed to rebuild witness")
+                throw TransactionError.proofGenerationFailed
+            }
+        } else if noteHeight <= bundledTreeHeight && needsRebuild, let cmu = noteCMU {
+            // Note is within bundled tree range - use treeCreateWitnessForCMU
+            print("📝 Note is within bundled tree range, creating witness from bundled CMUs...")
+
+            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                print("❌ Failed to load bundled commitment tree")
+                throw TransactionError.proofGenerationFailed
+            }
+
+            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                print("✅ Created witness at position \(result.position)")
+                witnessToUse = result.witness
+            } else {
+                print("❌ Failed to find note CMU in bundled tree")
+                throw TransactionError.proofGenerationFailed
             }
         }
 
@@ -274,8 +283,8 @@ final class TransactionBuilder {
             toAddress: toAddressBytes,
             amount: amount,
             memo: memoData,
-            anchor: anchor,           // Use current tree root (witness is kept up-to-date)
-            witness: witnessToUse,    // Stored witness matches current anchor
+            anchor: anchorFromHeader,  // CRITICAL: Use anchor from block header at note height
+            witness: witnessToUse,     // Use rebuilt witness that matches anchor
             noteValue: note.value,
             noteRcm: note.rcm,
             noteDiversifier: note.diversifier,
@@ -340,7 +349,7 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        let bundledTreeHeight: UInt64 = 2923123
+        let bundledTreeHeight: UInt64 = 2926122
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -402,90 +411,52 @@ final class TransactionBuilder {
 
         onProgress("witness", nil, nil)
 
-        // Get note info
+        // Get anchor and rebuild witness
+        let headerStore = HeaderStore.shared
+        try? headerStore.open()
+
         let noteHeight = note.height
-        print("📝 Note received at height: \(noteHeight)")
+        var anchorFromHeader: Data
+
+        if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+            anchorFromHeader = noteHeader.hashFinalSaplingRoot
+        } else {
+            anchorFromHeader = Data(count: 32)
+        }
 
         var witnessToUse = note.witness
+        let needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
+
         let noteCMU = note.cmu
 
-        // Use CURRENT tree root as anchor
-        guard let currentAnchor = ZipherXFFI.treeRoot() else {
-            print("❌ Tree not loaded - cannot get anchor")
-            throw TransactionError.proofGenerationFailed
-        }
-        var anchor = currentAnchor
-        let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-        print("📝 Current tree root (anchor): \(anchorHex)...")
-
-        // Check if witness needs rebuild:
-        // 1. Invalid witness (wrong size or all zeros)
-        // 2. Stored anchor is missing or doesn't match current anchor (witness is stale)
-        let witnessInvalid = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
-        let anchorMatches = !note.anchor.isEmpty && note.anchor == currentAnchor
-        let needsRebuild = witnessInvalid || !anchorMatches
-
-        if !anchorMatches && !note.anchor.isEmpty {
-            let storedAnchorHex = note.anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-            print("⚠️ Stored anchor (\(storedAnchorHex)...) doesn't match current (\(anchorHex)...) - rebuilding witness")
-        } else if note.anchor.isEmpty && !witnessInvalid {
-            print("⚠️ No stored anchor - rebuilding witness to verify")
-        }
-
-        if needsRebuild {
-            if witnessInvalid {
-                print("⚠️ Witness invalid (\(note.witness.count) bytes), needs rebuild")
-            }
-            onProgress("witness", "Updating witness...", 0.0)
-
+        if noteHeight > bundledTreeHeight {
             guard let cmu = noteCMU else {
-                print("❌ Note CMU not stored - cannot rebuild witness")
                 throw TransactionError.proofGenerationFailed
             }
 
-            if noteHeight <= bundledTreeHeight {
-                // Note within bundled range - use bundled tree for witness
-                print("📝 Note is within bundled tree range, creating witness...")
-
-                guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                      let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                    throw TransactionError.proofGenerationFailed
-                }
-
-                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
-                    witnessToUse = result.witness
-                    print("✅ Created witness at position \(result.position)")
-                } else {
-                    throw TransactionError.proofGenerationFailed
+            if let result = try await rebuildWitnessForNote(
+                cmu: cmu,
+                noteHeight: noteHeight,
+                bundledTreeHeight: bundledTreeHeight
+            ) {
+                witnessToUse = result.witness
+                if anchorFromHeader.allSatisfy({ $0 == 0 }) {
+                    anchorFromHeader = result.anchor
                 }
             } else {
-                // Note beyond bundled range - rebuild from chain
-                print("📝 Note is beyond bundled tree height (\(bundledTreeHeight)), rebuilding witness...")
-
-                if let result = try await rebuildWitnessForNote(
-                    cmu: cmu,
-                    noteHeight: noteHeight,
-                    bundledTreeHeight: bundledTreeHeight,
-                    onProgress: onProgress
-                ) {
-                    print("✅ Successfully rebuilt witness")
-                    witnessToUse = result.witness
-                    anchor = result.anchor
-                    let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-                    print("📝 Using computed anchor: \(anchorHex)...")
-
-                    // Save updated witness to database so next send is instant
-                    try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witnessToUse)
-                    try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: anchor)
-                    print("💾 Saved updated witness to database")
-                } else {
-                    throw TransactionError.proofGenerationFailed
-                }
+                throw TransactionError.proofGenerationFailed
             }
-        } else {
-            // Witness is valid and anchor matches - use directly
-            print("✅ Using stored witness (\(note.witness.count) bytes) - anchor matches")
-            onProgress("witness", "Witness ready", 1.0)
+        } else if needsRebuild, let cmu = noteCMU {
+            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                throw TransactionError.proofGenerationFailed
+            }
+
+            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                witnessToUse = result.witness
+            } else {
+                throw TransactionError.proofGenerationFailed
+            }
         }
 
         onProgress("proof", nil, nil)
@@ -496,8 +467,8 @@ final class TransactionBuilder {
             toAddress: toAddressBytes,
             amount: amount,
             memo: memoData,
-            anchor: anchor,           // Use current tree root (witness is kept up-to-date)
-            witness: witnessToUse,    // Stored witness matches current anchor
+            anchor: anchorFromHeader,
+            witness: witnessToUse,
             noteValue: note.value,
             noteRcm: note.rcm,
             noteDiversifier: note.diversifier,
@@ -569,14 +540,11 @@ final class TransactionBuilder {
                 continue
             }
 
-            // Use STORED anchor (tree root when witness was last updated)
-            // If stored anchor is nil/empty, use current tree root (will trigger rebuild)
-            let noteAnchor = dbNote.anchor ?? Data()
-
+            // The anchor is the current tree root, not from the witness
+            // Witness format: 4 bytes position + 32*32 bytes merkle path
             let note = SpendableNote(
-                id: dbNote.id, // Database row ID for witness updates
                 value: dbNote.value,
-                anchor: noteAnchor, // Stored anchor - for comparison with current tree root
+                anchor: anchor, // Use current tree root
                 witness: dbNote.witness,
                 diversifier: dbNote.diversifier,
                 rcm: dbNote.rcm,
@@ -633,210 +601,57 @@ final class TransactionBuilder {
 
     // MARK: - Witness Rebuild
 
-    /// Rebuild witness for a note to match current tree state
-    /// This fetches CMUs from chain and builds the tree to the note's position
-    /// - Returns: Updated witness and anchor tuple, or nil if failed
+    /// Rebuild witness for a note that's beyond the bundled tree height
+    /// This fetches CMUs from the chain and builds the tree up to the note's position
+    /// Returns tuple of (witness, anchor) where anchor is the tree root at noteHeight
     func rebuildWitnessForNote(
         cmu: Data,
         noteHeight: UInt64,
-        bundledTreeHeight: UInt64,
-        onProgress: ProgressCallback? = nil
+        bundledTreeHeight: UInt64
     ) async throws -> (witness: Data, anchor: Data)? {
         print("🔄 Rebuilding witness for note at height \(noteHeight)...")
         print("📝 Note CMU: \(cmu.map { String(format: "%02x", $0) }.joined().prefix(16))...")
 
-        // OPTIMIZATION: Check if tree is already loaded (from WalletManager startup)
-        var treeSize = ZipherXFFI.treeSize()
-        let expectedMinSize = UInt64(1_041_000) // Bundled tree has ~1.04M CMUs
-
-        if treeSize >= expectedMinSize {
-            // Tree already loaded! Skip expensive reload
-            print("✅ Tree already loaded with \(treeSize) commitments - skipping reload!")
-            onProgress?("witness", "Using cached tree...", 0.05)
-        } else {
-            // Tree not loaded - need to load bundled CMUs
-            print("⚠️ Tree has only \(treeSize) CMUs, loading bundled tree...")
-            onProgress?("witness", "Loading bundled tree...", 0.0)
-
-            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                print("❌ Failed to load bundled commitment tree")
-                return nil
-            }
-
-            // Parse bundled CMU count
-            guard bundledData.count >= 8 else { return nil }
-            let bundledCount = bundledData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-            print("📊 Bundled tree has \(bundledCount) CMUs ending at height \(bundledTreeHeight)")
-
-            // Initialize and load
-            guard ZipherXFFI.treeInit() else {
-                print("❌ Failed to initialize tree")
-                return nil
-            }
-
-            if !ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
-                print("❌ Failed to load bundled CMUs")
-                return nil
-            }
-
-            treeSize = ZipherXFFI.treeSize()
-            print("✅ Tree now has \(treeSize) commitments")
-        }
-
-        // OPTIMIZATION: Check what height we've already scanned to avoid re-fetching
-        // The tree already contains CMUs from bundled file AND from previous syncs
-        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
-
-        // Calculate actual start height - skip blocks already in tree
-        let actualStartHeight: UInt64
-        if noteHeight <= lastScannedHeight {
-            // Note is WITHIN already-scanned range - tree already has all needed CMUs!
-            // We just need to find the note's position and create witness
-            print("✅ Note at height \(noteHeight) is within scanned range (up to \(lastScannedHeight))")
-            print("✅ Tree already has all CMUs needed - no network fetch required!")
-            actualStartHeight = noteHeight + 1 // Skip all fetching
-        } else {
-            // Only fetch blocks AFTER last scanned height
-            actualStartHeight = max(bundledTreeHeight + 1, lastScannedHeight + 1)
-            print("📊 Last scanned height: \(lastScannedHeight), will fetch from \(actualStartHeight)")
-        }
-
-        let startHeight = actualStartHeight
-        let totalBlocks = noteHeight >= startHeight ? Int(noteHeight - startHeight + 1) : 0
-
-        if totalBlocks > 0 {
-            print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight) (\(totalBlocks) blocks via P2P)...")
-            onProgress?("witness", "Fetching \(totalBlocks) blocks...", 0.05)
-        } else {
-            print("✅ No additional blocks to fetch - using existing tree state")
-            onProgress?("witness", "Using cached data...", 0.5)
-        }
-
-        var notePosition: UInt64? = nil
-        var cmusProcessed = 0
-        let networkManager = NetworkManager.shared
-
-        // FAST PATH: If note is within already-scanned range, use bundled tree approach
-        // This avoids any network fetching!
-        if totalBlocks == 0 && noteHeight <= bundledTreeHeight {
-            print("🚀 FAST PATH: Note within bundled range, using treeCreateWitnessForCMU...")
-            onProgress?("witness", "Creating witness (fast)...", 0.7)
-
-            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                print("❌ Failed to load bundled tree for witness creation")
-                return nil
-            }
-
-            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
-                print("✅ Created witness at position \(result.position) via fast path")
-                let currentRoot = ZipherXFFI.treeRoot() ?? Data()
-                return (witness: result.witness, anchor: currentRoot)
-            } else {
-                print("❌ Failed to find note CMU in bundled tree")
-                return nil
-            }
-        }
-
-        // EDGE CASE: Note beyond bundled range but within scanned range
-        // If we're here with totalBlocks == 0, the witness is corrupted and needs full rebuild.
-        // We must REINITIALIZE the tree to avoid duplicate CMU corruption.
-        if totalBlocks == 0 && noteHeight > bundledTreeHeight && noteHeight <= lastScannedHeight {
-            print("⚠️ Note beyond bundled but within scanned range - witness needs full rebuild")
-            print("📊 Reinitializing tree and scanning blocks \(bundledTreeHeight + 1) to \(noteHeight)")
-            onProgress?("witness", "Rebuilding witness (corrupted)...", 0.1)
-
-            // MUST reinitialize tree to avoid duplicate CMUs
-            guard ZipherXFFI.treeInit() else {
-                print("❌ Failed to reinitialize tree")
-                return nil
-            }
-
-            // Reload bundled CMUs first
-            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                print("❌ Failed to load bundled tree")
-                return nil
-            }
-
-            if !ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
-                print("❌ Failed to reload bundled CMUs")
-                return nil
-            }
-            print("✅ Tree reinitialized with bundled CMUs")
-        }
-
-        // Batch size for P2P requests (larger = faster but may timeout)
-        let batchSize = 50
-        // If we reinitialized the tree, we need to fetch from bundled+1
-        // Otherwise use the calculated startHeight
-        let loopStartHeight = (totalBlocks == 0 && noteHeight > bundledTreeHeight) ? (bundledTreeHeight + 1) : startHeight
-        var currentHeight = loopStartHeight
-        let effectiveEndHeight = noteHeight
-        let effectiveTotalBlocks = noteHeight >= loopStartHeight ? Int(noteHeight - loopStartHeight + 1) : 0
-
-        // Skip the loop entirely if no blocks to fetch
-        guard effectiveTotalBlocks > 0 else {
-            print("✅ No blocks to fetch - all CMUs already in tree")
-            let currentRoot = ZipherXFFI.treeRoot() ?? Data()
-            // We still need to find the note's position - but if we reach here,
-            // we should have returned earlier via the fast path
+        // 1. Load bundled CMU file
+        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+              let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+            print("❌ Failed to load bundled commitment tree")
             return nil
         }
 
-        while currentHeight <= effectiveEndHeight {
-            let remainingBlocks = Int(noteHeight - currentHeight + 1)
-            let thisBatchSize = min(batchSize, remainingBlocks)
+        // Parse bundled CMU count
+        guard bundledData.count >= 8 else { return nil }
+        let bundledCount = bundledData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        print("📊 Bundled tree has \(bundledCount) CMUs ending at height \(bundledTreeHeight)")
 
-            // Report progress
-            let blocksProcessed = Int(currentHeight) - Int(loopStartHeight)
-            let progressPct = effectiveTotalBlocks > 0 ? Double(blocksProcessed) / Double(effectiveTotalBlocks) : 0.0
-            let progressStr = String(format: "%.0f%%", progressPct * 100)
-            print("📡 Fetching blocks \(currentHeight)-\(currentHeight + UInt64(thisBatchSize) - 1) (\(progressStr))")
-            onProgress?("witness", "Fetching blocks... \(progressStr)", 0.05 + progressPct * 0.85)
+        // 2. Initialize fresh tree
+        guard ZipherXFFI.treeInit() else {
+            print("❌ Failed to initialize tree")
+            return nil
+        }
 
-            // Try P2P first, fall back to InsightAPI
-            var blockCMUs: [(height: UInt64, cmus: [Data])] = []
+        // 3. Load bundled CMUs into tree
+        print("🌳 Loading bundled CMUs into tree...")
+        if !ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+            print("❌ Failed to load bundled CMUs")
+            return nil
+        }
 
-            if networkManager.isConnected, let peer = networkManager.peers.first {
-                do {
-                    // Use P2P batch fetch
-                    let blocks = try await peer.getFullBlocks(from: currentHeight, count: thisBatchSize)
-                    for block in blocks {
-                        var cmus: [Data] = []
-                        for tx in block.transactions {
-                            for output in tx.outputs {
-                                // CMUs from P2P are in wire format (little-endian) - use directly
-                                cmus.append(output.cmu)
-                            }
-                        }
-                        blockCMUs.append((height: block.blockHeight, cmus: cmus))
-                    }
-                } catch {
-                    print("⚠️ P2P batch fetch failed: \(error), falling back to InsightAPI")
-                    // Fall through to InsightAPI fallback
-                }
-            }
+        let treeSize = ZipherXFFI.treeSize()
+        print("✅ Tree now has \(treeSize) commitments")
 
-            // Fallback to InsightAPI if P2P failed or not connected
-            if blockCMUs.isEmpty {
-                for height in currentHeight..<(currentHeight + UInt64(thisBatchSize)) {
-                    if height > noteHeight { break }
-                    do {
-                        let cmus = try await fetchCMUsViaInsight(height: height)
-                        blockCMUs.append((height: height, cmus: cmus))
-                    } catch {
-                        print("⚠️ InsightAPI fetch failed at height \(height): \(error)")
-                    }
-                }
-            }
+        // 4. Fetch additional CMUs from blocks between bundledTreeHeight+1 and noteHeight
+        let startHeight = bundledTreeHeight + 1
+        print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight)...")
 
-            // Process fetched CMUs
-            for (height, cmus) in blockCMUs {
-                for blockCMU in cmus {
-                    cmusProcessed += 1
+        var additionalCMUs: [Data] = []
+        var notePosition: UInt64? = nil
 
+        for height in startHeight...noteHeight {
+            // Fetch block data via NetworkManager
+            do {
+                let blockCMUs = try await fetchCMUsViaInsight(height: height)
+                for blockCMU in blockCMUs {
                     // Check if this is our note's CMU
                     if blockCMU == cmu {
                         // Found our note! Append it and capture witness
@@ -853,22 +668,30 @@ final class TransactionBuilder {
                             return nil
                         }
 
+                        // Continue adding remaining CMUs to update the witness
                         notePosition = position
                         print("✅ Found note CMU at position \(position) in block \(height)")
+
+                        // Get witness data after finishing this block's CMUs
+                        // (we need to continue to end of block)
+                        additionalCMUs.append(blockCMU)
                     } else if notePosition != nil {
                         // After finding note, continue appending to update witness
                         _ = ZipherXFFI.treeAppend(cmu: blockCMU)
+                        additionalCMUs.append(blockCMU)
                     } else {
                         // Before finding note, just append
                         let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
                         if pos == UInt64.max {
                             print("⚠️ Failed to append CMU at height \(height)")
                         }
+                        additionalCMUs.append(blockCMU)
                     }
                 }
+            } catch {
+                print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
+                // Continue anyway - maybe note is in earlier block
             }
-
-            currentHeight += UInt64(thisBatchSize)
         }
 
         guard notePosition != nil else {
@@ -876,9 +699,8 @@ final class TransactionBuilder {
             return nil
         }
 
-        print("📊 Added \(cmusProcessed) CMUs from chain")
+        print("📊 Added \(additionalCMUs.count) CMUs from chain")
         print("📊 Final tree size: \(ZipherXFFI.treeSize())")
-        onProgress?("witness", "Building witness...", 0.95)
 
         // 5. Get the witness - it's index 0 since we only created one
         guard let witness = ZipherXFFI.treeGetWitness(index: 0) else {
@@ -904,7 +726,6 @@ final class TransactionBuilder {
             print("💾 Updated tree state saved to database")
         }
 
-        onProgress?("witness", nil, 1.0)
         return (witness: witness, anchor: anchor)
     }
 
@@ -947,7 +768,6 @@ final class TransactionBuilder {
 // MARK: - Supporting Types
 
 struct SpendableNote {
-    let id: Int64 // database row ID
     let value: UInt64
     let anchor: Data
     let witness: Data

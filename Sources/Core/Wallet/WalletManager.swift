@@ -91,9 +91,9 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadStatus: String = ""
 
     // Expected values for bundled tree validation
-    private let bundledTreeCMUCount: UInt64 = 1_041_688
-    private let bundledTreeHeight: UInt64 = 2_923_123
-    // Expected root (display format): 42d6a11f937de8a27060ad683a632be73d08fae9ff421145f58e16a282c702f3
+    private let bundledTreeCMUCount: UInt64 = 1_041_891
+    private let bundledTreeHeight: UInt64 = 2_926_122
+    // Expected root (display format): 5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945
 
     // Lock to prevent concurrent tree loading
     private var isTreeLoading = false
@@ -265,6 +265,82 @@ final class WalletManager: ObservableObject {
         }
     }
 
+    // MARK: - Background Tree Sync
+
+    /// Track background sync state to prevent concurrent syncs
+    private var isBackgroundSyncing = false
+    private let backgroundSyncLock = NSLock()
+
+    /// Sync tree to current chain height in background
+    /// Called automatically when new blocks arrive
+    /// This is lightweight - just appends new CMUs and updates witnesses
+    func backgroundSyncToHeight(_ targetHeight: UInt64) async {
+        // Prevent concurrent syncs
+        backgroundSyncLock.lock()
+        if isBackgroundSyncing {
+            backgroundSyncLock.unlock()
+            return
+        }
+        isBackgroundSyncing = true
+        backgroundSyncLock.unlock()
+
+        defer {
+            backgroundSyncLock.lock()
+            isBackgroundSyncing = false
+            backgroundSyncLock.unlock()
+        }
+
+        // Don't sync during initial sync or if tree not loaded
+        guard isTreeLoaded && !isSyncing else {
+            return
+        }
+
+        // Get current synced height
+        let currentHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
+        guard targetHeight > currentHeight else {
+            return // Already synced
+        }
+
+        let blocksToSync = targetHeight - currentHeight
+        print("🔄 Background sync: \(blocksToSync) new block(s) (\(currentHeight + 1) → \(targetHeight))")
+
+        do {
+            // Get spending key for note detection
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+
+            // Use FilterScanner for lightweight sync
+            let scanner = FilterScanner()
+
+            // Get account ID
+            guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+                print("⚠️ Background sync: No account found")
+                return
+            }
+
+            // Scan just the new blocks
+            try await scanner.startScan(
+                for: account.id,
+                viewingKey: spendingKey,
+                fromHeight: currentHeight + 1
+            )
+
+            // Update wallet height
+            try? WalletDatabase.shared.updateLastScannedHeight(targetHeight, hash: Data(count: 32))
+
+            print("✅ Background sync complete: tree now at height \(targetHeight)")
+
+            // Update balance if any new notes found
+            let notes = try WalletDatabase.shared.getUnspentNotes(accountId: account.id)
+            let totalBalance = notes.reduce(0) { $0 + $1.value }
+            await MainActor.run {
+                self.shieldedBalance = totalBalance
+            }
+
+        } catch {
+            print("⚠️ Background sync failed: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Wallet Creation
 
     /// Create a new wallet with a fresh mnemonic
@@ -288,6 +364,11 @@ final class WalletManager: ObservableObject {
         // Print address to console for debugging
         print("🔐 Generated z-address: \(address)")
         print("🔐 Address length: \(address.count) characters")
+
+        // CRITICAL: Reset database state for new wallet
+        // This ensures we scan from bundledTreeHeight, not from a previous wallet's lastScannedHeight
+        print("🗑️ Resetting database state for new wallet...")
+        try? resetDatabaseForNewWallet()
 
         // Update state
         DispatchQueue.main.async {
@@ -318,12 +399,42 @@ final class WalletManager: ObservableObject {
         // Derive z-address
         let address = try deriveZAddress(from: spendingKey)
 
+        // CRITICAL: Reset database state for restored wallet
+        // This ensures we scan from the beginning to find all historical notes
+        print("🗑️ Resetting database state for restored wallet...")
+        try? resetDatabaseForNewWallet()
+
         // Update state
         DispatchQueue.main.async {
             self.zAddress = address
             self.isWalletCreated = true
             self.saveWalletState()
         }
+    }
+
+    /// Reset database state for a new or restored wallet
+    /// Clears notes, tree state, scan history, and transaction history
+    private func resetDatabaseForNewWallet() throws {
+        // Open database with a temporary key to clear it
+        // Note: Database will be re-opened with correct key during first sync
+        print("🗑️ Clearing old wallet data from database...")
+
+        // Clear tree state
+        try? WalletDatabase.shared.clearTreeState()
+
+        // Reset last scanned height to 0 (will be set to bundledTreeHeight during scan)
+        try? WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
+
+        // Clear notes table
+        try? WalletDatabase.shared.clearAllNotes()
+
+        // Clear transaction history
+        try? WalletDatabase.shared.clearTransactionHistory()
+
+        // Clear accounts (will be recreated during sync)
+        try? WalletDatabase.shared.clearAccounts()
+
+        print("✅ Database reset complete for new wallet")
     }
 
     // MARK: - Balance
@@ -446,7 +557,7 @@ final class WalletManager: ObservableObject {
             // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
             // The getheaders protocol returns headers AFTER the locator hash
             // Checkpoint at bundledTreeHeight (2923123) will be used as locator
-            let bundledTreeHeight: UInt64 = 2923123
+            let bundledTreeHeight: UInt64 = 2926122
             let startHeight: UInt64
             if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
                 // Resume from where we left off
@@ -479,7 +590,7 @@ final class WalletManager: ObservableObject {
         let scanner = FilterScanner()
 
         // Bundled tree height for PHASE detection
-        let bundledTreeHeight: UInt64 = 2923123
+        let bundledTreeHeight: UInt64 = 2926122
 
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
@@ -605,6 +716,7 @@ final class WalletManager: ObservableObject {
         try? await Task.sleep(nanoseconds: 200_000_000) // 0.2 sec
 
         await updateTask("balance", status: .completed, detail: "\(unspentNotes.count) notes verified")
+        print("✅ Balance task marked as completed")
 
         // Update UI
         DispatchQueue.main.async {
@@ -671,7 +783,8 @@ final class WalletManager: ObservableObject {
             // Rebuild witness to current tree state
             guard let cmu = note.cmu else { continue }
 
-            if let result = try await TransactionBuilder.shared.rebuildWitnessForNote(
+            let builder = TransactionBuilder()
+            if let result = try await builder.rebuildWitnessForNote(
                 cmu: cmu,
                 noteHeight: note.height,
                 bundledTreeHeight: bundledTreeHeight
@@ -750,7 +863,7 @@ final class WalletManager: ObservableObject {
         print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
         // Clear existing notes but keep tree if we're starting from a specific height
-        let bundledTreeHeight: UInt64 = 2923123  // Height where bundled tree ends
+        let bundledTreeHeight: UInt64 = 2926122  // Height where bundled tree ends
 
         // Wait for any existing scan to complete (with timeout)
         if FilterScanner.isScanInProgress {
@@ -871,7 +984,7 @@ final class WalletManager: ObservableObject {
             // All notes have CMU - check if any are beyond bundled range
             print("🚀 Checking notes for witness rebuild...")
 
-            let bundledTreeHeight: UInt64 = 2923123 // Height where bundled tree ends
+            let bundledTreeHeight: UInt64 = 2926122 // Height where bundled tree ends
 
             // Check if ANY note is beyond bundled range
             let notesBeyondBundled = notesWithCMU.filter { $0.height > bundledTreeHeight }

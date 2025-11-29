@@ -84,15 +84,27 @@ struct ContentView: View {
                                 $0.id == "balance" && $0.status == .completed
                             }
 
-                            // If balance is done OR (not syncing AND syncTasks empty for a while), we're done
+                            // Check if ALL tasks are completed
+                            let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+                                if case .completed = $0.status { return true }
+                                if case .failed = $0.status { return true }
+                                return false
+                            }
+
+                            // If balance is done OR all tasks done, we're done
                             if balanceTaskCompleted {
                                 print("✅ Sync complete: balance task finished")
                                 break
                             }
 
-                            // Also break if sync stopped and no more tasks
-                            if !walletManager.isSyncing && walletManager.syncTasks.isEmpty && syncCompleteWait > 50 {
-                                print("✅ Sync complete: no more tasks")
+                            if allTasksCompleted {
+                                print("✅ Sync complete: all tasks finished")
+                                break
+                            }
+
+                            // Also break if sync stopped for a while (fallback)
+                            if !walletManager.isSyncing && syncCompleteWait > 100 {
+                                print("✅ Sync complete: sync stopped (fallback)")
                                 break
                             }
 
@@ -186,7 +198,14 @@ struct ContentView: View {
         }
 
         // Sync phase (40-95%)
-        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
+        // Check if still syncing OR tasks exist and not all completed
+        let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+            if case .completed = $0.status { return true }
+            if case .failed = $0.status { return true }
+            return false
+        }
+
+        if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !allTasksCompleted) {
             // Check if balance task is completed
             let balanceCompleted = walletManager.syncTasks.contains {
                 $0.id == "balance" && $0.status == .completed
@@ -217,7 +236,14 @@ struct ContentView: View {
             return walletManager.treeLoadStatus.isEmpty ? "Loading commitment tree..." : walletManager.treeLoadStatus
         }
         // Syncing (includes waiting for sync to start)
-        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
+        // Only show sync status if still syncing or tasks not all completed
+        let statusAllTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+            if case .completed = $0.status { return true }
+            if case .failed = $0.status { return true }
+            return false
+        }
+
+        if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !statusAllTasksCompleted) {
             if walletManager.syncStatus.isEmpty {
                 return "Starting blockchain sync..."
             }
@@ -226,6 +252,10 @@ struct ContentView: View {
         // Tree loaded, network connected, sync complete
         if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
             return "Ready!"
+        }
+        // All tasks completed - show ready message
+        if statusAllTasksCompleted {
+            return "Finalizing..."
         }
         // Waiting for sync to start
         return "Preparing sync..."
@@ -238,7 +268,7 @@ struct ContentView: View {
 
         // 1. FIRST: Network connection task
         if !networkManager.isConnected {
-            let status: SyncTask.TaskStatus = walletManager.isConnecting ? .inProgress : .pending
+            let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
             tasks.append(SyncTask(id: "connect", title: "Connect to network", status: status))
         } else {
             tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))

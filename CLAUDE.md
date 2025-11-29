@@ -259,12 +259,12 @@ The app includes a pre-built Sapling commitment tree (`commitment_tree_v3.bin`) 
 
 | Property | Value |
 |----------|-------|
-| **File** | `Resources/commitment_tree_v4.bin` |
+| **File** | `Resources/commitment_tree.bin` (copied from v4) |
 | **Format** | `[count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...` |
-| **CMU Count** | 1,041,688 commitments |
-| **End Height** | 2,923,123 |
+| **CMU Count** | 1,041,891 commitments |
+| **End Height** | 2,926,122 |
 | **File Size** | 31.8 MB |
-| **Tree Root** | `42d6a11f937de8a27060ad683a632be73d08fae9ff421145f58e16a282c702f3` |
+| **Tree Root** | `5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945` |
 
 ### How to Generate/Update the Bundled Tree
 
@@ -849,9 +849,10 @@ Future send (anchor stale due to new blocks):
 | Constant | Value | Location |
 |----------|-------|----------|
 | Sapling Activation | 476,969 | `ZclassicCheckpoints.swift` |
-| Bundled Tree Height | 2,923,123 | `FilterScanner.swift`, `TransactionBuilder.swift` |
-| Bundled CMU Count | 1,041,688 | Verified via `verify_tree` tool |
+| Bundled Tree Height | 2,926,122 | `FilterScanner.swift`, `TransactionBuilder.swift`, `WalletManager.swift` |
+| Bundled CMU Count | 1,041,891 | `WalletManager.swift` |
 | Default Fee | 10,000 zatoshis | `TransactionBuilder.swift` |
+| Min Peers for Sync | 3 | `HeaderSyncManager.swift` |
 
 ### 14. Transaction Builder Optimization Attempt - REVERTED (November 28, 2025)
 
@@ -1091,12 +1092,205 @@ This proves the full shielded transaction flow works end-to-end on Zclassic main
 
 ---
 
+### 20. Sync Performance and UI Improvements (November 29, 2025)
+
+**Changes Made:**
+
+1. **Pre-fetch Pipeline for Sync** (`FilterScanner.swift`)
+   - Sequential mode now pre-fetches batch N+1 while processing batch N
+   - ~40% speed improvement by overlapping network I/O with tree building
+   - Cancels pre-fetch task if scan is stopped early
+
+2. **Fixed Witness Loading Order** (`FilterScanner.swift`)
+   - Existing witnesses now loaded AFTER tree is initialized (was loading before)
+   - This ensures witnesses are properly updated as new CMUs are appended
+
+3. **Updated Bundled Tree to Latest Height**
+   - Height: 2,926,122 (was 2,923,123)
+   - CMU Count: 1,041,891 (was 1,041,688)
+   - Root: `5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945`
+   - Near-instant startup sync (only ~0 blocks to fetch on fresh install)
+
+4. **Face ID Authentication for Send Transactions** (`BiometricAuthManager.swift`)
+   - `authenticateForSend()` now ALWAYS requires fresh Face ID (no timeout bypass)
+   - This ensures every send transaction requires explicit biometric approval
+
+5. **Peer Count Warning** (`BalanceView.swift`)
+   - Peer count now shows RED when < 3 peers connected
+   - Added ⚠️ warning emoji to status text
+   - `HeaderSyncManager` requires minimum 3 peers for sync
+
+6. **P2P-Only Broadcasting** (`NetworkManager.swift`)
+   - Transaction broadcast is P2P only (no InsightAPI fallback)
+   - InsightAPI only used for mempool verification (read-only)
+
+**Files Modified:**
+- `Sources/Core/Network/FilterScanner.swift` - pre-fetch pipeline, witness loading order fix
+- `Sources/Core/Security/BiometricAuthManager.swift` - fresh Face ID for send
+- `Sources/Features/Balance/BalanceView.swift` - red peer count warning
+- `Sources/Core/Network/HeaderSyncManager.swift` - minPeers = 3
+- `Sources/Core/Network/NetworkManager.swift` - P2P-only broadcast
+- `Sources/Core/Wallet/WalletManager.swift` - bundled tree constants updated
+- `Sources/Core/Crypto/TransactionBuilder.swift` - bundled tree constants updated
+
+---
+
+### 21. UI Stuck at 98% During Initial Sync (November 29, 2025)
+
+**Problem**: App startup UI stuck at 98% even after scan completed successfully. The log showed endless `📊 Fetching network stats...` messages.
+
+**Root Cause**: ContentView's sync completion wait loop had flawed exit conditions:
+1. `balanceTaskCompleted` check relied on task status being set correctly
+2. `syncTasks.isEmpty` condition NEVER triggered because syncTasks array is never cleared (8 tasks remain after sync)
+3. No fallback timeout for cases where task status checking fails
+
+**Solution: Multiple Exit Conditions**
+
+1. **Added `allTasksCompleted` check** - Checks if all tasks have status `.completed` or `.failed`:
+   ```swift
+   let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+       if case .completed = $0.status { return true }
+       if case .failed = $0.status { return true }
+       return false
+   }
+   ```
+
+2. **Added fallback timeout** - If `isSyncing` is false for 10+ seconds, exit anyway:
+   ```swift
+   if !walletManager.isSyncing && syncCompleteWait > 100 {
+       print("✅ Sync complete: sync stopped (fallback)")
+       break
+   }
+   ```
+
+3. **Fixed `currentSyncProgress` computed property** - Changed condition to not get stuck when tasks exist but are all completed
+
+4. **Fixed `currentSyncStatus` computed property** - Same fix to show "Finalizing..." when appropriate
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - fixed sync completion detection, progress, and status logic
+- `Sources/Core/Wallet/WalletManager.swift` - added debug print for balance task completion
+
+---
+
+### 22. Broadcast Verification Error When InsightAPI Slow (November 29, 2025)
+
+**Problem**: Transaction broadcast succeeded (P2P peers accepted), but app showed error "Transaction not found on blockchain - may have been rejected" because InsightAPI verification took too long. Balance remained unchanged even though tx was on-chain.
+
+**Root Cause**: The verification step was BLOCKING and threw an error after 10 attempts (30 seconds). InsightAPI might be slow to index new transactions.
+
+**Solution: Non-blocking Verification**
+
+1. **Reduced verification attempts** - 5 attempts × 2 seconds = 10 seconds max wait
+2. **Verification is now informational** - If InsightAPI doesn't see the tx, log a warning but DON'T throw error
+3. **P2P broadcast success = success** - If at least 1 peer accepted the tx, return txId
+4. **Added debug logging** - Track which peers accept/reject the tx
+
+```swift
+// OLD: Threw error if verification failed
+throw NetworkError.transactionNotVerified
+
+// NEW: Log warning but return success
+if !verified {
+    print("⚠️ Transaction not yet visible on InsightAPI (may take a moment): \(txId)")
+    onProgress?("verify", "Broadcast complete (verifying...)", 1.0)
+}
+return txId  // P2P broadcast succeeded, tx is propagating
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - non-blocking verification, better logging
+
+---
+
+### 23. Background Tree Sync for Instant Sends (November 29, 2025)
+
+**Problem**: Transaction sends were slow (~30+ seconds) because the app had to fetch new blocks and rebuild witnesses at send time.
+
+**Solution: Automatic Background Sync**
+
+1. **Trigger**: When `chainHeight > walletHeight` (detected during network stats fetch)
+2. **Process**: Fetch new blocks, append CMUs to tree, update witnesses
+3. **Result**: Tree always current, witnesses always up-to-date
+
+**Flow**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│  1. App syncs on startup → tree at height N                 │
+│  2. Network stats detects chainHeight = N+5                 │
+│  3. Background sync fetches blocks N+1 to N+5               │
+│  4. CMUs appended, witnesses updated                        │
+│  5. User sends → tree already current → INSTANT!            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**TransactionBuilder Optimization**:
+- If `note.anchor == currentTreeRoot` → witness is current, skip rebuild
+- Prints "✅ Witness is current (anchor matches tree root) - INSTANT mode!"
+- Only rebuilds if witness is stale (missed background sync)
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - `backgroundSyncToHeight()` method
+- `Sources/Core/Network/NetworkManager.swift` - triggers background sync when chain ahead
+- `Sources/Core/Crypto/TransactionBuilder.swift` - skip rebuild if witness current
+
+---
+
+### 24. CRITICAL: Background Sync Reloading Bundled Tree Instead of Appending (November 29, 2025)
+
+**Problem**: Notes received in recent blocks were not being detected. Balance showed 0 even though transaction was confirmed on blockchain.
+
+**Root Cause**: The `needsFreshBundledTree` condition in `FilterScanner.startScan()` was wrong:
+```swift
+// OLD (WRONG):
+let needsFreshBundledTree = customStartHeight != nil && customStartHeight! > bundledTreeHeight
+```
+
+This condition was TRUE for background sync because:
+- `customStartHeight` = 2926324 (current height + 1)
+- `bundledTreeHeight` = 2926122
+- 2926324 > 2926122 = TRUE
+
+This caused background sync to reload the bundled tree (1,041,891 CMUs) every time instead of using the existing tree and APPENDING new CMUs. The shielded outputs from new blocks were never added to the tree.
+
+**Solution**: Changed condition to only trigger fresh reload for explicit rescans, not for incremental background sync:
+
+```swift
+// NEW (CORRECT):
+let initialTreeSize = ZipherXFFI.treeSize()
+let treeHasProgress = initialTreeSize > bundledTreeCMUCount
+
+// Only force fresh bundled tree if:
+// 1. Custom height provided AND starting exactly from bundled+1 (rescan scenario)
+// 2. AND tree doesn't already have progress (hasn't appended CMUs beyond bundled)
+let needsFreshBundledTree = customStartHeight != nil
+    && customStartHeight! == bundledTreeHeight + 1
+    && !treeHasProgress
+```
+
+**How Background Sync Now Works**:
+1. NetworkManager detects `chainHeight > walletHeight`
+2. Triggers `backgroundSyncToHeight(chainHeight)`
+3. FilterScanner called with `fromHeight: currentHeight + 1`
+4. `needsFreshBundledTree = false` (height != bundledTreeHeight + 1)
+5. Uses existing tree in memory
+6. Fetches blocks, appends CMUs, detects notes
+7. Saves updated tree to database
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - fixed `needsFreshBundledTree` condition
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
 - Header store may get out of sync - use "Rebuild Witnesses" to fix
+- Notes received BEFORE bundledTreeHeight (2926122) require manual "Full Rescan from Height" in Settings
 
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
 - z.log is available as usual here : /Users/chris/ZipherX
+- never kill any processes !
+- never kill any processes !
