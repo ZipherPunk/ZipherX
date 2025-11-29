@@ -66,10 +66,38 @@ struct ContentView: View {
                             }
                         }
 
-                        // WAIT for sync to actually complete (isSyncing = false)
-                        // This handles cases where refreshBalance() returns but sync continues
-                        while walletManager.isSyncing {
+                        // WAIT for sync to actually START (syncTasks becomes non-empty)
+                        // This prevents premature completion when sync hasn't begun yet
+                        var syncStartWait = 0
+                        while walletManager.syncTasks.isEmpty && syncStartWait < 100 {
                             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                            syncStartWait += 1
+                        }
+
+                        // WAIT for sync to actually complete (isSyncing = false AND balance task completed)
+                        // This handles cases where refreshBalance() returns but sync continues
+                        var syncCompleteWait = 0
+                        let maxSyncCompleteWait = 6000 // 10 minutes max for full sync
+                        while syncCompleteWait < maxSyncCompleteWait {
+                            // Check if balance task is completed (true completion indicator)
+                            let balanceTaskCompleted = walletManager.syncTasks.contains {
+                                $0.id == "balance" && $0.status == .completed
+                            }
+
+                            // If balance is done OR (not syncing AND syncTasks empty for a while), we're done
+                            if balanceTaskCompleted {
+                                print("✅ Sync complete: balance task finished")
+                                break
+                            }
+
+                            // Also break if sync stopped and no more tasks
+                            if !walletManager.isSyncing && walletManager.syncTasks.isEmpty && syncCompleteWait > 50 {
+                                print("✅ Sync complete: no more tasks")
+                                break
+                            }
+
+                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                            syncCompleteWait += 1
                         }
 
                         // ALSO wait for wallet height to match chain height
@@ -147,53 +175,76 @@ struct ContentView: View {
 
     /// Combined progress for all sync phases
     private var currentSyncProgress: Double {
-        // Tree loading phase (0-30%)
+        // Connecting phase (0-10%) - comes first now
+        if !networkManager.isConnected {
+            return walletManager.isConnecting ? 0.05 : 0.0
+        }
+
+        // Tree loading phase (10-40%)
         if !walletManager.isTreeLoaded {
-            return walletManager.treeLoadProgress * 0.3
+            return 0.10 + (walletManager.treeLoadProgress * 0.30)
         }
-        // Connecting phase (30-40%)
-        if walletManager.isConnecting && !walletManager.isSyncing {
-            return 0.35
+
+        // Sync phase (40-95%)
+        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
+            // Check if balance task is completed
+            let balanceCompleted = walletManager.syncTasks.contains {
+                $0.id == "balance" && $0.status == .completed
+            }
+            if balanceCompleted {
+                return 0.98
+            }
+            return 0.40 + (walletManager.syncProgress * 0.55)
         }
-        // Sync phase (40-100%)
-        if walletManager.isSyncing {
-            return 0.40 + (walletManager.syncProgress * 0.60)
+
+        // Finalizing phase (95-100%) - only if we're truly done
+        if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
+            return 1.0
         }
-        // If we reach here during initial sync, we're between phases or completing
-        // Return high progress to show we're almost done
-        if isInitialSync && walletManager.isTreeLoaded {
-            return 0.95
-        }
-        return 0.30
+
+        // Still waiting for sync to start
+        return 0.40
     }
 
     /// Combined status for all sync phases
     private var currentSyncStatus: String {
+        // Connecting (first step now)
+        if !networkManager.isConnected {
+            return walletManager.isConnecting ? "Connecting to network..." : "Waiting for network..."
+        }
         // Tree loading
         if !walletManager.isTreeLoaded {
             return walletManager.treeLoadStatus.isEmpty ? "Loading commitment tree..." : walletManager.treeLoadStatus
         }
-        // Connecting
-        if walletManager.isConnecting && !walletManager.isSyncing {
-            return walletManager.syncStatus.isEmpty ? "Connecting to network..." : walletManager.syncStatus
-        }
-        // Syncing
-        if walletManager.isSyncing {
+        // Syncing (includes waiting for sync to start)
+        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
+            if walletManager.syncStatus.isEmpty {
+                return "Starting blockchain sync..."
+            }
             return walletManager.syncStatus
         }
-        // Tree loaded, network connected, not syncing - wrapping up
-        if walletManager.isTreeLoaded && networkManager.isConnected {
-            return "Finalizing..."
+        // Tree loaded, network connected, sync complete
+        if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
+            return "Ready!"
         }
-        // Default
-        return "Initializing..."
+        // Waiting for sync to start
+        return "Preparing sync..."
     }
 
     /// Combined task list including tree loading
+    /// Order: Connect → Tree → Sync tasks (headers, scan, witnesses, balance)
     private var currentSyncTasks: [SyncTask] {
         var tasks: [SyncTask] = []
 
-        // Add tree loading task if tree not loaded yet
+        // 1. FIRST: Network connection task
+        if !networkManager.isConnected {
+            let status: SyncTask.TaskStatus = walletManager.isConnecting ? .inProgress : .pending
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: status))
+        } else {
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
+        }
+
+        // 2. SECOND: Tree loading task
         if !walletManager.isTreeLoaded {
             let treeTask = SyncTask(
                 id: "tree",
@@ -204,21 +255,10 @@ struct ContentView: View {
             )
             tasks.append(treeTask)
         } else {
-            // Tree loaded - show completed
             tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .completed))
         }
 
-        // Add connecting task
-        if walletManager.isConnecting && walletManager.syncTasks.isEmpty && !networkManager.isConnected {
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .inProgress))
-        } else if networkManager.isConnected {
-            // Already connected - show completed
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
-        } else if walletManager.isTreeLoaded && !networkManager.isConnected {
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .pending))
-        }
-
-        // Add sync tasks from WalletManager
+        // 3. THIRD: Sync tasks from WalletManager (headers, scan, witnesses, balance)
         if !walletManager.syncTasks.isEmpty {
             tasks.append(contentsOf: walletManager.syncTasks)
         } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
