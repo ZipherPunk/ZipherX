@@ -133,8 +133,20 @@ struct ContentView: View {
                         let currentChainHeight = networkManager.chainHeight
                         let currentWalletHeight = networkManager.walletHeight
 
-                        if currentChainHeight > currentWalletHeight {
+                        // Only catch-up if wallet is actually synced (walletHeight > 0)
+                        // and there are just a few missed blocks (not the entire chain)
+                        if currentWalletHeight > 0 && currentChainHeight > currentWalletHeight {
                             let missedBlocks = currentChainHeight - currentWalletHeight
+                            // Sanity check: should only be a few blocks, not thousands
+                            guard missedBlocks < 100 else {
+                                print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
+                                await MainActor.run {
+                                    walletManager.setConnecting(false, status: nil)
+                                    isInitialSync = false
+                                    hasCompletedInitialSync = true
+                                }
+                                return
+                            }
                             print("🔄 Catch-up: \(missedBlocks) new block(s) arrived during setup")
 
                             await MainActor.run {

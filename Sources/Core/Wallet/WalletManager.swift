@@ -329,11 +329,25 @@ final class WalletManager: ObservableObject {
 
             print("✅ Background sync complete: tree now at height \(targetHeight)")
 
-            // Update balance if any new notes found
+            // Update balance with proper confirmation calculation
             let notes = try WalletDatabase.shared.getUnspentNotes(accountId: account.id)
-            let totalBalance = notes.reduce(0) { $0 + $1.value }
+            var confirmedBalance: UInt64 = 0
+            var pendingBal: UInt64 = 0
+
+            for note in notes {
+                // Calculate confirmations: targetHeight - noteHeight + 1
+                let confirmations = targetHeight > note.height ? Int(targetHeight - note.height + 1) : 0
+                if confirmations >= 1 {
+                    confirmedBalance += note.value
+                } else {
+                    pendingBal += note.value
+                }
+            }
+
             await MainActor.run {
-                self.shieldedBalance = totalBalance
+                self.shieldedBalance = confirmedBalance
+                self.pendingBalance = pendingBal
+                print("💰 Background sync balance: \(confirmedBalance) zatoshis (\(pendingBal) pending)")
             }
 
         } catch {
