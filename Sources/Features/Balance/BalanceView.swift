@@ -9,21 +9,19 @@ struct BalanceView: View {
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var refreshTimer: Timer?
+    @State private var transactions: [TransactionHistoryItem] = []
+    @State private var isLoadingHistory = true
 
     var body: some View {
         VStack(spacing: 16) {
             // Balance display
             balanceCard
 
+            // Transaction history (compact)
+            transactionHistorySection
+
             // Network status
             networkStatus
-
-            // Rescan button - hidden but code kept for future key import feature
-            // System7Button(title: "Rescan") {
-            //     rescanBlockchain()
-            // }
-            // .disabled(true)
-            // .opacity(0.5)
 
             Spacer()
         }
@@ -36,6 +34,8 @@ struct BalanceView: View {
         .onAppear {
             // Start automatic refresh every 3 seconds
             startAutoRefresh()
+            // Load transaction history
+            loadTransactionHistory()
         }
         .onDisappear {
             // Stop auto refresh when leaving view
@@ -113,6 +113,137 @@ struct BalanceView: View {
         )
     }
 
+    private var transactionHistorySection: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 10))
+                Text("Recent Transactions")
+                    .font(System7Theme.titleFont(size: 10))
+                Spacer()
+            }
+            .foregroundColor(System7Theme.black)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            Divider()
+                .background(System7Theme.black)
+
+            // Transaction list or empty state
+            if isLoadingHistory {
+                HStack {
+                    ProgressView()
+                        .scaleEffect(0.6)
+                    Text("Loading...")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                }
+                .padding(8)
+            } else if transactions.isEmpty {
+                HStack {
+                    Image(systemName: "doc.text")
+                        .font(.system(size: 12))
+                        .foregroundColor(System7Theme.darkGray)
+                    Text("No transactions yet")
+                        .font(System7Theme.bodyFont(size: 9))
+                        .foregroundColor(System7Theme.darkGray)
+                    Spacer()
+                }
+                .padding(8)
+            } else {
+                // Show up to 5 recent transactions
+                VStack(spacing: 1) {
+                    ForEach(transactions.prefix(5), id: \.txidString) { tx in
+                        transactionRow(tx)
+                    }
+                }
+            }
+        }
+        .background(System7Theme.lightGray)
+        .overlay(
+            Rectangle()
+                .stroke(System7Theme.black, lineWidth: 1)
+        )
+    }
+
+    private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
+        HStack(spacing: 8) {
+            // Type icon
+            Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
+                .font(.system(size: 10))
+                .foregroundColor(tx.type == .received ? .green : .red)
+                .frame(width: 16)
+
+            // Amount
+            Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.4f", tx.valueInZCL))")
+                .font(System7Theme.monoFont(size: 9))
+                .foregroundColor(tx.type == .received ? .green : .red)
+
+            Spacer()
+
+            // Date/Time - prefer actual blockTime, fall back to estimated time
+            Text(tx.dateString ?? estimatedDateString(for: tx.height))
+                .font(System7Theme.bodyFont(size: 8))
+                .foregroundColor(System7Theme.darkGray)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(System7Theme.white)
+    }
+
+    /// Estimate date/time from block height
+    /// Zclassic has ~150 second block times (2.5 minutes)
+    private func estimatedDateString(for height: UInt64) -> String {
+        // Reference point: block 2,923,123 on November 28, 2025
+        let referenceHeight: UInt64 = 2_923_123
+        let referenceDate = Date(timeIntervalSince1970: 1764284400) // Nov 28, 2025 00:00 local
+
+        let blockDifference = Int64(height) - Int64(referenceHeight)
+        let secondsDifference = Double(blockDifference) * 150.0 // ~150 seconds per block
+
+        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter.string(from: estimatedDate)
+    }
+
+    private func loadTransactionHistory() {
+        isLoadingHistory = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // First, always try to populate from notes (it uses INSERT OR REPLACE so it's safe)
+                print("📜 Populating transaction history from notes...")
+                let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                print("📜 Populate result: \(populated) entries")
+
+                // Now fetch the history
+                let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)
+                print("📜 getTransactionHistory returned \(items.count) items")
+
+                // Debug: print first item if exists
+                if let first = items.first {
+                    print("📜 First tx: type=\(first.type), value=\(first.value), height=\(first.height), txid=\(first.txidString.prefix(16))...")
+                }
+
+                DispatchQueue.main.async {
+                    self.transactions = items
+                    self.isLoadingHistory = false
+                    print("📜 UI updated with \(items.count) transactions")
+                }
+            } catch {
+                print("❌ Failed to load transaction history: \(error)")
+                DispatchQueue.main.async {
+                    self.isLoadingHistory = false
+                }
+            }
+        }
+    }
+
     private var networkStatus: some View {
         VStack(spacing: 0) {
             // Connection status with more details
@@ -126,12 +257,6 @@ struct BalanceView: View {
                     Text(connectionStatusText)
                         .font(System7Theme.bodyFont(size: 10))
                         .foregroundColor(System7Theme.black)
-
-                    if networkManager.knownAddressCount > 0 {
-                        Text("\(networkManager.knownAddressCount) known addresses")
-                            .font(System7Theme.bodyFont(size: 8))
-                            .foregroundColor(System7Theme.darkGray)
-                    }
                 }
 
                 Spacer()
@@ -528,6 +653,8 @@ struct BalanceView: View {
                     isRefreshing = true
                     do {
                         try await walletManager.refreshBalance()
+                        // Reload transaction history after sync
+                        loadTransactionHistory()
                     } catch {
                         // Silently fail on auto-refresh
                         print("⚠️ Auto-refresh failed: \(error.localizedDescription)")

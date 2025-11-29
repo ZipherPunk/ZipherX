@@ -1,6 +1,11 @@
 import Foundation
 import UserNotifications
+#if canImport(UIKit)
 import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Manages local notifications for wallet events
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
@@ -137,6 +142,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Update app badge with pending transaction count
     func updateBadge(count: Int) {
+        #if os(iOS)
         if #available(iOS 16.0, *) {
             UNUserNotificationCenter.current().setBadgeCount(count) { error in
                 if let error = error {
@@ -149,11 +155,22 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 UIApplication.shared.applicationIconBadgeNumber = count
             }
         }
+        #elseif os(macOS)
+        // macOS uses dock badge
+        DispatchQueue.main.async {
+            if count > 0 {
+                NSApp.dockTile.badgeLabel = "\(count)"
+            } else {
+                NSApp.dockTile.badgeLabel = nil
+            }
+        }
+        #endif
     }
 
     /// Clear all notifications
     func clearAll() {
         UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        #if os(iOS)
         if #available(iOS 16.0, *) {
             UNUserNotificationCenter.current().setBadgeCount(0) { _ in }
         } else {
@@ -161,5 +178,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 UIApplication.shared.applicationIconBadgeNumber = 0
             }
         }
+        #elseif os(macOS)
+        DispatchQueue.main.async {
+            NSApp.dockTile.badgeLabel = nil
+        }
+        #endif
     }
 }

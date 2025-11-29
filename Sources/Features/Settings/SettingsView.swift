@@ -1,5 +1,11 @@
 import SwiftUI
 import LocalAuthentication
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Settings View - Export keys, PIN code, Face ID setup
 /// Classic Macintosh System 7 design
@@ -27,7 +33,6 @@ struct SettingsView: View {
     @State private var quickScanHeight = ""
     @State private var showFullRescanFromHeight = false
     @State private var fullRescanHeight = ""
-    @State private var showHistory = false
     @State private var showRebuildWitnessesWarning = false
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
@@ -39,9 +44,6 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                // History section
-                historySection
-
                 // Security section
                 securitySection
 
@@ -73,7 +75,7 @@ struct SettingsView: View {
         }
         .alert("Export Private Key", isPresented: $showExportAlert) {
             Button("Copy to Clipboard") {
-                UIPasteboard.general.string = exportedKey
+                copyToClipboard(exportedKey)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -141,51 +143,6 @@ struct SettingsView: View {
         } message: {
             Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
         }
-        .sheet(isPresented: $showHistory) {
-            HistoryView()
-        }
-    }
-
-    // MARK: - History Section
-
-    private var historySection: some View {
-        VStack(spacing: 12) {
-            // Section header
-            HStack {
-                Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 12))
-                Text("Transaction History")
-                    .font(System7Theme.titleFont(size: 12))
-                Spacer()
-            }
-            .foregroundColor(System7Theme.black)
-
-            // History button
-            Button(action: {
-                showHistory = true
-            }) {
-                HStack {
-                    Image(systemName: "list.bullet.rectangle")
-                        .font(.system(size: 12))
-                    Text("View History")
-                        .font(System7Theme.titleFont(size: 11))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.blue)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.blue.opacity(0.8), lineWidth: 2)
-                )
-            }
-        }
-        .padding(12)
-        .background(System7Theme.lightGray)
-        .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
-        )
     }
 
     // MARK: - Security Section
@@ -1240,10 +1197,22 @@ struct SettingsView: View {
             }
         }
     }
+
+    // MARK: - Clipboard Helper
+
+    private func copyToClipboard(_ string: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = string
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+        #endif
+    }
 }
 
 // MARK: - Share Sheet
 
+#if os(iOS)
 struct ShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     var applicationActivities: [UIActivity]? = nil
@@ -1258,6 +1227,35 @@ struct ShareSheet: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
+#elseif os(macOS)
+struct ShareSheet: View {
+    let activityItems: [Any]
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Share Log File")
+                .font(.headline)
+
+            if let url = activityItems.first as? URL {
+                Text(url.lastPathComponent)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Button("Copy Path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url.path, forType: .string)
+                }
+
+                Button("Open in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+            }
+        }
+        .padding()
+        .frame(minWidth: 300)
+    }
+}
+#endif
 
 #Preview {
     SettingsView()

@@ -1,4 +1,10 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Receive View - Display z-address and QR code
 /// Classic Macintosh System 7 design
@@ -37,7 +43,7 @@ struct ReceiveView: View {
         )
         .alert("Private Key", isPresented: $showExportAlert) {
             Button("Copy to Clipboard") {
-                UIPasteboard.general.string = exportedKey
+                copyToClipboard(exportedKey)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -153,7 +159,7 @@ struct ReceiveView: View {
     // MARK: - Actions
 
     private func copyAddress() {
-        UIPasteboard.general.string = walletManager.zAddress
+        copyToClipboard(walletManager.zAddress)
 
         withAnimation {
             showCopied = true
@@ -164,6 +170,15 @@ struct ReceiveView: View {
                 showCopied = false
             }
         }
+    }
+
+    private func copyToClipboard(_ string: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = string
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+        #endif
     }
 
     private func exportKey() {

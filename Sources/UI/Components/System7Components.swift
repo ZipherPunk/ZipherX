@@ -1,4 +1,10 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 // MARK: - Classic Mac Window
 struct System7Window<Content: View>: View {
@@ -73,19 +79,40 @@ struct System7Window<Content: View>: View {
 struct System7MenuBar: View {
     @State private var showQuote = false
     @State private var currentQuote: (quote: String, author: String) = ("", "")
+    @State private var appleGlow: Bool = false
+
+    // Zipherpunk neon green color
+    private let neonGreen = Color(red: 0, green: 1, blue: 0.25)
+    private let neonGreenDark = Color(red: 0, green: 0.7, blue: 0.15)
 
     var body: some View {
         HStack {
             // Apple menu - tap for privacy quote
+            // Larger tap area with proper safe area padding
             Button(action: {
                 currentQuote = PrivacyQuotes.randomQuote()
                 showQuote = true
             }) {
-                Image(systemName: "apple.logo")
-                    .font(.system(size: 14))
-                    .foregroundColor(System7Theme.black)
-                    .padding(.horizontal, 8)
+                ZStack {
+                    // Glow effect
+                    if appleGlow {
+                        Image(systemName: "apple.logo")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(neonGreen)
+                            .blur(radius: 4)
+                            .opacity(0.6)
+                    }
+
+                    // Main icon
+                    Image(systemName: "apple.logo")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(appleGlow ? neonGreen : neonGreenDark)
+                        .shadow(color: neonGreen.opacity(appleGlow ? 0.8 : 0.3), radius: appleGlow ? 6 : 2)
+                }
+                .frame(width: 44, height: 44) // Larger tap target
+                .contentShape(Rectangle())
             }
+            .padding(.leading, 8) // Extra left padding for edge accessibility
 
             Text("File")
                 .font(System7Theme.titleFont(size: 12))
@@ -102,7 +129,7 @@ struct System7MenuBar: View {
                 .font(.system(size: 12))
                 .padding(.horizontal, 8)
         }
-        .frame(height: 20)
+        .frame(height: 28) // Slightly taller for better tap area
         .background(System7Theme.white)
         .overlay(
             Rectangle()
@@ -114,6 +141,12 @@ struct System7MenuBar: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("\"\(currentQuote.quote)\"\n\n- \(currentQuote.author)")
+        }
+        .onAppear {
+            // Start pulsing animation
+            withAnimation(Animation.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
+                appleGlow = true
+            }
         }
     }
 }
@@ -283,6 +316,7 @@ struct System7QRCode: View {
 
     var body: some View {
         if let qrImage = generateQRCode(from: data) {
+            #if os(iOS)
             Image(uiImage: qrImage)
                 .interpolation(.none)
                 .resizable()
@@ -293,6 +327,18 @@ struct System7QRCode: View {
                     Rectangle()
                         .stroke(System7Theme.black, lineWidth: 2)
                 )
+            #elseif os(macOS)
+            Image(nsImage: qrImage)
+                .interpolation(.none)
+                .resizable()
+                .scaledToFit()
+                .padding(8)
+                .background(System7Theme.white)
+                .overlay(
+                    Rectangle()
+                        .stroke(System7Theme.black, lineWidth: 2)
+                )
+            #endif
         } else {
             Rectangle()
                 .fill(System7Theme.lightGray)
@@ -303,6 +349,7 @@ struct System7QRCode: View {
         }
     }
 
+    #if os(iOS)
     private func generateQRCode(from string: String) -> UIImage? {
         let data = string.data(using: .ascii)
         if let filter = CIFilter(name: "CIQRCodeGenerator") {
@@ -320,6 +367,25 @@ struct System7QRCode: View {
         }
         return nil
     }
+    #elseif os(macOS)
+    private func generateQRCode(from string: String) -> NSImage? {
+        let data = string.data(using: .ascii)
+        if let filter = CIFilter(name: "CIQRCodeGenerator") {
+            filter.setValue(data, forKey: "inputMessage")
+            filter.setValue("H", forKey: "inputCorrectionLevel")
+
+            if let output = filter.outputImage {
+                let transform = CGAffineTransform(scaleX: 10, y: 10)
+                let scaledOutput = output.transformed(by: transform)
+                let rep = NSCIImageRep(ciImage: scaledOutput)
+                let nsImage = NSImage(size: rep.size)
+                nsImage.addRepresentation(rep)
+                return nsImage
+            }
+        }
+        return nil
+    }
+    #endif
 }
 
 // MARK: - Cypherpunk Loading Components

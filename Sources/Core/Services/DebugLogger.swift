@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 /// Debug logging system that writes to a file for export
 /// Enable/disable via Settings or UserDefaults "debugLoggingEnabled"
@@ -115,7 +117,6 @@ final class DebugLogger {
     func logSystemInfo() {
         guard isEnabled else { return }
 
-        let device = UIDevice.current
         let bundle = Bundle.main
 
         log("═══════════════════════════════════════════════════════════")
@@ -123,10 +124,17 @@ final class DebugLogger {
         log("═══════════════════════════════════════════════════════════")
         log("App Version: \(bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
         log("Build: \(bundle.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
+        #if os(iOS)
+        let device = UIDevice.current
         log("Device: \(device.model)")
         log("iOS Version: \(device.systemVersion)")
         log("Device Name: \(device.name)")
         log("Identifier: \(device.identifierForVendor?.uuidString ?? "?")")
+        #elseif os(macOS)
+        log("Platform: macOS")
+        log("macOS Version: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        log("Host Name: \(ProcessInfo.processInfo.hostName)")
+        #endif
         log("Date: \(Date())")
         log("═══════════════════════════════════════════════════════════")
     }
