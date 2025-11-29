@@ -30,6 +30,9 @@ final class FilterScanner {
     // Progress callback - (progress, currentHeight, maxHeight)
     var onProgress: ((Double, UInt64, UInt64) -> Void)?
 
+    // Witness update progress callback - (current, total, status)
+    var onWitnessProgress: ((Int, Int, String) -> Void)?
+
     // Current chain height (updated during scan)
     private(set) var currentChainHeight: UInt64 = 0
 
@@ -638,12 +641,23 @@ final class FilterScanner {
         // Get current tree root (anchor) to save with witnesses
         let currentAnchor = ZipherXFFI.treeRoot() ?? Data()
 
+        // Calculate total witnesses to update
+        let totalWitnesses = existingWitnessIndices.count + pendingWitnesses.count
+        var witnessesUpdated = 0
+
+        // Report witness sync starting
+        if totalWitnesses > 0 {
+            onWitnessProgress?(0, totalWitnesses, "Syncing \(totalWitnesses) witness(es)...")
+        }
+
         // Update existing notes' witnesses and anchors
         for (noteId, witnessIndex) in existingWitnessIndices {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
                 try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                witnessesUpdated += 1
                 print("📝 Updated witness for existing note \(noteId)")
+                onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
             }
         }
 
@@ -652,13 +666,17 @@ final class FilterScanner {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
                 try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                witnessesUpdated += 1
                 print("📝 Updated witness for new note \(noteId)")
+                onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
             }
         }
 
-        let totalUpdated = existingWitnessIndices.count + pendingWitnesses.count
-        if totalUpdated > 0 {
-            print("✅ Updated \(totalUpdated) witness(es) to match current tree state")
+        if totalWitnesses > 0 {
+            print("✅ Updated \(totalWitnesses) witness(es) to match current tree state")
+            onWitnessProgress?(totalWitnesses, totalWitnesses, "All witnesses synced!")
+        } else {
+            onWitnessProgress?(0, 0, "No witnesses to update")
         }
 
         print("✅ Scan complete")

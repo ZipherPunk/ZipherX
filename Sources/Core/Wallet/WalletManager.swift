@@ -523,6 +523,25 @@ final class WalletManager: ObservableObject {
             }
         }
 
+        // Witness sync progress callback - update witnesses task with real progress
+        scanner.onWitnessProgress = { [weak self] current, total, status in
+            Task { @MainActor in
+                if let index = self?.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                    if total > 0 {
+                        self?.syncTasks[index].status = .inProgress
+                        self?.syncTasks[index].detail = status
+                        self?.syncTasks[index].progress = Double(current) / Double(total)
+                        self?.syncStatus = "Syncing Merkle witnesses..."
+                    }
+                    if current == total {
+                        self?.syncTasks[index].status = .completed
+                        self?.syncTasks[index].detail = total > 0 ? "\(total) witness(es) synced" : "No witnesses needed"
+                        self?.syncTasks[index].progress = 1.0
+                    }
+                }
+            }
+        }
+
         // Get account ID for scanning (database row id starts at 1)
         let database = WalletDatabase.shared
         guard let account = try database.getAccount(index: 0) else {
@@ -531,18 +550,16 @@ final class WalletManager: ObservableObject {
 
         do {
             // Pass spending key (169 bytes) so scanner can derive IVK properly
+            // Witness sync now happens inside startScan with progress reported via onWitnessProgress
+            await updateTask("witnesses", status: .inProgress, detail: "Waiting for scan...")
             try await scanner.startScan(for: account.id, viewingKey: spendingKey)
             await updateTask("height", status: .completed)
             await updateTask("scan", status: .completed)
+            // Note: witnesses task is completed by the onWitnessProgress callback
         } catch {
             await updateTask("scan", status: .failed(error.localizedDescription))
             throw error
         }
-
-        // Task 5: Witnesses already synced by FilterScanner during scan
-        // FilterScanner loads existing witnesses, updates them as CMUs are appended,
-        // and saves updated witnesses back to the database.
-        await updateTask("witnesses", status: .completed, detail: "Synced during scan")
 
         // Task 6: Calculate balance
         await updateTask("balance", status: .inProgress, detail: "Loading notes...")
