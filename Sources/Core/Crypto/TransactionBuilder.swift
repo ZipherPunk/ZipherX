@@ -684,27 +684,113 @@ final class TransactionBuilder {
             print("✅ Tree now has \(treeSize) commitments")
         }
 
-        // 4. Fetch additional CMUs from blocks between bundledTreeHeight+1 and noteHeight
-        // Use P2P batch fetching for MUCH faster performance
-        let startHeight = bundledTreeHeight + 1
-        let totalBlocks = Int(noteHeight - startHeight + 1)
-        print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight) (\(totalBlocks) blocks via P2P)...")
-        onProgress?("witness", "Fetching \(totalBlocks) blocks...", 0.05)
+        // OPTIMIZATION: Check what height we've already scanned to avoid re-fetching
+        // The tree already contains CMUs from bundled file AND from previous syncs
+        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
+
+        // Calculate actual start height - skip blocks already in tree
+        let actualStartHeight: UInt64
+        if noteHeight <= lastScannedHeight {
+            // Note is WITHIN already-scanned range - tree already has all needed CMUs!
+            // We just need to find the note's position and create witness
+            print("✅ Note at height \(noteHeight) is within scanned range (up to \(lastScannedHeight))")
+            print("✅ Tree already has all CMUs needed - no network fetch required!")
+            actualStartHeight = noteHeight + 1 // Skip all fetching
+        } else {
+            // Only fetch blocks AFTER last scanned height
+            actualStartHeight = max(bundledTreeHeight + 1, lastScannedHeight + 1)
+            print("📊 Last scanned height: \(lastScannedHeight), will fetch from \(actualStartHeight)")
+        }
+
+        let startHeight = actualStartHeight
+        let totalBlocks = noteHeight >= startHeight ? Int(noteHeight - startHeight + 1) : 0
+
+        if totalBlocks > 0 {
+            print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight) (\(totalBlocks) blocks via P2P)...")
+            onProgress?("witness", "Fetching \(totalBlocks) blocks...", 0.05)
+        } else {
+            print("✅ No additional blocks to fetch - using existing tree state")
+            onProgress?("witness", "Using cached data...", 0.5)
+        }
 
         var notePosition: UInt64? = nil
         var cmusProcessed = 0
         let networkManager = NetworkManager.shared
 
+        // FAST PATH: If note is within already-scanned range, use bundled tree approach
+        // This avoids any network fetching!
+        if totalBlocks == 0 && noteHeight <= bundledTreeHeight {
+            print("🚀 FAST PATH: Note within bundled range, using treeCreateWitnessForCMU...")
+            onProgress?("witness", "Creating witness (fast)...", 0.7)
+
+            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                print("❌ Failed to load bundled tree for witness creation")
+                return nil
+            }
+
+            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                print("✅ Created witness at position \(result.position) via fast path")
+                let currentRoot = ZipherXFFI.treeRoot() ?? Data()
+                return (witness: result.witness, anchor: currentRoot)
+            } else {
+                print("❌ Failed to find note CMU in bundled tree")
+                return nil
+            }
+        }
+
+        // EDGE CASE: Note beyond bundled range but within scanned range
+        // If we're here with totalBlocks == 0, the witness is corrupted and needs full rebuild.
+        // We must REINITIALIZE the tree to avoid duplicate CMU corruption.
+        if totalBlocks == 0 && noteHeight > bundledTreeHeight && noteHeight <= lastScannedHeight {
+            print("⚠️ Note beyond bundled but within scanned range - witness needs full rebuild")
+            print("📊 Reinitializing tree and scanning blocks \(bundledTreeHeight + 1) to \(noteHeight)")
+            onProgress?("witness", "Rebuilding witness (corrupted)...", 0.1)
+
+            // MUST reinitialize tree to avoid duplicate CMUs
+            guard ZipherXFFI.treeInit() else {
+                print("❌ Failed to reinitialize tree")
+                return nil
+            }
+
+            // Reload bundled CMUs first
+            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                print("❌ Failed to load bundled tree")
+                return nil
+            }
+
+            if !ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                print("❌ Failed to reload bundled CMUs")
+                return nil
+            }
+            print("✅ Tree reinitialized with bundled CMUs")
+        }
+
         // Batch size for P2P requests (larger = faster but may timeout)
         let batchSize = 50
-        var currentHeight = startHeight
+        // If we reinitialized the tree, we need to fetch from bundled+1
+        // Otherwise use the calculated startHeight
+        let actualStartHeight = (totalBlocks == 0 && noteHeight > bundledTreeHeight) ? (bundledTreeHeight + 1) : startHeight
+        var currentHeight = actualStartHeight
+        let effectiveEndHeight = noteHeight
+        let effectiveTotalBlocks = noteHeight >= actualStartHeight ? Int(noteHeight - actualStartHeight + 1) : 0
 
-        while currentHeight <= noteHeight {
+        // Skip the loop entirely if no blocks to fetch
+        guard effectiveTotalBlocks > 0 else {
+            print("✅ No blocks to fetch - all CMUs already in tree")
+            let currentRoot = ZipherXFFI.treeRoot() ?? Data()
+            // We still need to find the note's position - but if we reach here,
+            // we should have returned earlier via the fast path
+            return nil
+        }
+
+        while currentHeight <= effectiveEndHeight {
             let remainingBlocks = Int(noteHeight - currentHeight + 1)
             let thisBatchSize = min(batchSize, remainingBlocks)
 
             // Report progress
-            let progressPct = Double(currentHeight - startHeight) / Double(totalBlocks)
+            let progressPct = effectiveTotalBlocks > 0 ? Double(currentHeight - actualStartHeight) / Double(effectiveTotalBlocks) : 0
             let progressStr = String(format: "%.0f%%", progressPct * 100)
             print("📡 Fetching blocks \(currentHeight)-\(currentHeight + UInt64(thisBatchSize) - 1) (\(progressStr))")
             onProgress?("witness", "Fetching blocks... \(progressStr)", 0.05 + progressPct * 0.85)
