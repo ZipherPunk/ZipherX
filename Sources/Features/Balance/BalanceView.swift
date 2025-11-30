@@ -1,21 +1,33 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Balance View - Displays shielded ZCL balance
-/// Classic Macintosh System 7 design
+/// Themed design
 struct BalanceView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var themeManager: ThemeManager
     @State private var isRefreshing = false
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var refreshTimer: Timer?
     @State private var transactions: [TransactionHistoryItem] = []
     @State private var isLoadingHistory = true
+    @State private var selectedTransaction: TransactionHistoryItem? = nil
+    @State private var showTransactionDetail = false
 
     // Fireworks state
     @State private var showFireworks = false
     @State private var fireworksAmount: Double = 0
     @State private var previousBalance: UInt64 = 0
+
+    // Theme shortcut
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         ZStack {
@@ -40,10 +52,18 @@ struct BalanceView: View {
                     .zIndex(100)
             }
         }
+        .background(themeManager.currentTheme.backgroundColor)
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(errorMessage)
+        }
+        .sheet(isPresented: $showTransactionDetail) {
+            if let tx = selectedTransaction {
+                TransactionDetailView(transaction: tx)
+                    .environmentObject(themeManager)
+                    .environmentObject(networkManager)
+            }
         }
         .onAppear {
             // Initialize previous balance
@@ -74,6 +94,11 @@ struct BalanceView: View {
             }
             previousBalance = newValue
         }
+        .onChange(of: walletManager.transactionHistoryVersion) { _ in
+            // Transaction sent - reload history immediately
+            print("📜 Transaction history version changed - reloading")
+            loadTransactionHistory()
+        }
     }
 
     private var balanceCard: some View {
@@ -81,17 +106,17 @@ struct BalanceView: View {
             // Main balance
             VStack(spacing: 4) {
                 Text("Shielded Balance")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
 
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(formatBalance(walletManager.shieldedBalance))
-                        .font(System7Theme.titleFont(size: 24))
-                        .foregroundColor(System7Theme.black)
+                        .font(.system(size: 24, weight: .bold, design: theme.hasRetroStyling ? .monospaced : .default))
+                        .foregroundColor(theme.textPrimary)
 
                     Text("ZCL")
-                        .font(System7Theme.bodyFont(size: 12))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
                 }
             }
 
@@ -99,28 +124,28 @@ struct BalanceView: View {
             if walletManager.pendingBalance > 0 {
                 HStack(spacing: 4) {
                     Text("Pending:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
 
                     Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                 }
             }
 
-            // Mempool incoming (cypherpunk style!)
+            // Mempool incoming
             if networkManager.mempoolIncoming > 0 {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 10))
                     Text("Mempool:")
-                        .font(System7Theme.bodyFont(size: 10))
+                        .font(theme.captionFont)
                     Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
-                        .font(System7Theme.bodyFont(size: 10))
+                        .font(theme.captionFont)
                     Text("(\(networkManager.mempoolTxCount) tx)")
-                        .font(System7Theme.bodyFont(size: 9))
+                        .font(theme.captionFont)
                 }
-                .foregroundColor(.green)
+                .foregroundColor(theme.successColor)
             }
 
             // Privacy indicator
@@ -128,37 +153,27 @@ struct BalanceView: View {
                 Image(systemName: "lock.shield.fill")
                     .font(.system(size: 10))
                 Text("Fully Shielded")
-                    .font(System7Theme.bodyFont(size: 9))
+                    .font(theme.captionFont)
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(System7Theme.lightGray)
+            .background(theme.backgroundColor)
             .overlay(
-                Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
             )
+            .cornerRadius(theme.cornerRadius)
         }
         .padding(16)
         .frame(maxWidth: .infinity)
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
-        .overlay(
-            // Raised effect
-            Rectangle()
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [System7Theme.white, System7Theme.darkGray],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-                .padding(1)
-        )
+        .cornerRadius(theme.cornerRadius)
+        .shadow(color: theme.shadowColor, radius: theme.usesShadows ? 3 : 0)
     }
 
     private var transactionHistorySection: some View {
@@ -168,15 +183,15 @@ struct BalanceView: View {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 10))
                 Text("Recent Transactions")
-                    .font(System7Theme.titleFont(size: 10))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
 
             Divider()
-                .background(System7Theme.black)
+                .background(theme.borderColor)
 
             // Transaction list or empty state
             if isLoadingHistory {
@@ -184,23 +199,26 @@ struct BalanceView: View {
                     ProgressView()
                         .scaleEffect(0.6)
                     Text("Loading...")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                 }
                 .padding(8)
+                .onAppear { print("📜 TXHIST VIEW: Showing loading state") }
             } else if transactions.isEmpty {
+                let _ = print("📜 TXHIST VIEW: Empty state - transactions.count=\(transactions.count), isLoadingHistory=\(isLoadingHistory)")
                 HStack {
                     Image(systemName: "doc.text")
                         .font(.system(size: 12))
-                        .foregroundColor(System7Theme.darkGray)
+                        .foregroundColor(theme.textSecondary)
                     Text("No transactions yet")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                 }
                 .padding(8)
             } else {
+                let _ = print("📜 TXHIST VIEW: Showing \(transactions.count) transactions")
                 // Show up to 5 recent transactions
                 VStack(spacing: 1) {
                     ForEach(transactions.prefix(5), id: \.txidString) { tx in
@@ -209,36 +227,60 @@ struct BalanceView: View {
                 }
             }
         }
-        .background(System7Theme.lightGray)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
 
     private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
-        HStack(spacing: 8) {
-            // Type icon
-            Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
-                .font(.system(size: 10))
-                .foregroundColor(tx.type == .received ? .green : .red)
-                .frame(width: 16)
+        Button(action: {
+            selectedTransaction = tx
+            showTransactionDetail = true
+        }) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    // Type icon
+                    Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(tx.type == .received ? theme.successColor : theme.errorColor)
+                        .frame(width: 16)
 
-            // Amount
-            Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.4f", tx.valueInZCL))")
-                .font(System7Theme.monoFont(size: 9))
-                .foregroundColor(tx.type == .received ? .green : .red)
+                    // Amount
+                    Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.4f", tx.valueInZCL))")
+                        .font(theme.monoFont)
+                        .foregroundColor(tx.type == .received ? theme.successColor : theme.errorColor)
 
-            Spacer()
+                    Spacer()
 
-            // Date/Time - prefer actual blockTime, fall back to estimated time
-            Text(tx.dateString ?? estimatedDateString(for: tx.height))
-                .font(System7Theme.bodyFont(size: 8))
-                .foregroundColor(System7Theme.darkGray)
+                    // Date/Time - prefer actual blockTime, fall back to estimated time
+                    Text(tx.dateString ?? estimatedDateString(for: tx.height))
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                // Txid preview (truncated)
+                Text(truncatedTxid(tx.txidString))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .padding(.leading, 24)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(theme.surfaceColor)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(System7Theme.white)
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    /// Truncate txid for display: first 8 + ... + last 8 characters
+    private func truncatedTxid(_ txid: String) -> String {
+        guard txid.count > 20 else { return txid }
+        let prefix = txid.prefix(8)
+        let suffix = txid.suffix(8)
+        return "\(prefix)...\(suffix)"
     }
 
     /// Estimate date/time from block height
@@ -279,30 +321,35 @@ struct BalanceView: View {
 
     private func loadTransactionHistory() {
         isLoadingHistory = true
+        print("📜 TXHIST: loadTransactionHistory() CALLED")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 // First, always try to populate from notes (it uses INSERT OR REPLACE so it's safe)
-                print("📜 Populating transaction history from notes...")
+                print("📜 TXHIST: Populating history from notes...")
                 let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                print("📜 Populate result: \(populated) entries")
+                print("📜 TXHIST: Populate result: \(populated) entries")
 
                 // Now fetch the history
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)
-                print("📜 getTransactionHistory returned \(items.count) items")
+                print("📜 TXHIST: getTransactionHistory returned \(items.count) items")
 
                 // Debug: print first item if exists
                 if let first = items.first {
-                    print("📜 First tx: type=\(first.type), value=\(first.value), height=\(first.height), txid=\(first.txidString.prefix(16))...")
+                    let txidShort = String(first.txidString.prefix(12))
+                    print("📜 TXHIST: First tx: type=\(first.type), value=\(first.value)zat, height=\(first.height), txid=\(txidShort)")
+                } else {
+                    print("📜 TXHIST: No transactions in history!")
                 }
 
                 DispatchQueue.main.async {
+                    print("📜 TXHIST: Main thread - setting transactions array to \(items.count) items")
                     self.transactions = items
                     self.isLoadingHistory = false
-                    print("📜 UI updated with \(items.count) transactions")
+                    print("📜 TXHIST: Main thread - isLoadingHistory=false, transactions.count=\(self.transactions.count)")
                 }
             } catch {
-                print("❌ Failed to load transaction history: \(error)")
+                print("📜 TXHIST ERROR: Failed to load transaction history: \(error)")
                 DispatchQueue.main.async {
                     self.isLoadingHistory = false
                 }
@@ -321,7 +368,7 @@ struct BalanceView: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(connectionStatusText)
-                        .font(System7Theme.bodyFont(size: 10))
+                        .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
                 }
 
@@ -331,11 +378,16 @@ struct BalanceView: View {
                 if !networkManager.isConnected && !isRefreshing {
                     Button(action: { retryConnection() }) {
                         Text("Retry")
-                            .font(System7Theme.bodyFont(size: 9))
+                            .font(theme.captionFont)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
-                            .background(System7Theme.lightGray)
-                            .overlay(Rectangle().stroke(System7Theme.black, lineWidth: 1))
+                            .background(theme.buttonBackground)
+                            .foregroundColor(theme.buttonText)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                            )
+                            .cornerRadius(theme.cornerRadius)
                     }
                     .buttonStyle(.plain)
                 }
@@ -346,7 +398,7 @@ struct BalanceView: View {
             // Network stats
             if networkManager.isConnected {
                 Divider()
-                    .background(System7Theme.black)
+                    .background(theme.borderColor)
 
                 VStack(alignment: .leading, spacing: 3) {
                     if networkManager.chainHeight > 0 {
@@ -377,8 +429,8 @@ struct BalanceView: View {
                             ProgressView()
                                 .scaleEffect(0.6)
                             Text("Loading stats...")
-                                .font(System7Theme.bodyFont(size: 9))
-                                .foregroundColor(System7Theme.darkGray)
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
                         }
                     }
                 }
@@ -388,44 +440,44 @@ struct BalanceView: View {
 
             // Simplified wallet status - just show current state
             Divider()
-                .background(System7Theme.black)
+                .background(theme.borderColor)
 
             HStack {
                 if walletManager.isSyncing {
                     ProgressView()
                         .scaleEffect(0.5)
                     Text("Syncing...")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textPrimary)
                     Spacer()
                     if walletManager.syncProgress > 0 {
                         Text("\(Int(walletManager.syncProgress * 100))%")
-                            .font(System7Theme.bodyFont(size: 9))
-                            .foregroundColor(System7Theme.darkGray)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
                     }
                 } else if !networkManager.isConnected {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.red)
+                        .foregroundColor(theme.errorColor)
                         .font(.system(size: 10))
                     Text("Disconnected")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(.red)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.errorColor)
                     Spacer()
                 } else if networkManager.chainHeight > 0 && networkManager.walletHeight >= networkManager.chainHeight {
                     Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
+                        .foregroundColor(theme.successColor)
                         .font(.system(size: 10))
                     Text("Synced")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                 } else {
                     Image(systemName: "clock")
-                        .foregroundColor(.orange)
+                        .foregroundColor(theme.warningColor)
                         .font(.system(size: 10))
                     Text("Waiting to sync")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                 }
             }
@@ -504,11 +556,12 @@ struct BalanceView: View {
             }
             */
         }
-        .background(System7Theme.lightGray)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
 
     private func syncTaskRow(_ task: SyncTask) -> some View {
@@ -604,9 +657,9 @@ struct BalanceView: View {
     /// Text color for connection status - RED when peers < 3
     private var connectionTextColor: Color {
         if networkManager.isConnected && networkManager.connectedPeers < 3 {
-            return .red
+            return theme.errorColor
         }
-        return System7Theme.black
+        return theme.textPrimary
     }
 
     private var connectionStatusText: String {
@@ -770,11 +823,11 @@ struct BalanceView: View {
     private func statRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label)
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
             Text(value)
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.black)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textPrimary)
                 .lineLimit(1)
             Spacer()
         }
@@ -785,4 +838,5 @@ struct BalanceView: View {
     BalanceView()
         .environmentObject(WalletManager.shared)
         .environmentObject(NetworkManager.shared)
+        .environmentObject(ThemeManager.shared)
 }

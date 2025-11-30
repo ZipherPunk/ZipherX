@@ -74,6 +74,35 @@ final class WalletDatabase {
         }
     }
 
+    /// Delete the entire database file (for wallet reset/import)
+    /// CRITICAL: This permanently deletes all wallet data!
+    func deleteDatabase() throws {
+        // Close connection first
+        close()
+
+        // Delete the database file
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: dbPath) {
+            try fileManager.removeItem(atPath: dbPath)
+            print("🗑️ Database file deleted: \(dbPath)")
+        }
+
+        // Also delete any journal/wal files
+        let walPath = dbPath + "-wal"
+        let shmPath = dbPath + "-shm"
+        let journalPath = dbPath + "-journal"
+
+        if fileManager.fileExists(atPath: walPath) {
+            try? fileManager.removeItem(atPath: walPath)
+        }
+        if fileManager.fileExists(atPath: shmPath) {
+            try? fileManager.removeItem(atPath: shmPath)
+        }
+        if fileManager.fileExists(atPath: journalPath) {
+            try? fileManager.removeItem(atPath: journalPath)
+        }
+    }
+
     // MARK: - Schema
 
     private func createTables() throws {
@@ -806,6 +835,26 @@ final class WalletDatabase {
         }
     }
 
+    /// Delete notes received after a specific height (for repairing corrupted nullifiers)
+    /// Returns the count of deleted notes
+    func deleteNotesAfterHeight(_ height: UInt64) throws -> Int {
+        let sql = "DELETE FROM notes WHERE received_height > ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        return Int(sqlite3_changes(db))
+    }
+
     /// Get all nullifiers for spend detection
     func getAllNullifiers() throws -> Set<Data> {
         let sql = "SELECT nf FROM notes WHERE is_spent = 0;"
@@ -1245,8 +1294,9 @@ final class WalletDatabase {
             let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
             let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
 
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
             let item = TransactionHistoryItem(
-                txid: Data(bytes: txidPtr, count: Int(txidLen)),
+                txid: txidData,
                 height: height,
                 blockTime: blockTime,
                 type: TransactionType(rawValue: typeStr) ?? .received,
@@ -1255,6 +1305,7 @@ final class WalletDatabase {
                 toAddress: toAddress,
                 memo: memo
             )
+            print("📜 DB: Item created - txidLen=\(txidLen), type=\(typeStr), value=\(value), height=\(height), txidString=\(item.txidString.prefix(16))...")
 
             items.append(item)
         }

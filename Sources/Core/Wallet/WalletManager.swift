@@ -38,6 +38,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var syncTasks: [SyncTask] = []
     @Published private(set) var syncCurrentHeight: UInt64 = 0
     @Published private(set) var syncMaxHeight: UInt64 = 0
+    @Published private(set) var transactionHistoryVersion: Int = 0  // Increments when tx history changes
 
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
@@ -417,10 +418,30 @@ final class WalletManager: ObservableObject {
         // Derive z-address
         let address = try deriveZAddress(from: spendingKey)
 
-        // CRITICAL: Reset database state for restored wallet
-        // This ensures we scan from the beginning to find all historical notes
-        print("🗑️ Resetting database state for restored wallet...")
-        try? resetDatabaseForNewWallet()
+        // CRITICAL: Delete and recreate database for restored wallet
+        // This ensures NO old data persists (old lastScannedHeight, notes, etc.)
+        print("🗑️ Deleting old database for restored wallet...")
+
+        do {
+            try WalletDatabase.shared.deleteDatabase()
+            print("✅ Old database deleted")
+        } catch {
+            print("⚠️ Failed to delete database: \(error)")
+        }
+
+        // Open fresh database with new key
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        do {
+            try WalletDatabase.shared.open(encryptionKey: dbKey)
+            print("✅ Fresh database created with new key")
+        } catch {
+            print("⚠️ Failed to open database: \(error)")
+        }
+
+        // Reset tree state in FFI memory as well
+        isTreeLoaded = false
+        treeLoadProgress = 0.0
+        treeLoadStatus = ""
 
         // Update state - restored wallet (may have historical notes)
         DispatchQueue.main.async {
@@ -1373,16 +1394,27 @@ final class WalletManager: ObservableObject {
             onProgress("broadcast", detail, progress)
         }
 
-        // Get chain height for recording
-        let chainHeight = try await networkManager.getChainHeight()
-
-        // Mark the spent note immediately (with height for history)
+        // CRITICAL: Record transaction IMMEDIATELY after broadcast success
+        // This ensures the sent tx is in history even if subsequent operations fail
         guard let txidData = Data(hexString: txId) else {
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
-        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
 
-        // Record transaction in history
+        // Get chain height for recording (use cached if network fails)
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await networkManager.getChainHeight()
+        } catch {
+            // Fallback to cached chain height if network is unreliable
+            chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : 0
+            print("⚠️ Using cached chain height for tx recording: \(chainHeight)")
+        }
+
+        // Mark the spent note
+        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
+        print("✅ Note marked as spent in database")
+
+        // CRITICAL: Record transaction in history - MUST succeed before showing success
         _ = try WalletDatabase.shared.insertTransactionHistory(
             txid: txidData,
             height: chainHeight,
@@ -1394,6 +1426,21 @@ final class WalletManager: ObservableObject {
             fromDiversifier: nil,
             memo: memo
         )
+        print("📜 Transaction recorded in history: \(txId.prefix(16))...")
+
+        // VERIFY the transaction was actually saved
+        let savedTxs = try WalletDatabase.shared.getTransactionHistory(limit: 5)
+        let txWasSaved = savedTxs.contains { $0.txid == txidData }
+        guard txWasSaved else {
+            print("❌ CRITICAL: Transaction was NOT saved to database!")
+            throw WalletError.transactionFailed("Failed to save transaction to database")
+        }
+        print("✅ Verified transaction exists in database")
+
+        // Notify UI that transaction history changed
+        await MainActor.run {
+            self.transactionHistoryVersion += 1
+        }
 
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
@@ -1447,21 +1494,26 @@ final class WalletManager: ObservableObject {
         let networkManager = NetworkManager.shared
         let txId = try await networkManager.broadcastTransaction(rawTx)
 
-        // Get chain height for recording
-        let chainHeight = try await networkManager.getChainHeight()
-
-        // CRITICAL: Mark the spent note immediately to prevent double-spending
-        // Don't wait for blockchain confirmation - mark it now
-        print("📝 Marking note as spent (nullifier: \(spentNullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
-        // Convert txid hex string to Data
+        // CRITICAL: Record transaction IMMEDIATELY after broadcast success
         guard let txidData = Data(hexString: txId) else {
-            print("⚠️ Failed to convert txid to Data, skipping mark as spent")
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
+
+        // Get chain height for recording (use cached if network fails)
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await networkManager.getChainHeight()
+        } catch {
+            chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : 0
+            print("⚠️ Using cached chain height for tx recording: \(chainHeight)")
+        }
+
+        // Mark the spent note
+        print("📝 Marking note as spent (nullifier: \(spentNullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
         print("✅ Note marked as spent in database at height \(chainHeight)")
 
-        // Record transaction in history
+        // CRITICAL: Record transaction in history - MUST succeed before showing success
         _ = try WalletDatabase.shared.insertTransactionHistory(
             txid: txidData,
             height: chainHeight,
@@ -1473,7 +1525,21 @@ final class WalletManager: ObservableObject {
             fromDiversifier: nil,
             memo: memo
         )
-        print("📜 Transaction recorded in history")
+        print("📜 Transaction recorded in history: \(txId.prefix(16))...")
+
+        // VERIFY the transaction was actually saved
+        let savedTxs = try WalletDatabase.shared.getTransactionHistory(limit: 5)
+        let txWasSaved = savedTxs.contains { $0.txid == txidData }
+        guard txWasSaved else {
+            print("❌ CRITICAL: Transaction was NOT saved to database!")
+            throw WalletError.transactionFailed("Failed to save transaction to database")
+        }
+        print("✅ Verified transaction exists in database")
+
+        // Notify UI that transaction history changed
+        await MainActor.run {
+            self.transactionHistoryVersion += 1
+        }
 
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
@@ -1760,21 +1826,25 @@ final class WalletManager: ObservableObject {
             throw WalletError.invalidAddress("Failed to derive z-address from key: \(error.localizedDescription)")
         }
 
-        // CRITICAL: Reset database state for imported wallet
-        // This ensures we scan from Sapling activation to find historical notes
-        print("🗑️ Resetting database state for imported wallet...")
+        // CRITICAL: Delete and recreate database for imported wallet
+        // This ensures NO old data persists (old lastScannedHeight, notes, etc.)
+        print("🗑️ Deleting old database for imported wallet...")
 
-        // Open database with new key FIRST (required before any database operations)
+        do {
+            try WalletDatabase.shared.deleteDatabase()
+            print("✅ Old database deleted")
+        } catch {
+            print("⚠️ Failed to delete database: \(error)")
+        }
+
+        // Open fresh database with new key
         let dbKey = Data(SHA256.hash(data: spendingKey))
         do {
             try WalletDatabase.shared.open(encryptionKey: dbKey)
-            print("✅ Database opened with new key")
+            print("✅ Fresh database created with new key")
         } catch {
             print("⚠️ Failed to open database: \(error)")
         }
-
-        // Now reset all data
-        try? resetDatabaseForNewWallet()
 
         // Reset tree state in FFI memory as well
         isTreeLoaded = false

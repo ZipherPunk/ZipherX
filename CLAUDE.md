@@ -1558,6 +1558,48 @@ After fix, "Repair Notes" should:
 
 ---
 
+### 28. CRITICAL: Sent Transaction Not Recorded in History (November 30, 2025)
+
+**Problem**: User sent transaction successfully (success box appeared with txid), but transaction was NOT recorded in transaction_history database. Balance showed 0 but history showed "No transactions yet".
+
+**Root Cause**: In `sendShieldedWithProgress()`, the `getChainHeight()` call was BEFORE `insertTransactionHistory()`. When `getChainHeight()` threw an error ("Insufficient peers: got 0, need 1"), the code exited early and never recorded the transaction.
+
+```swift
+// OLD FLOW (buggy):
+let txId = try await broadcast(rawTx)           // ✅ Success
+let chainHeight = try await getChainHeight()    // ❌ THROWS ERROR
+try insertTransactionHistory(...)               // ⚠️ NEVER REACHED
+return txId                                     // ⚠️ Shows success but no DB record!
+```
+
+**Solution: Atomic Transaction Recording with Verification**
+
+1. **Fallback chain height**: If `getChainHeight()` fails, use cached `networkManager.chainHeight`
+2. **Mandatory DB write**: `insertTransactionHistory` must succeed (no silent catch)
+3. **Verification step**: Query database to VERIFY the transaction was actually saved
+4. **Only then return success**: Success box only appears if DB verification passes
+
+```swift
+// NEW FLOW (correct):
+let txId = try await broadcast(rawTx)           // ✅ Broadcast
+let chainHeight = try? await getChainHeight()   // Use cached if fails
+   ?? networkManager.chainHeight
+try insertTransactionHistory(...)               // ✅ Must succeed
+let saved = getTransactionHistory().contains(txId)  // ✅ VERIFY
+guard saved else { throw "Not saved" }          // ❌ Error if not verified
+return txId                                     // ✅ Only now show success
+```
+
+**Guarantee**: Success dialog ONLY appears after:
+1. Transaction broadcast accepted by P2P network
+2. Transaction recorded in database
+3. Database record VERIFIED by re-reading
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - both `sendShieldedWithProgress()` and `sendShielded()` functions
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
