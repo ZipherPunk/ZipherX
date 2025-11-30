@@ -1005,119 +1005,112 @@ struct SettingsView: View {
     // MARK: - Banned Peers Sheet
 
     private var bannedPeersSheet: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                // Header with count
-                HStack {
-                    Text("Banned Peers")
+        VStack(spacing: 0) {
+            // macOS header with Done button
+            HStack {
+                Text("Banned Peers")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("\(bannedPeersList.count) banned")
+                    .font(theme.bodyFont)
+                    .foregroundColor(bannedPeersList.isEmpty ? theme.textSecondary : .red)
+                Spacer()
+                Button("Done") {
+                    showBannedPeers = false
+                }
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            if bannedPeersList.isEmpty {
+                // Empty state
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 40))
+                        .foregroundColor(.green)
+                    Text("No Banned Peers")
                         .font(theme.titleFont)
                         .foregroundColor(theme.textPrimary)
-                    Spacer()
-                    Text("\(bannedPeersList.count) banned")
+                    Text("All peers are currently allowed to connect.")
                         .font(theme.bodyFont)
-                        .foregroundColor(bannedPeersList.isEmpty ? theme.textSecondary : .red)
+                        .foregroundColor(theme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(theme.surfaceColor)
+            } else {
+                // List of banned peers
+                List {
+                    ForEach(bannedPeersList, id: \.address) { peer in
+                        BannedPeerRow(
+                            peer: peer,
+                            isSelected: selectedBannedPeers.contains(peer.address),
+                            onToggle: {
+                                if selectedBannedPeers.contains(peer.address) {
+                                    selectedBannedPeers.remove(peer.address)
+                                } else {
+                                    selectedBannedPeers.insert(peer.address)
+                                }
+                            }
+                        )
+                        .environmentObject(themeManager)
+                    }
+                }
+                .listStyle(PlainListStyle())
+            }
+
+            // Action buttons
+            if !bannedPeersList.isEmpty {
+                VStack(spacing: 8) {
+                    // Unban selected
+                    Button(action: {
+                        for address in selectedBannedPeers {
+                            networkManager.unbanPeer(address: address)
+                        }
+                        bannedPeersList = networkManager.getBannedPeers()
+                        selectedBannedPeers.removeAll()
+                    }) {
+                        HStack {
+                            Image(systemName: "checkmark.circle")
+                            Text("Unban Selected (\(selectedBannedPeers.count))")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(selectedBannedPeers.isEmpty ? Color.gray : Color.green)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(selectedBannedPeers.isEmpty)
+
+                    // Unban all
+                    Button(action: {
+                        networkManager.unbanAllPeers()
+                        bannedPeersList = []
+                        selectedBannedPeers.removeAll()
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.uturn.backward")
+                            Text("Unban All")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(Color.orange)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
                 .padding()
                 .background(theme.backgroundColor)
-
-                if bannedPeersList.isEmpty {
-                    // Empty state
-                    VStack(spacing: 12) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.system(size: 40))
-                            .foregroundColor(.green)
-                        Text("No Banned Peers")
-                            .font(theme.titleFont)
-                            .foregroundColor(theme.textPrimary)
-                        Text("All peers are currently allowed to connect.")
-                            .font(theme.bodyFont)
-                            .foregroundColor(theme.textSecondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(theme.surfaceColor)
-                } else {
-                    // List of banned peers
-                    List {
-                        ForEach(bannedPeersList, id: \.address) { peer in
-                            BannedPeerRow(
-                                peer: peer,
-                                isSelected: selectedBannedPeers.contains(peer.address),
-                                onToggle: {
-                                    if selectedBannedPeers.contains(peer.address) {
-                                        selectedBannedPeers.remove(peer.address)
-                                    } else {
-                                        selectedBannedPeers.insert(peer.address)
-                                    }
-                                }
-                            )
-                            .environmentObject(themeManager)
-                        }
-                    }
-                    .listStyle(PlainListStyle())
-                }
-
-                // Action buttons
-                if !bannedPeersList.isEmpty {
-                    VStack(spacing: 8) {
-                        // Unban selected
-                        Button(action: {
-                            for address in selectedBannedPeers {
-                                networkManager.unbanPeer(address: address)
-                            }
-                            bannedPeersList = networkManager.getBannedPeers()
-                            selectedBannedPeers.removeAll()
-                        }) {
-                            HStack {
-                                Image(systemName: "checkmark.circle")
-                                Text("Unban Selected (\(selectedBannedPeers.count))")
-                            }
-                            .font(theme.bodyFont)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(selectedBannedPeers.isEmpty ? Color.gray : Color.green)
-                            .cornerRadius(4)
-                        }
-                        .disabled(selectedBannedPeers.isEmpty)
-
-                        // Unban all
-                        Button(action: {
-                            networkManager.unbanAllPeers()
-                            bannedPeersList = []
-                            selectedBannedPeers.removeAll()
-                        }) {
-                            HStack {
-                                Image(systemName: "arrow.uturn.backward")
-                                Text("Unban All")
-                            }
-                            .font(theme.bodyFont)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(Color.orange)
-                            .cornerRadius(4)
-                        }
-                    }
-                    .padding()
-                    .background(theme.backgroundColor)
-                }
-            }
-            .background(theme.backgroundColor)
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        showBannedPeers = false
-                    }
-                    .foregroundColor(theme.primaryColor)
-                }
             }
         }
-        #if os(iOS)
-        .navigationViewStyle(.stack)
-        #endif
+        .background(theme.backgroundColor)
     }
 
     // MARK: - Debug Section

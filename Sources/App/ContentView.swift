@@ -504,24 +504,24 @@ struct ContentView: View {
             showReceive: $showCypherpunkReceive
         )
         .sheet(isPresented: $showCypherpunkSettings) {
-            NavigationView {
-                SettingsView()
-                    .navigationTitle("Settings")
-                    #if os(iOS)
-                    .navigationBarTitleDisplayMode(.inline)
-                    #endif
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") {
-                                showCypherpunkSettings = false
-                            }
-                            .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
-                        }
+            VStack(spacing: 0) {
+                // Header
+                HStack {
+                    Spacer()
+                    Text("Settings")
+                        .font(.headline)
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    Spacer()
+                    Button("Done") {
+                        showCypherpunkSettings = false
                     }
+                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                }
+                .padding()
+                .background(Color.black)
+
+                SettingsView()
             }
-            #if os(iOS)
-            .navigationViewStyle(.stack)
-            #endif
             #if os(macOS)
             .frame(width: 500, height: 600)
             #endif
@@ -530,24 +530,24 @@ struct ContentView: View {
             .environmentObject(themeManager)
         }
         .sheet(isPresented: $showCypherpunkSend) {
-            NavigationView {
-                SendView()
-                    .navigationTitle("Send ZCL")
-                    #if os(iOS)
-                    .navigationBarTitleDisplayMode(.inline)
-                    #endif
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Cancel") {
-                                showCypherpunkSend = false
-                            }
-                            .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
-                        }
+            VStack(spacing: 0) {
+                // Header
+                HStack {
+                    Button("Cancel") {
+                        showCypherpunkSend = false
                     }
+                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    Spacer()
+                    Text("Send ZCL")
+                        .font(.headline)
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    Spacer()
+                }
+                .padding()
+                .background(Color.black)
+
+                SendView()
             }
-            #if os(iOS)
-            .navigationViewStyle(.stack)
-            #endif
             #if os(macOS)
             .frame(width: 480, height: 550)
             #endif
@@ -556,24 +556,24 @@ struct ContentView: View {
             .environmentObject(themeManager)
         }
         .sheet(isPresented: $showCypherpunkReceive) {
-            NavigationView {
-                ReceiveView()
-                    .navigationTitle("Receive ZCL")
-                    #if os(iOS)
-                    .navigationBarTitleDisplayMode(.inline)
-                    #endif
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") {
-                                showCypherpunkReceive = false
-                            }
-                            .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
-                        }
+            VStack(spacing: 0) {
+                // Header
+                HStack {
+                    Spacer()
+                    Text("Receive ZCL")
+                        .font(.headline)
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    Spacer()
+                    Button("Done") {
+                        showCypherpunkReceive = false
                     }
+                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                }
+                .padding()
+                .background(Color.black)
+
+                ReceiveView()
             }
-            #if os(iOS)
-            .navigationViewStyle(.stack)
-            #endif
             #if os(macOS)
             .frame(width: 420, height: 520)
             #endif

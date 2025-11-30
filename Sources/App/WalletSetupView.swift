@@ -125,177 +125,161 @@ struct WalletSetupView: View {
     // MARK: - Mnemonic Backup View
 
     private var mnemonicBackupView: some View {
-        NavigationView {
-            VStack(spacing: 16) {
-                // Warning
-                VStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 32))
-                        .foregroundColor(.orange)
+        VStack(spacing: 16) {
+            // Warning
+            VStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 32))
+                    .foregroundColor(.orange)
 
-                    Text("Write Down Your Seed Phrase!")
-                        .font(System7Theme.titleFont(size: 14))
+                Text("Write Down Your Seed Phrase!")
+                    .font(System7Theme.titleFont(size: 14))
 
-                    Text("This is your ONLY way to recover your wallet. Store it securely offline. Never share it with anyone.")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
-                        .multilineTextAlignment(.center)
-                }
-                .padding()
+                Text("This is your ONLY way to recover your wallet. Store it securely offline. Never share it with anyone.")
+                    .font(System7Theme.bodyFont(size: 10))
+                    .foregroundColor(System7Theme.darkGray)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
 
-                // Mnemonic words
-                ScrollView {
-                    LazyVGrid(columns: [
-                        GridItem(.flexible()),
-                        GridItem(.flexible()),
-                        GridItem(.flexible())
-                    ], spacing: 8) {
-                        ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
-                            HStack(spacing: 4) {
-                                Text("\(index + 1).")
-                                    .font(System7Theme.bodyFont(size: 9))
-                                    .foregroundColor(System7Theme.darkGray)
-                                    .frame(width: 20, alignment: .trailing)
+            // Mnemonic words
+            ScrollView {
+                LazyVGrid(columns: [
+                    GridItem(.flexible()),
+                    GridItem(.flexible()),
+                    GridItem(.flexible())
+                ], spacing: 8) {
+                    ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
+                        HStack(spacing: 4) {
+                            Text("\(index + 1).")
+                                .font(System7Theme.bodyFont(size: 9))
+                                .foregroundColor(System7Theme.darkGray)
+                                .frame(width: 20, alignment: .trailing)
 
-                                Text(word)
-                                    .font(System7Theme.bodyFont(size: 10))
-                                    .foregroundColor(System7Theme.black)
-                            }
-                            .padding(4)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(System7Theme.white)
-                            .overlay(
-                                Rectangle()
-                                    .stroke(System7Theme.black, lineWidth: 1)
-                            )
+                            Text(word)
+                                .font(System7Theme.bodyFont(size: 10))
+                                .foregroundColor(System7Theme.black)
                         }
+                        .padding(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(System7Theme.white)
+                        .overlay(
+                            Rectangle()
+                                .stroke(System7Theme.black, lineWidth: 1)
+                        )
                     }
-                    .padding()
-                }
-
-                // Confirm button
-                System7Button(title: "I've Saved My Seed Phrase") {
-                    showMnemonicBackup = false
                 }
                 .padding()
             }
-            .background(System7Theme.lightGray)
-            #if os(iOS)
-            .navigationBarHidden(true)
-            #endif
+
+            // Confirm button
+            System7Button(title: "I've Saved My Seed Phrase") {
+                showMnemonicBackup = false
+            }
+            .padding()
         }
-        #if os(iOS)
-        .navigationViewStyle(.stack)
-        #endif
+        .background(System7Theme.lightGray)
     }
 
     // MARK: - Import Warning View (Cypherpunk Privacy Notice)
 
     private var importWarningView: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                // Header with skull icon
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 48))
-                        .foregroundColor(.orange)
+        VStack(spacing: 0) {
+            // Header with skull icon
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 48))
+                    .foregroundColor(.orange)
 
-                    Text("PRIVACY WARNING")
-                        .font(System7Theme.titleFont(size: 16))
-                        .foregroundColor(System7Theme.black)
-                }
-                .padding(.top, 24)
+                Text("PRIVACY WARNING")
+                    .font(System7Theme.titleFont(size: 16))
+                    .foregroundColor(System7Theme.black)
+            }
+            .padding(.top, 24)
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // Cypherpunk manifesto quote
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("\"Privacy is necessary for an open society in the electronic age.\"")
-                                .font(System7Theme.bodyFont(size: 11))
-                                .italic()
-                                .foregroundColor(System7Theme.darkGray)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Cypherpunk manifesto quote
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("\"Privacy is necessary for an open society in the electronic age.\"")
+                            .font(System7Theme.bodyFont(size: 11))
+                            .italic()
+                            .foregroundColor(System7Theme.darkGray)
 
-                            Text("— A Cypherpunk's Manifesto, 1993")
-                                .font(System7Theme.bodyFont(size: 9))
-                                .foregroundColor(System7Theme.darkGray)
-                        }
-                        .padding()
-                        .background(Color.black.opacity(0.05))
-                        .overlay(
-                            Rectangle()
-                                .stroke(System7Theme.darkGray, lineWidth: 1)
-                        )
-
-                        // Privacy implications
-                        warningSection(
-                            title: "Address Reuse Degrades Privacy",
-                            icon: "eye.slash",
-                            content: "Importing a key that has been used elsewhere may reduce your privacy. Each transaction from a reused address can be linked together by blockchain observers."
-                        )
-
-                        // Historical scan warning
-                        warningSection(
-                            title: "Historical Scan Required",
-                            icon: "clock.arrow.circlepath",
-                            content: "To find all your previous transactions, the wallet needs to scan the blockchain history. A quick scan of recent blocks (~10,000) takes about 2-5 minutes. Older transactions may require a full historical scan (30-60 minutes)."
-                        )
-
-                        // Key security
-                        warningSection(
-                            title: "Key Security",
-                            icon: "key.fill",
-                            content: "Never import a key from an untrusted source. If anyone else has seen your private key, they can spend your funds. Your key is your sole proof of ownership."
-                        )
-
-                        // Fast start info
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Image(systemName: "bolt.fill")
-                                    .foregroundColor(.blue)
-                                Text("Fast Start Mode")
-                                    .font(System7Theme.titleFont(size: 11))
-                            }
-
-                            Text("By default, ZipherX scans only recent blocks for fast wallet setup. If your notes are older than ~17 days, use Settings → Quick Scan or Full Rescan to find them.")
-                                .font(System7Theme.bodyFont(size: 10))
-                                .foregroundColor(System7Theme.darkGray)
-                        }
-                        .padding()
-                        .background(Color.blue.opacity(0.1))
-                        .overlay(
-                            Rectangle()
-                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
-                        )
+                        Text("— A Cypherpunk's Manifesto, 1993")
+                            .font(System7Theme.bodyFont(size: 9))
+                            .foregroundColor(System7Theme.darkGray)
                     }
                     .padding()
-                }
+                    .background(Color.black.opacity(0.05))
+                    .overlay(
+                        Rectangle()
+                            .stroke(System7Theme.darkGray, lineWidth: 1)
+                    )
 
-                // Action buttons
-                VStack(spacing: 12) {
-                    System7Button(title: "I Understand, Continue") {
-                        showImportWarning = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            showImportKey = true
+                    // Privacy implications
+                    warningSection(
+                        title: "Address Reuse Degrades Privacy",
+                        icon: "eye.slash",
+                        content: "Importing a key that has been used elsewhere may reduce your privacy. Each transaction from a reused address can be linked together by blockchain observers."
+                    )
+
+                    // Historical scan warning
+                    warningSection(
+                        title: "Historical Scan Required",
+                        icon: "clock.arrow.circlepath",
+                        content: "To find all your previous transactions, the wallet needs to scan the blockchain history. A quick scan of recent blocks (~10,000) takes about 2-5 minutes. Older transactions may require a full historical scan (30-60 minutes)."
+                    )
+
+                    // Key security
+                    warningSection(
+                        title: "Key Security",
+                        icon: "key.fill",
+                        content: "Never import a key from an untrusted source. If anyone else has seen your private key, they can spend your funds. Your key is your sole proof of ownership."
+                    )
+
+                    // Fast start info
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Image(systemName: "bolt.fill")
+                                .foregroundColor(.blue)
+                            Text("Fast Start Mode")
+                                .font(System7Theme.titleFont(size: 11))
                         }
-                    }
 
-                    Button("Cancel") {
-                        showImportWarning = false
+                        Text("By default, ZipherX scans only recent blocks for fast wallet setup. If your notes are older than ~17 days, use Settings → Quick Scan or Full Rescan to find them.")
+                            .font(System7Theme.bodyFont(size: 10))
+                            .foregroundColor(System7Theme.darkGray)
                     }
-                    .font(System7Theme.bodyFont(size: 11))
-                    .foregroundColor(System7Theme.darkGray)
+                    .padding()
+                    .background(Color.blue.opacity(0.1))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                    )
                 }
                 .padding()
-                .background(System7Theme.lightGray)
             }
+
+            // Action buttons
+            VStack(spacing: 12) {
+                System7Button(title: "I Understand, Continue") {
+                    showImportWarning = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        showImportKey = true
+                    }
+                }
+
+                Button("Cancel") {
+                    showImportWarning = false
+                }
+                .font(System7Theme.bodyFont(size: 11))
+                .foregroundColor(System7Theme.darkGray)
+            }
+            .padding()
             .background(System7Theme.lightGray)
-            #if os(iOS)
-            .navigationBarHidden(true)
-            #endif
         }
-        #if os(iOS)
-        .navigationViewStyle(.stack)
-        #endif
+        .background(System7Theme.lightGray)
     }
 
     private func warningSection(title: String, icon: String, content: String) -> some View {
@@ -323,64 +307,56 @@ struct WalletSetupView: View {
     // MARK: - Import Key View
 
     private var importKeyView: some View {
-        NavigationView {
-            VStack(spacing: 16) {
-                Text("Import Private Key")
-                    .font(System7Theme.titleFont(size: 14))
-                    .padding(.top)
+        VStack(spacing: 16) {
+            Text("Import Private Key")
+                .font(System7Theme.titleFont(size: 14))
+                .padding(.top)
 
-                Text("Enter your Bech32 private key (secret-extended-key-main1...) or 338-character hex key.")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+            Text("Enter your Bech32 private key (secret-extended-key-main1...) or 338-character hex key.")
+                .font(System7Theme.bodyFont(size: 10))
+                .foregroundColor(System7Theme.darkGray)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
 
-                // Private key input
-                TextEditor(text: $privateKeyInput)
-                    .font(System7Theme.bodyFont(size: 10))
-                    .frame(height: 80)
-                    .padding(8)
-                    .background(System7Theme.white)
-                    .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
-                    )
-                    .padding(.horizontal)
+            // Private key input
+            TextEditor(text: $privateKeyInput)
+                .font(System7Theme.bodyFont(size: 10))
+                .frame(height: 80)
+                .padding(8)
+                .background(System7Theme.white)
+                .overlay(
+                    Rectangle()
+                        .stroke(System7Theme.black, lineWidth: 1)
+                )
+                .padding(.horizontal)
 
-                // Character count - support both 338-char hex and Bech32 format
-                let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                let charCount = cleanInput.count
-                let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
-                // 169 bytes = 338 hex chars, or Bech32 format (typically ~280 chars)
-                let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
-                Text(isBech32 ? "Bech32 format detected ✓" : (charCount == 338 ? "Hex format detected ✓" : "\(charCount)/338 characters"))
-                    .font(System7Theme.bodyFont(size: 9))
-                    .foregroundColor(isValidLength ? .green : System7Theme.darkGray)
+            // Character count - support both 338-char hex and Bech32 format
+            let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            let charCount = cleanInput.count
+            let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
+            // 169 bytes = 338 hex chars, or Bech32 format (typically ~280 chars)
+            let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
+            Text(isBech32 ? "Bech32 format detected ✓" : (charCount == 338 ? "Hex format detected ✓" : "\(charCount)/338 characters"))
+                .font(System7Theme.bodyFont(size: 9))
+                .foregroundColor(isValidLength ? .green : System7Theme.darkGray)
 
-                Spacer()
+            Spacer()
 
-                // Buttons
-                HStack(spacing: 12) {
-                    System7Button(title: "Cancel") {
-                        showImportKey = false
-                        privateKeyInput = ""
-                    }
-
-                    System7Button(title: "Import") {
-                        importPrivateKey()
-                    }
-                    .disabled(!isValidLength || isProcessing)
+            // Buttons
+            HStack(spacing: 12) {
+                System7Button(title: "Cancel") {
+                    showImportKey = false
+                    privateKeyInput = ""
                 }
-                .padding()
+
+                System7Button(title: "Import") {
+                    importPrivateKey()
+                }
+                .disabled(!isValidLength || isProcessing)
             }
-            .background(System7Theme.lightGray)
-            #if os(iOS)
-            .navigationBarHidden(true)
-            #endif
+            .padding()
         }
-        #if os(iOS)
-        .navigationViewStyle(.stack)
-        #endif
+        .background(System7Theme.lightGray)
     }
 
     // MARK: - Actions

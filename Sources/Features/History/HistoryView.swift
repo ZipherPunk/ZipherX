@@ -221,7 +221,24 @@ struct TransactionDetailView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
-        NavigationView {
+        VStack(spacing: 0) {
+            // Header with title and Done button
+            HStack {
+                Spacer()
+                Text("Transaction Details")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
             ScrollView {
                 VStack(spacing: 16) {
                     // Transaction type header
@@ -246,26 +263,9 @@ struct TransactionDetailView: View {
                 .padding()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(theme.backgroundColor)
-            .navigationTitle("Transaction Details")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                    .foregroundColor(theme.primaryColor)
-                }
-            }
-            .overlay(
-                copiedToast
-            )
         }
-        #if os(iOS)
-        .navigationViewStyle(.stack)
-        #endif
+        .background(theme.backgroundColor)
+        .overlay(copiedToast)
         #if os(macOS)
         .frame(minWidth: 500, minHeight: 600)
         #endif
