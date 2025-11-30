@@ -1412,6 +1412,152 @@ actor PeerMessageLock {
 
 ---
 
+### 25. CRITICAL: Wrong Nullifier for Notes After Bundled Tree (November 29, 2025)
+
+**Problem**: Balance showing 0.019 ZCL when it should be 0.0094 ZCL. Note 3 (0.0096 ZCL) was marked as UNSPENT when it had already been spent on-chain.
+
+**Root Cause**: Note 3's nullifier was computed with **position=0** instead of its correct tree position.
+
+**Why it happened**:
+1. Note 3 was received at height 2926435, which is AFTER the bundled tree ends at height 2926122
+2. When discovered during `processShieldedOutputsForNotesOnly`, the CMU lookup in bundled data failed
+3. Position defaulted to 0 (see lines 1270-1278 in FilterScanner.swift)
+4. Nullifier computed with position=0 is completely wrong
+5. Blockchain spend at height 2926511 has correct nullifier → no match → note stays "UNSPENT"
+
+**Evidence**:
+- Note 3 DB nullifier: `1B8BAF867480AACFD08CDDF92B6987402D44EF74A9E24E517BE0DB0B01EAD4BD`
+- Blockchain spend nullifier: `c64c896370e964824d50cb8387cf67abfbd2933ddebc15750fddec602cb5377b`
+- These don't match even when byte-reversed - completely different values due to wrong position
+
+**Solution: "Repair Notes" Function**
+
+Added a repair function that:
+1. Deletes notes received AFTER bundledTreeHeight (2926122)
+2. Clears tree state (forces reload from bundled CMUs)
+3. Rescans from bundledTreeHeight + 1 using SEQUENTIAL mode
+4. Sequential mode uses `processShieldedOutputsSync` which gets correct position from `ZipherXFFI.treeAppend()`
+5. Correct position → correct nullifier → spent notes properly detected
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - added `deleteNotesAfterHeight()`
+- `Sources/Core/Wallet/WalletManager.swift` - added `repairNotesAfterBundledTree()`
+- `Sources/Features/Settings/SettingsView.swift` - added "Repair Notes (fix balance)" button
+
+**User Instructions**:
+1. Go to Settings
+2. Scroll to "Blockchain Data" section
+3. Tap "Repair Notes (fix balance)" (purple button)
+4. Confirm the repair
+5. Wait for rescan to complete
+6. Balance should now show correct amount
+
+---
+
+### 26. CRITICAL: Repair Notes Did Not Actually Reload Tree - isTreeLoaded Bug (November 30, 2025)
+
+**Problem**: After running "Repair Notes", balance still showed wrong amount (0.0038 ZCL instead of 0.0094 ZCL). Nullifiers were still being computed with wrong positions.
+
+**Root Cause Investigation**:
+1. Created test binary `find_cmu_position.rs` to count CMUs from blockchain
+2. Found that correct position for first note is **1041904** but app computed **1042059** (off by 155!)
+3. Checked z.log: tree had 1,042,041+ commitments when bundled tree should have exactly 1,041,891
+4. The corrupted tree was being used even after "Repair Notes" was called
+
+**Bug Location**: `WalletManager.performWitnessRepair()` at line ~1014
+
+**Why Reload Failed**:
+```swift
+// The code was:
+print("🌳 Reloading commitment tree from bundled data...")
+await preloadCommitmentTree()
+
+// But preloadCommitmentTree() has this guard:
+if isTreeLoading || isTreeLoaded {  // isTreeLoaded was TRUE
+    return  // ← Returns immediately without reloading!
+}
+```
+
+The `preloadCommitmentTree()` function returned immediately because `isTreeLoaded` was still `true` from the initial load. The corrupted tree remained in FFI memory.
+
+**Fix Applied**:
+```swift
+// Now reset isTreeLoaded and clear FFI tree BEFORE calling preload:
+await MainActor.run {
+    self.isTreeLoaded = false
+    self.treeLoadProgress = 0.0
+    self.treeLoadStatus = ""
+}
+_ = ZipherXFFI.treeInit()  // Clear FFI tree
+print("🌳 Reloading commitment tree from bundled data...")
+await preloadCommitmentTree()  // Now this actually reloads
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - reset `isTreeLoaded` and clear FFI tree before reload
+
+**Verification**:
+After fix, "Repair Notes" should:
+1. Reset `isTreeLoaded = false`
+2. Clear FFI tree with `treeInit()`
+3. Actually reload 1,041,891 CMUs from bundled file
+4. Rescan and compute correct positions (1041904 not 1042059)
+5. Compute correct nullifiers that match on-chain spends
+6. Balance displays correct 0.0094 ZCL
+
+---
+
+### 27. UI/UX Improvements (November 30, 2025)
+
+**Changes Made:**
+
+1. **Cypherpunk Privacy Warning for Private Key Import** (`WalletSetupView.swift`)
+   - New warning sheet appears BEFORE import dialog
+   - Includes quote from "A Cypherpunk's Manifesto"
+   - Warns about: address reuse, historical scan duration, key security
+   - "Fast Start Mode" info box explaining recent-blocks-only scan
+   - User must tap "I Understand, Continue" to proceed
+
+2. **Default Theme Changed to Cypherpunk** (`ThemeManager.swift`)
+   - Default theme now `cypherpunk` instead of `mac7`
+   - Applies to iOS, macOS simulator, and macOS versions
+   - Existing users keep their chosen theme preference
+
+3. **Real-Time Chain Height Updates** (`NetworkManager.swift`)
+   - Added `statsRefreshTimer` (30-second interval)
+   - Chain height auto-updates without manual refresh
+   - Only logs when height actually changes
+
+4. **Real-Time Banned Peers Count** (`NetworkManager.swift`)
+   - Added `@Published bannedPeersCount` property
+   - Updates immediately when peers banned/unbanned
+   - UI reacts to changes automatically
+
+5. **Fixed Banned Peers List Display** (`SettingsView.swift`)
+   - Changed from non-reactive `getBannedPeers().count` to reactive `bannedPeersCount`
+   - Fixed macOS sheet size: `minWidth: 500, minHeight: 400`
+   - Proper theme support for cypherpunk mode
+
+6. **Floating Sync Progress Indicator** (`ContentView.swift`)
+   - Shows during background sync after initial sync complete
+   - Displays: progress bar, percentage, current/max block height, blocks remaining
+   - Floating at bottom of screen, user can still use app
+   - macOS has max width constraint (400px)
+
+7. **Sync Height Tracking** (`WalletManager.swift`)
+   - Added `@Published syncCurrentHeight` and `syncMaxHeight` properties
+   - Updated in real-time during scan progress callback
+
+**Files Modified:**
+- `Sources/App/WalletSetupView.swift` - cypherpunk import warning
+- `Sources/UI/Theme/ThemeManager.swift` - default theme to cypherpunk
+- `Sources/Core/Network/NetworkManager.swift` - stats refresh timer, banned peers count
+- `Sources/Features/Settings/SettingsView.swift` - reactive banned peers, macOS sheet size
+- `Sources/App/ContentView.swift` - floating sync indicator
+- `Sources/Core/Wallet/WalletManager.swift` - sync height tracking
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

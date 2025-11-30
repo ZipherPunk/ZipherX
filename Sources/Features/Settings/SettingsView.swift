@@ -8,7 +8,7 @@ import AppKit
 #endif
 
 /// Settings View - Export keys, PIN code, Face ID setup
-/// Classic Macintosh System 7 design
+/// Themed design
 struct SettingsView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
@@ -17,6 +17,7 @@ struct SettingsView: View {
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var useFaceID = false
+    @State private var selectedTimeout: TimeInterval = BiometricAuthManager.shared.authTimeout
     @State private var usePINCode = false
     @State private var showPINSetup = false
     @State private var pinCode = ""
@@ -35,6 +36,7 @@ struct SettingsView: View {
     @State private var showFullRescanFromHeight = false
     @State private var fullRescanHeight = ""
     @State private var showRebuildWitnessesWarning = false
+    @State private var showRepairNotesWarning = false
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
@@ -47,9 +49,17 @@ struct SettingsView: View {
     @State private var bannedPeersList: [BannedPeer] = []
     @State private var selectedBannedPeers: Set<String> = []
 
+    @EnvironmentObject var themeManager: ThemeManager
+
+    // Theme shortcut
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                // Appearance section (themes)
+                appearanceSection
+
                 // Security section
                 securitySection
 
@@ -74,6 +84,8 @@ struct SettingsView: View {
             }
             .padding()
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(themeManager.currentTheme.backgroundColor)
         .onAppear {
             checkBiometricAvailability()
         }
@@ -111,7 +123,9 @@ struct SettingsView: View {
         }
         .alert("Quick Scan for Notes", isPresented: $showQuickScan) {
             TextField("Start Height", text: $quickScanHeight)
+                #if os(iOS)
                 .keyboardType(.numberPad)
+                #endif
             Button("Cancel", role: .cancel) {
                 quickScanHeight = ""
             }
@@ -126,7 +140,9 @@ struct SettingsView: View {
         }
         .alert("Full Rescan from Height", isPresented: $showFullRescanFromHeight) {
             TextField("Start Height", text: $fullRescanHeight)
+                #if os(iOS)
                 .keyboardType(.numberPad)
+                #endif
             Button("Cancel", role: .cancel) {
                 fullRescanHeight = ""
             }
@@ -147,6 +163,87 @@ struct SettingsView: View {
         } message: {
             Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
         }
+        .alert("Repair Notes (Fix Nullifiers)", isPresented: $showRepairNotesWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Repair", role: .destructive) {
+                startRepairNotes()
+            }
+        } message: {
+            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height 2926122.\n\nDo you want to continue?")
+        }
+    }
+
+    // MARK: - Appearance Section
+
+    private var appearanceSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "paintbrush")
+                    .font(.system(size: 12))
+                Text("Appearance")
+                    .font(theme.titleFont)
+                Spacer()
+            }
+            .foregroundColor(theme.textPrimary)
+
+            // Theme selection grid
+            LazyVGrid(columns: [
+                GridItem(.flexible(), spacing: 12),
+                GridItem(.flexible(), spacing: 12)
+            ], spacing: 12) {
+                ForEach(ThemeType.allCases) { themeType in
+                    ThemePreviewCard(
+                        themeType: themeType,
+                        isSelected: themeManager.currentThemeType == themeType,
+                        action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                themeManager.setTheme(themeType)
+                            }
+                        }
+                    )
+                    .environmentObject(themeManager)
+                }
+            }
+
+            // Current theme info
+            HStack(spacing: 8) {
+                Image(systemName: themeIcon(for: themeManager.currentThemeType))
+                    .foregroundColor(themeManager.currentTheme.primaryColor)
+                    .font(.system(size: 12))
+
+                Text("Active: \(themeManager.currentTheme.name)")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+
+                Spacer()
+            }
+            .padding(8)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(themeManager.currentTheme.primaryColor.opacity(0.5), lineWidth: 1)
+            )
+        }
+        .padding(12)
+        .background(theme.backgroundColor)
+        .overlay(
+            Rectangle()
+                .stroke(theme.textPrimary, lineWidth: 1)
+        )
+    }
+
+    private func themeIcon(for type: ThemeType) -> String {
+        switch type {
+        case .mac7:
+            return "desktopcomputer"
+        case .cypherpunk:
+            return "terminal"
+        case .win95:
+            return "pc"
+        case .modern:
+            return "iphone"
+        }
     }
 
     // MARK: - Security Section
@@ -158,21 +255,21 @@ struct SettingsView: View {
                 Image(systemName: "lock.shield")
                     .font(.system(size: 12))
                 Text("Security")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // Face ID / Touch ID toggle
             if biometricAvailable {
                 HStack {
                     Image(systemName: getBiometricIcon())
                         .font(.system(size: 14))
-                        .foregroundColor(System7Theme.black)
+                        .foregroundColor(theme.textPrimary)
 
                     Text(getBiometricName())
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
 
                     Spacer()
 
@@ -189,22 +286,62 @@ struct SettingsView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(System7Theme.white)
+                .background(theme.surfaceColor)
                 .overlay(
                     Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                        .stroke(theme.textPrimary, lineWidth: 1)
                 )
+
+                // Inactivity timeout picker (only show if Face ID enabled)
+                if useFaceID {
+                    HStack {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 14))
+                            .foregroundColor(theme.textPrimary)
+
+                        Text("Lock after")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textPrimary)
+
+                        Spacer()
+
+                        Picker("", selection: $selectedTimeout) {
+                            ForEach(BiometricAuthManager.timeoutOptions, id: \.seconds) { option in
+                                Text(option.label).tag(option.seconds)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .accentColor(theme.primaryColor)
+                        .onChange(of: selectedTimeout) { newValue in
+                            BiometricAuthManager.shared.setAuthTimeout(newValue)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(theme.surfaceColor)
+                    .overlay(
+                        Rectangle()
+                            .stroke(theme.textPrimary, lineWidth: 1)
+                    )
+
+                    // Info text
+                    Text("\(getBiometricName()) required: at app launch, when sending ZCL, and after \(BiometricAuthManager.shared.timeoutDisplayString) of inactivity")
+                        .font(.system(size: 9))
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                }
             }
 
             // PIN Code toggle
             HStack {
                 Image(systemName: "number.square")
                     .font(.system(size: 14))
-                    .foregroundColor(System7Theme.black)
+                    .foregroundColor(theme.textPrimary)
 
                 Text("PIN Code")
-                    .font(System7Theme.bodyFont(size: 11))
-                    .foregroundColor(System7Theme.black)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
@@ -221,17 +358,17 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                    .stroke(theme.textPrimary, lineWidth: 1)
             )
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
     }
 
@@ -244,24 +381,24 @@ struct SettingsView: View {
                 Image(systemName: "network")
                     .font(.system(size: 12))
                 Text("Network")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // P2P Only toggle
             HStack {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
                     .font(.system(size: 14))
-                    .foregroundColor(System7Theme.black)
+                    .foregroundColor(theme.textPrimary)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("P2P Only Mode")
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
                     Text("No centralized API fallback")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                 }
 
                 Spacer()
@@ -276,10 +413,10 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                    .stroke(theme.textPrimary, lineWidth: 1)
             )
 
             // Info text
@@ -291,20 +428,24 @@ struct SettingsView: View {
                 Text(useP2POnly ?
                     "Maximum security: All data verified via decentralized P2P network with multi-peer consensus." :
                     "P2P first with InsightAPI fallback. Enable P2P-only for trustless operation.")
-                    .font(System7Theme.bodyFont(size: 9))
-                    .foregroundColor(System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(8)
-            .background(useP2POnly ? Color.green.opacity(0.1) : System7Theme.white)
+            .background(useP2POnly ? Color.green.opacity(0.1) : theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(useP2POnly ? Color.green.opacity(0.5) : System7Theme.black.opacity(0.3), lineWidth: 1)
+                    .stroke(useP2POnly ? Color.green.opacity(0.5) : theme.textPrimary.opacity(0.3), lineWidth: 1)
             )
 
             // Banned Peers button
             Button(action: {
                 bannedPeersList = networkManager.getBannedPeers()
+                print("🚫 Banned peers list: \(bannedPeersList.count) items")
+                for peer in bannedPeersList {
+                    print("  - \(peer.address): \(peer.reason.rawValue)")
+                }
                 selectedBannedPeers.removeAll()
                 showBannedPeers = true
             }) {
@@ -312,33 +453,37 @@ struct SettingsView: View {
                     Image(systemName: "person.crop.circle.badge.xmark")
                         .font(.system(size: 14))
                     Text("Banned Peers")
-                        .font(System7Theme.bodyFont(size: 11))
+                        .font(theme.bodyFont)
                     Spacer()
-                    Text("\(networkManager.getBannedPeers().count)")
-                        .font(System7Theme.monoFont(size: 10))
-                        .foregroundColor(.red)
+                    Text("\(networkManager.bannedPeersCount)")
+                        .font(theme.monoFont)
+                        .foregroundColor(networkManager.bannedPeersCount > 0 ? .red : theme.textSecondary)
                     Image(systemName: "chevron.right")
                         .font(.system(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .foregroundColor(theme.textSecondary)
                 }
-                .foregroundColor(System7Theme.black)
+                .foregroundColor(theme.textPrimary)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
-                .background(System7Theme.white)
+                .background(theme.surfaceColor)
                 .overlay(
                     Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                        .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
         .sheet(isPresented: $showBannedPeers) {
             bannedPeersSheet
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                       minHeight: 400, idealHeight: 500, maxHeight: 600)
+                #endif
         }
     }
 
@@ -351,10 +496,10 @@ struct SettingsView: View {
                 Image(systemName: "key")
                     .font(.system(size: 12))
                 Text("Backup")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // Warning
             HStack(spacing: 8) {
@@ -363,12 +508,12 @@ struct SettingsView: View {
                     .font(.system(size: 12))
 
                 Text("Never share your private key. Store it securely offline.")
-                    .font(System7Theme.bodyFont(size: 9))
-                    .foregroundColor(System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(8)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
                     .stroke(Color.orange.opacity(0.5), lineWidth: 1)
@@ -380,10 +525,10 @@ struct SettingsView: View {
             }
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
     }
 
@@ -396,24 +541,24 @@ struct SettingsView: View {
                 Image(systemName: "ladybug")
                     .font(.system(size: 12))
                 Text("Debug Logging")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // Debug toggle
             HStack {
                 Image(systemName: "doc.text")
                     .font(.system(size: 14))
-                    .foregroundColor(System7Theme.black)
+                    .foregroundColor(theme.textPrimary)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Enable Debug Log")
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
                     Text("Log size: \(debugLogSize)")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                 }
 
                 Spacer()
@@ -430,10 +575,10 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                    .stroke(theme.textPrimary, lineWidth: 1)
             )
 
             // Export and Clear buttons
@@ -446,7 +591,7 @@ struct SettingsView: View {
                         Image(systemName: "square.and.arrow.up")
                             .font(.system(size: 12))
                         Text("Export Log")
-                            .font(System7Theme.titleFont(size: 11))
+                            .font(theme.bodyFont)
                     }
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
@@ -467,7 +612,7 @@ struct SettingsView: View {
                         Image(systemName: "trash")
                             .font(.system(size: 12))
                         Text("Clear")
-                            .font(System7Theme.titleFont(size: 11))
+                            .font(theme.bodyFont)
                     }
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
@@ -482,16 +627,16 @@ struct SettingsView: View {
 
             // Info text
             Text("When enabled, all app logs are saved to debug.log file that you can export for troubleshooting.")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 8)
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
         .onAppear {
             updateDebugLogSize()
@@ -521,10 +666,10 @@ struct SettingsView: View {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 12))
                 Text("Blockchain Data")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // Warning box
             VStack(spacing: 8) {
@@ -534,15 +679,15 @@ struct SettingsView: View {
                         .font(.system(size: 14))
 
                     Text("DANGER ZONE")
-                        .font(System7Theme.titleFont(size: 10))
+                        .font(theme.bodyFont)
                         .foregroundColor(.red)
 
                     Spacer()
                 }
 
                 Text("Full rescan rebuilds the commitment tree from scratch. Required if witnesses are invalid. This takes 30-60 minutes.")
-                    .font(System7Theme.bodyFont(size: 9))
-                    .foregroundColor(System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(8)
@@ -560,7 +705,7 @@ struct SettingsView: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 12))
                     Text("Quick Scan (view only)")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -580,7 +725,7 @@ struct SettingsView: View {
                     Image(systemName: "checkmark.shield")
                         .font(.system(size: 12))
                     Text("Rebuild Witnesses (for spending)")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -592,6 +737,26 @@ struct SettingsView: View {
                 )
             }
 
+            // Repair Notes button - PURPLE (fix nullifier issues)
+            Button(action: {
+                showRepairNotesWarning = true
+            }) {
+                HStack {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .font(.system(size: 12))
+                    Text("Repair Notes (fix balance)")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.purple)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.purple.opacity(0.8), lineWidth: 2)
+                )
+            }
+
             // Full Rescan from Height button - ORANGE (spendable notes)
             Button(action: {
                 showFullRescanFromHeight = true
@@ -600,7 +765,7 @@ struct SettingsView: View {
                     Image(systemName: "arrow.clockwise.circle")
                         .font(.system(size: 12))
                     Text("Full Rescan from Height")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -620,7 +785,7 @@ struct SettingsView: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12))
                     Text("Full Rescan (from scratch)")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -633,10 +798,10 @@ struct SettingsView: View {
             }
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
     }
 
@@ -645,19 +810,19 @@ struct SettingsView: View {
     private var rescanProgressView: some View {
         VStack(spacing: 20) {
             Text("Full Blockchain Rescan")
-                .font(System7Theme.titleFont(size: 16))
-                .foregroundColor(System7Theme.black)
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
 
             // Progress bar
             VStack(spacing: 8) {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Rectangle()
-                            .fill(System7Theme.white)
+                            .fill(theme.surfaceColor)
                             .frame(height: 20)
                             .overlay(
                                 Rectangle()
-                                    .stroke(System7Theme.black, lineWidth: 1)
+                                    .stroke(theme.textPrimary, lineWidth: 1)
                             )
 
                         Rectangle()
@@ -669,57 +834,57 @@ struct SettingsView: View {
                 .frame(height: 20)
 
                 Text("\(Int(rescanProgress * 100))%")
-                    .font(System7Theme.titleFont(size: 14))
-                    .foregroundColor(System7Theme.black)
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
             }
 
             // Block progress
             VStack(spacing: 4) {
                 HStack {
                     Text("Block:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                     Text("\(rescanCurrentHeight) / \(rescanMaxHeight)")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textPrimary)
                 }
 
                 HStack {
                     Text("Elapsed:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                     Text(formatDuration(rescanElapsedTime))
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textPrimary)
                 }
 
                 HStack {
                     Text("Estimated:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                     Text(estimatedTimeRemaining)
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textPrimary)
                 }
 
                 HStack {
                     Text("Tree Size:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Spacer()
                     Text("\(ZipherXFFI.treeSize()) commitments")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textPrimary)
                 }
             }
             .padding(12)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                    .stroke(theme.textPrimary, lineWidth: 1)
             )
 
             // Status message
@@ -727,17 +892,17 @@ struct SettingsView: View {
                 // Error state
                 VStack(spacing: 8) {
                     Text("Rescan failed!")
-                        .font(System7Theme.titleFont(size: 12))
+                        .font(theme.titleFont)
                         .foregroundColor(.red)
                     Text(errorMessage)
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(.center)
                 }
             } else {
                 Text(rescanProgress >= 1.0 ? "Rescan complete!" : "Building commitment tree...")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(rescanProgress >= 1.0 ? .green : System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(rescanProgress >= 1.0 ? .green : theme.textSecondary)
             }
 
             if rescanProgress >= 1.0 || rescanProgress < 0 {
@@ -752,12 +917,12 @@ struct SettingsView: View {
                 .foregroundColor(.white)
                 .overlay(
                     Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                        .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
         }
         .padding(30)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .interactiveDismissDisabled(rescanProgress >= 0 && rescanProgress < 1.0)
     }
 
@@ -793,18 +958,22 @@ struct SettingsView: View {
     private var pinSetupSheet: some View {
         VStack(spacing: 20) {
             Text("Set PIN Code")
-                .font(System7Theme.titleFont(size: 16))
-                .foregroundColor(System7Theme.black)
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
 
             VStack(spacing: 12) {
                 SecureField("Enter 4-6 digit PIN", text: $pinCode)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    #if os(iOS)
                     .keyboardType(.numberPad)
+                    #endif
                     .frame(maxWidth: 200)
 
                 SecureField("Confirm PIN", text: $confirmPIN)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    #if os(iOS)
                     .keyboardType(.numberPad)
+                    #endif
                     .frame(maxWidth: 200)
             }
 
@@ -824,7 +993,7 @@ struct SettingsView: View {
             }
         }
         .padding(30)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
     }
 
     // MARK: - Banned Peers Sheet
@@ -835,14 +1004,15 @@ struct SettingsView: View {
                 // Header with count
                 HStack {
                     Text("Banned Peers")
-                        .font(System7Theme.titleFont(size: 14))
+                        .font(theme.titleFont)
+                        .foregroundColor(theme.textPrimary)
                     Spacer()
                     Text("\(bannedPeersList.count) banned")
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(.red)
+                        .font(theme.bodyFont)
+                        .foregroundColor(bannedPeersList.isEmpty ? theme.textSecondary : .red)
                 }
                 .padding()
-                .background(System7Theme.lightGray)
+                .background(theme.backgroundColor)
 
                 if bannedPeersList.isEmpty {
                     // Empty state
@@ -851,13 +1021,14 @@ struct SettingsView: View {
                             .font(.system(size: 40))
                             .foregroundColor(.green)
                         Text("No Banned Peers")
-                            .font(System7Theme.titleFont(size: 14))
+                            .font(theme.titleFont)
+                            .foregroundColor(theme.textPrimary)
                         Text("All peers are currently allowed to connect.")
-                            .font(System7Theme.bodyFont(size: 11))
-                            .foregroundColor(System7Theme.darkGray)
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(System7Theme.white)
+                    .background(theme.surfaceColor)
                 } else {
                     // List of banned peers
                     List {
@@ -873,6 +1044,7 @@ struct SettingsView: View {
                                     }
                                 }
                             )
+                            .environmentObject(themeManager)
                         }
                     }
                     .listStyle(PlainListStyle())
@@ -893,7 +1065,7 @@ struct SettingsView: View {
                                 Image(systemName: "checkmark.circle")
                                 Text("Unban Selected (\(selectedBannedPeers.count))")
                             }
-                            .font(System7Theme.bodyFont(size: 11))
+                            .font(theme.bodyFont)
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -912,7 +1084,7 @@ struct SettingsView: View {
                                 Image(systemName: "arrow.uturn.backward")
                                 Text("Unban All")
                             }
-                            .font(System7Theme.bodyFont(size: 11))
+                            .font(theme.bodyFont)
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -921,15 +1093,19 @@ struct SettingsView: View {
                         }
                     }
                     .padding()
-                    .background(System7Theme.lightGray)
+                    .background(theme.backgroundColor)
                 }
             }
+            .background(theme.backgroundColor)
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         showBannedPeers = false
                     }
+                    .foregroundColor(theme.primaryColor)
                 }
             }
         }
@@ -944,10 +1120,10 @@ struct SettingsView: View {
                 Image(systemName: "hammer")
                     .font(.system(size: 12))
                 Text("Debug Tools")
-                    .font(System7Theme.titleFont(size: 12))
+                    .font(theme.titleFont)
                 Spacer()
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
 
             // Recover Spent Notes button - for failed transaction recovery
             Button(action: {
@@ -957,7 +1133,7 @@ struct SettingsView: View {
                     Image(systemName: "arrow.uturn.backward.circle")
                         .font(.system(size: 12))
                     Text("Recover Stuck Funds")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -970,8 +1146,8 @@ struct SettingsView: View {
             }
 
             Text("If a transaction failed but your balance shows 0, this will recover any stuck funds back to spendable.")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 8)
 
@@ -983,7 +1159,7 @@ struct SettingsView: View {
                     Image(systemName: "trash")
                         .font(.system(size: 12))
                     Text("Clear Block Headers")
-                        .font(System7Theme.titleFont(size: 11))
+                        .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
                 .frame(maxWidth: .infinity)
@@ -997,16 +1173,16 @@ struct SettingsView: View {
 
             // Info text
             Text("Clears all cached block headers. Use this to test header sync progress bar. Headers will re-sync on next balance refresh.")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 8)
         }
         .padding(12)
-        .background(System7Theme.lightGray)
+        .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+                .stroke(theme.textPrimary, lineWidth: 1)
         )
     }
 
@@ -1244,6 +1420,55 @@ struct SettingsView: View {
         }
     }
 
+    private func startRepairNotes() {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = 0
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform note repair in background
+        Task {
+            do {
+                print("🔧 Starting note repair...")
+
+                try await walletManager.repairNotesAfterBundledTree { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ Note repair complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    errorMessage = "Note repair failed: \(error.localizedDescription)"
+                    print("❌ Repair error: \(error)")
+                    rescanProgress = -1
+                }
+            }
+        }
+    }
+
     private func startQuickScan(from startHeight: UInt64) {
         // Reset progress state
         rescanProgress = 0
@@ -1404,9 +1629,12 @@ struct ShareSheet: View {
 // MARK: - Banned Peer Row
 
 struct BannedPeerRow: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let peer: BannedPeer
     let isSelected: Bool
     let onToggle: () -> Void
+
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         Button(action: onToggle) {
@@ -1419,19 +1647,19 @@ struct BannedPeerRow: View {
                 // Peer info
                 VStack(alignment: .leading, spacing: 4) {
                     Text(peer.address)
-                        .font(System7Theme.monoFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.monoFont)
+                        .foregroundColor(theme.textPrimary)
 
                     HStack(spacing: 8) {
                         // Ban reason
                         Text(peer.reason.rawValue)
-                            .font(System7Theme.bodyFont(size: 9))
+                            .font(theme.captionFont)
                             .foregroundColor(.red)
 
                         // Time remaining
                         Text("• \(timeRemaining)")
-                            .font(System7Theme.bodyFont(size: 9))
-                            .foregroundColor(System7Theme.darkGray)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
                     }
                 }
 
@@ -1465,4 +1693,5 @@ struct BannedPeerRow: View {
     SettingsView()
         .environmentObject(WalletManager.shared)
         .environmentObject(NetworkManager.shared)
+        .environmentObject(ThemeManager.shared)
 }

@@ -26,6 +26,7 @@ final class WalletManager: ObservableObject {
 
     // MARK: - Published Properties
     @Published private(set) var isWalletCreated: Bool = false
+    @Published private(set) var isImportedWallet: Bool = false  // True if wallet was imported (may have historical notes)
     @Published private(set) var shieldedBalance: UInt64 = 0 // in zatoshis
     @Published private(set) var pendingBalance: UInt64 = 0
     @Published private(set) var zAddress: String = ""
@@ -35,6 +36,8 @@ final class WalletManager: ObservableObject {
     @Published private(set) var syncStatus: String = ""
     @Published private(set) var lastError: WalletError?
     @Published private(set) var syncTasks: [SyncTask] = []
+    @Published private(set) var syncCurrentHeight: UInt64 = 0
+    @Published private(set) var syncMaxHeight: UInt64 = 0
 
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
@@ -384,10 +387,11 @@ final class WalletManager: ObservableObject {
         print("🗑️ Resetting database state for new wallet...")
         try? resetDatabaseForNewWallet()
 
-        // Update state
+        // Update state - new wallet (not imported, no historical notes possible)
         DispatchQueue.main.async {
             self.zAddress = address
             self.isWalletCreated = true
+            self.isImportedWallet = false  // New wallet - fast startup OK
             self.saveWalletState()
         }
 
@@ -418,10 +422,11 @@ final class WalletManager: ObservableObject {
         print("🗑️ Resetting database state for restored wallet...")
         try? resetDatabaseForNewWallet()
 
-        // Update state
+        // Update state - restored wallet (may have historical notes)
         DispatchQueue.main.async {
             self.zAddress = address
             self.isWalletCreated = true
+            self.isImportedWallet = true  // Restored wallet - scan for historical notes
             self.saveWalletState()
         }
     }
@@ -609,6 +614,8 @@ final class WalletManager: ObservableObject {
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
                 self?.syncProgress = progress
+                self?.syncCurrentHeight = currentHeight
+                self?.syncMaxHeight = maxHeight
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     // Show context: scanning from checkpoint to current
                     let blocksToScan = maxHeight > bundledTreeHeight ? maxHeight - bundledTreeHeight : 0
@@ -699,7 +706,17 @@ final class WalletManager: ObservableObject {
         await updateTaskWithProgress("balance", detail: "Processing \(totalNotes) notes...", progress: 0.1)
 
         // Get current chain height to calculate confirmations
-        let chainHeight = scanner.currentChainHeight
+        // IMPORTANT: Use multiple sources to avoid 0 chain height bug
+        // Priority: scanner > NetworkManager > lastScannedHeight
+        var chainHeight = scanner.currentChainHeight
+        if chainHeight == 0 {
+            chainHeight = UInt64(NetworkManager.shared.chainHeight)
+        }
+        if chainHeight == 0 {
+            // Fallback to last scanned height from database
+            chainHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        }
+        print("📊 Balance calculation using chainHeight: \(chainHeight)")
 
         var totalBalance: UInt64 = 0
         var pendingBalance: UInt64 = 0
@@ -940,6 +957,90 @@ final class WalletManager: ObservableObject {
         // Refresh balance after scan
         try await refreshBalance()
         print("✅ Full rescan complete")
+    }
+
+    /// Repair notes with corrupted nullifiers
+    /// This deletes notes received after the bundled tree height and rescans to rediscover them
+    /// with correct positions and nullifiers
+    /// - Parameter onProgress: Callback with (progress, currentHeight, maxHeight)
+    func repairNotesAfterBundledTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+        guard isWalletCreated else {
+            throw WalletError.walletNotCreated
+        }
+
+        let bundledTreeHeight: UInt64 = 2926122
+
+        // Get spending key
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // SECURITY: Key retrieved - not logged
+
+        // Ensure database is open
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        try WalletDatabase.shared.open(encryptionKey: dbKey)
+        print("📂 Database opened for repair")
+
+        // Get account ID
+        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+            print("❌ No account found in database")
+            throw WalletError.walletNotCreated
+        }
+        print("👤 Account ID: \(account.id)")
+
+        // Delete notes received AFTER bundled tree height
+        // These notes may have corrupted nullifiers due to wrong position calculation
+        let deletedCount = try WalletDatabase.shared.deleteNotesAfterHeight(bundledTreeHeight)
+        print("🗑️ Deleted \(deletedCount) notes after height \(bundledTreeHeight)")
+
+        // Clear tree state so it gets rebuilt from bundled CMUs
+        try WalletDatabase.shared.clearTreeState()
+        print("🌳 Cleared tree state")
+
+        // Update last scanned height to bundled tree height so scan resumes from there
+        try WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+        print("📝 Set last scanned height to \(bundledTreeHeight)")
+
+        // Ensure network connection
+        print("📡 Ensuring network connection...")
+        if !NetworkManager.shared.isConnected {
+            try await NetworkManager.shared.connect()
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+        }
+        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+
+        // Wait for any existing scan to complete
+        if FilterScanner.isScanInProgress {
+            print("⏳ Waiting for existing scan to complete...")
+            var waitCount = 0
+            while FilterScanner.isScanInProgress && waitCount < 60 {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                waitCount += 1
+            }
+        }
+
+        // Clear the in-memory tree and reload from bundled CMUs
+        // CRITICAL: Reset isTreeLoaded flag so preloadCommitmentTree() actually reloads
+        // Without this, preloadCommitmentTree() returns immediately because isTreeLoaded is true
+        await MainActor.run {
+            self.isTreeLoaded = false
+            self.treeLoadProgress = 0.0
+            self.treeLoadStatus = ""
+        }
+        // Also clear the FFI tree to ensure fresh start
+        _ = ZipherXFFI.treeInit()
+        print("🌳 Reloading commitment tree from bundled data...")
+        await preloadCommitmentTree()
+
+        // Scan from bundledTreeHeight + 1 to current chain tip
+        // This uses sequential mode which properly calculates positions
+        let scanner = FilterScanner()
+        scanner.onProgress = onProgress
+
+        print("🔄 Starting repair scan from height \(bundledTreeHeight + 1)...")
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: bundledTreeHeight + 1)
+
+        // Refresh balance
+        try await refreshBalance()
+        print("✅ Note repair complete - nullifiers recalculated with correct positions")
     }
 
     /// Rebuild witnesses from bundled tree height
@@ -1506,6 +1607,7 @@ final class WalletManager: ObservableObject {
     private func loadWalletState() {
         let defaults = UserDefaults.standard
         isWalletCreated = defaults.bool(forKey: "wallet_created")
+        isImportedWallet = defaults.bool(forKey: "wallet_imported")
         zAddress = defaults.string(forKey: "z_address") ?? ""
 
         // Load balance from database on startup (async)
@@ -1562,6 +1664,7 @@ final class WalletManager: ObservableObject {
     private func saveWalletState() {
         let defaults = UserDefaults.standard
         defaults.set(isWalletCreated, forKey: "wallet_created")
+        defaults.set(isImportedWallet, forKey: "wallet_imported")
         defaults.set(zAddress, forKey: "z_address")
     }
 
@@ -1605,41 +1708,88 @@ final class WalletManager: ObservableObject {
 
         // Check if it's Bech32 format (secret-extended-key-main1...)
         if cleanKey.hasPrefix("secret-extended-key-main") {
+            print("🔑 Detected Bech32 format, decoding...")
             guard let keyData = ZipherXFFI.decodeSpendingKey(cleanKey) else {
-                // Key decode failed
-                throw WalletError.invalidSeed
+                print("❌ Failed to decode Bech32 spending key")
+                throw WalletError.invalidAddress("Failed to decode Bech32 key. Please check it's a valid secret-extended-key-main1... format.")
             }
             spendingKey = keyData
-            // SECURITY: Key decoded - not logged
+            print("✓ Bech32 key decoded, \(keyData.count) bytes")
         }
         // Legacy hex format (338 chars)
         else if cleanKey.count == 338 {
+            print("🔑 Detected hex format, parsing...")
             guard let keyData = Data(hexString: cleanKey) else {
                 print("❌ Failed to parse hex string")
-                throw WalletError.invalidSeed
+                throw WalletError.invalidAddress("Failed to parse hex key. Please ensure it contains only valid hex characters (0-9, a-f).")
             }
             spendingKey = keyData
-            // SECURITY: Key decoded - not logged
+            print("✓ Hex key parsed, \(keyData.count) bytes")
         }
         else {
-            print("❌ Invalid key format: expected Bech32 (secret-extended-key-main1...) or hex (338 chars)")
-            throw WalletError.invalidSeed
+            print("❌ Invalid key format: got \(cleanKey.count) chars, expected Bech32 (secret-extended-key-main1...) or hex (338 chars)")
+            throw WalletError.invalidAddress("Invalid key format. Expected: Bech32 key (secret-extended-key-main1...) or 338-character hex key. Got \(cleanKey.count) characters.")
+        }
+
+        // Verify key size
+        guard spendingKey.count == 169 else {
+            print("❌ Invalid spending key size: \(spendingKey.count) bytes, expected 169")
+            throw WalletError.invalidAddress("Invalid key size: \(spendingKey.count) bytes, expected 169 bytes.")
         }
 
         // Store in secure storage
-        try secureStorage.storeSpendingKey(spendingKey)
+        print("🔑 Storing key in secure storage...")
+        do {
+            try secureStorage.storeSpendingKey(spendingKey)
+            print("✓ Key stored successfully")
+        } catch {
+            print("❌ Failed to store key: \(error.localizedDescription)")
+            throw WalletError.secureEnclaveError("Failed to store key: \(error.localizedDescription)")
+        }
 
         // Derive z-address
-        let address = try deriveZAddress(from: spendingKey)
+        print("🔑 Deriving z-address...")
+        let address: String
+        do {
+            address = try deriveZAddress(from: spendingKey)
+            print("✓ Address derived: \(address.prefix(20))...")
+        } catch {
+            print("❌ Failed to derive address: \(error.localizedDescription)")
+            // Clean up stored key since we couldn't complete the import
+            try? secureStorage.deleteSpendingKey()
+            throw WalletError.invalidAddress("Failed to derive z-address from key: \(error.localizedDescription)")
+        }
 
-        // Update state
+        // CRITICAL: Reset database state for imported wallet
+        // This ensures we scan from Sapling activation to find historical notes
+        print("🗑️ Resetting database state for imported wallet...")
+
+        // Open database with new key FIRST (required before any database operations)
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        do {
+            try WalletDatabase.shared.open(encryptionKey: dbKey)
+            print("✅ Database opened with new key")
+        } catch {
+            print("⚠️ Failed to open database: \(error)")
+        }
+
+        // Now reset all data
+        try? resetDatabaseForNewWallet()
+
+        // Reset tree state in FFI memory as well
+        isTreeLoaded = false
+        treeLoadProgress = 0.0
+        treeLoadStatus = ""
+
+        // Update state - mark as imported wallet (may have historical notes)
         DispatchQueue.main.async {
             self.zAddress = address
             self.isWalletCreated = true
+            self.isImportedWallet = true  // Important: triggers historical note scanning
             self.saveWalletState()
         }
 
-        print("✅ Key imported successfully")
+        print("✅ Key imported successfully (will scan for historical notes)")
     }
 }
 

@@ -7,6 +7,7 @@ struct WalletSetupView: View {
 
     @State private var showCreateWallet = false
     @State private var showImportKey = false
+    @State private var showImportWarning = false
     @State private var mnemonic: [String] = []
     @State private var showMnemonicBackup = false
     @State private var privateKeyInput = ""
@@ -57,7 +58,7 @@ struct WalletSetupView: View {
                         .disabled(isProcessing)
 
                         System7Button(title: "Import Private Key") {
-                            showImportKey = true
+                            showImportWarning = true
                         }
                         .disabled(isProcessing)
                     }
@@ -69,6 +70,9 @@ struct WalletSetupView: View {
         }
         .sheet(isPresented: $showMnemonicBackup) {
             mnemonicBackupView
+        }
+        .sheet(isPresented: $showImportWarning) {
+            importWarningView
         }
         .sheet(isPresented: $showImportKey) {
             importKeyView
@@ -167,8 +171,138 @@ struct WalletSetupView: View {
                 .padding()
             }
             .background(System7Theme.lightGray)
+            #if os(iOS)
             .navigationBarHidden(true)
+            #endif
         }
+    }
+
+    // MARK: - Import Warning View (Cypherpunk Privacy Notice)
+
+    private var importWarningView: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Header with skull icon
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+
+                    Text("PRIVACY WARNING")
+                        .font(System7Theme.titleFont(size: 16))
+                        .foregroundColor(System7Theme.black)
+                }
+                .padding(.top, 24)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        // Cypherpunk manifesto quote
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\"Privacy is necessary for an open society in the electronic age.\"")
+                                .font(System7Theme.bodyFont(size: 11))
+                                .italic()
+                                .foregroundColor(System7Theme.darkGray)
+
+                            Text("— A Cypherpunk's Manifesto, 1993")
+                                .font(System7Theme.bodyFont(size: 9))
+                                .foregroundColor(System7Theme.darkGray)
+                        }
+                        .padding()
+                        .background(Color.black.opacity(0.05))
+                        .overlay(
+                            Rectangle()
+                                .stroke(System7Theme.darkGray, lineWidth: 1)
+                        )
+
+                        // Privacy implications
+                        warningSection(
+                            title: "Address Reuse Degrades Privacy",
+                            icon: "eye.slash",
+                            content: "Importing a key that has been used elsewhere may reduce your privacy. Each transaction from a reused address can be linked together by blockchain observers."
+                        )
+
+                        // Historical scan warning
+                        warningSection(
+                            title: "Historical Scan Required",
+                            icon: "clock.arrow.circlepath",
+                            content: "To find all your previous transactions, the wallet needs to scan the blockchain history. A quick scan of recent blocks (~10,000) takes about 2-5 minutes. Older transactions may require a full historical scan (30-60 minutes)."
+                        )
+
+                        // Key security
+                        warningSection(
+                            title: "Key Security",
+                            icon: "key.fill",
+                            content: "Never import a key from an untrusted source. If anyone else has seen your private key, they can spend your funds. Your key is your sole proof of ownership."
+                        )
+
+                        // Fast start info
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Image(systemName: "bolt.fill")
+                                    .foregroundColor(.blue)
+                                Text("Fast Start Mode")
+                                    .font(System7Theme.titleFont(size: 11))
+                            }
+
+                            Text("By default, ZipherX scans only recent blocks for fast wallet setup. If your notes are older than ~17 days, use Settings → Quick Scan or Full Rescan to find them.")
+                                .font(System7Theme.bodyFont(size: 10))
+                                .foregroundColor(System7Theme.darkGray)
+                        }
+                        .padding()
+                        .background(Color.blue.opacity(0.1))
+                        .overlay(
+                            Rectangle()
+                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                        )
+                    }
+                    .padding()
+                }
+
+                // Action buttons
+                VStack(spacing: 12) {
+                    System7Button(title: "I Understand, Continue") {
+                        showImportWarning = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            showImportKey = true
+                        }
+                    }
+
+                    Button("Cancel") {
+                        showImportWarning = false
+                    }
+                    .font(System7Theme.bodyFont(size: 11))
+                    .foregroundColor(System7Theme.darkGray)
+                }
+                .padding()
+                .background(System7Theme.lightGray)
+            }
+            .background(System7Theme.lightGray)
+            #if os(iOS)
+            .navigationBarHidden(true)
+            #endif
+        }
+    }
+
+    private func warningSection(title: String, icon: String, content: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(.orange)
+                Text(title)
+                    .font(System7Theme.titleFont(size: 11))
+            }
+
+            Text(content)
+                .font(System7Theme.bodyFont(size: 10))
+                .foregroundColor(System7Theme.darkGray)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding()
+        .background(Color.orange.opacity(0.1))
+        .overlay(
+            Rectangle()
+                .stroke(Color.orange.opacity(0.5), lineWidth: 1)
+        )
     }
 
     // MARK: - Import Key View
@@ -180,7 +314,7 @@ struct WalletSetupView: View {
                     .font(System7Theme.titleFont(size: 14))
                     .padding(.top)
 
-                Text("Enter your 64-character hex private key.")
+                Text("Enter your Bech32 private key (secret-extended-key-main1...) or 338-character hex key.")
                     .font(System7Theme.bodyFont(size: 10))
                     .foregroundColor(System7Theme.darkGray)
                     .multilineTextAlignment(.center)
@@ -198,12 +332,13 @@ struct WalletSetupView: View {
                     )
                     .padding(.horizontal)
 
-                // Character count - support both 64-char hex and Bech32 format
+                // Character count - support both 338-char hex and Bech32 format
                 let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
                 let charCount = cleanInput.count
                 let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
-                let isValidLength = charCount == 64 || (isBech32 && charCount > 100)
-                Text(isBech32 ? "Bech32 format detected" : "\(charCount)/64 characters")
+                // 169 bytes = 338 hex chars, or Bech32 format (typically ~280 chars)
+                let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
+                Text(isBech32 ? "Bech32 format detected ✓" : (charCount == 338 ? "Hex format detected ✓" : "\(charCount)/338 characters"))
                     .font(System7Theme.bodyFont(size: 9))
                     .foregroundColor(isValidLength ? .green : System7Theme.darkGray)
 
@@ -224,7 +359,9 @@ struct WalletSetupView: View {
                 .padding()
             }
             .background(System7Theme.lightGray)
+            #if os(iOS)
             .navigationBarHidden(true)
+            #endif
         }
     }
 

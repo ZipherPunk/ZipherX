@@ -8,15 +8,15 @@ final class NetworkManager: ObservableObject {
     static let shared = NetworkManager()
 
     // MARK: - Constants
-    private let MIN_PEERS = 3
-    private let MAX_PEERS = 20
-    private let TARGET_PEER_PERCENT = 0.10 // Connect to 10% of known addresses
+    private let MIN_PEERS = 8  // Increased from 3 for better reliability
+    private let MAX_PEERS = 30  // Increased from 20
+    private let TARGET_PEER_PERCENT = 0.15 // Connect to 15% of known addresses
     private let CONSENSUS_THRESHOLD = 2 // SECURITY: Require at least 2 peers to agree
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
-    private let BAN_DURATION: TimeInterval = 86400 // 24 hours
+    private let BAN_DURATION: TimeInterval = 3600 // 1 hour (was 24 hours - too aggressive)
     private let MAX_KNOWN_ADDRESSES = 1000
-    private let GETADDR_INTERVAL: TimeInterval = 60 // Request addresses every minute initially
+    private let GETADDR_INTERVAL: TimeInterval = 30 // Request addresses every 30 seconds
 
     // MARK: - Published Properties
     @Published private(set) var connectedPeers: Int = 0
@@ -30,6 +30,7 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var zclPriceUSD: Double = 0.0
     @Published private(set) var lastBlockTxCount: Int = 0
     @Published private(set) var networkDifficulty: Double = 0.0
+    @Published private(set) var bannedPeersCount: Int = 0
 
     // MARK: - Private Properties
     internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
@@ -40,6 +41,8 @@ final class NetworkManager: ObservableObject {
     }
     private var peerRotationTimer: Timer?
     private var addressDiscoveryTimer: Timer?
+    private var statsRefreshTimer: Timer?
+    private let STATS_REFRESH_INTERVAL: TimeInterval = 30 // Refresh chain height every 30 seconds
     private let queue = DispatchQueue(label: "com.zipherx.network", qos: .userInitiated)
 
     // Address Manager
@@ -81,6 +84,7 @@ final class NetworkManager: ObservableObject {
     private init() {
         setupPeerRotation()
         setupAddressDiscovery()
+        setupStatsRefresh()
         loadPersistedAddresses()
     }
 
@@ -142,8 +146,6 @@ final class NetworkManager: ObservableObject {
     /// Ban a peer
     private func banPeer(_ peer: Peer, reason: BanReason) {
         addressLock.lock()
-        defer { addressLock.unlock() }
-
         let ban = BannedPeer(
             address: peer.host,
             banTime: Date(),
@@ -151,12 +153,19 @@ final class NetworkManager: ObservableObject {
             reason: reason
         )
         bannedPeers[peer.host] = ban
+        let newCount = bannedPeers.count
 
         // Remove from known good addresses
         let key = "\(peer.host):\(peer.port)"
         knownAddresses.removeValue(forKey: key)
         triedAddresses.remove(key)
         newAddresses.remove(key)
+        addressLock.unlock()
+
+        // Update published count on main thread
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
+        }
 
         print("🚫 Banned peer \(peer.host): \(reason.rawValue)")
     }
@@ -164,8 +173,6 @@ final class NetworkManager: ObservableObject {
     /// Ban a peer by address (for connection failures)
     private func banAddress(_ host: String, port: UInt16, reason: BanReason) {
         addressLock.lock()
-        defer { addressLock.unlock() }
-
         let ban = BannedPeer(
             address: host,
             banTime: Date(),
@@ -173,12 +180,19 @@ final class NetworkManager: ObservableObject {
             reason: reason
         )
         bannedPeers[host] = ban
+        let newCount = bannedPeers.count
 
         // Remove from known good addresses
         let key = "\(host):\(port)"
         knownAddresses.removeValue(forKey: key)
         triedAddresses.remove(key)
         newAddresses.remove(key)
+        addressLock.unlock()
+
+        // Update published count on main thread
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
+        }
 
         print("🚫 Banned address \(host): \(reason.rawValue)")
     }
@@ -186,33 +200,49 @@ final class NetworkManager: ObservableObject {
     /// Get list of all currently banned peers
     func getBannedPeers() -> [BannedPeer] {
         addressLock.lock()
-        defer { addressLock.unlock() }
 
         // Clean up expired bans first
-        let now = Date()
         bannedPeers = bannedPeers.filter { !$0.value.isExpired }
+        let result = Array(bannedPeers.values).sorted { $0.banTime > $1.banTime }
+        let newCount = bannedPeers.count
+        addressLock.unlock()
 
-        return Array(bannedPeers.values).sorted { $0.banTime > $1.banTime }
+        // Update published count on main thread
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
+        }
+
+        return result
     }
 
     /// Unban a specific peer by address
     func unbanPeer(address: String) {
         addressLock.lock()
-        defer { addressLock.unlock() }
+        let removed = bannedPeers.removeValue(forKey: address) != nil
+        let newCount = bannedPeers.count
+        addressLock.unlock()
 
-        if bannedPeers.removeValue(forKey: address) != nil {
+        if removed {
             print("✅ Unbanned peer: \(address)")
+            // Update published count on main thread
+            DispatchQueue.main.async {
+                self.bannedPeersCount = newCount
+            }
         }
     }
 
     /// Unban all peers
     func unbanAllPeers() {
         addressLock.lock()
-        defer { addressLock.unlock() }
-
         let count = bannedPeers.count
         bannedPeers.removeAll()
+        addressLock.unlock()
+
         print("✅ Unbanned all \(count) peers")
+        // Update published count on main thread
+        DispatchQueue.main.async {
+            self.bannedPeersCount = 0
+        }
     }
 
     /// Calculate target number of peers based on known addresses
@@ -290,6 +320,35 @@ final class NetworkManager: ObservableObject {
             Task {
                 await self?.discoverMoreAddresses()
             }
+        }
+    }
+
+    private func setupStatsRefresh() {
+        statsRefreshTimer = Timer.scheduledTimer(withTimeInterval: STATS_REFRESH_INTERVAL, repeats: true) { [weak self] _ in
+            Task {
+                await self?.refreshChainHeight()
+            }
+        }
+    }
+
+    /// Refresh chain height from InsightAPI (called periodically)
+    private func refreshChainHeight() async {
+        guard isConnected else { return }
+
+        do {
+            let status = try await InsightAPI.shared.getStatus()
+            let newHeight = status.height
+
+            // Only update and log if height changed
+            if newHeight != chainHeight {
+                await MainActor.run {
+                    self.chainHeight = newHeight
+                    print("📊 Chain height updated: \(newHeight)")
+                }
+            }
+        } catch {
+            // Silent failure - not critical
+            print("⚠️ Chain height refresh failed: \(error.localizedDescription)")
         }
     }
 
@@ -835,19 +894,26 @@ final class NetworkManager: ObservableObject {
     typealias BroadcastProgressCallback = (_ phase: String, _ detail: String?, _ progress: Double?) -> Void
 
     /// Broadcast transaction with multi-peer propagation and progress reporting
-    /// P2P ONLY - no InsightAPI fallback (trustless operation)
-    /// Success = at least one peer accepted + mempool confirms (FAST EXIT)
+    /// Primary: P2P broadcast to connected peers
+    /// Fallback: InsightAPI broadcast if no P2P peers available
+    /// Success = at least one peer/API accepted + mempool confirms (FAST EXIT)
     func broadcastTransactionWithProgress(_ rawTx: Data, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
-        guard isConnected else {
-            print("❌ Broadcast failed: not connected to network")
-            throw NetworkError.notConnected
-        }
+        // If no P2P peers, fall back to InsightAPI broadcast
+        if !isConnected || peers.isEmpty {
+            print("⚠️ No P2P peers available, using InsightAPI broadcast...")
+            onProgress?("api", "Broadcasting via API...", 0.3)
 
-        guard !peers.isEmpty else {
-            print("❌ Broadcast failed: no peers available")
-            throw NetworkError.broadcastFailed
+            do {
+                let txid = try await InsightAPI.shared.broadcastTransaction(rawTx)
+                print("✅ InsightAPI broadcast successful: \(txid)")
+                onProgress?("api", "Broadcast successful!", 1.0)
+                return txid
+            } catch {
+                print("❌ InsightAPI broadcast failed: \(error)")
+                throw NetworkError.broadcastFailed
+            }
         }
 
         let peerCount = peers.count
@@ -939,8 +1005,19 @@ final class NetworkManager: ObservableObject {
 
         // Check results
         guard let txId = await state.getTxId() else {
-            print("❌ No peers accepted the transaction")
-            throw NetworkError.broadcastFailed
+            // P2P broadcast failed - fall back to InsightAPI
+            print("⚠️ P2P broadcast failed, trying InsightAPI...")
+            onProgress?("api", "P2P failed, trying API...", 0.5)
+
+            do {
+                let apiTxId = try await InsightAPI.shared.broadcastTransaction(rawTx)
+                print("✅ InsightAPI broadcast successful: \(apiTxId)")
+                onProgress?("api", "Broadcast successful!", 1.0)
+                return apiTxId
+            } catch {
+                print("❌ InsightAPI broadcast also failed: \(error)")
+                throw NetworkError.broadcastFailed
+            }
         }
 
         let successCount = await state.getSuccessCount()
@@ -999,47 +1076,49 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
-        var heights: [UInt64: Int] = [:]
+        // Collect heights from multiple sources and use the HIGHEST
+        // This prevents stale data from any single source blocking sync
+        print("📡 Getting chain height from multiple sources...")
+        var maxHeight: UInt64 = 0
 
-        await withTaskGroup(of: UInt64?.self) { group in
-            for peer in peers {
-                group.addTask {
-                    // Get height from peer's version message or getblockcount
-                    return UInt64(peer.peerStartHeight)
-                }
-            }
-
-            for await result in group {
-                if let height = result, height > 0 {
-                    heights[height, default: 0] += 1
-                }
-            }
+        // 1. Try InsightAPI (usually most up-to-date)
+        if let status = try? await InsightAPI.shared.getStatus() {
+            print("📡 InsightAPI height: \(status.height)")
+            maxHeight = max(maxHeight, status.height)
+        } else {
+            print("⚠️ InsightAPI unavailable")
         }
 
-        // Return highest height with consensus
-        if let (height, count) = heights.max(by: { $0.key < $1.key }),
-           count >= 1 {
-            return height
+        // 2. Check header store (locally synced headers)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            print("📡 HeaderStore height: \(headerHeight)")
+            maxHeight = max(maxHeight, headerHeight)
         }
 
-        // Fallback: If P2P peers don't report valid heights, use InsightAPI
-        print("⚠️ P2P peers did not report chain height, falling back to InsightAPI...")
-        do {
-            let status = try await InsightAPI.shared.getStatus()
-            print("📊 InsightAPI chain height: \(status.height)")
-            return status.height
-        } catch {
-            print("❌ InsightAPI fallback also failed: \(error)")
-
-            // Final fallback: use cached chain height if recent enough
-            // This allows transactions to be built when temporarily offline
-            if chainHeight > 0 {
-                print("⚠️ Using cached chain height: \(chainHeight)")
-                return chainHeight
+        // 3. Check P2P peer heights (from version handshake - may be stale)
+        var peerMaxHeight: UInt64 = 0
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > peerMaxHeight {
+                peerMaxHeight = h
             }
-
-            throw NetworkError.consensusNotReached
         }
+        if peerMaxHeight > 0 {
+            print("📡 P2P peer max height: \(peerMaxHeight)")
+            maxHeight = max(maxHeight, peerMaxHeight)
+        }
+
+        // 4. Use cached chain height as baseline
+        if chainHeight > 0 {
+            maxHeight = max(maxHeight, chainHeight)
+        }
+
+        if maxHeight > 0 {
+            print("📡 Using max chain height: \(maxHeight)")
+            return maxHeight
+        }
+
+        throw NetworkError.consensusNotReached
     }
 
     /// Get compact block filters for transaction detection
