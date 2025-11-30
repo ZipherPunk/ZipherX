@@ -184,6 +184,7 @@ struct WalletSetupView: View {
             .navigationBarHidden(true)
             #endif
         }
+        .navigationViewStyle(.stack)
     }
 
     // MARK: - Import Warning View (Cypherpunk Privacy Notice)
@@ -290,6 +291,7 @@ struct WalletSetupView: View {
             .navigationBarHidden(true)
             #endif
         }
+        .navigationViewStyle(.stack)
     }
 
     private func warningSection(title: String, icon: String, content: String) -> some View {
@@ -372,6 +374,7 @@ struct WalletSetupView: View {
             .navigationBarHidden(true)
             #endif
         }
+        .navigationViewStyle(.stack)
     }
 
     // MARK: - Actions

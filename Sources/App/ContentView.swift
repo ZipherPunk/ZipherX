@@ -519,6 +519,7 @@ struct ContentView: View {
                         }
                     }
             }
+            .navigationViewStyle(.stack)
             #if os(macOS)
             .frame(width: 500, height: 600)
             #endif
@@ -542,6 +543,7 @@ struct ContentView: View {
                         }
                     }
             }
+            .navigationViewStyle(.stack)
             #if os(macOS)
             .frame(width: 480, height: 550)
             #endif
@@ -565,6 +567,7 @@ struct ContentView: View {
                         }
                     }
             }
+            .navigationViewStyle(.stack)
             #if os(macOS)
             .frame(width: 420, height: 520)
             #endif

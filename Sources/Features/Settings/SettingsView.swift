@@ -109,6 +109,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showPINSetup) {
             pinSetupSheet
+                #if os(macOS)
+                .frame(minWidth: 400, idealWidth: 450, minHeight: 350, idealHeight: 400)
+                #endif
         }
         .alert("Full Blockchain Rescan", isPresented: $showRescanWarning) {
             Button("Cancel", role: .cancel) {}
@@ -120,6 +123,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showRescanProgress) {
             rescanProgressView
+                #if os(macOS)
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 300, idealHeight: 350)
+                #endif
         }
         .alert("Quick Scan for Notes", isPresented: $showQuickScan) {
             TextField("Start Height", text: $quickScanHeight)
@@ -1109,6 +1115,7 @@ struct SettingsView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
 
     // MARK: - Debug Section

@@ -1,12 +1,22 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Transaction History View - Displays sent/received transactions
-/// Classic Macintosh System 7 design
+/// Themed design
 struct HistoryView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    @EnvironmentObject var networkManager: NetworkManager
     @State private var transactions: [TransactionHistoryItem] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
     @State private var selectedTransaction: TransactionHistoryItem?
+
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,11 +31,19 @@ struct HistoryView: View {
                 transactionList
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.backgroundColor)
         .onAppear {
             loadTransactions()
         }
         .sheet(item: $selectedTransaction) { transaction in
             TransactionDetailView(transaction: transaction)
+                .environmentObject(themeManager)
+                .environmentObject(networkManager)
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 550, maxWidth: 600,
+                       minHeight: 650, idealHeight: 700, maxHeight: 800)
+                #endif
         }
     }
 
@@ -34,8 +52,8 @@ struct HistoryView: View {
             Spacer()
             ProgressView()
             Text("Loading transactions...")
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textSecondary)
             Spacer()
         }
     }
@@ -45,10 +63,10 @@ struct HistoryView: View {
             Spacer()
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 32))
-                .foregroundColor(System7Theme.darkGray)
+                .foregroundColor(theme.textSecondary)
             Text(message)
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
             Spacer()
@@ -60,13 +78,13 @@ struct HistoryView: View {
             Spacer()
             Image(systemName: "doc.text")
                 .font(.system(size: 32))
-                .foregroundColor(System7Theme.darkGray)
+                .foregroundColor(theme.textSecondary)
             Text("No transactions yet")
-                .font(System7Theme.bodyFont(size: 12))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textSecondary)
             Text("Transactions will appear here\nafter syncing")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .multilineTextAlignment(.center)
             Spacer()
         }
@@ -84,7 +102,7 @@ struct HistoryView: View {
             }
             .padding(.vertical, 1)
         }
-        .background(System7Theme.darkGray)
+        .background(theme.borderColor)
     }
 
     private func transactionRow(_ transaction: TransactionHistoryItem) -> some View {
@@ -93,7 +111,7 @@ struct HistoryView: View {
             VStack {
                 Image(systemName: transaction.type == .received ? "arrow.down.left" : "arrow.up.right")
                     .font(.system(size: 16))
-                    .foregroundColor(transaction.type == .received ? .green : .red)
+                    .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
             }
             .frame(width: 24)
 
@@ -102,36 +120,36 @@ struct HistoryView: View {
                 // Type and amount
                 HStack {
                     Text(transaction.type == .received ? "Received" : "Sent")
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
 
                     Spacer()
 
                     Text("\(transaction.type == .received ? "+" : "-")\(String(format: "%.8f", transaction.valueInZCL)) ZCL")
-                        .font(System7Theme.titleFont(size: 11))
-                        .foregroundColor(transaction.type == .received ? .green : .red)
+                        .font(theme.titleFont)
+                        .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
                 }
 
                 // Date and height
                 HStack {
                     if let dateString = transaction.dateString {
                         Text(dateString)
-                            .font(System7Theme.bodyFont(size: 9))
-                            .foregroundColor(System7Theme.darkGray)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
                     }
 
                     Spacer()
 
                     Text("Block \(transaction.height)")
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                 }
 
                 // Address preview (if available)
                 if let address = transaction.toAddress {
                     Text(shortenAddress(address))
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                         .lineLimit(1)
                 }
             }
@@ -139,11 +157,11 @@ struct HistoryView: View {
             // Disclosure indicator
             Image(systemName: "chevron.right")
                 .font(.system(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .foregroundColor(theme.textSecondary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
     }
 
     // MARK: - Actions
@@ -192,171 +210,337 @@ struct HistoryView: View {
 // MARK: - Transaction Detail View
 
 struct TransactionDetailView: View {
-    let transaction: TransactionHistoryItem
+    @EnvironmentObject var themeManager: ThemeManager
+    @EnvironmentObject var networkManager: NetworkManager
     @Environment(\.dismiss) private var dismiss
 
+    let transaction: TransactionHistoryItem
+
+    @State private var showCopied = false
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Title bar
-            HStack {
-                Button(action: { dismiss() }) {
-                    Text("Done")
-                        .font(System7Theme.bodyFont(size: 12))
-                        .foregroundColor(System7Theme.black)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(System7Theme.white)
-                        .overlay(
-                            Rectangle()
-                                .stroke(System7Theme.black, lineWidth: 1)
-                        )
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                Text("Transaction Details")
-                    .font(System7Theme.titleFont(size: 14))
-                    .foregroundColor(System7Theme.black)
-
-                Spacer()
-
-                Color.clear.frame(width: 50, height: 24)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(System7Theme.lightGray)
-            .overlay(
-                Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
-            )
-
-            // Content
+        NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
+                    // Transaction type header
+                    transactionHeader
+
                     // Amount card
                     amountCard
 
                     // Details card
                     detailsCard
 
+                    // Txid with copy button
+                    txidCard
+
                     // Memo card
                     if let memo = transaction.memo, !memo.isEmpty {
                         memoCard(memo)
                     }
+
+                    Spacer()
                 }
                 .padding()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.backgroundColor)
+            .navigationTitle("Transaction Details")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .foregroundColor(theme.primaryColor)
+                }
+            }
+            .overlay(
+                copiedToast
+            )
         }
-        .background(System7Theme.lightGray)
+        .navigationViewStyle(.stack)
+        #if os(macOS)
+        .frame(minWidth: 500, minHeight: 600)
+        #endif
+    }
+
+    private var transactionHeader: some View {
+        VStack(spacing: 8) {
+            // Large icon
+            Image(systemName: transaction.type == .received ? "arrow.down.left.circle.fill" : "arrow.up.right.circle.fill")
+                .font(.system(size: 48))
+                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+
+            Text(transaction.type == .received ? "Received" : "Sent")
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
+
+            // Confirmations
+            if let confirmations = calculateConfirmations() {
+                HStack(spacing: 4) {
+                    Image(systemName: confirmations >= 6 ? "checkmark.shield.fill" : "clock")
+                        .font(.system(size: 10))
+                    Text(confirmations >= 6 ? "Confirmed (\(confirmations))" : "\(confirmations) confirmation\(confirmations == 1 ? "" : "s")")
+                        .font(theme.captionFont)
+                }
+                .foregroundColor(confirmations >= 6 ? theme.successColor : theme.warningColor)
+            }
+        }
+        .padding()
     }
 
     private var amountCard: some View {
         VStack(spacing: 8) {
-            // Type icon
-            Image(systemName: transaction.type == .received ? "arrow.down.left.circle.fill" : "arrow.up.right.circle.fill")
-                .font(.system(size: 40))
-                .foregroundColor(transaction.type == .received ? .green : .red)
-
-            // Amount
-            Text("\(transaction.type == .received ? "+" : "-")\(String(format: "%.8f", transaction.valueInZCL)) ZCL")
-                .font(System7Theme.titleFont(size: 20))
-                .foregroundColor(System7Theme.black)
-
-            // Type label
-            Text(transaction.type == .received ? "Received" : "Sent")
-                .font(System7Theme.bodyFont(size: 12))
-                .foregroundColor(System7Theme.darkGray)
+            Text(transaction.type == .received ? "+" : "-")
+                .font(.system(size: 14))
+                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+            +
+            Text(String(format: "%.8f", transaction.valueInZCL))
+                .font(.system(size: 28, weight: .bold, design: .monospaced))
+                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+            +
+            Text(" ZCL")
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textSecondary)
         }
-        .padding(16)
+        .padding()
         .frame(maxWidth: .infinity)
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
 
     private var detailsCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Date
-            if let dateString = transaction.dateString {
-                detailRow("Date:", dateString)
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Details")
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
+
+            Divider()
+                .background(theme.borderColor)
 
             // Block height
-            detailRow("Block:", "\(transaction.height)")
+            detailRow("Block Height", "\(transaction.height)")
+
+            // Date/Time
+            if let dateString = transaction.dateString {
+                detailRow("Date", dateString)
+            } else {
+                detailRow("Date", estimatedDateString(for: transaction.height))
+            }
+
+            // Value in zatoshis
+            detailRow("Amount (zatoshis)", "\(transaction.value)")
 
             // Fee (if sent)
             if transaction.type == .sent, let fee = transaction.feeInZCL {
-                detailRow("Fee:", "\(String(format: "%.8f", fee)) ZCL")
+                detailRow("Fee", "\(String(format: "%.8f", fee)) ZCL")
             }
 
             // Address (if available)
             if let address = transaction.toAddress {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("To Address:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                    Text("To Address")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                     Text(address)
-                        .font(System7Theme.monoFont(size: 9))
-                        .foregroundColor(System7Theme.black)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
                         .textSelection(.enabled)
                 }
                 .padding(.top, 4)
             }
-
-            // Transaction ID
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Transaction ID:")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
-                Text(transaction.txidString)
-                    .font(System7Theme.monoFont(size: 8))
-                    .foregroundColor(System7Theme.black)
-                    .textSelection(.enabled)
-                    .lineLimit(2)
-            }
-            .padding(.top, 4)
         }
-        .padding(12)
+        .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
+    }
+
+    private var txidCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Transaction ID")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+
+                Spacer()
+
+                Button(action: copyTxid) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 12))
+                        Text("Copy")
+                            .font(theme.captionFont)
+                    }
+                    .foregroundColor(theme.primaryColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(theme.buttonBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                    )
+                    .cornerRadius(theme.cornerRadius)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+
+            Divider()
+                .background(theme.borderColor)
+
+            // Full txid (scrollable if needed)
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(transaction.txidString)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                    .textSelection(.enabled)
+            }
+
+            // Explorer link hint
+            Text("Tap and hold to select, or use Copy button")
+                .font(.system(size: 9))
+                .foregroundColor(theme.textSecondary)
+                .italic()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.surfaceColor)
+        .overlay(
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+        )
+        .cornerRadius(theme.cornerRadius)
     }
 
     private func memoCard(_ memo: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Memo:")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+            Text("Memo")
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
+
+            Divider()
+                .background(theme.borderColor)
 
             Text(memo)
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.black)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textPrimary)
                 .textSelection(.enabled)
         }
-        .padding(12)
+        .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
+
+    private var copiedToast: some View {
+        Group {
+            if showCopied {
+                VStack {
+                    Spacer()
+
+                    Text("Txid Copied!")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(theme.surfaceColor)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: 2)
+                        )
+                        .cornerRadius(theme.cornerRadius)
+                        .shadow(color: theme.shadowColor, radius: theme.usesShadows ? 5 : 0)
+
+                    Spacer()
+                        .frame(height: 40)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: showCopied)
+    }
+
+    // MARK: - Helper Functions
 
     private func detailRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label)
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
             Spacer()
             Text(value)
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.black)
+                .font(theme.monoFont)
+                .foregroundColor(theme.textPrimary)
+        }
+    }
+
+    private func calculateConfirmations() -> Int? {
+        let chainHeight = networkManager.chainHeight
+        guard chainHeight > 0 && transaction.height > 0 else { return nil }
+        let confirmations = Int(chainHeight) - Int(transaction.height) + 1
+        return max(0, confirmations)
+    }
+
+    private func estimatedDateString(for height: UInt64) -> String {
+        let currentHeight = networkManager.chainHeight
+        let currentDate = Date()
+
+        if currentHeight == 0 {
+            let referenceHeight: UInt64 = 2_926_100
+            let referenceDate = Date(timeIntervalSince1970: 1732881600)
+            let blockDifference = Int64(height) - Int64(referenceHeight)
+            let secondsDifference = Double(blockDifference) * 150.0
+            let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+
+            let formatter = DateFormatter()
+            formatter.dateStyle = .short
+            formatter.timeStyle = .short
+            return formatter.string(from: estimatedDate)
+        }
+
+        let blockDifference = Int64(height) - Int64(currentHeight)
+        let secondsDifference = Double(blockDifference) * 150.0
+        let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: estimatedDate)
+    }
+
+    private func copyTxid() {
+        #if os(iOS)
+        UIPasteboard.general.string = transaction.txidString
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(transaction.txidString, forType: .string)
+        #endif
+
+        withAnimation {
+            showCopied = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            withAnimation {
+                showCopied = false
+            }
         }
     }
 }
@@ -369,4 +553,6 @@ extension TransactionHistoryItem: Identifiable {
 
 #Preview {
     HistoryView()
+        .environmentObject(ThemeManager.shared)
+        .environmentObject(NetworkManager.shared)
 }
