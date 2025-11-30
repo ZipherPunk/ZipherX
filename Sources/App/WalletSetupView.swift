@@ -70,12 +70,21 @@ struct WalletSetupView: View {
         }
         .sheet(isPresented: $showMnemonicBackup) {
             mnemonicBackupView
+                #if os(macOS)
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 500, idealHeight: 550)
+                #endif
         }
         .sheet(isPresented: $showImportWarning) {
             importWarningView
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 550, minHeight: 600, idealHeight: 700)
+                #endif
         }
         .sheet(isPresented: $showImportKey) {
             importKeyView
+                #if os(macOS)
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 450)
+                #endif
         }
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
