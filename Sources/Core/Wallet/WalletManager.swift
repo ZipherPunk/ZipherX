@@ -567,57 +567,83 @@ final class WalletManager: ObservableObject {
             throw error
         }
 
-        // Task 3: Sync block headers
+        // Task 3: Sync block headers (with retry logic for peer timing issues)
         await updateTask("headers", status: .inProgress)
-        do {
-            print("📥 Opening header store...")
-            try HeaderStore.shared.open()
 
-            print("🔄 Starting header sync...")
-            let headerSync = HeaderSyncManager(
-                headerStore: HeaderStore.shared,
-                networkManager: NetworkManager.shared
-            )
+        let maxHeaderRetries = 3
+        var headerSyncSuccess = false
+        var lastHeaderError: Error?
 
-            // Track progress
-            headerSync.onProgress = { [weak self] progress in
-                Task { @MainActor in
-                    if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
-                        self?.syncTasks[index].detail = "\(progress.currentHeight) / \(progress.totalHeight)"
-                        // Calculate progress percentage (0.0 to 1.0)
-                        let progressPercentage = progress.totalHeight > 0
-                            ? Double(progress.currentHeight) / Double(progress.totalHeight)
-                            : 0.0
-                        self?.syncTasks[index].progress = progressPercentage
+        for attempt in 1...maxHeaderRetries {
+            do {
+                if attempt > 1 {
+                    print("🔄 Header sync retry attempt \(attempt)/\(maxHeaderRetries)...")
+                    await updateTask("headers", status: .inProgress, detail: "Retry \(attempt)/\(maxHeaderRetries)")
+                    // Wait for peers to be more ready
+                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                }
+
+                print("📥 Opening header store...")
+                try HeaderStore.shared.open()
+
+                print("🔄 Starting header sync...")
+                let headerSync = HeaderSyncManager(
+                    headerStore: HeaderStore.shared,
+                    networkManager: NetworkManager.shared
+                )
+
+                // Track progress
+                headerSync.onProgress = { [weak self] progress in
+                    Task { @MainActor in
+                        if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                            self?.syncTasks[index].detail = "\(progress.currentHeight) / \(progress.totalHeight)"
+                            // Calculate progress percentage (0.0 to 1.0)
+                            let progressPercentage = progress.totalHeight > 0
+                                ? Double(progress.currentHeight) / Double(progress.totalHeight)
+                                : 0.0
+                            self?.syncTasks[index].progress = progressPercentage
+                        }
                     }
                 }
+
+                // Get starting height for sync
+                // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
+                // The getheaders protocol returns headers AFTER the locator hash
+                // Checkpoint at bundledTreeHeight (2923123) will be used as locator
+                let bundledTreeHeight: UInt64 = 2926122
+                let startHeight: UInt64
+                if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
+                    // Resume from where we left off
+                    startHeight = latestHeight + 1
+                    print("📊 Resuming header sync from height \(startHeight)")
+                } else {
+                    // Start from bundledTreeHeight + 1 (checkpoint at bundledTreeHeight used as locator)
+                    startHeight = bundledTreeHeight + 1
+                    print("📊 Starting header sync from height \(startHeight) (checkpoint at \(bundledTreeHeight))")
+                }
+
+                try await headerSync.syncHeaders(from: startHeight)
+
+                let stats = try HeaderStore.shared.getStats()
+                print("✅ Header sync complete! Stored \(stats.count) headers (latest: \(stats.latestHeight ?? 0))")
+
+                await updateTask("headers", status: .completed)
+                headerSyncSuccess = true
+                break // Success - exit retry loop
+
+            } catch {
+                lastHeaderError = error
+                print("⚠️ Header sync attempt \(attempt) failed: \(error.localizedDescription)")
+
+                if attempt == maxHeaderRetries {
+                    // Final attempt failed - mark as failed
+                    await updateTask("headers", status: .failed(error.localizedDescription))
+                }
             }
+        }
 
-            // Get starting height for sync
-            // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
-            // The getheaders protocol returns headers AFTER the locator hash
-            // Checkpoint at bundledTreeHeight (2923123) will be used as locator
-            let bundledTreeHeight: UInt64 = 2926122
-            let startHeight: UInt64
-            if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
-                // Resume from where we left off
-                startHeight = latestHeight + 1
-                print("📊 Resuming header sync from height \(startHeight)")
-            } else {
-                // Start from bundledTreeHeight + 1 (checkpoint at bundledTreeHeight used as locator)
-                startHeight = bundledTreeHeight + 1
-                print("📊 Starting header sync from height \(startHeight) (checkpoint at \(bundledTreeHeight))")
-            }
-
-            try await headerSync.syncHeaders(from: startHeight)
-
-            let stats = try HeaderStore.shared.getStats()
-            print("✅ Header sync complete! Stored \(stats.count) headers (latest: \(stats.latestHeight ?? 0))")
-
-            await updateTask("headers", status: .completed)
-        } catch {
-            print("⚠️ Header sync failed: \(error.localizedDescription)")
-            await updateTask("headers", status: .failed(error.localizedDescription))
+        if !headerSyncSuccess {
+            print("⚠️ Header sync failed after \(maxHeaderRetries) attempts: \(lastHeaderError?.localizedDescription ?? "unknown")")
             // Continue anyway - transactions will fail if headers aren't synced
             // but user can still see the error and try again
         }
