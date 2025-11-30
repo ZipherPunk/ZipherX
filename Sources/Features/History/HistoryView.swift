@@ -263,7 +263,9 @@ struct TransactionDetailView: View {
                 copiedToast
             )
         }
+        #if os(iOS)
         .navigationViewStyle(.stack)
+        #endif
         #if os(macOS)
         .frame(minWidth: 500, minHeight: 600)
         #endif

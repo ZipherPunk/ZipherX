@@ -1115,7 +1115,9 @@ struct SettingsView: View {
                 }
             }
         }
+        #if os(iOS)
         .navigationViewStyle(.stack)
+        #endif
     }
 
     // MARK: - Debug Section
