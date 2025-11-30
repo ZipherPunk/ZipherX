@@ -941,13 +941,29 @@ final class NetworkManager: ObservableObject {
         let state = BroadcastState()
 
         // Broadcast to all peers - but check mempool after FIRST success
+        // Use short timeout (5s) to avoid waiting for slow/dead peers
         try await withThrowingTaskGroup(of: Void.self) { group in
-            // Add broadcast tasks for all peers
+            // Add broadcast tasks for all peers with fast timeout
             for peer in peers {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
-                        let id = try await peer.broadcastTransaction(rawTx)
+                        // 5 second timeout per peer - don't wait for slow handshakes
+                        let id = try await withThrowingTaskGroup(of: String.self) { timeoutGroup in
+                            timeoutGroup.addTask {
+                                try await peer.broadcastTransaction(rawTx)
+                            }
+                            timeoutGroup.addTask {
+                                try await Task.sleep(nanoseconds: 5_000_000_000) // 5s timeout
+                                throw NetworkError.timeout
+                            }
+                            // Return first result (either success or timeout)
+                            guard let result = try await timeoutGroup.next() else {
+                                throw NetworkError.timeout
+                            }
+                            timeoutGroup.cancelAll()
+                            return result
+                        }
                         print("✅ Peer \(peerHost) accepted tx: \(id)")
                         let count = await state.recordSuccess(id)
                         onProgress?("peers", "Accepted by \(count)/\(peerCount) peers", Double(count) / Double(peerCount))
@@ -959,12 +975,17 @@ final class NetworkManager: ObservableObject {
 
             // Add mempool verification task - runs in parallel, exits early on success
             group.addTask {
-                // Wait for at least one peer to accept
-                while await state.getTxId() == nil {
+                // Wait for at least one peer to accept (max 10 seconds, then give up)
+                var waitAttempts = 0
+                while await state.getTxId() == nil && waitAttempts < 100 {
                     try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    waitAttempts += 1
                 }
 
-                guard let txId = await state.getTxId() else { return }
+                guard let txId = await state.getTxId() else {
+                    print("⚠️ No peer accepted transaction within timeout")
+                    return
+                }
 
                 onProgress?("verify", "Checking mempool...", 0.5)
 
