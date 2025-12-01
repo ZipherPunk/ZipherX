@@ -1651,11 +1651,97 @@ return txId                                     // ✅ Only now show success
 
 ---
 
+### 30. Dual-Mode Architecture: Light + Full Node (December 1, 2025)
+
+**Feature**: ZipherX now supports two operating modes on macOS:
+
+1. **Light Mode** (default) - P2P network with bundled commitment tree
+2. **Full Node Mode** - Local zclassicd daemon with complete blockchain
+
+**Architecture**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         ZipherX App                          │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────┐    ┌──────────────────────────────┐│
+│  │   Light Mode        │    │   Full Node Mode             ││
+│  │   (iOS + macOS)     │    │   (macOS only)               ││
+│  │                     │    │                              ││
+│  │  - P2P Network      │    │  - Local zclassicd daemon    ││
+│  │  - Bundled Tree     │    │  - Bootstrap download        ││
+│  │  - ~50MB storage    │    │  - RPC communication         ││
+│  │  - Fast startup     │    │  - Full blockchain (~5GB)    ││
+│  │                     │    │  - Built-in explorer         ││
+│  └─────────────────────┘    └──────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+**New Files Created**:
+
+| File | Purpose |
+|------|---------|
+| `Sources/Core/FullNode/WalletMode.swift` | Mode enum, manager, persistence |
+| `Sources/Core/FullNode/RPCClient.swift` | JSON-RPC client for zclassicd |
+| `Sources/Core/FullNode/BootstrapManager.swift` | Bootstrap download/extract |
+| `Sources/Core/FullNode/BootstrapProgressView.swift` | Bootstrap progress UI |
+| `Sources/App/ModeSelection/ModeSelectionView.swift` | First-launch mode selection |
+| `Sources/Features/Explorer/ExplorerView.swift` | Blockchain explorer UI |
+| `Sources/Features/Explorer/ExplorerViewModel.swift` | Explorer logic + data models |
+
+**RPCClient Features** (ported from Zipher):
+- Connection management with localhost-only security
+- Balance queries (total, transparent, shielded, unconfirmed)
+- Address management (create, list, get balance)
+- Transaction sending via z_sendmany
+- Private key import/export
+- Wallet encryption support
+- Explorer methods (getblock, gettransaction, getaddressbalance)
+- Error sanitization (removes paths, IPs, addresses from errors)
+
+**BootstrapManager Features** (ported from Zipher):
+- GitHub release detection for latest bootstrap
+- Multi-part download with resume support
+- SHA256 checksum verification
+- Zstd decompression
+- zclassic.conf generation with random RPC credentials
+- Sapling parameter download if missing
+- Progress reporting with speed/ETA
+
+**Explorer Features**:
+- Search by block height, hash, txid, or address
+- Block details (hash, height, time, transactions)
+- Transaction details (inputs, outputs, shielded components)
+- Address lookup with privacy protection for z-addresses
+- Works in both modes (InsightAPI for light, RPC for full node)
+
+**Settings Integration**:
+- New "Wallet Mode" section in Settings (macOS only)
+- Shows current mode with description
+- "Switch to Full Node" button triggers bootstrap
+- "Switch to Light Mode" button for easy mode change
+- Full node status shows daemon connection and block height
+
+**Privacy Philosophy** (Explorer):
+```swift
+// Shielded addresses are PRIVATE - the explorer respects this
+if address.isShielded {
+    // Show privacy notice, not balance
+    Text("\"Privacy is necessary for an open society in the electronic age.\"")
+    Text("Shielded address balances and transactions are hidden from prying eyes.")
+}
+```
+
+**Files Modified**:
+- `Sources/Features/Settings/SettingsView.swift` - added walletModeSection
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
 - Header store may get out of sync - use "Rebuild Witnesses" to fix
 - Notes received BEFORE bundledTreeHeight (2926122) require manual "Full Rescan from Height" in Settings
+- Full Node mode requires manual zclassicd installation (not bundled)
 
 ## Contact
 

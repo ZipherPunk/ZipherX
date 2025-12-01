@@ -60,6 +60,11 @@ struct SettingsView: View {
                 // Appearance section (themes)
                 appearanceSection
 
+                #if os(macOS)
+                // Wallet mode section (macOS only)
+                walletModeSection
+                #endif
+
                 // Security section
                 securitySection
 
@@ -178,6 +183,181 @@ struct SettingsView: View {
             Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height 2926122.\n\nDo you want to continue?")
         }
     }
+
+    // MARK: - Wallet Mode Section (macOS only)
+
+    #if os(macOS)
+    @StateObject private var modeManager = WalletModeManager.shared
+    @StateObject private var bootstrapManager = BootstrapManager.shared
+    @State private var showBootstrapSheet = false
+    @State private var showModeChangeAlert = false
+
+    private var walletModeSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 12))
+                Text("Wallet Mode")
+                    .font(theme.titleFont)
+                Spacer()
+            }
+            .foregroundColor(theme.textPrimary)
+
+            // Current mode display
+            HStack {
+                Image(systemName: modeManager.currentMode.icon)
+                    .font(.system(size: 20))
+                    .foregroundColor(theme.primaryColor)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(modeManager.currentMode.displayName)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+                    Text(modeManager.currentMode.description)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                Spacer()
+
+                // Mode indicator
+                Text(modeManager.currentMode == .light ? "Active" : "Active")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.successColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(theme.successColor.opacity(0.2))
+                    .cornerRadius(theme.cornerRadius)
+            }
+            .padding(12)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.primaryColor.opacity(0.5), lineWidth: 1)
+            )
+
+            // Full Node specific options
+            if modeManager.currentMode == .fullNode {
+                // Full node status
+                fullNodeStatusView
+            } else {
+                // Switch to Full Node button
+                Button(action: {
+                    showModeChangeAlert = true
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text("Switch to Full Node Mode")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+                    .padding(12)
+                    .background(theme.surfaceColor)
+                    .overlay(
+                        Rectangle()
+                            .stroke(theme.textPrimary, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+
+            // Info text
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle")
+                    .foregroundColor(.blue)
+                    .font(.system(size: 12))
+
+                Text(modeManager.currentMode == .light ?
+                    "Light mode uses P2P network with bundled commitment tree for fast, mobile-friendly operation." :
+                    "Full Node mode runs a local zclassicd daemon for complete blockchain verification.")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .padding(12)
+        .background(theme.backgroundColor)
+        .overlay(
+            Rectangle()
+                .stroke(theme.textPrimary, lineWidth: 1)
+        )
+        .alert("Switch to Full Node Mode?", isPresented: $showModeChangeAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Switch") {
+                modeManager.setMode(.fullNode)
+                if bootstrapManager.needsBootstrap {
+                    showBootstrapSheet = true
+                }
+            }
+        } message: {
+            Text("Full Node mode requires ~5GB of storage and will download the Zclassic blockchain.\n\nThis provides complete verification and explorer features.\n\nYou can switch back to Light mode anytime.")
+        }
+        .sheet(isPresented: $showBootstrapSheet) {
+            BootstrapProgressView()
+                .environmentObject(themeManager)
+                .frame(minWidth: 500, minHeight: 400)
+        }
+    }
+
+    private var fullNodeStatusView: some View {
+        VStack(spacing: 8) {
+            // Daemon connection status
+            HStack {
+                Circle()
+                    .fill(RPCClient.shared.isConnected ? Color.green : Color.red)
+                    .frame(width: 8, height: 8)
+
+                Text(RPCClient.shared.isConnected ? "Daemon Connected" : "Daemon Offline")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+
+                Spacer()
+
+                if RPCClient.shared.isConnected {
+                    Text("Block \(RPCClient.shared.blockHeight)")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+            }
+            .padding(10)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(RPCClient.shared.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
+            )
+
+            // Switch to Light mode button
+            Button(action: {
+                modeManager.setMode(.light)
+            }) {
+                HStack {
+                    Image(systemName: "bolt.fill")
+                    Text("Switch to Light Mode")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textPrimary)
+                .padding(12)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+    }
+    #endif
 
     // MARK: - Appearance Section
 
