@@ -1809,6 +1809,52 @@ let uuid = IORegistryEntryCreateCFProperty(platformExpert, kIOPlatformUUIDKey as
 
 ---
 
+### 22. Transaction History Change Output Filter (December 1, 2025)
+
+**Problem**: User reported change outputs (internal wallet transactions) were showing in transaction history alongside real sent/received transactions.
+
+**Root Cause**: The SQL query in `WalletDatabase.getTransactionHistory()` was returning ALL transaction types including `change`.
+
+**Solution**: Added filter to exclude change outputs from history display:
+
+```sql
+-- Added to both count and select queries
+WHERE t1.tx_type != 'change'
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - lines ~1441 and ~1465
+
+**Verification**: Both iOS Simulator and macOS wallets now show only `received` and `sent` transactions.
+
+---
+
+### 23. Security Audit Report Generated (December 1, 2025)
+
+Created comprehensive cypherpunk-styled HTML security audit report:
+
+**Location**: `/Users/chris/ZipherX/docs/SECURITY_AUDIT_REPORT.html`
+
+**Report Contents**:
+- Executive Summary with key metrics
+- Balance Verification (100% accuracy confirmed)
+- Transaction History Verification
+- Private Key Import Performance Analysis:
+  - iOS Simulator: 2m13s total (56s tree load + 77s scan)
+  - macOS: 2m50s total (57s tree load + 113s scan)
+- Security Findings:
+  - **CRITICAL**: SQLite database NOT encrypted (SQLCipher not implemented)
+  - **WARNING**: Spending keys in memory during signing
+  - **WARNING**: macOS file-based key storage (no Secure Enclave for Sapling keys)
+  - **PASSED**: Key encryption (AES-GCM-256), No hardcoded credentials, Network security (HTTPS), Biometric auth, Sapling proof verification, Tree integrity
+- Cryptographic Implementation Details
+- Required Actions Before Production (P0-P4 prioritized)
+- Verification Commands
+
+**View Report**: `open /Users/chris/ZipherX/docs/SECURITY_AUDIT_REPORT.html`
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

@@ -208,21 +208,23 @@ final class WalletDatabase {
             INSERT OR IGNORE INTO sync_state (id, last_scanned_height) VALUES (1, 0);
             """,
 
-            // Transaction history (unified view of sent/received)
+            // Transaction history (unified view of sent/received/change)
             """
             CREATE TABLE IF NOT EXISTS transaction_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 txid BLOB NOT NULL,
                 block_height INTEGER NOT NULL,
                 block_time INTEGER,
-                tx_type TEXT NOT NULL CHECK (tx_type IN ('sent', 'received')),
+                tx_type TEXT NOT NULL CHECK (tx_type IN ('sent', 'received', 'change')),
                 value INTEGER NOT NULL,
                 fee INTEGER,
                 to_address TEXT,
                 from_diversifier BLOB,
                 memo TEXT,
+                status TEXT NOT NULL DEFAULT 'confirmed' CHECK (status IN ('pending', 'mempool', 'confirming', 'confirmed')),
+                confirmations INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-                UNIQUE(txid, tx_type, value)
+                UNIQUE(txid, tx_type)
             );
             """,
 
@@ -331,6 +333,139 @@ final class WalletDatabase {
                 throw DatabaseError.schemaCreationFailed("Migration failed: \(String(cString: sqlite3_errmsg(db)))")
             }
             print("📂 Migration: Added spent_height column to notes table")
+        }
+
+        // Migration 5: Add status and confirmations columns to transaction_history
+        let historyPragmaSql = "PRAGMA table_info(transaction_history);"
+        var historyPragmaStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, historyPragmaSql, -1, &historyPragmaStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(historyPragmaStmt) }
+
+        var hasStatusColumn = false
+        var hasConfirmationsColumn = false
+        while sqlite3_step(historyPragmaStmt) == SQLITE_ROW {
+            if let columnName = sqlite3_column_text(historyPragmaStmt, 1) {
+                let name = String(cString: columnName)
+                if name == "status" { hasStatusColumn = true }
+                if name == "confirmations" { hasConfirmationsColumn = true }
+            }
+        }
+
+        if !hasStatusColumn {
+            let alterSql = "ALTER TABLE transaction_history ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed';"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration: Added status column to transaction_history")
+            }
+        }
+
+        if !hasConfirmationsColumn {
+            let alterSql = "ALTER TABLE transaction_history ADD COLUMN confirmations INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration: Added confirmations column to transaction_history")
+            }
+        }
+
+        // Migration 6: Recreate transaction_history with 'change' type and fixed UNIQUE constraint
+        // SQLite doesn't support ALTER TABLE for CHECK constraints, so we need to recreate
+        // First check if the current constraint allows 'change' type
+        // Use minimal INSERT that doesn't depend on status/confirmations columns existing
+        print("📂 Migration 6: Testing if 'change' type is supported...")
+        let testInsert = "INSERT INTO transaction_history (txid, block_height, tx_type, value) VALUES (X'00', 0, 'change', 0);"
+        let testResult = sqlite3_exec(db, testInsert, nil, nil, nil)
+        print("📂 Migration 6: Test result = \(testResult) (SQLITE_OK = \(SQLITE_OK))")
+        if testResult != SQLITE_OK {
+            // 'change' type not allowed or schema is old, need to recreate table
+            print("📂 Migration 6: Recreating transaction_history with 'change' type support...")
+
+            // Drop any leftover _new table from previous failed migration
+            _ = sqlite3_exec(db, "DROP TABLE IF EXISTS transaction_history_new;", nil, nil, nil)
+
+            // Start transaction
+            _ = sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil)
+
+            // Create new table with correct schema
+            let createNewTable = """
+                CREATE TABLE IF NOT EXISTS transaction_history_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    txid BLOB NOT NULL,
+                    block_height INTEGER NOT NULL,
+                    block_time INTEGER,
+                    tx_type TEXT NOT NULL CHECK (tx_type IN ('sent', 'received', 'change')),
+                    value INTEGER NOT NULL,
+                    fee INTEGER,
+                    to_address TEXT,
+                    from_diversifier BLOB,
+                    memo TEXT,
+                    status TEXT NOT NULL DEFAULT 'confirmed' CHECK (status IN ('pending', 'mempool', 'confirming', 'confirmed')),
+                    confirmations INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    UNIQUE(txid, tx_type)
+                );
+            """
+
+            let createResult = sqlite3_exec(db, createNewTable, nil, nil, nil)
+            print("📂 Migration 6: Create new table result = \(createResult)")
+            if createResult == SQLITE_OK {
+                // Copy data, keeping only one entry per (txid, tx_type) - prefer the one with highest value
+                // Check if old table has status column to determine which copy query to use
+                var hasOldStatusColumn = false
+                var columnCheckStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, "PRAGMA table_info(transaction_history);", -1, &columnCheckStmt, nil) == SQLITE_OK {
+                    while sqlite3_step(columnCheckStmt) == SQLITE_ROW {
+                        if let colName = sqlite3_column_text(columnCheckStmt, 1) {
+                            if String(cString: colName) == "status" { hasOldStatusColumn = true }
+                        }
+                    }
+                    sqlite3_finalize(columnCheckStmt)
+                }
+
+                let copyData: String
+                if hasOldStatusColumn {
+                    copyData = """
+                        INSERT INTO transaction_history_new (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status, confirmations, created_at)
+                        SELECT txid, block_height, block_time, tx_type, MAX(value), fee, to_address, from_diversifier, memo, status, confirmations, created_at
+                        FROM transaction_history
+                        GROUP BY txid, tx_type;
+                    """
+                } else {
+                    // Old table doesn't have status/confirmations - use defaults
+                    copyData = """
+                        INSERT INTO transaction_history_new (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, created_at)
+                        SELECT txid, block_height, block_time, tx_type, MAX(value), fee, to_address, from_diversifier, memo, created_at
+                        FROM transaction_history
+                        GROUP BY txid, tx_type;
+                    """
+                }
+
+                print("📂 Migration 6: hasOldStatusColumn = \(hasOldStatusColumn)")
+                let copyResult = sqlite3_exec(db, copyData, nil, nil, nil)
+                print("📂 Migration 6: Copy data result = \(copyResult)")
+                if copyResult == SQLITE_OK {
+                    // Drop old table and rename new one
+                    let dropResult = sqlite3_exec(db, "DROP TABLE transaction_history;", nil, nil, nil)
+                    print("📂 Migration 6: Drop old table result = \(dropResult)")
+                    let renameResult = sqlite3_exec(db, "ALTER TABLE transaction_history_new RENAME TO transaction_history;", nil, nil, nil)
+                    print("📂 Migration 6: Rename result = \(renameResult)")
+                    _ = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);", nil, nil, nil)
+                    _ = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);", nil, nil, nil)
+                    _ = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+                    print("📂 Migration 6: Successfully recreated transaction_history")
+                } else {
+                    let errMsg = String(cString: sqlite3_errmsg(db))
+                    print("📂 Migration 6: Failed to copy data: \(errMsg)")
+                    _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                }
+            } else {
+                let errMsg = String(cString: sqlite3_errmsg(db))
+                print("📂 Migration 6: Failed to create new table: \(errMsg)")
+                _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            }
+        } else {
+            // 'change' type already supported, delete test row
+            _ = sqlite3_exec(db, "DELETE FROM transaction_history WHERE txid = X'00' AND value = 0;", nil, nil, nil)
+            print("📂 Migration 6: 'change' type already supported")
         }
     }
 
@@ -719,8 +854,25 @@ final class WalletDatabase {
         return notes
     }
 
-    /// Mark note as spent
+    /// Mark note as spent and record sent transaction in history
     func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64) throws {
+        // SECURITY: Never log nullifiers - they are sensitive privacy data
+
+        // First, get the note's value so we can record it in transaction history
+        var noteValue: UInt64 = 0
+        let selectSql = "SELECT value FROM notes WHERE nf = ?;"
+        var selectStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
+            nullifier.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+            }
+            if sqlite3_step(selectStmt) == SQLITE_ROW {
+                noteValue = UInt64(sqlite3_column_int64(selectStmt, 0))
+            }
+            sqlite3_finalize(selectStmt)
+        }
+
+        // Update the note as spent
         let sql = "UPDATE notes SET is_spent = 1, spent_in_tx = ?, spent_height = ? WHERE nf = ?;"
 
         var stmt: OpaquePointer?
@@ -740,7 +892,15 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
-        print("📜 Marked note spent at height \(spentHeight) with txid")
+
+        let changedRows = sqlite3_changes(db)
+        if changedRows > 0 {
+            print("✅ Marked \(changedRows) note(s) as spent at height \(spentHeight)")
+        }
+
+        // NOTE: SENT transactions are now recorded by populateHistoryFromNotes() which
+        // correctly calculates actualSent = input - change - fee. Do not add SENT here
+        // as it would use the note value instead of the actual sent amount.
     }
 
     /// Mark note as spent by height
@@ -781,7 +941,7 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
-        print("Marked note as unspent (nullifier: \(nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
+        print("Marked note as unspent")
     }
 
     /// Get all spent notes for an account (for recovery from failed broadcasts)
@@ -857,6 +1017,27 @@ final class WalletDatabase {
 
     /// Get all nullifiers for spend detection
     func getAllNullifiers() throws -> Set<Data> {
+        // Debug: First count all notes and unspent notes
+        var countStmt: OpaquePointer?
+        let countSql = "SELECT COUNT(*) FROM notes;"
+        if sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK {
+            if sqlite3_step(countStmt) == SQLITE_ROW {
+                let totalNotes = sqlite3_column_int(countStmt, 0)
+                print("🔍 NULLIFIER DEBUG: Total notes in DB: \(totalNotes)")
+            }
+            sqlite3_finalize(countStmt)
+        }
+
+        var unspentStmt: OpaquePointer?
+        let unspentSql = "SELECT COUNT(*) FROM notes WHERE is_spent = 0;"
+        if sqlite3_prepare_v2(db, unspentSql, -1, &unspentStmt, nil) == SQLITE_OK {
+            if sqlite3_step(unspentStmt) == SQLITE_ROW {
+                let unspentNotes = sqlite3_column_int(unspentStmt, 0)
+                print("🔍 NULLIFIER DEBUG: Unspent notes in DB: \(unspentNotes)")
+            }
+            sqlite3_finalize(unspentStmt)
+        }
+
         let sql = "SELECT nf FROM notes WHERE is_spent = 0;"
 
         var stmt: OpaquePointer?
@@ -870,11 +1051,12 @@ final class WalletDatabase {
         while sqlite3_step(stmt) == SQLITE_ROW {
             let nfPtr = sqlite3_column_blob(stmt, 0)
             let nfLen = sqlite3_column_bytes(stmt, 0)
-            if let ptr = nfPtr {
-                nullifiers.insert(Data(bytes: ptr, count: Int(nfLen)))
+            if let ptr = nfPtr, nfLen > 0 {
+                let nfData = Data(bytes: ptr, count: Int(nfLen))
+                nullifiers.insert(nfData)
             }
         }
-
+        // SECURITY: Log only count, never the actual nullifiers
         return nullifiers
     }
 
@@ -1251,20 +1433,43 @@ final class WalletDatabase {
 
     /// Get transaction history ordered by height (newest first)
     func getTransactionHistory(limit: Int = 100, offset: Int = 0) throws -> [TransactionHistoryItem] {
-        // First check total count
-        let countSql = "SELECT COUNT(*) FROM transaction_history;"
+        print("📜 getTransactionHistory called")
+
+        // First check total count (excluding change outputs for accurate count)
+        let countSql = """
+            SELECT COUNT(*) FROM transaction_history t1
+            WHERE t1.tx_type != 'change'
+            AND NOT (
+                t1.tx_type = 'received'
+                AND EXISTS (
+                    SELECT 1 FROM transaction_history t2
+                    WHERE t2.txid = t1.txid AND t2.tx_type = 'sent'
+                )
+            );
+        """
         var countStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK {
             if sqlite3_step(countStmt) == SQLITE_ROW {
                 let count = sqlite3_column_int(countStmt, 0)
-                print("📜 DB: transaction_history table has \(count) rows")
+                print("📜 DB: transaction_history has \(count) displayable rows (excluding change outputs)")
             }
             sqlite3_finalize(countStmt)
         }
 
+        // Exclude change outputs:
+        // 1. Explicitly exclude tx_type = 'change'
+        // 2. Also exclude received transactions where the same txid exists as sent
         let sql = """
-            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo
-            FROM transaction_history
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history t1
+            WHERE t1.tx_type != 'change'
+            AND NOT (
+                t1.tx_type = 'received'
+                AND EXISTS (
+                    SELECT 1 FROM transaction_history t2
+                    WHERE t2.txid = t1.txid AND t2.tx_type = 'sent'
+                )
+            )
             ORDER BY block_height DESC, created_at DESC
             LIMIT ? OFFSET ?;
         """
@@ -1293,6 +1498,8 @@ final class WalletDatabase {
             let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
             let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
             let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = sqlite3_column_type(stmt, 8) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 8)) : "confirmed"
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
 
             let txidData = Data(bytes: txidPtr, count: Int(txidLen))
             let item = TransactionHistoryItem(
@@ -1303,7 +1510,9 @@ final class WalletDatabase {
                 value: value,
                 fee: fee,
                 toAddress: toAddress,
-                memo: memo
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .confirmed,
+                confirmations: confirmations
             )
             print("📜 DB: Item created - txidLen=\(txidLen), type=\(typeStr), value=\(value), height=\(height), txidString=\(item.txidString.prefix(16))...")
 
@@ -1331,9 +1540,26 @@ final class WalletDatabase {
         return Int(sqlite3_column_int(stmt, 0))
     }
 
-    /// Populate transaction history from existing notes
-    /// Call this once to backfill history for notes discovered before history tracking was added
+    /// Populate transaction history from notes table
+    /// Creates a unified view with: SENT, RECEIVED, and CHANGE transaction types
+    ///
+    /// Transaction Types:
+    /// - SENT: When we spent a note to send funds elsewhere. Value = actualSent (input - change - fee)
+    /// - RECEIVED: When we received funds from an external source
+    /// - CHANGE: When we received change back from our own SENT transaction
+    ///
+    /// Logic:
+    /// 1. Build a set of all spent_in_tx txids (these are SENT transactions)
+    /// 2. For each note:
+    ///    - If note.txid matches a spent_in_tx → it's a CHANGE output
+    ///    - Otherwise → it's a RECEIVED transaction
+    /// 3. For each SENT tx: actualSent = input.value - sum(change outputs) - fee
+    ///
+    /// NOTE: This function CLEARS existing history and rebuilds from notes
     func populateHistoryFromNotes() throws -> Int {
+        // Clear existing history first to ensure correct values
+        try clearTransactionHistory()
+
         // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
         let sql = """
             SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf, n.spent_height
@@ -1345,10 +1571,21 @@ final class WalletDatabase {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
-        defer { sqlite3_finalize(stmt) }
 
         var count = 0
         var notesFound = 0
+
+        // Collect all notes first
+        struct NoteData {
+            let diversifier: Data?
+            let value: UInt64
+            let receivedHeight: UInt64
+            let txid: Data
+            let isSpent: Bool
+            let spentTxid: Data?
+            let spentHeight: UInt64?
+        }
+        var allNotes: [NoteData] = []
 
         while sqlite3_step(stmt) == SQLITE_ROW {
             notesFound += 1
@@ -1363,7 +1600,6 @@ final class WalletDatabase {
             let spentTxLen = sqlite3_column_bytes(stmt, 5)
             let nullifierPtr = sqlite3_column_blob(stmt, 6)
             let nullifierLen = sqlite3_column_bytes(stmt, 6)
-            // spent_height is column 7 (may be NULL if not spent or old data)
             let spentHeight: UInt64? = sqlite3_column_type(stmt, 7) != SQLITE_NULL
                 ? UInt64(sqlite3_column_int64(stmt, 7))
                 : nil
@@ -1373,46 +1609,105 @@ final class WalletDatabase {
             if let txidPtr = txidPtr, txidLen > 0 {
                 txid = Data(bytes: txidPtr, count: Int(txidLen))
             } else if let nullifierPtr = nullifierPtr, nullifierLen > 0 {
-                // Use first 32 bytes of nullifier as synthetic txid
                 txid = Data(bytes: nullifierPtr, count: min(Int(nullifierLen), 32))
             } else {
                 print("📜 Note at height \(receivedHeight) has no txid or nullifier, skipping")
-                continue // Skip notes without txid or nullifier
-            }
-
-            let diversifier = diversifierPtr != nil ? Data(bytes: diversifierPtr!, count: Int(diversifierLen)) : nil
-
-            // IMPORTANT: Skip if this txid already exists as a SENT transaction
-            // This prevents change outputs from appearing as separate "received" entries
-            let checkSql = "SELECT COUNT(*) FROM transaction_history WHERE txid = ? AND tx_type = 'sent';"
-            var checkStmt: OpaquePointer?
-            var isChangeOutput = false
-
-            if sqlite3_prepare_v2(db, checkSql, -1, &checkStmt, nil) == SQLITE_OK {
-                txid.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
-                }
-                if sqlite3_step(checkStmt) == SQLITE_ROW {
-                    let sentCount = sqlite3_column_int(checkStmt, 0)
-                    if sentCount > 0 {
-                        isChangeOutput = true
-                        print("📜 Skipping change output for txid (already has SENT entry)")
-                    }
-                }
-                sqlite3_finalize(checkStmt)
-            }
-
-            // Skip inserting RECEIVED entry if this is a change output from our own send
-            if isChangeOutput {
                 continue
             }
 
-            // Insert RECEIVED transaction using direct SQL to check actual insertion
-            let insertSql = """
-                INSERT OR REPLACE INTO transaction_history
-                (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """
+            let diversifier = diversifierPtr != nil ? Data(bytes: diversifierPtr!, count: Int(diversifierLen)) : nil
+            let spentTxid: Data? = (spentTxPtr != nil && spentTxLen > 0) ? Data(bytes: spentTxPtr!, count: Int(spentTxLen)) : nil
+
+            allNotes.append(NoteData(
+                diversifier: diversifier,
+                value: value,
+                receivedHeight: receivedHeight,
+                txid: txid,
+                isSpent: isSpent,
+                spentTxid: spentTxid,
+                spentHeight: spentHeight
+            ))
+        }
+        sqlite3_finalize(stmt)
+
+        print("📜 populateHistoryFromNotes: Found \(allNotes.count) notes total")
+        let spentNotes = allNotes.filter { $0.isSpent }
+        print("📜 populateHistoryFromNotes: \(spentNotes.count) notes are spent")
+        for note in spentNotes {
+            print("📜   Spent note: value=\(note.value), spentTxid=\(note.spentTxid?.prefix(8).hexString ?? "nil"), spentHeight=\(note.spentHeight ?? 0)")
+        }
+
+        // Build a set of all spent_in_tx txids - these represent our SENT transactions
+        var sentTxids: Set<Data> = []
+        for note in allNotes where note.isSpent {
+            if let spentTxid = note.spentTxid {
+                sentTxids.insert(spentTxid)
+            }
+        }
+
+        let insertSql = """
+            INSERT OR REPLACE INTO transaction_history
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let fee: UInt64 = 10_000
+
+        // PASS 1: Insert all SENT transactions
+        // Group spent notes by their spent_in_tx to handle multi-input transactions
+        var sentTxData: [Data: (inputValue: UInt64, spentHeight: UInt64)] = [:]
+        for note in allNotes where note.isSpent {
+            guard let spentTxid = note.spentTxid else { continue }
+            let existing = sentTxData[spentTxid]
+            let newInputValue = (existing?.inputValue ?? 0) + note.value
+            let height = note.spentHeight ?? note.receivedHeight
+            sentTxData[spentTxid] = (inputValue: newInputValue, spentHeight: existing?.spentHeight ?? height)
+        }
+
+        for (spentTxid, txInfo) in sentTxData {
+            // Find all change outputs: notes received in the same tx (note.txid == spentTxid)
+            let changeOutputs = allNotes.filter { $0.txid == spentTxid }
+            let totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+
+            // actualSent = sum(inputs) - sum(change) - fee
+            let actualSentValue = txInfo.inputValue - totalChangeValue - fee
+
+            print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), actualSent=\(actualSentValue)")
+
+            var spentStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, insertSql, -1, &spentStmt, nil) == SQLITE_OK else {
+                print("📜 SENT: Failed to prepare statement for txid=\(spentTxid.prefix(8).hexString)")
+                continue
+            }
+
+            spentTxid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(spentStmt, 2, Int64(txInfo.spentHeight))
+            sqlite3_bind_null(spentStmt, 3)
+            sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(spentStmt, 5, Int64(actualSentValue))
+            sqlite3_bind_int64(spentStmt, 6, Int64(fee))
+            sqlite3_bind_null(spentStmt, 7)
+            sqlite3_bind_null(spentStmt, 8)
+            sqlite3_bind_null(spentStmt, 9)
+
+            let stepResult = sqlite3_step(spentStmt)
+            if stepResult == SQLITE_DONE {
+                count += 1
+                print("📜 SENT: Successfully inserted txid=\(spentTxid.prefix(8).hexString)")
+            } else {
+                let errMsg = String(cString: sqlite3_errmsg(db))
+                print("📜 SENT: Failed to insert txid=\(spentTxid.prefix(8).hexString), error=\(errMsg), stepResult=\(stepResult)")
+            }
+            sqlite3_finalize(spentStmt)
+        }
+
+        // PASS 2: Insert RECEIVED and CHANGE transactions for each note
+        for note in allNotes {
+            // Determine if this is a CHANGE output (received in a tx that we initiated)
+            let isChange = sentTxids.contains(note.txid)
+            let txType = isChange ? TransactionType.change : TransactionType.received
 
             var insertStmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK else {
@@ -1420,18 +1715,16 @@ final class WalletDatabase {
                 continue
             }
 
-            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
-            txid.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            note.txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
             }
-            sqlite3_bind_int64(insertStmt, 2, Int64(receivedHeight))
+            sqlite3_bind_int64(insertStmt, 2, Int64(note.receivedHeight))
             sqlite3_bind_null(insertStmt, 3) // block_time
-            sqlite3_bind_text(insertStmt, 4, TransactionType.received.rawValue, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_int64(insertStmt, 5, Int64(value))
-            sqlite3_bind_null(insertStmt, 6) // fee
+            sqlite3_bind_text(insertStmt, 4, txType.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(insertStmt, 5, Int64(note.value))
+            sqlite3_bind_null(insertStmt, 6) // fee (only for SENT)
             sqlite3_bind_null(insertStmt, 7) // to_address
-            if let diversifier = diversifier {
+            if let diversifier = note.diversifier {
                 diversifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(insertStmt, 8, ptr.baseAddress, Int32(diversifier.count), SQLITE_TRANSIENT)
                 }
@@ -1443,51 +1736,11 @@ final class WalletDatabase {
             let result = sqlite3_step(insertStmt)
             if result == SQLITE_DONE {
                 count += 1
-                print("📜 Inserted received tx: height=\(receivedHeight), value=\(value)")
+                print("📜 Inserted \(txType.rawValue) tx: height=\(note.receivedHeight), value=\(note.value)")
             } else {
                 print("📜 Insert failed: \(String(cString: sqlite3_errmsg(db)))")
             }
             sqlite3_finalize(insertStmt)
-
-            // If spent, also insert SENT transaction
-            if isSpent {
-                let spentTxid: Data
-                if let spentTxPtr = spentTxPtr, spentTxLen > 0 {
-                    spentTxid = Data(bytes: spentTxPtr, count: Int(spentTxLen))
-                } else if let nullifierPtr = nullifierPtr, nullifierLen > 0 {
-                    // Use reversed nullifier as synthetic spent txid (different from receive)
-                    var nfData = Data(bytes: nullifierPtr, count: min(Int(nullifierLen), 32))
-                    nfData.reverse()
-                    spentTxid = nfData
-                } else {
-                    continue
-                }
-
-                var spentStmt: OpaquePointer?
-                guard sqlite3_prepare_v2(db, insertSql, -1, &spentStmt, nil) == SQLITE_OK else {
-                    continue
-                }
-
-                spentTxid.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
-                }
-                // Use spent_height if available, fallback to received_height for old data
-                let txSpentHeight = spentHeight ?? receivedHeight
-                sqlite3_bind_int64(spentStmt, 2, Int64(txSpentHeight))
-                sqlite3_bind_null(spentStmt, 3)
-                sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_int64(spentStmt, 5, Int64(value))
-                sqlite3_bind_int64(spentStmt, 6, 10_000) // fee
-                sqlite3_bind_null(spentStmt, 7)
-                sqlite3_bind_null(spentStmt, 8)
-                sqlite3_bind_null(spentStmt, 9)
-
-                if sqlite3_step(spentStmt) == SQLITE_DONE {
-                    count += 1
-                    print("📜 Inserted sent tx: spentHeight=\(txSpentHeight), value=\(value)")
-                }
-                sqlite3_finalize(spentStmt)
-            }
         }
 
         print("📜 Found \(notesFound) notes, populated \(count) transaction history entries")
@@ -1547,12 +1800,14 @@ final class WalletDatabase {
         value: UInt64,
         fee: UInt64,
         toAddress: String?,
-        memo: String? = nil
+        memo: String? = nil,
+        status: TransactionStatus = .confirmed,
+        confirmations: Int = 0
     ) throws {
         let sql = """
             INSERT OR REPLACE INTO transaction_history
-            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
-            VALUES (?, ?, NULL, 'sent', ?, ?, ?, NULL, ?);
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status, confirmations)
+            VALUES (?, ?, NULL, 'sent', ?, ?, ?, NULL, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -1579,34 +1834,184 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 6)
         }
+        sqlite3_bind_text(stmt, 7, status.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 8, Int32(confirmations))
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
-        print("📜 Recorded sent transaction: height=\(height), value=\(value) zatoshis, fee=\(fee)")
+        print("📜 Recorded sent transaction: height=\(height), value=\(value) zatoshis, fee=\(fee), status=\(status.rawValue)")
     }
 
-    /// Check if a transaction exists in history (for deduplication)
-    func transactionExistsInHistory(txid: Data, type: TransactionType) -> Bool {
-        let sql = "SELECT COUNT(*) FROM transaction_history WHERE txid = ? AND tx_type = ?;"
+    /// Record a pending transaction (just broadcast, not yet in any block)
+    func recordPendingTransaction(
+        txid: Data,
+        type: TransactionType,
+        value: UInt64,
+        fee: UInt64?,
+        toAddress: String?
+    ) throws {
+        let sql = """
+            INSERT OR REPLACE INTO transaction_history
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status, confirmations)
+            VALUES (?, 0, NULL, ?, ?, ?, ?, NULL, NULL, 'pending', 0);
+        """
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return false
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
 
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
         txid.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
-        sqlite3_bind_text(stmt, 2, type.rawValue, -1, nil)
-
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return false
+        sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 3, Int64(value))
+        if let fee = fee {
+            sqlite3_bind_int64(stmt, 4, Int64(fee))
+        } else {
+            sqlite3_bind_null(stmt, 4)
+        }
+        if let toAddress = toAddress {
+            sqlite3_bind_text(stmt, 5, toAddress, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 5)
         }
 
-        return sqlite3_column_int(stmt, 0) > 0
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        let txidHex = txid.map { String(format: "%02x", $0) }.joined()
+        print("📜 Recorded pending transaction: txid=\(txidHex.prefix(16))..., type=\(type.rawValue), value=\(value)")
     }
+
+    /// Update transaction status (when it gets confirmed)
+    func updateTransactionStatus(txid: Data, status: TransactionStatus, confirmations: Int, height: UInt64? = nil) throws {
+        var sql: String
+        if let height = height {
+            sql = "UPDATE transaction_history SET status = ?, confirmations = ?, block_height = ? WHERE txid = ?;"
+        } else {
+            sql = "UPDATE transaction_history SET status = ?, confirmations = ? WHERE txid = ?;"
+        }
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        sqlite3_bind_text(stmt, 1, status.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 2, Int32(confirmations))
+        if let height = height {
+            sqlite3_bind_int64(stmt, 3, Int64(height))
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            }
+        } else {
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            }
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Get all pending/unconfirmed transactions
+    func getPendingTransactions() throws -> [TransactionHistoryItem] {
+        let sql = """
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history
+            WHERE status IN ('pending', 'mempool', 'confirming')
+            ORDER BY created_at DESC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var items: [TransactionHistoryItem] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let txidLen = sqlite3_column_bytes(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let value = UInt64(sqlite3_column_int64(stmt, 4))
+            let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
+            let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = String(cString: sqlite3_column_text(stmt, 8))
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
+
+            items.append(TransactionHistoryItem(
+                txid: Data(bytes: txidPtr, count: Int(txidLen)),
+                height: height,
+                blockTime: blockTime,
+                type: TransactionType(rawValue: typeStr) ?? .sent,
+                value: value,
+                fee: fee,
+                toAddress: toAddress,
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .pending,
+                confirmations: confirmations
+            ))
+        }
+
+        return items
+    }
+
+    /// Update confirmations for all transactions based on current chain height
+    func updateAllConfirmations(chainHeight: UInt64) throws {
+        // For confirmed transactions, calculate confirmations = chainHeight - block_height + 1
+        // Update status based on confirmation count
+        let sql = """
+            UPDATE transaction_history
+            SET confirmations = CASE
+                WHEN block_height > 0 THEN MAX(0, ? - block_height + 1)
+                ELSE 0
+            END,
+            status = CASE
+                WHEN block_height = 0 THEN status
+                WHEN (? - block_height + 1) >= 6 THEN 'confirmed'
+                WHEN (? - block_height + 1) >= 1 THEN 'confirming'
+                ELSE 'mempool'
+            END
+            WHERE status != 'pending';
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(chainHeight))
+        sqlite3_bind_int64(stmt, 2, Int64(chainHeight))
+        sqlite3_bind_int64(stmt, 3, Int64(chainHeight))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        let updated = sqlite3_changes(db)
+        if updated > 0 {
+            print("📜 Updated confirmations for \(updated) transactions (chainHeight=\(chainHeight))")
+        }
+    }
+
+    // MARK: - Deprecated Migration Code (removed)
+    // populateSentTransactionsFromSpentNotes() was removed because it added SENT transactions
+    // with incorrect values (note value instead of actual sent amount).
+    // populateHistoryFromNotes() now correctly calculates: actualSent = input - change - fee
 }
 
 // MARK: - Data Types
@@ -1641,6 +2046,15 @@ struct SpentNote {
 enum TransactionType: String {
     case sent = "sent"
     case received = "received"
+    case change = "change"
+}
+
+/// Transaction confirmation status
+enum TransactionStatus: String {
+    case pending = "pending"         // Not yet broadcast
+    case mempool = "mempool"         // In mempool, 0 confirmations
+    case confirming = "confirming"   // 1-5 confirmations
+    case confirmed = "confirmed"     // 6+ confirmations
 }
 
 struct TransactionHistoryItem {
@@ -1652,11 +2066,33 @@ struct TransactionHistoryItem {
     let fee: UInt64?
     let toAddress: String?
     let memo: String?
+    let status: TransactionStatus
+    let confirmations: Int
 
-    /// Transaction ID as hex string (reversed for display)
+    /// Transaction ID as hex string for display
     var txidString: String {
-        // Reverse bytes for display (Bitcoin-style txid)
-        Data(txid.reversed()).map { String(format: "%02x", $0) }.joined()
+        // txid is already stored in display format (big-endian), no reversal needed
+        txid.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Unique identifier for ForEach (combines txid + type to handle same txid with different types)
+    var uniqueId: String {
+        txidString + "_" + type.rawValue
+    }
+
+    /// Status display string
+    var statusString: String {
+        switch status {
+        case .pending: return "Pending"
+        case .mempool: return "Unconfirmed"
+        case .confirming: return "\(confirmations) conf."
+        case .confirmed: return "Confirmed"
+        }
+    }
+
+    /// Whether this transaction is still pending (not yet confirmed)
+    var isPending: Bool {
+        status == .pending || status == .mempool || status == .confirming
     }
 
     /// Value in ZCL (not zatoshis)
