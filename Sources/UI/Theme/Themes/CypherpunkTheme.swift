@@ -10,12 +10,12 @@ struct CypherpunkTheme: AppTheme {
 
     // MARK: - Platform-specific Colors
     #if os(macOS)
-    // Bitcoin Orange palette for macOS (official Bitcoin orange: #F7931A)
-    private static let primaryAccent = Color(red: 0.969, green: 0.576, blue: 0.102)  // #F7931A Bitcoin Orange
-    private static let primaryAccentDark = Color(red: 0.85, green: 0.45, blue: 0.05)
-    private static let primaryAccentDim = Color(red: 0.5, green: 0.3, blue: 0.05)
+    // NEON FLUO Orange palette for macOS (bright like the neon green, Bitcoin-inspired)
+    private static let primaryAccent = Color(red: 1.0, green: 0.4, blue: 0.0)       // Bright neon orange
+    private static let primaryAccentDark = Color(red: 0.8, green: 0.3, blue: 0.0)   // Dark neon orange
+    private static let primaryAccentDim = Color(red: 0.5, green: 0.2, blue: 0.0)    // Dim orange
     private static let terminalBlack = Color(red: 0.02, green: 0.02, blue: 0.02)
-    private static let terminalDark = Color(red: 0.08, green: 0.06, blue: 0.04)
+    private static let terminalDark = Color(red: 0.06, green: 0.04, blue: 0.02)     // Slight orange tint
     #else
     // Neon Green palette for iOS (Matrix style)
     private static let primaryAccent = Color(red: 0, green: 1, blue: 0.25)
