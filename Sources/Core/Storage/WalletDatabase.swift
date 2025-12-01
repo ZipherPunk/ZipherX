@@ -1378,8 +1378,11 @@ final class WalletDatabase {
         fromDiversifier: Data?,
         memo: String?
     ) throws -> Int64 {
+        // Use INSERT OR REPLACE to update existing entries with same (txid, tx_type)
+        // This ensures sent transactions are properly recorded even if a "received"
+        // entry for the same txid exists (e.g., change output detected during scan)
         let sql = """
-            INSERT OR IGNORE INTO transaction_history
+            INSERT OR REPLACE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
@@ -1390,8 +1393,10 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
         txid.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
         if let blockTime = blockTime {
@@ -1399,7 +1404,7 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 3)
         }
-        sqlite3_bind_text(stmt, 4, type.rawValue, -1, nil)
+        sqlite3_bind_text(stmt, 4, type.rawValue, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 5, Int64(value))
         if let fee = fee {
             sqlite3_bind_int64(stmt, 6, Int64(fee))
@@ -1407,19 +1412,19 @@ final class WalletDatabase {
             sqlite3_bind_null(stmt, 6)
         }
         if let toAddress = toAddress {
-            sqlite3_bind_text(stmt, 7, toAddress, -1, nil)
+            sqlite3_bind_text(stmt, 7, toAddress, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 7)
         }
         if let fromDiversifier = fromDiversifier {
             fromDiversifier.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(fromDiversifier.count), nil)
+                sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(fromDiversifier.count), SQLITE_TRANSIENT)
             }
         } else {
             sqlite3_bind_null(stmt, 8)
         }
         if let memo = memo {
-            sqlite3_bind_text(stmt, 9, memo, -1, nil)
+            sqlite3_bind_text(stmt, 9, memo, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 9)
         }
@@ -1428,7 +1433,11 @@ final class WalletDatabase {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
 
-        return sqlite3_last_insert_rowid(db)
+        let rowsChanged = sqlite3_changes(db)
+        let rowId = sqlite3_last_insert_rowid(db)
+        print("📜 DB: Insert result - rowId=\(rowId), rowsChanged=\(rowsChanged), txid=\(txid.prefix(8).map { String(format: "%02x", $0) }.joined())..., type=\(type.rawValue)")
+
+        return rowId
     }
 
     /// Get transaction history ordered by height (newest first)
@@ -1538,6 +1547,25 @@ final class WalletDatabase {
         }
 
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Check if a transaction exists in history (direct check, no filtering)
+    func transactionExists(txid: Data, type: TransactionType) throws -> Bool {
+        let sql = "SELECT 1 FROM transaction_history WHERE txid = ? AND tx_type = ? LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+        }
+        sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)
+
+        return sqlite3_step(stmt) == SQLITE_ROW
     }
 
     /// Populate transaction history from notes table

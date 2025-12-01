@@ -1462,9 +1462,8 @@ final class WalletManager: ObservableObject {
         )
         print("📜 Transaction recorded in history: \(txId.prefix(16))...")
 
-        // VERIFY the transaction was actually saved
-        let savedTxs = try WalletDatabase.shared.getTransactionHistory(limit: 5)
-        let txWasSaved = savedTxs.contains { $0.txid == txidData }
+        // VERIFY the transaction was actually saved using direct query (not filtered getTransactionHistory)
+        let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
         guard txWasSaved else {
             print("❌ CRITICAL: Transaction was NOT saved to database!")
             throw WalletError.transactionFailed("Failed to save transaction to database")
@@ -1561,9 +1560,8 @@ final class WalletManager: ObservableObject {
         )
         print("📜 Transaction recorded in history: \(txId.prefix(16))...")
 
-        // VERIFY the transaction was actually saved
-        let savedTxs = try WalletDatabase.shared.getTransactionHistory(limit: 5)
-        let txWasSaved = savedTxs.contains { $0.txid == txidData }
+        // VERIFY the transaction was actually saved using direct query (not filtered getTransactionHistory)
+        let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
         guard txWasSaved else {
             print("❌ CRITICAL: Transaction was NOT saved to database!")
             throw WalletError.transactionFailed("Failed to save transaction to database")
