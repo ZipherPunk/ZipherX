@@ -16,6 +16,8 @@ struct WalletSetupView: View {
     @State private var errorMessage = ""
     @State private var isProcessing = false
     @State private var currentBlockHeight: UInt64 = 0
+    @State private var showMnemonicWords = false  // Hidden by default for cypherpunk security
+    @State private var showPrivateKeyInput = false  // Hidden by default
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -190,39 +192,112 @@ struct WalletSetupView: View {
                 }
                 .padding(.top, 24)
 
-                // Mnemonic words grid
-                ScrollView {
-                    LazyVGrid(columns: [
-                        GridItem(.flexible()),
-                        GridItem(.flexible()),
-                        GridItem(.flexible())
-                    ], spacing: 8) {
-                        ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
-                            HStack(spacing: 4) {
-                                Text("\(index + 1).")
-                                    .font(.system(size: 10, weight: .regular, design: .monospaced))
-                                    .foregroundColor(theme.textSecondary)
-                                    .frame(width: 24, alignment: .trailing)
+                // Security notice when hidden
+                if !showMnemonicWords {
+                    VStack(spacing: 16) {
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: 40))
+                            .foregroundColor(theme.primaryColor)
 
-                                Text(word)
-                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                    .foregroundColor(theme.primaryColor)
+                        Text("SEED PHRASE HIDDEN")
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+
+                        Text("For your security, your seed phrase is hidden by default.\nMake sure no one is watching your screen.")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+
+                        // Reveal button
+                        Button(action: { showMnemonicWords = true }) {
+                            HStack {
+                                Image(systemName: "eye.fill")
+                                Text("REVEAL SEED PHRASE")
                             }
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(theme.surfaceColor)
-                            .cornerRadius(4)
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.warningColor)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 12)
+                            .background(theme.warningColor.opacity(0.15))
+                            .cornerRadius(theme.cornerRadius)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(theme.borderColor, lineWidth: 1)
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.warningColor.opacity(0.5), lineWidth: 1)
                             )
                         }
+                        .buttonStyle(PlainButtonStyle())
                     }
-                    .padding()
+                    .padding(.vertical, 40)
+                    .frame(maxWidth: .infinity)
+                    .background(theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+                    .padding(.horizontal, 24)
                 }
 
+                // Mnemonic words grid (only shown when revealed)
+                if showMnemonicWords {
+                    // Warning banner
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.shield.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("SENSITIVE DATA VISIBLE - ENSURE PRIVACY")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.warningColor)
+                        Spacer()
+                        Button(action: { showMnemonicWords = false }) {
+                            Image(systemName: "eye.slash")
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    .padding(10)
+                    .background(theme.warningColor.opacity(0.15))
+                    .cornerRadius(theme.cornerRadius)
+                    .padding(.horizontal, 24)
+
+                    ScrollView {
+                        LazyVGrid(columns: [
+                            GridItem(.flexible()),
+                            GridItem(.flexible()),
+                            GridItem(.flexible())
+                        ], spacing: 8) {
+                            ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
+                                HStack(spacing: 4) {
+                                    Text("\(index + 1).")
+                                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                                        .foregroundColor(theme.textSecondary)
+                                        .frame(width: 24, alignment: .trailing)
+
+                                    Text(word)
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                        .foregroundColor(theme.primaryColor)
+                                }
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(theme.surfaceColor)
+                                .cornerRadius(4)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(theme.borderColor, lineWidth: 1)
+                                )
+                            }
+                        }
+                        .padding()
+                    }
+                }
+
+                Spacer()
+
                 // Confirm button
-                Button(action: { showMnemonicBackup = false }) {
+                Button(action: {
+                    showMnemonicWords = false  // Reset for next time
+                    showMnemonicBackup = false
+                }) {
                     Text("I'VE SAVED MY SEED PHRASE")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundColor(theme.backgroundColor)
@@ -404,25 +479,143 @@ struct WalletSetupView: View {
                 }
                 .padding(.top, 24)
 
-                // Private key input
-                TextEditor(text: $privateKeyInput)
-                    .font(.system(size: 11, weight: .regular, design: .monospaced))
-                    .foregroundColor(theme.textPrimary)
-                    .frame(height: 100)
-                    .padding(12)
-                    .background(theme.surfaceColor)
-                    .cornerRadius(theme.cornerRadius)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: theme.cornerRadius)
-                            .stroke(theme.borderColor, lineWidth: 1)
-                    )
-                    .padding(.horizontal, 24)
-                    .onAppear {
-                        // Hide default TextEditor background on macOS
-                        #if os(macOS)
-                        NSTextView.appearance(whenContainedInInstancesOf: [NSScrollView.self]).backgroundColor = .clear
-                        #endif
+                // Private key input (hidden by default)
+                ZStack {
+                    if showPrivateKeyInput {
+                        // Visible input
+                        VStack(spacing: 8) {
+                            // Warning banner when visible
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.shield.fill")
+                                    .foregroundColor(theme.warningColor)
+                                Text("KEY VISIBLE - ENSURE PRIVACY")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.warningColor)
+                                Spacer()
+                                Button(action: { showPrivateKeyInput = false }) {
+                                    Image(systemName: "eye.slash")
+                                        .foregroundColor(theme.textSecondary)
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                            }
+                            .padding(10)
+                            .background(theme.warningColor.opacity(0.15))
+                            .cornerRadius(theme.cornerRadius)
+
+                            TextEditor(text: $privateKeyInput)
+                                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                .foregroundColor(theme.textPrimary)
+                                .frame(height: 100)
+                                .padding(12)
+                                .background(theme.surfaceColor)
+                                .cornerRadius(theme.cornerRadius)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                        .stroke(theme.borderColor, lineWidth: 1)
+                                )
+                        }
+                    } else {
+                        // Hidden input with masked display
+                        VStack(spacing: 12) {
+                            // Masked display
+                            HStack {
+                                if privateKeyInput.isEmpty {
+                                    Text("Paste your private key here...")
+                                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                                        .foregroundColor(theme.textSecondary.opacity(0.5))
+                                } else {
+                                    Text(maskedKeyDisplay)
+                                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                                        .foregroundColor(theme.primaryColor)
+                                }
+                                Spacer()
+                            }
+                            .frame(height: 80)
+                            .padding(12)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(theme.cornerRadius)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.borderColor, lineWidth: 1)
+                            )
+                            .onTapGesture {
+                                // Paste from clipboard when tapped
+                                #if os(macOS)
+                                if let clipboardString = NSPasteboard.general.string(forType: .string) {
+                                    privateKeyInput = clipboardString
+                                }
+                                #else
+                                if let clipboardString = UIPasteboard.general.string {
+                                    privateKeyInput = clipboardString
+                                }
+                                #endif
+                            }
+
+                            // Action buttons
+                            HStack(spacing: 12) {
+                                Button(action: {
+                                    #if os(macOS)
+                                    if let clipboardString = NSPasteboard.general.string(forType: .string) {
+                                        privateKeyInput = clipboardString
+                                    }
+                                    #else
+                                    if let clipboardString = UIPasteboard.general.string {
+                                        privateKeyInput = clipboardString
+                                    }
+                                    #endif
+                                }) {
+                                    HStack {
+                                        Image(systemName: "doc.on.clipboard")
+                                        Text("PASTE")
+                                    }
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.primaryColor)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 8)
+                                    .background(theme.surfaceColor)
+                                    .cornerRadius(theme.cornerRadius)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                            .stroke(theme.borderColor, lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(PlainButtonStyle())
+
+                                if !privateKeyInput.isEmpty {
+                                    Button(action: { showPrivateKeyInput = true }) {
+                                        HStack {
+                                            Image(systemName: "eye")
+                                            Text("REVEAL")
+                                        }
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(theme.warningColor)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 8)
+                                        .background(theme.warningColor.opacity(0.15))
+                                        .cornerRadius(theme.cornerRadius)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                                .stroke(theme.warningColor.opacity(0.5), lineWidth: 1)
+                                        )
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
+
+                                    Button(action: { privateKeyInput = "" }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(theme.textSecondary)
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
+                                }
+                            }
+                        }
                     }
+                }
+                .padding(.horizontal, 24)
+                .onAppear {
+                    #if os(macOS)
+                    NSTextView.appearance(whenContainedInInstancesOf: [NSScrollView.self]).backgroundColor = .clear
+                    #endif
+                }
 
                 // Character count / validation
                 let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -441,8 +634,11 @@ struct WalletSetupView: View {
                             .foregroundColor(theme.successColor)
                         Text("Hex format detected")
                             .foregroundColor(theme.successColor)
+                    } else if charCount > 0 {
+                        Text("\(charCount) characters (hidden)")
+                            .foregroundColor(theme.textSecondary)
                     } else {
-                        Text("\(charCount)/338 characters")
+                        Text("Tap to paste from clipboard")
                             .foregroundColor(theme.textSecondary)
                     }
                 }
@@ -473,6 +669,7 @@ struct WalletSetupView: View {
 
                     Button(action: {
                         showImportKey = false
+                        showPrivateKeyInput = false
                         privateKeyInput = ""
                     }) {
                         Text("Cancel")
@@ -485,6 +682,18 @@ struct WalletSetupView: View {
                 .padding(.bottom, 24)
             }
         }
+    }
+
+    // Helper to show masked key
+    private var maskedKeyDisplay: String {
+        let clean = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.count <= 8 {
+            return String(repeating: "•", count: clean.count)
+        }
+        let prefix = String(clean.prefix(4))
+        let suffix = String(clean.suffix(4))
+        let middle = String(repeating: "•", count: min(clean.count - 8, 30))
+        return "\(prefix)\(middle)\(suffix)"
     }
 
     // MARK: - Actions
