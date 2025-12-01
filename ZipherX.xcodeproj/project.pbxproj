@@ -47,7 +47,6 @@
 		52BC66B9631F78F1CFF46212 /* WalletMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D769A0AE4089D10446BFBBCE /* WalletMode.swift */; };
 		53AD3883AF96C239472094A2 /* BalanceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32F58618190CB98DA9E3EB4B /* BalanceView.swift */; };
 		55B0CB3E3A91EF351BAC5427 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119FB9D2179DC1425CABD79E /* NotificationManager.swift */; };
-		58E9D2E66381DCBE91A6FF24 /* CypherpunkLoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BF3A13A4D0E5D00C77BBAF /* CypherpunkLoadingView.swift */; };
 		5914C82375A7F26280EC072B /* SendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0A89DDCE7B836E49AF56B4 /* SendView.swift */; };
 		596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */; };
 		5B9788995FB9227C7F0D5864 /* WalletMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D769A0AE4089D10446BFBBCE /* WalletMode.swift */; };
@@ -61,7 +60,6 @@
 		76CAA651280ABA8925035994 /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */; };
 		76E34B0E07EC1B8587C2BE12 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		772BD4E27BC23CDF88246433 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */; };
-		78450C347B493667DDC82F5B /* CypherpunkLoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BF3A13A4D0E5D00C77BBAF /* CypherpunkLoadingView.swift */; };
 		79B002B28B3284D1D6AEEA57 /* Mac7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7173E7574C060D4285B73B46 /* Mac7Theme.swift */; };
 		7A96BC266309441F5614C1C7 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		7C38AF6C374A0F3FC5A6B5AA /* commitment_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */; };
@@ -151,7 +149,6 @@
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
-		A0BF3A13A4D0E5D00C77BBAF /* CypherpunkLoadingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkLoadingView.swift; sourceTree = "<group>"; };
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
 		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
@@ -316,7 +313,6 @@
 		4B0FBF8C9D7E46913504EAA0 /* Components */ = {
 			isa = PBXGroup;
 			children = (
-				A0BF3A13A4D0E5D00C77BBAF /* CypherpunkLoadingView.swift */,
 				79B539975C988B8093FB4106 /* System7Components.swift */,
 				6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */,
 			);
@@ -625,7 +621,6 @@
 				A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */,
 				ECE7A8EBCC60183A2F686044 /* Checkpoints.swift in Sources */,
 				F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */,
-				78450C347B493667DDC82F5B /* CypherpunkLoadingView.swift in Sources */,
 				C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */,
 				76CAA651280ABA8925035994 /* DebugLogger.swift in Sources */,
 				E844AE91EBA8D86DC8441EC4 /* ExplorerView.swift in Sources */,
@@ -677,7 +672,6 @@
 				36A75F1FA4D8DFF11BDB6137 /* BootstrapProgressView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
 				8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */,
-				58E9D2E66381DCBE91A6FF24 /* CypherpunkLoadingView.swift in Sources */,
 				4349DCD1E3A8528A99795205 /* CypherpunkTheme.swift in Sources */,
 				6EE32FD3ED6A227AA235757E /* DebugLogger.swift in Sources */,
 				8A38BF03B3A4BB357D8C2904 /* ExplorerView.swift in Sources */,

@@ -342,7 +342,7 @@ struct ExplorerView: View {
 
     // MARK: - Address Detail
 
-    private func addressDetailView(_ address: AddressInfo) -> some View {
+    private func addressDetailView(_ address: ExplorerAddressInfo) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             // Header
             HStack {

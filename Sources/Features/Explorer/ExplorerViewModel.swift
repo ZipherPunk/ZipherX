@@ -137,7 +137,7 @@ class ExplorerViewModel: ObservableObject {
     private func searchAddress(_ address: String, isShielded: Bool) async throws -> ExplorerResult {
         if isShielded {
             // Shielded addresses are private - don't expose balance
-            return .address(AddressInfo(
+            return .address(ExplorerAddressInfo(
                 address: address,
                 isShielded: true,
                 balance: nil,
@@ -152,7 +152,7 @@ class ExplorerViewModel: ObservableObject {
         if modeManager.currentMode == .fullNode {
             let rpc = RPCClient.shared
             let balance = try await rpc.getAddressBalance(address)
-            return .address(AddressInfo(
+            return .address(ExplorerAddressInfo(
                 address: address,
                 isShielded: false,
                 balance: balance,
@@ -341,7 +341,7 @@ class ExplorerViewModel: ObservableObject {
         )
     }
 
-    private func fetchAddressFromInsight(address: String) async throws -> AddressInfo {
+    private func fetchAddressFromInsight(address: String) async throws -> ExplorerAddressInfo {
         let url = URL(string: "https://explorer.zcl.zelcore.io/api/addr/\(address)")!
         let (data, _) = try await URLSession.shared.data(from: url)
 
@@ -353,7 +353,7 @@ class ExplorerViewModel: ObservableObject {
         let totalReceived = json["totalReceived"] as? Double
         let txCount = json["txApperances"] as? Int
 
-        return AddressInfo(
+        return ExplorerAddressInfo(
             address: address,
             isShielded: false,
             balance: balance,
@@ -368,7 +368,7 @@ class ExplorerViewModel: ObservableObject {
 enum ExplorerResult {
     case block(BlockInfo)
     case transaction(TransactionInfo)
-    case address(AddressInfo)
+    case address(ExplorerAddressInfo)
 }
 
 struct BlockInfo {
@@ -417,7 +417,7 @@ struct TxIO: Identifiable {
     let value: Double
 }
 
-struct AddressInfo {
+struct ExplorerAddressInfo {
     let address: String
     let isShielded: Bool
     let balance: Double?
