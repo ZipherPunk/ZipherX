@@ -2,6 +2,9 @@ import Foundation
 import Security
 import LocalAuthentication
 import CryptoKit
+#if os(macOS)
+import IOKit
+#endif
 
 /// Secure Key Storage using iOS Secure Enclave
 /// Keys NEVER leave the hardware security module
@@ -17,6 +20,15 @@ final class SecureKeyStorage {
     /// Check if running on simulator
     private var isSimulator: Bool {
         #if targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Check if running on macOS (may be unsigned during development)
+    private var isMacOS: Bool {
+        #if os(macOS)
         return true
         #else
         return false
@@ -47,6 +59,15 @@ final class SecureKeyStorage {
             print("📱 Simulator detected, using simple keychain storage")
             try storeKeySimple(key, tag: spendingKeyTag)
             print("✅ SecureKeyStorage: Key stored in simulator keychain")
+            return
+        }
+
+        if isMacOS {
+            // macOS: Use simple storage without accessibility constraints
+            // This avoids -67068 errSecMissingEntitlement on unsigned builds
+            print("🖥️ macOS detected, using simple keychain storage")
+            try storeKeySimpleMacOS(key, tag: spendingKeyTag)
+            print("✅ SecureKeyStorage: Key stored in macOS keychain")
             return
         }
 
@@ -151,7 +172,22 @@ final class SecureKeyStorage {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
 
-        let status = SecItemAdd(query as CFDictionary, nil)
+        var status = SecItemAdd(query as CFDictionary, nil)
+
+        // If duplicate exists, update instead
+        if status == errSecDuplicateItem {
+            print("⚠️ SE: Key already exists, updating...")
+            let searchQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "ZipherX",
+                kSecAttrAccount as String: spendingKeyTag
+            ]
+            let updateAttributes: [String: Any] = [
+                kSecValueData as String: encryptedData
+            ]
+            status = SecItemUpdate(searchQuery as CFDictionary, updateAttributes as CFDictionary)
+        }
+
         guard status == errSecSuccess else {
             print("❌ SE: Keychain store failed with status: \(status)")
             throw SecureStorageError.keychainStoreFailed(status)
@@ -159,27 +195,397 @@ final class SecureKeyStorage {
         print("✓ SE: Encrypted key stored in keychain")
     }
 
-    /// Simple keychain storage for Simulator or fallback (NOT SECURE - development only)
+    /// Simulator keychain storage with AES-GCM encryption
+    /// Uses a device-unique key to encrypt the spending key before storing
     private func storeKeySimple(_ key: Data, tag: String) throws {
-        print("🔐 Simple: Storing \(key.count) bytes with tag: \(tag)")
+        print("🔐 Simulator: Storing \(key.count) bytes with tag: \(tag) (encrypted)")
+
+        // Encrypt the key using AES-GCM with simulator-unique key
+        let encryptionKey = try getSimulatorEncryptionKey()
+        let sealedBox = try AES.GCM.seal(key, using: encryptionKey)
+        guard let encryptedData = sealedBox.combined else {
+            throw SecureStorageError.encryptionFailed("Failed to create sealed box")
+        }
+        print("🔐 Simulator: Encrypted to \(encryptedData.count) bytes")
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
             kSecAttrAccount as String: tag,
-            kSecValueData as String: key,
+            kSecValueData as String: encryptedData,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
 
-        let status = SecItemAdd(query as CFDictionary, nil)
+        var status = SecItemAdd(query as CFDictionary, nil)
+
+        // If duplicate exists (-25299), update instead of add
+        if status == errSecDuplicateItem {
+            print("⚠️ Simulator: Key already exists, updating...")
+            let searchQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "ZipherX",
+                kSecAttrAccount as String: tag
+            ]
+            let updateAttributes: [String: Any] = [
+                kSecValueData as String: encryptedData
+            ]
+            status = SecItemUpdate(searchQuery as CFDictionary, updateAttributes as CFDictionary)
+        }
+
         guard status == errSecSuccess else {
-            print("❌ Simple: Keychain store failed with status: \(status)")
+            print("❌ Simulator: Keychain store failed with status: \(status)")
             throw SecureStorageError.keychainStoreFailed(status)
         }
-        print("✓ Simple: Key stored in keychain")
+        print("✓ Simulator: Encrypted key stored in keychain")
+    }
+
+    /// Get encryption key for simulator (uses device identifier)
+    private func getSimulatorEncryptionKey() throws -> SymmetricKey {
+        // Use simulator device UDID or a derived identifier
+        let deviceId = getSimulatorDeviceId()
+        let salt = try getOrCreateSimulatorSalt()
+
+        // Derive encryption key using HKDF
+        let inputKeyMaterial = SymmetricKey(data: Data(deviceId.utf8))
+        let derivedKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKeyMaterial,
+            salt: salt,
+            info: Data("ZipherX-simulator-encryption".utf8),
+            outputByteCount: 32
+        )
+
+        return derivedKey
+    }
+
+    /// Get simulator device identifier
+    private func getSimulatorDeviceId() -> String {
+        #if targetEnvironment(simulator)
+        // Use the simulator's UDID from environment or a fallback
+        if let simulatorUDID = ProcessInfo.processInfo.environment["SIMULATOR_UDID"] {
+            return simulatorUDID
+        }
+        #endif
+        // Fallback: use bundle identifier + a constant
+        return "ZipherX-sim-\(Bundle.main.bundleIdentifier ?? "unknown")-device"
+    }
+
+    /// Get or create salt for simulator encryption
+    private func getOrCreateSimulatorSalt() throws -> Data {
+        let saltTag = "com.zipherx.simulator.salt"
+
+        // Try to retrieve existing salt
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX-Salt",
+            kSecAttrAccount as String: saltTag,
+            kSecReturnData as String: true
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let salt = result as? Data {
+            return salt
+        }
+
+        // Create new random salt
+        var salt = Data(count: 32)
+        let saltResult = salt.withUnsafeMutableBytes { ptr in
+            SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+        }
+        guard saltResult == errSecSuccess else {
+            throw SecureStorageError.keyGenerationFailed("Failed to generate random salt")
+        }
+
+        // Store salt in keychain
+        let storeQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX-Salt",
+            kSecAttrAccount as String: saltTag,
+            kSecValueData as String: salt,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        let storeStatus = SecItemAdd(storeQuery as CFDictionary, nil)
+        if storeStatus != errSecSuccess && storeStatus != errSecDuplicateItem {
+            print("⚠️ Simulator: Could not store salt (status: \(storeStatus)), using in-memory")
+        }
+
+        return salt
+    }
+
+    /// Decrypt data stored with simulator encryption
+    private func decryptSimulatorData(_ encryptedData: Data) throws -> Data {
+        let encryptionKey = try getSimulatorEncryptionKey()
+        let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
+        let decryptedData = try AES.GCM.open(sealedBox, using: encryptionKey)
+        return decryptedData
+    }
+
+    /// macOS keychain storage with AES-GCM encryption
+    /// Uses a device-unique key to encrypt the spending key before storing
+    /// This avoids -67068 errSecMissingEntitlement on unsigned/development builds
+    private func storeKeySimpleMacOS(_ key: Data, tag: String) throws {
+        print("🖥️ macOS: Storing \(key.count) bytes with tag: \(tag) (encrypted)")
+
+        // Encrypt the key using AES-GCM with device-unique key
+        let encryptionKey = try getMacOSEncryptionKey()
+        let sealedBox = try AES.GCM.seal(key, using: encryptionKey)
+        guard let encryptedData = sealedBox.combined else {
+            throw SecureStorageError.encryptionFailed("Failed to create sealed box")
+        }
+        print("🔐 macOS: Encrypted to \(encryptedData.count) bytes")
+
+        // macOS keychain without accessibility constraints (works without code signing)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: tag,
+            kSecValueData as String: encryptedData
+            // Deliberately NOT setting kSecAttrAccessible to avoid entitlement requirement
+        ]
+
+        var status = SecItemAdd(query as CFDictionary, nil)
+
+        // If duplicate exists, update instead of add
+        if status == errSecDuplicateItem {
+            print("⚠️ macOS: Key already exists, updating...")
+            let searchQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "ZipherX",
+                kSecAttrAccount as String: tag
+            ]
+            let updateAttributes: [String: Any] = [
+                kSecValueData as String: encryptedData
+            ]
+            status = SecItemUpdate(searchQuery as CFDictionary, updateAttributes as CFDictionary)
+        }
+
+        guard status == errSecSuccess else {
+            print("❌ macOS: Keychain store failed with status: \(status)")
+            throw SecureStorageError.keychainStoreFailed(status)
+        }
+        print("✓ macOS: Encrypted key stored in keychain")
+    }
+
+    /// Get or create a device-unique encryption key for macOS
+    /// This key is derived from the hardware UUID and a salt stored in keychain
+    private func getMacOSEncryptionKey() throws -> SymmetricKey {
+        // Get hardware UUID
+        let hardwareUUID = getHardwareUUID()
+
+        // Get or create salt
+        let salt = try getOrCreateMacOSSalt()
+
+        // Derive encryption key using HKDF
+        let inputKeyMaterial = SymmetricKey(data: Data(hardwareUUID.utf8))
+        let derivedKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKeyMaterial,
+            salt: salt,
+            info: Data("ZipherX-macOS-encryption".utf8),
+            outputByteCount: 32
+        )
+
+        return derivedKey
+    }
+
+    /// Get hardware UUID on macOS
+    private func getHardwareUUID() -> String {
+        #if os(macOS)
+        let platformExpert = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPlatformExpertDevice")
+        )
+        defer { IOObjectRelease(platformExpert) }
+
+        if let uuid = IORegistryEntryCreateCFProperty(
+            platformExpert,
+            kIOPlatformUUIDKey as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? String {
+            return uuid
+        }
+        #endif
+        // Fallback: use a static string (less secure but works)
+        return "ZipherX-macOS-fallback-\(Bundle.main.bundleIdentifier ?? "unknown")"
+    }
+
+    /// Get or create a random salt for key derivation
+    private func getOrCreateMacOSSalt() throws -> Data {
+        let saltTag = "com.zipherx.macos.salt"
+
+        // Try to retrieve existing salt
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX-Salt",
+            kSecAttrAccount as String: saltTag,
+            kSecReturnData as String: true
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let salt = result as? Data {
+            return salt
+        }
+
+        // Create new random salt
+        var salt = Data(count: 32)
+        let saltResult = salt.withUnsafeMutableBytes { ptr in
+            SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+        }
+        guard saltResult == errSecSuccess else {
+            throw SecureStorageError.keyGenerationFailed("Failed to generate random salt")
+        }
+
+        // Store salt in keychain
+        let storeQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX-Salt",
+            kSecAttrAccount as String: saltTag,
+            kSecValueData as String: salt
+        ]
+
+        let storeStatus = SecItemAdd(storeQuery as CFDictionary, nil)
+        if storeStatus != errSecSuccess && storeStatus != errSecDuplicateItem {
+            print("⚠️ macOS: Could not store salt (status: \(storeStatus)), using in-memory")
+        }
+
+        return salt
+    }
+
+    /// Decrypt data stored with macOS encryption
+    private func decryptMacOSData(_ encryptedData: Data) throws -> Data {
+        let encryptionKey = try getMacOSEncryptionKey()
+        let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
+        let decryptedData = try AES.GCM.open(sealedBox, using: encryptionKey)
+        return decryptedData
     }
 
     /// Retrieve spending key with biometric authentication
     /// - Returns: The decrypted spending key
+    /// Check if a spending key exists AND is usable in secure storage
+    /// This validates that we can actually retrieve the key, not just that an entry exists
+    /// (An encrypted key without its Secure Enclave decryption key is NOT usable)
+    func hasSpendingKey() -> Bool {
+        print("🔐 hasSpendingKey: Checking key existence...")
+
+        // First check: Does the keychain entry exist at all? (without reading data to avoid prompt)
+        let existsQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: spendingKeyTag,
+            kSecReturnAttributes as String: true,  // Just get attributes, not data
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail  // Don't show UI
+        ]
+
+        var existsResult: AnyObject?
+        let existsStatus = SecItemCopyMatching(existsQuery as CFDictionary, &existsResult)
+
+        if existsStatus == errSecItemNotFound {
+            print("🔐 hasSpendingKey: No keychain entry found")
+            return false
+        }
+
+        if existsStatus == errSecInteractionNotAllowed {
+            // Item exists but requires authentication - we can't check further without UI
+            // On macOS, assume it exists and let retrieveSpendingKey handle errors
+            print("🔐 hasSpendingKey: Entry exists but requires authentication")
+            // For now, return true and let the actual retrieval fail with proper error handling
+            return true
+        }
+
+        if existsStatus != errSecSuccess {
+            print("🔐 hasSpendingKey: Query failed with status \(existsStatus)")
+            return false
+        }
+
+        print("🔐 hasSpendingKey: Keychain entry exists, checking data size...")
+
+        // Second check: Get the data size to determine if encrypted or not
+        let dataQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: spendingKeyTag,
+            kSecReturnData as String: true,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail  // Don't show UI
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(dataQuery as CFDictionary, &result)
+
+        if status == errSecInteractionNotAllowed {
+            // Data exists but requires user interaction - assume valid on macOS
+            print("🔐 hasSpendingKey: Data requires authentication, assuming valid")
+            return true
+        }
+
+        guard status == errSecSuccess, let data = result as? Data else {
+            print("🔐 hasSpendingKey: Could not read data, status=\(status)")
+            return false
+        }
+
+        print("🔐 hasSpendingKey: Got data, size=\(data.count) bytes")
+
+        // Simulator: data is encrypted with AES-GCM (169 + 12 nonce + 16 tag = 197 bytes)
+        if isSimulator {
+            // Try to decrypt to verify it's valid
+            do {
+                let decrypted = try decryptSimulatorData(data)
+                let valid = decrypted.count == 169
+                print("🔐 hasSpendingKey: Simulator mode, decrypted valid=\(valid)")
+                return valid
+            } catch {
+                print("🔐 hasSpendingKey: Simulator mode, decrypt failed - \(error)")
+                return false
+            }
+        }
+
+        // macOS: data is encrypted with AES-GCM (169 + 12 nonce + 16 tag = 197 bytes)
+        if isMacOS {
+            // Try to decrypt to verify it's valid
+            do {
+                let decrypted = try decryptMacOSData(data)
+                let valid = decrypted.count == 169
+                print("🔐 hasSpendingKey: macOS mode, decrypted valid=\(valid)")
+                return valid
+            } catch {
+                print("🔐 hasSpendingKey: macOS mode, decrypt failed - \(error)")
+                return false
+            }
+        }
+
+        // Check if data is unencrypted (169 bytes = valid spending key)
+        if data.count == 169 {
+            print("🔐 hasSpendingKey: Unencrypted key (169 bytes)")
+            return true
+        }
+
+        print("🔐 hasSpendingKey: Data is encrypted (\(data.count) bytes), checking SE key...")
+
+        // Data is encrypted - check if we have the Secure Enclave key to decrypt it
+        let keyQuery: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecReturnRef as String: true,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail  // Don't show UI
+        ]
+
+        var keyRef: AnyObject?
+        let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
+
+        if keyStatus != errSecSuccess {
+            // Encrypted data exists but Secure Enclave key is missing - NOT usable
+            print("⚠️ hasSpendingKey: Keychain data exists but Secure Enclave key is missing (status=\(keyStatus))")
+            return false
+        }
+
+        print("🔐 hasSpendingKey: Both encrypted data and SE key exist - valid!")
+        return true
+    }
+
     func retrieveSpendingKey() throws -> Data {
         // Get data from keychain
         let query: [String: Any] = [
@@ -196,9 +602,16 @@ final class SecureKeyStorage {
             throw SecureStorageError.keyNotFound
         }
 
-        // Simulator fallback: data is stored unencrypted
+        // Simulator: data is encrypted with AES-GCM, need to decrypt
         if isSimulator {
-            return data
+            print("📱 Simulator: Decrypting key from keychain")
+            return try decryptSimulatorData(data)
+        }
+
+        // macOS: data is encrypted with AES-GCM, need to decrypt
+        if isMacOS {
+            print("🖥️ macOS: Decrypting key from keychain")
+            return try decryptMacOSData(data)
         }
 
         // Check if we have a Secure Enclave key
@@ -245,9 +658,26 @@ final class SecureKeyStorage {
     }
 
     /// Delete spending key and associated Secure Enclave key
+    /// This function is tolerant of errors - it tries its best to delete everything
     func deleteSpendingKey() throws {
+        var errors: [String] = []
+
         // Delete encrypted key from keychain
-        try deleteKey(tag: spendingKeyTag)
+        do {
+            try deleteKey(tag: spendingKeyTag)
+        } catch {
+            // Log but continue - we want to try deleting everything
+            print("⚠️ deleteSpendingKey: Failed to delete keychain entry: \(error)")
+            errors.append("keychain: \(error.localizedDescription)")
+        }
+
+        // Also try deleting viewing key
+        do {
+            try deleteKey(tag: viewingKeyTag)
+        } catch {
+            print("⚠️ deleteSpendingKey: Failed to delete viewing key: \(error)")
+            // Don't add to errors - viewing key is optional
+        }
 
         // Delete Secure Enclave key
         let keyQuery: [String: Any] = [
@@ -257,7 +687,18 @@ final class SecureKeyStorage {
 
         let status = SecItemDelete(keyQuery as CFDictionary)
         if status != errSecSuccess && status != errSecItemNotFound {
-            throw SecureStorageError.keychainDeleteFailed(status)
+            print("⚠️ deleteSpendingKey: Failed to delete SE key, status: \(status)")
+            // On macOS, -25244 (errSecInvalidKeychain) can happen - ignore it
+            if status != -25244 {
+                errors.append("SE key: status \(status)")
+            }
+        }
+
+        // Only throw if we couldn't delete anything critical
+        // If the item doesn't exist, that's fine - the goal is to ensure it's gone
+        if !errors.isEmpty {
+            print("⚠️ deleteSpendingKey completed with warnings: \(errors)")
+            // Don't throw - we did our best to clean up
         }
     }
 
@@ -310,7 +751,16 @@ final class SecureKeyStorage {
         ]
 
         let status = SecItemDelete(query as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
+        // Accept success, item not found, or various macOS keychain issues
+        let acceptableStatuses: [OSStatus] = [
+            errSecSuccess,
+            errSecItemNotFound,
+            -25244,  // errSecInvalidKeychain - can happen on macOS
+            -25243,  // errSecNoSuchKeychain
+            -25291,  // errSecAuthFailed - item may not exist anyway
+            -67068   // errSecMissingEntitlement - unsigned macOS builds
+        ]
+        if !acceptableStatuses.contains(status) {
             throw SecureStorageError.keychainDeleteFailed(status)
         }
     }

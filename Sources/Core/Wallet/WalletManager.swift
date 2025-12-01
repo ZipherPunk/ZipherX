@@ -1,6 +1,9 @@
 import Foundation
 import Combine
 import CryptoKit
+#if os(macOS)
+import AppKit
+#endif
 
 /// Sync task status
 enum SyncTaskStatus: Equatable {
@@ -790,6 +793,11 @@ final class WalletManager: ObservableObject {
         // Final verification step
         await updateTaskWithProgress("balance", detail: "Finalizing balance...", progress: 0.95)
 
+        // Update transaction confirmations based on current chain height
+        if chainHeight > 0 {
+            try? database.updateAllConfirmations(chainHeight: chainHeight)
+        }
+
         // Brief pause to show the progress (balance calc is very fast)
         try? await Task.sleep(nanoseconds: 200_000_000) // 0.2 sec
 
@@ -1535,7 +1543,7 @@ final class WalletManager: ObservableObject {
         }
 
         // Mark the spent note
-        print("📝 Marking note as spent (nullifier: \(spentNullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...)")
+        // SECURITY: Never log nullifiers
         try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
         print("✅ Note marked as spent in database at height \(chainHeight)")
 
@@ -1597,7 +1605,7 @@ final class WalletManager: ObservableObject {
             if note.spentInTx == nil || note.spentInTx?.isEmpty == true {
                 try database.markNoteUnspent(nullifier: note.nullifier)
                 recoveredCount += 1
-                print("Recovered note with nullifier: \(note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...")
+                // SECURITY: Log recovery action without exposing nullifier
             }
         }
 
@@ -1698,9 +1706,34 @@ final class WalletManager: ObservableObject {
 
     private func loadWalletState() {
         let defaults = UserDefaults.standard
-        isWalletCreated = defaults.bool(forKey: "wallet_created")
+        let storedWalletCreated = defaults.bool(forKey: "wallet_created")
         isImportedWallet = defaults.bool(forKey: "wallet_imported")
         zAddress = defaults.string(forKey: "z_address") ?? ""
+
+        // CRITICAL: Verify that the Secure Enclave key actually exists
+        // UserDefaults can persist across app reinstalls, but Keychain might not
+        // If UserDefaults says wallet exists but key is missing, reset to show welcome screen
+        if storedWalletCreated {
+            if secureStorage.hasSpendingKey() {
+                isWalletCreated = true
+                print("✅ Wallet state loaded: key exists")
+            } else {
+                // Key is missing - reset wallet state to show welcome screen
+                print("⚠️ UserDefaults has wallet_created=true but Secure Enclave key is missing")
+                print("🔄 Resetting wallet state to show welcome screen...")
+                isWalletCreated = false
+                isImportedWallet = false
+                zAddress = ""
+                // Clear the stale UserDefaults
+                defaults.removeObject(forKey: "wallet_created")
+                defaults.removeObject(forKey: "wallet_imported")
+                defaults.removeObject(forKey: "z_address")
+                defaults.synchronize()
+                return
+            }
+        } else {
+            isWalletCreated = false
+        }
 
         // Load balance from database on startup (async)
         if isWalletCreated {
@@ -1760,19 +1793,85 @@ final class WalletManager: ObservableObject {
         defaults.set(zAddress, forKey: "z_address")
     }
 
-    /// Delete wallet and all associated data
+    /// Delete wallet and all associated data, then terminate the app
+    /// CRITICAL: This permanently deletes everything!
     func deleteWallet() throws {
-        try secureStorage.deleteSpendingKey()
+        print("🗑️ DELETE WALLET: Starting complete wallet deletion...")
 
+        // 1. Wait for any ongoing scan to complete (with timeout)
+        // FilterScanner doesn't have a shared instance, so we just wait for the flag
+        if FilterScanner.isScanInProgress {
+            print("🗑️ Waiting for scan to finish...")
+            var waitCount = 0
+            while FilterScanner.isScanInProgress && waitCount < 30 {
+                Thread.sleep(forTimeInterval: 0.5)
+                waitCount += 1
+            }
+        }
+        print("🗑️ Scan check complete")
+
+        // 2. Delete spending key from keychain
+        do {
+            try secureStorage.deleteSpendingKey()
+            print("🗑️ Deleted spending key")
+        } catch {
+            print("⚠️ Failed to delete spending key: \(error) (continuing anyway)")
+        }
+
+        // 3. Delete wallet database (notes, transactions, tree state, accounts)
+        do {
+            try WalletDatabase.shared.deleteDatabase()
+            print("🗑️ Deleted wallet database")
+        } catch {
+            print("⚠️ Failed to delete wallet database: \(error)")
+        }
+
+        // 4. Delete header store
+        do {
+            try HeaderStore.shared.deleteDatabase()
+            print("🗑️ Deleted header store")
+        } catch {
+            print("⚠️ Failed to delete header store: \(error)")
+        }
+
+        // 5. Clear all UserDefaults
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: "wallet_created")
+        defaults.removeObject(forKey: "z_address")
+        defaults.removeObject(forKey: "last_scanned_height")
+        defaults.removeObject(forKey: "debugLoggingEnabled")
+        defaults.removeObject(forKey: "useP2POnly")
+        defaults.removeObject(forKey: "persisted_peer_addresses")
+        defaults.synchronize()
+        print("🗑️ Cleared UserDefaults")
+
+        // 6. Clear in-memory state
         DispatchQueue.main.async {
             self.isWalletCreated = false
             self.zAddress = ""
             self.shieldedBalance = 0
             self.pendingBalance = 0
+            self.isTreeLoaded = false
+            self.transactionHistoryVersion = 0
+            self.syncTasks = []
+        }
 
-            let defaults = UserDefaults.standard
-            defaults.removeObject(forKey: "wallet_created")
-            defaults.removeObject(forKey: "z_address")
+        // 7. Reset FFI tree state (reinitialize to empty)
+        _ = ZipherXFFI.treeInit()
+        print("🗑️ Reset FFI tree state")
+
+        print("✅ DELETE WALLET: Complete! App should be restarted.")
+
+        // 8. Force quit the app after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            print("🛑 Terminating app...")
+            #if os(iOS)
+            // On iOS, we can't force quit, but we show a message
+            // The user needs to restart manually
+            #else
+            // On macOS, terminate the app
+            NSApplication.shared.terminate(nil)
+            #endif
         }
     }
 

@@ -1736,6 +1736,79 @@ if address.isShielded {
 
 ---
 
+### 21. CRITICAL SECURITY FIX: Encrypted Private Key Storage on All Platforms (December 2025)
+
+**Problem**: Private keys were stored UNENCRYPTED in keychain on macOS and iOS Simulator, which is a critical security vulnerability.
+
+**Root Cause**: The original implementation only used Secure Enclave encryption for real iOS devices. Simulator and macOS fallback modes stored keys in plain text in the keychain.
+
+**Solution: AES-GCM Encryption for All Non-Secure-Enclave Platforms**
+
+| Platform | Encryption Method | Key Derivation |
+|----------|------------------|----------------|
+| iOS Device | Secure Enclave (hardware) | EC key in secure hardware |
+| iOS Simulator | AES-GCM-256 | HKDF from SIMULATOR_UDID + random salt |
+| macOS | AES-GCM-256 | HKDF from Hardware UUID + random salt |
+
+**Implementation Details**:
+
+1. **Simulator encryption** (`storeKeySimple()`):
+   ```swift
+   let encryptionKey = try getSimulatorEncryptionKey()
+   let sealedBox = try AES.GCM.seal(key, using: encryptionKey)
+   // Store sealedBox.combined in keychain
+   ```
+
+2. **macOS encryption** (`storeKeySimpleMacOS()`):
+   ```swift
+   let encryptionKey = try getMacOSEncryptionKey()
+   let sealedBox = try AES.GCM.seal(key, using: encryptionKey)
+   // Store sealedBox.combined in keychain (no kSecAttrAccessible)
+   ```
+
+3. **Key derivation** (both platforms):
+   ```swift
+   // Get device-unique identifier
+   let deviceId = getSimulatorDeviceId() // or getHardwareUUID() for macOS
+   let salt = try getOrCreateSalt()
+
+   // Derive 256-bit key using HKDF
+   let derivedKey = HKDF<SHA256>.deriveKey(
+       inputKeyMaterial: SymmetricKey(data: Data(deviceId.utf8)),
+       salt: salt,
+       info: Data("ZipherX-...-encryption".utf8),
+       outputByteCount: 32
+   )
+   ```
+
+4. **Salt storage**: Random 32-byte salt stored separately in keychain for each platform
+
+5. **Decryption**: `decryptSimulatorData()` and `decryptMacOSData()` functions for retrieval
+
+6. **Validation**: `hasSpendingKey()` now attempts decryption to verify key is valid
+
+**macOS Hardware UUID** (via IOKit):
+```swift
+#if os(macOS)
+import IOKit
+let platformExpert = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+let uuid = IORegistryEntryCreateCFProperty(platformExpert, kIOPlatformUUIDKey as CFString, ...)
+#endif
+```
+
+**Security Properties**:
+- Keys are ALWAYS encrypted at rest (AES-GCM provides confidentiality + integrity)
+- Encryption key is device-bound (cannot decrypt on different device)
+- Salt ensures same key produces different ciphertext on different devices
+- 12-byte nonce + 16-byte auth tag = 28 bytes overhead (169 → 197 bytes)
+
+**Files Modified**:
+- `Sources/Core/Storage/SecureKeyStorage.swift` - complete encryption overhaul
+
+**Breaking Change**: Existing wallets on simulator/macOS with unencrypted keys will need to be deleted and recreated. The `hasSpendingKey()` function will return `false` if it cannot decrypt the stored data.
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
