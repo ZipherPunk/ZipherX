@@ -124,6 +124,56 @@ final class InsightAPI {
         return false
     }
 
+    // MARK: - Broadcasting
+
+    /// Broadcast a raw transaction via InsightAPI
+    /// - Parameter rawTx: Raw transaction bytes
+    /// - Returns: Transaction ID (txid) as hex string
+    /// - Throws: InsightError.broadcastFailed if the API rejects the transaction
+    func broadcastTransaction(_ rawTx: Data) async throws -> String {
+        let url = URL(string: "\(baseURL)/api/tx/send")!
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        // Convert raw tx to hex string for JSON body
+        let rawTxHex = rawTx.hexString
+        let body = ["rawtx": rawTxHex]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        print("📡 Broadcasting transaction via InsightAPI (\(rawTx.count) bytes)...")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        // Check HTTP status
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode != 200 {
+                // Try to parse error message
+                if let errorStr = String(data: data, encoding: .utf8) {
+                    print("❌ InsightAPI broadcast error: \(errorStr)")
+                    throw InsightError.broadcastFailed(errorStr)
+                }
+                throw InsightError.broadcastFailed("HTTP \(httpResponse.statusCode)")
+            }
+        }
+
+        // Parse response - expects {"txid": "..."}
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let txid = json["txid"] as? String else {
+            // Some APIs return just the txid string directly
+            if let txidStr = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               txidStr.count == 64 {
+                print("✅ Transaction broadcast via InsightAPI: \(txidStr)")
+                return txidStr
+            }
+            throw InsightError.invalidData
+        }
+
+        print("✅ Transaction broadcast via InsightAPI: \(txid)")
+        return txid
+    }
+
     /// Get raw transaction
     func getRawTransaction(txid: String) async throws -> Data {
         let url = URL(string: "\(baseURL)/api/rawtx/\(txid)")!
@@ -424,11 +474,14 @@ enum InsightError: LocalizedError {
     case networkError
     case notFound
     case transactionRejected(String)
+    case broadcastFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidData:
             return "Invalid data from API"
+        case .broadcastFailed(let reason):
+            return "Broadcast failed: \(reason)"
         case .networkError:
             return "Network error"
         case .notFound:

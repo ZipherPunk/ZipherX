@@ -25,10 +25,14 @@ enum SendProgressStatus: Equatable {
 }
 
 /// Send View - Send shielded ZCL transactions (z-to-z only!)
-/// Classic Macintosh System 7 design
+/// Themed design
 struct SendView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var themeManager: ThemeManager
+
+    // Theme shortcut
+    private var theme: AppTheme { themeManager.currentTheme }
 
     @State private var recipientAddress = ""
     @State private var amount = ""
@@ -50,34 +54,36 @@ struct SendView: View {
 
     var body: some View {
         ZStack {
-            VStack(spacing: 16) {
-                // Recipient address
-                addressField
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Recipient address
+                    addressField
 
-                // Amount
-                amountField
+                    // Amount
+                    amountField
 
-                // Memo (optional)
-                memoField
+                    // Memo (optional)
+                    memoField
 
-                // Available balance
-                availableBalance
+                    // Available balance
+                    availableBalance
 
-                // Send button
-                System7Button(title: isSending ? "Sending..." : "Send ZCL") {
-                    validateAndConfirm()
+                    // Send button
+                    System7Button(title: isSending ? "Sending..." : "Send ZCL") {
+                        validateAndConfirm()
+                    }
+                    .disabled(isSending || !isValidInput)
                 }
-                .disabled(isSending || !isValidInput)
-
-                Spacer()
+                .padding()
             }
-            .padding()
 
             // Progress overlay when sending
             if isSending {
                 sendProgressOverlay
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.backgroundColor)
         .alert("Confirm Transaction", isPresented: $showConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Send") {
@@ -87,67 +93,103 @@ struct SendView: View {
             Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
         }
         .sheet(isPresented: $showSuccess) {
-            VStack(spacing: 16) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 50))
-                    .foregroundColor(.green)
+            // Cypherpunk-style success screen with dark background and green fluo
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-                Text("Transaction Sent!")
-                    .font(System7Theme.titleFont(size: 16))
+                VStack(spacing: 20) {
+                    // Glowing checkmark
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 60))
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.4)) // Bright fluo green
+                        .shadow(color: Color(red: 0, green: 1, blue: 0.4).opacity(0.8), radius: 20)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Transaction ID:")
-                        .font(System7Theme.bodyFont(size: 10))
-                        .foregroundColor(System7Theme.darkGray)
+                    Text("TRANSACTION BROADCAST")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.4))
+                        .shadow(color: Color(red: 0, green: 1, blue: 0.4).opacity(0.5), radius: 5)
 
-                    Text(txId)
-                        .font(System7Theme.monoFont(size: 9))
-                        .padding(8)
-                        .background(System7Theme.white)
-                        .overlay(
-                            Rectangle()
-                                .stroke(System7Theme.black, lineWidth: 1)
-                        )
-                        .lineLimit(3)
-                }
-                .padding(.horizontal)
+                    Text("Your shielded transaction has been sent to the network.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(Color.green.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
 
-                HStack(spacing: 12) {
-                    Button(action: {
-                        copyToClipboard(txId)
-                    }) {
-                        HStack {
-                            Image(systemName: "doc.on.doc")
-                            Text("Copy TxID")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TXID:")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(Color.green.opacity(0.6))
+
+                        Text(txId)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(Color(red: 0, green: 1, blue: 0.4)) // Fluo green
+                            .padding(12)
+                            .frame(maxWidth: .infinity)
+                            .background(Color.green.opacity(0.1))
+                            .overlay(
+                                Rectangle()
+                                    .stroke(Color(red: 0, green: 1, blue: 0.4).opacity(0.5), lineWidth: 1)
+                            )
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.7)
+                    }
+                    .padding(.horizontal, 20)
+
+                    HStack(spacing: 16) {
+                        // Copy button - cypherpunk style
+                        Button(action: {
+                            #if os(iOS)
+                            UIPasteboard.general.string = txId
+                            // Haptic feedback
+                            let generator = UIImpactFeedbackGenerator(style: .medium)
+                            generator.impactOccurred()
+                            #elseif os(macOS)
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(txId, forType: .string)
+                            #endif
+                        }) {
+                            HStack {
+                                Image(systemName: "doc.on.doc")
+                                Text("COPY TXID")
+                            }
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color(red: 0, green: 1, blue: 0.4))
+                            .cornerRadius(4)
                         }
-                        .font(System7Theme.bodyFont(size: 11))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                    }
-                    .background(System7Theme.lightGray)
-                    .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
-                    )
 
-                    Button(action: {
-                        showSuccess = false
-                        clearForm()
-                    }) {
-                        Text("Done")
-                            .font(System7Theme.bodyFont(size: 11))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
+                        // Done button
+                        Button(action: {
+                            showSuccess = false
+                            clearForm()
+                        }) {
+                            Text("DONE")
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(Color(red: 0, green: 1, blue: 0.4))
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 10)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(Color(red: 0, green: 1, blue: 0.4), lineWidth: 1)
+                                )
+                        }
                     }
-                    .background(System7Theme.lightGray)
-                    .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
-                    )
+                    .padding(.top, 10)
+
+                    // Cypherpunk quote
+                    Text("\"Privacy is necessary for an open society.\"")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(Color.green.opacity(0.3))
+                        .italic()
+                        .padding(.top, 10)
                 }
+                .padding(30)
             }
-            .padding(24)
-            .background(System7Theme.lightGray)
+            #if os(macOS)
+            .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 450)
+            #endif
         }
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
@@ -160,8 +202,8 @@ struct SendView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("Recipient Address (z-address only)")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
 
                 Spacer()
 
@@ -174,44 +216,36 @@ struct SendView: View {
                         Image(systemName: "qrcode.viewfinder")
                             .font(.system(size: 12))
                         Text("Scan")
-                            .font(System7Theme.bodyFont(size: 9))
+                            .font(theme.captionFont)
                     }
-                    .foregroundColor(System7Theme.black)
+                    .foregroundColor(theme.buttonText)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(System7Theme.lightGray)
+                    .background(theme.buttonBackground)
                     .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                     )
+                    .cornerRadius(theme.cornerRadius)
                 }
                 .buttonStyle(.plain)
                 #endif
             }
 
             TextField("zs1...", text: $recipientAddress)
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.black)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textPrimary)
+                #if os(iOS)
                 .autocapitalization(.none)
+                #endif
                 .disableAutocorrection(true)
                 .padding(8)
-                .background(System7Theme.white)
+                .background(theme.surfaceColor)
                 .overlay(
-                    Rectangle()
-                        .stroke(addressBorderColor, lineWidth: 1)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(addressBorderColor, lineWidth: theme.borderWidth)
                 )
-                .overlay(
-                    Rectangle()
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [System7Theme.darkGray, System7Theme.white],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                        .padding(1)
-                )
+                .cornerRadius(theme.cornerRadius)
                 .onChange(of: recipientAddress) { newValue in
                     // Validate on change but only call FFI when address looks complete
                     if newValue.isEmpty {
@@ -281,13 +315,13 @@ struct SendView: View {
 
     private var addressBorderColor: Color {
         if recipientAddress.isEmpty {
-            return System7Theme.black
+            return theme.borderColor
         } else if isAddressTransparent {
-            return .red
+            return theme.errorColor
         } else if isAddressValid {
-            return .green
+            return theme.successColor
         } else {
-            return .orange
+            return theme.warningColor
         }
     }
 
@@ -296,133 +330,116 @@ struct SendView: View {
         if isAddressTransparent {
             HStack(spacing: 4) {
                 Image(systemName: "xmark.circle.fill")
-                    .foregroundColor(.red)
+                    .foregroundColor(theme.errorColor)
                 Text("t-addresses not allowed! ZipherX is z-only.")
-                    .foregroundColor(.red)
+                    .foregroundColor(theme.errorColor)
             }
-            .font(System7Theme.bodyFont(size: 9))
+            .font(theme.captionFont)
         } else if isAddressValid {
             HStack(spacing: 4) {
                 Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(.green)
+                    .foregroundColor(theme.successColor)
                 Text("Valid shielded address")
-                    .foregroundColor(.green)
+                    .foregroundColor(theme.successColor)
             }
-            .font(System7Theme.bodyFont(size: 9))
+            .font(theme.captionFont)
         } else {
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
+                    .foregroundColor(theme.warningColor)
                 Text("Invalid address format")
-                    .foregroundColor(.orange)
+                    .foregroundColor(theme.warningColor)
             }
-            .font(System7Theme.bodyFont(size: 9))
+            .font(theme.captionFont)
         }
     }
 
     private var amountField: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Amount (ZCL)")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
 
             HStack {
                 TextField("0.00000000", text: $amount)
-                    .font(System7Theme.bodyFont(size: 11))
-                    .foregroundColor(System7Theme.black)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+                    #if os(iOS)
                     .keyboardType(.decimalPad)
+                    #endif
                     .padding(8)
-                    .background(System7Theme.white)
+                    .background(theme.surfaceColor)
                     .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                     )
-                    .overlay(
-                        Rectangle()
-                            .strokeBorder(
-                                LinearGradient(
-                                    colors: [System7Theme.darkGray, System7Theme.white],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                lineWidth: 1
-                            )
-                            .padding(1)
-                    )
+                    .cornerRadius(theme.cornerRadius)
 
                 // Max button
                 Button(action: setMaxAmount) {
                     Text("Max")
-                        .font(System7Theme.bodyFont(size: 9))
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.buttonText)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                 }
-                .background(System7Theme.lightGray)
+                .background(theme.buttonBackground)
                 .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                 )
+                .cornerRadius(theme.cornerRadius)
             }
 
             // Fee notice
             Text("Network fee: 0.0001 ZCL")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
         }
     }
 
     private var memoField: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Encrypted Memo (optional)")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
 
             TextField("Private message...", text: $memo)
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.black)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textPrimary)
                 .padding(8)
-                .background(System7Theme.white)
+                .background(theme.surfaceColor)
                 .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                 )
-                .overlay(
-                    Rectangle()
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [System7Theme.darkGray, System7Theme.white],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                        .padding(1)
-                )
+                .cornerRadius(theme.cornerRadius)
 
             Text("Memo is encrypted end-to-end")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
         }
     }
 
     private var availableBalance: some View {
         HStack {
             Text("Available:")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
 
             Spacer()
 
             Text("\(formatBalance(walletManager.shieldedBalance)) ZCL")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.black)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textPrimary)
         }
         .padding(8)
-        .background(System7Theme.lightGray)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
 
     // MARK: - Validation
@@ -650,32 +667,32 @@ struct SendView: View {
                     switch step.status {
                     case .pending:
                         Image(systemName: "circle")
-                            .foregroundColor(System7Theme.darkGray)
+                            .foregroundColor(theme.textSecondary)
                     case .inProgress:
                         ProgressView()
                             .scaleEffect(0.6)
                     case .completed:
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
+                            .foregroundColor(theme.successColor)
                     case .failed:
                         Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.red)
+                            .foregroundColor(theme.errorColor)
                     }
                 }
                 .frame(width: 16, height: 16)
 
                 // Step title
                 Text(step.title)
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(step.status == .pending ? System7Theme.darkGray : System7Theme.black)
+                    .font(theme.captionFont)
+                    .foregroundColor(step.status == .pending ? theme.textSecondary : theme.textPrimary)
 
                 Spacer()
 
                 // Detail text
                 if let detail = step.detail {
                     Text(detail)
-                        .font(System7Theme.bodyFont(size: 9))
-                        .foregroundColor(System7Theme.darkGray)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                         .lineLimit(1)
                 }
             }
@@ -684,13 +701,13 @@ struct SendView: View {
             if let progress = step.progress, progress > 0 && step.status == .inProgress {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
-                        Rectangle()
-                            .fill(System7Theme.white)
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .fill(theme.surfaceColor)
                             .frame(height: 8)
-                            .overlay(Rectangle().stroke(System7Theme.black, lineWidth: 1))
+                            .overlay(RoundedRectangle(cornerRadius: theme.cornerRadius).stroke(theme.borderColor, lineWidth: theme.borderWidth))
 
-                        Rectangle()
-                            .fill(Color.blue.opacity(0.7))
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .fill(theme.primaryColor)
                             .frame(width: geometry.size.width * min(progress, 1.0), height: 6)
                             .padding(.leading, 1)
                             .padding(.top, 1)
@@ -703,8 +720,8 @@ struct SendView: View {
             // Error message
             if case .failed(let error) = step.status {
                 Text(error)
-                    .font(System7Theme.bodyFont(size: 8))
-                    .foregroundColor(.red)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.errorColor)
                     .lineLimit(2)
                     .padding(.leading, 24)
             }
@@ -723,6 +740,7 @@ struct SendView: View {
     SendView()
         .environmentObject(WalletManager.shared)
         .environmentObject(NetworkManager.shared)
+        .environmentObject(ThemeManager.shared)
 }
 
 // MARK: - QR Scanner View (iOS only)

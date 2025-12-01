@@ -521,7 +521,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chris.zipherx.dev.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZipherX.app/ZipherX";
@@ -537,7 +537,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chris.zipherx.dev.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ZipherX.app/ZipherX";
@@ -551,6 +551,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 4YD8RW93H4;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -567,7 +568,8 @@
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = "-lresolv";
-				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chris.zipherx.dev;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
@@ -584,6 +586,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = ZipherX.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 4YD8RW93H4;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -600,7 +603,8 @@
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = "-lresolv";
-				PRODUCT_BUNDLE_IDENTIFIER = com.zipherx.wallet;
+				PRODUCT_BUNDLE_IDENTIFIER = com.chris.zipherx.dev;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;

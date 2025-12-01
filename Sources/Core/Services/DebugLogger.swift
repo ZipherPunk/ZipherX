@@ -1,7 +1,23 @@
 import Foundation
+import os.log
 #if canImport(UIKit)
 import UIKit
 #endif
+
+// MARK: - OSLog Logger for Device Debugging
+private let zipherxLog = OSLog(subsystem: "com.zipherx.wallet", category: "debug")
+
+// MARK: - Global Print Override
+// Override Swift's print to use os_log for device visibility
+
+/// Global print override - uses os_log for reliable device logging
+public func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    // Use os_log for device visibility (shows in Console.app and Xcode)
+    os_log("%{public}@", log: zipherxLog, type: .default, "DEBUGZIPHERX: \(output)")
+    // Also print to stdout for simulator
+    Swift.print("DEBUGZIPHERX: \(output)", terminator: terminator)
+}
 
 /// Debug logging system that writes to a file for export
 /// Enable/disable via Settings or UserDefaults "debugLoggingEnabled"
@@ -43,9 +59,10 @@ final class DebugLogger {
     }
 
     /// Log a message with timestamp
+    /// All logs are prefixed with "DEBUGZIPHERX" for easy filtering in Xcode console
     func log(_ message: String, file: String = #file, function: String = #function, line: Int = #line) {
-        // Always print to console
-        print(message)
+        // Always print to console with DEBUGZIPHERX prefix for filtering
+        print("DEBUGZIPHERX: \(message)")
 
         // Only write to file if enabled
         guard isEnabled else { return }

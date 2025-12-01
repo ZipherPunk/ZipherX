@@ -63,6 +63,9 @@ struct BalanceView: View {
                 TransactionDetailView(transaction: tx)
                     .environmentObject(themeManager)
                     .environmentObject(networkManager)
+                    #if os(macOS)
+                    .frame(minWidth: 500, idealWidth: 550, minHeight: 500, idealHeight: 600)
+                    #endif
             }
         }
         .onAppear {

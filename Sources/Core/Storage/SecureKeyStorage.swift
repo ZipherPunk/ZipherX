@@ -24,28 +24,83 @@ final class SecureKeyStorage {
     }
 
     /// Store spending key with Secure Enclave protection
-    /// Falls back to simple keychain storage on Simulator
+    /// Falls back to simple keychain storage on Simulator or if Secure Enclave fails
     /// - Parameter key: The spending key data to store
     func storeSpendingKey(_ key: Data) throws {
+        print("🔐 SecureKeyStorage: Starting key storage (\(key.count) bytes)")
+
         // Delete existing key if present
-        try? deleteKey(tag: spendingKeyTag)
+        print("🔐 SecureKeyStorage: Deleting any existing key...")
+        let deleteResult = deleteKeyInternal(tag: spendingKeyTag)
+        print("🔐 SecureKeyStorage: Delete existing key result: \(deleteResult)")
+
+        // Also delete any existing Secure Enclave key to avoid orphaned keys
+        let oldKeyQuery: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!
+        ]
+        let seDeleteStatus = SecItemDelete(oldKeyQuery as CFDictionary)
+        print("🔐 SecureKeyStorage: Delete Secure Enclave key status: \(seDeleteStatus)")
 
         if isSimulator {
             // Simulator fallback: store directly in keychain (NOT SECURE - dev only!)
+            print("📱 Simulator detected, using simple keychain storage")
             try storeKeySimple(key, tag: spendingKeyTag)
+            print("✅ SecureKeyStorage: Key stored in simulator keychain")
             return
         }
 
-        // Create access control with biometric protection
+        // Try Secure Enclave first, fall back to simple keychain if it fails
+        do {
+            print("🔐 SecureKeyStorage: Attempting Secure Enclave storage...")
+            try storeKeyWithSecureEnclave(key)
+            print("✅ SecureKeyStorage: Key stored with Secure Enclave protection")
+        } catch {
+            // Secure Enclave failed (maybe no biometrics enrolled)
+            // Fall back to simple keychain storage
+            print("⚠️ SecureKeyStorage: Secure Enclave failed: \(error.localizedDescription)")
+            print("📱 SecureKeyStorage: Falling back to keychain storage (less secure)")
+            try storeKeySimple(key, tag: spendingKeyTag)
+            print("✅ SecureKeyStorage: Key stored in fallback keychain")
+        }
+    }
+
+    /// Internal delete that returns status for debugging
+    private func deleteKeyInternal(tag: String) -> OSStatus {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: tag
+        ]
+        return SecItemDelete(query as CFDictionary)
+    }
+
+    /// Store key using Secure Enclave (may throw if biometrics not available)
+    private func storeKeyWithSecureEnclave(_ key: Data) throws {
+        // Check if biometrics are available (for logging only)
+        let context = LAContext()
+        var authError: NSError?
+        let biometricsAvailable = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError)
+        print("🔐 SE: Biometrics available: \(biometricsAvailable), error: \(authError?.localizedDescription ?? "none")")
+
+        // Create access control - DO NOT require biometrics for key access
+        // Biometric auth is handled at the UI level (SendView) before transactions
+        // This allows startup/sync without Face ID prompts
         var error: Unmanaged<CFError>?
+        let accessFlags: SecAccessControlCreateFlags = [.privateKeyUsage]
+        print("🔐 SE: Using access flags: \(accessFlags.rawValue) (no biometric requirement)")
+
         guard let accessControl = SecAccessControlCreateWithFlags(
             kCFAllocatorDefault,
             kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            [.privateKeyUsage, .biometryCurrentSet],
+            accessFlags,
             &error
         ) else {
-            throw SecureStorageError.accessControlCreationFailed(error?.takeRetainedValue().localizedDescription ?? "Unknown error")
+            let errorMsg = error?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            print("❌ SE: Access control creation failed: \(errorMsg)")
+            throw SecureStorageError.accessControlCreationFailed(errorMsg)
         }
+        print("✓ SE: Access control created")
 
         // Generate a Secure Enclave key for encryption
         let attributes: [String: Any] = [
@@ -61,13 +116,18 @@ final class SecureKeyStorage {
 
         var keyError: Unmanaged<CFError>?
         guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &keyError) else {
-            throw SecureStorageError.keyGenerationFailed(keyError?.takeRetainedValue().localizedDescription ?? "Unknown error")
+            let errorMsg = keyError?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            print("❌ SE: Key generation failed: \(errorMsg)")
+            throw SecureStorageError.keyGenerationFailed(errorMsg)
         }
+        print("✓ SE: Secure Enclave key generated")
 
         // Encrypt the spending key with the Secure Enclave key
         guard let publicKey = SecKeyCopyPublicKey(privateKey) else {
+            print("❌ SE: Failed to extract public key")
             throw SecureStorageError.publicKeyExtractionFailed
         }
+        print("✓ SE: Public key extracted")
 
         var encryptError: Unmanaged<CFError>?
         guard let encryptedData = SecKeyCreateEncryptedData(
@@ -76,8 +136,11 @@ final class SecureKeyStorage {
             key as CFData,
             &encryptError
         ) else {
-            throw SecureStorageError.encryptionFailed(encryptError?.takeRetainedValue().localizedDescription ?? "Unknown error")
+            let errorMsg = encryptError?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            print("❌ SE: Encryption failed: \(errorMsg)")
+            throw SecureStorageError.encryptionFailed(errorMsg)
         }
+        print("✓ SE: Data encrypted (\(CFDataGetLength(encryptedData)) bytes)")
 
         // Store encrypted spending key in keychain
         let query: [String: Any] = [
@@ -90,12 +153,15 @@ final class SecureKeyStorage {
 
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
+            print("❌ SE: Keychain store failed with status: \(status)")
             throw SecureStorageError.keychainStoreFailed(status)
         }
+        print("✓ SE: Encrypted key stored in keychain")
     }
 
-    /// Simple keychain storage for Simulator (NOT SECURE - development only)
+    /// Simple keychain storage for Simulator or fallback (NOT SECURE - development only)
     private func storeKeySimple(_ key: Data, tag: String) throws {
+        print("🔐 Simple: Storing \(key.count) bytes with tag: \(tag)")
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
@@ -106,8 +172,10 @@ final class SecureKeyStorage {
 
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
+            print("❌ Simple: Keychain store failed with status: \(status)")
             throw SecureStorageError.keychainStoreFailed(status)
         }
+        print("✓ Simple: Key stored in keychain")
     }
 
     /// Retrieve spending key with biometric authentication
@@ -133,26 +201,34 @@ final class SecureKeyStorage {
             return data
         }
 
-        // Real device: data is encrypted, need Secure Enclave to decrypt
-        let encryptedData = data
-
-        // Get Secure Enclave private key for decryption
+        // Check if we have a Secure Enclave key
+        // NOTE: Do NOT use kSecUseOperationPrompt here - that would trigger Face ID
+        // Face ID should only be required for SENDING transactions, not reading
         let keyQuery: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-            kSecReturnRef as String: true,
-            kSecUseOperationPrompt as String: "Authenticate to access your wallet"
+            kSecReturnRef as String: true
         ]
 
         var keyRef: AnyObject?
         let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
 
-        guard keyStatus == errSecSuccess else {
+        // If no Secure Enclave key exists, the data is stored unencrypted (fallback mode)
+        if keyStatus != errSecSuccess {
+            // Check if the data looks like a valid spending key (169 bytes for extended spending key)
+            // If it's 169 bytes, it's likely unencrypted (simple keychain fallback)
+            if data.count == 169 {
+                print("📱 Using fallback keychain storage (no Secure Enclave key)")
+                return data
+            }
+            // Otherwise it might be encrypted but we lost the key - this is bad
             throw SecureStorageError.secureEnclaveKeyNotFound
         }
 
+        // Real device with Secure Enclave: data is encrypted, need to decrypt
         let privateKey = keyRef as! SecKey
+        let encryptedData = data
 
         // Decrypt the spending key
         var decryptError: Unmanaged<CFError>?

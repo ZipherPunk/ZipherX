@@ -7,37 +7,43 @@ import AppKit
 #endif
 
 /// Receive View - Display z-address and QR code
-/// Classic Macintosh System 7 design
+/// Themed design
 struct ReceiveView: View {
     @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var themeManager: ThemeManager
     @State private var showCopied = false
     @State private var showExportAlert = false
     @State private var exportedKey = ""
 
+    // Theme shortcut
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
-        VStack(spacing: 16) {
-            // QR Code
-            qrCodeSection
+        ScrollView {
+            VStack(spacing: 16) {
+                // QR Code
+                qrCodeSection
 
-            // Address display
-            addressSection
+                // Address display
+                addressSection
 
-            // Copy button
-            System7Button(title: "Copy Address") {
-                copyAddress()
+                // Copy button
+                System7Button(title: "Copy Address") {
+                    copyAddress()
+                }
+
+                // Export key button
+                System7Button(title: "Export Private Key") {
+                    exportKey()
+                }
+
+                // Privacy notice
+                privacyNotice
             }
-
-            // Export key button
-            System7Button(title: "Export Private Key") {
-                exportKey()
-            }
-
-            // Privacy notice
-            privacyNotice
-
-            Spacer()
+            .padding()
         }
-        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.backgroundColor)
         .overlay(
             copiedToast
         )
@@ -54,8 +60,8 @@ struct ReceiveView: View {
     private var qrCodeSection: some View {
         VStack(spacing: 8) {
             Text("Scan to Receive ZCL")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
 
             System7QRCode(data: walletManager.zAddress)
                 .frame(width: 180, height: 180)
@@ -65,45 +71,33 @@ struct ReceiveView: View {
     private var addressSection: some View {
         VStack(spacing: 8) {
             Text("Your Shielded Address")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
 
             // Address in a scrollable text box
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(walletManager.zAddress)
-                    .font(System7Theme.bodyFont(size: 9))
-                    .foregroundColor(System7Theme.black)
+                    .font(theme.monoFont)
+                    .foregroundColor(theme.textPrimary)
                     .lineLimit(1)
             }
             .padding(8)
             .frame(maxWidth: .infinity)
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
-                Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
             )
-            .overlay(
-                // Sunken effect (inset field)
-                Rectangle()
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [System7Theme.darkGray, System7Theme.white],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-                    .padding(1)
-            )
+            .cornerRadius(theme.cornerRadius)
 
             // Address type indicator
             HStack(spacing: 4) {
                 Image(systemName: "checkmark.shield.fill")
                     .font(.system(size: 10))
                 Text("z-address (Sapling)")
-                    .font(System7Theme.bodyFont(size: 9))
+                    .font(theme.captionFont)
             }
-            .foregroundColor(System7Theme.black)
+            .foregroundColor(theme.textPrimary)
         }
     }
 
@@ -113,21 +107,23 @@ struct ReceiveView: View {
                 Image(systemName: "info.circle")
                     .font(.system(size: 10))
                 Text("Privacy Note")
-                    .font(System7Theme.titleFont(size: 10))
+                    .font(theme.titleFont)
             }
+            .foregroundColor(theme.textPrimary)
 
             Text("This address provides full privacy. Transactions are encrypted and cannot be traced.")
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(System7Theme.lightGray)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
+        .cornerRadius(theme.cornerRadius)
     }
 
     private var copiedToast: some View {
@@ -137,15 +133,17 @@ struct ReceiveView: View {
                     Spacer()
 
                     Text("Address Copied!")
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
-                        .background(System7Theme.white)
+                        .background(theme.surfaceColor)
                         .overlay(
-                            Rectangle()
-                                .stroke(System7Theme.black, lineWidth: 2)
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: 2)
                         )
+                        .cornerRadius(theme.cornerRadius)
+                        .shadow(color: theme.shadowColor, radius: theme.usesShadows ? 5 : 0)
 
                     Spacer()
                         .frame(height: 40)
@@ -195,4 +193,5 @@ struct ReceiveView: View {
 #Preview {
     ReceiveView()
         .environmentObject(WalletManager.shared)
+        .environmentObject(ThemeManager.shared)
 }

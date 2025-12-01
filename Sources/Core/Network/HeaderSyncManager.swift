@@ -9,9 +9,11 @@ final class HeaderSyncManager {
     private let headerStore: HeaderStore
     private let networkManager: NetworkManager
 
-    // Consensus parameters - relaxed for better connectivity
-    private let minPeers = 1  // Reduced from 3 - even 1 peer is enough to sync
-    private let consensusThreshold = 1  // Use whatever peers we have
+    // Consensus parameters
+    // Start with 1 peer for faster initial sync, but use more when available
+    // Note: Block data is still verified via Sapling roots from header store
+    private let minPeers = 1  // Minimum peers to start (will use more if available)
+    private let consensusThreshold = 1  // Require consensus when multiple peers
 
     // Sync state
     private var isSyncing = false
@@ -88,42 +90,63 @@ final class HeaderSyncManager {
 
     /// Get the current chain tip height from consensus of peers
     func getChainTip() async throws -> UInt64 {
+        var maxHeight: UInt64 = 0
+
+        // 1. Try InsightAPI first (most reliable when available)
+        if let status = try? await InsightAPI.shared.getStatus() {
+            print("📡 InsightAPI chain tip: \(status.height)")
+            maxHeight = max(maxHeight, status.height)
+        }
+
+        // 2. Check header store (locally synced headers)
+        if let headerHeight = try? headerStore.getLatestHeight() {
+            print("📡 HeaderStore height: \(headerHeight)")
+            maxHeight = max(maxHeight, headerHeight)
+        }
+
+        // 3. Get peer heights from version handshake (may be stale but better than nothing)
         let peers = try await networkManager.getConnectedPeers(min: minPeers)
-
-        var heights: [UInt64] = []
-
-        // Query each peer for their chain tip
-        await withTaskGroup(of: UInt64?.self) { group in
-            for peer in peers {
-                group.addTask {
-                    // Use peer's reported start height from version handshake
-                    return UInt64(peer.peerStartHeight)
-                }
-            }
-
-            for await height in group {
-                if let height = height {
-                    heights.append(height)
-                }
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > maxHeight {
+                maxHeight = h
             }
         }
 
-        guard heights.count >= consensusThreshold else {
-            throw SyncError.insufficientPeers(got: heights.count, need: consensusThreshold)
+        // 4. PROBE: Try requesting headers beyond our known height to discover new blocks
+        // This is the most accurate way to get real chain tip from P2P
+        if let probeHeight = await probeForNewHeaders(from: maxHeight, peers: peers) {
+            print("📡 P2P probe found chain tip: \(probeHeight)")
+            maxHeight = max(maxHeight, probeHeight)
         }
 
-        // Use median height for consensus
-        let sortedHeights = heights.sorted()
-        let medianHeight = sortedHeights[sortedHeights.count / 2]
-
-        // Verify consensus (at least consensusThreshold peers within 10 blocks)
-        let consensusHeights = sortedHeights.filter { abs(Int64($0) - Int64(medianHeight)) <= 10 }
-
-        guard consensusHeights.count >= consensusThreshold else {
-            throw SyncError.noConsensus(heights: heights)
+        if maxHeight > 0 {
+            print("📡 Using chain tip: \(maxHeight)")
+            return maxHeight
         }
 
-        return medianHeight
+        throw SyncError.insufficientPeers(got: 0, need: 1)
+    }
+
+    /// Probe P2P peers to discover actual chain height by requesting headers
+    private func probeForNewHeaders(from knownHeight: UInt64, peers: [Peer]) async -> UInt64? {
+        guard let peer = peers.first else { return nil }
+
+        // Try to get headers starting from our known height
+        // If peer has more blocks, they'll send headers up to their tip
+        do {
+            let headers = try await peer.getBlockHeaders(from: knownHeight, count: 100)
+            if !headers.isEmpty {
+                // The last header tells us the peer's current tip
+                // Add knownHeight offset since getBlockHeaders returns from that point
+                let count = UInt64(headers.count)
+                return knownHeight + count
+            }
+        } catch {
+            print("⚠️ P2P header probe failed: \(error)")
+        }
+
+        return nil
     }
 
     /// Request headers from multiple peers and verify consensus

@@ -33,14 +33,17 @@ enum ZclassicCheckpoints {
         // Recent checkpoints for faster sync
         2900000: "0000000000recentcheckpoint2900000placeholder0123456789abcdef",
         2916559: "0000000000bootstrap20251120checkpoint0123456789abcdef01234567",
+        // Bundled tree checkpoint (must match bundledTreeHeight in FilterScanner/WalletManager)
+        2926122: "000004496018943355cdf6c313e2aac3f3356bb7f31a31d1a5b5b582dfe594ef",
     ]
 
     /// Sapling activation height on Zclassic mainnet
     static let saplingActivationHeight: UInt64 = 558000
 
-    /// Recent checkpoint for faster initial sync (from bootstrap)
+    /// Recent checkpoint for faster initial sync (from bundled tree)
     /// New wallets will start scanning from here instead of Sapling activation
-    static let recentCheckpointHeight: UInt64 = 2916559
+    /// MUST match bundledTreeHeight in FilterScanner.swift and WalletManager.swift
+    static let recentCheckpointHeight: UInt64 = 2926122
 
     /// Network upgrade heights
     static let overwinterActivationHeight: UInt64 = 352000

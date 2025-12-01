@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalAuthentication
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -8,8 +9,11 @@ import AppKit
 
 // MARK: - Classic Mac Window
 struct System7Window<Content: View>: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let title: String
     let content: Content
+
+    private var theme: AppTheme { themeManager.currentTheme }
 
     init(title: String, @ViewBuilder content: () -> Content) {
         self.title = title
@@ -20,21 +24,21 @@ struct System7Window<Content: View>: View {
         VStack(spacing: 0) {
             // Title bar
             HStack {
-                // Close box - white fill with black border for visibility
-                Rectangle()
-                    .fill(System7Theme.white)
+                // Close box
+                RoundedRectangle(cornerRadius: theme.cornerRadius / 2)
+                    .fill(theme.surfaceColor)
                     .frame(width: 12, height: 12)
                     .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: theme.cornerRadius / 2)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                     )
                     .padding(.leading, 8)
 
                 Spacer()
 
                 Text(title)
-                    .font(System7Theme.titleFont(size: 12))
-                    .foregroundColor(System7Theme.black)
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
@@ -44,46 +48,57 @@ struct System7Window<Content: View>: View {
                     .frame(width: 12, height: 12)
                     .padding(.trailing, 8)
             }
-            .frame(height: 20)
+            .frame(height: 24)
             .background(
-                // Title bar stripes
-                HStack(spacing: 1) {
-                    ForEach(0..<50, id: \.self) { _ in
-                        Rectangle()
-                            .fill(System7Theme.black)
-                            .frame(width: 1)
-                    }
-                }
-                .opacity(0.3)
+                // Title bar gradient/pattern based on theme
+                theme.hasRetroStyling ?
+                    AnyView(
+                        HStack(spacing: 1) {
+                            ForEach(0..<50, id: \.self) { _ in
+                                Rectangle()
+                                    .fill(theme.borderColor)
+                                    .frame(width: 1)
+                            }
+                        }
+                        .opacity(0.3)
+                    )
+                    : AnyView(
+                        LinearGradient(
+                            colors: [theme.surfaceColor, theme.backgroundColor],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
             )
-            .background(System7Theme.white)
+            .background(theme.surfaceColor)
             .overlay(
-                Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
             )
 
             // Content area
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(System7Theme.white)
+                .background(theme.surfaceColor)
                 .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                 )
         }
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
+        .cornerRadius(theme.cornerRadius)
+        .shadow(color: theme.shadowColor, radius: theme.usesShadows ? 5 : 0)
     }
 }
 
 // MARK: - Menu Bar
 struct System7MenuBar: View {
+    @EnvironmentObject var themeManager: ThemeManager
     @State private var showQuote = false
     @State private var currentQuote: (quote: String, author: String) = ("", "")
     @State private var appleGlow: Bool = false
 
-    // Zipherpunk neon green color
-    private let neonGreen = Color(red: 0, green: 1, blue: 0.25)
-    private let neonGreenDark = Color(red: 0, green: 0.7, blue: 0.15)
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         HStack {
@@ -94,11 +109,11 @@ struct System7MenuBar: View {
                 showQuote = true
             }) {
                 ZStack {
-                    // Glow effect
+                    // Glow effect (always use accent color for glow)
                     if appleGlow {
                         Image(systemName: "apple.logo")
                             .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(neonGreen)
+                            .foregroundColor(theme.primaryColor)
                             .blur(radius: 4)
                             .opacity(0.6)
                     }
@@ -106,8 +121,8 @@ struct System7MenuBar: View {
                     // Main icon
                     Image(systemName: "apple.logo")
                         .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(appleGlow ? neonGreen : neonGreenDark)
-                        .shadow(color: neonGreen.opacity(appleGlow ? 0.8 : 0.3), radius: appleGlow ? 6 : 2)
+                        .foregroundColor(appleGlow ? theme.primaryColor : theme.primaryColor.opacity(0.7))
+                        .shadow(color: theme.primaryColor.opacity(appleGlow ? 0.8 : 0.3), radius: appleGlow ? 6 : 2)
                 }
                 .frame(width: 44, height: 44) // Larger tap target
                 .contentShape(Rectangle())
@@ -115,11 +130,13 @@ struct System7MenuBar: View {
             .padding(.leading, 8) // Extra left padding for edge accessibility
 
             Text("File")
-                .font(System7Theme.titleFont(size: 12))
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
                 .padding(.horizontal, 8)
 
             Text("Edit")
-                .font(System7Theme.titleFont(size: 12))
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
                 .padding(.horizontal, 8)
 
             Spacer()
@@ -127,14 +144,15 @@ struct System7MenuBar: View {
             // Network status
             Image(systemName: "network")
                 .font(.system(size: 12))
+                .foregroundColor(theme.textPrimary)
                 .padding(.horizontal, 8)
         }
         .frame(height: 28) // Slightly taller for better tap area
-        .background(System7Theme.white)
+        .background(theme.surfaceColor)
         .overlay(
             Rectangle()
-                .frame(height: 1)
-                .foregroundColor(System7Theme.black),
+                .frame(height: theme.borderWidth)
+                .foregroundColor(theme.borderColor),
             alignment: .bottom
         )
         .alert("Privacy Quote", isPresented: $showQuote) {
@@ -153,55 +171,94 @@ struct System7MenuBar: View {
 
 // MARK: - Tab Button
 struct System7TabButton: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let title: String
     let isSelected: Bool
     let action: () -> Void
 
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.black)
+                .font(theme.bodyFont)
+                .foregroundColor(isSelected ? theme.textPrimary : theme.textSecondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
         }
-        .background(isSelected ? System7Theme.white : System7Theme.lightGray)
+        .background(isSelected ? theme.surfaceColor : theme.backgroundColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
         .overlay(
-            // Raised/sunken effect
-            Rectangle()
-                .strokeBorder(
-                    LinearGradient(
-                        colors: isSelected
-                            ? [System7Theme.darkGray, System7Theme.white]
-                            : [System7Theme.white, System7Theme.darkGray],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
+            // Raised/sunken effect for retro themes
+            theme.hasRetroStyling ?
+                AnyView(
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: isSelected
+                                    ? [theme.textSecondary.opacity(0.5), theme.surfaceColor]
+                                    : [theme.surfaceColor, theme.textSecondary.opacity(0.5)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                        .padding(1)
                 )
-                .padding(1)
+                : AnyView(EmptyView())
         )
+        .cornerRadius(theme.cornerRadius)
+        .shadow(color: isSelected && theme.usesShadows ? theme.shadowColor : .clear, radius: 2)
     }
 }
 
 // MARK: - Classic Button
 struct System7Button: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let title: String
     let action: () -> Void
     @State private var isPressed = false
 
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.black)
-                .system7ButtonStyle(isPressed: isPressed)
+                .font(theme.bodyFont)
+                .foregroundColor(theme.buttonText)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(isPressed ? theme.buttonBackground.opacity(0.8) : theme.buttonBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                )
+                .overlay(
+                    // 3D effect for retro themes
+                    theme.hasRetroStyling ?
+                        AnyView(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .strokeBorder(
+                                    LinearGradient(
+                                        colors: isPressed
+                                            ? [theme.textSecondary.opacity(0.5), theme.surfaceColor]
+                                            : [theme.surfaceColor, theme.textSecondary.opacity(0.5)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    ),
+                                    lineWidth: 1
+                                )
+                                .padding(1)
+                        )
+                        : AnyView(EmptyView())
+                )
+                .cornerRadius(theme.cornerRadius)
+                .shadow(color: theme.usesShadows && !isPressed ? theme.shadowColor : .clear, radius: 2, y: 1)
         }
         .buttonStyle(PlainButtonStyle())
         .onLongPressGesture(minimumDuration: .infinity, pressing: { pressing in
@@ -212,50 +269,63 @@ struct System7Button: View {
 
 // MARK: - Text Field
 struct System7TextField: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let placeholder: String
     @Binding var text: String
 
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
         TextField(placeholder, text: $text)
-            .font(System7Theme.bodyFont(size: 11))
-            .padding(8)
-            .background(System7Theme.white)
+            .font(theme.bodyFont)
+            .foregroundColor(theme.textPrimary)
+            .padding(10)
+            .background(theme.surfaceColor)
             .overlay(
-                Rectangle()
-                    .stroke(System7Theme.black, lineWidth: 1)
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
             )
             .overlay(
-                Rectangle()
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [System7Theme.darkGray, System7Theme.white],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
+                // Inset effect for retro themes
+                theme.hasRetroStyling ?
+                    AnyView(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .strokeBorder(
+                                LinearGradient(
+                                    colors: [theme.textSecondary.opacity(0.3), theme.surfaceColor],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: 1
+                            )
+                            .padding(1)
                     )
-                    .padding(1)
+                    : AnyView(EmptyView())
             )
+            .cornerRadius(theme.cornerRadius)
     }
 }
 
 // MARK: - Progress Bar
 struct System7ProgressBar: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let progress: Double
+
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(System7Theme.white)
+                RoundedRectangle(cornerRadius: theme.cornerRadius / 2)
+                    .fill(theme.backgroundColor)
                     .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.black, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: theme.cornerRadius / 2)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                     )
 
-                Rectangle()
-                    .fill(System7Theme.black)
-                    .frame(width: geometry.size.width * progress)
+                RoundedRectangle(cornerRadius: theme.cornerRadius / 2)
+                    .fill(theme.primaryColor)
+                    .frame(width: max(0, geometry.size.width * progress - 4))
                     .padding(2)
             }
         }
@@ -265,6 +335,7 @@ struct System7ProgressBar: View {
 
 // MARK: - Alert/Dialog
 struct System7Alert: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let title: String
     let message: String
     let primaryButton: String
@@ -272,22 +343,24 @@ struct System7Alert: View {
     let primaryAction: () -> Void
     let secondaryAction: (() -> Void)?
 
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
         VStack(spacing: 16) {
             HStack(alignment: .top, spacing: 16) {
                 // Alert icon
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 32))
-                    .foregroundColor(System7Theme.black)
+                    .foregroundColor(theme.warningColor)
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text(title)
-                        .font(System7Theme.titleFont(size: 12))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.titleFont)
+                        .foregroundColor(theme.textPrimary)
 
                     Text(message)
-                        .font(System7Theme.bodyFont(size: 11))
-                        .foregroundColor(System7Theme.black)
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -302,17 +375,22 @@ struct System7Alert: View {
             }
         }
         .padding(20)
-        .background(System7Theme.lightGray)
+        .background(theme.surfaceColor)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 2)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: 2)
         )
+        .cornerRadius(theme.cornerRadius)
+        .shadow(color: theme.shadowColor, radius: theme.usesShadows ? 10 : 0)
     }
 }
 
 // MARK: - QR Code View (for Receive)
 struct System7QRCode: View {
+    @EnvironmentObject var themeManager: ThemeManager
     let data: String
+
+    private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         if let qrImage = generateQRCode(from: data) {
@@ -322,29 +400,32 @@ struct System7QRCode: View {
                 .resizable()
                 .scaledToFit()
                 .padding(8)
-                .background(System7Theme.white)
+                .background(Color.white) // QR codes need white background for scanning
                 .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                 )
+                .cornerRadius(theme.cornerRadius)
             #elseif os(macOS)
             Image(nsImage: qrImage)
                 .interpolation(.none)
                 .resizable()
                 .scaledToFit()
                 .padding(8)
-                .background(System7Theme.white)
+                .background(Color.white) // QR codes need white background for scanning
                 .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
                 )
+                .cornerRadius(theme.cornerRadius)
             #endif
         } else {
-            Rectangle()
-                .fill(System7Theme.lightGray)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .fill(theme.backgroundColor)
                 .overlay(
                     Text("QR Error")
-                        .font(System7Theme.bodyFont())
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.errorColor)
                 )
         }
     }
@@ -1000,6 +1081,538 @@ struct CypherpunkSyncTaskRow: View {
     }
 }
 
+// MARK: - Cypherpunk Main View
+
+/// Cypherpunk-themed main wallet interface
+/// Single screen with balance, send/receive buttons, and transaction history
+struct CypherpunkMainView: View {
+    @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var themeManager: ThemeManager
+    @Binding var showSettings: Bool
+    @Binding var showSend: Bool
+    @Binding var showReceive: Bool
+
+    @State private var transactions: [TransactionHistoryItem] = []
+    @State private var isLoadingHistory = true
+    @State private var selectedTransaction: TransactionHistoryItem?
+    @State private var glitchOffset: CGFloat = 0
+    @State private var showGlitch: Bool = false
+    @State private var previousBalance: UInt64 = 0
+    @State private var showFireworks = false
+    @State private var fireworksAmount: Double = 0
+
+    // Matrix green colors
+    private let matrixGreen = Color(red: 0, green: 1, blue: 0.25)
+    private let matrixGreenDark = Color(red: 0, green: 0.7, blue: 0.2)
+    private let matrixGreenDarker = Color(red: 0, green: 0.4, blue: 0.1)
+
+    private let glitchTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        ZStack {
+            // Dark background with subtle matrix pattern
+            Color.black
+                .ignoresSafeArea()
+
+            // Matrix rain effect (subtle background)
+            MatrixRainBackground()
+                .opacity(0.15)
+
+            VStack(spacing: 0) {
+                // Top bar with settings gear
+                topBar
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+
+                Spacer()
+                    .frame(height: 20)
+
+                // Balance section (centered and prominent)
+                balanceSection
+                    .padding(.horizontal, 20)
+
+                Spacer()
+                    .frame(height: 30)
+
+                // Send / Receive buttons
+                actionButtons
+                    .padding(.horizontal, 20)
+
+                Spacer()
+                    .frame(height: 24)
+
+                // Transaction history
+                transactionHistory
+                    .frame(maxHeight: .infinity)
+
+                // Network status bar at bottom
+                networkStatusBar
+            }
+
+            // Fireworks overlay
+            if showFireworks {
+                FireworksView(isShowing: $showFireworks, amount: fireworksAmount)
+                    .transition(.opacity)
+                    .zIndex(100)
+            }
+        }
+        .sheet(item: $selectedTransaction) { transaction in
+            TransactionDetailView(transaction: transaction)
+                .environmentObject(themeManager)
+                .environmentObject(networkManager)
+        }
+        .onAppear {
+            previousBalance = walletManager.shieldedBalance
+            loadTransactionHistory()
+        }
+        .onChange(of: walletManager.shieldedBalance) { newValue in
+            if newValue != previousBalance {
+                loadTransactionHistory()
+            }
+            // Detect incoming ZCL
+            if newValue > previousBalance && previousBalance > 0 {
+                let increase = newValue - previousBalance
+                fireworksAmount = Double(increase) / 100_000_000.0
+                withAnimation {
+                    showFireworks = true
+                }
+            }
+            previousBalance = newValue
+        }
+        .onReceive(glitchTimer) { _ in
+            if Bool.random() && Double.random(in: 0...1) < 0.05 {
+                showGlitch = true
+                glitchOffset = CGFloat.random(in: -3...3)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    showGlitch = false
+                    glitchOffset = 0
+                }
+            }
+        }
+    }
+
+    // MARK: - Top Bar
+
+    private var topBar: some View {
+        HStack {
+            // Network indicator
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(networkManager.isConnected ? matrixGreen : Color.red)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
+
+                Text("\(networkManager.connectedPeers) PEERS")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(matrixGreenDark)
+            }
+
+            Spacer()
+
+            // App title
+            Text("ZIPHERX")
+                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                .foregroundColor(matrixGreen)
+                .tracking(2)
+
+            Spacer()
+
+            // Settings gear button
+            Button(action: { showSettings = true }) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 22))
+                    .foregroundColor(matrixGreen)
+                    .shadow(color: matrixGreen.opacity(0.5), radius: 4)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+    }
+
+    // MARK: - Balance Section
+
+    private var balanceSection: some View {
+        VStack(spacing: 8) {
+            // "BALANCE" label
+            Text("SHIELDED BALANCE")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(matrixGreenDark)
+                .tracking(3)
+
+            // Main ZCL balance with glitch effect
+            ZStack {
+                Text(formatBalance(walletManager.shieldedBalance))
+                    .font(.system(size: 48, weight: .bold, design: .monospaced))
+                    .foregroundColor(matrixGreen)
+                    .shadow(color: matrixGreen.opacity(0.8), radius: 10)
+                    .offset(x: showGlitch ? glitchOffset : 0)
+
+                if showGlitch {
+                    Text(formatBalance(walletManager.shieldedBalance))
+                        .font(.system(size: 48, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color.cyan.opacity(0.5))
+                        .offset(x: -glitchOffset)
+                }
+            }
+
+            // ZCL label
+            Text("ZCL")
+                .font(.system(size: 16, weight: .bold, design: .monospaced))
+                .foregroundColor(matrixGreenDark)
+
+            // USD value (placeholder - would need price feed)
+            Text("≈ $\(formatUSDValue()) USD")
+                .font(.system(size: 14, design: .monospaced))
+                .foregroundColor(matrixGreenDarker)
+
+            // Privacy badge
+            HStack(spacing: 6) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 10))
+                Text("FULLY SHIELDED")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .tracking(1)
+            }
+            .foregroundColor(matrixGreenDark)
+            .padding(.top, 4)
+
+            // Pending balance
+            if walletManager.pendingBalance > 0 {
+                HStack(spacing: 4) {
+                    Text("PENDING:")
+                        .font(.system(size: 10, design: .monospaced))
+                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(Color.yellow)
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    // MARK: - Action Buttons
+
+    private var actionButtons: some View {
+        HStack(spacing: 16) {
+            // SEND button
+            Button(action: { showSend = true }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 20))
+                    Text("SEND")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(
+                    LinearGradient(
+                        colors: [matrixGreen, matrixGreenDark],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .cornerRadius(8)
+                .shadow(color: matrixGreen.opacity(0.5), radius: 8)
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            // RECEIVE button
+            Button(action: { showReceive = true }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 20))
+                    Text("RECEIVE")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(matrixGreen)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Color.black)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(matrixGreen, lineWidth: 2)
+                )
+                .cornerRadius(8)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+    }
+
+    // MARK: - Transaction History
+
+    private var transactionHistory: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("TRANSACTION HISTORY")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(matrixGreenDark)
+                    .tracking(2)
+
+                Spacer()
+
+                if isLoadingHistory {
+                    ProgressView()
+                        .scaleEffect(0.6)
+                        .tint(matrixGreen)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+
+            // Divider
+            Rectangle()
+                .fill(matrixGreenDarker)
+                .frame(height: 1)
+
+            // Transaction list
+            if transactions.isEmpty && !isLoadingHistory {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "doc.text")
+                        .font(.system(size: 32))
+                        .foregroundColor(matrixGreenDarker)
+                    Text("NO TRANSACTIONS YET")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(matrixGreenDarker)
+                    Spacer()
+                }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(transactions, id: \.txidString) { tx in
+                            transactionRow(tx)
+                                .onTapGesture {
+                                    selectedTransaction = tx
+                                }
+                        }
+                    }
+                }
+            }
+        }
+        .background(Color.black.opacity(0.5))
+    }
+
+    private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
+        HStack(spacing: 12) {
+            // Direction icon
+            Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(tx.type == .received ? matrixGreen : Color.orange)
+                .frame(width: 24)
+
+            // Details
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tx.type == .received ? "RECEIVED" : "SENT")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(tx.type == .received ? matrixGreen : Color.orange)
+
+                if let date = tx.dateString {
+                    Text(date)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(matrixGreenDarker)
+                }
+            }
+
+            Spacer()
+
+            // Amount
+            Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.4f", tx.valueInZCL))")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(tx.type == .received ? matrixGreen : Color.orange)
+
+            // Chevron
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10))
+                .foregroundColor(matrixGreenDarker)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(Color.black.opacity(0.3))
+        .overlay(
+            Rectangle()
+                .fill(matrixGreenDarker.opacity(0.3))
+                .frame(height: 1),
+            alignment: .bottom
+        )
+    }
+
+    // MARK: - Network Status Bar
+
+    private var networkStatusBar: some View {
+        HStack(spacing: 16) {
+            // Zclassic network version
+            HStack(spacing: 4) {
+                Image(systemName: "network")
+                    .font(.system(size: 9))
+                Text("ZCL v2.1.2-1")
+                    .font(.system(size: 10, design: .monospaced))
+            }
+            .foregroundColor(matrixGreenDarker)
+
+            Spacer()
+
+            // Sync status
+            if walletManager.isSyncing {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .tint(matrixGreen)
+                    Text("SYNCING...")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                .foregroundColor(matrixGreen)
+            } else {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 9))
+                    Text("SYNCED")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                .foregroundColor(matrixGreenDark)
+            }
+
+            Spacer()
+
+            // Block height
+            HStack(spacing: 4) {
+                Image(systemName: "cube.fill")
+                    .font(.system(size: 9))
+                Text("\(networkManager.chainHeight)")
+                    .font(.system(size: 10, design: .monospaced))
+            }
+            .foregroundColor(matrixGreenDarker)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.8))
+    }
+
+    // MARK: - Helpers
+
+    private func formatBalance(_ zatoshis: UInt64) -> String {
+        let zcl = Double(zatoshis) / 100_000_000.0
+        if zcl == 0 {
+            return "0.0000"
+        } else if zcl < 0.0001 {
+            return String(format: "%.8f", zcl)
+        } else {
+            return String(format: "%.4f", zcl)
+        }
+    }
+
+    private func formatUSDValue() -> String {
+        // Placeholder - would need actual price feed
+        // For now, show approximate value (ZCL ~ $0.02)
+        let zcl = Double(walletManager.shieldedBalance) / 100_000_000.0
+        let usd = zcl * 0.02 // Approximate price
+        return String(format: "%.2f", usd)
+    }
+
+    private func loadTransactionHistory() {
+        isLoadingHistory = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                var items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
+                if items.isEmpty {
+                    let count = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if count > 0 {
+                        items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.transactions = items
+                    self.isLoadingHistory = false
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isLoadingHistory = false
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Matrix Rain Background
+
+struct MatrixRainBackground: View {
+    @State private var columns: [MatrixColumn] = []
+
+    var body: some View {
+        GeometryReader { geometry in
+            Canvas { context, size in
+                for column in columns {
+                    for (index, char) in column.characters.enumerated() {
+                        let y = column.y + CGFloat(index) * 14
+                        if y > 0 && y < size.height {
+                            let opacity = 1.0 - (Double(index) / Double(column.characters.count))
+                            context.opacity = opacity * 0.5
+                            context.draw(
+                                Text(char)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25)),
+                                at: CGPoint(x: column.x, y: y)
+                            )
+                        }
+                    }
+                }
+            }
+            .onAppear {
+                setupColumns(in: geometry.size)
+                startAnimation()
+            }
+        }
+    }
+
+    private func setupColumns(in size: CGSize) {
+        let columnCount = Int(size.width / 20)
+        columns = (0..<columnCount).map { i in
+            MatrixColumn(
+                x: CGFloat(i) * 20,
+                y: CGFloat.random(in: -size.height...0),
+                speed: CGFloat.random(in: 2...6),
+                characters: generateMatrixChars()
+            )
+        }
+    }
+
+    private func generateMatrixChars() -> [String] {
+        let chars = "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789"
+        return (0..<Int.random(in: 5...15)).map { _ in
+            String(chars.randomElement()!)
+        }
+    }
+
+    private var screenHeight: CGFloat {
+        #if os(iOS)
+        return UIScreen.main.bounds.height
+        #else
+        return NSScreen.main?.frame.height ?? 800
+        #endif
+    }
+
+    private func startAnimation() {
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            for i in columns.indices {
+                columns[i].y += columns[i].speed
+                if columns[i].y > screenHeight + 200 {
+                    columns[i].y = CGFloat.random(in: -300...(-100))
+                    columns[i].characters = generateMatrixChars()
+                }
+            }
+        }
+    }
+}
+
+struct MatrixColumn: Identifiable {
+    let id = UUID()
+    var x: CGFloat
+    var y: CGFloat
+    var speed: CGFloat
+    var characters: [String]
+}
+
 // MARK: - Fireworks Animation for Incoming ZCL
 
 /// Individual firework particle
@@ -1050,12 +1663,12 @@ struct FireworksView: View {
                         .font(.system(size: 60))
 
                     Text("+\(String(format: "%.4f", amount)) ZCL")
-                        .font(System7Theme.titleFont(size: 28))
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
                         .foregroundColor(.green)
                         .shadow(color: .green, radius: 10)
 
                     Text("RECEIVED!")
-                        .font(System7Theme.titleFont(size: 18))
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
                         .shadow(color: .white, radius: 5)
                 }
@@ -1149,6 +1762,133 @@ struct FireworksView: View {
 
             if allFaded || particles.isEmpty {
                 timer.invalidate()
+            }
+        }
+    }
+}
+
+// MARK: - Lock Screen View
+
+/// Face ID lock screen overlay
+struct LockScreenView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    let onUnlock: () -> Void
+
+    @State private var isAuthenticating = false
+    @State private var authError: String?
+    @State private var showRetryButton = false
+
+    private var theme: AppTheme { themeManager.currentTheme }
+    private var biometricManager: BiometricAuthManager { BiometricAuthManager.shared }
+
+    var body: some View {
+        ZStack {
+            // Blurred/dimmed background
+            theme.backgroundColor
+                .ignoresSafeArea()
+
+            VStack(spacing: 24) {
+                Spacer()
+
+                // Lock icon
+                Image(systemName: biometricManager.biometricType.systemImageName)
+                    .font(.system(size: 64))
+                    .foregroundColor(theme.primaryColor)
+                    .opacity(isAuthenticating ? 0.6 : 1.0)
+                    .scaleEffect(isAuthenticating ? 1.1 : 1.0)
+                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: isAuthenticating)
+
+                // Title
+                Text("ZipherX Locked")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+
+                // Subtitle
+                Text("Authenticate with \(biometricManager.biometricType.displayName) to unlock")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+
+                // Error message
+                if let error = authError {
+                    Text(error)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.errorColor)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+
+                Spacer()
+
+                // Unlock button
+                if showRetryButton {
+                    Button(action: attemptUnlock) {
+                        HStack {
+                            Image(systemName: biometricManager.biometricType.systemImageName)
+                            Text("Tap to Unlock")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        .background(theme.buttonBackground)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                        )
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                } else {
+                    // Auto-authenticate on appear
+                    Text("Authenticating...")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                Spacer()
+                    .frame(height: 50)
+            }
+        }
+        .onAppear {
+            // Auto-prompt for Face ID when lock screen appears
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                attemptUnlock()
+            }
+        }
+    }
+
+    private func attemptUnlock() {
+        isAuthenticating = true
+        authError = nil
+        showRetryButton = false
+
+        biometricManager.authenticateForAppUnlock { success, error in
+            isAuthenticating = false
+
+            if success {
+                onUnlock()
+            } else {
+                if let laError = error as? LAError {
+                    switch laError.code {
+                    case .userCancel:
+                        authError = "Authentication cancelled"
+                    case .userFallback:
+                        authError = "Use passcode instead"
+                    case .biometryNotAvailable:
+                        authError = "\(biometricManager.biometricType.displayName) not available"
+                    case .biometryNotEnrolled:
+                        authError = "\(biometricManager.biometricType.displayName) not enrolled"
+                    case .biometryLockout:
+                        authError = "Too many attempts. Try passcode."
+                    default:
+                        authError = "Authentication failed"
+                    }
+                } else {
+                    authError = "Authentication failed"
+                }
+                showRetryButton = true
             }
         }
     }

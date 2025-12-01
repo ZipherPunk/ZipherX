@@ -10,6 +10,10 @@ final class SaplingParams {
 
     private let baseURL = "https://z.cash/downloads/"
 
+    // Lock to prevent concurrent ensureParams calls
+    private var isEnsuring = false
+    private let ensureLock = NSLock()
+
     private let spendParams = (
         name: "sapling-spend.params",
         bundleName: "sapling-spend",  // Uncompressed in bundle (46MB)
@@ -63,6 +67,27 @@ final class SaplingParams {
     /// Ensure Sapling parameters are available
     /// Priority: 1. Already copied  2. Copy from bundle  3. Download
     func ensureParams() async throws {
+        // Prevent concurrent calls - first one wins, others wait
+        ensureLock.lock()
+        if isEnsuring {
+            ensureLock.unlock()
+            debugLog(.params, "⏳ Params already being ensured by another call, waiting...")
+            // Wait for the other call to complete
+            while !areParamsReady {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+            debugLog(.params, "✅ Params ready (waited for other call)")
+            return
+        }
+        isEnsuring = true
+        ensureLock.unlock()
+
+        defer {
+            ensureLock.lock()
+            isEnsuring = false
+            ensureLock.unlock()
+        }
+
         debugLog(.params, "📋 Ensuring Sapling params are ready...")
 
         // Check spend params
