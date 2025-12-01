@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Wallet Setup View - Create or restore wallet
-/// Classic Macintosh System 7 design
+/// Uses current theme from ThemeManager
 struct WalletSetupView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var themeManager: ThemeManager
@@ -17,77 +17,113 @@ struct WalletSetupView: View {
     @State private var isProcessing = false
     @State private var currentBlockHeight: UInt64 = 0
 
+    private var theme: AppTheme { themeManager.currentTheme }
+
     var body: some View {
-        VStack(spacing: 0) {
-            System7MenuBar()
+        ZStack {
+            // Background
+            theme.backgroundColor
+                .ignoresSafeArea()
 
-            System7Window(title: "Welcome to ZipherX") {
-                VStack(spacing: 24) {
-                    // Logo/Title
-                    VStack(spacing: 8) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.system(size: 48))
-                            .foregroundColor(System7Theme.black)
+            VStack(spacing: 24) {
+                Spacer()
 
-                        Text("ZipherX")
-                            .font(System7Theme.titleFont(size: 18))
-                            .foregroundColor(System7Theme.black)
+                // Logo/Title
+                VStack(spacing: 12) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 64))
+                        .foregroundColor(theme.primaryColor)
+                        .shadow(color: theme.primaryColor.opacity(0.5), radius: 10)
 
-                        Text("Secure Zclassic Wallet")
-                            .font(System7Theme.bodyFont(size: 11))
-                            .foregroundColor(System7Theme.darkGray)
-                    }
-                    .padding(.top, 20)
+                    Text("ZipherX")
+                        .font(.system(size: 32, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
 
-                    // Features list
-                    featuresList
-
-                    Spacer()
-
-                    // Block height display
-                    if currentBlockHeight > 0 {
-                        Text("Block Height: \(currentBlockHeight)")
-                            .font(System7Theme.bodyFont(size: 9))
-                            .foregroundColor(System7Theme.darkGray)
-                    }
-
-                    // Action buttons
-                    VStack(spacing: 12) {
-                        System7Button(title: "Create New Wallet") {
-                            createNewWallet()
-                        }
-                        .disabled(isProcessing)
-
-                        System7Button(title: "Import Private Key") {
-                            showImportWarning = true
-                        }
-                        .disabled(isProcessing)
-                    }
-                    .padding(.bottom, 20)
+                    Text("Secure Zclassic Wallet")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
                 }
-                .padding()
+
+                // Features list
+                featuresList
+
+                // Block height display
+                if currentBlockHeight > 0 {
+                    HStack(spacing: 4) {
+                        Text("BLOCK:")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                        Text("\(currentBlockHeight)")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.primaryColor)
+                    }
+                }
+
+                Spacer()
+
+                // Action buttons
+                VStack(spacing: 16) {
+                    Button(action: { createNewWallet() }) {
+                        HStack {
+                            Image(systemName: "plus.circle.fill")
+                            Text("CREATE NEW WALLET")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.backgroundColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(theme.primaryColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.primaryColor.opacity(0.5), lineWidth: 1)
+                        )
+                    }
+                    .disabled(isProcessing)
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: { showImportWarning = true }) {
+                        HStack {
+                            Image(systemName: "key.fill")
+                            Text("IMPORT PRIVATE KEY")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.primaryColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: 1)
+                        )
+                    }
+                    .disabled(isProcessing)
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding(.horizontal, 32)
+                .padding(.bottom, 40)
             }
-            .padding()
         }
         .sheet(isPresented: $showMnemonicBackup) {
             mnemonicBackupView
                 .environmentObject(themeManager)
                 #if os(macOS)
-                .frame(minWidth: 450, idealWidth: 500, minHeight: 500, idealHeight: 550)
+                .frame(minWidth: 500, idealWidth: 550, minHeight: 550, idealHeight: 600)
                 #endif
         }
         .sheet(isPresented: $showImportWarning) {
             importWarningView
                 .environmentObject(themeManager)
                 #if os(macOS)
-                .frame(minWidth: 500, idealWidth: 550, minHeight: 600, idealHeight: 700)
+                .frame(minWidth: 550, idealWidth: 600, minHeight: 650, idealHeight: 750)
                 #endif
         }
         .sheet(isPresented: $showImportKey) {
             importKeyView
                 .environmentObject(themeManager)
                 #if os(macOS)
-                .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 450)
+                .frame(minWidth: 500, idealWidth: 550, minHeight: 450, idealHeight: 500)
                 #endif
         }
         .alert("Error", isPresented: $showError) {
@@ -101,266 +137,349 @@ struct WalletSetupView: View {
     }
 
     private var featuresList: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             featureRow(icon: "lock.shield", text: "Fully Shielded (z-addresses only)")
             featureRow(icon: "network", text: "Decentralized (8+ peer consensus)")
             featureRow(icon: "cpu", text: "Secure Enclave protection")
             featureRow(icon: "checkmark.seal", text: "Local proof verification")
         }
-        .padding(12)
-        .background(System7Theme.lightGray)
+        .padding(16)
+        .background(theme.surfaceColor.opacity(0.8))
+        .cornerRadius(theme.cornerRadius)
         .overlay(
-            Rectangle()
-                .stroke(System7Theme.black, lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.borderColor, lineWidth: 1)
         )
+        .padding(.horizontal, 32)
     }
 
     private func featureRow(icon: String, text: String) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 12) {
             Image(systemName: icon)
-                .font(.system(size: 12))
-                .frame(width: 16)
+                .font(.system(size: 14))
+                .foregroundColor(theme.primaryColor)
+                .frame(width: 20)
             Text(text)
-                .font(System7Theme.bodyFont(size: 10))
+                .font(theme.bodyFont)
+                .foregroundColor(theme.textPrimary)
         }
-        .foregroundColor(System7Theme.black)
     }
 
     // MARK: - Mnemonic Backup View
 
     private var mnemonicBackupView: some View {
-        VStack(spacing: 16) {
-            // Warning
-            VStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 32))
-                    .foregroundColor(.orange)
+        ZStack {
+            theme.backgroundColor.ignoresSafeArea()
 
-                Text("Write Down Your Seed Phrase!")
-                    .font(System7Theme.titleFont(size: 14))
+            VStack(spacing: 20) {
+                // Warning header
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(theme.warningColor)
 
-                Text("This is your ONLY way to recover your wallet. Store it securely offline. Never share it with anyone.")
-                    .font(System7Theme.bodyFont(size: 10))
-                    .foregroundColor(System7Theme.darkGray)
-                    .multilineTextAlignment(.center)
-            }
-            .padding()
+                    Text("BACKUP YOUR SEED PHRASE")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
 
-            // Mnemonic words
-            ScrollView {
-                LazyVGrid(columns: [
-                    GridItem(.flexible()),
-                    GridItem(.flexible()),
-                    GridItem(.flexible())
-                ], spacing: 8) {
-                    ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
-                        HStack(spacing: 4) {
-                            Text("\(index + 1).")
-                                .font(System7Theme.bodyFont(size: 9))
-                                .foregroundColor(System7Theme.darkGray)
-                                .frame(width: 20, alignment: .trailing)
-
-                            Text(word)
-                                .font(System7Theme.bodyFont(size: 10))
-                                .foregroundColor(System7Theme.black)
-                        }
-                        .padding(4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(System7Theme.white)
-                        .overlay(
-                            Rectangle()
-                                .stroke(System7Theme.black, lineWidth: 1)
-                        )
-                    }
+                    Text("Write these words down. This is your ONLY way to recover your wallet.")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
                 }
-                .padding()
-            }
+                .padding(.top, 24)
 
-            // Confirm button
-            System7Button(title: "I've Saved My Seed Phrase") {
-                showMnemonicBackup = false
+                // Mnemonic words grid
+                ScrollView {
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                        GridItem(.flexible())
+                    ], spacing: 8) {
+                        ForEach(Array(mnemonic.enumerated()), id: \.offset) { index, word in
+                            HStack(spacing: 4) {
+                                Text("\(index + 1).")
+                                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                                    .foregroundColor(theme.textSecondary)
+                                    .frame(width: 24, alignment: .trailing)
+
+                                Text(word)
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.primaryColor)
+                            }
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.borderColor, lineWidth: 1)
+                            )
+                        }
+                    }
+                    .padding()
+                }
+
+                // Confirm button
+                Button(action: { showMnemonicBackup = false }) {
+                    Text("I'VE SAVED MY SEED PHRASE")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.backgroundColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(theme.primaryColor)
+                        .cornerRadius(theme.cornerRadius)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .padding()
         }
-        .background(System7Theme.lightGray)
     }
 
     // MARK: - Import Warning View (Cypherpunk Privacy Notice)
 
     private var importWarningView: some View {
-        VStack(spacing: 0) {
-            // Header with skull icon
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 48))
-                    .foregroundColor(.orange)
+        ZStack {
+            theme.backgroundColor.ignoresSafeArea()
 
-                Text("PRIVACY WARNING")
-                    .font(System7Theme.titleFont(size: 16))
-                    .foregroundColor(System7Theme.black)
-            }
-            .padding(.top, 24)
+            VStack(spacing: 0) {
+                // Header
+                VStack(spacing: 16) {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.system(size: 56))
+                        .foregroundColor(theme.warningColor)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Cypherpunk manifesto quote
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("\"Privacy is necessary for an open society in the electronic age.\"")
-                            .font(System7Theme.bodyFont(size: 11))
-                            .italic()
-                            .foregroundColor(System7Theme.darkGray)
+                    Text("PRIVACY WARNING")
+                        .font(.system(size: 20, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+                }
+                .padding(.top, 32)
 
-                        Text("— A Cypherpunk's Manifesto, 1993")
-                            .font(System7Theme.bodyFont(size: 9))
-                            .foregroundColor(System7Theme.darkGray)
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.05))
-                    .overlay(
-                        Rectangle()
-                            .stroke(System7Theme.darkGray, lineWidth: 1)
-                    )
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        // Cypherpunk manifesto quote
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\"Privacy is necessary for an open society in the electronic age.\"")
+                                .font(.system(size: 13, weight: .regular, design: .monospaced))
+                                .italic()
+                                .foregroundColor(theme.primaryColor)
 
-                    // Privacy implications
-                    warningSection(
-                        title: "Address Reuse Degrades Privacy",
-                        icon: "eye.slash",
-                        content: "Importing a key that has been used elsewhere may reduce your privacy. Each transaction from a reused address can be linked together by blockchain observers."
-                    )
-
-                    // Historical scan warning
-                    warningSection(
-                        title: "Historical Scan Required",
-                        icon: "clock.arrow.circlepath",
-                        content: "To find all your previous transactions, the wallet needs to scan the blockchain history. A quick scan of recent blocks (~10,000) takes about 2-5 minutes. Older transactions may require a full historical scan (30-60 minutes)."
-                    )
-
-                    // Key security
-                    warningSection(
-                        title: "Key Security",
-                        icon: "key.fill",
-                        content: "Never import a key from an untrusted source. If anyone else has seen your private key, they can spend your funds. Your key is your sole proof of ownership."
-                    )
-
-                    // Fast start info
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Image(systemName: "bolt.fill")
-                                .foregroundColor(.blue)
-                            Text("Fast Start Mode")
-                                .font(System7Theme.titleFont(size: 11))
+                            Text("— A Cypherpunk's Manifesto, 1993")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
                         }
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                        )
 
-                        Text("By default, ZipherX scans only recent blocks for fast wallet setup. If your notes are older than ~17 days, use Settings → Quick Scan or Full Rescan to find them.")
-                            .font(System7Theme.bodyFont(size: 10))
-                            .foregroundColor(System7Theme.darkGray)
+                        // Warning sections
+                        warningSection(
+                            title: "ADDRESS REUSE",
+                            icon: "link.badge.plus",
+                            content: "Importing a key used elsewhere may reduce privacy. Transactions can be linked by observers."
+                        )
+
+                        warningSection(
+                            title: "HISTORICAL SCAN",
+                            icon: "clock.arrow.circlepath",
+                            content: "Finding old transactions requires scanning blockchain history. Quick scan: 2-5 min. Full scan: 30-60 min."
+                        )
+
+                        warningSection(
+                            title: "KEY SECURITY",
+                            icon: "key.fill",
+                            content: "Never import keys from untrusted sources. Anyone with your key can spend your funds."
+                        )
+
+                        // Fast start info
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Image(systemName: "bolt.fill")
+                                    .foregroundColor(theme.primaryColor)
+                                Text("FAST START")
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.textPrimary)
+                            }
+
+                            Text("ZipherX scans recent blocks by default. Use Settings → Quick Scan for older notes.")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        .padding()
+                        .background(theme.primaryColor.opacity(0.1))
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                        )
                     }
                     .padding()
-                    .background(Color.blue.opacity(0.1))
-                    .overlay(
-                        Rectangle()
-                            .stroke(Color.blue.opacity(0.5), lineWidth: 1)
-                    )
                 }
-                .padding()
-            }
 
-            // Action buttons
-            VStack(spacing: 12) {
-                System7Button(title: "I Understand, Continue") {
-                    showImportWarning = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        showImportKey = true
+                // Action buttons
+                VStack(spacing: 12) {
+                    Button(action: {
+                        showImportWarning = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            showImportKey = true
+                        }
+                    }) {
+                        Text("I UNDERSTAND, CONTINUE")
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.backgroundColor)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(theme.primaryColor)
+                            .cornerRadius(theme.cornerRadius)
                     }
-                }
+                    .buttonStyle(PlainButtonStyle())
 
-                Button("Cancel") {
-                    showImportWarning = false
+                    Button(action: { showImportWarning = false }) {
+                        Text("Cancel")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
-                .font(System7Theme.bodyFont(size: 11))
-                .foregroundColor(System7Theme.darkGray)
+                .padding(24)
+                .background(theme.surfaceColor)
             }
-            .padding()
-            .background(System7Theme.lightGray)
         }
-        .background(System7Theme.lightGray)
     }
 
     private func warningSection(title: String, icon: String, content: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: icon)
-                    .foregroundColor(.orange)
+                    .foregroundColor(theme.warningColor)
                 Text(title)
-                    .font(System7Theme.titleFont(size: 11))
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
             }
 
             Text(content)
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding()
-        .background(Color.orange.opacity(0.1))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.warningColor.opacity(0.1))
+        .cornerRadius(theme.cornerRadius)
         .overlay(
-            Rectangle()
-                .stroke(Color.orange.opacity(0.5), lineWidth: 1)
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.warningColor.opacity(0.3), lineWidth: 1)
         )
     }
 
     // MARK: - Import Key View
 
     private var importKeyView: some View {
-        VStack(spacing: 16) {
-            Text("Import Private Key")
-                .font(System7Theme.titleFont(size: 14))
-                .padding(.top)
+        ZStack {
+            theme.backgroundColor.ignoresSafeArea()
 
-            Text("Enter your Bech32 private key (secret-extended-key-main1...) or 338-character hex key.")
-                .font(System7Theme.bodyFont(size: 10))
-                .foregroundColor(System7Theme.darkGray)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
+            VStack(spacing: 20) {
+                // Header
+                VStack(spacing: 12) {
+                    Image(systemName: "key.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(theme.primaryColor)
 
-            // Private key input
-            TextEditor(text: $privateKeyInput)
-                .font(System7Theme.bodyFont(size: 10))
-                .frame(height: 80)
-                .padding(8)
-                .background(System7Theme.white)
-                .overlay(
-                    Rectangle()
-                        .stroke(System7Theme.black, lineWidth: 1)
-                )
-                .padding(.horizontal)
+                    Text("IMPORT PRIVATE KEY")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
 
-            // Character count - support both 338-char hex and Bech32 format
-            let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-            let charCount = cleanInput.count
-            let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
-            // 169 bytes = 338 hex chars, or Bech32 format (typically ~280 chars)
-            let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
-            Text(isBech32 ? "Bech32 format detected ✓" : (charCount == 338 ? "Hex format detected ✓" : "\(charCount)/338 characters"))
-                .font(System7Theme.bodyFont(size: 9))
-                .foregroundColor(isValidLength ? .green : System7Theme.darkGray)
-
-            Spacer()
-
-            // Buttons
-            HStack(spacing: 12) {
-                System7Button(title: "Cancel") {
-                    showImportKey = false
-                    privateKeyInput = ""
+                    Text("Enter your Bech32 key (secret-extended-key-main1...) or 338-char hex key.")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
                 }
+                .padding(.top, 24)
 
-                System7Button(title: "Import") {
-                    importPrivateKey()
+                // Private key input
+                TextEditor(text: $privateKeyInput)
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 100)
+                    .padding(12)
+                    .background(theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+                    .padding(.horizontal, 24)
+
+                // Character count / validation
+                let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                let charCount = cleanInput.count
+                let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
+                let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
+
+                HStack {
+                    if isBech32 {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(theme.successColor)
+                        Text("Bech32 format detected")
+                            .foregroundColor(theme.successColor)
+                    } else if charCount == 338 {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(theme.successColor)
+                        Text("Hex format detected")
+                            .foregroundColor(theme.successColor)
+                    } else {
+                        Text("\(charCount)/338 characters")
+                            .foregroundColor(theme.textSecondary)
+                    }
                 }
-                .disabled(!isValidLength || isProcessing)
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
+
+                Spacer()
+
+                // Buttons
+                VStack(spacing: 12) {
+                    Button(action: { importPrivateKey() }) {
+                        HStack {
+                            if isProcessing {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                                    .tint(theme.backgroundColor)
+                            }
+                            Text(isProcessing ? "IMPORTING..." : "IMPORT KEY")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.backgroundColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(isValidLength && !isProcessing ? theme.primaryColor : theme.textSecondary)
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .disabled(!isValidLength || isProcessing)
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: {
+                        showImportKey = false
+                        privateKeyInput = ""
+                    }) {
+                        Text("Cancel")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .padding()
         }
-        .background(System7Theme.lightGray)
     }
 
     // MARK: - Actions
@@ -369,7 +488,7 @@ struct WalletSetupView: View {
         Task {
             do {
                 let status = try await InsightAPI.shared.getStatus()
-                DispatchQueue.main.async {
+                await MainActor.run {
                     currentBlockHeight = status.height
                 }
             } catch {
@@ -385,13 +504,13 @@ struct WalletSetupView: View {
             do {
                 let words = try walletManager.createNewWallet()
 
-                DispatchQueue.main.async {
+                await MainActor.run {
                     mnemonic = words
                     isProcessing = false
                     showMnemonicBackup = true
                 }
             } catch {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     errorMessage = error.localizedDescription
                     showError = true
                     isProcessing = false
@@ -407,13 +526,13 @@ struct WalletSetupView: View {
             do {
                 try walletManager.importSpendingKey(privateKeyInput)
 
-                DispatchQueue.main.async {
+                await MainActor.run {
                     showImportKey = false
                     privateKeyInput = ""
                     isProcessing = false
                 }
             } catch {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     errorMessage = error.localizedDescription
                     showError = true
                     isProcessing = false
