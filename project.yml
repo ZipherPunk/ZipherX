@@ -26,6 +26,7 @@ targets:
       - path: Resources
         excludes:
           - "**/.DS_Store"
+      - path: Assets.xcassets
     info:
       path: Info.plist
       properties:
@@ -71,6 +72,7 @@ targets:
       - path: Resources
         excludes:
           - "**/.DS_Store"
+      - path: Assets.xcassets
     info:
       path: Info-macOS.plist
       properties:
@@ -92,6 +94,8 @@ targets:
         OTHER_LDFLAGS:
           - "-lresolv"
         MACOSX_DEPLOYMENT_TARGET: "12.0"
+        # App icon
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
       - framework: Libraries/ZipherXFFI.xcframework
         embed: false
