@@ -4,6 +4,7 @@ import SwiftUI
 /// Classic Macintosh System 7 design
 struct WalletSetupView: View {
     @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var themeManager: ThemeManager
 
     @State private var showCreateWallet = false
     @State private var showImportKey = false
@@ -70,18 +71,21 @@ struct WalletSetupView: View {
         }
         .sheet(isPresented: $showMnemonicBackup) {
             mnemonicBackupView
+                .environmentObject(themeManager)
                 #if os(macOS)
                 .frame(minWidth: 450, idealWidth: 500, minHeight: 500, idealHeight: 550)
                 #endif
         }
         .sheet(isPresented: $showImportWarning) {
             importWarningView
+                .environmentObject(themeManager)
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 550, minHeight: 600, idealHeight: 700)
                 #endif
         }
         .sheet(isPresented: $showImportKey) {
             importKeyView
+                .environmentObject(themeManager)
                 #if os(macOS)
                 .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 450)
                 #endif
@@ -422,4 +426,5 @@ struct WalletSetupView: View {
 #Preview {
     WalletSetupView()
         .environmentObject(WalletManager.shared)
+        .environmentObject(ThemeManager.shared)
 }
