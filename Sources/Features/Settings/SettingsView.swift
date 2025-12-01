@@ -187,13 +187,14 @@ struct SettingsView: View {
     // MARK: - Wallet Mode Section (macOS only)
 
     #if os(macOS)
-    @StateObject private var modeManager = WalletModeManager.shared
-    @StateObject private var bootstrapManager = BootstrapManager.shared
     @State private var showBootstrapSheet = false
     @State private var showModeChangeAlert = false
 
     private var walletModeSection: some View {
-        VStack(spacing: 12) {
+        let modeManager = WalletModeManager.shared
+        let bootstrapManager = BootstrapManager.shared
+
+        return VStack(spacing: 12) {
             // Section header
             HStack {
                 Image(systemName: "server.rack")
