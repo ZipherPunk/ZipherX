@@ -510,12 +510,12 @@ struct ContentView: View {
                     Spacer()
                     Text("Settings")
                         .font(.headline)
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                     Spacer()
                     Button("Done") {
                         showCypherpunkSettings = false
                     }
-                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .foregroundColor(NeonColors.primary)
                 }
                 .padding()
                 .background(Color.black)
@@ -536,11 +536,11 @@ struct ContentView: View {
                     Button("Cancel") {
                         showCypherpunkSend = false
                     }
-                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .foregroundColor(NeonColors.primary)
                     Spacer()
                     Text("Send ZCL")
                         .font(.headline)
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                     Spacer()
                 }
                 .padding()
@@ -562,12 +562,12 @@ struct ContentView: View {
                     Spacer()
                     Text("Receive ZCL")
                         .font(.headline)
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                     Spacer()
                     Button("Done") {
                         showCypherpunkReceive = false
                     }
-                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .foregroundColor(NeonColors.primary)
                 }
                 .padding()
                 .background(Color.black)

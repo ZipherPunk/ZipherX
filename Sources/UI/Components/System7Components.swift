@@ -7,6 +7,29 @@ import UIKit
 import AppKit
 #endif
 
+// MARK: - Platform-specific Neon Colors
+// macOS: Neon Orange (Bitcoin-inspired)
+// iOS: Neon Green (Matrix-inspired)
+enum NeonColors {
+    #if os(macOS)
+    static let primary = Color(red: 1.0, green: 0.4, blue: 0.0)       // Bright neon orange
+    static let primaryDark = Color(red: 0.8, green: 0.3, blue: 0.0)   // Dark neon orange
+    static let primaryDim = Color(red: 0.5, green: 0.2, blue: 0.0)    // Dim orange
+    static let primaryVeryDim = Color(red: 0.3, green: 0.12, blue: 0.0)
+    static let progressBg = Color(red: 0.2, green: 0.08, blue: 0.0)
+    static let progressFillStart = Color(red: 0.8, green: 0.3, blue: 0.0)
+    static let progressFillEnd = Color(red: 1.0, green: 0.5, blue: 0.0)
+    #else
+    static let primary = NeonColors.primary          // Neon green
+    static let primaryDark = NeonColors.primaryDark     // Dark neon green
+    static let primaryDim = NeonColors.primaryDim      // Dim green
+    static let primaryVeryDim = NeonColors.primaryVeryDim
+    static let progressBg = NeonColors.progressBg
+    static let progressFillStart = NeonColors.progressFillStart
+    static let progressFillEnd = NeonColors.progressFillEnd
+    #endif
+}
+
 // MARK: - Classic Mac Window
 struct System7Window<Content: View>: View {
     @EnvironmentObject var themeManager: ThemeManager
@@ -578,7 +601,7 @@ struct CypherpunkLoadingView: View {
                 ZStack {
                     Text("ZIPHERX")
                         .font(.system(size: 36, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                         .offset(x: showGlitch ? glitchOffset : 0)
 
                     // Glitch red channel
@@ -593,7 +616,7 @@ struct CypherpunkLoadingView: View {
                 // Subtitle
                 Text("SHIELDED BY DEFAULT")
                     .font(.system(size: 14, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 0.7, blue: 0.2))
+                    .foregroundColor(NeonColors.primaryDark)
                     .tracking(4)
 
                 Spacer()
@@ -604,13 +627,13 @@ struct CypherpunkLoadingView: View {
                     if isFirstLaunch {
                         Text("First launch initialization...")
                             .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(Color(red: 0, green: 0.6, blue: 0.15))
+                            .foregroundColor(NeonColors.primaryDim)
                     }
 
                     // Rotating cypherpunk message
                     Text(currentMessage)
                         .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                         .multilineTextAlignment(.center)
                         .animation(.easeInOut(duration: 0.3), value: currentMessage)
 
@@ -619,7 +642,7 @@ struct CypherpunkLoadingView: View {
                         ZStack(alignment: .leading) {
                             // Background
                             Rectangle()
-                                .fill(Color(red: 0, green: 0.2, blue: 0.05))
+                                .fill(NeonColors.progressBg)
                                 .frame(height: 12)
 
                             // Progress fill
@@ -627,8 +650,8 @@ struct CypherpunkLoadingView: View {
                                 .fill(
                                     LinearGradient(
                                         colors: [
-                                            Color(red: 0, green: 0.8, blue: 0.2),
-                                            Color(red: 0, green: 1, blue: 0.4)
+                                            NeonColors.progressFillStart,
+                                            NeonColors.progressFillEnd
                                         ],
                                         startPoint: .leading,
                                         endPoint: .trailing
@@ -639,7 +662,7 @@ struct CypherpunkLoadingView: View {
 
                             // Border
                             Rectangle()
-                                .stroke(Color(red: 0, green: 0.6, blue: 0.15), lineWidth: 1)
+                                .stroke(NeonColors.primaryDim, lineWidth: 1)
                                 .frame(height: 12)
                         }
                     }
@@ -649,13 +672,13 @@ struct CypherpunkLoadingView: View {
                     // Progress percentage
                     Text("\(Int(progress * 100))%")
                         .font(.system(size: 24, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
 
                     // Technical status (if user wants to see it)
                     if !status.isEmpty {
                         Text(status)
                             .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                            .foregroundColor(NeonColors.primaryDim)
                     }
                 }
 
@@ -665,11 +688,11 @@ struct CypherpunkLoadingView: View {
                 VStack(spacing: 4) {
                     Text("Privacy is not a feature")
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                        .foregroundColor(NeonColors.primaryDim)
 
                     Text("It's a right.")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.7, blue: 0.2))
+                        .foregroundColor(NeonColors.primaryDark)
                 }
                 .padding(.bottom, 40)
             }
@@ -711,13 +734,13 @@ struct CypherpunkTxProgressView: View {
                 // Title with animation
                 Text("SENDING TRANSACTION")
                     .font(.system(size: 18, weight: .bold, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .foregroundColor(NeonColors.primary)
                     .tracking(2)
 
                 // Cypherpunk message
                 Text(currentMessage)
                     .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 0.8, blue: 0.2))
+                    .foregroundColor(NeonColors.progressFillStart)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
                     .animation(.easeInOut(duration: 0.3), value: currentMessage)
@@ -732,14 +755,14 @@ struct CypherpunkTxProgressView: View {
                 .background(Color.black.opacity(0.5))
                 .overlay(
                     Rectangle()
-                        .stroke(Color(red: 0, green: 0.4, blue: 0.1), lineWidth: 1)
+                        .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
                 )
                 .padding(.horizontal, 20)
 
                 // Footer message
                 Text("Do not close the app")
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                    .foregroundColor(NeonColors.primaryDim)
             }
         }
         .onReceive(timer) { _ in
@@ -772,16 +795,16 @@ struct CypherpunkProgressStepRow: View {
                     switch step.status {
                     case .pending:
                         Circle()
-                            .stroke(Color(red: 0, green: 0.3, blue: 0.08), lineWidth: 1)
+                            .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
                             .frame(width: 16, height: 16)
                     case .inProgress:
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: Color(red: 0, green: 1, blue: 0.25)))
+                            .progressViewStyle(CircularProgressViewStyle(tint: NeonColors.primary))
                             .scaleEffect(0.7)
                             .frame(width: 16, height: 16)
                     case .completed:
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(Color(red: 0, green: 0.8, blue: 0.2))
+                            .foregroundColor(NeonColors.progressFillStart)
                             .frame(width: 16, height: 16)
                     case .failed:
                         Image(systemName: "xmark.circle.fill")
@@ -801,7 +824,7 @@ struct CypherpunkProgressStepRow: View {
                 if let detail = step.detail {
                     Text(detail)
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                        .foregroundColor(NeonColors.primaryDim)
                 }
             }
 
@@ -810,11 +833,11 @@ struct CypherpunkProgressStepRow: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Rectangle()
-                            .fill(Color(red: 0, green: 0.15, blue: 0.03))
+                            .fill(NeonColors.progressBg)
                             .frame(height: 4)
 
                         Rectangle()
-                            .fill(Color(red: 0, green: 0.8, blue: 0.2))
+                            .fill(NeonColors.progressFillStart)
                             .frame(width: geometry.size.width * min(progress, 1.0), height: 4)
                     }
                 }
@@ -835,11 +858,11 @@ struct CypherpunkProgressStepRow: View {
     private var stepTextColor: Color {
         switch step.status {
         case .pending:
-            return Color(red: 0, green: 0.3, blue: 0.08)
+            return NeonColors.primaryVeryDim
         case .inProgress:
-            return Color(red: 0, green: 1, blue: 0.25)
+            return NeonColors.primary
         case .completed:
-            return Color(red: 0, green: 0.7, blue: 0.2)
+            return NeonColors.primaryDark
         case .failed:
             return .red
         }
@@ -885,7 +908,7 @@ struct CypherpunkSyncView: View {
                 ZStack {
                     Text("SYNCING")
                         .font(.system(size: 28, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
                         .offset(x: showGlitch ? glitchOffset : 0)
 
                     if showGlitch {
@@ -899,13 +922,13 @@ struct CypherpunkSyncView: View {
                 // Subtitle
                 Text("PROTECTING YOUR PRIVACY")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 0.7, blue: 0.2))
+                    .foregroundColor(NeonColors.primaryDark)
                     .tracking(3)
 
                 // Rotating cypherpunk message
                 Text(currentMessage)
                     .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                    .foregroundColor(NeonColors.primary)
                     .multilineTextAlignment(.center)
                     .animation(.easeInOut(duration: 0.3), value: currentMessage)
                     .padding(.top, 8)
@@ -921,7 +944,7 @@ struct CypherpunkSyncView: View {
                     .background(Color.black.opacity(0.5))
                     .overlay(
                         Rectangle()
-                            .stroke(Color(red: 0, green: 0.4, blue: 0.1), lineWidth: 1)
+                            .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
                     )
                     .padding(.horizontal, 20)
                 }
@@ -931,15 +954,15 @@ struct CypherpunkSyncView: View {
                     GeometryReader { geometry in
                         ZStack(alignment: .leading) {
                             Rectangle()
-                                .fill(Color(red: 0, green: 0.2, blue: 0.05))
+                                .fill(NeonColors.progressBg)
                                 .frame(height: 12)
 
                             Rectangle()
                                 .fill(
                                     LinearGradient(
                                         colors: [
-                                            Color(red: 0, green: 0.8, blue: 0.2),
-                                            Color(red: 0, green: 1, blue: 0.4)
+                                            NeonColors.progressFillStart,
+                                            NeonColors.progressFillEnd
                                         ],
                                         startPoint: .leading,
                                         endPoint: .trailing
@@ -949,7 +972,7 @@ struct CypherpunkSyncView: View {
                                 .animation(.linear(duration: 0.3), value: progress)
 
                             Rectangle()
-                                .stroke(Color(red: 0, green: 0.6, blue: 0.15), lineWidth: 1)
+                                .stroke(NeonColors.primaryDim, lineWidth: 1)
                                 .frame(height: 12)
                         }
                     }
@@ -959,13 +982,13 @@ struct CypherpunkSyncView: View {
                     // Progress percentage
                     Text("\(Int(progress * 100))%")
                         .font(.system(size: 20, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))
+                        .foregroundColor(NeonColors.primary)
 
                     // Status text
                     if !status.isEmpty {
                         Text(status)
                             .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                            .foregroundColor(NeonColors.primaryDim)
                     }
                 }
                 .padding(.top, 8)
@@ -976,12 +999,12 @@ struct CypherpunkSyncView: View {
                 VStack(spacing: 4) {
                     Text("\"We must defend our own privacy\"")
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.4, blue: 0.1))
+                        .foregroundColor(NeonColors.primaryVeryDim)
                         .italic()
 
                     Text("- Cypherpunk's Manifesto")
                         .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.3, blue: 0.08))
+                        .foregroundColor(NeonColors.primaryVeryDim)
                 }
                 .padding(.bottom, 30)
             }
@@ -1015,16 +1038,16 @@ struct CypherpunkSyncTaskRow: View {
                     switch task.status {
                     case .pending:
                         Circle()
-                            .stroke(Color(red: 0, green: 0.3, blue: 0.08), lineWidth: 1)
+                            .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
                             .frame(width: 14, height: 14)
                     case .inProgress:
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: Color(red: 0, green: 1, blue: 0.25)))
+                            .progressViewStyle(CircularProgressViewStyle(tint: NeonColors.primary))
                             .scaleEffect(0.6)
                             .frame(width: 14, height: 14)
                     case .completed:
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(Color(red: 0, green: 0.8, blue: 0.2))
+                            .foregroundColor(NeonColors.progressFillStart)
                             .font(.system(size: 14))
                     case .failed:
                         Image(systemName: "xmark.circle.fill")
@@ -1044,7 +1067,7 @@ struct CypherpunkSyncTaskRow: View {
                 if let detail = task.detail {
                     Text(detail)
                         .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 0.5, blue: 0.1))
+                        .foregroundColor(NeonColors.primaryDim)
                 }
             }
 
@@ -1053,11 +1076,11 @@ struct CypherpunkSyncTaskRow: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Rectangle()
-                            .fill(Color(red: 0, green: 0.15, blue: 0.03))
+                            .fill(NeonColors.progressBg)
                             .frame(height: 3)
 
                         Rectangle()
-                            .fill(Color(red: 0, green: 0.8, blue: 0.2))
+                            .fill(NeonColors.progressFillStart)
                             .frame(width: geometry.size.width * min(progress, 1.0), height: 3)
                     }
                 }
@@ -1070,11 +1093,11 @@ struct CypherpunkSyncTaskRow: View {
     private var taskTextColor: Color {
         switch task.status {
         case .pending:
-            return Color(red: 0, green: 0.3, blue: 0.08)
+            return NeonColors.primaryVeryDim
         case .inProgress:
-            return Color(red: 0, green: 1, blue: 0.25)
+            return NeonColors.primary
         case .completed:
-            return Color(red: 0, green: 0.7, blue: 0.2)
+            return NeonColors.primaryDark
         case .failed:
             return .red
         }
@@ -1103,9 +1126,9 @@ struct CypherpunkMainView: View {
     @State private var fireworksAmount: Double = 0
 
     // Matrix green colors
-    private let matrixGreen = Color(red: 0, green: 1, blue: 0.25)
-    private let matrixGreenDark = Color(red: 0, green: 0.7, blue: 0.2)
-    private let matrixGreenDarker = Color(red: 0, green: 0.4, blue: 0.1)
+    private let matrixGreen = NeonColors.primary
+    private let matrixGreenDark = NeonColors.primaryDark
+    private let matrixGreenDarker = NeonColors.primaryVeryDim
 
     private let glitchTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
@@ -1551,7 +1574,7 @@ struct MatrixRainBackground: View {
                             context.draw(
                                 Text(char)
                                     .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(Color(red: 0, green: 1, blue: 0.25)),
+                                    .foregroundColor(NeonColors.primary),
                                 at: CGPoint(x: column.x, y: y)
                             )
                         }

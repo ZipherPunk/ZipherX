@@ -101,13 +101,13 @@ struct SendView: View {
                     // Glowing checkmark
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 60))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.4)) // Bright fluo green
-                        .shadow(color: Color(red: 0, green: 1, blue: 0.4).opacity(0.8), radius: 20)
+                        .foregroundColor(NeonColors.progressFillEnd) // Bright fluo green
+                        .shadow(color: NeonColors.progressFillEnd.opacity(0.8), radius: 20)
 
                     Text("TRANSACTION BROADCAST")
                         .font(.system(size: 18, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color(red: 0, green: 1, blue: 0.4))
-                        .shadow(color: Color(red: 0, green: 1, blue: 0.4).opacity(0.5), radius: 5)
+                        .foregroundColor(NeonColors.progressFillEnd)
+                        .shadow(color: NeonColors.progressFillEnd.opacity(0.5), radius: 5)
 
                     Text("Your shielded transaction has been sent to the network.")
                         .font(.system(size: 12, design: .monospaced))
@@ -122,13 +122,13 @@ struct SendView: View {
 
                         Text(txId)
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(Color(red: 0, green: 1, blue: 0.4)) // Fluo green
+                            .foregroundColor(NeonColors.progressFillEnd) // Fluo green
                             .padding(12)
                             .frame(maxWidth: .infinity)
                             .background(Color.green.opacity(0.1))
                             .overlay(
                                 Rectangle()
-                                    .stroke(Color(red: 0, green: 1, blue: 0.4).opacity(0.5), lineWidth: 1)
+                                    .stroke(NeonColors.progressFillEnd.opacity(0.5), lineWidth: 1)
                             )
                             .lineLimit(2)
                             .minimumScaleFactor(0.7)
@@ -156,7 +156,7 @@ struct SendView: View {
                             .foregroundColor(.black)
                             .padding(.horizontal, 20)
                             .padding(.vertical, 10)
-                            .background(Color(red: 0, green: 1, blue: 0.4))
+                            .background(NeonColors.progressFillEnd)
                             .cornerRadius(4)
                         }
 
@@ -167,12 +167,12 @@ struct SendView: View {
                         }) {
                             Text("DONE")
                                 .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                .foregroundColor(Color(red: 0, green: 1, blue: 0.4))
+                                .foregroundColor(NeonColors.progressFillEnd)
                                 .padding(.horizontal, 20)
                                 .padding(.vertical, 10)
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color(red: 0, green: 1, blue: 0.4), lineWidth: 1)
+                                        .stroke(NeonColors.progressFillEnd, lineWidth: 1)
                                 )
                         }
                     }
