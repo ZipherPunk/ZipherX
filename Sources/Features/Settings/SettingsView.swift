@@ -241,7 +241,7 @@ struct SettingsView: View {
             // Full Node specific options
             if modeManager.currentMode == .fullNode {
                 // Full node status
-                fullNodeStatusView
+                fullNodeStatusView(modeManager: modeManager)
             } else {
                 // Switch to Full Node button
                 Button(action: {
@@ -309,22 +309,24 @@ struct SettingsView: View {
         }
     }
 
-    private var fullNodeStatusView: some View {
-        VStack(spacing: 8) {
+    private func fullNodeStatusView(modeManager: WalletModeManager) -> some View {
+        let rpcClient = RPCClient.shared
+
+        return VStack(spacing: 8) {
             // Daemon connection status
             HStack {
                 Circle()
-                    .fill(RPCClient.shared.isConnected ? Color.green : Color.red)
+                    .fill(rpcClient.isConnected ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
 
-                Text(RPCClient.shared.isConnected ? "Daemon Connected" : "Daemon Offline")
+                Text(rpcClient.isConnected ? "Daemon Connected" : "Daemon Offline")
                     .font(theme.bodyFont)
                     .foregroundColor(theme.textPrimary)
 
                 Spacer()
 
-                if RPCClient.shared.isConnected {
-                    Text("Block \(RPCClient.shared.blockHeight)")
+                if rpcClient.isConnected {
+                    Text("Block \(rpcClient.blockHeight)")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
                 }
@@ -333,7 +335,7 @@ struct SettingsView: View {
             .background(theme.surfaceColor)
             .overlay(
                 Rectangle()
-                    .stroke(RPCClient.shared.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
+                    .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
             )
 
             // Switch to Light mode button

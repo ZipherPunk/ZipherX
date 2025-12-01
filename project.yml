@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: com.zipherx
   deploymentTarget:
     iOS: "15.0"
+    macOS: "12.0"
   xcodeVersion: "15.0"
   generateEmptyDirectories: true
 
@@ -13,6 +14,7 @@ settings:
     DEVELOPMENT_TEAM: ""
 
 targets:
+  # iOS Target
   ZipherX:
     type: application
     platform: iOS
@@ -57,6 +59,49 @@ targets:
           - $(AppIdentifierPrefix)com.zipherx.wallet
         com.apple.developer.default-data-protection: NSFileProtectionComplete
 
+  # macOS Target
+  ZipherXMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes:
+          - "**/.DS_Store"
+    resources:
+      - path: Resources
+        excludes:
+          - "**/.DS_Store"
+    info:
+      path: Info-macOS.plist
+      properties:
+        CFBundleDisplayName: ZipherX
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        CFBundleName: ZipherX
+        LSMinimumSystemVersion: "12.0"
+        NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
+        NSHumanReadableCopyright: "Copyright © 2025 ZipherX. All rights reserved."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet.mac
+        INFOPLIST_FILE: Info-macOS.plist
+        CODE_SIGN_ENTITLEMENTS: ZipherXMac.entitlements
+        # Bridging header for Rust FFI
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/ZipherX-Bridging-Header.h
+        # Link resolver library
+        OTHER_LDFLAGS:
+          - "-lresolv"
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+    dependencies:
+      - framework: Libraries/ZipherXFFI.xcframework
+        embed: false
+    entitlements:
+      path: ZipherXMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+
   ZipherXTests:
     type: bundle.unit-test
     platform: iOS
@@ -82,6 +127,19 @@ schemes:
       config: Debug
       targets:
         - ZipherXTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+
+  ZipherXMac:
+    build:
+      targets:
+        ZipherXMac: all
+    run:
+      config: Debug
     profile:
       config: Release
     analyze:
