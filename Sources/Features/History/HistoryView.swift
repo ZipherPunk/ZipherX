@@ -172,17 +172,14 @@ struct HistoryView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                var items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
-
-                // If history is empty, try to populate from existing notes
-                if items.isEmpty {
-                    print("📜 Transaction history empty, populating from existing notes...")
-                    let count = try WalletDatabase.shared.populateHistoryFromNotes()
-                    if count > 0 {
-                        // Reload after populating
-                        items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
-                    }
+                // ALWAYS populate from notes first to catch any new transactions
+                // This ensures newly discovered notes appear in history
+                let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                if populatedCount > 0 {
+                    print("📜 Populated \(populatedCount) new transaction history entries")
                 }
+
+                let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
 
                 DispatchQueue.main.async {
                     self.transactions = items

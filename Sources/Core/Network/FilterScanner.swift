@@ -144,12 +144,22 @@ final class FilterScanner {
                 startHeight = ZclassicCheckpoints.recentCheckpointHeight
                 print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
             } else if bundledTreeAvailable {
-                // FAST STARTUP: Only scan recent blocks (bundledTreeHeight+1 to current)
-                // Historical scan can be triggered manually via Settings → "Full Historical Scan"
-                // This ensures <10 second wallet ready time
-                startHeight = bundledTreeHeight + 1
-                print("📦 Fast startup with bundled tree - scanning from \(startHeight) to current")
-                print("   💡 For old notes, use Settings → 'Full Historical Scan'")
+                // Check if this is an imported/restored wallet (may have historical notes)
+                let isImportedWallet = WalletManager.shared.isImportedWallet
+
+                if isImportedWallet {
+                    // IMPORTED/RESTORED WALLET: Fast scan of recent blocks only
+                    // Scan last ~10,000 blocks (~17 days) for quick results
+                    // User can do "Quick Scan" from Settings for older notes
+                    let recentBlocksToScan: UInt64 = 10_000
+                    startHeight = max(bundledTreeHeight + 1, latestHeight > recentBlocksToScan ? latestHeight - recentBlocksToScan : bundledTreeHeight + 1)
+                    print("📦 Imported wallet - fast scan of recent \(latestHeight - startHeight + 1) blocks")
+                    print("   💡 Use Settings → Quick Scan for older notes")
+                } else {
+                    // NEW WALLET: Fast startup - no historical notes possible
+                    startHeight = bundledTreeHeight + 1
+                    print("📦 New wallet with bundled tree - fast startup from \(startHeight)")
+                }
             } else {
                 // No tree anywhere - full scan from Sapling activation
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -401,74 +411,99 @@ final class FilterScanner {
         // - If scanning after bundled tree: use SEQUENTIAL mode (tree building + note discovery)
         var currentHeight = startHeight
 
-        // PHASE 1: If we're scanning within bundled tree range, scan those blocks first (parallel/fast)
+        // PHASE 1: If we're scanning within bundled tree range, scan those blocks first (batch/fast)
         if scanWithinBundledRange && startHeight <= bundledTreeHeight {
-            print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(bundledTreeHeight) for notes (parallel, no tree building)")
+            print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(bundledTreeHeight) for notes (batch P2P, no tree building)")
 
             let parallelEndHeight = min(bundledTreeHeight, targetHeight)
             let parallelTotalBlocks = parallelEndHeight - startHeight + 1
             var parallelScannedBlocks: UInt64 = 0
-            let parallelBatchSize = 100
+            let batchSize = 500 // Larger batches for P2P batch fetching
 
             while currentHeight <= parallelEndHeight && isScanning {
-                let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, parallelEndHeight)
-                let heights = Array(currentHeight...endHeight)
+                let remainingBlocks = Int(parallelEndHeight - currentHeight + 1)
+                let thisBatchSize = min(batchSize, remainingBlocks)
+                let endHeight = currentHeight + UInt64(thisBatchSize) - 1
 
-                print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
+                print("⚡ Batch fetching blocks \(currentHeight) to \(endHeight) (\(thisBatchSize) blocks)...")
 
-                // Fetch all blocks in parallel using P2P-first approach
-                await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
-                    for height in heights {
-                        group.addTask {
+                // Use batch P2P fetch - much faster than individual requests!
+                var blockDataMap: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
+
+                do {
+                    // Try P2P batch fetch first
+                    if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected {
+                        let results = try await networkManager.getBlocksDataP2P(from: currentHeight, count: thisBatchSize)
+                        for (height, _, txData) in results {
+                            blockDataMap[height] = txData
+                        }
+                        FilterScanner.p2pBlockFetchingWorks = true
+                    } else {
+                        throw ScanError.networkError
+                    }
+                } catch {
+                    // Fallback to InsightAPI with parallel fetching (still faster than sequential)
+                    if !useP2POnly {
+                        print("⚠️ P2P batch failed, using InsightAPI fallback...")
+                        await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
+                            for height in currentHeight...endHeight {
+                                group.addTask {
+                                    do {
+                                        let txData = try await self.fetchBlockData(height: height)
+                                        return (height, txData.isEmpty ? nil : txData)
+                                    } catch {
+                                        return (height, nil)
+                                    }
+                                }
+                            }
+                            for await (height, txData) in group {
+                                if let data = txData {
+                                    blockDataMap[height] = data
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process all fetched blocks
+                for height in currentHeight...endHeight {
+                    guard isScanning else { break }
+
+                    if let transactions = blockDataMap[height] {
+                        for (txid, shieldedOutputs, shieldedSpends) in transactions {
                             do {
-                                let txData = try await self.fetchBlockData(height: height)
-                                return (height, txData.isEmpty ? nil : txData)
+                                try await MainActor.run {
+                                    // Use note-discovery-only mode (no tree append)
+                                    // Now also passes spends for nullifier detection
+                                    // Pass bundled CMU data for real position lookup
+                                    try self.processShieldedOutputsForNotesOnly(
+                                        outputs: shieldedOutputs,
+                                        spends: shieldedSpends,
+                                        txid: txid,
+                                        accountId: accountId,
+                                        spendingKey: spendingKey,
+                                        ivk: ivk,
+                                        height: height,
+                                        bundledCMUData: self.bundledCMUData
+                                    )
+                                }
                             } catch {
-                                return (height, nil)
+                                print("❌ Error processing tx \(txid): \(error)")
                             }
                         }
                     }
 
-                    // Process results - for bundled range we skip tree building but DO find notes AND detect spent notes
-                    for await (height, txData) in group {
-                        guard isScanning else { break }
-
-                        if let transactions = txData {
-                            for (txid, shieldedOutputs, shieldedSpends) in transactions {
-                                do {
-                                    try await MainActor.run {
-                                        // Use note-discovery-only mode (no tree append)
-                                        // Now also passes spends for nullifier detection
-                                        // Pass bundled CMU data for real position lookup
-                                        try self.processShieldedOutputsForNotesOnly(
-                                            outputs: shieldedOutputs,
-                                            spends: shieldedSpends,
-                                            txid: txid,
-                                            accountId: accountId,
-                                            spendingKey: spendingKey,
-                                            ivk: ivk,
-                                            height: height,
-                                            bundledCMUData: self.bundledCMUData
-                                        )
-                                    }
-                                } catch {
-                                    print("❌ Error processing tx \(txid): \(error)")
-                                }
-                            }
-                        }
-
-                        parallelScannedBlocks += 1
-                        // Report progress every 50 blocks, at start, and at end
-                        if parallelScannedBlocks == 1 || parallelScannedBlocks % 50 == 0 || parallelScannedBlocks == parallelTotalBlocks {
-                            let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
-                            onProgress?(progress * 0.5, height, targetHeight) // 50% for phase 1
-                        }
+                    parallelScannedBlocks += 1
+                    // Report progress every 100 blocks
+                    if parallelScannedBlocks == 1 || parallelScannedBlocks % 100 == 0 || parallelScannedBlocks == parallelTotalBlocks {
+                        let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
+                        onProgress?(progress * 0.5, height, targetHeight) // 50% for phase 1
                     }
                 }
 
                 // Save progress for bundled range scan
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
-                print("⚡ Parallel scanned \(currentHeight) to \(endHeight)")
+                print("⚡ Batch scanned \(currentHeight) to \(endHeight)")
                 currentHeight = endHeight + 1
             }
 
@@ -1020,8 +1055,8 @@ final class FilterScanner {
                 }
 
                 if knownNullifiers.contains(spend.nullifier) {
-                    // One of our notes was spent!
-                    try database.markNoteSpent(nullifier: spend.nullifier, spentHeight: height)
+                    // One of our notes was spent! Include txid for history tracking
+                    try database.markNoteSpent(nullifier: spend.nullifier, txid: tx.txHash, spentHeight: height)
                     print("💸 Note spent at height \(height)")
                 }
             }
@@ -1092,6 +1127,8 @@ final class FilterScanner {
         // This must be done before processing outputs
         if let spends = spends, !spends.isEmpty {
             print("🔍 Checking \(spends.count) spend(s) at height \(height) against \(knownNullifiers.count) known nullifiers")
+            // Convert txid from hex string to Data for database storage
+            let txidData = Data(hexString: txid)
             for spend in spends {
                 guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
                     continue
@@ -1101,8 +1138,12 @@ final class FilterScanner {
                 // Must reverse before comparison!
                 let nullifierWire = nullifierDisplay.reversedBytes()
                 if knownNullifiers.contains(nullifierWire) {
-                    // One of our notes was spent!
-                    try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                    // One of our notes was spent! Include txid for history tracking
+                    if let txidData = txidData {
+                        try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
+                    } else {
+                        try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                    }
                     print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
                 }
             }
@@ -1208,6 +1249,8 @@ final class FilterScanner {
         // This must be done before processing outputs so we can catch spends
         // of notes we already know about
         if let spends = spends {
+            // Convert txid from hex string to Data for database storage
+            let txidData = Data(hexString: txid)
             for spend in spends {
                 guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
                     continue
@@ -1217,8 +1260,12 @@ final class FilterScanner {
                 // Must reverse before comparison!
                 let nullifierWire = nullifierDisplay.reversedBytes()
                 if knownNullifiers.contains(nullifierWire) {
-                    // One of our notes was spent!
-                    try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                    // One of our notes was spent! Include txid for history tracking
+                    if let txidData = txidData {
+                        try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
+                    } else {
+                        try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                    }
                     print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
                 }
             }
