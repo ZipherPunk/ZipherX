@@ -30,6 +30,7 @@ struct BalanceView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        let _ = print("📜 BALANCEVIEW: body being rendered")
         ZStack {
             VStack(spacing: 16) {
                 // Balance display
@@ -69,6 +70,7 @@ struct BalanceView: View {
             }
         }
         .onAppear {
+            print("📜 BALANCEVIEW: onAppear TRIGGERED")
             // Initialize previous balance
             previousBalance = walletManager.shieldedBalance
             // Start automatic refresh every 3 seconds
@@ -221,12 +223,38 @@ struct BalanceView: View {
                 }
                 .padding(8)
             } else {
-                let _ = print("📜 TXHIST VIEW: Showing \(transactions.count) transactions")
-                // Show up to 5 recent transactions
+                // Filter out change transactions - user doesn't want to see internal change outputs
+                let visibleTransactions = transactions.filter { $0.type != .change }
+                let _ = print("📜 TXHIST VIEW: Showing \(visibleTransactions.count) of \(transactions.count) transactions (hidden: change)")
+                // Show up to 5 recent transactions (excluding change)
                 VStack(spacing: 1) {
-                    ForEach(transactions.prefix(5), id: \.txidString) { tx in
+                    ForEach(visibleTransactions.prefix(5), id: \.uniqueId) { tx in
                         transactionRow(tx)
                     }
+                }
+
+                // Show warning if history doesn't match balance
+                if let mismatchInfo = historyBalanceMismatch {
+                    Divider()
+                        .background(theme.borderColor)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                            Text("Incomplete History")
+                                .font(theme.captionFont)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundColor(theme.warningColor)
+
+                        Text(mismatchInfo.message)
+                            .font(.system(size: 9))
+                            .foregroundColor(theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(theme.warningColor.opacity(0.1))
                 }
             }
         }
@@ -238,6 +266,46 @@ struct BalanceView: View {
         .cornerRadius(theme.cornerRadius)
     }
 
+    /// Check if transaction history sum matches the displayed balance
+    private var historyBalanceMismatch: (message: String, difference: Int64)? {
+        guard !transactions.isEmpty else { return nil }
+
+        // Calculate balance from history (excluding change which is internal)
+        let totalReceived = transactions
+            .filter { $0.type == .received }
+            .reduce(0) { $0 + Int64($1.value) }
+
+        let totalSent = transactions
+            .filter { $0.type == .sent }
+            .reduce(0) { $0 + Int64($1.value) }
+
+        let historyBalance = totalReceived - totalSent
+        let actualBalance = Int64(walletManager.shieldedBalance)
+        let difference = actualBalance - historyBalance
+
+        // Allow small tolerance for fees/rounding (10000 zatoshis = 0.0001 ZCL)
+        if abs(difference) > 10000 {
+            let diffZCL = Double(abs(difference)) / 100_000_000.0
+            let scanHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+
+            if difference > 0 {
+                // Balance is higher than history suggests - missing RECEIVED transactions
+                return (
+                    message: "History shows \(String(format: "%.4f", diffZCL)) ZCL less than balance. Some transactions before block \(scanHeight) may be missing. Use Settings → Quick Scan to find older transactions.",
+                    difference: difference
+                )
+            } else {
+                // Balance is lower than history suggests - missing SENT transactions
+                return (
+                    message: "History shows \(String(format: "%.4f", diffZCL)) ZCL more than balance. Some outgoing transactions may not be recorded. Use Settings → Full Rescan if needed.",
+                    difference: difference
+                )
+            }
+        }
+
+        return nil
+    }
+
     private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
         Button(action: {
             selectedTransaction = tx
@@ -245,34 +313,58 @@ struct BalanceView: View {
         }) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
-                    // Type icon
-                    Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
-                        .font(.system(size: 10))
-                        .foregroundColor(tx.type == .received ? theme.successColor : theme.errorColor)
-                        .frame(width: 16)
+                    // Type icon with pending indicator
+                    ZStack {
+                        Image(systemName: txIcon(for: tx.type))
+                            .font(.system(size: 10))
+                            .foregroundColor(tx.isPending ? theme.warningColor : txColor(for: tx.type))
+                            .frame(width: 16)
+
+                        // Pulsing dot for pending transactions
+                        if tx.isPending {
+                            Circle()
+                                .fill(theme.warningColor)
+                                .frame(width: 6, height: 6)
+                                .offset(x: 6, y: -4)
+                        }
+                    }
 
                     // Amount
-                    Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.4f", tx.valueInZCL))")
+                    Text("\(tx.type == .sent ? "-" : "+")\(String(format: "%.8f", tx.valueInZCL))")
                         .font(theme.monoFont)
-                        .foregroundColor(tx.type == .received ? theme.successColor : theme.errorColor)
+                        .foregroundColor(tx.isPending ? theme.warningColor : txColor(for: tx.type))
 
                     Spacer()
 
-                    // Date/Time - prefer actual blockTime, fall back to estimated time
-                    Text(tx.dateString ?? estimatedDateString(for: tx.height))
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
+                    // Status or Date/Time
+                    if tx.isPending {
+                        Text(tx.statusString)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.warningColor)
+                    } else {
+                        Text(tx.dateString ?? estimatedDateString(for: tx.height))
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
                 }
 
-                // Txid preview (truncated)
-                Text(truncatedTxid(tx.txidString))
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundColor(theme.textSecondary)
-                    .padding(.leading, 24)
+                // Txid preview (truncated) with confirmations
+                HStack {
+                    Text(truncatedTxid(tx.txidString))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+
+                    if tx.status == .confirmed && tx.confirmations > 0 {
+                        Text("(\(tx.confirmations) conf.)")
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundColor(theme.textSecondary.opacity(0.7))
+                    }
+                }
+                .padding(.leading, 24)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(theme.surfaceColor)
+            .background(tx.isPending ? theme.warningColor.opacity(0.1) : theme.surfaceColor)
             .contentShape(Rectangle())
         }
         .buttonStyle(PlainButtonStyle())
@@ -671,7 +763,7 @@ struct BalanceView: View {
         } else if networkManager.isConnected {
             let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
             let warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
-            return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning)"
+            return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning) (\(networkManager.knownAddressCount) known)"
         } else {
             return "Disconnected"
         }
@@ -776,23 +868,12 @@ struct BalanceView: View {
             // Only fetch stats if already connected (don't auto-connect repeatedly)
             if networkManager.isConnected {
                 // Fetch network stats (block height, difficulty, etc.)
+                // This will automatically trigger backgroundSyncToHeight() if needed
                 await networkManager.fetchNetworkStats()
 
-                // Check for new blocks and scan them - but NOT if scan is already running
-                if networkManager.chainHeight > networkManager.walletHeight &&
-                   networkManager.chainHeight > 0 &&
-                   !FilterScanner.isScanInProgress {
-                    isRefreshing = true
-                    do {
-                        try await walletManager.refreshBalance()
-                        // Reload transaction history after sync
-                        loadTransactionHistory()
-                    } catch {
-                        // Silently fail on auto-refresh
-                        print("⚠️ Auto-refresh failed: \(error.localizedDescription)")
-                    }
-                    isRefreshing = false
-                }
+                // Reload transaction history periodically
+                // (backgroundSyncToHeight updates balance automatically)
+                loadTransactionHistory()
             } else {
                 // Try to connect once
                 do {
@@ -801,6 +882,32 @@ struct BalanceView: View {
                     // Silently fail - will retry on next tick
                 }
             }
+        }
+    }
+
+    // MARK: - Transaction Display Helpers
+
+    /// Returns the appropriate SF Symbol icon for each transaction type
+    private func txIcon(for type: TransactionType) -> String {
+        switch type {
+        case .sent:
+            return "arrow.up.circle.fill"
+        case .received:
+            return "arrow.down.circle.fill"
+        case .change:
+            return "arrow.triangle.2.circlepath"
+        }
+    }
+
+    /// Returns the appropriate color for each transaction type
+    private func txColor(for type: TransactionType) -> Color {
+        switch type {
+        case .sent:
+            return theme.errorColor
+        case .received:
+            return theme.successColor
+        case .change:
+            return theme.textSecondary
         }
     }
 

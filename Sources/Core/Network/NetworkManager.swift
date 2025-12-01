@@ -2,6 +2,23 @@ import Foundation
 import Network
 import Combine
 
+/// Timeout helper for async operations
+func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw NetworkError.timeout
+        }
+        // Return first result, cancel the other
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
+}
+
 /// Multi-Peer Network Manager for Zclassic
 /// Connects to multiple nodes and requires consensus for all queries
 final class NetworkManager: ObservableObject {
@@ -85,7 +102,8 @@ final class NetworkManager: ObservableObject {
         setupPeerRotation()
         setupAddressDiscovery()
         setupStatsRefresh()
-        loadPersistedAddresses()
+        loadBundledPeers()      // Load bundled peers first (for fresh installs)
+        loadPersistedAddresses() // Then override with persisted (for returning users)
     }
 
     // MARK: - Address Management
@@ -425,6 +443,97 @@ final class NetworkManager: ObservableObject {
         }
     }
 
+    /// Load bundled peer list from Resources (for fresh installs)
+    private func loadBundledPeers() {
+        guard let url = Bundle.main.url(forResource: "bundled_peers", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let bundledPeers = try? JSONDecoder().decode([BundledPeer].self, from: data) else {
+            print("📡 No bundled peers file found (this is OK for development)")
+            return
+        }
+
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        var loadedCount = 0
+        for peer in bundledPeers {
+            let key = "\(peer.host):\(peer.port)"
+
+            // Skip if banned or already known
+            if isBanned(peer.host) || knownAddresses[key] != nil {
+                continue
+            }
+
+            let address = PeerAddress(host: peer.host, port: peer.port)
+            knownAddresses[key] = AddressInfo(
+                address: address,
+                source: "bundled",
+                firstSeen: Date(),
+                lastSeen: Date(),
+                attempts: 0,
+                successes: peer.reliability > 0.5 ? 1 : 0  // Assume good if reliability > 50%
+            )
+
+            // High reliability peers go to tried set
+            if peer.reliability > 0.5 {
+                triedAddresses.insert(key)
+            } else {
+                newAddresses.insert(key)
+            }
+            loadedCount += 1
+        }
+
+        print("📡 Loaded \(loadedCount) bundled peer addresses")
+    }
+
+    /// Export current reliable peers for bundling in future releases
+    /// Call this from Settings when 100+ peers have been discovered
+    func exportReliablePeersForBundling() -> String {
+        addressLock.lock()
+        let reliablePeers = knownAddresses.values
+            .filter { $0.successes > 0 && $0.attempts > 0 }  // Must have succeeded at least once
+            .sorted {
+                // Sort by success rate, then by total successes
+                let rate1 = Double($0.successes) / Double(max(1, $0.attempts))
+                let rate2 = Double($1.successes) / Double(max(1, $1.attempts))
+                if abs(rate1 - rate2) < 0.1 {
+                    return $0.successes > $1.successes
+                }
+                return rate1 > rate2
+            }
+            .prefix(150)  // Export top 150 reliable peers
+            .map { info -> BundledPeer in
+                let reliability = Double(info.successes) / Double(max(1, info.attempts))
+                return BundledPeer(
+                    host: info.address.host,
+                    port: info.address.port,
+                    reliability: reliability,
+                    lastSeen: info.lastSeen
+                )
+            }
+        addressLock.unlock()
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        guard let data = try? encoder.encode(Array(reliablePeers)),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return "// Error encoding peers"
+        }
+
+        return jsonString
+    }
+
+    /// Get count of reliable peers (success rate > 50%)
+    var reliablePeerCount: Int {
+        addressLock.lock()
+        let count = knownAddresses.values.filter {
+            $0.successes > 0 && Double($0.successes) / Double(max(1, $0.attempts)) > 0.5
+        }.count
+        addressLock.unlock()
+        return count
+    }
+
     // MARK: - Connection Management
 
     /// Connect to the Zclassic network
@@ -609,18 +718,19 @@ final class NetworkManager: ObservableObject {
         }
 
         // Get chain info from Insight API
+        var currentChainHeight: UInt64 = 0
         do {
             let status = try await InsightAPI.shared.getStatus()
-            let height = status.height
-            print("📊 Chain height: \(height)")
+            currentChainHeight = status.height
+            print("📊 Chain height: \(currentChainHeight)")
 
             // Get last block info
-            let blockHash = try await InsightAPI.shared.getBlockHash(height: height)
+            let blockHash = try await InsightAPI.shared.getBlockHash(height: currentChainHeight)
             let block = try await InsightAPI.shared.getBlock(hash: blockHash)
             print("📊 Last block txns: \(block.tx.count)")
 
             await MainActor.run {
-                self.chainHeight = height
+                self.chainHeight = currentChainHeight
                 self.lastBlockTxCount = block.tx.count
                 self.networkDifficulty = status.difficulty
                 print("📊 Updated chainHeight to: \(self.chainHeight)")
@@ -640,10 +750,15 @@ final class NetworkManager: ObservableObject {
 
         // BACKGROUND SYNC: If chain is ahead of wallet, sync new blocks
         // This keeps the tree always current for instant sends
-        if chainHeight > dbHeight && dbHeight > 0 {
+        // IMPORTANT: Use local currentChainHeight, not @Published chainHeight
+        // to avoid race conditions with MainActor updates
+        if currentChainHeight > dbHeight && dbHeight > 0 {
+            print("🔄 Background sync needed: chain=\(currentChainHeight) wallet=\(dbHeight) (+\(currentChainHeight - dbHeight) blocks)")
             Task {
-                await WalletManager.shared.backgroundSyncToHeight(chainHeight)
+                await WalletManager.shared.backgroundSyncToHeight(currentChainHeight)
             }
+        } else if currentChainHeight > 0 && dbHeight > 0 {
+            print("📊 Sync check: chain=\(currentChainHeight) wallet=\(dbHeight) - no sync needed")
         }
 
         // MEMPOOL SCAN: Check for incoming unconfirmed transactions
@@ -1483,47 +1598,69 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get multiple blocks' data for P2P scanning
-    /// NOTE: This is not used for normal scanning (uses InsightAPI instead to avoid peer spam)
-    /// Kept for potential future use with trusted peers or local nodes
+    /// Tries ALL connected peers with fast rotation on failure, then falls back to InsightAPI
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        guard isConnected else {
-            throw NetworkError.notConnected
-        }
-
-        guard let peer = peers.first else {
-            throw NetworkError.notConnected
-        }
-
         var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
-        // Fetch blocks one by one using HeaderStore hashes (with InsightAPI fallback)
+        // Track which peers have failed recently (don't retry them for this batch)
+        var failedPeerIndices: Set<Int> = []
+
+        print("🔄 P2P batch fetch: \(count) blocks from height \(height), \(peers.count) peers available")
+
+        // Fetch blocks one by one
         for i in 0..<count {
             let blockHeight = height + UInt64(i)
-
             var block: CompactBlock?
+            var blockHash: Data?
 
-            // Try P2P first: Get block hash from HeaderStore
-            if let header = try? HeaderStore.shared.getHeader(at: blockHeight) {
-                block = try? await peer.getBlockByHash(hash: header.blockHash)
+            // Log progress every 50 blocks
+            if i % 50 == 0 {
+                print("📊 P2P progress: \(i)/\(count) blocks fetched (height \(blockHeight))")
             }
 
-            // Fallback to InsightAPI if P2P failed
+            // Get block hash from HeaderStore
+            if let header = try? HeaderStore.shared.getHeader(at: blockHeight) {
+                blockHash = header.blockHash
+            } else {
+                print("⚠️ No header found for height \(blockHeight)")
+            }
+
+            // Try ALL connected peers with 3 second timeout each
+            if let hash = blockHash {
+                let availablePeers = peers.enumerated().filter { !failedPeerIndices.contains($0.offset) }
+
+                for (peerIndex, peer) in availablePeers {
+                    do {
+                        block = try await withTimeout(seconds: 3) {
+                            try await peer.getBlockByHash(hash: hash)
+                        }
+                        if block != nil {
+                            // Success! Use this peer
+                            break
+                        }
+                    } catch {
+                        // Mark peer as failed for this batch
+                        failedPeerIndices.insert(peerIndex)
+                        print("⚠️ P2P: Peer \(peerIndex) failed at height \(blockHeight), trying next...")
+                    }
+                }
+            }
+
+            // Fallback to InsightAPI if all P2P peers failed
             if block == nil {
                 do {
+                    if i == 0 {
+                        print("📡 Falling back to InsightAPI (no P2P headers available)...")
+                    }
                     let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: blockHeight)
-                    // Get shielded outputs via InsightAPI (uses raw tx parsing)
                     let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
-                    // Fetch shielded data from each transaction (including spends for nullifier detection!)
                     var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
                     for txid in insightBlock.tx {
-                        // Get full tx to check for spends (nullifier detection)
                         let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
                         let spends = txInfo?.spendDescs
-
-                        // Get outputs from raw tx (full encCiphertext)
                         let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
 
-                        // Include tx if it has outputs OR spends (spends are for nullifier detection)
                         if !outputs.isEmpty || (spends?.isEmpty == false) {
                             txDataList.append((txid, outputs, spends))
                         }
@@ -1531,18 +1668,17 @@ final class NetworkManager: ObservableObject {
                     results.append((blockHeight, hashFromAPI, txDataList))
                     continue
                 } catch {
-                    print("⚠️ P2P batch: Failed to get block at height \(blockHeight) (P2P and InsightAPI both failed)")
+                    print("⚠️ P2P batch: Failed to get block at height \(blockHeight) (all peers + InsightAPI failed): \(error)")
                     continue
                 }
             }
 
             guard let block = block else {
-                print("⚠️ P2P batch: No block data at height \(blockHeight)")
                 continue
             }
-            // Use block hash from P2P block
-            let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
 
+            // Process P2P block data
+            let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
             var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
 
             for tx in block.transactions {
@@ -1742,6 +1878,14 @@ struct PersistedAddress: Codable {
     let lastSeen: Date
     let attempts: Int
     let successes: Int
+}
+
+/// Peer data for bundling in app resources
+struct BundledPeer: Codable {
+    let host: String
+    let port: UInt16
+    let reliability: Double  // Success rate 0.0-1.0
+    let lastSeen: Date
 }
 
 struct ShieldedBalance: Equatable {

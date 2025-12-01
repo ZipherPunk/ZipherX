@@ -1855,6 +1855,53 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 
 ---
 
+### 32. Background Sync Not Triggering for New Blocks (December 1, 2025)
+
+**Problem**: iOS simulator received ZCL from a transaction but it never appeared in the wallet. Full node balance was correct, but ZipherX showed the old balance. z.log showed chain height updates but no background sync calls.
+
+**Root Causes**:
+
+1. **Race condition with @Published chainHeight**:
+   - `fetchNetworkStats()` updated `chainHeight` on MainActor at line 732
+   - But the condition check at line 752 used `chainHeight` directly
+   - Due to async/await, the value might not be updated yet when checked
+
+2. **Competing sync mechanisms**:
+   - `fetchNetworkStats()` spawned `backgroundSyncToHeight()` in a Task
+   - `autoRefreshTick()` in BalanceView also called `refreshBalance()`
+   - `refreshBalance()` sets `isSyncing = true`
+   - `backgroundSyncToHeight()` has guard: `guard !isSyncing else { return }`
+   - Result: `refreshBalance()` blocked the background sync!
+
+**Solution**:
+
+1. **Use local variable for chain height** (`NetworkManager.swift`):
+   ```swift
+   var currentChainHeight: UInt64 = 0
+   // ... fetch from API ...
+   currentChainHeight = status.height
+
+   // Use local variable, not @Published property
+   if currentChainHeight > dbHeight && dbHeight > 0 {
+       await WalletManager.shared.backgroundSyncToHeight(currentChainHeight)
+   }
+   ```
+
+2. **Remove redundant refreshBalance() call** (`BalanceView.swift`):
+   - `autoRefreshTick()` now only calls `fetchNetworkStats()`
+   - `backgroundSyncToHeight()` handles new block detection automatically
+   - Removed competing sync that was blocking background sync
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - use local `currentChainHeight`, add debug logging
+- `Sources/Features/Balance/BalanceView.swift` - remove redundant `refreshBalance()` call in `autoRefreshTick()`
+
+**Debug Logging Added**:
+- `"🔄 Background sync needed: chain=X wallet=Y (+Z blocks)"` when sync triggered
+- `"📊 Sync check: chain=X wallet=Y - no sync needed"` when already synced
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
