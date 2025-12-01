@@ -322,11 +322,10 @@ final class SecureKeyStorage {
         return decryptedData
     }
 
-    /// macOS keychain storage with AES-GCM encryption
-    /// Uses a device-unique key to encrypt the spending key before storing
-    /// This avoids -67068 errSecMissingEntitlement on unsigned/development builds
+    /// macOS file-based storage with AES-GCM encryption
+    /// Uses encrypted file instead of keychain to avoid -67068 errSecMissingEntitlement on unsigned builds
     private func storeKeySimpleMacOS(_ key: Data, tag: String) throws {
-        print("🖥️ macOS: Storing \(key.count) bytes with tag: \(tag) (encrypted)")
+        print("🖥️ macOS: Storing \(key.count) bytes with tag: \(tag) (encrypted file)")
 
         // Encrypt the key using AES-GCM with device-unique key
         let encryptionKey = try getMacOSEncryptionKey()
@@ -336,36 +335,52 @@ final class SecureKeyStorage {
         }
         print("🔐 macOS: Encrypted to \(encryptedData.count) bytes")
 
-        // macOS keychain without accessibility constraints (works without code signing)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX",
-            kSecAttrAccount as String: tag,
-            kSecValueData as String: encryptedData
-            // Deliberately NOT setting kSecAttrAccessible to avoid entitlement requirement
-        ]
+        // Store in encrypted file in app's Application Support directory
+        let fileURL = try getMacOSKeyFileURL(for: tag)
 
-        var status = SecItemAdd(query as CFDictionary, nil)
+        // Create directory if needed
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        // If duplicate exists, update instead of add
-        if status == errSecDuplicateItem {
-            print("⚠️ macOS: Key already exists, updating...")
-            let searchQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: "ZipherX",
-                kSecAttrAccount as String: tag
-            ]
-            let updateAttributes: [String: Any] = [
-                kSecValueData as String: encryptedData
-            ]
-            status = SecItemUpdate(searchQuery as CFDictionary, updateAttributes as CFDictionary)
+        // Write encrypted data with protection
+        try encryptedData.write(to: fileURL, options: [.atomic, .completeFileProtection])
+
+        print("✓ macOS: Encrypted key stored at \(fileURL.path)")
+    }
+
+    /// Get the file URL for storing encrypted keys on macOS
+    private func getMacOSKeyFileURL(for tag: String) throws -> URL {
+        let fileManager = FileManager.default
+
+        // Use Application Support directory
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw SecureStorageError.keyGenerationFailed("Could not find Application Support directory")
         }
 
-        guard status == errSecSuccess else {
-            print("❌ macOS: Keychain store failed with status: \(status)")
-            throw SecureStorageError.keychainStoreFailed(status)
+        let zipherxDir = appSupport.appendingPathComponent("ZipherX", isDirectory: true)
+        let safeTag = tag.replacingOccurrences(of: ".", with: "_")
+        return zipherxDir.appendingPathComponent("\(safeTag).enc")
+    }
+
+    /// Check if macOS key file exists
+    private func macOSKeyFileExists(for tag: String) -> Bool {
+        guard let fileURL = try? getMacOSKeyFileURL(for: tag) else { return false }
+        return FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
+    /// Read encrypted key from macOS file
+    private func readMacOSKeyFile(for tag: String) throws -> Data {
+        let fileURL = try getMacOSKeyFileURL(for: tag)
+        return try Data(contentsOf: fileURL)
+    }
+
+    /// Delete macOS key file
+    private func deleteMacOSKeyFile(for tag: String) throws {
+        let fileURL = try getMacOSKeyFileURL(for: tag)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.removeItem(at: fileURL)
+            print("🗑️ macOS: Deleted key file at \(fileURL.path)")
         }
-        print("✓ macOS: Encrypted key stored in keychain")
     }
 
     /// Get or create a device-unique encryption key for macOS
@@ -411,24 +426,28 @@ final class SecureKeyStorage {
         return "ZipherX-macOS-fallback-\(Bundle.main.bundleIdentifier ?? "unknown")"
     }
 
-    /// Get or create a random salt for key derivation
+    /// Get or create a random salt for key derivation (file-based for macOS)
     private func getOrCreateMacOSSalt() throws -> Data {
-        let saltTag = "com.zipherx.macos.salt"
+        let fileManager = FileManager.default
 
-        // Try to retrieve existing salt
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX-Salt",
-            kSecAttrAccount as String: saltTag,
-            kSecReturnData as String: true
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        if status == errSecSuccess, let salt = result as? Data {
-            return salt
+        // Use Application Support directory for salt file
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw SecureStorageError.keyGenerationFailed("Could not find Application Support directory")
         }
+
+        let zipherxDir = appSupport.appendingPathComponent("ZipherX", isDirectory: true)
+        let saltFileURL = zipherxDir.appendingPathComponent("key_salt.bin")
+
+        // Try to read existing salt
+        if fileManager.fileExists(atPath: saltFileURL.path) {
+            let salt = try Data(contentsOf: saltFileURL)
+            if salt.count == 32 {
+                return salt
+            }
+        }
+
+        // Create directory if needed
+        try fileManager.createDirectory(at: zipherxDir, withIntermediateDirectories: true)
 
         // Create new random salt
         var salt = Data(count: 32)
@@ -439,18 +458,9 @@ final class SecureKeyStorage {
             throw SecureStorageError.keyGenerationFailed("Failed to generate random salt")
         }
 
-        // Store salt in keychain
-        let storeQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX-Salt",
-            kSecAttrAccount as String: saltTag,
-            kSecValueData as String: salt
-        ]
-
-        let storeStatus = SecItemAdd(storeQuery as CFDictionary, nil)
-        if storeStatus != errSecSuccess && storeStatus != errSecDuplicateItem {
-            print("⚠️ macOS: Could not store salt (status: \(storeStatus)), using in-memory")
-        }
+        // Store salt to file
+        try salt.write(to: saltFileURL, options: [.atomic])
+        print("🔐 macOS: Created new salt file at \(saltFileURL.path)")
 
         return salt
     }
@@ -471,6 +481,26 @@ final class SecureKeyStorage {
     func hasSpendingKey() -> Bool {
         print("🔐 hasSpendingKey: Checking key existence...")
 
+        // macOS: Check file-based storage (keychain doesn't work on unsigned builds)
+        if isMacOS {
+            let fileExists = macOSKeyFileExists(for: spendingKeyTag)
+            print("🔐 hasSpendingKey: macOS file exists = \(fileExists)")
+            if fileExists {
+                // Try to decrypt to verify it's valid
+                do {
+                    let encryptedData = try readMacOSKeyFile(for: spendingKeyTag)
+                    let decrypted = try decryptMacOSData(encryptedData)
+                    let valid = decrypted.count == 169
+                    print("🔐 hasSpendingKey: macOS mode, decrypted valid=\(valid)")
+                    return valid
+                } catch {
+                    print("🔐 hasSpendingKey: macOS mode, decrypt failed - \(error)")
+                    return false
+                }
+            }
+            return false
+        }
+
         // First check: Does the keychain entry exist at all? (without reading data to avoid prompt)
         let existsQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -490,7 +520,6 @@ final class SecureKeyStorage {
 
         if existsStatus == errSecInteractionNotAllowed {
             // Item exists but requires authentication - we can't check further without UI
-            // On macOS, assume it exists and let retrieveSpendingKey handle errors
             print("🔐 hasSpendingKey: Entry exists but requires authentication")
             // For now, return true and let the actual retrieval fail with proper error handling
             return true
@@ -516,7 +545,7 @@ final class SecureKeyStorage {
         let status = SecItemCopyMatching(dataQuery as CFDictionary, &result)
 
         if status == errSecInteractionNotAllowed {
-            // Data exists but requires user interaction - assume valid on macOS
+            // Data exists but requires user interaction - assume valid
             print("🔐 hasSpendingKey: Data requires authentication, assuming valid")
             return true
         }
@@ -538,20 +567,6 @@ final class SecureKeyStorage {
                 return valid
             } catch {
                 print("🔐 hasSpendingKey: Simulator mode, decrypt failed - \(error)")
-                return false
-            }
-        }
-
-        // macOS: data is encrypted with AES-GCM (169 + 12 nonce + 16 tag = 197 bytes)
-        if isMacOS {
-            // Try to decrypt to verify it's valid
-            do {
-                let decrypted = try decryptMacOSData(data)
-                let valid = decrypted.count == 169
-                print("🔐 hasSpendingKey: macOS mode, decrypted valid=\(valid)")
-                return valid
-            } catch {
-                print("🔐 hasSpendingKey: macOS mode, decrypt failed - \(error)")
                 return false
             }
         }
@@ -587,7 +602,14 @@ final class SecureKeyStorage {
     }
 
     func retrieveSpendingKey() throws -> Data {
-        // Get data from keychain
+        // macOS: Use file-based storage (keychain doesn't work on unsigned builds)
+        if isMacOS {
+            print("🖥️ macOS: Reading encrypted key from file")
+            let encryptedData = try readMacOSKeyFile(for: spendingKeyTag)
+            return try decryptMacOSData(encryptedData)
+        }
+
+        // Get data from keychain (iOS device / simulator)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
@@ -606,12 +628,6 @@ final class SecureKeyStorage {
         if isSimulator {
             print("📱 Simulator: Decrypting key from keychain")
             return try decryptSimulatorData(data)
-        }
-
-        // macOS: data is encrypted with AES-GCM, need to decrypt
-        if isMacOS {
-            print("🖥️ macOS: Decrypting key from keychain")
-            return try decryptMacOSData(data)
         }
 
         // Check if we have a Secure Enclave key
@@ -662,13 +678,26 @@ final class SecureKeyStorage {
     func deleteSpendingKey() throws {
         var errors: [String] = []
 
-        // Delete encrypted key from keychain
+        // macOS: Delete file-based storage
+        if isMacOS {
+            do {
+                try deleteMacOSKeyFile(for: spendingKeyTag)
+                print("✓ deleteSpendingKey: macOS key file deleted")
+            } catch {
+                print("⚠️ deleteSpendingKey: Failed to delete macOS key file: \(error)")
+                errors.append("macOS file: \(error.localizedDescription)")
+            }
+        }
+
+        // Delete encrypted key from keychain (iOS / simulator)
         do {
             try deleteKey(tag: spendingKeyTag)
         } catch {
             // Log but continue - we want to try deleting everything
             print("⚠️ deleteSpendingKey: Failed to delete keychain entry: \(error)")
-            errors.append("keychain: \(error.localizedDescription)")
+            if !isMacOS {
+                errors.append("keychain: \(error.localizedDescription)")
+            }
         }
 
         // Also try deleting viewing key
@@ -679,18 +708,20 @@ final class SecureKeyStorage {
             // Don't add to errors - viewing key is optional
         }
 
-        // Delete Secure Enclave key
-        let keyQuery: [String: Any] = [
-            kSecClass as String: kSecClassKey,
-            kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!
-        ]
+        // Delete Secure Enclave key (iOS only)
+        if !isMacOS {
+            let keyQuery: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!
+            ]
 
-        let status = SecItemDelete(keyQuery as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
-            print("⚠️ deleteSpendingKey: Failed to delete SE key, status: \(status)")
-            // On macOS, -25244 (errSecInvalidKeychain) can happen - ignore it
-            if status != -25244 {
-                errors.append("SE key: status \(status)")
+            let status = SecItemDelete(keyQuery as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound {
+                print("⚠️ deleteSpendingKey: Failed to delete SE key, status: \(status)")
+                // On macOS, -25244 (errSecInvalidKeychain) can happen - ignore it
+                if status != -25244 {
+                    errors.append("SE key: status \(status)")
+                }
             }
         }
 
