@@ -14,6 +14,12 @@ struct ContentView: View {
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
 
+    // Startup timing
+    @State private var syncStartTime: Date? = nil
+    @State private var syncCompletionDuration: TimeInterval? = nil
+    @State private var showCompletionScreen: Bool = false
+    private let estimatedSyncDuration: TimeInterval = 45  // ~45 seconds estimated
+
     // Cypherpunk mode sheet states
     @State private var showCypherpunkSettings = false
     @State private var showCypherpunkSend = false
@@ -38,6 +44,11 @@ struct ContentView: View {
                         guard !hasCompletedInitialSync else {
                             print("DEBUGZIPHERX: 🚀 Task: Already completed, returning")
                             return
+                        }
+
+                        // Start the timer
+                        await MainActor.run {
+                            syncStartTime = Date()
                         }
 
                         print("DEBUGZIPHERX: 🚀 Task: isTreeLoaded = \(walletManager.isTreeLoaded)")
@@ -216,23 +227,16 @@ struct ContentView: View {
                             walletManager.setConnecting(false, status: nil)
                         }
 
-                        // Brief pause to show completion
-                        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
-
-                        // Mark initial sync as complete ONLY after everything finishes
+                        // Calculate final duration and show completion screen
                         await MainActor.run {
-                            isInitialSync = false
-                            hasCompletedInitialSync = true
-
-                            // After initial sync, show lock screen if biometric enabled
-                            // This prompts Face ID on app launch
-                            if biometricManager.isBiometricEnabled {
-                                isShowingLockScreen = true
+                            if let start = syncStartTime {
+                                syncCompletionDuration = Date().timeIntervalSince(start)
                             }
-
-                            // Start inactivity timer now that sync is done
-                            startInactivityTimer()
+                            showCompletionScreen = true
                         }
+
+                        // Wait for user to click the enter button
+                        // The button callback will set isInitialSync = false
                     }
 
                 // SINGLE cypherpunk overlay for ALL initial sync phases
@@ -241,7 +245,27 @@ struct ContentView: View {
                     CypherpunkSyncView(
                         progress: currentSyncProgress,
                         status: currentSyncStatus,
-                        tasks: currentSyncTasks
+                        tasks: currentSyncTasks,
+                        startTime: syncStartTime,
+                        estimatedDuration: estimatedSyncDuration,
+                        isComplete: showCompletionScreen,
+                        completionDuration: syncCompletionDuration,
+                        onEnterWallet: {
+                            // User clicked the enter button
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                isInitialSync = false
+                                hasCompletedInitialSync = true
+                                showCompletionScreen = false
+                            }
+
+                            // After initial sync, show lock screen if biometric enabled
+                            if biometricManager.isBiometricEnabled {
+                                isShowingLockScreen = true
+                            }
+
+                            // Start inactivity timer now that sync is done
+                            startInactivityTimer()
+                        }
                     )
                     .transition(.opacity)
                 }
@@ -366,17 +390,21 @@ struct ContentView: View {
 
     /// Combined progress for all sync phases
     private var currentSyncProgress: Double {
-        // Connecting phase (0-10%) - comes first now
-        if !networkManager.isConnected {
-            return walletManager.isConnecting ? 0.05 : 0.0
-        }
-
-        // Tree loading phase (10-40%)
+        // Tree loading phase (0-40%) - FIRST priority
+        // Tree loads before network connection starts
         if !walletManager.isTreeLoaded {
-            return 0.10 + (walletManager.treeLoadProgress * 0.30)
+            // Show 5% immediately, then scale progress from 5-40%
+            let baseProgress = 0.05
+            let treePhaseSize = 0.35
+            return baseProgress + (walletManager.treeLoadProgress * treePhaseSize)
         }
 
-        // Sync phase (40-95%)
+        // Connecting phase (40-50%) - after tree is loaded
+        if !networkManager.isConnected {
+            return walletManager.isConnecting ? 0.45 : 0.40
+        }
+
+        // Sync phase (50-95%)
         // Check if still syncing OR tasks exist and not all completed
         let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
             if case .completed = $0.status { return true }
@@ -392,7 +420,7 @@ struct ContentView: View {
             if balanceCompleted {
                 return 0.98
             }
-            return 0.40 + (walletManager.syncProgress * 0.55)
+            return 0.50 + (walletManager.syncProgress * 0.45)
         }
 
         // Finalizing phase (95-100%) - only if we're truly done
@@ -401,18 +429,18 @@ struct ContentView: View {
         }
 
         // Still waiting for sync to start
-        return 0.40
+        return 0.50
     }
 
     /// Combined status for all sync phases
     private var currentSyncStatus: String {
-        // Connecting (first step now)
-        if !networkManager.isConnected {
-            return walletManager.isConnecting ? "Connecting to network..." : "Waiting for network..."
-        }
-        // Tree loading
+        // Tree loading (first step now)
         if !walletManager.isTreeLoaded {
             return walletManager.treeLoadStatus.isEmpty ? "Loading commitment tree..." : walletManager.treeLoadStatus
+        }
+        // Connecting (after tree loaded)
+        if !networkManager.isConnected {
+            return walletManager.isConnecting ? "Connecting to network..." : "Waiting for network..."
         }
         // Syncing (includes waiting for sync to start)
         // Only show sync status if still syncing or tasks not all completed
@@ -441,30 +469,35 @@ struct ContentView: View {
     }
 
     /// Combined task list including tree loading
-    /// Order: Connect → Tree → Sync tasks (headers, scan, witnesses, balance)
+    /// Order: Tree → Connect → Sync tasks (headers, scan, witnesses, balance)
     private var currentSyncTasks: [SyncTask] {
         var tasks: [SyncTask] = []
 
-        // 1. FIRST: Network connection task
-        if !networkManager.isConnected {
-            let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: status))
-        } else {
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
-        }
-
-        // 2. SECOND: Tree loading task
+        // 1. FIRST: Tree loading task (loads before network connection)
         if !walletManager.isTreeLoaded {
             let treeTask = SyncTask(
                 id: "tree",
                 title: "Load commitment tree",
-                status: walletManager.treeLoadProgress > 0 ? .inProgress : .pending,
+                status: .inProgress,  // Always in progress until loaded
                 detail: walletManager.treeLoadStatus,
                 progress: walletManager.treeLoadProgress
             )
             tasks.append(treeTask)
         } else {
             tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .completed))
+        }
+
+        // 2. SECOND: Network connection task (after tree loaded)
+        if walletManager.isTreeLoaded {
+            if !networkManager.isConnected {
+                let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
+                tasks.append(SyncTask(id: "connect", title: "Connect to network", status: status))
+            } else {
+                tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
+            }
+        } else {
+            // Tree not loaded yet - show connect as pending
+            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .pending))
         }
 
         // 3. THIRD: Sync tasks from WalletManager (headers, scan, witnesses, balance)
