@@ -408,7 +408,6 @@ struct WalletSetupView: View {
                 TextEditor(text: $privateKeyInput)
                     .font(.system(size: 11, weight: .regular, design: .monospaced))
                     .foregroundColor(theme.textPrimary)
-                    .scrollContentBackground(.hidden)
                     .frame(height: 100)
                     .padding(12)
                     .background(theme.surfaceColor)
@@ -418,6 +417,12 @@ struct WalletSetupView: View {
                             .stroke(theme.borderColor, lineWidth: 1)
                     )
                     .padding(.horizontal, 24)
+                    .onAppear {
+                        // Hide default TextEditor background on macOS
+                        #if os(macOS)
+                        NSTextView.appearance(whenContainedInInstancesOf: [NSScrollView.self]).backgroundColor = .clear
+                        #endif
+                    }
 
                 // Character count / validation
                 let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
