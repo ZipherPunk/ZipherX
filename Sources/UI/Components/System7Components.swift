@@ -20,13 +20,13 @@ enum NeonColors {
     static let progressFillStart = Color(red: 0.8, green: 0.3, blue: 0.0)
     static let progressFillEnd = Color(red: 1.0, green: 0.5, blue: 0.0)
     #else
-    static let primary = NeonColors.primary          // Neon green
-    static let primaryDark = NeonColors.primaryDark     // Dark neon green
-    static let primaryDim = NeonColors.primaryDim      // Dim green
-    static let primaryVeryDim = NeonColors.primaryVeryDim
-    static let progressBg = NeonColors.progressBg
-    static let progressFillStart = NeonColors.progressFillStart
-    static let progressFillEnd = NeonColors.progressFillEnd
+    static let primary = Color(red: 0, green: 1, blue: 0.25)          // Neon green
+    static let primaryDark = Color(red: 0, green: 0.7, blue: 0.2)     // Dark neon green
+    static let primaryDim = Color(red: 0, green: 0.5, blue: 0.1)      // Dim green
+    static let primaryVeryDim = Color(red: 0, green: 0.3, blue: 0.08)
+    static let progressBg = Color(red: 0, green: 0.2, blue: 0.05)
+    static let progressFillStart = Color(red: 0, green: 0.8, blue: 0.2)
+    static let progressFillEnd = Color(red: 0, green: 1, blue: 0.4)
     #endif
 }
 
