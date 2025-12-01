@@ -1600,6 +1600,57 @@ return txId                                     // ✅ Only now show success
 
 ---
 
+### 29. Immediate Transaction History Recording (December 1, 2025)
+
+**Problem**: Transaction history was not always in sync with the actual blockchain state:
+1. History only populated when user opens History tab (lazy loading)
+2. Notes discovered during scanning weren't immediately recorded in history
+3. If app crashed between note discovery and History tab opening, transactions would be missing
+
+**Root Cause**:
+- `populateHistoryFromNotes()` was only called when history was empty
+- FilterScanner discovered notes and stored them, but didn't record in transaction_history
+- `markNoteSpent()` wasn't passing the spending txid for proper tracking
+
+**Solution: Real-time Transaction Recording**
+
+1. **HistoryView ALWAYS populates** (`HistoryView.swift`):
+   - Changed to call `populateHistoryFromNotes()` on EVERY load, not just when empty
+   - Ensures any newly discovered notes appear in history
+
+2. **FilterScanner records immediately** (`FilterScanner.swift`):
+   - Added `recordReceivedTransaction()` calls in ALL note discovery locations:
+     - `processShieldedOutputsSync()` - sync mode scanning
+     - `processShieldedOutputsForNotesOnly()` - parallel note discovery
+     - `processShieldedOutputs()` - async legacy mode
+     - `processDecryptedNote()` - (already had `insertTransactionHistory()`)
+   - Updated all 3 `markNoteSpent()` calls to include spending txid
+
+3. **New WalletDatabase functions** (`WalletDatabase.swift`):
+   ```swift
+   // Record received transaction immediately when note discovered
+   func recordReceivedTransaction(txid: Data, height: UInt64, value: UInt64, memo: String?) throws
+
+   // Record sent transaction immediately when user initiates send
+   func recordSentTransaction(txid: Data, height: UInt64, value: UInt64, fee: UInt64, toAddress: String?, memo: String?) throws
+
+   // Check for deduplication
+   func transactionExistsInHistory(txid: Data, type: TransactionType) -> Bool
+   ```
+
+4. **Deduplication via `INSERT OR IGNORE`**:
+   - Multiple calls to record same transaction are safe
+   - UNIQUE constraint on (txid, tx_type) prevents duplicates
+
+**Result**: Transaction history is now updated in real-time as notes are discovered during scanning, not lazily when user opens History tab.
+
+**Files Modified**:
+- `Sources/Features/History/HistoryView.swift` - always call populateHistoryFromNotes()
+- `Sources/Core/Network/FilterScanner.swift` - immediate history recording + txid in markNoteSpent()
+- `Sources/Core/Storage/WalletDatabase.swift` - new recording functions
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

@@ -1493,6 +1493,120 @@ final class WalletDatabase {
         print("📜 Found \(notesFound) notes, populated \(count) transaction history entries")
         return count
     }
+
+    // MARK: - Immediate Transaction Recording
+    // These functions ensure history is updated in real-time, not lazily
+
+    /// Record a received transaction immediately when a note is discovered during scanning
+    /// Called from FilterScanner when we successfully decrypt a note
+    func recordReceivedTransaction(
+        txid: Data,
+        height: UInt64,
+        value: UInt64,
+        memo: String? = nil
+    ) throws {
+        let sql = """
+            INSERT OR IGNORE INTO transaction_history
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, NULL, 'received', ?, NULL, NULL, NULL, ?);
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+        }
+        sqlite3_bind_int64(stmt, 2, Int64(height))
+        sqlite3_bind_int64(stmt, 3, Int64(value))
+        if let memo = memo {
+            sqlite3_bind_text(stmt, 4, memo, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 4)
+        }
+
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_DONE {
+            let changes = sqlite3_changes(db)
+            if changes > 0 {
+                print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis")
+            }
+        }
+    }
+
+    /// Record a sent transaction immediately when user initiates send
+    /// Called from WalletManager BEFORE broadcasting to ensure we have a record
+    func recordSentTransaction(
+        txid: Data,
+        height: UInt64,
+        value: UInt64,
+        fee: UInt64,
+        toAddress: String?,
+        memo: String? = nil
+    ) throws {
+        let sql = """
+            INSERT OR REPLACE INTO transaction_history
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, NULL, 'sent', ?, ?, ?, NULL, ?);
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+        }
+        sqlite3_bind_int64(stmt, 2, Int64(height))
+        sqlite3_bind_int64(stmt, 3, Int64(value))
+        sqlite3_bind_int64(stmt, 4, Int64(fee))
+        if let toAddress = toAddress {
+            sqlite3_bind_text(stmt, 5, toAddress, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 5)
+        }
+        if let memo = memo {
+            sqlite3_bind_text(stmt, 6, memo, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 6)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("📜 Recorded sent transaction: height=\(height), value=\(value) zatoshis, fee=\(fee)")
+    }
+
+    /// Check if a transaction exists in history (for deduplication)
+    func transactionExistsInHistory(txid: Data, type: TransactionType) -> Bool {
+        let sql = "SELECT COUNT(*) FROM transaction_history WHERE txid = ? AND tx_type = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+        sqlite3_bind_text(stmt, 2, type.rawValue, -1, nil)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return false
+        }
+
+        return sqlite3_column_int(stmt, 0) > 0
+    }
 }
 
 // MARK: - Data Types

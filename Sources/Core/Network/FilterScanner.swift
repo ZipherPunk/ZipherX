@@ -1227,6 +1227,15 @@ final class FilterScanner {
                 cmu: cmu // Store CMU for potential witness rebuild
             )
 
+            // IMMEDIATELY record in transaction history for real-time consistency
+            let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
+            try database.recordReceivedTransaction(
+                txid: txidData,
+                height: height,
+                value: value,
+                memo: memoText
+            )
+
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
         }
     }
@@ -1352,6 +1361,15 @@ final class FilterScanner {
                 cmu: cmu // Store CMU for witness rebuild
             )
 
+            // IMMEDIATELY record in transaction history for real-time consistency
+            let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
+            try database.recordReceivedTransaction(
+                txid: txidData,
+                height: height,
+                value: value,
+                memo: memoText
+            )
+
             print("📝 Stored note \(noteId) with value \(value)")
         }
     }
@@ -1474,6 +1492,20 @@ final class FilterScanner {
 
             // Track for final witness update
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
+
+            // IMMEDIATELY record in transaction history for real-time consistency
+            let memoText: String? = {
+                let truncated = note.memo.prefix(512)
+                let filtered = truncated.filter { $0 != 0 }
+                guard !filtered.isEmpty else { return nil }
+                return String(data: Data(filtered), encoding: .utf8)
+            }()
+            try database.recordReceivedTransaction(
+                txid: txidData,
+                height: height,
+                value: note.value,
+                memo: memoText
+            )
 
             print("💰 Stored note \(noteId): \(note.value) zatoshis at height \(height), tree pos \(position)")
         }
