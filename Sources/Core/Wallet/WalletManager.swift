@@ -211,9 +211,42 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // Load full commitment tree from CMUs (required for witness generation)
-        // This takes ~53 seconds but ensures all spending operations are instant
-        print("🌳 Loading bundled commitment tree (first time)...")
+        // FAST PATH: Try loading pre-serialized tree (instant - <1 second)
+        // The serialized tree file contains the Merkle frontier, not all CMUs
+        print("🌳 Loading bundled commitment tree...")
+        await MainActor.run {
+            self.treeLoadStatus = "Restoring privacy infrastructure..."
+            self.treeLoadProgress = 0.3
+        }
+
+        if let serializedTreeURL = Bundle.main.url(forResource: "commitment_tree_serialized", withExtension: "bin"),
+           let serializedData = try? Data(contentsOf: serializedTreeURL) {
+
+            // This is instant! Just deserialize the Merkle frontier
+            if ZipherXFFI.treeDeserialize(data: serializedData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ Bundled commitment tree loaded instantly: \(treeSize) commitments")
+
+                // Save to database for next time
+                if let serializedTree = ZipherXFFI.treeSerialize() {
+                    try? WalletDatabase.shared.saveTreeState(serializedTree)
+                    print("💾 Tree state saved to database for future use")
+                }
+
+                await MainActor.run {
+                    self.isTreeLoaded = true
+                    self.treeLoadProgress = 1.0
+                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                }
+                return
+            } else {
+                print("⚠️ Failed to deserialize bundled tree, falling back to CMU rebuild...")
+            }
+        }
+
+        // SLOW FALLBACK: Build tree from CMUs (only if serialized file fails/missing)
+        // This takes ~50 seconds but ensures all spending operations are instant
+        print("🌳 Rebuilding commitment tree from CMUs (slow fallback)...")
         await MainActor.run {
             self.treeLoadStatus = "Building cryptographic foundation..."
             self.treeLoadProgress = 0.0

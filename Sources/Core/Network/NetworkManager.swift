@@ -961,8 +961,10 @@ final class NetworkManager: ObservableObject {
             var newIncomingTxs: [(txid: String, amount: UInt64)] = []
 
             // Check each mempool transaction for shielded outputs
-            for txHash in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
-                guard let rawTx = try? await peer.getMempoolTransaction(txid: txHash) else {
+            for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
+                let txHashHex = txHashData.map { String(format: "%02x", $0) }.joined()
+
+                guard let rawTx = try? await peer.getMempoolTransaction(txid: txHashData) else {
                     continue
                 }
 
@@ -982,7 +984,7 @@ final class NetworkManager: ObservableObject {
                                 let valueBytes = Data(decrypted[11..<19])
                                 let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
                                 txIncomingAmount += value
-                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHash.prefix(12))...")
+                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHashHex.prefix(12))...")
                             }
                         }
                     }
@@ -993,14 +995,14 @@ final class NetworkManager: ObservableObject {
 
                         // Check if this is a NEW incoming tx we haven't notified about
                         notifiedMempoolLock.lock()
-                        let isNewTx = !notifiedMempoolIncomingTxs.contains(txHash)
+                        let isNewTx = !notifiedMempoolIncomingTxs.contains(txHashHex)
                         if isNewTx {
-                            notifiedMempoolIncomingTxs.insert(txHash)
+                            notifiedMempoolIncomingTxs.insert(txHashHex)
                         }
                         notifiedMempoolLock.unlock()
 
                         if isNewTx {
-                            newIncomingTxs.append((txHash, txIncomingAmount))
+                            newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
                         }
                     }
                 }
