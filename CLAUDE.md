@@ -2033,6 +2033,111 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 
 ---
 
+### 35. CRITICAL: Malicious P2P Peer Fake Height Attack Protection (December 2, 2025)
+
+**Problem**: P2P peers were sending fake headers with height 2929802 when the real chain height was ~2929692 (110 blocks in the future!). This caused:
+- Chain height display showing impossible future blocks
+- Sync appearing "stuck" at fake target
+- Database storing fake `lastScannedHeight`
+- Balance showing incorrect values (notes not found or wrong spent status)
+
+**Root Cause**: The `getChainTip()` function in HeaderSyncManager trusted P2P peer heights without validation. Malicious peers could claim any height and the wallet would accept it.
+
+**Solution: InsightAPI as Authoritative Chain Height Source**
+
+1. **HeaderSyncManager.swift** - Complete rewrite of `getChainTip()`:
+   ```swift
+   func getChainTip() async throws -> UInt64 {
+       // SECURITY: Use InsightAPI as authoritative chain height
+       let status = try await InsightAPI.shared.getStatus()
+       let trustedHeight = status.height
+
+       // Validate P2P heights against trusted source
+       if p2pMaxHeight > trustedHeight + maxP2PAheadTolerance {
+           print("🚨 [SECURITY] P2P peer reporting FAKE height \(p2pMaxHeight)")
+           // Reject fake P2P height - use trusted
+       }
+
+       // Auto-clear fake headers from store
+       if headerStoreHeight > trustedHeight + maxP2PAheadTolerance {
+           try? headerStore.clearAllHeaders()
+           print("✅ Fake headers cleared")
+       }
+   }
+   ```
+
+2. **WalletManager.swift** - Added sync state validation on startup:
+   ```swift
+   // SECURITY CHECK: Validate lastScannedHeight against trusted chain
+   let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
+   let status = try await InsightAPI.shared.getStatus()
+
+   if lastScanned > status.height + 10 {
+       print("🚨 [SECURITY] Detected FAKE lastScannedHeight: \(lastScanned)")
+       // Reset to safe state
+       try WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, ...)
+       try? HeaderStore.shared.clearAllHeaders()
+   }
+   ```
+
+**Security Properties**:
+- InsightAPI provides trusted chain height (connects to real blockchain)
+- P2P heights validated with 5-block tolerance for network propagation
+- Fake headers automatically detected and cleared
+- Fake lastScannedHeight automatically detected and reset
+- Logs security warnings for monitoring
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - InsightAPI-first chain tip, auto-clear fake headers
+- `Sources/Core/Wallet/WalletManager.swift` - Startup validation of lastScannedHeight
+
+---
+
+### 36. Bug Fixes and Improvements (December 2, 2025)
+
+**Fixes Applied:**
+
+1. **Change Output Detection Fix** (`FilterScanner.swift`)
+   - **Problem**: Change outputs were showing as separate "RECEIVED" entries in transaction history
+   - **Root Cause**: `Data(hexString: txid)` was called on already-Data type parameter at line 1556
+   - **Fix**: Used `txid` directly instead of converting from hex
+   - Applied to 4 functions: `processShieldedOutputsSync()`, `processShieldedOutputsForNotesOnly()`, `processShieldedOutputsP2P()`, `processDecryptedNote()`
+
+2. **Fireworks Notification for Sender Fix** (`FilterScanner.swift`, `NetworkManager.swift`)
+   - **Problem**: Sender was seeing fireworks when receiving change from their own transaction
+   - **Fix**: Moved `NotificationManager.shared.notifyReceived()` inside `else` blocks for non-change outputs only
+   - Also added change output check to mempool notification in `fetchNetworkStats()`
+
+3. **Peer Discovery Fix** (`NetworkManager.swift`)
+   - **Problem**: 1000 known addresses but only 3-4 peers connected
+   - **Root Cause**: `connect()` was only using DNS-discovered peers, not stored known addresses
+   - **Fix**: Build candidate list from ALL known addresses, with fresh DNS discoveries at front
+
+4. **Banned Peers Counter Fix** (`NetworkManager.swift`)
+   - **Problem**: Counter showed 4 banned but list showed 0 when clicked
+   - **Root Cause**: Ban functions counted all bans including expired ones, but `getBannedPeers()` filtered expired
+   - **Fix**: Clean up expired bans before counting in both `banPeer()` and `banAddress()`
+
+5. **Improved Transaction Status Messages** (`NetworkManager.swift`)
+   - Changed status messages to be more descriptive and accurate:
+
+   | Phase | Old Message | New Message |
+   |-------|-------------|-------------|
+   | P2P Broadcast | "Sending to X peers..." | "Propagating to network (X peers)..." |
+   | Peer Accept | "Accepted by X/Y peers" | "Accepted by X/Y nodes" |
+   | Mempool Check | "Checking mempool..." | "Verifying mempool acceptance..." |
+   | Mempool Verified | "Confirmed!" | "In mempool - awaiting miners" |
+   | Propagating | "Broadcast complete!" | "Propagating to miners..." |
+   | API Broadcast | "Broadcasting via API..." | "Submitting to blockchain..." |
+   | API Success | "Broadcast successful!" | "Submitted - awaiting miners" |
+   | API Fallback | "P2P failed, trying API..." | "Retrying via backup route..." |
+
+**Files Modified:**
+- `Sources/Core/Network/FilterScanner.swift` - change output detection fix, fireworks fix
+- `Sources/Core/Network/NetworkManager.swift` - peer discovery, banned peers counter, tx status messages, mempool notification
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

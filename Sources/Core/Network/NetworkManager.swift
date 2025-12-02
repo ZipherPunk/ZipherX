@@ -2,6 +2,49 @@ import Foundation
 import Network
 import Combine
 
+/// Thread-safe actor for transaction tracking state
+/// Eliminates priority inversion from NSLock usage in async contexts
+private actor TransactionTrackingState {
+    /// Pending outgoing transactions (txid -> amount in zatoshis)
+    private var pendingOutgoingTxs: [String: UInt64] = [:]
+
+    /// Notified incoming mempool transactions (to avoid duplicate notifications)
+    private var notifiedMempoolIncomingTxs: Set<String> = []
+
+    // MARK: - Outgoing Transaction Tracking
+
+    func trackOutgoing(txid: String, amount: UInt64) -> (total: UInt64, count: Int) {
+        pendingOutgoingTxs[txid] = amount
+        let total = pendingOutgoingTxs.values.reduce(0, +)
+        return (total, pendingOutgoingTxs.count)
+    }
+
+    func confirmOutgoing(txid: String) -> (amount: UInt64?, removed: Bool, total: UInt64, count: Int) {
+        let amount = pendingOutgoingTxs[txid]
+        let removed = pendingOutgoingTxs.removeValue(forKey: txid) != nil
+        let total = pendingOutgoingTxs.values.reduce(0, +)
+        return (amount, removed, total, pendingOutgoingTxs.count)
+    }
+
+    func getPendingTxids() -> [String] {
+        Array(pendingOutgoingTxs.keys)
+    }
+
+    // MARK: - Incoming Mempool Notification Tracking
+
+    func checkAndMarkNotified(txid: String) -> Bool {
+        let isNew = !notifiedMempoolIncomingTxs.contains(txid)
+        if isNew {
+            notifiedMempoolIncomingTxs.insert(txid)
+        }
+        return isNew
+    }
+
+    func clearIncomingNotification(txid: String) {
+        notifiedMempoolIncomingTxs.remove(txid)
+    }
+}
+
 /// Timeout helper for async operations
 func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) async throws -> T {
     try await withThrowingTaskGroup(of: T.self) { group in
@@ -48,6 +91,10 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var lastBlockTxCount: Int = 0
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
+
+    /// Sybil attack detection - published when a fake peer is banned
+    /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
+    @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
 
     /// Flag to suppress background sync during initial startup sync
     /// Set to true during ContentView's initial sync task, false after completion
@@ -173,8 +220,12 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Ban a peer
-    private func banPeer(_ peer: Peer, reason: BanReason) {
+    func banPeer(_ peer: Peer, reason: BanReason) {
         addressLock.lock()
+
+        // Clean up expired bans first
+        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
+
         let ban = BannedPeer(
             address: peer.host,
             banTime: Date(),
@@ -200,8 +251,12 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Ban a peer by address (for connection failures)
-    private func banAddress(_ host: String, port: UInt16, reason: BanReason) {
+    func banAddress(_ host: String, port: UInt16, reason: BanReason) {
         addressLock.lock()
+
+        // Clean up expired bans first
+        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
+
         let ban = BannedPeer(
             address: host,
             banTime: Date(),
@@ -360,33 +415,51 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Refresh chain height (P2P-first, InsightAPI fallback)
+    /// Refresh chain height (InsightAPI authoritative, P2P fallback)
     /// Also triggers background sync if wallet is behind
     private func refreshChainHeight() async {
         guard isConnected else { return }
 
-        // P2P-FIRST: Try to get chain height from P2P sources
+        // CRITICAL: InsightAPI is authoritative - it represents actual network state
+        // P2P peers and HeaderStore can have corrupt/fake data from malicious peers
         var newHeight: UInt64 = 0
+        var networkTruthHeight: UInt64 = 0
 
-        // 1. Check header store (locally verified headers)
-        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            newHeight = max(newHeight, headerHeight)
+        // 1. ALWAYS get network truth from InsightAPI first
+        if let status = try? await InsightAPI.shared.getStatus() {
+            networkTruthHeight = status.height
+            newHeight = networkTruthHeight
+            print("📡 [API] Network height (authoritative): \(networkTruthHeight)")
         }
 
-        // 2. Check P2P peer heights
+        // 2. Check header store - but REJECT if it exceeds network truth (indicates corrupt data)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            if networkTruthHeight > 0 && headerHeight > networkTruthHeight + 10 {
+                print("⚠️ HeaderStore height \(headerHeight) exceeds network truth \(networkTruthHeight) - ignoring stale/fake data")
+                // TODO: Consider clearing corrupt headers
+            } else if networkTruthHeight == 0 {
+                // Only use HeaderStore if we couldn't reach InsightAPI
+                newHeight = max(newHeight, headerHeight)
+                print("📡 [P2P] Using HeaderStore height (API unavailable): \(headerHeight)")
+            }
+        }
+
+        // 3. Check P2P peer heights - same validation
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
-            if h > newHeight {
-                newHeight = h
+            if networkTruthHeight > 0 && h > networkTruthHeight + 10 {
+                // Ignore peers claiming heights beyond network truth
+                continue
+            }
+            if h > 0 && networkTruthHeight == 0 {
+                // Only use peer heights if InsightAPI unavailable
+                newHeight = max(newHeight, h)
             }
         }
 
-        // 3. Only fallback to InsightAPI if P2P gives no result
-        if newHeight == 0 {
-            if let status = try? await InsightAPI.shared.getStatus() {
-                newHeight = status.height
-                print("📊 [FALLBACK] Chain height from InsightAPI: \(newHeight)")
-            }
+        // If we got network truth, make sure we use it
+        if networkTruthHeight > 0 {
+            newHeight = networkTruthHeight
         }
 
         // Only update and log if height changed
@@ -603,13 +676,27 @@ final class NetworkManager: ObservableObject {
             addAddress(addr, source: "dns")
         }
 
-        // Calculate target: 10% of known addresses (min 3, max 20)
+        // Calculate target: 15% of known addresses (min 8, max 30)
         let targetPeers = calculateTargetPeers()
         print("📋 Known addresses: \(knownAddresses.count), Target peers: \(targetPeers)")
 
+        // Build candidate list from ALL known addresses, not just DNS discovered
+        // This allows reconnecting to previously discovered peers
+        addressLock.lock()
+        var allCandidates: [PeerAddress] = []
+        for (key, info) in knownAddresses {
+            let components = key.split(separator: ":")
+            guard components.count == 2, let port = UInt16(components[1]) else { continue }
+            allCandidates.append(PeerAddress(host: String(components[0]), port: port))
+        }
+        addressLock.unlock()
+
+        // Add fresh DNS discoveries to the front (prioritize fresh data)
+        allCandidates = discoveredPeers + allCandidates
+
         // Deduplicate and filter banned peers
         var seenPeers = Set<String>()
-        var validPeers = discoveredPeers.filter { addr in
+        var validPeers = allCandidates.filter { addr in
             let key = "\(addr.host):\(addr.port)"
             if seenPeers.contains(key) || isBanned(addr.host) {
                 return false
@@ -617,6 +704,8 @@ final class NetworkManager: ObservableObject {
             seenPeers.insert(key)
             return true
         }
+
+        print("📋 Valid candidates after dedup: \(validPeers.count)")
 
         // Shuffle to avoid always connecting to same peers
         validPeers.shuffle()
@@ -679,13 +768,15 @@ final class NetworkManager: ObservableObject {
                             self.isConnected = true
                         }
 
-                        // Update address info (thread-safe)
+                        // Update address info (on main thread to avoid async lock warning)
                         let key = "\(peer.host):\(peer.port)"
-                        addressLock.lock()
-                        knownAddresses[key]?.successes += 1
-                        newAddresses.remove(key)
-                        triedAddresses.insert(key)
-                        addressLock.unlock()
+                        DispatchQueue.main.async {
+                            self.addressLock.lock()
+                            self.knownAddresses[key]?.successes += 1
+                            self.newAddresses.remove(key)
+                            self.triedAddresses.insert(key)
+                            self.addressLock.unlock()
+                        }
 
                         // Request addresses from new peer (async)
                         Task {
@@ -746,7 +837,7 @@ final class NetworkManager: ObservableObject {
 
     /// Fetch network statistics (P2P-first, InsightAPI fallback)
     func fetchNetworkStats() async {
-        print("📊 Fetching network stats (P2P-first)...")
+        print("📊 Fetching network stats...")
 
         // Get peer version from first connected peer
         if let peer = peers.first {
@@ -757,38 +848,38 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // P2P-FIRST: Get chain height from P2P sources
+        // Get authoritative chain height from InsightAPI
+        // This is the source of truth for display - don't trust stale local headers
         var currentChainHeight: UInt64 = 0
-        var usedP2P = false
 
-        // 1. First try header store (locally verified headers)
-        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            currentChainHeight = headerHeight
-            usedP2P = true
-            print("📊 [P2P] HeaderStore height: \(headerHeight)")
-        }
-
-        // 2. Check P2P peer heights from version handshake
-        for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
-            if h > currentChainHeight {
-                currentChainHeight = h
-                usedP2P = true
+        // 1. First try InsightAPI (authoritative network source)
+        if let status = try? await InsightAPI.shared.getStatus() {
+            currentChainHeight = status.height
+            print("📊 [API] Network height: \(currentChainHeight)")
+            await MainActor.run {
+                self.networkDifficulty = status.difficulty
             }
         }
 
-        // 3. Only if P2P gives no result, fallback to InsightAPI
+        // 2. If API unavailable, fallback to header store (may be stale)
         if currentChainHeight == 0 {
-            print("⚠️ [P2P] No P2P height, falling back to InsightAPI...")
-            if let status = try? await InsightAPI.shared.getStatus() {
-                currentChainHeight = status.height
-                print("📊 [FALLBACK] InsightAPI height: \(currentChainHeight)")
-                await MainActor.run {
-                    self.networkDifficulty = status.difficulty
+            if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                currentChainHeight = headerHeight
+                print("📊 [P2P] HeaderStore height: \(headerHeight)")
+            }
+        }
+
+        // 3. If still no height, try P2P peer heights from version handshake
+        if currentChainHeight == 0 {
+            for peer in peers {
+                let h = UInt64(peer.peerStartHeight)
+                if h > currentChainHeight {
+                    currentChainHeight = h
                 }
             }
-        } else if usedP2P {
-            print("📊 [P2P] Using P2P chain height: \(currentChainHeight)")
+            if currentChainHeight > 0 {
+                print("📊 [P2P] Peer height: \(currentChainHeight)")
+            }
         }
 
         // Update chain height
@@ -853,51 +944,39 @@ final class NetworkManager: ObservableObject {
     /// Contains (txid, amount, isOutgoing) - cleared after UI handles it
     @Published var justConfirmedTx: (txid: String, amount: UInt64, isOutgoing: Bool)? = nil
 
-    /// Track pending outgoing transactions (txid -> amount in zatoshis)
-    private var pendingOutgoingTxs: [String: UInt64] = [:]
-    private let pendingTxLock = NSLock()
-
-    /// Track notified incoming mempool transactions to avoid duplicate notifications
-    private var notifiedMempoolIncomingTxs: Set<String> = []
-    private let notifiedMempoolLock = NSLock()
+    /// Actor-based transaction tracking (eliminates priority inversion from NSLock)
+    private let txTrackingState = TransactionTrackingState()
 
     /// Called after successfully broadcasting a transaction
     /// Tracks the pending outgoing amount until it confirms
     func trackPendingOutgoing(txid: String, amount: UInt64) {
-        pendingTxLock.lock()
-        pendingOutgoingTxs[txid] = amount
-        let totalPending = pendingOutgoingTxs.values.reduce(0, +)
-        let txCount = pendingOutgoingTxs.count
-        pendingTxLock.unlock()
-
-        DispatchQueue.main.async {
-            self.mempoolOutgoing = totalPending
-            self.mempoolOutgoingTxCount = txCount
-            print("📤 Tracking pending outgoing: \(txid.prefix(12))... = \(amount) zatoshis (total: \(totalPending))")
+        Task {
+            let result = await txTrackingState.trackOutgoing(txid: txid, amount: amount)
+            await MainActor.run {
+                self.mempoolOutgoing = result.total
+                self.mempoolOutgoingTxCount = result.count
+                print("📤 Tracking pending outgoing: \(txid.prefix(12))... = \(amount) zatoshis (total: \(result.total))")
+            }
         }
     }
 
     /// Called when a transaction is confirmed (found in a block)
     /// Removes from pending tracking and publishes confirmation for UI celebration
     func confirmOutgoingTx(txid: String) {
-        pendingTxLock.lock()
-        let amount = pendingOutgoingTxs[txid]
-        let removed = pendingOutgoingTxs.removeValue(forKey: txid)
-        let totalPending = pendingOutgoingTxs.values.reduce(0, +)
-        let txCount = pendingOutgoingTxs.count
-        pendingTxLock.unlock()
+        Task {
+            let result = await txTrackingState.confirmOutgoing(txid: txid)
+            if result.removed {
+                await MainActor.run {
+                    self.mempoolOutgoing = result.total
+                    self.mempoolOutgoingTxCount = result.count
 
-        if removed != nil {
-            DispatchQueue.main.async {
-                self.mempoolOutgoing = totalPending
-                self.mempoolOutgoingTxCount = txCount
+                    // Publish confirmation for UI celebration (cypherpunk mined message!)
+                    if let amount = result.amount {
+                        self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
+                    }
 
-                // Publish confirmation for UI celebration (cypherpunk mined message!)
-                if let amount = amount {
-                    self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
+                    print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(result.total))")
                 }
-
-                print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(totalPending))")
             }
         }
     }
@@ -905,18 +984,15 @@ final class NetworkManager: ObservableObject {
     /// Called when an incoming transaction is confirmed (found in a block during scanning)
     /// Removes from the notification tracking set to allow future notifications for same txid if re-broadcast
     func clearMempoolIncomingNotification(txid: String) {
-        notifiedMempoolLock.lock()
-        notifiedMempoolIncomingTxs.remove(txid)
-        notifiedMempoolLock.unlock()
+        Task {
+            await txTrackingState.clearIncomingNotification(txid: txid)
+        }
     }
 
     /// Check if any pending outgoing transactions have been confirmed
     /// Called periodically to clean up confirmed transactions
     func checkPendingOutgoingConfirmations() async {
-        pendingTxLock.lock()
-        let pendingTxids = Array(pendingOutgoingTxs.keys)
-        pendingTxLock.unlock()
-
+        let pendingTxids = await txTrackingState.getPendingTxids()
         guard !pendingTxids.isEmpty else { return }
 
         for txid in pendingTxids {
@@ -993,14 +1069,8 @@ final class NetworkManager: ObservableObject {
                         incomingAmount += txIncomingAmount
                         incomingCount += 1
 
-                        // Check if this is a NEW incoming tx we haven't notified about
-                        notifiedMempoolLock.lock()
-                        let isNewTx = !notifiedMempoolIncomingTxs.contains(txHashHex)
-                        if isNewTx {
-                            notifiedMempoolIncomingTxs.insert(txHashHex)
-                        }
-                        notifiedMempoolLock.unlock()
-
+                        // Check if this is a NEW incoming tx we haven't notified about (actor-based, no priority inversion)
+                        let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
                         if isNewTx {
                             newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
                         }
@@ -1009,9 +1079,18 @@ final class NetworkManager: ObservableObject {
             }
 
             // Send notifications for NEW incoming transactions
+            // But SKIP notifications for change outputs (where we already have a "sent" tx with same txid)
             for (txid, amount) in newIncomingTxs {
-                print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
-                NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
+                // Check if this is a change output from our own send
+                let txidData = Data(hexString: txid) ?? Data()
+                let isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+
+                if isChangeOutput {
+                    print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
+                } else {
+                    print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
+                    NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
+                }
             }
 
             await MainActor.run {
@@ -1240,12 +1319,12 @@ final class NetworkManager: ObservableObject {
         // If no P2P peers, fall back to InsightAPI broadcast
         if !isConnected || peers.isEmpty {
             print("⚠️ No P2P peers available, using InsightAPI broadcast...")
-            onProgress?("api", "Broadcasting via API...", 0.3)
+            onProgress?("api", "Submitting to blockchain...", 0.3)
 
             do {
                 let txid = try await InsightAPI.shared.broadcastTransaction(rawTx)
                 print("✅ InsightAPI broadcast successful: \(txid)")
-                onProgress?("api", "Broadcast successful!", 1.0)
+                onProgress?("api", "Submitted - awaiting miners", 1.0)
                 return txid
             } catch {
                 print("❌ InsightAPI broadcast failed: \(error)")
@@ -1255,7 +1334,7 @@ final class NetworkManager: ObservableObject {
 
         let peerCount = peers.count
         print("📡 Broadcasting to \(peerCount) peers...")
-        onProgress?("peers", "Sending to \(peerCount) peers...", 0.0)
+        onProgress?("peers", "Propagating to network (\(peerCount) peers)...", 0.0)
 
         // Use actor for thread-safe state
         actor BroadcastState {
@@ -1306,7 +1385,7 @@ final class NetworkManager: ObservableObject {
                         }
                         print("✅ Peer \(peerHost) accepted tx: \(id)")
                         let count = await state.recordSuccess(id)
-                        onProgress?("peers", "Accepted by \(count)/\(peerCount) peers", Double(count) / Double(peerCount))
+                        onProgress?("peers", "Accepted by \(count)/\(peerCount) nodes", Double(count) / Double(peerCount))
                     } catch {
                         print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
                     }
@@ -1327,13 +1406,13 @@ final class NetworkManager: ObservableObject {
                     return
                 }
 
-                onProgress?("verify", "Checking mempool...", 0.5)
+                onProgress?("verify", "Verifying mempool acceptance...", 0.5)
 
                 // Check mempool - just 3 quick attempts
                 for attempt in 1...3 {
                     if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
                         print("✅ Transaction VERIFIED in mempool: \(txId)")
-                        onProgress?("verify", "Confirmed!", 1.0)
+                        onProgress?("verify", "In mempool - awaiting miners", 1.0)
                         await state.setVerified()
                         return // Exit immediately!
                     }
@@ -1368,12 +1447,12 @@ final class NetworkManager: ObservableObject {
         guard let txId = await state.getTxId() else {
             // P2P broadcast failed - fall back to InsightAPI
             print("⚠️ P2P broadcast failed, trying InsightAPI...")
-            onProgress?("api", "P2P failed, trying API...", 0.5)
+            onProgress?("api", "Retrying via backup route...", 0.5)
 
             do {
                 let apiTxId = try await InsightAPI.shared.broadcastTransaction(rawTx)
                 print("✅ InsightAPI broadcast successful: \(apiTxId)")
-                onProgress?("api", "Broadcast successful!", 1.0)
+                onProgress?("api", "Submitted - awaiting miners", 1.0)
                 return apiTxId
             } catch {
                 print("❌ InsightAPI broadcast also failed: \(error)")
@@ -1389,7 +1468,7 @@ final class NetworkManager: ObservableObject {
         if !verified {
             // P2P broadcast succeeded, tx is propagating even if mempool check timed out
             print("⚠️ Mempool not yet visible (tx is propagating): \(txId)")
-            onProgress?("verify", "Broadcast complete!", 1.0)
+            onProgress?("verify", "Propagating to miners...", 1.0)
         }
 
         return txId
@@ -1438,16 +1517,25 @@ final class NetworkManager: ObservableObject {
         }
 
         // P2P-FIRST architecture: prioritize trustless P2P data
+        // CRITICAL: Always verify against network - don't trust stale cached values!
         print("📡 Getting chain height (P2P-first)...")
-        var maxHeight: UInt64 = 0
 
-        // 1. Check header store first (our locally verified headers)
-        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            print("📡 [P2P] HeaderStore height: \(headerHeight)")
-            maxHeight = max(maxHeight, headerHeight)
+        // 1. Get authoritative network height from InsightAPI (most reliable)
+        // This serves as ground truth to detect stale/invalid local state
+        var networkHeight: UInt64 = 0
+        if let status = try? await InsightAPI.shared.getStatus() {
+            networkHeight = status.height
+            print("📡 [API] Network height: \(networkHeight)")
         }
 
-        // 2. Check P2P peer heights from version handshake
+        // 2. Check header store (our locally verified headers)
+        var headerHeight: UInt64 = 0
+        if let h = try? HeaderStore.shared.getLatestHeight() {
+            headerHeight = h
+            print("📡 [P2P] HeaderStore height: \(headerHeight)")
+        }
+
+        // 3. Check P2P peer heights from version handshake
         var peerMaxHeight: UInt64 = 0
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
@@ -1457,26 +1545,30 @@ final class NetworkManager: ObservableObject {
         }
         if peerMaxHeight > 0 {
             print("📡 [P2P] Peer max height: \(peerMaxHeight)")
-            maxHeight = max(maxHeight, peerMaxHeight)
         }
 
-        // 3. Use cached chain height as baseline
-        if chainHeight > 0 {
-            maxHeight = max(maxHeight, chainHeight)
-        }
+        // 4. Determine best height - prefer network truth over potentially stale local data
+        // If network height is available and local headers are significantly higher (>100 blocks),
+        // the local headers may be invalid/stale - use network height instead
+        var bestHeight: UInt64 = 0
 
-        // 4. Only if P2P gives no result, fallback to InsightAPI
-        if maxHeight == 0 {
-            print("⚠️ [P2P] No P2P height available, falling back to InsightAPI...")
-            if let status = try? await InsightAPI.shared.getStatus() {
-                print("📡 [FALLBACK] InsightAPI height: \(status.height)")
-                maxHeight = status.height
+        if networkHeight > 0 {
+            bestHeight = networkHeight
+            // Warn if local state seems corrupted (claims more blocks than network has)
+            if headerHeight > networkHeight + 10 {
+                print("⚠️ HeaderStore height (\(headerHeight)) exceeds network (\(networkHeight)) - possible stale data")
             }
+        } else if headerHeight > 0 {
+            bestHeight = headerHeight
+        } else if peerMaxHeight > 0 {
+            bestHeight = peerMaxHeight
+        } else if chainHeight > 0 {
+            bestHeight = chainHeight  // Last resort: use cached value
         }
 
-        if maxHeight > 0 {
-            print("📡 Using chain height: \(maxHeight)")
-            return maxHeight
+        if bestHeight > 0 {
+            print("📡 Using chain height: \(bestHeight)")
+            return bestHeight
         }
 
         throw NetworkError.consensusNotReached
@@ -1712,24 +1804,55 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
-        var maxHeight: UInt64 = 0
+        // SECURITY: Get InsightAPI height first to validate P2P sources
+        var trustedHeight: UInt64 = 0
+        let maxDeviation: UInt64 = 10
 
-        // 1. HeaderStore is the most reliable P2P source (locally verified headers)
-        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            maxHeight = max(maxHeight, headerHeight)
+        do {
+            let status = try await InsightAPI.shared.getStatus()
+            trustedHeight = status.height
+        } catch {
+            print("⚠️ InsightAPI unavailable for P2P height validation")
         }
 
-        // 2. Peer version heights (may be stale but still P2P)
-        for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
-            if h > maxHeight {
-                maxHeight = h
+        var maxHeight: UInt64 = 0
+
+        // 1. HeaderStore (locally verified headers - but may have fake data)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            // Validate against trusted source
+            if trustedHeight > 0 && headerHeight > trustedHeight + maxDeviation {
+                print("🚨 [SECURITY] HeaderStore height \(headerHeight) is FAKE, ignoring")
+            } else {
+                maxHeight = max(maxHeight, headerHeight)
             }
         }
 
-        // 3. Cached chain height as baseline
-        if chainHeight > 0 {
-            maxHeight = max(maxHeight, chainHeight)
+        // 2. Peer version heights (may be fake)
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > 0 {
+                // Validate against trusted source
+                if trustedHeight > 0 && h > trustedHeight + maxDeviation {
+                    print("🚨 [SECURITY] Peer height \(h) is FAKE, ignoring")
+                } else if h > maxHeight {
+                    maxHeight = h
+                }
+            }
+        }
+
+        // 3. Use trusted height if we have it and P2P sources were all fake
+        if trustedHeight > 0 && maxHeight == 0 {
+            print("📡 All P2P heights were fake, using InsightAPI: \(trustedHeight)")
+            return trustedHeight
+        }
+
+        // 4. Fallback to cached height only if reasonable
+        if maxHeight == 0 && chainHeight > 0 {
+            if trustedHeight > 0 && chainHeight > trustedHeight + maxDeviation {
+                print("🚨 [SECURITY] Cached chainHeight \(chainHeight) is FAKE, ignoring")
+            } else {
+                maxHeight = chainHeight
+            }
         }
 
         guard maxHeight > 0 else {
@@ -1827,133 +1950,241 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get multiple blocks' data for P2P scanning
-    /// Tries ALL connected peers with fast rotation on failure, then falls back to InsightAPI
+    /// Distributes block ranges across peers - each peer fetches its range SEQUENTIALLY
+    /// All peers work in PARALLEL for maximum throughput
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-
-        // Track which peers have failed recently (don't retry them for this batch)
-        var failedPeerIndices: Set<Int> = []
-
-        print("🔄 P2P batch fetch: \(count) blocks from height \(height), \(peers.count) peers available")
-
-        // Fetch blocks one by one
-        for i in 0..<count {
-            let blockHeight = height + UInt64(i)
-            var block: CompactBlock?
-            var blockHash: Data?
-
-            // Log progress every 50 blocks
-            if i % 50 == 0 {
-                print("📊 P2P progress: \(i)/\(count) blocks fetched (height \(blockHeight))")
-            }
-
-            // Get block hash from HeaderStore
-            if let header = try? HeaderStore.shared.getHeader(at: blockHeight) {
-                blockHash = header.blockHash
-            } else {
-                print("⚠️ No header found for height \(blockHeight)")
-            }
-
-            // Try ALL connected peers with 3 second timeout each
-            if let hash = blockHash {
-                let availablePeers = peers.enumerated().filter { !failedPeerIndices.contains($0.offset) }
-
-                for (peerIndex, peer) in availablePeers {
-                    do {
-                        block = try await withTimeout(seconds: 3) {
-                            try await peer.getBlockByHash(hash: hash)
-                        }
-                        if block != nil {
-                            // Success! Use this peer
-                            break
-                        }
-                    } catch {
-                        // Mark peer as failed for this batch
-                        failedPeerIndices.insert(peerIndex)
-                        print("⚠️ P2P: Peer \(peerIndex) failed at height \(blockHeight), trying next...")
-                    }
-                }
-            }
-
-            // Fallback to InsightAPI if all P2P peers failed
-            if block == nil {
-                do {
-                    if i == 0 {
-                        print("📡 Falling back to InsightAPI (no P2P headers available)...")
-                    }
-                    let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: blockHeight)
-                    let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
-                    var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-
-                    for txid in insightBlock.tx {
-                        let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
-                        let spends = txInfo?.spendDescs
-                        let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
-
-                        if !outputs.isEmpty || (spends?.isEmpty == false) {
-                            txDataList.append((txid, outputs, spends))
-                        }
-                    }
-                    results.append((blockHeight, hashFromAPI, txDataList))
-                    continue
-                } catch {
-                    print("⚠️ P2P batch: Failed to get block at height \(blockHeight) (all peers + InsightAPI failed): \(error)")
-                    continue
-                }
-            }
-
-            guard let block = block else {
-                continue
-            }
-
-            // Process P2P block data
-            let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
-            var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-
-            for tx in block.transactions {
-                var shieldedOutputs: [ShieldedOutput] = []
-                for output in tx.outputs {
-                    let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
-                    let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
-                    let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
-
-                    let shieldedOutput = ShieldedOutput(
-                        cv: String(repeating: "0", count: 64),
-                        cmu: cmuHex,
-                        ephemeralKey: epkHex,
-                        encCiphertext: ciphertextHex,
-                        outCiphertext: String(repeating: "0", count: 160),
-                        proof: String(repeating: "0", count: 384)
-                    )
-                    shieldedOutputs.append(shieldedOutput)
-                }
-
-                var shieldedSpends: [ShieldedSpend]? = nil
-                if !tx.spends.isEmpty {
-                    shieldedSpends = tx.spends.map { spend in
-                        let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
-                        return ShieldedSpend(
-                            cv: String(repeating: "0", count: 64),
-                            anchor: String(repeating: "0", count: 64),
-                            nullifier: nullifierHex,
-                            rk: String(repeating: "0", count: 64),
-                            proof: String(repeating: "0", count: 384),
-                            spendAuthSig: String(repeating: "0", count: 128)
-                        )
-                    }
-                }
-
-                let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
-
-                if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
-                    txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
-                }
-            }
-
-            results.append((blockHeight, finalBlockHash, txDataList))
+        let availablePeers = peers
+        guard !availablePeers.isEmpty else {
+            throw NetworkError.notConnected
         }
 
-        return results
+        let peerCount = availablePeers.count
+        let blocksPerPeer = (count + peerCount - 1) / peerCount  // Ceiling division
+
+        print("🚀 P2P parallel fetch: \(count) blocks across \(peerCount) peers (~\(blocksPerPeer) blocks each)")
+        let startTime = Date()
+
+        // Each peer gets a DISJOINT range of blocks
+        // Peer 0: [height, height + blocksPerPeer)
+        // Peer 1: [height + blocksPerPeer, height + 2*blocksPerPeer)
+        // etc.
+        let results = await withTaskGroup(of: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
+            var collected: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+
+            for (peerIndex, peer) in availablePeers.enumerated() {
+                let rangeStart = height + UInt64(peerIndex * blocksPerPeer)
+                let rangeEnd = min(rangeStart + UInt64(blocksPerPeer), height + UInt64(count))
+                let rangeCount = Int(rangeEnd - rangeStart)
+
+                if rangeCount <= 0 { break }
+
+                group.addTask {
+                    // Each peer fetches its range SEQUENTIALLY (no interleaving)
+                    return await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
+                }
+            }
+
+            // Collect results from all peers
+            for await result in group {
+                if let blocks = result {
+                    collected.append(contentsOf: blocks)
+                }
+            }
+
+            return collected
+        }
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        let rate = Double(results.count) / max(elapsed, 0.001)
+        print("✅ P2P parallel fetch complete: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
+
+        // Sort by height to maintain order
+        return results.sorted { $0.0 < $1.0 }
+    }
+
+    /// Fetch a batch of blocks from a single peer using HeaderStore hashes
+    /// Uses sequential getdata calls (batch getdata had parsing issues)
+    private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
+        do {
+            // Get block hashes from HeaderStore (already synced, no network call needed)
+            var blockHashes: [(UInt64, Data)] = []
+            for i in 0..<count {
+                let height = startHeight + UInt64(i)
+                if let header = try? HeaderStore.shared.getHeader(at: height) {
+                    blockHashes.append((height, header.blockHash))
+                }
+            }
+
+            guard !blockHashes.isEmpty else {
+                print("⚠️ No headers in HeaderStore for height \(startHeight)")
+                return nil
+            }
+
+            // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
+            var blocks: [(UInt64, CompactBlock)] = []
+            for (height, hash) in blockHashes {
+                do {
+                    let block = try await withTimeout(seconds: 10) {
+                        try await peer.getBlockByHash(hash: hash)
+                    }
+                    blocks.append((height, block))
+                } catch {
+                    // Skip blocks that fail to fetch
+                    continue
+                }
+            }
+
+            var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+
+            for (blockHeight, compactBlock) in blocks {
+                let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
+                var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+                for tx in compactBlock.transactions {
+                    var shieldedOutputs: [ShieldedOutput] = []
+                    for output in tx.outputs {
+                        let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                        let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                        let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+
+                        let shieldedOutput = ShieldedOutput(
+                            cv: String(repeating: "0", count: 64),
+                            cmu: cmuHex,
+                            ephemeralKey: epkHex,
+                            encCiphertext: ciphertextHex,
+                            outCiphertext: String(repeating: "0", count: 160),
+                            proof: String(repeating: "0", count: 384)
+                        )
+                        shieldedOutputs.append(shieldedOutput)
+                    }
+
+                    var shieldedSpends: [ShieldedSpend]? = nil
+                    if !tx.spends.isEmpty {
+                        shieldedSpends = tx.spends.map { spend in
+                            let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                            return ShieldedSpend(
+                                cv: String(repeating: "0", count: 64),
+                                anchor: String(repeating: "0", count: 64),
+                                nullifier: nullifierHex,
+                                rk: String(repeating: "0", count: 64),
+                                proof: String(repeating: "0", count: 384),
+                                spendAuthSig: String(repeating: "0", count: 128)
+                            )
+                        }
+                    }
+
+                    let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+
+                    if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                        txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+                    }
+                }
+
+                results.append((blockHeight, finalBlockHash, txDataList))
+            }
+
+            return results
+        } catch {
+            print("⚠️ P2P batch fetch failed for peer \(peer.host): \(error)")
+            return nil
+        }
+    }
+
+    /// Fetch a single block from P2P peers with fallback to InsightAPI
+    private func fetchSingleBlockP2P(height: UInt64, peers: [Peer]) async -> (UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])? {
+        var block: CompactBlock?
+        var blockHash: Data?
+
+        // Get block hash from HeaderStore
+        if let header = try? HeaderStore.shared.getHeader(at: height) {
+            blockHash = header.blockHash
+        }
+
+        // Try P2P peers with timeout
+        if let hash = blockHash {
+            // Try a random peer first for load balancing
+            let shuffledPeers = peers.shuffled()
+            for peer in shuffledPeers.prefix(3) {  // Try up to 3 peers
+                do {
+                    block = try await withTimeout(seconds: 5) {
+                        try await peer.getBlockByHash(hash: hash)
+                    }
+                    if block != nil { break }
+                } catch {
+                    // Try next peer
+                }
+            }
+        }
+
+        // Fallback to InsightAPI if P2P failed
+        if block == nil {
+            do {
+                let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: height)
+                let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
+                var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+                for txid in insightBlock.tx {
+                    let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
+                    let spends = txInfo?.spendDescs
+                    let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
+
+                    if !outputs.isEmpty || (spends?.isEmpty == false) {
+                        txDataList.append((txid, outputs, spends))
+                    }
+                }
+                return (height, hashFromAPI, txDataList)
+            } catch {
+                return nil
+            }
+        }
+
+        guard let block = block else { return nil }
+
+        // Process P2P block data
+        let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
+        var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+        for tx in block.transactions {
+            var shieldedOutputs: [ShieldedOutput] = []
+            for output in tx.outputs {
+                let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+
+                let shieldedOutput = ShieldedOutput(
+                    cv: String(repeating: "0", count: 64),
+                    cmu: cmuHex,
+                    ephemeralKey: epkHex,
+                    encCiphertext: ciphertextHex,
+                    outCiphertext: String(repeating: "0", count: 160),
+                    proof: String(repeating: "0", count: 384)
+                )
+                shieldedOutputs.append(shieldedOutput)
+            }
+
+            var shieldedSpends: [ShieldedSpend]? = nil
+            if !tx.spends.isEmpty {
+                shieldedSpends = tx.spends.map { spend in
+                    let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                    return ShieldedSpend(
+                        cv: String(repeating: "0", count: 64),
+                        anchor: String(repeating: "0", count: 64),
+                        nullifier: nullifierHex,
+                        rk: String(repeating: "0", count: 64),
+                        proof: String(repeating: "0", count: 384),
+                        spendAuthSig: String(repeating: "0", count: 128)
+                    )
+                }
+            }
+
+            let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+
+            if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+            }
+        }
+
+        return (height, finalBlockHash, txDataList)
     }
 
     // MARK: - Peer Rotation
@@ -2129,10 +2360,11 @@ struct BlockHeader: Hashable {
     let version: Int32
     let prevBlockHash: Data
     let merkleRoot: Data
+    let finalSaplingRoot: Data // 32-byte reserved field (hashFinalSaplingRoot post-Sapling)
     let timestamp: UInt32
     let bits: UInt32
-    let nonce: Data // Equihash nonce
-    let solution: Data // Equihash solution
+    let nonce: Data // Equihash nonce (32 bytes)
+    let solution: Data // Equihash solution (1344 bytes for Equihash(200,9))
 }
 
 struct CompactFilter: Hashable {
