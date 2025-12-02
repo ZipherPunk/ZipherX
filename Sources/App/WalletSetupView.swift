@@ -9,15 +9,18 @@ struct WalletSetupView: View {
     @State private var showCreateWallet = false
     @State private var showImportKey = false
     @State private var showImportWarning = false
+    @State private var showRestoreMnemonic = false  // Restore from seed phrase
     @State private var mnemonic: [String] = []
     @State private var showMnemonicBackup = false
     @State private var privateKeyInput = ""
+    @State private var mnemonicInputWords: [String] = Array(repeating: "", count: 24)  // For restore
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var isProcessing = false
     @State private var currentBlockHeight: UInt64 = 0
     @State private var showMnemonicWords = false  // Hidden by default for cypherpunk security
     @State private var showPrivateKeyInput = false  // Hidden by default
+    @State private var showMnemonicInput = false  // Hidden by default for restore
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -84,10 +87,10 @@ struct WalletSetupView: View {
                     .disabled(isProcessing)
                     .buttonStyle(PlainButtonStyle())
 
-                    Button(action: { showImportWarning = true }) {
+                    Button(action: { showRestoreMnemonic = true }) {
                         HStack {
-                            Image(systemName: "key.fill")
-                            Text("IMPORT PRIVATE KEY")
+                            Image(systemName: "arrow.counterclockwise.circle.fill")
+                            Text("RESTORE FROM SEED")
                         }
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundColor(theme.primaryColor)
@@ -98,6 +101,25 @@ struct WalletSetupView: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: theme.cornerRadius)
                                 .stroke(theme.borderColor, lineWidth: 1)
+                        )
+                    }
+                    .disabled(isProcessing)
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: { showImportWarning = true }) {
+                        HStack {
+                            Image(systemName: "key.fill")
+                            Text("IMPORT PRIVATE KEY")
+                        }
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(theme.surfaceColor.opacity(0.5))
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor.opacity(0.5), lineWidth: 1)
                         )
                     }
                     .disabled(isProcessing)
@@ -126,6 +148,13 @@ struct WalletSetupView: View {
                 .environmentObject(themeManager)
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 550, minHeight: 450, idealHeight: 500)
+                #endif
+        }
+        .sheet(isPresented: $showRestoreMnemonic) {
+            restoreMnemonicView
+                .environmentObject(themeManager)
+                #if os(macOS)
+                .frame(minWidth: 550, idealWidth: 600, minHeight: 650, idealHeight: 750)
                 #endif
         }
         .alert("Error", isPresented: $showError) {
@@ -611,11 +640,6 @@ struct WalletSetupView: View {
                     }
                 }
                 .padding(.horizontal, 24)
-                .onAppear {
-                    #if os(macOS)
-                    NSTextView.appearance(whenContainedInInstancesOf: [NSScrollView.self]).backgroundColor = .clear
-                    #endif
-                }
 
                 // Character count / validation
                 let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -696,6 +720,245 @@ struct WalletSetupView: View {
         return "\(prefix)\(middle)\(suffix)"
     }
 
+    // MARK: - Restore Mnemonic View
+
+    private var restoreMnemonicView: some View {
+        ZStack {
+            theme.backgroundColor.ignoresSafeArea()
+
+            VStack(spacing: 16) {
+                // Header
+                VStack(spacing: 12) {
+                    Image(systemName: "arrow.counterclockwise.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(theme.primaryColor)
+
+                    Text("RESTORE FROM SEED")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Enter your 24-word seed phrase to restore your wallet.")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+                .padding(.top, 24)
+
+                // Security notice when hidden
+                if !showMnemonicInput {
+                    VStack(spacing: 16) {
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: 40))
+                            .foregroundColor(theme.primaryColor)
+
+                        Text("SEED PHRASE HIDDEN")
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+
+                        Text("For your security, seed phrase input is hidden by default.\nMake sure no one is watching your screen.")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+
+                        // Reveal button
+                        Button(action: { showMnemonicInput = true }) {
+                            HStack {
+                                Image(systemName: "eye.fill")
+                                Text("ENTER SEED PHRASE")
+                            }
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.warningColor)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 12)
+                            .background(theme.warningColor.opacity(0.15))
+                            .cornerRadius(theme.cornerRadius)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.warningColor.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    .padding(.vertical, 40)
+                    .frame(maxWidth: .infinity)
+                    .background(theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+                    .padding(.horizontal, 24)
+                }
+
+                // Mnemonic input grid (only shown when revealed)
+                if showMnemonicInput {
+                    // Warning banner
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.shield.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("SENSITIVE DATA - ENSURE PRIVACY")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.warningColor)
+                        Spacer()
+                        Button(action: { showMnemonicInput = false }) {
+                            Image(systemName: "eye.slash")
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    .padding(10)
+                    .background(theme.warningColor.opacity(0.15))
+                    .cornerRadius(theme.cornerRadius)
+                    .padding(.horizontal, 24)
+
+                    // Word count indicator
+                    let filledWords = mnemonicInputWords.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+                    HStack {
+                        Text("\(filledWords)/24 words entered")
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundColor(filledWords == 24 ? theme.successColor : theme.textSecondary)
+
+                        Spacer()
+
+                        // Paste all button
+                        Button(action: { pasteAllWords() }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.on.clipboard")
+                                Text("PASTE ALL")
+                            }
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.primaryColor)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.borderColor, lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+
+                        // Clear all button
+                        Button(action: { mnemonicInputWords = Array(repeating: "", count: 24) }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "xmark.circle")
+                                Text("CLEAR")
+                            }
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.borderColor, lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    .padding(.horizontal, 24)
+
+                    ScrollView {
+                        LazyVGrid(columns: [
+                            GridItem(.flexible()),
+                            GridItem(.flexible()),
+                            GridItem(.flexible())
+                        ], spacing: 8) {
+                            ForEach(0..<24, id: \.self) { index in
+                                HStack(spacing: 4) {
+                                    Text("\(index + 1).")
+                                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                                        .foregroundColor(theme.textSecondary)
+                                        .frame(width: 24, alignment: .trailing)
+
+                                    TextField("", text: $mnemonicInputWords[index])
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(theme.primaryColor)
+                                        .textFieldStyle(PlainTextFieldStyle())
+                                        .autocapitalization(.none)
+                                        .disableAutocorrection(true)
+                                }
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(theme.surfaceColor)
+                                .cornerRadius(4)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(mnemonicInputWords[index].isEmpty ? theme.borderColor : theme.primaryColor.opacity(0.5), lineWidth: 1)
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 16)
+                    }
+                }
+
+                Spacer()
+
+                // Buttons
+                VStack(spacing: 12) {
+                    let filledWords = mnemonicInputWords.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+                    let isValid = filledWords == 24
+
+                    Button(action: { restoreFromMnemonic() }) {
+                        HStack {
+                            if isProcessing {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                                    .tint(theme.backgroundColor)
+                            }
+                            Text(isProcessing ? "RESTORING..." : "RESTORE WALLET")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.backgroundColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(isValid && !isProcessing ? theme.primaryColor : theme.textSecondary)
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .disabled(!isValid || isProcessing)
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: {
+                        showRestoreMnemonic = false
+                        showMnemonicInput = false
+                        mnemonicInputWords = Array(repeating: "", count: 24)
+                    }) {
+                        Text("Cancel")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
+            }
+        }
+    }
+
+    /// Paste all words from clipboard (space-separated)
+    private func pasteAllWords() {
+        #if os(macOS)
+        guard let clipboardString = NSPasteboard.general.string(forType: .string) else { return }
+        #else
+        guard let clipboardString = UIPasteboard.general.string else { return }
+        #endif
+
+        let words = clipboardString
+            .lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+
+        // Fill in words up to 24
+        for (index, word) in words.prefix(24).enumerated() {
+            mnemonicInputWords[index] = word
+        }
+    }
+
     // MARK: - Actions
 
     private func fetchBlockHeight() {
@@ -743,6 +1006,34 @@ struct WalletSetupView: View {
                 await MainActor.run {
                     showImportKey = false
                     privateKeyInput = ""
+                    isProcessing = false
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showError = true
+                    isProcessing = false
+                }
+            }
+        }
+    }
+
+    private func restoreFromMnemonic() {
+        isProcessing = true
+
+        // Clean up words (trim whitespace, lowercase)
+        let cleanedWords = mnemonicInputWords.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+
+        Task {
+            do {
+                try walletManager.restoreWallet(from: cleanedWords)
+
+                await MainActor.run {
+                    showRestoreMnemonic = false
+                    showMnemonicInput = false
+                    mnemonicInputWords = Array(repeating: "", count: 24)
                     isProcessing = false
                 }
             } catch {

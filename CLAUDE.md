@@ -122,7 +122,7 @@ Before any release:
 - [x] Secure Enclave used for key operations (SecureKeyStorage.swift)
 - [x] Multi-peer consensus implemented (consensusThreshold = 3)
 - [x] Sapling proofs verified locally (LocalTxProver)
-- [x] BIP39 mnemonic generation (24-word seed phrases via FFI)
+- [x] BIP39 mnemonic backup & restore (24-word seed phrases via FFI)
 - [x] No sensitive data in logs (DEBUG_LOGGING flag)
 - [x] Network traffic encrypted (P2P + HTTPS)
 - [x] Memory protection for spending keys (SecureData wrapper)
