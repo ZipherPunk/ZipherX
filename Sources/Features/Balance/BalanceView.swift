@@ -26,6 +26,12 @@ struct BalanceView: View {
     @State private var fireworksAmount: Double = 0
     @State private var previousBalance: UInt64 = 0
 
+    // Mined celebration state
+    @State private var showMinedCelebration = false
+    @State private var minedTxAmount: Double = 0
+    @State private var minedTxId: String = ""
+    @State private var minedIsOutgoing: Bool = true
+
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -46,11 +52,23 @@ struct BalanceView: View {
             }
             .padding()
 
-            // Fireworks overlay
+            // Fireworks overlay (for incoming transactions)
             if showFireworks {
                 FireworksView(isShowing: $showFireworks, amount: fireworksAmount)
                     .transition(.opacity)
                     .zIndex(100)
+            }
+
+            // Mined celebration overlay (for confirmed transactions)
+            if showMinedCelebration {
+                MinedCelebrationView(
+                    isShowing: $showMinedCelebration,
+                    amount: minedTxAmount,
+                    txid: minedTxId,
+                    isOutgoing: minedIsOutgoing
+                )
+                .transition(.opacity)
+                .zIndex(101)
             }
         }
         .background(themeManager.currentTheme.backgroundColor)
@@ -89,13 +107,28 @@ struct BalanceView: View {
             }
 
             // Detect incoming ZCL - balance increased!
+            // IMPORTANT: Suppress fireworks for change outputs (balance increase within 30 seconds of send)
             if newValue > previousBalance && previousBalance > 0 {
                 let increase = newValue - previousBalance
-                fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
-                withAnimation {
-                    showFireworks = true
+
+                // Check if this is likely a change output from a recent send
+                let isLikelyChangeOutput: Bool
+                if let lastSend = walletManager.lastSendTimestamp {
+                    let timeSinceSend = Date().timeIntervalSince(lastSend)
+                    isLikelyChangeOutput = timeSinceSend < 30.0 // Within 30 seconds of send
+                } else {
+                    isLikelyChangeOutput = false
                 }
-                print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+
+                if isLikelyChangeOutput {
+                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
+                } else {
+                    fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
+                    withAnimation {
+                        showFireworks = true
+                    }
+                    print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+                }
             }
             previousBalance = newValue
         }
@@ -103,6 +136,23 @@ struct BalanceView: View {
             // Transaction sent - reload history immediately
             print("📜 Transaction history version changed - reloading")
             loadTransactionHistory()
+        }
+        .onChange(of: networkManager.justConfirmedTx?.txid) { txid in
+            // Transaction was mined - show celebration!
+            if let txid = txid, let confirmed = networkManager.justConfirmedTx {
+                minedTxId = txid
+                minedTxAmount = Double(confirmed.amount) / 100_000_000.0
+                minedIsOutgoing = confirmed.isOutgoing
+                withAnimation {
+                    showMinedCelebration = true
+                }
+                print("⛏️ MINED CELEBRATION! \(minedIsOutgoing ? "Sent" : "Received") \(minedTxAmount) ZCL")
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justConfirmedTx = nil
+                }
+            }
         }
     }
 
@@ -138,19 +188,52 @@ struct BalanceView: View {
                 }
             }
 
-            // Mempool incoming
+            // Mempool incoming (cypherpunk style)
             if networkManager.mempoolIncoming > 0 {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.down.circle.fill")
-                        .font(.system(size: 10))
-                    Text("Mempool:")
-                        .font(theme.captionFont)
-                    Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
-                        .font(theme.captionFont)
-                    Text("(\(networkManager.mempoolTxCount) tx)")
-                        .font(theme.captionFont)
+                VStack(spacing: 2) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 10))
+                        Text("INCOMING")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    }
+                    .foregroundColor(theme.successColor)
+
+                    Text("propagating through the network...")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .italic()
                 }
-                .foregroundColor(theme.successColor)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 8)
+                .background(theme.successColor.opacity(0.1))
+                .cornerRadius(theme.cornerRadius)
+            }
+
+            // Mempool outgoing (cypherpunk style)
+            if networkManager.mempoolOutgoing > 0 {
+                VStack(spacing: 2) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 10))
+                        Text("OUTGOING")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    }
+                    .foregroundColor(theme.warningColor)
+
+                    Text("awaiting miners' confirmation...")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .italic()
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 8)
+                .background(theme.warningColor.opacity(0.1))
+                .cornerRadius(theme.cornerRadius)
             }
 
             // Privacy indicator

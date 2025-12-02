@@ -579,7 +579,9 @@ struct ContentView: View {
                 .padding()
                 .background(Color.black)
 
-                SendView()
+                SendView(onSendComplete: {
+                    showCypherpunkSend = false
+                })
             }
             #if os(macOS)
             .frame(width: 480, height: 550)
@@ -657,7 +659,9 @@ struct ContentView: View {
                         case .balance:
                             BalanceView()
                         case .send:
-                            SendView()
+                            SendView(onSendComplete: {
+                                selectedTab = .balance
+                            })
                         case .receive:
                             ReceiveView()
                         case .settings:

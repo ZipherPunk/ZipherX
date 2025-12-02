@@ -31,6 +31,9 @@ struct SendView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
 
+    /// Optional callback when send completes successfully - used to navigate back to balance tab
+    var onSendComplete: (() -> Void)? = nil
+
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -160,10 +163,12 @@ struct SendView: View {
                             .cornerRadius(4)
                         }
 
-                        // Done button
+                        // Done button - navigates back to balance tab
                         Button(action: {
                             showSuccess = false
                             clearForm()
+                            // Navigate back to main screen (balance tab)
+                            onSendComplete?()
                         }) {
                             Text("DONE")
                                 .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -456,6 +461,13 @@ struct SendView: View {
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
         guard let amountValue = Double(normalizedAmount),
               amountValue > 0 else {
+            return false
+        }
+
+        // SECURITY: Prevent integer overflow - max ~184 billion ZCL (UInt64.max / 100_000_000)
+        // In practice, total supply is 21 million, so 100 million is a safe upper bound
+        let maxZCL: Double = 100_000_000.0  // 100 million ZCL
+        guard amountValue <= maxZCL else {
             return false
         }
 

@@ -350,6 +350,7 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Refresh chain height from InsightAPI (called periodically)
+    /// Also triggers background sync if wallet is behind
     private func refreshChainHeight() async {
         guard isConnected else { return }
 
@@ -362,6 +363,15 @@ final class NetworkManager: ObservableObject {
                 await MainActor.run {
                     self.chainHeight = newHeight
                     print("📊 Chain height updated: \(newHeight)")
+                }
+
+                // CRITICAL: Trigger background sync if wallet is behind
+                let dbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                if newHeight > dbHeight && dbHeight > 0 {
+                    print("🔄 New block detected, syncing: chain=\(newHeight) wallet=\(dbHeight) (+\(newHeight - dbHeight) blocks)")
+                    Task {
+                        await WalletManager.shared.backgroundSyncToHeight(newHeight)
+                    }
                 }
             }
         } catch {
@@ -633,6 +643,9 @@ final class NetworkManager: ObservableObject {
                         peers.append(peer)
                         connectedCount += 1
 
+                        // Set up block announcement listener
+                        self.setupBlockListener(for: peer)
+
                         // Update UI immediately
                         await MainActor.run {
                             self.connectedPeers = connectedCount
@@ -766,6 +779,11 @@ final class NetworkManager: ObservableObject {
         Task {
             await scanMempoolForIncoming()
         }
+
+        // Check if any outgoing pending txs have been confirmed
+        Task {
+            await checkPendingOutgoingConfirmations()
+        }
     }
 
     // MARK: - Mempool Detection (Cypherpunk Style!)
@@ -773,6 +791,78 @@ final class NetworkManager: ObservableObject {
     /// Published property for incoming mempool amount
     @Published private(set) var mempoolIncoming: UInt64 = 0
     @Published private(set) var mempoolTxCount: Int = 0
+
+    /// Published property for outgoing pending transactions (just broadcast, waiting for confirmation)
+    @Published private(set) var mempoolOutgoing: UInt64 = 0
+    @Published private(set) var mempoolOutgoingTxCount: Int = 0
+
+    /// Published when a transaction is confirmed (for showing "mined" celebration)
+    /// Contains (txid, amount, isOutgoing) - cleared after UI handles it
+    @Published var justConfirmedTx: (txid: String, amount: UInt64, isOutgoing: Bool)? = nil
+
+    /// Track pending outgoing transactions (txid -> amount in zatoshis)
+    private var pendingOutgoingTxs: [String: UInt64] = [:]
+    private let pendingTxLock = NSLock()
+
+    /// Called after successfully broadcasting a transaction
+    /// Tracks the pending outgoing amount until it confirms
+    func trackPendingOutgoing(txid: String, amount: UInt64) {
+        pendingTxLock.lock()
+        pendingOutgoingTxs[txid] = amount
+        let totalPending = pendingOutgoingTxs.values.reduce(0, +)
+        let txCount = pendingOutgoingTxs.count
+        pendingTxLock.unlock()
+
+        DispatchQueue.main.async {
+            self.mempoolOutgoing = totalPending
+            self.mempoolOutgoingTxCount = txCount
+            print("📤 Tracking pending outgoing: \(txid.prefix(12))... = \(amount) zatoshis (total: \(totalPending))")
+        }
+    }
+
+    /// Called when a transaction is confirmed (found in a block)
+    /// Removes from pending tracking and publishes confirmation for UI celebration
+    func confirmOutgoingTx(txid: String) {
+        pendingTxLock.lock()
+        let amount = pendingOutgoingTxs[txid]
+        let removed = pendingOutgoingTxs.removeValue(forKey: txid)
+        let totalPending = pendingOutgoingTxs.values.reduce(0, +)
+        let txCount = pendingOutgoingTxs.count
+        pendingTxLock.unlock()
+
+        if removed != nil {
+            DispatchQueue.main.async {
+                self.mempoolOutgoing = totalPending
+                self.mempoolOutgoingTxCount = txCount
+
+                // Publish confirmation for UI celebration (cypherpunk mined message!)
+                if let amount = amount {
+                    self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
+                }
+
+                print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(totalPending))")
+            }
+        }
+    }
+
+    /// Check if any pending outgoing transactions have been confirmed
+    /// Called periodically to clean up confirmed transactions
+    func checkPendingOutgoingConfirmations() async {
+        pendingTxLock.lock()
+        let pendingTxids = Array(pendingOutgoingTxs.keys)
+        pendingTxLock.unlock()
+
+        guard !pendingTxids.isEmpty else { return }
+
+        for txid in pendingTxids {
+            // Check if transaction has confirmations via InsightAPI
+            if let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid) {
+                if txInfo.confirmations > 0 {
+                    confirmOutgoingTx(txid: txid)
+                }
+            }
+        }
+    }
 
     /// Scan mempool for incoming shielded transactions
     /// Uses trial decryption to detect payments before confirmation
@@ -961,6 +1051,47 @@ final class NetworkManager: ObservableObject {
 
         return peer
     }
+
+    // MARK: - Block Announcement Listener
+
+    /// Set up block announcement listener for a peer
+    /// When the peer receives a new block via P2P inv message, it triggers a background sync
+    private func setupBlockListener(for peer: Peer) {
+        peer.onBlockAnnounced = { [weak self] blockHash in
+            guard let self = self else { return }
+
+            let hashHex = blockHash.map { String(format: "%02x", $0) }.joined()
+            print("📦 New block announced: \(hashHex.prefix(16))...")
+
+            // Trigger background sync immediately (non-blocking)
+            Task {
+                await self.onNewBlockAnnounced()
+            }
+        }
+
+        // Start listening in background
+        peer.startBlockListener()
+    }
+
+    /// Called when any peer announces a new block
+    /// Triggers fetchNetworkStats which will sync new blocks via backgroundSyncToHeight
+    private func onNewBlockAnnounced() async {
+        // Debounce: avoid multiple syncs if multiple peers announce same block
+        let now = Date()
+        if let lastAnnouncement = lastBlockAnnouncementTime,
+           now.timeIntervalSince(lastAnnouncement) < 2.0 {
+            return // Skip if less than 2 seconds since last announcement
+        }
+        lastBlockAnnouncementTime = now
+
+        print("⚡ Processing new block announcement - triggering sync...")
+
+        // Fetch network stats which will trigger backgroundSyncToHeight if needed
+        await fetchNetworkStats()
+    }
+
+    /// Track last block announcement time for debouncing
+    private var lastBlockAnnouncementTime: Date?
 
     // MARK: - Consensus Queries
 
@@ -1772,6 +1903,9 @@ final class NetworkManager: ObservableObject {
 
                 if let peer = try? await connectToPeer(address) {
                     peers.append(peer)
+
+                    // Set up block announcement listener
+                    setupBlockListener(for: peer)
 
                     let key = "\(address.host):\(address.port)"
                     knownAddresses[key]?.successes += 1

@@ -43,6 +43,9 @@ final class WalletManager: ObservableObject {
     @Published private(set) var syncMaxHeight: UInt64 = 0
     @Published private(set) var transactionHistoryVersion: Int = 0  // Increments when tx history changes
 
+    /// Timestamp of last sent transaction - used to suppress fireworks for change outputs
+    @Published private(set) var lastSendTimestamp: Date? = nil
+
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
     private let mnemonicGenerator: MnemonicGenerator
@@ -1428,6 +1431,14 @@ final class WalletManager: ObservableObject {
             onProgress("broadcast", detail, progress)
         }
 
+        // Track as pending outgoing (cypherpunk mempool status)
+        networkManager.trackPendingOutgoing(txid: txId, amount: amount)
+
+        // Record send timestamp - used to suppress fireworks for change outputs
+        await MainActor.run {
+            self.lastSendTimestamp = Date()
+        }
+
         // CRITICAL: Record transaction IMMEDIATELY after broadcast success
         // This ensures the sent tx is in history even if subsequent operations fail
         guard let txidData = Data(hexString: txId) else {
@@ -1526,6 +1537,14 @@ final class WalletManager: ObservableObject {
         // Broadcast through multi-peer network
         let networkManager = NetworkManager.shared
         let txId = try await networkManager.broadcastTransaction(rawTx)
+
+        // Track as pending outgoing (cypherpunk mempool status)
+        networkManager.trackPendingOutgoing(txid: txId, amount: amount)
+
+        // Record send timestamp - used to suppress fireworks for change outputs
+        await MainActor.run {
+            self.lastSendTimestamp = Date()
+        }
 
         // CRITICAL: Record transaction IMMEDIATELY after broadcast success
         guard let txidData = Data(hexString: txId) else {

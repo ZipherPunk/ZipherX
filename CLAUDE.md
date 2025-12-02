@@ -1902,6 +1902,52 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 
 ---
 
+### 22. UX Improvements and P2P Broadcast Fix (December 2, 2025)
+
+**Changes Made:**
+
+1. **Change Output Fireworks Suppression** (`WalletManager.swift`, `BalanceView.swift`)
+   - Added `lastSendTimestamp` property to track when transactions were sent
+   - Balance increases within 30 seconds of a send are treated as change outputs
+   - Change outputs no longer trigger the "received" fireworks celebration
+
+2. **Rocket Emoji for Incoming Transactions** (`System7Components.swift`)
+   - Changed `FireworksView` to show 🚀 instead of 🎉
+   - Changed text from "RECEIVED!" to "INCOMING!"
+
+3. **Navigate to Balance After Send Success** (`SendView.swift`, `ContentView.swift`)
+   - Added `onSendComplete` callback to `SendView`
+   - After clicking "DONE" on success screen, user is returned to balance tab
+   - Works for both tab-based view and cypherpunk sheet view
+
+4. **Mined Transaction Celebration** (`NetworkManager.swift`, `BalanceView.swift`, `System7Components.swift`)
+   - Added `justConfirmedTx` published property for confirmed transaction notifications
+   - Added `MinedCelebrationView` with cypherpunk messages:
+     - "Proof of work complete. Your transaction is now immutable."
+     - "Consensus achieved. The network validates your privacy."
+     - "Block sealed. Your financial sovereignty preserved."
+     - "Hash verified. Another step toward freedom."
+   - Shows ⛏️ MINED! overlay when outgoing transaction confirms
+   - Auto-dismisses after 4 seconds or on tap
+
+5. **P2P Broadcast Protocol Fix** (`Peer.swift`)
+   - **Root cause**: P2P `broadcastTransaction` was waiting for a response that never comes
+   - In Bitcoin/Zcash P2P protocol, successful tx broadcast has **no response**
+   - Node either silently accepts (success) or sends `reject` message (failure)
+   - Fixed to wait only 500ms for potential reject, then assume success
+   - This enables proper P2P transaction broadcast instead of always falling back to InsightAPI
+
+**Files Modified:**
+- `Sources/Core/Wallet/WalletManager.swift` - added `lastSendTimestamp`
+- `Sources/Features/Balance/BalanceView.swift` - change detection, mined celebration
+- `Sources/Features/Send/SendView.swift` - `onSendComplete` callback
+- `Sources/App/ContentView.swift` - pass callbacks to SendView
+- `Sources/Core/Network/NetworkManager.swift` - `justConfirmedTx` property
+- `Sources/Core/Network/Peer.swift` - fixed P2P broadcast protocol
+- `Sources/UI/Components/System7Components.swift` - 🚀 emoji, `MinedCelebrationView`
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
@@ -1909,7 +1955,61 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 - Notes received BEFORE bundledTreeHeight (2926122) require manual "Full Rescan from Height" in Settings
 - Full Node mode requires manual zclassicd installation (not bundled)
 
+---
+
+## Remaining Security & Performance Tasks
+
+### P0: Critical Security (Required Before Release)
+
+1. **SQLCipher Database Encryption** - Encrypt wallet.db with user passphrase
+   - All notes, witnesses, spending keys stored in plaintext SQLite
+   - Need AES-256 encryption via SQLCipher
+   - Key derivation from user passphrase with PBKDF2
+
+2. **Memory Protection for Spending Keys** - Zero memory after use
+   - Spending keys in memory could be dumped
+   - Need `memset_s` to zero key buffers after use
+   - Disable swap for sensitive memory regions
+
+### P1: Important Security
+
+3. **App Lock with Background Timeout** - Auto-lock after X minutes background
+   - Currently only locks on app launch
+   - Need timer-based auto-lock when app goes to background
+   - Configurable timeout in Settings (1/5/15 minutes)
+
+4. **Emergency Wipe Manager** - Secure data deletion
+   - One-button wipe of all wallet data
+   - Confirmation dialog with countdown
+   - Wipe: keys, database, keychain, UserDefaults
+
+5. **Backup Confirmation Flow** - Ensure user has backup before sending
+   - Disable Send button until user confirms backup
+   - Show warning on first send
+   - Track backup confirmation status
+
+### P2: Performance Optimization
+
+6. **Pre-fetch Pipeline Expansion** - Overlap more network/compute
+   - Current: pre-fetch 1 batch ahead during sync
+   - Could pre-fetch 2-3 batches for faster initial sync
+
+7. **Witness Caching at Discovery** - Cache witness when note found
+   - Currently rebuild witness at send time
+   - Could cache witness immediately when note discovered
+   - Would make first send instant (no rebuild wait)
+
+8. **Background Sync Optimization** - More efficient background updates
+   - iOS background fetch integration
+   - Minimize battery/network usage
+   - Push notification for incoming transactions
+
 ## Contact
+
+For questions about this project, refer to the architecture document or review the security model section.
+- z.log is available as usual here : /Users/chris/ZipherX
+- never kill any processes !
+- never kill any processes !
 
 For questions about this project, refer to the architecture document or review the security model section.
 - z.log is available as usual here : /Users/chris/ZipherX

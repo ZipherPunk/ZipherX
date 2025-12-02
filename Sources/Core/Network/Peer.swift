@@ -60,6 +60,14 @@ final class Peer {
     var peerUserAgent: String = ""
     var peerStartHeight: Int32 = 0
 
+    // Block announcement listener
+    private var blockListenerTask: Task<Void, Never>?
+    private var isListening = false
+
+    /// Callback when a new block is announced via P2P inv message
+    /// Parameters: block hash (32 bytes, wire format)
+    var onBlockAnnounced: ((Data) -> Void)?
+
     init(host: String, port: UInt16, networkMagic: [UInt8]) {
         self.id = UUID().uuidString
         self.host = host
@@ -233,8 +241,144 @@ final class Peer {
     }
 
     func disconnect() {
+        stopBlockListener()
         connection?.cancel()
         connection = nil
+    }
+
+    // MARK: - Block Announcement Listener
+
+    /// Start listening for block announcements in background
+    /// Call this after handshake completes
+    /// NOTE: The listener only runs when peer is idle (not busy with other operations)
+    func startBlockListener() {
+        guard !isListening else { return }
+        isListening = true
+
+        blockListenerTask = Task { [weak self] in
+            guard let self = self else { return }
+            print("📡 [\(self.host)] Block listener started")
+
+            while self.isListening && self.connection != nil {
+                do {
+                    // Only listen when peer is not busy with other operations
+                    // This prevents interference with request-response patterns
+                    let isBusy = await self.messageLock.isBusy
+                    if isBusy {
+                        // Peer is busy, wait and retry
+                        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                        continue
+                    }
+
+                    // Try to receive a message with a timeout
+                    let (command, payload) = try await self.receiveMessageNonBlocking()
+
+                    // Handle the received message
+                    await self.handleBackgroundMessage(command: command, payload: payload)
+
+                } catch NetworkError.timeout {
+                    // Timeout is normal - just continue listening
+                    continue
+                } catch {
+                    // Connection closed or error - stop listening
+                    if self.isListening {
+                        print("📡 [\(self.host)] Block listener stopped: \(error.localizedDescription)")
+                    }
+                    break
+                }
+            }
+
+            print("📡 [\(self.host)] Block listener ended")
+        }
+    }
+
+    /// Stop listening for block announcements
+    func stopBlockListener() {
+        isListening = false
+        blockListenerTask?.cancel()
+        blockListenerTask = nil
+    }
+
+    /// Receive message without blocking indefinitely (uses short timeout)
+    private func receiveMessageNonBlocking() async throws -> (String, Data) {
+        guard let connection = connection else {
+            throw NetworkError.notConnected
+        }
+
+        // Use a short timeout to periodically check if we should stop
+        return try await withThrowingTaskGroup(of: (String, Data).self) { group in
+            group.addTask {
+                return try await self.receiveMessage()
+            }
+
+            group.addTask {
+                // 30 second timeout - allows periodic check of isListening
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw NetworkError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Handle messages received in background listener
+    private func handleBackgroundMessage(command: String, payload: Data) async {
+        switch command {
+        case "inv":
+            handleInvMessage(payload: payload)
+
+        case "ping":
+            // Respond to pings to keep connection alive
+            try? await sendMessage(command: "pong", payload: payload)
+
+        case "alert", "addr", "headers", "tx", "block":
+            // Known message types we don't need to handle in background
+            break
+
+        default:
+            // Ignore other messages
+            break
+        }
+    }
+
+    /// Parse inv message and extract block announcements
+    private func handleInvMessage(payload: Data) {
+        guard payload.count >= 1 else { return }
+
+        var offset = 0
+
+        // Read count (varint)
+        let (count, countSize) = readVarInt(from: payload, at: offset)
+        offset += countSize
+
+        var blockHashes: [Data] = []
+
+        for _ in 0..<count {
+            guard offset + 36 <= payload.count else { break }
+
+            // Type: 1 = MSG_TX, 2 = MSG_BLOCK
+            let invType = payload.loadUInt32(at: offset)
+            offset += 4
+
+            // Hash (32 bytes)
+            let hash = payload.subdata(in: offset..<offset+32)
+            offset += 32
+
+            // Collect block announcements (type 2)
+            if invType == 2 {
+                blockHashes.append(hash)
+            }
+        }
+
+        // Notify about new blocks
+        if !blockHashes.isEmpty {
+            print("📦 [\(host)] Received \(blockHashes.count) new block announcement(s)!")
+            for blockHash in blockHashes {
+                onBlockAnnounced?(blockHash)
+            }
+        }
     }
 
     // MARK: - Handshake
@@ -498,40 +642,81 @@ final class Peer {
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
         try await sendMessage(command: "tx", payload: rawTx)
 
-        let (command, response) = try await receiveMessage()
-
-        // Check for rejection
-        if command == "reject" {
-            // Parse reject message: varint message_type + reason_code + varint reason_text
-            var offset = 0
-            // Skip message type (varint + string)
-            if response.count > 0 {
-                let msgLen = Int(response[0])
-                offset = 1 + msgLen
-            }
-            if offset < response.count {
-                let rejectCode = response[offset]
-                let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
-                let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
-
-                // Get reason text
-                var reason = ""
-                if offset + 1 < response.count {
-                    let reasonLen = Int(response[offset + 1])
-                    if offset + 2 + reasonLen <= response.count {
-                        reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
-                    }
-                }
-                print("❌ Transaction rejected: \(codeName) - \(reason)")
-                throw NetworkError.transactionRejected
-            }
-        }
-
-        print("📨 Broadcast response: \(command)")
+        // NOTE: In Bitcoin/Zcash P2P protocol, successful tx broadcast has NO response!
+        // The node either:
+        // 1. Silently accepts (no response) - SUCCESS
+        // 2. Sends a "reject" message - FAILURE
+        //
+        // We do a SHORT wait (500ms) for potential reject message, then assume success.
 
         // TX ID is the double SHA256 hash of the raw transaction
         let txId = rawTx.doubleSHA256().reversed()
-        return txId.map { String(format: "%02x", $0) }.joined()
+        let txIdString = txId.map { String(format: "%02x", $0) }.joined()
+
+        // Short wait for potential reject message (non-blocking)
+        do {
+            // Use a short timeout - if no reject within 500ms, assume accepted
+            let checkForReject = Task {
+                try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+            }
+
+            // Try to receive any immediate reject message
+            let receiveTask = Task {
+                try await receiveMessage()
+            }
+
+            // Race: either timeout wins (success) or we get a message
+            let result = try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
+                group.addTask {
+                    try await checkForReject.value
+                    return nil // Timeout = no reject = success
+                }
+                group.addTask {
+                    let (cmd, resp) = try await receiveTask.value
+                    return (cmd, resp)
+                }
+
+                // First to complete wins
+                if let firstResult = try await group.next() {
+                    group.cancelAll()
+                    return firstResult
+                }
+                return nil
+            }
+
+            // Check if we got a reject message
+            if let (command, response) = result, command == "reject" {
+                // Parse reject message
+                var offset = 0
+                if response.count > 0 {
+                    let msgLen = Int(response[0])
+                    offset = 1 + msgLen
+                }
+                if offset < response.count {
+                    let rejectCode = response[offset]
+                    let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
+                    let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
+
+                    var reason = ""
+                    if offset + 1 < response.count {
+                        let reasonLen = Int(response[offset + 1])
+                        if offset + 2 + reasonLen <= response.count {
+                            reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
+                        }
+                    }
+                    print("❌ Transaction rejected: \(codeName) - \(reason)")
+                    throw NetworkError.transactionRejected
+                }
+            }
+        } catch {
+            // Ignore timeout errors - they mean success (no reject received)
+            if !(error is CancellationError) {
+                print("⚠️ Broadcast check error: \(error)")
+            }
+        }
+
+        print("📡 Broadcast sent to peer, txid: \(txIdString.prefix(16))...")
+        return txIdString
     }
 
     func getBlockHeaders(from height: UInt64, count: Int) async throws -> [BlockHeader] {
@@ -995,24 +1180,33 @@ final class Peer {
         var pos = offset
 
         // Version (4 bytes)
+        guard pos + 4 <= data.count else { return data.count }
         pos += 4
 
         // For non-overwintered, standard Bitcoin-like format
         // vin
         let (vinCount, vinBytes) = readCompactSize(data, at: pos)
         pos += vinBytes
-        for _ in 0..<vinCount {
+
+        // Limit loop iterations to prevent runaway parsing on corrupted data
+        let safeVinCount = min(vinCount, 10000)
+        for _ in 0..<safeVinCount {
+            guard pos < data.count else { return data.count }
             pos = skipTransparentInput(data, offset: pos)
         }
 
         // vout
         let (voutCount, voutBytes) = readCompactSize(data, at: pos)
         pos += voutBytes
-        for _ in 0..<voutCount {
+
+        let safeVoutCount = min(voutCount, 10000)
+        for _ in 0..<safeVoutCount {
+            guard pos < data.count else { return data.count }
             pos = skipTransparentOutput(data, offset: pos)
         }
 
         // nLockTime (4 bytes)
+        guard pos + 4 <= data.count else { return data.count }
         pos += 4
 
         return pos
@@ -1022,15 +1216,22 @@ final class Peer {
     private func skipTransparentInput(_ data: Data, offset: Int) -> Int {
         var pos = offset
 
+        // Bounds check
+        guard pos + 36 <= data.count else { return data.count }
+
         // prevout: txid (32) + vout index (4)
         pos += 36
 
         // scriptSig length + scriptSig
         let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
         pos += scriptBytes
-        pos += Int(scriptLen)
+
+        // Safe conversion - if scriptLen is too big, return end of data
+        guard scriptLen <= UInt64(data.count - pos) else { return data.count }
+        pos += Int(clamping: scriptLen)
 
         // sequence (4 bytes)
+        guard pos + 4 <= data.count else { return data.count }
         pos += 4
 
         return pos
@@ -1040,13 +1241,19 @@ final class Peer {
     private func skipTransparentOutput(_ data: Data, offset: Int) -> Int {
         var pos = offset
 
+        // Bounds check
+        guard pos + 8 <= data.count else { return data.count }
+
         // value (8 bytes)
         pos += 8
 
         // scriptPubKey length + scriptPubKey
         let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
         pos += scriptBytes
-        pos += Int(scriptLen)
+
+        // Safe conversion - if scriptLen is too big, return end of data
+        guard scriptLen <= UInt64(data.count - pos) else { return data.count }
+        pos += Int(clamping: scriptLen)
 
         return pos
     }
