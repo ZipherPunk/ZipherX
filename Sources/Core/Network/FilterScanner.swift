@@ -19,12 +19,22 @@ final class FilterScanner {
     private var isScanning = false
     private var scanTask: Task<Void, Never>?
 
-    // Static lock to prevent concurrent scans across all instances
-    private static var globalScanLock = false
+    // SECURITY: Thread-safe lock to prevent concurrent scans across all instances
+    private static let globalScanLock = NSLock()
+    private static var _isScanningFlag = false
 
-    /// Check if any scan is currently in progress
+    /// Check if any scan is currently in progress (thread-safe)
     static var isScanInProgress: Bool {
-        return globalScanLock
+        globalScanLock.lock()
+        defer { globalScanLock.unlock() }
+        return _isScanningFlag
+    }
+
+    /// Thread-safe setter for scan flag
+    private static func setScanInProgress(_ value: Bool) {
+        globalScanLock.lock()
+        _isScanningFlag = value
+        globalScanLock.unlock()
     }
 
     // Progress callback - (progress, currentHeight, maxHeight)
@@ -69,17 +79,17 @@ final class FilterScanner {
     ///   - viewingKey: Spending key (used as viewing key)
     ///   - fromHeight: Optional custom start height (for quick scan)
     func startScan(for accountId: Int64, viewingKey: Data, fromHeight customStartHeight: UInt64? = nil) async throws {
-        // Check both instance and global lock
-        guard !isScanning && !FilterScanner.globalScanLock else {
+        // SECURITY: Thread-safe check and acquisition of global lock
+        guard !isScanning && !FilterScanner.isScanInProgress else {
             print("⚠️ Scan already in progress, skipping")
             return
         }
 
         isScanning = true
-        FilterScanner.globalScanLock = true
+        FilterScanner.setScanInProgress(true)
         defer {
             isScanning = false
-            FilterScanner.globalScanLock = false
+            FilterScanner.setScanInProgress(false)
         }
 
         // Get current chain height
@@ -209,6 +219,7 @@ final class FilterScanner {
 
         // Load known nullifiers from database for spend detection
         knownNullifiers = try database.getAllNullifiers()
+        print("🔍 FilterScanner: Loaded \(knownNullifiers.count) known nullifiers from database")
 
         // NOTE: Existing witnesses are loaded AFTER tree is ready (see below)
         // This is critical - witnesses must be loaded into an initialized tree
@@ -883,31 +894,41 @@ final class FilterScanner {
         )
     }
 
-    /// Read compact size (variable int)
+    /// Read compact size (variable int) with bounds checking
+    /// SECURITY: Validates size is within reasonable bounds to prevent DoS attacks
     private func readCompactSize(_ data: Data, offset: inout Int) -> Int {
         guard offset < data.count else { return 0 }
 
         let first = data[offset]
         offset += 1
 
+        var value: UInt64 = 0
+
         if first < 253 {
-            return Int(first)
+            value = UInt64(first)
         } else if first == 253 {
             guard offset + 2 <= data.count else { return 0 }
-            let value = data.loadUInt16(at: offset)
+            value = UInt64(data.loadUInt16(at: offset))
             offset += 2
-            return Int(value)
         } else if first == 254 {
             guard offset + 4 <= data.count else { return 0 }
-            let value = data.loadUInt32(at: offset)
+            value = UInt64(data.loadUInt32(at: offset))
             offset += 4
-            return Int(value)
         } else {
             guard offset + 8 <= data.count else { return 0 }
-            let value = data.loadUInt64(at: offset)
+            value = data.loadUInt64(at: offset)
             offset += 8
-            return Int(clamping: value)
         }
+
+        // SECURITY: Bounds check - reject unreasonably large values
+        // Max allowed: 100MB to prevent memory exhaustion attacks
+        let maxAllowedSize: UInt64 = 100 * 1024 * 1024
+        guard value <= maxAllowedSize else {
+            print("⚠️ SECURITY: Rejected varint value \(value) exceeding max \(maxAllowedSize)")
+            return 0
+        }
+
+        return Int(value)
     }
 
     /// Parse a single transaction from raw data
@@ -1045,14 +1066,7 @@ final class FilterScanner {
         // Check for spent notes (nullifier detection)
         for tx in block.transactions {
             for spend in tx.spends {
-                // Debug: Log nullifier comparison when we have known nullifiers
-                if !knownNullifiers.isEmpty {
-                    let spendNfHex = spend.nullifier.hexString
-                    let matched = knownNullifiers.contains(spend.nullifier)
-                    if matched {
-                        print("💸 MATCH! Spend nullifier \(spendNfHex) matches our note!")
-                    }
-                }
+                // SECURITY: Check for nullifier match without logging sensitive data
 
                 if knownNullifiers.contains(spend.nullifier) {
                     // One of our notes was spent! Include txid for history tracking
@@ -1144,7 +1158,7 @@ final class FilterScanner {
                     } else {
                         try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     }
-                    print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
+                    print("💸 Note spent at height \(height)")
                 }
             }
         }
@@ -1206,7 +1220,7 @@ final class FilterScanner {
             )
 
             // Debug: Log the computed nullifier and position
-            print("🔐 Computed nullifier for note at position \(treePosition): \(nullifier.hexString)")
+            // SECURITY: Never log nullifiers - they are sensitive privacy data
 
             knownNullifiers.insert(nullifier)
 
@@ -1275,7 +1289,7 @@ final class FilterScanner {
                     } else {
                         try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     }
-                    print("💸 Note spent at height \(height) - nullifier: \(spend.nullifier.prefix(16))...")
+                    print("💸 Note spent at height \(height)")
                 }
             }
         }
@@ -1342,8 +1356,7 @@ final class FilterScanner {
                 position: position
             )
 
-            // Debug: Log the computed nullifier and position
-            print("🔐 Computed nullifier for note at position \(position): \(nullifier.hexString)")
+            // SECURITY: Never log nullifiers - they are sensitive privacy data
 
             knownNullifiers.insert(nullifier)
 
@@ -1579,22 +1592,45 @@ final class FilterScanner {
     // MARK: - Helper Methods
 
     private func getChainHeight() async throws -> UInt64 {
-        // Try P2P first (trustless, decentralized)
+        // Get both HeaderStore height and P2P chain tip
+        // We use the MINIMUM to ensure we never scan beyond synced headers
+        // But if headers are fully synced, we'll scan to the true chain tip
+
+        let headerStoreHeight = try? HeaderStore.shared.getLatestHeight()
+        var p2pHeight: UInt64? = nil
+
+        // Try to get P2P chain tip
         do {
-            let p2pHeight = try await networkManager.getChainHeightP2POnly()
-            print("📡 P2P chain height: \(p2pHeight)")
-            return p2pHeight
+            p2pHeight = try await networkManager.getChainHeightP2POnly()
         } catch {
-            if useP2POnly {
-                print("❌ P2P height unavailable and P2P-only mode enabled")
-                throw ScanError.networkError
+            if !useP2POnly {
+                // Try InsightAPI as fallback for chain tip
+                if let status = try? await insightAPI.getStatus() {
+                    p2pHeight = status.height
+                }
             }
-            print("⚠️ P2P height unavailable, falling back to InsightAPI...")
         }
 
-        // Fallback to InsightAPI if P2P fails (only in fallback mode)
-        let status = try await insightAPI.getStatus()
-        return status.height
+        // Determine which height to use
+        if let hsHeight = headerStoreHeight, let chainTip = p2pHeight {
+            // Use minimum of HeaderStore and chain tip
+            // This ensures we don't scan beyond synced headers
+            let scanHeight = min(hsHeight, chainTip)
+            print("📡 Chain tip: \(chainTip), HeaderStore: \(hsHeight) → Scanning to: \(scanHeight)")
+            return scanHeight
+        } else if let hsHeight = headerStoreHeight {
+            // Only HeaderStore available - use it
+            print("📡 Using HeaderStore height: \(hsHeight)")
+            return hsHeight
+        } else if let chainTip = p2pHeight {
+            // Only P2P available (no headers synced yet) - this is for initial sync
+            print("⚠️ No headers synced, using P2P chain tip: \(chainTip)")
+            return chainTip
+        }
+
+        // No height available at all
+        print("❌ Cannot determine chain height")
+        throw ScanError.networkError
     }
 
     private func deriveIncomingViewingKey(from viewingKey: Data) -> Data {

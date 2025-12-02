@@ -46,6 +46,9 @@ struct ContentView: View {
                             return
                         }
 
+                        // Suppress background sync during initial startup to avoid race conditions
+                        networkManager.suppressBackgroundSync = true
+
                         // Start the timer
                         await MainActor.run {
                             syncStartTime = Date()
@@ -226,6 +229,9 @@ struct ContentView: View {
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
                         }
+
+                        // Re-enable background sync now that initial sync is complete
+                        networkManager.suppressBackgroundSync = false
 
                         // Calculate final duration and show completion screen
                         await MainActor.run {
@@ -484,20 +490,20 @@ struct ContentView: View {
             )
             tasks.append(treeTask)
         } else {
-            tasks.append(SyncTask(id: "tree", title: "Load commitment tree", status: .completed))
+            tasks.append(SyncTask(id: "tree", title: "Load Sapling note tree", status: .completed))
         }
 
         // 2. SECOND: Network connection task (after tree loaded)
         if walletManager.isTreeLoaded {
             if !networkManager.isConnected {
                 let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
-                tasks.append(SyncTask(id: "connect", title: "Connect to network", status: status))
+                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: status))
             } else {
-                tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .completed))
+                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .completed))
             }
         } else {
             // Tree not loaded yet - show connect as pending
-            tasks.append(SyncTask(id: "connect", title: "Connect to network", status: .pending))
+            tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .pending))
         }
 
         // 3. THIRD: Sync tasks from WalletManager (headers, scan, witnesses, balance)
@@ -505,7 +511,7 @@ struct ContentView: View {
             tasks.append(contentsOf: walletManager.syncTasks)
         } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
             // Sync already complete or skipped - show completed scan task
-            tasks.append(SyncTask(id: "scan", title: "Scan blockchain", status: .completed))
+            tasks.append(SyncTask(id: "scan", title: "Decrypt shielded notes", status: .completed))
         }
 
         return tasks

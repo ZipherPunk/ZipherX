@@ -1948,6 +1948,74 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 
 ---
 
+### 33. P2P-First Header Sync with Cypherpunk UI (December 2, 2025)
+
+**Problem**: Header sync task was showing red (failed) at startup, and InsightAPI was being used as fallback too frequently.
+
+**Root Causes Fixed**:
+
+1. **Header sync loop exiting early** - Loop used `endHeight` (requested) instead of actual headers received. P2P `getheaders` returns max 160 headers per response, not 2000.
+
+2. **Peer failures blocking sync** - If initial batch of peers failed, sync gave up without trying other peers from the pool.
+
+3. **Scan running ahead of header sync** - FilterScanner used P2P chain tip, which could be ahead of synced headers, causing "No header found" errors.
+
+**Solutions Implemented**:
+
+1. **Fixed header sync loop** (`HeaderSyncManager.swift`):
+   ```swift
+   // Use actual headers received, not requested endHeight
+   let actualEndHeight = currentHeight + UInt64(headers.count) - 1
+   currentHeight = actualEndHeight + 1
+   ```
+
+2. **Peer retry logic** - Try at least 10 peers before giving up:
+   ```swift
+   let minPeersToTry = 10
+   while successfulHeaders.count < consensusThreshold && !remainingPeers.isEmpty {
+       // Try peers in batches, exit early if consensus reached
+       if successfulHeaders.count >= consensusThreshold {
+           group.cancelAll()
+           break
+       }
+   }
+   ```
+
+3. **Reactive reconnection** - On handshake failure, wait 50ms and retry once:
+   ```swift
+   catch NetworkError.handshakeFailed {
+       peer.disconnect()
+       try? await Task.sleep(nanoseconds: 50_000_000)
+       try await peer.connect()
+       try await peer.performHandshake()
+       // Retry request
+   }
+   ```
+
+4. **Scan height = min(HeaderStore, P2P)** (`FilterScanner.swift`):
+   ```swift
+   let scanHeight = min(hsHeight, chainTip)
+   // Ensures we never scan beyond synced headers
+   ```
+
+**Cypherpunk Task Names** (`WalletManager.swift`, `ContentView.swift`):
+- "Load zk-SNARK circuits"
+- "Derive spending keys"
+- "Unlock encrypted vault"
+- "Verify peer consensus (3/3)"
+- "Query chain tip from peers"
+- "Decrypt shielded notes"
+- "Build Merkle witnesses"
+- "Tally unspent notes"
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - fixed sync loop, peer retry logic, reactive reconnection
+- `Sources/Core/Network/FilterScanner.swift` - scan height = min(HeaderStore, P2P)
+- `Sources/Core/Wallet/WalletManager.swift` - cypherpunk task names and status messages
+- `Sources/App/ContentView.swift` - cypherpunk task names
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

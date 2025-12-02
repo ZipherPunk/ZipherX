@@ -497,14 +497,14 @@ final class WalletManager: ObservableObject {
             self.syncProgress = 0.0
             self.syncStatus = "Initializing privacy shield..."
             self.syncTasks = [
-                SyncTask(id: "params", title: "Fetch Sapling params", status: .pending),
-                SyncTask(id: "keys", title: "Load wallet keys", status: .pending),
-                SyncTask(id: "database", title: "Open database", status: .pending),
-                SyncTask(id: "headers", title: "Sync block headers", status: .pending),
-                SyncTask(id: "height", title: "Get chain height", status: .pending),
-                SyncTask(id: "scan", title: "Scan blocks since checkpoint", status: .pending),
-                SyncTask(id: "witnesses", title: "Sync Merkle witnesses", status: .pending),
-                SyncTask(id: "balance", title: "Calculate balance", status: .pending)
+                SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
+                SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
+                SyncTask(id: "database", title: "Unlock encrypted vault", status: .pending),
+                SyncTask(id: "headers", title: "Verify peer consensus (3/3)", status: .pending),
+                SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
+                SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
+                SyncTask(id: "witnesses", title: "Build Merkle witnesses", status: .pending),
+                SyncTask(id: "balance", title: "Tally unspent notes", status: .pending)
             ]
         }
 
@@ -574,9 +574,11 @@ final class WalletManager: ObservableObject {
         }
 
         // Task 3: Sync block headers (with retry logic for peer timing issues)
+        // NOTE: Header sync is optional for balance display - if it fails, we continue anyway
+        // Headers are only needed for transaction building (anchor verification)
         await updateTask("headers", status: .inProgress)
 
-        let maxHeaderRetries = 3
+        let maxHeaderRetries = 2  // Reduced from 3 to fail faster
         var headerSyncSuccess = false
         var lastHeaderError: Error?
 
@@ -585,8 +587,8 @@ final class WalletManager: ObservableObject {
                 if attempt > 1 {
                     print("🔄 Header sync retry attempt \(attempt)/\(maxHeaderRetries)...")
                     await updateTask("headers", status: .inProgress, detail: "Retry \(attempt)/\(maxHeaderRetries)")
-                    // Wait for peers to be more ready
-                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                    // Wait briefly for peers to recover - reduced from 2 seconds
+                    try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
                 }
 
                 print("📥 Opening header store...")
@@ -1347,19 +1349,21 @@ final class WalletManager: ObservableObject {
             if case .inProgress = status {
                 switch id {
                 case "params":
-                    self.syncStatus = "Loading cryptographic parameters..."
+                    self.syncStatus = "Loading zk-SNARK proving circuits..."
                 case "keys":
-                    self.syncStatus = "Unlocking your keys..."
+                    self.syncStatus = "Deriving keys from seed entropy..."
                 case "database":
-                    self.syncStatus = "Opening secure vault..."
+                    self.syncStatus = "Unlocking encrypted vault..."
                 case "headers":
-                    self.syncStatus = "Syncing block headers..."
+                    self.syncStatus = "Reaching consensus with 3 peers..."
                 case "height":
-                    self.syncStatus = "Checking network state..."
+                    self.syncStatus = "Querying decentralized chain tip..."
                 case "scan":
-                    self.syncStatus = "Scanning for shielded notes..."
+                    self.syncStatus = "Trial-decrypting shielded outputs..."
+                case "witnesses":
+                    self.syncStatus = "Computing Merkle authentication paths..."
                 case "balance":
-                    self.syncStatus = "Calculating your sovereignty..."
+                    self.syncStatus = "Tallying your sovereign wealth..."
                 default:
                     self.syncStatus = "Processing..."
                 }

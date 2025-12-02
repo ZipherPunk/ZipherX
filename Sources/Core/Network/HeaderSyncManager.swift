@@ -10,10 +10,9 @@ final class HeaderSyncManager {
     private let networkManager: NetworkManager
 
     // Consensus parameters
-    // Start with 1 peer for faster initial sync, but use more when available
-    // Note: Block data is still verified via Sapling roots from header store
-    private let minPeers = 1  // Minimum peers to start (will use more if available)
-    private let consensusThreshold = 1  // Require consensus when multiple peers
+    // SECURITY: Require 3 peers to agree to prevent single-peer attacks
+    private let minPeers = 3  // Minimum peers for trustless operation
+    private let consensusThreshold = 3  // Require 3 peers to agree on headers
 
     // Sync state
     private var isSyncing = false
@@ -72,39 +71,44 @@ final class HeaderSyncManager {
             // Store headers
             try headerStore.insertHeaders(headers)
 
-            currentHeight = endHeight + 1
+            // Update currentHeight based on ACTUAL headers received (not requested endHeight)
+            // P2P getheaders only returns up to 2000 headers per request
+            let actualEndHeight = currentHeight + UInt64(headers.count) - 1
+            currentHeight = actualEndHeight + 1
 
             // Report progress
             let progress = HeaderSyncProgress(
-                currentHeight: endHeight,
+                currentHeight: actualEndHeight,
                 totalHeight: chainTip,
                 headersStored: try headerStore.getHeaderCount()
             )
             onProgress?(progress)
 
-            print("✅ Synced to height \(endHeight) (\(progress.percentComplete)%)")
+            print("✅ Synced \(headers.count) headers to height \(actualEndHeight) (\(progress.percentComplete)%)")
+
+            // If we received fewer headers than expected, peers don't have more
+            if headers.isEmpty {
+                print("⚠️ No more headers available from peers")
+                break
+            }
         }
 
         print("🎉 Header sync complete! Synced to height \(chainTip)")
     }
 
-    /// Get the current chain tip height from consensus of peers
+    /// Get the current chain tip height from consensus of peers (P2P-first)
     func getChainTip() async throws -> UInt64 {
         var maxHeight: UInt64 = 0
 
-        // 1. Try InsightAPI first (most reliable when available)
-        if let status = try? await InsightAPI.shared.getStatus() {
-            print("📡 InsightAPI chain tip: \(status.height)")
-            maxHeight = max(maxHeight, status.height)
-        }
+        // P2P-FIRST architecture: prioritize trustless P2P data
 
-        // 2. Check header store (locally synced headers)
+        // 1. Check header store (locally verified headers)
         if let headerHeight = try? headerStore.getLatestHeight() {
-            print("📡 HeaderStore height: \(headerHeight)")
+            print("📡 [P2P] HeaderStore height: \(headerHeight)")
             maxHeight = max(maxHeight, headerHeight)
         }
 
-        // 3. Get peer heights from version handshake (may be stale but better than nothing)
+        // 2. Get peer heights from version handshake (may be stale but P2P-based)
         let peers = try await networkManager.getConnectedPeers(min: minPeers)
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
@@ -113,11 +117,20 @@ final class HeaderSyncManager {
             }
         }
 
-        // 4. PROBE: Try requesting headers beyond our known height to discover new blocks
+        // 3. PROBE: Try requesting headers beyond our known height to discover new blocks
         // This is the most accurate way to get real chain tip from P2P
         if let probeHeight = await probeForNewHeaders(from: maxHeight, peers: peers) {
-            print("📡 P2P probe found chain tip: \(probeHeight)")
+            print("📡 [P2P] Probe found chain tip: \(probeHeight)")
             maxHeight = max(maxHeight, probeHeight)
+        }
+
+        // 4. Only fallback to InsightAPI if P2P gives no result
+        if maxHeight == 0 {
+            print("⚠️ [P2P] No P2P height available, falling back to InsightAPI...")
+            if let status = try? await InsightAPI.shared.getStatus() {
+                print("📡 [FALLBACK] InsightAPI chain tip: \(status.height)")
+                maxHeight = status.height
+            }
         }
 
         if maxHeight > 0 {
@@ -135,11 +148,14 @@ final class HeaderSyncManager {
         // Try to get headers starting from our known height
         // If peer has more blocks, they'll send headers up to their tip
         do {
+            // Ensure peer connection is fresh before probing
+            try await peer.ensureConnected()
             let headers = try await peer.getBlockHeaders(from: knownHeight, count: 100)
             if !headers.isEmpty {
                 // The last header tells us the peer's current tip
                 // Add knownHeight offset since getBlockHeaders returns from that point
                 let count = UInt64(headers.count)
+                peer.markActive()
                 return knownHeight + count
             }
         } catch {
@@ -150,44 +166,112 @@ final class HeaderSyncManager {
     }
 
     /// Request headers from multiple peers and verify consensus
+    /// Tries at least 10 peers before giving up (P2P-first, no InsightAPI fallback for headers)
     private func requestHeadersWithConsensus(
         from startHeight: UInt64,
         to endHeight: UInt64
     ) async throws -> [ZclassicBlockHeader] {
-        // P2P header sync from connected peers
-        let requiredPeers = minPeers
-        let peers = try await networkManager.getConnectedPeers(min: requiredPeers)
+        let minPeersToTry = 10  // Try at least 10 peers before giving up
 
-        // Collect headers from each peer
-        var peerHeaders: [[ZclassicBlockHeader]] = []
+        // Get ALL available peers for resilience
+        var allPeers = networkManager.peers
 
-        await withTaskGroup(of: [ZclassicBlockHeader]?.self) { group in
-            for peer in peers {
-                group.addTask {
-                    do {
-                        return try await self.requestHeaders(
-                            from: peer,
-                            startHeight: startHeight,
-                            endHeight: endHeight
-                        )
-                    } catch {
-                        print("⚠️ Failed to get headers from peer \(peer.host): \(error)")
-                        peer.recordFailure()
-                        return nil
+        // If we don't have enough peers, try to connect more
+        if allPeers.count < minPeersToTry {
+            print("🔄 Only \(allPeers.count) peers, attempting to connect more...")
+            try? await networkManager.connect()
+            allPeers = networkManager.peers
+        }
+
+        guard allPeers.count >= minPeers else {
+            throw SyncError.insufficientPeers(got: allPeers.count, need: minPeers)
+        }
+
+        // Track which peers we've tried and which succeeded
+        var triedPeersCount = 0
+        var successfulHeaders: [[ZclassicBlockHeader]] = []
+        var remainingPeers = allPeers
+
+        // Keep trying peers until we have consensus or tried 10+ peers
+        while successfulHeaders.count < consensusThreshold && !remainingPeers.isEmpty {
+            let peersNeeded = consensusThreshold - successfulHeaders.count
+            let peersToTry = Array(remainingPeers.prefix(max(peersNeeded + 1, 4))) // Try at least 4 at a time
+
+            // Remove from remaining pool
+            for peer in peersToTry {
+                remainingPeers.removeAll { $0.host == peer.host }
+            }
+            triedPeersCount += peersToTry.count
+
+            print("🌐 Trying \(peersToTry.count) peers (total tried: \(triedPeersCount), need \(consensusThreshold - successfulHeaders.count) more)")
+
+            // Request headers from this batch in parallel
+            await withTaskGroup(of: (String, [ZclassicBlockHeader]?).self) { group in
+                for peer in peersToTry {
+                    group.addTask {
+                        do {
+                            try await peer.ensureConnected()
+                            let result = try await self.requestHeaders(
+                                from: peer,
+                                startHeight: startHeight,
+                                endHeight: endHeight
+                            )
+                            peer.markActive()
+                            return (peer.host, result)
+                        } catch NetworkError.handshakeFailed {
+                            // Try reconnect once
+                            print("🔄 [\(peer.host)] Handshake failed, reconnecting...")
+                            peer.disconnect()
+                            try? await Task.sleep(nanoseconds: 50_000_000)
+                            do {
+                                try await peer.connect()
+                                try await peer.performHandshake()
+                                let result = try await self.requestHeaders(
+                                    from: peer,
+                                    startHeight: startHeight,
+                                    endHeight: endHeight
+                                )
+                                peer.markActive()
+                                return (peer.host, result)
+                            } catch {
+                                peer.recordFailure()
+                                return (peer.host, nil)
+                            }
+                        } catch {
+                            print("⚠️ [\(peer.host)] Failed: \(error)")
+                            peer.recordFailure()
+                            return (peer.host, nil)
+                        }
+                    }
+                }
+
+                // Collect results, exit early if we reach consensus
+                for await (host, headers) in group {
+                    if let headers = headers {
+                        successfulHeaders.append(headers)
+                        print("📊 Consensus: \(successfulHeaders.count)/\(self.consensusThreshold) peers (\(host))")
+                        if successfulHeaders.count >= self.consensusThreshold {
+                            group.cancelAll()
+                            break
+                        }
+                    } else {
+                        print("⚠️ Peer \(host) failed, \(remainingPeers.count) peers remaining")
                     }
                 }
             }
 
-            for await headers in group {
-                if let headers = headers {
-                    peerHeaders.append(headers)
-                }
+            // If we've tried 10+ peers and still don't have consensus, give up
+            if triedPeersCount >= minPeersToTry && successfulHeaders.count < consensusThreshold {
+                print("❌ Tried \(triedPeersCount) peers, only \(successfulHeaders.count) succeeded")
+                break
             }
         }
 
-        guard peerHeaders.count >= consensusThreshold else {
-            throw SyncError.insufficientPeers(got: peerHeaders.count, need: consensusThreshold)
+        guard successfulHeaders.count >= consensusThreshold else {
+            throw SyncError.insufficientPeers(got: successfulHeaders.count, need: consensusThreshold)
         }
+
+        let peerHeaders = successfulHeaders
 
         print("📊 Received headers from \(peerHeaders.count) peers")
 
