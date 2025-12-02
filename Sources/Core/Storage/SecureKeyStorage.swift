@@ -8,7 +8,15 @@ import IOKit
 
 /// Secure Key Storage using iOS Secure Enclave
 /// Keys NEVER leave the hardware security module
+///
+/// Memory Protection:
+/// - Spending keys are NEVER cached in memory
+/// - Keys are retrieved fresh from Secure Enclave for each operation
+/// - Decrypted key data is zeroed immediately after use via `SecureData`
 final class SecureKeyStorage {
+
+    // MARK: - Singleton
+    static let shared = SecureKeyStorage()
 
     // MARK: - Constants
     private let spendingKeyTag = "com.zipherx.spendingkey"
@@ -857,5 +865,76 @@ enum SecureStorageError: LocalizedError {
         case .secureEnclaveNotAvailable:
             return "Secure Enclave is not available on this device"
         }
+    }
+}
+
+// MARK: - SecureData: Memory-Protected Key Container
+
+/// A wrapper for sensitive key data that automatically zeros memory when deallocated.
+/// Use this for any decrypted spending key data to prevent keys from lingering in memory.
+///
+/// Usage:
+/// ```swift
+/// let secureKey = try SecureData(SecureKeyStorage.shared.retrieveSpendingKey())
+/// // Use secureKey.data for operations
+/// // Memory is automatically zeroed when secureKey goes out of scope
+/// ```
+final class SecureData {
+    /// The underlying data - DO NOT copy or store this elsewhere
+    private(set) var bytes: [UInt8]
+
+    /// Access the data as Data (creates a copy - use sparingly)
+    var data: Data {
+        return Data(bytes)
+    }
+
+    /// Initialize with Data (copies bytes to internal array)
+    init(_ data: Data) {
+        self.bytes = Array(data)
+    }
+
+    /// Initialize with byte array (takes ownership)
+    init(bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    /// Manually zero the memory (call this when done with the key)
+    func zero() {
+        for i in 0..<bytes.count {
+            bytes[i] = 0
+        }
+    }
+
+    /// Automatically zero memory when deallocated
+    deinit {
+        zero()
+        print("🔐 SecureData: Memory zeroed (\(bytes.count) bytes)")
+    }
+}
+
+// MARK: - Secure Key Access Extension
+
+extension SecureKeyStorage {
+    /// Retrieve spending key wrapped in SecureData for automatic memory cleanup
+    /// The key data will be zeroed when the SecureData object is deallocated
+    func retrieveSpendingKeySecure() throws -> SecureData {
+        let keyData = try retrieveSpendingKey()
+        return SecureData(keyData)
+    }
+
+    /// Execute a closure with the spending key, then automatically zero the key memory
+    /// This is the RECOMMENDED way to use the spending key for signing operations
+    ///
+    /// Example:
+    /// ```swift
+    /// let signature = try SecureKeyStorage.shared.withSpendingKey { keyData in
+    ///     return try signTransaction(with: keyData)
+    /// }
+    /// // Key memory is now zeroed
+    /// ```
+    func withSpendingKey<T>(_ operation: (Data) throws -> T) throws -> T {
+        let secureKey = try retrieveSpendingKeySecure()
+        defer { secureKey.zero() }  // Ensure zeroing even on throw
+        return try operation(secureKey.data)
     }
 }

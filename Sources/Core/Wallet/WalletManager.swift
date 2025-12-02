@@ -46,6 +46,16 @@ final class WalletManager: ObservableObject {
     /// Timestamp of last sent transaction - used to suppress fireworks for change outputs
     @Published private(set) var lastSendTimestamp: Date? = nil
 
+    /// Balance before the most recent send - used to detect change vs real incoming
+    @Published private(set) var balanceBeforeLastSend: UInt64? = nil
+
+    /// Clear the balance tracking after change output is processed
+    @MainActor
+    func clearBalanceBeforeLastSend() {
+        balanceBeforeLastSend = nil
+        lastSendTimestamp = nil
+    }
+
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
     private let mnemonicGenerator: MnemonicGenerator
@@ -359,6 +369,9 @@ final class WalletManager: ObservableObject {
                 self.pendingBalance = pendingBal
                 print("💰 Background sync balance: \(confirmedBalance) zatoshis (\(pendingBal) pending)")
             }
+
+            // Update wallet height in NetworkManager for UI display
+            NetworkManager.shared.updateWalletHeight(targetHeight)
 
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")
@@ -816,6 +829,11 @@ final class WalletManager: ObservableObject {
             self.syncProgress = 1.0
             print("💰 Balance updated: \(totalBalance) zatoshis (\(pendingBalance) pending)")
         }
+
+        // Update wallet height in NetworkManager for UI display
+        let lastScannedHeight = (try? database.getLastScannedHeight()) ?? 0
+        NetworkManager.shared.updateWalletHeight(lastScannedHeight)
+        print("✅ Sync complete: balance task finished")
     }
 
     /// Sync witnesses for notes beyond bundled tree to match current tree state
@@ -1411,6 +1429,11 @@ final class WalletManager: ObservableObject {
             throw WalletError.insufficientFunds
         }
 
+        // Record balance BEFORE send - used to detect change vs real incoming
+        await MainActor.run {
+            self.balanceBeforeLastSend = currentBalance
+        }
+
         // Get spending key from Secure Enclave
         let spendingKey = try secureStorage.retrieveSpendingKey()
         onProgress("prover", nil, nil)
@@ -1524,6 +1547,11 @@ final class WalletManager: ObservableObject {
             throw WalletError.insufficientFunds
         }
         print("✅ Balance check passed")
+
+        // Record balance BEFORE send - used to detect change vs real incoming
+        await MainActor.run {
+            self.balanceBeforeLastSend = currentBalance
+        }
 
         // Get spending key from Secure Enclave
         let spendingKey = try secureStorage.retrieveSpendingKey()

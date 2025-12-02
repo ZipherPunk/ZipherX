@@ -49,12 +49,23 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
 
+    /// Flag to suppress background sync during initial startup sync
+    /// Set to true during ContentView's initial sync task, false after completion
+    var suppressBackgroundSync: Bool = false
+
     // MARK: - Private Properties
     internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
 
     /// Get a connected peer for block downloads
     func getConnectedPeer() -> Peer? {
         return peers.first
+    }
+
+    /// Update wallet height directly (called after sync completes)
+    func updateWalletHeight(_ height: UInt64) {
+        Task { @MainActor in
+            self.walletHeight = height
+        }
     }
     private var peerRotationTimer: Timer?
     private var addressDiscoveryTimer: Timer?
@@ -349,34 +360,50 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Refresh chain height from InsightAPI (called periodically)
+    /// Refresh chain height (P2P-first, InsightAPI fallback)
     /// Also triggers background sync if wallet is behind
     private func refreshChainHeight() async {
         guard isConnected else { return }
 
-        do {
-            let status = try await InsightAPI.shared.getStatus()
-            let newHeight = status.height
+        // P2P-FIRST: Try to get chain height from P2P sources
+        var newHeight: UInt64 = 0
 
-            // Only update and log if height changed
-            if newHeight != chainHeight {
-                await MainActor.run {
-                    self.chainHeight = newHeight
-                    print("📊 Chain height updated: \(newHeight)")
-                }
+        // 1. Check header store (locally verified headers)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            newHeight = max(newHeight, headerHeight)
+        }
 
-                // CRITICAL: Trigger background sync if wallet is behind
-                let dbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
-                if newHeight > dbHeight && dbHeight > 0 {
-                    print("🔄 New block detected, syncing: chain=\(newHeight) wallet=\(dbHeight) (+\(newHeight - dbHeight) blocks)")
-                    Task {
-                        await WalletManager.shared.backgroundSyncToHeight(newHeight)
-                    }
+        // 2. Check P2P peer heights
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > newHeight {
+                newHeight = h
+            }
+        }
+
+        // 3. Only fallback to InsightAPI if P2P gives no result
+        if newHeight == 0 {
+            if let status = try? await InsightAPI.shared.getStatus() {
+                newHeight = status.height
+                print("📊 [FALLBACK] Chain height from InsightAPI: \(newHeight)")
+            }
+        }
+
+        // Only update and log if height changed
+        if newHeight > 0 && newHeight != chainHeight {
+            await MainActor.run {
+                self.chainHeight = newHeight
+                print("📊 Chain height updated: \(newHeight)")
+            }
+
+            // CRITICAL: Trigger background sync if wallet is behind
+            let dbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+            if newHeight > dbHeight && dbHeight > 0 {
+                print("🔄 New block detected, syncing: chain=\(newHeight) wallet=\(dbHeight) (+\(newHeight - dbHeight) blocks)")
+                Task {
+                    await WalletManager.shared.backgroundSyncToHeight(newHeight)
                 }
             }
-        } catch {
-            // Silent failure - not critical
-            print("⚠️ Chain height refresh failed: \(error.localizedDescription)")
         }
     }
 
@@ -717,39 +744,59 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Fetch network statistics
+    /// Fetch network statistics (P2P-first, InsightAPI fallback)
     func fetchNetworkStats() async {
-        print("📊 Fetching network stats...")
+        print("📊 Fetching network stats (P2P-first)...")
 
         // Get peer version from first connected peer
         if let peer = peers.first {
             let version = peer.peerUserAgent.isEmpty ? "Unknown" : peer.peerUserAgent
-            print("📊 Peer version: \(version)")
+            print("📊 [P2P] Peer version: \(version)")
             await MainActor.run {
                 self.peerVersion = version
             }
         }
 
-        // Get chain info from Insight API
+        // P2P-FIRST: Get chain height from P2P sources
         var currentChainHeight: UInt64 = 0
-        do {
-            let status = try await InsightAPI.shared.getStatus()
-            currentChainHeight = status.height
-            print("📊 Chain height: \(currentChainHeight)")
+        var usedP2P = false
 
-            // Get last block info
-            let blockHash = try await InsightAPI.shared.getBlockHash(height: currentChainHeight)
-            let block = try await InsightAPI.shared.getBlock(hash: blockHash)
-            print("📊 Last block txns: \(block.tx.count)")
+        // 1. First try header store (locally verified headers)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            currentChainHeight = headerHeight
+            usedP2P = true
+            print("📊 [P2P] HeaderStore height: \(headerHeight)")
+        }
 
+        // 2. Check P2P peer heights from version handshake
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > currentChainHeight {
+                currentChainHeight = h
+                usedP2P = true
+            }
+        }
+
+        // 3. Only if P2P gives no result, fallback to InsightAPI
+        if currentChainHeight == 0 {
+            print("⚠️ [P2P] No P2P height, falling back to InsightAPI...")
+            if let status = try? await InsightAPI.shared.getStatus() {
+                currentChainHeight = status.height
+                print("📊 [FALLBACK] InsightAPI height: \(currentChainHeight)")
+                await MainActor.run {
+                    self.networkDifficulty = status.difficulty
+                }
+            }
+        } else if usedP2P {
+            print("📊 [P2P] Using P2P chain height: \(currentChainHeight)")
+        }
+
+        // Update chain height
+        if currentChainHeight > 0 {
             await MainActor.run {
                 self.chainHeight = currentChainHeight
-                self.lastBlockTxCount = block.tx.count
-                self.networkDifficulty = status.difficulty
                 print("📊 Updated chainHeight to: \(self.chainHeight)")
             }
-        } catch {
-            print("⚠️ Failed to fetch chain stats: \(error)")
         }
 
         // Get ZCL price (from CoinGecko or similar)
@@ -765,7 +812,10 @@ final class NetworkManager: ObservableObject {
         // This keeps the tree always current for instant sends
         // IMPORTANT: Use local currentChainHeight, not @Published chainHeight
         // to avoid race conditions with MainActor updates
-        if currentChainHeight > dbHeight && dbHeight > 0 {
+        // SKIP during initial sync to avoid race conditions with startup header sync
+        if suppressBackgroundSync {
+            print("📊 Background sync suppressed (initial sync in progress)")
+        } else if currentChainHeight > dbHeight && dbHeight > 0 {
             print("🔄 Background sync needed: chain=\(currentChainHeight) wallet=\(dbHeight) (+\(currentChainHeight - dbHeight) blocks)")
             Task {
                 await WalletManager.shared.backgroundSyncToHeight(currentChainHeight)
@@ -776,13 +826,16 @@ final class NetworkManager: ObservableObject {
 
         // MEMPOOL SCAN: Check for incoming unconfirmed transactions
         // Uses message queue to prevent stream conflicts
-        Task {
-            await scanMempoolForIncoming()
-        }
+        // SKIP during initial sync to avoid interfering with header sync
+        if !suppressBackgroundSync {
+            Task {
+                await scanMempoolForIncoming()
+            }
 
-        // Check if any outgoing pending txs have been confirmed
-        Task {
-            await checkPendingOutgoingConfirmations()
+            // Check if any outgoing pending txs have been confirmed
+            Task {
+                await checkPendingOutgoingConfirmations()
+            }
         }
     }
 
@@ -803,6 +856,10 @@ final class NetworkManager: ObservableObject {
     /// Track pending outgoing transactions (txid -> amount in zatoshis)
     private var pendingOutgoingTxs: [String: UInt64] = [:]
     private let pendingTxLock = NSLock()
+
+    /// Track notified incoming mempool transactions to avoid duplicate notifications
+    private var notifiedMempoolIncomingTxs: Set<String> = []
+    private let notifiedMempoolLock = NSLock()
 
     /// Called after successfully broadcasting a transaction
     /// Tracks the pending outgoing amount until it confirms
@@ -843,6 +900,14 @@ final class NetworkManager: ObservableObject {
                 print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(totalPending))")
             }
         }
+    }
+
+    /// Called when an incoming transaction is confirmed (found in a block during scanning)
+    /// Removes from the notification tracking set to allow future notifications for same txid if re-broadcast
+    func clearMempoolIncomingNotification(txid: String) {
+        notifiedMempoolLock.lock()
+        notifiedMempoolIncomingTxs.remove(txid)
+        notifiedMempoolLock.unlock()
     }
 
     /// Check if any pending outgoing transactions have been confirmed
@@ -893,6 +958,7 @@ final class NetworkManager: ObservableObject {
 
             var incomingAmount: UInt64 = 0
             var incomingCount = 0
+            var newIncomingTxs: [(txid: String, amount: UInt64)] = []
 
             // Check each mempool transaction for shielded outputs
             for txHash in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
@@ -902,6 +968,7 @@ final class NetworkManager: ObservableObject {
 
                 // Parse transaction for shielded outputs
                 if let outputs = parseShieldedOutputs(from: rawTx) {
+                    var txIncomingAmount: UInt64 = 0
                     for output in outputs {
                         // Try to decrypt with our key
                         if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
@@ -914,13 +981,35 @@ final class NetworkManager: ObservableObject {
                             if decrypted.count >= 19 {
                                 let valueBytes = Data(decrypted[11..<19])
                                 let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
-                                incomingAmount += value
-                                incomingCount += 1
-                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis!")
+                                txIncomingAmount += value
+                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHash.prefix(12))...")
                             }
                         }
                     }
+
+                    if txIncomingAmount > 0 {
+                        incomingAmount += txIncomingAmount
+                        incomingCount += 1
+
+                        // Check if this is a NEW incoming tx we haven't notified about
+                        notifiedMempoolLock.lock()
+                        let isNewTx = !notifiedMempoolIncomingTxs.contains(txHash)
+                        if isNewTx {
+                            notifiedMempoolIncomingTxs.insert(txHash)
+                        }
+                        notifiedMempoolLock.unlock()
+
+                        if isNewTx {
+                            newIncomingTxs.append((txHash, txIncomingAmount))
+                        }
+                    }
                 }
+            }
+
+            // Send notifications for NEW incoming transactions
+            for (txid, amount) in newIncomingTxs {
+                print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
+                NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
             }
 
             await MainActor.run {
@@ -1194,6 +1283,9 @@ final class NetworkManager: ObservableObject {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
+                        // Ensure peer connection is still valid before broadcast
+                        try await peer.ensureConnected()
+
                         // 5 second timeout per peer - don't wait for slow handshakes
                         let id = try await withThrowingTaskGroup(of: String.self) { timeoutGroup in
                             timeoutGroup.addTask {
@@ -1337,32 +1429,23 @@ final class NetworkManager: ObservableObject {
         return headers
     }
 
-    /// Get current chain height from peers (with InsightAPI fallback)
+    /// Get current chain height from peers (P2P-first, InsightAPI fallback)
     func getChainHeight() async throws -> UInt64 {
         guard isConnected else {
             throw NetworkError.notConnected
         }
 
-        // Collect heights from multiple sources and use the HIGHEST
-        // This prevents stale data from any single source blocking sync
-        print("📡 Getting chain height from multiple sources...")
+        // P2P-FIRST architecture: prioritize trustless P2P data
+        print("📡 Getting chain height (P2P-first)...")
         var maxHeight: UInt64 = 0
 
-        // 1. Try InsightAPI (usually most up-to-date)
-        if let status = try? await InsightAPI.shared.getStatus() {
-            print("📡 InsightAPI height: \(status.height)")
-            maxHeight = max(maxHeight, status.height)
-        } else {
-            print("⚠️ InsightAPI unavailable")
-        }
-
-        // 2. Check header store (locally synced headers)
+        // 1. Check header store first (our locally verified headers)
         if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            print("📡 HeaderStore height: \(headerHeight)")
+            print("📡 [P2P] HeaderStore height: \(headerHeight)")
             maxHeight = max(maxHeight, headerHeight)
         }
 
-        // 3. Check P2P peer heights (from version handshake - may be stale)
+        // 2. Check P2P peer heights from version handshake
         var peerMaxHeight: UInt64 = 0
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
@@ -1371,17 +1454,26 @@ final class NetworkManager: ObservableObject {
             }
         }
         if peerMaxHeight > 0 {
-            print("📡 P2P peer max height: \(peerMaxHeight)")
+            print("📡 [P2P] Peer max height: \(peerMaxHeight)")
             maxHeight = max(maxHeight, peerMaxHeight)
         }
 
-        // 4. Use cached chain height as baseline
+        // 3. Use cached chain height as baseline
         if chainHeight > 0 {
             maxHeight = max(maxHeight, chainHeight)
         }
 
+        // 4. Only if P2P gives no result, fallback to InsightAPI
+        if maxHeight == 0 {
+            print("⚠️ [P2P] No P2P height available, falling back to InsightAPI...")
+            if let status = try? await InsightAPI.shared.getStatus() {
+                print("📡 [FALLBACK] InsightAPI height: \(status.height)")
+                maxHeight = status.height
+            }
+        }
+
         if maxHeight > 0 {
-            print("📡 Using max chain height: \(maxHeight)")
+            print("📡 Using chain height: \(maxHeight)")
             return maxHeight
         }
 
@@ -1611,34 +1703,38 @@ final class NetworkManager: ObservableObject {
         return try await getCompactBlocks(from: height, count: count)
     }
 
-    /// Get chain height from P2P peers only (no InsightAPI fallback)
+    /// Get chain height from P2P sources only (no InsightAPI fallback)
+    /// Uses: HeaderStore (locally verified) > peer version heights
     func getChainHeightP2POnly() async throws -> UInt64 {
         guard isConnected else {
             throw NetworkError.notConnected
         }
 
-        var heights: [UInt64: Int] = [:]
+        var maxHeight: UInt64 = 0
 
-        await withTaskGroup(of: UInt64?.self) { group in
-            for peer in peers {
-                group.addTask {
-                    return UInt64(peer.peerStartHeight)
-                }
-            }
+        // 1. HeaderStore is the most reliable P2P source (locally verified headers)
+        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+            maxHeight = max(maxHeight, headerHeight)
+        }
 
-            for await result in group {
-                if let height = result, height > 0 {
-                    heights[height, default: 0] += 1
-                }
+        // 2. Peer version heights (may be stale but still P2P)
+        for peer in peers {
+            let h = UInt64(peer.peerStartHeight)
+            if h > maxHeight {
+                maxHeight = h
             }
         }
 
-        // Return highest height with at least one peer
-        guard let (height, _) = heights.max(by: { $0.key < $1.key }) else {
+        // 3. Cached chain height as baseline
+        if chainHeight > 0 {
+            maxHeight = max(maxHeight, chainHeight)
+        }
+
+        guard maxHeight > 0 else {
             throw NetworkError.consensusNotReached
         }
 
-        return height
+        return maxHeight
     }
 
     // MARK: - P2P Block Data for Scanning (Full P2P Mode)

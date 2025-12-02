@@ -107,27 +107,41 @@ struct BalanceView: View {
             }
 
             // Detect incoming ZCL - balance increased!
-            // IMPORTANT: Suppress fireworks for change outputs (balance increase within 30 seconds of send)
+            // IMPORTANT: Suppress fireworks for change outputs
             if newValue > previousBalance && previousBalance > 0 {
                 let increase = newValue - previousBalance
 
                 // Check if this is likely a change output from a recent send
+                // Method 1: Compare against balance before last send (most reliable)
+                // Method 2: Fallback to 30-second timer if balance tracking unavailable
                 let isLikelyChangeOutput: Bool
-                if let lastSend = walletManager.lastSendTimestamp {
+                if let balanceBeforeSend = walletManager.balanceBeforeLastSend {
+                    // If new balance <= balance before send, it's change (not real incoming)
+                    // Because: after send, balance = original - amount - fee + change
+                    // So new balance should never exceed what we had before sending
+                    isLikelyChangeOutput = newValue <= balanceBeforeSend
+                    print("💰 Change detection: newBalance=\(newValue), balanceBeforeSend=\(balanceBeforeSend), isChange=\(isLikelyChangeOutput)")
+                } else if let lastSend = walletManager.lastSendTimestamp {
+                    // Fallback: use timestamp-based detection
                     let timeSinceSend = Date().timeIntervalSince(lastSend)
-                    isLikelyChangeOutput = timeSinceSend < 30.0 // Within 30 seconds of send
+                    isLikelyChangeOutput = timeSinceSend < 30.0
+                    print("💰 Change detection (fallback): timeSinceSend=\(timeSinceSend)s, isChange=\(isLikelyChangeOutput)")
                 } else {
                     isLikelyChangeOutput = false
                 }
 
                 if isLikelyChangeOutput {
                     print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
+                    // Clear tracking after change is processed
+                    walletManager.clearBalanceBeforeLastSend()
                 } else {
                     fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
                     withAnimation {
                         showFireworks = true
                     }
                     print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+                    // Clear tracking after real incoming is processed
+                    walletManager.clearBalanceBeforeLastSend()
                 }
             }
             previousBalance = newValue
