@@ -245,13 +245,15 @@ struct BalanceView: View {
                         .foregroundColor(theme.textSecondary)
                 }
 
-                // RECEIVER SIDE: Show pending INCOMING amount right below balance
-                // BUT: Suppress if this is likely change from our own outgoing transaction
-                // Change detection: if mempoolOutgoing > 0 or we sent recently, this is change not real incoming
+                // RECEIVER SIDE: Show pending INCOMING amount (mempool only, not yet mined)
+                // Suppress conditions:
+                // 1. Change from our own send (mempoolOutgoing > 0 or sent recently)
+                // 2. Transaction already mined (pendingBalance > 0 means it's in a block now)
                 let isLikelyChange = networkManager.mempoolOutgoing > 0 ||
                     (walletManager.lastSendTimestamp != nil && Date().timeIntervalSince(walletManager.lastSendTimestamp!) < 120.0)
+                let alreadyMined = walletManager.pendingBalance > 0
 
-                if networkManager.mempoolIncoming > 0 && !isLikelyChange {
+                if networkManager.mempoolIncoming > 0 && !isLikelyChange && !alreadyMined {
                     HStack(spacing: 4) {
                         Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 10))
@@ -265,10 +267,11 @@ struct BalanceView: View {
                 }
             }
 
-            // UNIFIED Pending indicator - shows OUTGOING in mempool OR notes with 0 confirmations
-            // Priority: mempoolOutgoing (tx not yet mined) > pendingBalance (mined but 0 conf)
+            // PENDING indicator - shows notes with 0 confirmations (just mined)
+            // For RECEIVER: shows incoming that was just mined
+            // For SENDER: mempoolOutgoing takes priority (tx not yet in block)
             if networkManager.mempoolOutgoing > 0 {
-                // Transaction in mempool - not yet mined
+                // SENDER: Transaction in mempool - not yet mined
                 HStack(spacing: 4) {
                     Image(systemName: "clock.arrow.circlepath")
                         .font(.system(size: 10))
@@ -280,17 +283,17 @@ struct BalanceView: View {
                 }
                 .foregroundColor(theme.warningColor)
             } else if walletManager.pendingBalance > 0 {
-                // Transaction mined but 0 confirmations (change not yet spendable)
+                // RECEIVER: Transaction mined but 0 confirmations (GREEN - it's incoming!)
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle")
                         .font(.system(size: 10))
                     Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    Text("pending")
+                    Text("0 confirmations")
                         .font(.system(size: 9, design: .monospaced))
                         .italic()
                 }
-                .foregroundColor(theme.textSecondary)
+                .foregroundColor(theme.successColor)  // GREEN for incoming (mined but 0 conf)
             }
 
             // Privacy indicator
