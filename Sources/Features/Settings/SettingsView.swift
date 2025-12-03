@@ -157,6 +157,9 @@ struct SettingsView: View {
     @State private var showPeerExportSuccess = false
     @State private var peerExportCount = 0
 
+    // Seed phrase info
+    @State private var showSeedPhraseInfo = false
+
     @EnvironmentObject var themeManager: ThemeManager
 
     // Theme shortcut
@@ -313,6 +316,11 @@ struct SettingsView: View {
             }
         } message: {
             Text("Type DELETE (in capital letters) to confirm.\n\nAfter this, your wallet is GONE FOREVER.\n\nNo recovery is possible without your private key backup!")
+        }
+        .alert("Seed Phrase Not Stored", isPresented: $showSeedPhraseInfo) {
+            Button("I Understand", role: .cancel) {}
+        } message: {
+            Text("\"Privacy is necessary for an open society.\"\n\nFor maximum security, your 24-word seed phrase was shown ONLY during wallet creation and is NOT stored on this device.\n\nIf you didn't write it down, use \"Export Private Key\" above as your backup.\n\nYour private key can fully restore your wallet.")
         }
     }
 
@@ -917,7 +925,7 @@ struct SettingsView: View {
                     .stroke(Color.orange.opacity(0.3), lineWidth: 1)
             )
 
-            // Reveal Seed Phrase info (if not imported wallet)
+            // Reveal Seed Phrase (if not imported wallet)
             if !walletManager.isImportedWallet {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -926,18 +934,35 @@ struct SettingsView: View {
                         Text("Seed Phrase")
                             .font(theme.bodyFont)
                     }
-                    .foregroundColor(theme.textPrimary)
+                    .foregroundColor(theme.primaryColor)
 
-                    Text("Your 24-word seed phrase was shown during wallet creation. For security, it is not stored on this device. If you didn't write it down, you can export your private key above as a backup.")
+                    Text("Your 24-word seed phrase was shown during wallet creation.")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    Button(action: { showSeedPhraseInfo = true }) {
+                        HStack {
+                            Image(systemName: "eye")
+                                .font(.system(size: 11))
+                            Text("View Seed Phrase")
+                                .font(theme.bodyFont)
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(theme.primaryColor)
+                        .overlay(
+                            Rectangle()
+                                .stroke(theme.primaryColor.opacity(0.8), lineWidth: 1)
+                        )
+                    }
                 }
                 .padding(10)
-                .background(theme.surfaceColor)
+                .background(theme.primaryColor.opacity(0.1))
                 .overlay(
                     Rectangle()
-                        .stroke(theme.borderColor, lineWidth: 1)
+                        .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
                 )
             }
 
