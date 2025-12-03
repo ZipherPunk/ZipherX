@@ -246,7 +246,12 @@ struct BalanceView: View {
                 }
 
                 // RECEIVER SIDE: Show pending INCOMING amount right below balance
-                if networkManager.mempoolIncoming > 0 {
+                // BUT: Suppress if this is likely change from our own outgoing transaction
+                // Change detection: if mempoolOutgoing > 0 or we sent recently, this is change not real incoming
+                let isLikelyChange = networkManager.mempoolOutgoing > 0 ||
+                    (walletManager.lastSendTimestamp != nil && Date().timeIntervalSince(walletManager.lastSendTimestamp!) < 120.0)
+
+                if networkManager.mempoolIncoming > 0 && !isLikelyChange {
                     HStack(spacing: 4) {
                         Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 10))
