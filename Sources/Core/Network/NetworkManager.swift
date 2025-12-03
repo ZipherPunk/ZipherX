@@ -1284,37 +1284,163 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Parse shielded outputs from raw transaction data
+    /// Parse shielded outputs from raw transaction data using proper Zcash v4 format
     private func parseShieldedOutputs(from rawTx: Data) -> [(cmu: Data, epk: Data, ciphertext: Data)]? {
-        // Zcash v4 transaction format (simplified)
-        // We need to find the shielded outputs section
+        // Zcash v4 overwintered Sapling transaction format
         guard rawTx.count > 200 else { return nil }
 
+        var pos = 0
         var outputs: [(cmu: Data, epk: Data, ciphertext: Data)] = []
 
-        // Try to find OutputDescription pattern (948 bytes each)
-        // cv(32) + cmu(32) + ephemeralKey(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
-        let outputDescSize = 948
-        var offset = 0
+        // Header (4 bytes): version and fOverwintered flag
+        guard pos + 4 <= rawTx.count else { return nil }
+        let header = rawTx.loadUInt32(at: pos)
+        let version = header & 0x7FFFFFFF
+        let fOverwintered = (header & 0x80000000) != 0
+        pos += 4
 
-        // Skip to shielded section (after header, inputs, etc)
-        // This is a simplified scan - look for valid-looking output patterns
-        while offset + outputDescSize <= rawTx.count {
-            // Check if this looks like an OutputDescription
-            let potentialCmu = rawTx.subdata(in: offset+32..<offset+64)
-            let potentialEpk = rawTx.subdata(in: offset+64..<offset+96)
-            let potentialCiphertext = rawTx.subdata(in: offset+96..<offset+676) // 580 bytes
+        // Must be Sapling v4 overwintered transaction
+        guard fOverwintered && version >= 4 else {
+            print("🔮 parseShieldedOutputs: Not Sapling v4 (v\(version), overwinter=\(fOverwintered))")
+            return nil
+        }
 
-            // Basic validation - non-zero values
-            if !potentialCmu.allSatisfy({ $0 == 0 }) &&
-               !potentialEpk.allSatisfy({ $0 == 0 }) {
-                outputs.append((cmu: potentialCmu, epk: potentialEpk, ciphertext: potentialCiphertext))
+        // nVersionGroupId (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        let versionGroupId = rawTx.loadUInt32(at: pos)
+        pos += 4
+
+        // Verify Sapling version group ID (0x892F2085)
+        guard versionGroupId == 0x892F2085 else {
+            print("🔮 parseShieldedOutputs: Not Sapling versionGroupId=0x\(String(format: "%08X", versionGroupId))")
+            return nil
+        }
+
+        // Skip vin (transparent inputs)
+        let (vinCount, vinBytes) = readCompactSize(rawTx, at: pos)
+        pos += vinBytes
+        for _ in 0..<min(vinCount, 10000) {
+            guard pos < rawTx.count else { return nil }
+            pos = skipTransparentInput(rawTx, offset: pos)
+        }
+
+        // Skip vout (transparent outputs)
+        let (voutCount, voutBytes) = readCompactSize(rawTx, at: pos)
+        pos += voutBytes
+        for _ in 0..<min(voutCount, 10000) {
+            guard pos < rawTx.count else { return nil }
+            pos = skipTransparentOutput(rawTx, offset: pos)
+        }
+
+        // Skip nLockTime (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        pos += 4
+
+        // Skip nExpiryHeight (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        pos += 4
+
+        // Skip valueBalance (8 bytes)
+        guard pos + 8 <= rawTx.count else { return nil }
+        pos += 8
+
+        // Skip vShieldedSpend (each SpendDescription is 384 bytes)
+        let (spendCount, spendBytes) = readCompactSize(rawTx, at: pos)
+        pos += spendBytes
+        for _ in 0..<min(spendCount, 10000) {
+            guard pos + 384 <= rawTx.count else { return nil }
+            pos += 384 // cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
+        }
+
+        // vShieldedOutput (each OutputDescription is 948 bytes)
+        let (outputCount, outputBytes) = readCompactSize(rawTx, at: pos)
+        pos += outputBytes
+        print("🔮 parseShieldedOutputs: Found \(outputCount) shielded outputs at pos=\(pos)")
+
+        for i in 0..<min(outputCount, 10000) {
+            // OutputDescription: cv(32) + cmu(32) + ephemeralKey(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
+            guard pos + 948 <= rawTx.count else {
+                print("🔮 parseShieldedOutputs: Not enough data for output \(i) at pos=\(pos)")
+                break
             }
 
-            offset += 32 // Slide window
+            // cv (32 bytes) - skip
+            pos += 32
+
+            // cmu (32 bytes) - EXTRACT
+            let cmu = rawTx.subdata(in: pos..<pos+32)
+            pos += 32
+
+            // ephemeralKey (32 bytes) - EXTRACT
+            let epk = rawTx.subdata(in: pos..<pos+32)
+            pos += 32
+
+            // encCiphertext (580 bytes) - EXTRACT
+            let ciphertext = rawTx.subdata(in: pos..<pos+580)
+            pos += 580
+
+            outputs.append((cmu: cmu, epk: epk, ciphertext: ciphertext))
+            print("🔮 parseShieldedOutputs: Output[\(i)] cmu=\(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+
+            // outCiphertext (80 bytes) - skip
+            pos += 80
+
+            // zkproof (192 bytes) - skip
+            pos += 192
         }
 
         return outputs.isEmpty ? nil : outputs
+    }
+
+    /// Helper: Read compact size (varint) from data
+    private func readCompactSize(_ data: Data, at offset: Int) -> (UInt64, Int) {
+        guard offset < data.count else { return (0, 0) }
+
+        let first = data[offset]
+        if first < 253 {
+            return (UInt64(first), 1)
+        } else if first == 253 {
+            guard offset + 3 <= data.count else { return (0, 1) }
+            let value = UInt16(data[offset + 1]) | (UInt16(data[offset + 2]) << 8)
+            return (UInt64(value), 3)
+        } else if first == 254 {
+            guard offset + 5 <= data.count else { return (0, 1) }
+            let value = data.loadUInt32(at: offset + 1)
+            return (UInt64(value), 5)
+        } else {
+            guard offset + 9 <= data.count else { return (0, 1) }
+            let value = data.loadUInt64(at: offset + 1)
+            return (value, 9)
+        }
+    }
+
+    /// Helper: Skip a transparent input
+    private func skipTransparentInput(_ data: Data, offset: Int) -> Int {
+        var pos = offset
+        guard pos + 36 <= data.count else { return data.count }
+        pos += 36 // prevout: txid (32) + vout index (4)
+
+        let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+        pos += scriptBytes
+        guard scriptLen <= UInt64(data.count - pos) else { return data.count }
+        pos += Int(clamping: scriptLen)
+
+        guard pos + 4 <= data.count else { return data.count }
+        pos += 4 // sequence
+        return pos
+    }
+
+    /// Helper: Skip a transparent output
+    private func skipTransparentOutput(_ data: Data, offset: Int) -> Int {
+        var pos = offset
+        guard pos + 8 <= data.count else { return data.count }
+        pos += 8 // value
+
+        let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+        pos += scriptBytes
+        guard scriptLen <= UInt64(data.count - pos) else { return data.count }
+        pos += Int(clamping: scriptLen)
+        return pos
     }
 
     /// Last time price was fetched (for rate limiting)
