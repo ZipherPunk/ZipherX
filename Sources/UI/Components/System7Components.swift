@@ -904,22 +904,63 @@ struct CypherpunkSyncView: View {
     @State private var elapsedTime: TimeInterval = 0
     @State private var showCompletionAnimation: Bool = false
 
+    // MARK: - ZClassic History Story (shown during sync)
+    // A cypherpunk tale of freedom, forks, and fighting the 20% tax
     private let syncMessages = [
-        "Establishing secure connection...",
-        "Verifying cryptographic proofs...",
-        "Scanning the blockchain for your notes...",
-        "Building your financial privacy...",
-        "Decrypting shielded transactions...",
-        "Maintaining your sovereignty...",
-        "The network can't see you...",
-        "Your transactions, your business...",
-        "Privacy is power...",
-        "Trustless verification in progress...",
-        "Cryptographic freedom loading...",
-        "Cypherpunks write code...",
-        "Privacy is not a crime...",
-        "Be your own bank...",
-        "Code is law..."
+        // Chapter 1: The Genesis
+        "October 2016: Zcash launches with revolutionary zk-SNARKs...",
+        "But there's a catch: 20% of every block goes to founders.",
+        "\"What if this is the money people use for 100 years?\" - Rhett",
+        "One cypherpunk saw the tax and said: \"Not on my watch.\"",
+
+        // Chapter 2: The Fork
+        "November 6, 2016: Rhett Creighton deletes 22 lines of code.",
+        "ZClassic is born. No founder's tax. 100% to miners.",
+        "\"Privacy is necessary for an open society.\" - Eric Hughes",
+        "A fair launch. No pre-mine. No VCs. Just code.",
+
+        // Chapter 3: The Children
+        "May 2017: ZenCash forks from ZClassic at block 110,000.",
+        "ZClassic's DNA spreads. Privacy for the people.",
+        "ZenCash later becomes Horizen. The legacy grows.",
+        "One act of defiance spawned an entire ecosystem.",
+
+        // Chapter 4: The Madness
+        "December 2017: Rhett announces Bitcoin Private.",
+        "ZCL explodes from $5 to $247. A 50x moonshot.",
+        "\"Smart money\" arrives. So does the chaos.",
+        "Everyone wanted free coins. Few understood the vision.",
+
+        // Chapter 5: The Aftermath
+        "March 2018: The fork completes. ZCL crashes 98%.",
+        "Rhett leaves. The community remains.",
+        "True believers held through the storm.",
+        "Price means nothing. Privacy means everything.",
+
+        // Chapter 6: The Survivors
+        "2019-2025: The community maintains the flame.",
+        "No marketing. No hype. Just cypherpunks keeping it alive.",
+        "ZClassic endures. Quiet. Private. Unstoppable.",
+        "Those who understand, understand.",
+
+        // Cypherpunk Philosophy
+        "\"Cypherpunks write code.\" - Eric Hughes, 1993",
+        "\"We must defend our own privacy.\"",
+        "Privacy is not secrecy. Privacy is power.",
+        "The right to transact freely is the right to be free.",
+        "No permission needed. No surveillance accepted.",
+        "Your keys. Your coins. Your sovereignty.",
+        "In math we trust. In code we verify.",
+        "Decentralization is not a feature. It's the point.",
+        "ZClassic: Where 100% belongs to those who earn it.",
+        "The revolution will not be centralized.",
+
+        // Technical Poetry
+        "zk-SNARKs: Proving truth without revealing secrets.",
+        "Equihash: Memory-hard, ASIC-resistant, fair.",
+        "Sapling: Faster, lighter, more private.",
+        "21 million coins. Zero compromises.",
+        "Every block reward: 100% yours. 0% theirs."
     ]
 
     private let completionMessages = [
