@@ -10,8 +10,10 @@ final class HeaderSyncManager {
     private let networkManager: NetworkManager
 
     // Consensus parameters
-    // SECURITY: Require 3 peers to agree to prevent single-peer attacks
-    private let minPeers = 3  // Minimum peers for trustless operation
+    // SECURITY: Chain height consensus uses InsightAPI + P2P peers with auto-banning
+    // Header sync needs fewer peers since headers are verified by chain continuity + PoW
+    // Fake heights are detected and banned by getConsensusChainHeight()
+    private let minPeers = 3  // Minimum peers for header sync
     private let consensusThreshold = 3  // Require 3 peers to agree on headers
 
     // Sync state
@@ -40,9 +42,20 @@ final class HeaderSyncManager {
 
         print("🔄 Starting header sync from height \(startHeight)")
 
-        // Get current chain tip from peers
-        let chainTip = try await getChainTip()
-        print("🎯 Network chain tip: \(chainTip)")
+        // SECURITY: Use multi-source consensus for chain height
+        // Don't trust any single source (InsightAPI could be compromised too!)
+        // Get consensus from: InsightAPI + multiple P2P peers
+        // Peers reporting fake heights will be BANNED automatically
+        let consensusHeight = await InsightAPI.shared.getConsensusChainHeight(networkManager: networkManager)
+
+        guard consensusHeight > 0 else {
+            print("❌ No consensus on chain height - cannot sync safely")
+            throw SyncError.noConsensus(heights: [])
+        }
+
+        // Use consensus height as the sync target
+        let chainTip = consensusHeight
+        print("🎯 Consensus chain tip: \(chainTip)")
 
         guard chainTip > startHeight else {
             print("✅ Already synced to tip")
@@ -59,10 +72,25 @@ final class HeaderSyncManager {
             print("📥 Syncing headers \(currentHeight) to \(endHeight)")
 
             // Request headers from multiple peers
-            let headers = try await requestHeadersWithConsensus(
+            var headers = try await requestHeadersWithConsensus(
                 from: currentHeight,
                 to: endHeight
             )
+
+            // SECURITY: Cap headers at consensus height - reject fake future headers
+            // Malicious peers may send headers beyond the real chain tip
+            let maxAllowedHeight = chainTip
+            let originalCount = headers.count
+
+            // Calculate how many headers we can actually use
+            let maxHeadersToKeep = Int(maxAllowedHeight - currentHeight + 1)
+            if headers.count > maxHeadersToKeep && maxHeadersToKeep > 0 {
+                headers = Array(headers.prefix(maxHeadersToKeep))
+                print("🚨 [SECURITY] Filtered out \(originalCount - headers.count) fake future headers (capped at height \(maxAllowedHeight))")
+            } else if maxHeadersToKeep <= 0 {
+                print("⚠️ Already at or past consensus height \(maxAllowedHeight), no headers needed")
+                break
+            }
 
             // Verify chain continuity (each header's prevHash matches previous block's hash)
             // Equihash is verified during parsing in parseHeadersPayload
@@ -96,41 +124,76 @@ final class HeaderSyncManager {
         print("🎉 Header sync complete! Synced to height \(chainTip)")
     }
 
-    /// Get the current chain tip height from consensus of peers (P2P-first)
+    /// Get the current chain tip height with InsightAPI as authoritative source
+    /// InsightAPI provides the trusted chain height; P2P heights are validated against it
     func getChainTip() async throws -> UInt64 {
-        var maxHeight: UInt64 = 0
+        // SECURITY FIX: Use InsightAPI as authoritative chain height source
+        // Malicious P2P peers can report fake heights (e.g., 110+ blocks in future)
+        // InsightAPI connects to real blockchain and provides correct height
 
-        // P2P-FIRST architecture: prioritize trustless P2P data
+        // Maximum blocks a P2P peer can be ahead of InsightAPI (network propagation tolerance)
+        let maxP2PAheadTolerance: UInt64 = 5
 
-        // 1. Check header store (locally verified headers)
-        if let headerHeight = try? headerStore.getLatestHeight() {
-            print("📡 [P2P] HeaderStore height: \(headerHeight)")
-            maxHeight = max(maxHeight, headerHeight)
+        // 1. Get authoritative chain height from InsightAPI FIRST
+        var trustedHeight: UInt64 = 0
+        do {
+            let status = try await InsightAPI.shared.getStatus()
+            trustedHeight = status.height
+            print("📡 [TRUSTED] InsightAPI chain tip: \(trustedHeight)")
+        } catch {
+            print("⚠️ InsightAPI unavailable: \(error)")
         }
 
-        // 2. Get peer heights from version handshake (may be stale but P2P-based)
+        // 2. Check header store (locally verified headers)
+        var headerStoreHeight: UInt64 = 0
+        if let headerHeight = try? headerStore.getLatestHeight() {
+            print("📡 [LOCAL] HeaderStore height: \(headerHeight)")
+            headerStoreHeight = headerHeight
+        }
+
+        // 3. Get peer heights from version handshake
+        var p2pMaxHeight: UInt64 = 0
         let peers = try await networkManager.getConnectedPeers(min: minPeers)
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
-            if h > maxHeight {
-                maxHeight = h
+            if h > p2pMaxHeight && h > 0 {
+                p2pMaxHeight = h
             }
         }
 
-        // 3. PROBE: Try requesting headers beyond our known height to discover new blocks
-        // This is the most accurate way to get real chain tip from P2P
-        if let probeHeight = await probeForNewHeaders(from: maxHeight, peers: peers) {
-            print("📡 [P2P] Probe found chain tip: \(probeHeight)")
-            maxHeight = max(maxHeight, probeHeight)
+        if p2pMaxHeight > 0 {
+            print("📡 [P2P] Max peer height: \(p2pMaxHeight)")
         }
 
-        // 4. Only fallback to InsightAPI if P2P gives no result
-        if maxHeight == 0 {
-            print("⚠️ [P2P] No P2P height available, falling back to InsightAPI...")
-            if let status = try? await InsightAPI.shared.getStatus() {
-                print("📡 [FALLBACK] InsightAPI chain tip: \(status.height)")
-                maxHeight = status.height
+        // 4. SECURITY CHECK: Validate P2P height against trusted source
+        var maxHeight: UInt64 = 0
+
+        if trustedHeight > 0 {
+            // We have trusted height - use it as baseline
+            maxHeight = trustedHeight
+
+            // Check if P2P peers are reporting suspiciously high heights
+            if p2pMaxHeight > trustedHeight + maxP2PAheadTolerance {
+                print("🚨 [SECURITY] P2P peer reporting FAKE height \(p2pMaxHeight) (trusted: \(trustedHeight))")
+                print("🚨 [SECURITY] Rejecting P2P height - \(p2pMaxHeight - trustedHeight) blocks in future!")
+                // Don't use fake P2P height - stick with trusted
+            } else if p2pMaxHeight > trustedHeight {
+                // P2P is slightly ahead (within tolerance) - might have newer block
+                print("ℹ️ P2P slightly ahead (\(p2pMaxHeight - trustedHeight) blocks) - acceptable")
+                maxHeight = p2pMaxHeight
             }
+
+            // Check header store too - auto-clear fake headers
+            if headerStoreHeight > trustedHeight + maxP2PAheadTolerance {
+                print("🚨 [SECURITY] HeaderStore has FAKE headers up to \(headerStoreHeight)")
+                print("🧹 [SECURITY] Auto-clearing all headers to remove fake data...")
+                try? headerStore.clearAllHeaders()
+                print("✅ Fake headers cleared - will re-sync from trusted height")
+            }
+        } else {
+            // InsightAPI unavailable - use P2P with caution
+            print("⚠️ InsightAPI unavailable, using P2P height with caution")
+            maxHeight = max(headerStoreHeight, p2pMaxHeight)
         }
 
         if maxHeight > 0 {
@@ -139,30 +202,6 @@ final class HeaderSyncManager {
         }
 
         throw SyncError.insufficientPeers(got: 0, need: 1)
-    }
-
-    /// Probe P2P peers to discover actual chain height by requesting headers
-    private func probeForNewHeaders(from knownHeight: UInt64, peers: [Peer]) async -> UInt64? {
-        guard let peer = peers.first else { return nil }
-
-        // Try to get headers starting from our known height
-        // If peer has more blocks, they'll send headers up to their tip
-        do {
-            // Ensure peer connection is fresh before probing
-            try await peer.ensureConnected()
-            let headers = try await peer.getBlockHeaders(from: knownHeight, count: 100)
-            if !headers.isEmpty {
-                // The last header tells us the peer's current tip
-                // Add knownHeight offset since getBlockHeaders returns from that point
-                let count = UInt64(headers.count)
-                peer.markActive()
-                return knownHeight + count
-            }
-        } catch {
-            print("⚠️ P2P header probe failed: \(error)")
-        }
-
-        return nil
     }
 
     /// Request headers from multiple peers and verify consensus
@@ -267,16 +306,25 @@ final class HeaderSyncManager {
             }
         }
 
-        guard successfulHeaders.count >= consensusThreshold else {
+        // FALLBACK: If we couldn't reach full consensus but have at least 2 peers agreeing,
+        // proceed with reduced security. Better than being stuck forever.
+        let reducedThreshold = 2
+        if successfulHeaders.count < consensusThreshold && successfulHeaders.count >= reducedThreshold {
+            print("⚠️ Reduced consensus: using \(successfulHeaders.count) peers (ideal is \(consensusThreshold))")
+        }
+
+        guard successfulHeaders.count >= reducedThreshold else {
             throw SyncError.insufficientPeers(got: successfulHeaders.count, need: consensusThreshold)
         }
 
         let peerHeaders = successfulHeaders
+        // Use actual peer count as the effective threshold for consensus verification
+        let effectiveThreshold = min(successfulHeaders.count, consensusThreshold)
 
         print("📊 Received headers from \(peerHeaders.count) peers")
 
         // Verify consensus - all peers should return same headers
-        let consensusHeaders = try verifyHeaderConsensus(peerHeaders)
+        let consensusHeaders = try verifyHeaderConsensus(peerHeaders, threshold: effectiveThreshold)
 
         return consensusHeaders
     }
@@ -332,11 +380,30 @@ final class HeaderSyncManager {
         // Number of block locator hashes (varint - use 1 for simplicity)
         payload.append(1)
 
-        // Block locator hash (use last known header, or genesis if starting fresh)
-        if startHeight > 0, let lastHeader = try? headerStore.getHeader(at: startHeight - 1) {
-            payload.append(lastHeader.blockHash)
+        // Block locator hash - need the hash at (startHeight - 1) to request headers starting at startHeight
+        let locatorHeight = startHeight > 0 ? startHeight - 1 : 0
+        var locatorHash: Data?
+
+        // First try: Get from HeaderStore (cached headers)
+        if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
+            locatorHash = lastHeader.blockHash
+            print("📋 Using HeaderStore hash for locator at height \(locatorHeight)")
+        }
+
+        // Second try: Get from checkpoints if HeaderStore doesn't have it
+        if locatorHash == nil, let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
+            // Convert checkpoint hex (big-endian display format) to wire format (little-endian)
+            if let hashData = Data(hexString: checkpointHex) {
+                locatorHash = hashData.reversed() // Reverse to wire format
+                print("📋 Using checkpoint hash for locator at height \(locatorHeight)")
+            }
+        }
+
+        // Fallback: Use zero hash (will return headers from genesis)
+        if let hash = locatorHash {
+            payload.append(hash)
         } else {
-            // Use zero hash for genesis
+            print("⚠️ No locator hash available for height \(locatorHeight), using zero hash")
             payload.append(Data(count: 32))
         }
 
@@ -445,7 +512,7 @@ final class HeaderSyncManager {
     }
 
     /// Verify that multiple peers agree on header data (consensus)
-    private func verifyHeaderConsensus(_ peerHeaders: [[ZclassicBlockHeader]]) throws -> [ZclassicBlockHeader] {
+    private func verifyHeaderConsensus(_ peerHeaders: [[ZclassicBlockHeader]], threshold: Int) throws -> [ZclassicBlockHeader] {
         guard let firstHeaders = peerHeaders.first else {
             throw SyncError.noHeadersReceived
         }
@@ -477,13 +544,13 @@ final class HeaderSyncManager {
                 throw SyncError.noConsensus(heights: [])
             }
 
-            guard votes >= consensusThreshold else {
+            guard votes >= threshold else {
                 let hashHex = consensusHash.map { String(format: "%02x", $0) }.joined().prefix(16)
                 throw SyncError.insufficientConsensus(
                     position: i,
                     hash: String(hashHex),
                     votes: votes,
-                    need: consensusThreshold
+                    need: threshold
                 )
             }
 
@@ -493,11 +560,11 @@ final class HeaderSyncManager {
             }
 
             let saplingVotes = saplingRootVotes[consensusHeader.hashFinalSaplingRoot] ?? 0
-            guard saplingVotes >= consensusThreshold else {
+            guard saplingVotes >= threshold else {
                 throw SyncError.saplingRootMismatch(
                     position: i,
                     votes: saplingVotes,
-                    need: consensusThreshold
+                    need: threshold
                 )
             }
 
@@ -521,16 +588,20 @@ final class HeaderSyncManager {
             prevHash = prevHeader.blockHash
         }
 
+        let totalHeaders = headers.count
         for (index, header) in headers.enumerated() {
             // Verify previous hash links correctly
             // Skip verification for the very first header if we don't have its previous block
             if let prevHash = prevHash {
-                // Debug: Print hash comparison
+                // Debug: Print only first and last headers to reduce log spam
                 let prevHex = prevHash.map { String(format: "%02x", $0) }.joined()
                 let gotPrevHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined()
                 let currentBlockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
 
-                print("🔍 Height \(currentHeight): blockHash=\(currentBlockHex.prefix(16))... prevBlock=\(gotPrevHex.prefix(16))...")
+                // Only show first, last, and every 500th header
+                if index == 0 || index == totalHeaders - 1 || index % 500 == 0 {
+                    print("🔍 Height \(currentHeight): blockHash=\(currentBlockHex.prefix(16))... prevBlock=\(gotPrevHex.prefix(16))...")
+                }
 
                 guard header.hashPrevBlock == prevHash else {
                     print("❌ MISMATCH at height \(currentHeight)!")

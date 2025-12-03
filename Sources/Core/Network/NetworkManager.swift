@@ -1153,10 +1153,27 @@ final class NetworkManager: ObservableObject {
         for peer in connectedPeers {
             do {
                 print("🔮 scanMempoolForIncoming: requesting mempool txs from peer \(peer.host)...")
+                // Ensure connection is fresh before requesting mempool
+                try await peer.ensureConnected()
                 mempoolTxs = try await peer.getMempoolTransactions()
                 successfulPeer = peer
                 print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host)")
                 break
+            } catch NetworkError.handshakeFailed {
+                // Connection is stale - try to reconnect
+                print("🔮 scanMempoolForIncoming: peer \(peer.host) stale, reconnecting...")
+                peer.disconnect()
+                do {
+                    try await peer.connect()
+                    try await peer.performHandshake()
+                    mempoolTxs = try await peer.getMempoolTransactions()
+                    successfulPeer = peer
+                    print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host) after reconnect")
+                    break
+                } catch {
+                    print("⚠️ scanMempoolForIncoming: peer \(peer.host) reconnect failed: \(error.localizedDescription)")
+                    continue
+                }
             } catch {
                 print("⚠️ scanMempoolForIncoming: peer \(peer.host) failed: \(error.localizedDescription)")
                 continue

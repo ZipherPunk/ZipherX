@@ -693,6 +693,21 @@ final class WalletManager: ObservableObject {
                 print("📥 Opening header store...")
                 try HeaderStore.shared.open()
 
+                // CRITICAL: Check for corrupted header timestamps
+                // Bug: Headers were being assigned wrong heights (from genesis instead of bundled tree)
+                // This caused timestamps to show 2016 instead of 2025
+                // Detection: If a header at recent height has timestamp < 2024, it's corrupted
+                let corruptedTimestampThreshold: UInt32 = 1704067200 // Jan 1, 2024 UTC
+                if let latestHeight = try? HeaderStore.shared.getLatestHeight(),
+                   latestHeight >= bundledTreeHeight,
+                   let sampleHeader = try? HeaderStore.shared.getHeader(at: bundledTreeHeight + 100),
+                   sampleHeader.time < corruptedTimestampThreshold {
+                    print("🚨 [CRITICAL] Detected corrupted header timestamps (showing 2016 dates)")
+                    print("🧹 Clearing all headers to trigger fresh sync with correct data...")
+                    try HeaderStore.shared.clearAllHeaders()
+                    print("✅ Corrupted headers cleared")
+                }
+
                 print("🔄 Starting header sync...")
                 let headerSync = HeaderSyncManager(
                     headerStore: HeaderStore.shared,
