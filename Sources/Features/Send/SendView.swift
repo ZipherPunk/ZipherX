@@ -84,6 +84,109 @@ struct SendView: View {
             if isSending {
                 sendProgressOverlay
             }
+
+            // Success overlay - displayed OVER everything when showSuccess is true
+            // Using overlay instead of sheet to avoid nested sheet issues on macOS
+            if showSuccess {
+                // Cypherpunk-style success screen with dark background and green fluo
+                ZStack {
+                    Color.black.ignoresSafeArea()
+
+                    VStack(spacing: 20) {
+                        // Glowing checkmark
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 60))
+                            .foregroundColor(NeonColors.progressFillEnd) // Bright fluo green
+                            .shadow(color: NeonColors.progressFillEnd.opacity(0.8), radius: 20)
+
+                        Text("TRANSACTION BROADCAST")
+                            .font(.system(size: 18, weight: .bold, design: .monospaced))
+                            .foregroundColor(NeonColors.progressFillEnd)
+                            .shadow(color: NeonColors.progressFillEnd.opacity(0.5), radius: 5)
+
+                        Text("Your shielded transaction has been sent to the network.")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(Color.green.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("TXID:")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(Color.green.opacity(0.6))
+
+                            Text(txId)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(NeonColors.progressFillEnd) // Fluo green
+                                .padding(12)
+                                .frame(maxWidth: .infinity)
+                                .background(Color.green.opacity(0.1))
+                                .overlay(
+                                    Rectangle()
+                                        .stroke(NeonColors.progressFillEnd.opacity(0.5), lineWidth: 1)
+                                )
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.7)
+                        }
+                        .padding(.horizontal, 20)
+
+                        HStack(spacing: 16) {
+                            // Copy button - cypherpunk style
+                            Button(action: {
+                                #if os(iOS)
+                                UIPasteboard.general.string = txId
+                                // Haptic feedback
+                                let generator = UIImpactFeedbackGenerator(style: .medium)
+                                generator.impactOccurred()
+                                #elseif os(macOS)
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(txId, forType: .string)
+                                #endif
+                            }) {
+                                HStack {
+                                    Image(systemName: "doc.on.doc")
+                                    Text("COPY TXID")
+                                }
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 10)
+                                .background(NeonColors.progressFillEnd)
+                                .cornerRadius(4)
+                            }
+
+                            // Done button - navigates back to balance tab
+                            Button(action: {
+                                showSuccess = false
+                                clearForm()
+                                // Navigate back to main screen (balance tab) after overlay closes
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                    onSendComplete?()
+                                }
+                            }) {
+                                Text("DONE")
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(NeonColors.progressFillEnd)
+                                    .padding(.horizontal, 20)
+                                    .padding(.vertical, 10)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .stroke(NeonColors.progressFillEnd, lineWidth: 1)
+                                    )
+                            }
+                        }
+                        .padding(.top, 10)
+
+                        // Cypherpunk quote
+                        Text("\"Privacy is necessary for an open society.\"")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(Color.green.opacity(0.3))
+                            .italic()
+                            .padding(.top, 10)
+                    }
+                    .padding(30)
+                }
+            } // end if showSuccess
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.backgroundColor)
@@ -94,107 +197,6 @@ struct SendView: View {
             }
         } message: {
             Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
-        }
-        .sheet(isPresented: $showSuccess) {
-            // Cypherpunk-style success screen with dark background and green fluo
-            ZStack {
-                Color.black.ignoresSafeArea()
-
-                VStack(spacing: 20) {
-                    // Glowing checkmark
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 60))
-                        .foregroundColor(NeonColors.progressFillEnd) // Bright fluo green
-                        .shadow(color: NeonColors.progressFillEnd.opacity(0.8), radius: 20)
-
-                    Text("TRANSACTION BROADCAST")
-                        .font(.system(size: 18, weight: .bold, design: .monospaced))
-                        .foregroundColor(NeonColors.progressFillEnd)
-                        .shadow(color: NeonColors.progressFillEnd.opacity(0.5), radius: 5)
-
-                    Text("Your shielded transaction has been sent to the network.")
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(Color.green.opacity(0.7))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("TXID:")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(Color.green.opacity(0.6))
-
-                        Text(txId)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(NeonColors.progressFillEnd) // Fluo green
-                            .padding(12)
-                            .frame(maxWidth: .infinity)
-                            .background(Color.green.opacity(0.1))
-                            .overlay(
-                                Rectangle()
-                                    .stroke(NeonColors.progressFillEnd.opacity(0.5), lineWidth: 1)
-                            )
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.7)
-                    }
-                    .padding(.horizontal, 20)
-
-                    HStack(spacing: 16) {
-                        // Copy button - cypherpunk style
-                        Button(action: {
-                            #if os(iOS)
-                            UIPasteboard.general.string = txId
-                            // Haptic feedback
-                            let generator = UIImpactFeedbackGenerator(style: .medium)
-                            generator.impactOccurred()
-                            #elseif os(macOS)
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(txId, forType: .string)
-                            #endif
-                        }) {
-                            HStack {
-                                Image(systemName: "doc.on.doc")
-                                Text("COPY TXID")
-                            }
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
-                            .background(NeonColors.progressFillEnd)
-                            .cornerRadius(4)
-                        }
-
-                        // Done button - navigates back to balance tab
-                        Button(action: {
-                            showSuccess = false
-                            clearForm()
-                            // Navigate back to main screen (balance tab)
-                            onSendComplete?()
-                        }) {
-                            Text("DONE")
-                                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                .foregroundColor(NeonColors.progressFillEnd)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 10)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(NeonColors.progressFillEnd, lineWidth: 1)
-                                )
-                        }
-                    }
-                    .padding(.top, 10)
-
-                    // Cypherpunk quote
-                    Text("\"Privacy is necessary for an open society.\"")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(Color.green.opacity(0.3))
-                        .italic()
-                        .padding(.top, 10)
-                }
-                .padding(30)
-            }
-            #if os(macOS)
-            .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 450)
-            #endif
         }
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
@@ -604,6 +606,25 @@ struct SendView: View {
         case "proof":
             updateStepSync("proof", status: .completed)
             updateStepSync("broadcast", status: .inProgress)
+        case "peers":
+            // IMMEDIATE TXID DISPLAY: Show success screen as soon as first peer accepts!
+            // Extract txid from detail string: "Accepted by X/Y nodes [txid:abc123...]"
+            if let detail = detail, let txidRange = detail.range(of: "[txid:") {
+                let afterTxid = detail[txidRange.upperBound...]
+                if let endBracket = afterTxid.firstIndex(of: "]") {
+                    let extractedTxid = String(afterTxid[..<endBracket])
+                    // Show success screen IMMEDIATELY with txid
+                    if !showSuccess && !extractedTxid.isEmpty {
+                        txId = extractedTxid
+                        showSuccess = true
+                        isSending = false
+                        sendProgress = []
+                        print("🚀 INSTANT SUCCESS: Showing txid immediately after peer accept: \(extractedTxid.prefix(16))...")
+                    }
+                }
+            }
+            // Also update broadcast step progress
+            updateStepSync("broadcast", status: .inProgress, detail: detail?.replacingOccurrences(of: #"\s*\[txid:[^\]]+\]"#, with: "", options: .regularExpression), progress: progress)
         case "broadcast":
             // Broadcast step has sub-progress for peer propagation and verification
             if let p = progress, p < 1.0 {

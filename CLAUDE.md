@@ -2291,6 +2291,54 @@ let referenceTimestamp: TimeInterval = 1764072000
 
 ---
 
+### 40. Instant Txid Display on First Peer Accept (December 3, 2025)
+
+**Problem**: User reported that the transaction success screen with txid only appeared after 1 block confirmation, not immediately when peers accepted the transaction.
+
+**Root Cause**:
+1. `broadcastTransactionWithProgress` sent `"peers"` as the phase, but `WalletManager` was forwarding it as `"broadcast"`
+2. The success screen only showed after `sendShieldedWithProgress` returned, which waited for mempool verification
+3. The txid was available as soon as the first peer accepted, but UI didn't display it
+
+**Solution: Immediate Txid Display**
+
+1. **Include txid in progress callback** (`NetworkManager.swift`):
+   ```swift
+   // Include txid in detail so UI can display it immediately
+   onProgress?("peers", "Accepted by \(count)/\(peerCount) nodes [txid:\(id)]", ...)
+   ```
+
+2. **Forward actual phase to UI** (`WalletManager.swift`):
+   ```swift
+   // OLD: Always sent "broadcast" phase
+   onProgress("broadcast", detail, progress)
+
+   // NEW: Forward actual phase ("peers", "verify", "api")
+   onProgress(phase, detail, progress)
+   ```
+
+3. **Handle "peers" phase in SendView** (`SendView.swift`):
+   ```swift
+   case "peers":
+       // Extract txid from detail: "Accepted by X/Y nodes [txid:abc123...]"
+       if let txidRange = detail.range(of: "[txid:") {
+           let extractedTxid = // parse txid
+           // Show success screen IMMEDIATELY
+           txId = extractedTxid
+           showSuccess = true
+           isSending = false
+       }
+   ```
+
+**Result**: Success screen with full txid now appears as soon as the first P2P peer accepts the transaction, instead of waiting for mempool verification or block confirmation.
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - include txid in peer accept progress
+- `Sources/Core/Wallet/WalletManager.swift` - forward actual phase instead of hardcoding "broadcast"
+- `Sources/Features/Send/SendView.swift` - handle "peers" phase, extract and display txid immediately
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

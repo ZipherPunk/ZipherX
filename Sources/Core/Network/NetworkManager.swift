@@ -1572,7 +1572,8 @@ final class NetworkManager: ObservableObject {
                         }
                         print("✅ Peer \(peerHost) accepted tx: \(id)")
                         let count = await state.recordSuccess(id)
-                        onProgress?("peers", "Accepted by \(count)/\(peerCount) nodes", Double(count) / Double(peerCount))
+                        // Include txid in detail so UI can display it immediately
+                        onProgress?("peers", "Accepted by \(count)/\(peerCount) nodes [txid:\(id)]", Double(count) / Double(peerCount))
                     } catch {
                         print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
                     }

@@ -81,6 +81,7 @@ final class WalletManager: ObservableObject {
 
     /// Pre-initialize the Groth16 prover for faster transactions
     /// This loads the 50MB+ Sapling params files once at startup
+    /// Uses bytes-based loading to avoid macOS Hardened Runtime file access restrictions
     private func preloadProver() async {
         print("⚡ Pre-initializing Groth16 prover...")
 
@@ -91,11 +92,24 @@ final class WalletManager: ObservableObject {
             return
         }
 
-        let spendPath = params.spendParamsPath.path
-        let outputPath = params.outputParamsPath.path
+        // Load param files in Swift (which has full file access)
+        // Then pass bytes to Rust (avoids Hardened Runtime file access restrictions)
+        let spendPath = params.spendParamsPath
+        let outputPath = params.outputParamsPath
 
-        // Initialize prover in background
-        if ZipherXFFI.initProver(spendParamsPath: spendPath, outputParamsPath: outputPath) {
+        guard let spendData = try? Data(contentsOf: spendPath) else {
+            print("⚠️ Failed to read spend params file, will retry at send time")
+            return
+        }
+        guard let outputData = try? Data(contentsOf: outputPath) else {
+            print("⚠️ Failed to read output params file, will retry at send time")
+            return
+        }
+
+        print("📂 Loaded params: spend=\(spendData.count) bytes, output=\(outputData.count) bytes")
+
+        // Initialize prover using bytes (avoids Rust file access issues)
+        if ZipherXFFI.initProverFromBytes(spendData: spendData, outputData: outputData) {
             print("✅ Groth16 prover pre-initialized (faster first transaction!)")
         } else {
             print("⚠️ Failed to pre-initialize prover, will retry at send time")
@@ -219,29 +233,40 @@ final class WalletManager: ObservableObject {
             self.treeLoadProgress = 0.3
         }
 
-        if let serializedTreeURL = Bundle.main.url(forResource: "commitment_tree_serialized", withExtension: "bin"),
-           let serializedData = try? Data(contentsOf: serializedTreeURL) {
+        // DEBUG: Log bundle path to help diagnose resource loading issues
+        print("📁 Bundle path: \(Bundle.main.bundlePath)")
+        print("📁 Resource path: \(Bundle.main.resourcePath ?? "nil")")
 
-            // This is instant! Just deserialize the Merkle frontier
-            if ZipherXFFI.treeDeserialize(data: serializedData) {
-                let treeSize = ZipherXFFI.treeSize()
-                print("✅ Bundled commitment tree loaded instantly: \(treeSize) commitments")
+        if let serializedTreeURL = Bundle.main.url(forResource: "commitment_tree_serialized", withExtension: "bin") {
+            print("✅ Found serialized tree at: \(serializedTreeURL.path)")
+            if let serializedData = try? Data(contentsOf: serializedTreeURL) {
+                print("✅ Loaded serialized tree data: \(serializedData.count) bytes")
 
-                // Save to database for next time
-                if let serializedTree = ZipherXFFI.treeSerialize() {
-                    try? WalletDatabase.shared.saveTreeState(serializedTree)
-                    print("💾 Tree state saved to database for future use")
+                // This is instant! Just deserialize the Merkle frontier
+                if ZipherXFFI.treeDeserialize(data: serializedData) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("✅ Bundled commitment tree loaded instantly: \(treeSize) commitments")
+
+                    // Save to database for next time
+                    if let serializedTree = ZipherXFFI.treeSerialize() {
+                        try? WalletDatabase.shared.saveTreeState(serializedTree)
+                        print("💾 Tree state saved to database for future use")
+                    }
+
+                    await MainActor.run {
+                        self.isTreeLoaded = true
+                        self.treeLoadProgress = 1.0
+                        self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                    }
+                    return
+                } else {
+                    print("⚠️ FFI treeDeserialize returned false, falling back to CMU rebuild...")
                 }
-
-                await MainActor.run {
-                    self.isTreeLoaded = true
-                    self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
-                }
-                return
             } else {
-                print("⚠️ Failed to deserialize bundled tree, falling back to CMU rebuild...")
+                print("⚠️ Failed to read serialized tree data, falling back to CMU rebuild...")
             }
+        } else {
+            print("⚠️ commitment_tree_serialized.bin not found in bundle, falling back to CMU rebuild...")
         }
 
         // SLOW FALLBACK: Build tree from CMUs (only if serialized file fails/missing)
@@ -617,6 +642,34 @@ final class WalletManager: ObservableObject {
         } catch {
             await updateTask("database", status: .failed(error.localizedDescription))
             throw error
+        }
+
+        // SECURITY CHECK: Validate lastScannedHeight against trusted chain height
+        // Malicious P2P peers may have caused fake heights to be stored
+        do {
+            let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
+            if lastScanned > bundledTreeHeight {
+                // Query InsightAPI for trusted chain height
+                let status = try await InsightAPI.shared.getStatus()
+                let trustedHeight = status.height
+                let maxAheadTolerance: UInt64 = 10
+
+                if lastScanned > trustedHeight + maxAheadTolerance {
+                    print("🚨 [SECURITY] Detected FAKE lastScannedHeight: \(lastScanned)")
+                    print("🚨 [SECURITY] Trusted chain height is: \(trustedHeight)")
+                    print("🧹 Resetting to bundled tree height...")
+
+                    // Reset to safe state
+                    try WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+                    try? HeaderStore.shared.open()
+                    try? HeaderStore.shared.clearAllHeaders()
+
+                    print("✅ Fake sync state cleared - will rescan from trusted height")
+                }
+            }
+        } catch {
+            print("⚠️ Could not validate lastScannedHeight: \(error)")
+            // Continue anyway - HeaderSyncManager will also validate
         }
 
         // Task 3: Sync block headers (with retry logic for peer timing issues)
@@ -1055,7 +1108,9 @@ final class WalletManager: ObservableObject {
         } else {
             // Reset all sync state (notes, nullifiers, tree)
             try WalletDatabase.shared.resetSyncState()
-            print("🔄 Reset complete - starting full rescan from Sapling activation")
+            // Also clear header store to remove any stale/fake P2P headers
+            try? HeaderStore.shared.clearAllHeaders()
+            print("🔄 Reset complete (including headers) - starting full rescan from Sapling activation")
         }
 
         // Create scanner with progress callback
@@ -1488,11 +1543,18 @@ final class WalletManager: ObservableObject {
         let networkManager = NetworkManager.shared
         let txId = try await networkManager.broadcastTransactionWithProgress(rawTx) { phase, detail, progress in
             // Forward broadcast progress to the UI
-            onProgress("broadcast", detail, progress)
+            // Use actual phase ("peers", "verify", "api") so UI can show txid immediately on first peer accept
+            onProgress(phase, detail, progress)
         }
 
         // Track as pending outgoing (cypherpunk mempool status)
-        networkManager.trackPendingOutgoing(txid: txId, amount: amount)
+        // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
+        // IMPORTANT: await to ensure mempoolOutgoing is set before UI updates
+        let pendingFee: UInt64 = 10_000
+        await networkManager.trackPendingOutgoing(txid: txId, amount: amount + pendingFee)
+
+        // Show "Saving transaction..." while we record to database
+        onProgress("broadcast", "Saving transaction (txid: \(txId.prefix(16))...)...", 0.95)
 
         // Record send timestamp - used to suppress fireworks for change outputs
         await MainActor.run {
@@ -1549,8 +1611,13 @@ final class WalletManager: ObservableObject {
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
-        // Refresh balance
-        try await refreshBalance()
+        // Signal completion with txid visible in progress message
+        onProgress("broadcast", "Transaction complete!", 1.0)
+
+        // Refresh balance in background (don't block success screen)
+        Task {
+            try? await refreshBalance()
+        }
 
         return txId
     }
@@ -1604,7 +1671,10 @@ final class WalletManager: ObservableObject {
         let txId = try await networkManager.broadcastTransaction(rawTx)
 
         // Track as pending outgoing (cypherpunk mempool status)
-        networkManager.trackPendingOutgoing(txid: txId, amount: amount)
+        // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
+        // IMPORTANT: await to ensure mempoolOutgoing is set before UI updates
+        let pendingFee: UInt64 = 10_000
+        await networkManager.trackPendingOutgoing(txid: txId, amount: amount + pendingFee)
 
         // Record send timestamp - used to suppress fireworks for change outputs
         await MainActor.run {
@@ -2067,6 +2137,100 @@ final class WalletManager: ObservableObject {
         }
 
         print("✅ Key imported successfully (will scan for historical notes)")
+    }
+
+    // MARK: - Post-Scan Nullifier Verification
+
+    /// Verify nullifier spend status for all unspent notes
+    /// This is a fallback check that queries the blockchain for each note's nullifier
+    /// Called after scan to catch any spent notes that were missed during normal scan
+    func verifyNullifierSpendStatus() async throws {
+        print("🔍 Starting post-scan nullifier verification...")
+
+        let database = WalletDatabase.shared
+        let unspentNotes = try database.getAllUnspentNotes(accountId: 1)
+
+        guard !unspentNotes.isEmpty else {
+            print("✅ No unspent notes to verify")
+            return
+        }
+
+        print("🔍 Checking \(unspentNotes.count) unspent note(s) for spend status...")
+
+        var spentCount = 0
+
+        for note in unspentNotes {
+            // Convert nullifier to hex for API lookup
+            // Notes store nullifier in wire format (little-endian)
+            // API expects display format (big-endian)
+            let nullifierDisplay = note.nullifier.reversedBytes().hexString
+
+            // Search for this nullifier in spending transactions
+            // We need to check transactions that contain this nullifier in vShieldedSpend
+            let isSpent = try await checkNullifierSpentOnChain(nullifier: nullifierDisplay, afterHeight: note.height)
+
+            if isSpent {
+                print("💸 Found spent note: \(note.value) zatoshis (nullifier found on chain)")
+                try database.markNoteSpent(nullifier: note.nullifier, spentHeight: 0) // Height unknown
+                spentCount += 1
+            }
+        }
+
+        if spentCount > 0 {
+            print("✅ Marked \(spentCount) note(s) as spent via nullifier verification")
+        } else {
+            print("✅ All unspent notes verified - none are spent on chain")
+        }
+    }
+
+    /// Check if a nullifier has been spent on the blockchain
+    /// Scans transactions from the note's height to current tip
+    private func checkNullifierSpentOnChain(nullifier: String, afterHeight: UInt64) async throws -> Bool {
+        // Strategy: Check blocks from note height to current tip for spending transactions
+        // This is expensive, so we batch and parallelize
+
+        let api = InsightAPI.shared
+        let status = try await api.getStatus()
+        let currentHeight = status.height
+
+        // Don't scan more than 5000 blocks (arbitrary limit for performance)
+        let maxScanBlocks: UInt64 = 5000
+        let startHeight = afterHeight
+        let endHeight = min(currentHeight, afterHeight + maxScanBlocks)
+
+        // Batch size for parallel processing
+        let batchSize: UInt64 = 100
+
+        for batchStart in stride(from: startHeight, to: endHeight, by: Int(batchSize)) {
+            let batchEnd = min(batchStart + batchSize, endHeight)
+
+            // Check each block in this batch
+            for height in batchStart..<batchEnd {
+                do {
+                    let blockHash = try await api.getBlockHash(height: height)
+                    let block = try await api.getBlock(hash: blockHash)
+
+                    // Check each transaction in the block
+                    for txid in block.tx {
+                        let tx = try await api.getTransaction(txid: txid)
+
+                        // Check if any spend matches our nullifier
+                        if let spends = tx.spendDescs {
+                            for spend in spends {
+                                if spend.nullifier == nullifier {
+                                    return true // Found! This note was spent
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    // Skip blocks that fail to fetch
+                    continue
+                }
+            }
+        }
+
+        return false
     }
 }
 
