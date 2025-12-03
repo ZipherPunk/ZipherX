@@ -1284,6 +1284,22 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
+            // Method 3: Check if we sent recently (within 120 seconds)
+            // This catches cases where DB and pendingOutgoingTxs might not have the tx yet
+            if !isChangeOutput {
+                if let lastSend = WalletManager.shared.lastSendTimestamp,
+                   Date().timeIntervalSince(lastSend) < 120.0 {
+                    isChangeOutput = true
+                    print("🔔 MEMPOOL: Detected recent send activity - treating as change output")
+                }
+            }
+
+            // Method 4: Check if mempoolOutgoing > 0 (we have pending outgoing tx)
+            if !isChangeOutput && mempoolOutgoing > 0 {
+                isChangeOutput = true
+                print("🔔 MEMPOOL: mempoolOutgoing > 0 - treating as change output")
+            }
+
             if isChangeOutput {
                 print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
             } else {
