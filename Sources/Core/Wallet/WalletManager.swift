@@ -512,16 +512,22 @@ final class WalletManager: ObservableObject {
         // Record creation time for accurate sync timing display
         DispatchQueue.main.async {
             self.walletCreationTime = Date()
-            print("⏱️ Wallet restore started at: \(self.walletCreationTime!)")
+            debugLog("⏱️ Wallet restore started at: \(self.walletCreationTime!)")
         }
+
+        debugLog("🔑 Validating mnemonic (\(mnemonic.count) words)...")
 
         // Validate mnemonic
         guard mnemonicGenerator.validateMnemonic(mnemonic) else {
+            debugLog("❌ Mnemonic validation failed")
             throw WalletError.invalidMnemonic
         }
+        debugLog("✅ Mnemonic validated")
 
         // Derive seed
+        debugLog("🔑 Deriving seed from mnemonic...")
         let seed = try mnemonicGenerator.mnemonicToSeed(mnemonic: mnemonic)
+        debugLog("✅ Seed derived (\(seed.count) bytes)")
 
         // Derive spending key
         let spendingKey = try deriveSpendingKey(from: seed)
@@ -569,9 +575,13 @@ final class WalletManager: ObservableObject {
     /// Reset database state for a new or restored wallet
     /// Clears notes, tree state, scan history, and transaction history
     private func resetDatabaseForNewWallet() throws {
-        // Open database with a temporary key to clear it
-        // Note: Database will be re-opened with correct key during first sync
         print("🗑️ Clearing old wallet data from database...")
+
+        // Check if database is open - if not, skip clearing (nothing to clear)
+        guard WalletDatabase.shared.isOpen else {
+            print("⚠️ Database not open yet - skipping reset (will be fresh on first open)")
+            return
+        }
 
         // Clear tree state
         try? WalletDatabase.shared.clearTreeState()
