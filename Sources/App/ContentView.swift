@@ -430,23 +430,21 @@ struct ContentView: View {
             $0.id == "balance" && $0.status == .completed
         }
 
+        // PRIORITY: If all tasks completed OR balance completed, show 98%
+        // This takes precedence over catch-up phase to avoid stuck at 96%
+        if allTasksCompleted || balanceCompleted {
+            return 0.98
+        }
+
         // Sync phase (50-95%)
-        if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !allTasksCompleted) {
-            if balanceCompleted {
-                return 0.98
-            }
+        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
             return 0.50 + (walletManager.syncProgress * 0.45)
         }
 
         // Catch-up phase (95-98%) - when isConnecting is set but not syncing
-        // This happens between initial sync complete and catch-up sync starting
+        // This happens BEFORE sync tasks are created
         if walletManager.isConnecting && !walletManager.isSyncing {
             return 0.96
-        }
-
-        // All tasks completed but still in initial sync - show near complete
-        if allTasksCompleted || balanceCompleted {
-            return 0.98
         }
 
         // Finalizing phase (100%) - only if we're truly done
@@ -476,15 +474,21 @@ struct ContentView: View {
             return false
         }
 
+        // PRIORITY: All tasks completed - show "Almost ready..."
+        // This takes precedence to avoid showing stale status messages
+        if statusAllTasksCompleted {
+            return "Almost ready..."
+        }
+
         // Syncing (includes waiting for sync to start)
-        if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !statusAllTasksCompleted) {
+        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
             if walletManager.syncStatus.isEmpty {
                 return "Starting blockchain sync..."
             }
             return walletManager.syncStatus
         }
 
-        // Catch-up phase - waiting for new blocks
+        // Catch-up phase - waiting for new blocks (BEFORE sync tasks created)
         if walletManager.isConnecting && !walletManager.isSyncing {
             // Use the status set by WalletManager if available
             if !walletManager.syncStatus.isEmpty {
@@ -496,10 +500,6 @@ struct ContentView: View {
         // Tree loaded, network connected, sync complete
         if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
             return "Ready!"
-        }
-        // All tasks completed - almost done
-        if statusAllTasksCompleted {
-            return "Almost ready..."
         }
         // Waiting for sync to start
         return "Preparing sync..."
