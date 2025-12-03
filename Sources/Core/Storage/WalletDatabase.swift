@@ -2349,6 +2349,20 @@ struct TransactionHistoryItem {
             }
         }
 
+        // Final fallback: estimate based on block height
+        // Zclassic has 2.5 minute block time (150 seconds)
+        // Reference: block 2931180 was mined around Dec 3, 2025 18:09 UTC
+        if height > 0 {
+            let referenceHeight: UInt64 = 2931180
+            let referenceTimestamp: TimeInterval = 1733249340 // Dec 3, 2025 18:09 UTC
+            let blockTime: TimeInterval = 150 // 2.5 minutes
+
+            let heightDiff = Int64(height) - Int64(referenceHeight)
+            let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTime)
+            let date = Date(timeIntervalSince1970: estimatedTimestamp)
+            return formatter.string(from: date) + " (est)"
+        }
+
         // No timestamp available
         return nil
     }
