@@ -71,11 +71,23 @@ struct SendView: View {
                     // Available balance
                     availableBalance
 
+                    // Pending transaction warning
+                    if hasPendingTransaction {
+                        HStack(spacing: 8) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .foregroundColor(theme.warningColor)
+                            Text("Transaction pending - wait for confirmation")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.warningColor)
+                        }
+                        .padding(.vertical, 8)
+                    }
+
                     // Send button
-                    System7Button(title: isSending ? "Sending..." : "Send ZCL") {
+                    System7Button(title: sendButtonTitle) {
                         validateAndConfirm()
                     }
-                    .disabled(isSending || !isValidInput)
+                    .disabled(isSending || !isValidInput || hasPendingTransaction)
                 }
                 .padding()
             }
@@ -474,9 +486,36 @@ struct SendView: View {
         }
 
         // Check sufficient funds
-        let zatoshis = UInt64(amountValue * 100_000_000)
+        // Use round() to avoid floating-point precision loss (e.g., 0.0012 becoming 0.00119999...)
+        let zatoshis = UInt64(round(amountValue * 100_000_000))
         let fee: UInt64 = 10000
         return zatoshis + fee <= walletManager.shieldedBalance
+    }
+
+    /// Check if there's a pending outgoing transaction that hasn't confirmed yet
+    private var hasPendingTransaction: Bool {
+        // Check both mempoolOutgoing and lastSendTimestamp with pending balance
+        if networkManager.mempoolOutgoing > 0 {
+            return true
+        }
+        // Also check if we sent recently and balance hasn't stabilized
+        if let lastSend = walletManager.lastSendTimestamp,
+           Date().timeIntervalSince(lastSend) < 300.0, // 5 minutes window
+           walletManager.pendingBalance > 0 {
+            return true
+        }
+        return false
+    }
+
+    /// Dynamic button title based on state
+    private var sendButtonTitle: String {
+        if isSending {
+            return "Sending..."
+        } else if hasPendingTransaction {
+            return "Pending..."
+        } else {
+            return "Send ZCL"
+        }
     }
 
     // MARK: - Actions
@@ -501,7 +540,8 @@ struct SendView: View {
     private func sendTransaction() {
         // Require Face ID / Touch ID authentication before sending
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        let zatoshis = UInt64((Double(normalizedAmount) ?? 0) * 100_000_000)
+        // Use round() to avoid floating-point precision loss
+        let zatoshis = UInt64(round((Double(normalizedAmount) ?? 0) * 100_000_000))
 
         BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { [self] success, error in
             if success {
@@ -542,7 +582,8 @@ struct SendView: View {
                 guard let amountValue = Double(normalizedAmount) else {
                     throw WalletError.invalidAddress("Invalid amount")
                 }
-                let zatoshis = UInt64(amountValue * 100_000_000)
+                // Use round() to avoid floating-point precision loss (e.g., 0.0012 -> 119999 instead of 120000)
+                let zatoshis = UInt64(round(amountValue * 100_000_000))
 
                 // Step 2-6: Building transaction (handled by TransactionBuilder with callbacks)
                 await updateStep("prover", status: .inProgress)

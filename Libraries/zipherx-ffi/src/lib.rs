@@ -886,9 +886,60 @@ pub unsafe extern "C" fn zipherx_decode_spending_key(
 // Transaction Building - Sapling Proofs
 // =============================================================================
 
-/// Initialize the prover with Sapling parameters
+/// Initialize the prover with Sapling parameters from raw byte arrays
+/// Use this when file access from Rust is restricted (e.g., Hardened Runtime)
+/// Swift reads the files and passes the bytes to Rust
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
+    spend_data: *const u8,
+    spend_len: usize,
+    output_data: *const u8,
+    output_len: usize,
+) -> bool {
+    eprintln!("📁 Loading Sapling params from memory:");
+    eprintln!("   Spend:  {} bytes", spend_len);
+    eprintln!("   Output: {} bytes", output_len);
+
+    // Verify expected file sizes
+    if spend_len != 47958396 {
+        eprintln!("❌ Spend params has wrong size! Got {}, expected 47958396", spend_len);
+        return false;
+    }
+    if output_len != 3592860 {
+        eprintln!("❌ Output params has wrong size! Got {}, expected 3592860", output_len);
+        return false;
+    }
+
+    // Create slices from the raw pointers
+    let spend_bytes = std::slice::from_raw_parts(spend_data, spend_len);
+    let output_bytes = std::slice::from_raw_parts(output_data, output_len);
+
+    eprintln!("📂 Loading prover from memory...");
+
+    // Load the prover with Sapling parameters from bytes
+    let prover = std::panic::catch_unwind(|| {
+        LocalTxProver::from_bytes(spend_bytes, output_bytes)
+    });
+
+    match prover {
+        Ok(p) => {
+            let mut global_prover = PROVER.lock().unwrap();
+            *global_prover = Some(p);
+            eprintln!("✅ Prover initialized from memory");
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Prover initialization panicked: {:?}", e);
+            eprintln!("   This usually means the params are corrupted or have wrong format");
+            false
+        }
+    }
+}
+
+/// Initialize the prover with Sapling parameters from file paths
 /// Must be called before building transactions
 /// spend_path and output_path are paths to sapling-spend.params and sapling-output.params
+/// NOTE: May fail on macOS with Hardened Runtime - use zipherx_init_prover_from_bytes instead
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_init_prover(
     spend_path: *const i8,
@@ -1208,6 +1259,291 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     }
 
     debug_log!("✅ Transaction built: {} bytes", tx_bytes.len());
+
+    // Copy to output
+    if tx_bytes.len() > 10000 {
+        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+}
+
+/// Spend information for multi-input transactions
+/// Passed as an array of pointers to this struct
+#[repr(C)]
+pub struct SpendInfo {
+    /// Serialized IncrementalWitness data
+    pub witness_data: *const u8,
+    /// Length of witness data
+    pub witness_len: usize,
+    /// Note value in zatoshis
+    pub note_value: u64,
+    /// Note commitment randomness (32 bytes)
+    pub note_rcm: *const u8,
+    /// Note diversifier (11 bytes)
+    pub note_diversifier: *const u8,
+}
+
+/// Build a shielded transaction with multiple input notes
+///
+/// This allows spending from multiple notes in a single transaction,
+/// enabling transactions larger than any single note.
+///
+/// # Safety
+/// - sk: 169-byte ExtendedSpendingKey
+/// - to_address: 43-byte payment address
+/// - amount: amount to send in zatoshis
+/// - memo: 512-byte memo or null for empty
+/// - spends: array of SpendInfo pointers
+/// - spend_count: number of spends
+/// - chain_height: current chain height for branch ID selection
+/// - tx_out: output buffer (should be at least 10000 bytes)
+/// - tx_out_len: receives actual transaction length
+/// - nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
+///
+/// Returns true on success, false on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_multi(
+    sk: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    spends: *const *const SpendInfo,
+    spend_count: usize,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+    nullifiers_out: *mut u8,
+) -> bool {
+    if spend_count == 0 || spend_count > 100 {
+        eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
+        return false;
+    }
+
+    // Get the prover
+    let prover_guard = PROVER.lock().unwrap();
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // Parse inputs
+    let sk_slice = slice::from_raw_parts(sk, 169);
+    let to_addr_slice = slice::from_raw_parts(to_address, 43);
+
+    // Deserialize spending key
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // Parse destination address
+    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // Calculate fee (standard 10000 zatoshis)
+    let fee = 10000u64;
+
+    // Parse all spends and calculate total input value
+    let spend_infos = slice::from_raw_parts(spends, spend_count);
+    let mut total_input: u64 = 0;
+    let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
+
+    for (i, spend_ptr) in spend_infos.iter().enumerate() {
+        let spend = &**spend_ptr;
+
+        let witness_slice = slice::from_raw_parts(spend.witness_data, spend.witness_len);
+        let rcm_slice = slice::from_raw_parts(spend.note_rcm, 32);
+        let div_slice = slice::from_raw_parts(spend.note_diversifier, 11);
+
+        // Parse note commitment randomness
+        let mut rcm_bytes = [0u8; 32];
+        rcm_bytes.copy_from_slice(rcm_slice);
+        let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+            Some(r) => r,
+            None => {
+                eprintln!("❌ Invalid rcm for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse diversifier
+        let mut div_bytes = [0u8; 11];
+        div_bytes.copy_from_slice(div_slice);
+        let diversifier = Diversifier(div_bytes);
+
+        // Get the address that received this note using the note's diversifier
+        let fvk = extsk.to_diversifiable_full_viewing_key();
+        let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("❌ Invalid diversifier for spend {}", i);
+                return false;
+            }
+        };
+
+        // Create note to spend
+        let note = zcash_primitives::sapling::Note::from_parts(
+            note_addr,
+            NoteValue::from_raw(spend.note_value),
+            Rseed::BeforeZip212(rcm),
+        );
+
+        // Deserialize witness
+        let mut reader = std::io::Cursor::new(witness_slice);
+        let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("❌ Failed to deserialize witness for spend {}: {:?}", i, e);
+                    return false;
+                }
+            };
+
+        // Get merkle path
+        let merkle_path = match witness.path() {
+            Some(p) => p,
+            None => {
+                eprintln!("❌ Failed to get merkle path for spend {}", i);
+                return false;
+            }
+        };
+
+        total_input += spend.note_value;
+        parsed_spends.push((note, merkle_path, diversifier));
+
+        debug_log!("📝 Spend {}: value={} zatoshis", i, spend.note_value);
+    }
+
+    debug_log!("📊 Multi-input tx: {} spends, total input = {} zatoshis", spend_count, total_input);
+
+    // Verify funds
+    if total_input < amount + fee {
+        eprintln!("❌ Insufficient funds: have {}, need {} (amount={} + fee={})",
+                  total_input, amount + fee, amount, fee);
+        return false;
+    }
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Verify branch ID
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔑 Branch ID: 0x{:08x} at height {}", branch_id_u32, chain_height);
+
+    if chain_height >= 707000 && branch_id_u32 != 0x930b540d {
+        eprintln!("❌ ERROR: At height {}, expected branch ID 0x930b540d (Buttercup) but got 0x{:08x}", chain_height, branch_id_u32);
+    }
+
+    // Add all spends
+    for (i, (note, merkle_path, diversifier)) in parsed_spends.iter().enumerate() {
+        if let Err(e) = builder.add_sapling_spend(
+            extsk.clone(),
+            *diversifier,
+            note.clone(),
+            merkle_path.clone(),
+        ) {
+            eprintln!("❌ Failed to add spend {}: {:?}", i, e);
+            return false;
+        }
+        debug_log!("✅ Spend {} added successfully", i);
+    }
+
+    // Prepare memo
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        let memo_slice = slice::from_raw_parts(memo, 512);
+        let mut m = [0u8; 512];
+        m.copy_from_slice(memo_slice);
+        m
+    };
+    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+
+    // Add output to recipient
+    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // Add change output if needed
+    let change = total_input - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let (_, change_addr) = extsk.default_address();
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+        debug_log!("💰 Change output: {} zatoshis", change);
+    }
+
+    // Build the transaction with proofs
+    debug_log!("🔨 Building multi-input transaction...");
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // Compute and output nullifiers for all spent notes
+    // Get the nullifier deriving key (nk) from the viewing key
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let nk = dfvk.fvk().vk.nk;
+
+    for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
+        // Get position from merkle path
+        let position = u64::try_from(merkle_path.position()).unwrap_or(0);
+
+        // Compute nullifier using proper PRF_nf
+        let nf_result = note.nf(&nk, position);
+        let nf_bytes = nf_result.0;
+
+        // Copy to output buffer
+        let offset = i * 32;
+        std::ptr::copy_nonoverlapping(nf_bytes.as_ptr(), nullifiers_out.add(offset), 32);
+        debug_log!("🔐 Nullifier {}: {}", i, hex::encode(&nf_bytes));
+    }
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    debug_log!("✅ Multi-input transaction built: {} bytes, {} spends", tx_bytes.len(), spend_count);
 
     // Copy to output
     if tx_bytes.len() > 10000 {

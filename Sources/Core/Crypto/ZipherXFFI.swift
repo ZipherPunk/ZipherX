@@ -403,12 +403,32 @@ enum ZipherXFFI {
 
     // MARK: - Transaction Building
 
-    /// Initialize the prover with Sapling parameters
-    /// Must be called before building transactions
+    /// Initialize the prover with Sapling parameters from file paths
+    /// NOTE: May fail on macOS with Hardened Runtime - use initProverFromBytes instead
     static func initProver(spendParamsPath: String, outputParamsPath: String) -> Bool {
         return spendParamsPath.withCString { spendPtr in
             outputParamsPath.withCString { outputPtr in
                 zipherx_init_prover(spendPtr, outputPtr)
+            }
+        }
+    }
+
+    /// Initialize the prover with Sapling parameters from raw byte arrays
+    /// Use this when file access from Rust is restricted (e.g., macOS Hardened Runtime)
+    /// Swift reads the files and passes the bytes to Rust
+    static func initProverFromBytes(spendData: Data, outputData: Data) -> Bool {
+        return spendData.withUnsafeBytes { spendPtr in
+            guard let spendBaseAddress = spendPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            return outputData.withUnsafeBytes { outputPtr in
+                guard let outputBaseAddress = outputPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return false
+                }
+                return zipherx_init_prover_from_bytes(
+                    spendBaseAddress, spendData.count,
+                    outputBaseAddress, outputData.count
+                )
             }
         }
     }
@@ -476,6 +496,116 @@ enum ZipherXFFI {
         }
 
         return Data(txOutput.prefix(txLen))
+    }
+
+    /// Spend information for multi-input transactions
+    struct SpendInfoSwift {
+        let witness: Data
+        let value: UInt64
+        let rcm: Data
+        let diversifier: Data
+    }
+
+    /// Build a multi-input shielded transaction
+    /// Returns tuple of (raw transaction bytes, array of nullifiers for spent notes)
+    static func buildTransactionMulti(
+        spendingKey: Data,
+        toAddress: Data,
+        amount: UInt64,
+        memo: Data?,
+        spends: [SpendInfoSwift],
+        chainHeight: UInt64
+    ) -> (txData: Data, nullifiers: [Data])? {
+        guard spendingKey.count == 169,
+              toAddress.count == 43,
+              !spends.isEmpty,
+              spends.count <= 100 else {
+            print("❌ buildTransactionMulti: invalid inputs")
+            return nil
+        }
+
+        // Validate all spends
+        for (i, spend) in spends.enumerated() {
+            guard spend.rcm.count == 32,
+                  spend.diversifier.count == 11,
+                  !spend.witness.isEmpty else {
+                print("❌ buildTransactionMulti: invalid spend \(i)")
+                return nil
+            }
+        }
+
+        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txLen: Int = 0
+        var nullifiersOutput = [UInt8](repeating: 0, count: 32 * spends.count)
+
+        let memoData = memo ?? Data(repeating: 0, count: 512)
+        guard memoData.count == 512 else { return nil }
+
+        // Create C-compatible SpendInfo structs
+        // We need to keep references to the data alive during the FFI call
+        var spendInfos: [SpendInfo] = []
+        var witnessBuffers: [[UInt8]] = []
+        var rcmBuffers: [[UInt8]] = []
+        var divBuffers: [[UInt8]] = []
+
+        for spend in spends {
+            witnessBuffers.append(Array(spend.witness))
+            rcmBuffers.append(Array(spend.rcm))
+            divBuffers.append(Array(spend.diversifier))
+        }
+
+        // Create SpendInfo structs pointing to our buffers
+        for i in 0..<spends.count {
+            let info = SpendInfo(
+                witness_data: UnsafePointer(witnessBuffers[i]),
+                witness_len: witnessBuffers[i].count,
+                note_value: spends[i].value,
+                note_rcm: UnsafePointer(rcmBuffers[i]),
+                note_diversifier: UnsafePointer(divBuffers[i])
+            )
+            spendInfos.append(info)
+        }
+
+        // Create array of pointers to SpendInfo
+        var spendPtrs: [UnsafePointer<SpendInfo>?] = []
+        for i in 0..<spendInfos.count {
+            spendPtrs.append(withUnsafePointer(to: &spendInfos[i]) { $0 })
+        }
+
+        let success = spendingKey.withUnsafeBytes { skPtr in
+            toAddress.withUnsafeBytes { toPtr in
+                memoData.withUnsafeBytes { memoPtr in
+                    spendPtrs.withUnsafeBufferPointer { spendsPtr in
+                        zipherx_build_transaction_multi(
+                            skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            toPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            amount,
+                            memoPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            spendsPtr.baseAddress,
+                            spends.count,
+                            chainHeight,
+                            &txOutput,
+                            &txLen,
+                            &nullifiersOutput
+                        )
+                    }
+                }
+            }
+        }
+
+        guard success, txLen > 0 else {
+            return nil
+        }
+
+        // Extract nullifiers
+        var nullifiers: [Data] = []
+        for i in 0..<spends.count {
+            let offset = i * 32
+            let nfData = Data(nullifiersOutput[offset..<(offset + 32)])
+            nullifiers.append(nfData)
+        }
+
+        return (Data(txOutput.prefix(txLen)), nullifiers)
     }
 
     /// Compute a value commitment

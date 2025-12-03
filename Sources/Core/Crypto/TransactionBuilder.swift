@@ -36,6 +36,7 @@ final class TransactionBuilder {
     // MARK: - Prover Initialization
 
     /// Initialize the prover with Sapling parameters
+    /// Uses bytes-based loading to avoid macOS Hardened Runtime file access restrictions
     func initializeProver() throws {
         guard !proverInitialized else { return }
 
@@ -44,10 +45,28 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        let spendPath = params.spendParamsPath.path
-        let outputPath = params.outputParamsPath.path
+        // Load param files in Swift (which has full file access)
+        // Then pass bytes to Rust (avoids Hardened Runtime file access restrictions)
+        let spendPath = params.spendParamsPath
+        let outputPath = params.outputParamsPath
 
-        guard ZipherXFFI.initProver(spendParamsPath: spendPath, outputParamsPath: outputPath) else {
+        print("📁 Loading Sapling params from Swift:")
+        print("   Spend:  \(spendPath.path)")
+        print("   Output: \(outputPath.path)")
+
+        guard let spendData = try? Data(contentsOf: spendPath) else {
+            print("❌ Failed to read spend params file")
+            throw TransactionError.proofGenerationFailed
+        }
+        guard let outputData = try? Data(contentsOf: outputPath) else {
+            print("❌ Failed to read output params file")
+            throw TransactionError.proofGenerationFailed
+        }
+
+        print("📂 Loaded params: spend=\(spendData.count) bytes, output=\(outputData.count) bytes")
+
+        // Initialize prover using bytes (avoids Rust file access issues)
+        guard ZipherXFFI.initProverFromBytes(spendData: spendData, outputData: outputData) else {
             throw TransactionError.proofGenerationFailed
         }
 
@@ -154,12 +173,29 @@ final class TransactionBuilder {
         // Get spendable notes with FRESH witnesses
         let notes = try await getSpendableNotes(for: from, spendingKey: spendingKey)
 
-        // Select notes to spend
-        let (selectedNotes, _) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
+        // CURRENT LIMITATION: Single-note transactions only
+        // Find the largest note that can cover the amount + fee
+        let requiredAmount = amount + DEFAULT_FEE
+        let sortedNotes = notes.sorted { $0.value > $1.value }
 
-        guard let note = selectedNotes.first else {
-            throw TransactionError.insufficientFunds
+        // Find a single note large enough for the transaction
+        guard let note = sortedNotes.first(where: { $0.value >= requiredAmount }) else {
+            // Calculate what the user CAN send with their largest note
+            let largestNote = sortedNotes.first?.value ?? 0
+            let maxSendable = largestNote > DEFAULT_FEE ? largestNote - DEFAULT_FEE : 0
+            let totalBalance = notes.reduce(0) { $0 + $1.value }
+
+            print("❌ No single note large enough for this transaction")
+            print("   Required: \(requiredAmount) zatoshis (amount: \(amount) + fee: \(DEFAULT_FEE))")
+            print("   Largest note: \(largestNote) zatoshis")
+            print("   Max sendable: \(maxSendable) zatoshis (\(Double(maxSendable) / 100_000_000) ZCL)")
+            print("   Total balance: \(totalBalance) zatoshis across \(notes.count) notes")
+            print("   NOTE: Multi-input transactions not yet supported - must use single note")
+
+            throw TransactionError.noteLargeEnough(largestNote: largestNote, required: requiredAmount)
         }
+
+        print("📝 Selected note: \(note.value) zatoshis at height \(note.height)")
 
         // Prepare memo (512 bytes)
         var memoData = Data(repeating: 0, count: 512)
@@ -396,11 +432,39 @@ final class TransactionBuilder {
 
         // Get spendable notes
         let notes = try await getSpendableNotes(for: from, spendingKey: spendingKey)
-        let (selectedNotes, _) = try selectNotes(notes, targetAmount: amount + DEFAULT_FEE)
 
-        guard let note = selectedNotes.first else {
+        // Note selection - prefer single note, fall back to multi-input
+        let requiredAmount = amount + DEFAULT_FEE
+        let sortedNotes = notes.sorted { $0.value > $1.value }
+        let totalBalance = notes.reduce(0) { $0 + $1.value }
+
+        // Check if we have enough total balance
+        guard totalBalance >= requiredAmount else {
+            print("❌ Insufficient total balance: have \(totalBalance), need \(requiredAmount)")
             throw TransactionError.insufficientFunds
         }
+
+        // Try to find a single note large enough (preferred for simplicity/fee)
+        var selectedNotes: [SpendableNote] = []
+        if let singleNote = sortedNotes.first(where: { $0.value >= requiredAmount }) {
+            selectedNotes = [singleNote]
+            print("📝 Single note selected: \(singleNote.value) zatoshis at height \(singleNote.height)")
+        } else {
+            // Multi-input mode: select notes until we have enough
+            print("📝 No single note large enough, using multi-input mode...")
+            var accumulated: UInt64 = 0
+            for note in sortedNotes {
+                selectedNotes.append(note)
+                accumulated += note.value
+                print("   + Note: \(note.value) zatoshis (running total: \(accumulated))")
+                if accumulated >= requiredAmount {
+                    break
+                }
+            }
+            print("📝 Selected \(selectedNotes.count) notes totaling \(accumulated) zatoshis")
+        }
+
+        let isMultiInput = selectedNotes.count > 1
 
         // Prepare memo
         var memoData = Data(repeating: 0, count: 512)
@@ -411,86 +475,134 @@ final class TransactionBuilder {
 
         onProgress("witness", nil, nil)
 
-        // Get anchor and rebuild witness
+        // Get anchor and rebuild witnesses for all selected notes
         let headerStore = HeaderStore.shared
         try? headerStore.open()
 
-        let noteHeight = note.height
-        var anchorFromHeader: Data
+        // Prepare witnesses for all selected notes
+        var preparedSpends: [(note: SpendableNote, witness: Data)] = []
 
-        if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
-            anchorFromHeader = noteHeader.hashFinalSaplingRoot
-        } else {
-            anchorFromHeader = Data(count: 32)
-        }
+        for (index, note) in selectedNotes.enumerated() {
+            print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
 
-        var witnessToUse = note.witness
-        let needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
+            var witnessToUse = note.witness
+            let needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
+            let noteCMU = note.cmu
+            let noteHeight = note.height
 
-        let noteCMU = note.cmu
-
-        // OPTIMIZATION: If witness is valid AND anchor matches tree root → INSTANT mode!
-        // Only rebuild if witness is missing/invalid
-        if !needsRebuild && note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
-            if let currentTreeRoot = ZipherXFFI.treeRoot(), note.anchor == currentTreeRoot {
-                print("✅ Witness is current (anchor matches tree root) - INSTANT mode!")
-                // Use stored witness and current tree root as anchor
-                anchorFromHeader = currentTreeRoot
-            }
-        }
-
-        // Only rebuild witness if needed (missing, invalid, or anchor mismatch)
-        if needsRebuild && noteHeight > bundledTreeHeight {
-            guard let cmu = noteCMU else {
-                throw TransactionError.proofGenerationFailed
-            }
-
-            print("⚠️ Witness needs rebuild for note at height \(noteHeight)")
-            if let result = try await rebuildWitnessForNote(
-                cmu: cmu,
-                noteHeight: noteHeight,
-                bundledTreeHeight: bundledTreeHeight
-            ) {
-                witnessToUse = result.witness
-                if anchorFromHeader.allSatisfy({ $0 == 0 }) {
-                    anchorFromHeader = result.anchor
+            // OPTIMIZATION: If witness is valid AND anchor matches tree root → INSTANT mode!
+            if !needsRebuild && note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+                if let currentTreeRoot = ZipherXFFI.treeRoot(), note.anchor == currentTreeRoot {
+                    print("✅ Note \(index + 1) witness is current - INSTANT mode!")
                 }
-            } else {
-                throw TransactionError.proofGenerationFailed
-            }
-        } else if needsRebuild, let cmu = noteCMU {
-            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                throw TransactionError.proofGenerationFailed
             }
 
-            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
-                witnessToUse = result.witness
-            } else {
-                throw TransactionError.proofGenerationFailed
+            // Only rebuild witness if needed
+            if needsRebuild && noteHeight > bundledTreeHeight {
+                guard let cmu = noteCMU else {
+                    print("❌ Note \(index + 1) has no CMU for witness rebuild")
+                    throw TransactionError.proofGenerationFailed
+                }
+
+                print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight)")
+                if let result = try await rebuildWitnessForNote(
+                    cmu: cmu,
+                    noteHeight: noteHeight,
+                    bundledTreeHeight: bundledTreeHeight
+                ) {
+                    witnessToUse = result.witness
+                } else {
+                    throw TransactionError.proofGenerationFailed
+                }
+            } else if needsRebuild, let cmu = noteCMU {
+                guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                      let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                    throw TransactionError.proofGenerationFailed
+                }
+
+                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                    witnessToUse = result.witness
+                } else {
+                    print("❌ Failed to create witness for note \(index + 1)")
+                    throw TransactionError.proofGenerationFailed
+                }
             }
+
+            preparedSpends.append((note: note, witness: witnessToUse))
         }
 
         onProgress("proof", nil, nil)
 
-        // Build transaction
-        guard let rawTx = ZipherXFFI.buildTransaction(
-            spendingKey: spendingKey,
-            toAddress: toAddressBytes,
-            amount: amount,
-            memo: memoData,
-            anchor: anchorFromHeader,
-            witness: witnessToUse,
-            noteValue: note.value,
-            noteRcm: note.rcm,
-            noteDiversifier: note.diversifier,
-            chainHeight: chainHeight
-        ) else {
-            throw TransactionError.proofGenerationFailed
-        }
+        if isMultiInput {
+            // MULTI-INPUT TRANSACTION
+            print("🔨 Building multi-input transaction with \(preparedSpends.count) spends...")
 
-        print("✅ Transaction built: \(rawTx.count) bytes")
-        return (rawTx, note.nullifier)
+            // Convert to SpendInfoSwift array
+            var spendInfos: [ZipherXFFI.SpendInfoSwift] = []
+            for (note, witness) in preparedSpends {
+                let info = ZipherXFFI.SpendInfoSwift(
+                    witness: witness,
+                    value: note.value,
+                    rcm: note.rcm,
+                    diversifier: note.diversifier
+                )
+                spendInfos.append(info)
+            }
+
+            // Build multi-input transaction
+            guard let result = ZipherXFFI.buildTransactionMulti(
+                spendingKey: spendingKey,
+                toAddress: toAddressBytes,
+                amount: amount,
+                memo: memoData,
+                spends: spendInfos,
+                chainHeight: chainHeight
+            ) else {
+                print("❌ Multi-input transaction build failed")
+                throw TransactionError.proofGenerationFailed
+            }
+
+            print("✅ Multi-input transaction built: \(result.txData.count) bytes, \(result.nullifiers.count) nullifiers")
+
+            // Return first nullifier (for primary tracking) - TODO: track all nullifiers
+            let primaryNullifier = result.nullifiers.first ?? preparedSpends[0].note.nullifier
+            return (result.txData, primaryNullifier)
+
+        } else {
+            // SINGLE-INPUT TRANSACTION (existing logic)
+            let note = preparedSpends[0].note
+            let witnessToUse = preparedSpends[0].witness
+            let noteHeight = note.height
+
+            // Get anchor from header store
+            var anchorFromHeader: Data
+            if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+                anchorFromHeader = noteHeader.hashFinalSaplingRoot
+            } else if let currentTreeRoot = ZipherXFFI.treeRoot() {
+                anchorFromHeader = currentTreeRoot
+            } else {
+                anchorFromHeader = Data(count: 32)
+            }
+
+            // Build single-input transaction
+            guard let rawTx = ZipherXFFI.buildTransaction(
+                spendingKey: spendingKey,
+                toAddress: toAddressBytes,
+                amount: amount,
+                memo: memoData,
+                anchor: anchorFromHeader,
+                witness: witnessToUse,
+                noteValue: note.value,
+                noteRcm: note.rcm,
+                noteDiversifier: note.diversifier,
+                chainHeight: chainHeight
+            ) else {
+                throw TransactionError.proofGenerationFailed
+            }
+
+            print("✅ Transaction built: \(rawTx.count) bytes")
+            return (rawTx, note.nullifier)
+        }
     }
 
     // MARK: - Note Management
@@ -599,16 +711,84 @@ final class TransactionBuilder {
 
     // MARK: - Address Validation
 
+    /// Bech32 character set for decoding
+    private static let bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+    /// Bech32 generator polynomial for checksum
+    private static let bech32Generator: [UInt32] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+
+    /// Bech32 polymod function for checksum verification
+    private func bech32Polymod(_ values: [UInt8]) -> UInt32 {
+        var chk: UInt32 = 1
+        for v in values {
+            let b = chk >> 25
+            chk = ((chk & 0x1ffffff) << 5) ^ UInt32(v)
+            for i in 0..<5 {
+                if ((b >> i) & 1) == 1 {
+                    chk ^= TransactionBuilder.bech32Generator[i]
+                }
+            }
+        }
+        return chk
+    }
+
+    /// Expand human-readable part for checksum calculation
+    private func bech32HrpExpand(_ hrp: String) -> [UInt8] {
+        var ret: [UInt8] = []
+        for c in hrp.utf8 {
+            ret.append(c >> 5)
+        }
+        ret.append(0)
+        for c in hrp.utf8 {
+            ret.append(c & 31)
+        }
+        return ret
+    }
+
+    /// Verify Bech32 checksum
+    private func bech32VerifyChecksum(_ hrp: String, _ data: [UInt8]) -> Bool {
+        let expanded = bech32HrpExpand(hrp)
+        return bech32Polymod(expanded + data) == 1
+    }
+
+    /// Validate z-address with full Bech32 checksum verification
+    /// SECURITY: Validates checksum to prevent typos and malformed addresses
     private func isValidZAddress(_ address: String) -> Bool {
         // Zclassic Sapling addresses use Bech32 encoding with "zs1" prefix
         guard address.hasPrefix("zs1"), address.count == 78 else {
             return false
         }
 
-        // Bech32 character set (no "1" in data part)
-        let validChars = CharacterSet(charactersIn: "qpzry9x8gf2tvdw0s3jn54khce6mua7l")
-        let addressData = String(address.dropFirst(3))
-        return addressData.unicodeScalars.allSatisfy { validChars.contains($0) }
+        // Find separator (last '1' in address)
+        guard let separatorIndex = address.lastIndex(of: "1") else {
+            return false
+        }
+
+        let hrp = String(address[..<separatorIndex])
+        let dataPart = String(address[address.index(after: separatorIndex)...])
+
+        // Validate HRP
+        guard hrp == "zs" else { return false }
+
+        // Decode Bech32 data part
+        var data: [UInt8] = []
+        for c in dataPart.lowercased() {
+            guard let index = TransactionBuilder.bech32Charset.firstIndex(of: c) else {
+                return false // Invalid character
+            }
+            data.append(UInt8(TransactionBuilder.bech32Charset.distance(from: TransactionBuilder.bech32Charset.startIndex, to: index)))
+        }
+
+        // Verify checksum (last 6 characters)
+        guard data.count >= 6 else { return false }
+
+        // Verify the Bech32 checksum
+        guard bech32VerifyChecksum(hrp, data) else {
+            print("⚠️ SECURITY: Invalid Bech32 checksum for address")
+            return false
+        }
+
+        return true
     }
 
     // MARK: - Witness Rebuild
@@ -799,6 +979,7 @@ enum TransactionError: LocalizedError {
     case proofGenerationFailed
     case signingFailed
     case serializationFailed
+    case noteLargeEnough(largestNote: UInt64, required: UInt64)
 
     var errorDescription: String? {
         switch self {
@@ -812,6 +993,10 @@ enum TransactionError: LocalizedError {
             return "Failed to sign transaction"
         case .serializationFailed:
             return "Failed to serialize transaction"
+        case .noteLargeEnough(let largestNote, let required):
+            let maxSendable = largestNote > 10000 ? largestNote - 10000 : 0
+            let maxZCL = Double(maxSendable) / 100_000_000
+            return "No single note large enough. Your largest note is \(String(format: "%.4f", Double(largestNote) / 100_000_000)) ZCL. Max you can send: \(String(format: "%.4f", maxZCL)) ZCL (multi-note spending coming soon)"
         }
     }
 }

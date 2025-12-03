@@ -60,6 +60,12 @@ final class Peer {
     var peerUserAgent: String = ""
     var peerStartHeight: Int32 = 0
 
+    /// Last time the connection was actively used (for staleness detection)
+    private var lastActivity: Date?
+
+    /// Max idle time before connection is considered stale (in seconds)
+    private let maxIdleTime: TimeInterval = 60
+
     // Block announcement listener
     private var blockListenerTask: Task<Void, Never>?
     private var isListening = false
@@ -246,6 +252,59 @@ final class Peer {
         connection = nil
     }
 
+    /// Check if connection is still ready (not cancelled/failed)
+    var isConnectionReady: Bool {
+        guard let conn = connection else { return false }
+        switch conn.state {
+        case .ready:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Check if connection is stale (idle for too long)
+    private var isConnectionStale: Bool {
+        guard let activity = lastActivity else {
+            // Never used - consider stale if it's been a while since creation
+            return true
+        }
+        return Date().timeIntervalSince(activity) > maxIdleTime
+    }
+
+    /// Reconnect if connection is not ready or stale
+    func ensureConnected() async throws {
+        let needsReconnect = !isConnectionReady || isConnectionStale
+
+        if !needsReconnect {
+            return // Connection is ready and fresh
+        }
+
+        // Log why we're reconnecting
+        if !isConnectionReady {
+            print("🔄 [\(host)] Connection not ready, reconnecting...")
+        } else if isConnectionStale {
+            let idleTime = lastActivity.map { Int(Date().timeIntervalSince($0)) } ?? -1
+            print("🔄 [\(host)] Connection stale (idle \(idleTime)s), reconnecting...")
+        }
+
+        // Disconnect old connection if exists
+        if connection != nil {
+            disconnect()
+        }
+
+        // Reconnect with fresh handshake
+        try await connect()
+        try await performHandshake()
+        lastActivity = Date()
+        print("✅ [\(host)] Reconnected successfully")
+    }
+
+    /// Update last activity timestamp (call after successful message exchange)
+    func markActive() {
+        lastActivity = Date()
+    }
+
     // MARK: - Block Announcement Listener
 
     /// Start listening for block announcements in background
@@ -401,6 +460,7 @@ final class Peer {
         let _ = try await receiveMessage()
 
         recordSuccess()
+        lastActivity = Date() // Mark connection as active after successful handshake
     }
 
     private func parseVersionPayload(_ data: Data) {
@@ -720,6 +780,30 @@ final class Peer {
     }
 
     func getBlockHeaders(from height: UInt64, count: Int) async throws -> [BlockHeader] {
+        // Try once, if it fails with handshake error, force reconnect and retry
+        var retryCount = 0
+        let maxRetries = 1
+
+        while retryCount <= maxRetries {
+            do {
+                return try await getBlockHeadersInternal(from: height, count: count)
+            } catch NetworkError.handshakeFailed {
+                retryCount += 1
+                if retryCount <= maxRetries {
+                    print("🔄 [\(host)] Handshake failed, forcing reconnect...")
+                    disconnect()
+                    try await connect()
+                    try await performHandshake()
+                    print("✅ [\(host)] Reconnected, retrying getBlockHeaders...")
+                } else {
+                    throw NetworkError.handshakeFailed
+                }
+            }
+        }
+        throw NetworkError.handshakeFailed
+    }
+
+    private func getBlockHeadersInternal(from height: UInt64, count: Int) async throws -> [BlockHeader] {
         // Build getheaders message with block locator
         var payload = Data()
 
@@ -773,10 +857,20 @@ final class Peer {
         for _ in 0..<min(headerCount, count) {
             guard offset + headerSize <= response.count else { break }
 
+            // Zcash/Zclassic block header layout (140 bytes base + solution):
+            // 0-3:     version (4 bytes)
+            // 4-35:    prevBlockHash (32 bytes)
+            // 36-67:   merkleRoot (32 bytes)
+            // 68-99:   finalSaplingRoot (32 bytes) - reserved/hashFinalSaplingRoot
+            // 100-103: timestamp (4 bytes)
+            // 104-107: bits (4 bytes)
+            // 108-139: nonce (32 bytes)
+            // 140+:    solution (1344 bytes for Equihash(200,9))
             let header = BlockHeader(
                 version: response.loadInt32(at: offset),
                 prevBlockHash: Data(response[(offset + 4)..<(offset + 36)]),
                 merkleRoot: Data(response[(offset + 36)..<(offset + 68)]),
+                finalSaplingRoot: Data(response[(offset + 68)..<(offset + 100)]),
                 timestamp: response.loadUInt32(at: offset + 100),
                 bits: response.loadUInt32(at: offset + 104),
                 nonce: Data(response[(offset + 108)..<(offset + 140)]),
@@ -933,7 +1027,11 @@ final class Peer {
         // - Equihash solution (compactSize + solution)
         // - Transaction count (compactSize)
         // - Transactions
-        guard data.count >= 140 else { return nil }
+        debugLog(.network, "📦 P2P BLOCK: Parsing block data, size=\(data.count) bytes")
+        guard data.count >= 140 else {
+            debugLog(.error, "❌ P2P BLOCK: Too small, need at least 140 bytes")
+            return nil
+        }
 
         var offset = 0
 
@@ -965,7 +1063,12 @@ final class Peer {
         // Equihash solution follows: compactSize + solution data
         let (solutionSize, solutionSizeBytes) = readCompactSize(data, at: offset)
         offset += solutionSizeBytes
-        offset += Int(solutionSize) // Skip solution data
+        // Zclassic uses compressed Equihash solutions (400 bytes), not uncompressed (1344 bytes)
+        let safeSolutionSize = min(solutionSize, 10000)
+        guard offset + Int(safeSolutionSize) <= data.count else {
+            return nil
+        }
+        offset += Int(safeSolutionSize) // Skip solution data
 
         // Compute block hash from header + solution
         let headerAndSolution = data.prefix(offset)
@@ -982,8 +1085,10 @@ final class Peer {
         // Read transaction count (compactSize)
         let (txCount, txCountBytes) = readCompactSize(data, at: offset)
         offset += txCountBytes
+        // Sanity limit - blocks rarely have >10000 transactions
+        let safeTxCount = min(txCount, 100000)
 
-        for txIndex in 0..<Int(txCount) {
+        for txIndex in 0..<Int(safeTxCount) {
             guard offset < data.count else { break }
 
             // Parse full Zcash v4 transaction
@@ -1039,6 +1144,7 @@ final class Peer {
         var outputs: [CompactOutput] = []
 
         guard pos + 4 <= data.count else {
+            debugLog(.network, "❌ P2P TX: Not enough data for header at offset \(offset)")
             return (Data(repeating: 0, count: 32), [], [], pos)
         }
 
@@ -1048,28 +1154,46 @@ final class Peer {
         let fOverwintered = (header & 0x80000000) != 0
         pos += 4
 
+        debugLog(.network, "📋 P2P TX: offset=\(offset) header=0x\(String(format: "%08X", header)) v\(version) overwinter=\(fOverwintered)")
+
         // Check for Sapling transaction (v4 with overwintered)
         guard fOverwintered && version >= 4 else {
             // Not a Sapling transaction - skip it entirely
-            // For older versions, we can't reliably parse, so skip
+            debugLog(.network, "⏭️ P2P TX: Not Sapling (v\(version), overwinter=\(fOverwintered)) - skipping")
             return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
         }
 
         // nVersionGroupId (4 bytes)
         guard pos + 4 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
+        let versionGroupId = data.loadUInt32(at: pos)
         pos += 4
+
+        // Verify Sapling version group ID (0x892F2085)
+        guard versionGroupId == 0x892F2085 else {
+            // Not a Sapling transaction - could be Overwinter (0x03C48270) or other
+            debugLog(.network, "⏭️ P2P TX: Not Sapling versionGroupId=0x\(String(format: "%08X", versionGroupId)) - skipping")
+            return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
+        }
 
         // vin (transparent inputs)
         let (vinCount, vinBytes) = readCompactSize(data, at: pos)
         pos += vinBytes
-        for _ in 0..<vinCount {
+        debugLog(.network, "📋 P2P TX: vinCount=\(vinCount) pos=\(pos)")
+        // Sanity limit - transactions rarely have >1000 inputs
+        let safeVinCount = min(vinCount, 10000)
+        for _ in 0..<safeVinCount {
+            guard pos < data.count else { break }
             pos = skipTransparentInput(data, offset: pos)
         }
 
         // vout (transparent outputs)
         let (voutCount, voutBytes) = readCompactSize(data, at: pos)
         pos += voutBytes
-        for _ in 0..<voutCount {
+        debugLog(.network, "📋 P2P TX: voutCount=\(voutCount) pos after vin=\(pos)")
+        // Sanity limit - transactions rarely have >1000 outputs
+        let safeVoutCount = min(voutCount, 10000)
+        for _ in 0..<safeVoutCount {
+            guard pos < data.count else { break }
             pos = skipTransparentOutput(data, offset: pos)
         }
 
@@ -1085,11 +1209,16 @@ final class Peer {
         guard pos + 8 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
         pos += 8
 
+        debugLog(.network, "📋 P2P TX: pos after locktime/expiry/valueBalance=\(pos)")
+
         // vShieldedSpend
         let (spendCount, spendBytes) = readCompactSize(data, at: pos)
         pos += spendBytes
+        debugLog(.network, "📋 P2P TX: spendCount=\(spendCount)")
+        // Sanity limit - Sapling transactions rarely have >100 spends
+        let safeSpendCount = min(spendCount, 10000)
 
-        for _ in 0..<spendCount {
+        for _ in 0..<safeSpendCount {
             // SpendDescription: cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
             // Total: 384 bytes
             guard pos + 384 <= data.count else { break }
@@ -1118,11 +1247,17 @@ final class Peer {
         // vShieldedOutput
         let (outputCount, outputBytes) = readCompactSize(data, at: pos)
         pos += outputBytes
+        debugLog(.network, "📋 P2P TX: outputCount=\(outputCount)")
+        // Sanity limit - Sapling transactions rarely have >100 outputs
+        let safeOutputCount = min(outputCount, 10000)
 
-        for _ in 0..<outputCount {
+        for i in 0..<safeOutputCount {
             // OutputDescription: cv(32) + cmu(32) + ephemeralKey(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
             // Total: 948 bytes
-            guard pos + 948 <= data.count else { break }
+            guard pos + 948 <= data.count else {
+                debugLog(.error, "❌ P2P TX: Not enough data for output \(i) at pos=\(pos), need 948, have \(data.count - pos)")
+                break
+            }
 
             // cv (32 bytes) - skip
             pos += 32
@@ -1140,6 +1275,7 @@ final class Peer {
             pos += 580
 
             outputs.append(CompactOutput(cmu: cmu, epk: epk, ciphertext: ciphertext))
+            debugLog(.network, "📋 P2P TX: Output[\(i)] cmu=\(cmu.prefix(8).hexString)...")
 
             // outCiphertext (80 bytes) - skip
             pos += 80
@@ -1151,28 +1287,33 @@ final class Peer {
         // JoinSplits (usually empty for Sapling era)
         let (jsCount, jsBytes) = readCompactSize(data, at: pos)
         pos += jsBytes
-        if jsCount > 0 {
+        if jsCount > 0 && jsCount < 10000 { // Sanity check - JoinSplits are rare in Sapling era
             // Skip JoinSplit data (each is 1698 bytes + 64 byte sig if any)
-            pos += Int(jsCount) * 1698
-            if jsCount > 0 {
+            let jsDataSize = Int(clamping: jsCount) * 1698
+            if pos + jsDataSize + 64 <= data.count {
+                pos += jsDataSize
                 pos += 64 // joinsplitSig
             }
+            // If data doesn't have full JoinSplit, just continue - we already have spends/outputs
         }
+        // If jsCount >= 10000, it's corrupted but we still have spends/outputs, continue
 
         // Binding signature (64 bytes) - only if spends or outputs exist
-        if spendCount > 0 || outputCount > 0 {
+        if (spendCount > 0 || outputCount > 0) && pos + 64 <= data.count {
             pos += 64
         }
 
         // Compute txHash (double SHA256 of the raw transaction)
-        let txEnd = pos
-        guard txEnd > txStart && txEnd <= data.count else {
-            return (Data(repeating: 0, count: 32), spends, outputs, pos)
+        // Use min(pos, data.count) to ensure we don't go past the data
+        let txEnd = min(pos, data.count)
+        guard txEnd > txStart else {
+            return (Data(repeating: 0, count: 32), spends, outputs, txEnd)
         }
         let txData = data[txStart..<txEnd]
         let txHash = Data(txData).doubleSHA256()
 
-        return (txHash, spends, outputs, pos)
+        debugLog(.network, "✅ P2P TX: Parsed successfully - \(spends.count) spends, \(outputs.count) outputs, txHash=\(txHash.reversedBytes().hexString)")
+        return (txHash, spends, outputs, txEnd)
     }
 
     /// Skip a legacy (pre-Sapling) transaction
@@ -1272,6 +1413,9 @@ final class Peer {
 
     /// Get a single block by its hash via P2P getdata
     func getBlockByHash(hash: Data) async throws -> CompactBlock {
+        // Ensure connection is fresh before making request
+        try await ensureConnected()
+
         guard hash.count == 32 else {
             throw PeerError.invalidData
         }
@@ -1332,6 +1476,84 @@ final class Peer {
         }
 
         throw PeerError.timeout
+    }
+
+    /// Get multiple blocks by their hashes via a single P2P getdata message (batch)
+    /// Returns blocks in the order they are received (may differ from request order)
+    func getBlocksByHashes(hashes: [Data]) async throws -> [CompactBlock] {
+        guard !hashes.isEmpty else { return [] }
+
+        // Ensure connection is fresh before making request
+        try await ensureConnected()
+
+        // Validate all hashes
+        for hash in hashes {
+            guard hash.count == 32 else { throw PeerError.invalidData }
+        }
+
+        // Build getdata message for multiple blocks
+        var payload = Data()
+        // Encode count as varint (simple case: count < 253)
+        if hashes.count < 253 {
+            payload.append(UInt8(hashes.count))
+        } else {
+            payload.append(253) // 0xfd prefix
+            payload.append(contentsOf: withUnsafeBytes(of: UInt16(hashes.count).littleEndian) { Array($0) })
+        }
+
+        for hash in hashes {
+            payload.append(contentsOf: withUnsafeBytes(of: UInt32(2).littleEndian) { Array($0) }) // MSG_BLOCK = 2
+            payload.append(hash)
+        }
+
+        try await sendMessage(command: "getdata", payload: payload)
+
+        // Wait for all block responses
+        var blocks: [CompactBlock] = []
+        var attempts = 0
+        let maxAttempts = hashes.count * 30 + 30 // Scale with batch size
+
+        while blocks.count < hashes.count && attempts < maxAttempts {
+            attempts += 1
+
+            do {
+                let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
+                    group.addTask {
+                        try await self.receiveMessage()
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
+                        throw PeerError.timeout
+                    }
+
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    return result
+                }
+
+                let (command, response) = result
+
+                if command == "block" {
+                    if let block = parseCompactBlock(response) {
+                        blocks.append(block)
+                    }
+                } else if command == "notfound" {
+                    // Peer doesn't have one of the blocks - just continue
+                    continue
+                } else if command == "ping" {
+                    try? await sendMessage(command: "pong", payload: response)
+                }
+                // Continue waiting for more block messages
+            } catch is CancellationError {
+                continue
+            } catch PeerError.timeout {
+                // If we have some blocks but hit timeout, return what we have
+                if !blocks.isEmpty { break }
+                continue
+            }
+        }
+
+        return blocks
     }
 
     /// Get a transaction by its hash via P2P getdata
@@ -1608,4 +1830,5 @@ enum BanReason: String {
     case protocolViolation = "Protocol violation"
     case timeout = "Connection/response timeout"
     case corruptedData = "Sent corrupted or invalid data"
+    case fakeChainHeight = "Reported fake chain height (Sybil attack detected)"
 }

@@ -1,5 +1,22 @@
 import Foundation
 
+/// Actor for thread-safe ensuring state (eliminates priority inversion)
+private actor EnsureState {
+    private var isEnsuring = false
+
+    func startEnsuring() -> Bool {
+        if isEnsuring {
+            return false // Already in progress
+        }
+        isEnsuring = true
+        return true
+    }
+
+    func finishEnsuring() {
+        isEnsuring = false
+    }
+}
+
 /// Sapling parameter file manager
 /// Uses BUNDLED params (uncompressed in app bundle) - no download needed!
 /// Falls back to download only if bundle copy fails
@@ -10,9 +27,8 @@ final class SaplingParams {
 
     private let baseURL = "https://z.cash/downloads/"
 
-    // Lock to prevent concurrent ensureParams calls
-    private var isEnsuring = false
-    private let ensureLock = NSLock()
+    // Actor-based state to prevent concurrent ensureParams calls (no priority inversion)
+    private let ensureState = EnsureState()
 
     private let spendParams = (
         name: "sapling-spend.params",
@@ -67,10 +83,9 @@ final class SaplingParams {
     /// Ensure Sapling parameters are available
     /// Priority: 1. Already copied  2. Copy from bundle  3. Download
     func ensureParams() async throws {
-        // Prevent concurrent calls - first one wins, others wait
-        ensureLock.lock()
-        if isEnsuring {
-            ensureLock.unlock()
+        // Prevent concurrent calls - first one wins, others wait (actor-based, no priority inversion)
+        let didStart = await ensureState.startEnsuring()
+        if !didStart {
             debugLog(.params, "⏳ Params already being ensured by another call, waiting...")
             // Wait for the other call to complete
             while !areParamsReady {
@@ -79,13 +94,9 @@ final class SaplingParams {
             debugLog(.params, "✅ Params ready (waited for other call)")
             return
         }
-        isEnsuring = true
-        ensureLock.unlock()
 
         defer {
-            ensureLock.lock()
-            isEnsuring = false
-            ensureLock.unlock()
+            Task { await ensureState.finishEnsuring() }
         }
 
         debugLog(.params, "📋 Ensuring Sapling params are ready...")

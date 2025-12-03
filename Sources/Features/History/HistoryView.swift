@@ -135,7 +135,8 @@ struct HistoryView: View {
                     if let dateString = transaction.dateString {
                         Text(dateString)
                             .font(theme.captionFont)
-                            .foregroundColor(theme.textSecondary)
+                            // Green for received (same as icon/amount), red for sent
+                            .foregroundColor(transaction.type == .received ? Color(red: 0.2, green: 0.8, blue: 0.2) : theme.errorColor)
                     }
 
                     Spacer()
@@ -285,12 +286,13 @@ struct TransactionDetailView: View {
             // Confirmations
             if let confirmations = calculateConfirmations() {
                 HStack(spacing: 4) {
-                    Image(systemName: confirmations >= 6 ? "checkmark.shield.fill" : "clock")
+                    // 0 conf = clock (pending), 1-5 = checkmark (mined), 6+ = shield (fully confirmed)
+                    Image(systemName: confirmations == 0 ? "clock" : (confirmations >= 6 ? "checkmark.shield.fill" : "checkmark.circle.fill"))
                         .font(.system(size: 10))
-                    Text(confirmations >= 6 ? "Confirmed (\(confirmations))" : "\(confirmations) confirmation\(confirmations == 1 ? "" : "s")")
+                    Text(confirmations == 0 ? "Pending" : (confirmations >= 6 ? "Confirmed (\(confirmations))" : "\(confirmations) confirmation\(confirmations == 1 ? "" : "s")"))
                         .font(theme.captionFont)
                 }
-                .foregroundColor(confirmations >= 6 ? theme.successColor : theme.warningColor)
+                .foregroundColor(confirmations == 0 ? theme.warningColor : theme.successColor)
             }
         }
         .padding()
@@ -336,7 +338,7 @@ struct TransactionDetailView: View {
             if let dateString = transaction.dateString {
                 detailRow("Date", dateString)
             } else {
-                detailRow("Date", estimatedDateString(for: transaction.height))
+                detailRow("Date", blockDateString(for: transaction))
             }
 
             // Value in zatoshis
@@ -500,48 +502,29 @@ struct TransactionDetailView: View {
         return max(0, confirmations)
     }
 
-    private func estimatedDateString(for height: UInt64) -> String {
-        // Updated reference point: Dec 3, 2025 ~08:00 UTC
-        let referenceHeight: UInt64 = 2_930_657
-        let referenceTimestamp: TimeInterval = 1733212800 // Dec 3, 2025 08:00 UTC
-        let referenceDate = Date(timeIntervalSince1970: referenceTimestamp)
-
-        let currentHeight = networkManager.chainHeight
-        let currentDate = Date()
-
-        // If we have a valid chain height, use current tip for best accuracy
-        if currentHeight > 0 && height <= currentHeight {
-            let blockDifference = Int64(height) - Int64(currentHeight)
-            let secondsDifference = Double(blockDifference) * 150.0
-            let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
-
-            // SAFETY: Never show future dates for confirmed transactions
-            if estimatedDate > currentDate {
-                let refBlockDiff = Int64(height) - Int64(referenceHeight)
-                let refSecondsDiff = Double(refBlockDiff) * 150.0
-                let refEstimatedDate = referenceDate.addingTimeInterval(refSecondsDiff)
-
-                let formatter = DateFormatter()
-                formatter.dateStyle = .medium
-                formatter.timeStyle = .short
-                return formatter.string(from: refEstimatedDate)
-            }
-
-            let formatter = DateFormatter()
-            formatter.dateStyle = .medium
-            formatter.timeStyle = .short
-            return formatter.string(from: estimatedDate)
-        }
-
-        // Fallback: use reference-based calculation
-        let blockDifference = Int64(height) - Int64(referenceHeight)
-        let secondsDifference = Double(blockDifference) * 150.0
-        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
-
+    /// Format the actual block timestamp for display
+    /// Uses the real mined block time stored in the transaction, NOT an estimate
+    private func blockDateString(for transaction: TransactionHistoryItem) -> String {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
-        return formatter.string(from: estimatedDate)
+
+        // Use the real block timestamp if available
+        if let blockTime = transaction.blockTime, blockTime > 0 {
+            let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
+            return formatter.string(from: date)
+        }
+
+        // Fallback: try to get from HeaderStore directly
+        if transaction.height > 0 {
+            if let header = try? HeaderStore.shared.getHeader(at: transaction.height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(header.time))
+                return formatter.string(from: date)
+            }
+        }
+
+        // Last resort: show "Unknown" instead of fake estimate
+        return "Unknown"
     }
 
     private func copyTxid() {

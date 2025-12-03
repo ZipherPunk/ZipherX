@@ -81,6 +81,8 @@ final class BiometricAuthManager: ObservableObject {
         }
 
         switch context.biometryType {
+        case .none:
+            return .none
         case .faceID:
             return .faceID
         case .touchID:

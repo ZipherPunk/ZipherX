@@ -22,11 +22,16 @@ targets:
       - path: Sources
         excludes:
           - "**/.DS_Store"
+      - path: Assets.xcassets
+        buildPhase: resources
     resources:
       - path: Resources
         excludes:
           - "**/.DS_Store"
-      - path: Assets.xcassets
+      - path: Resources/sapling-spend.params
+        buildPhase: resources
+      - path: Resources/sapling-output.params
+        buildPhase: resources
     info:
       path: Info.plist
       properties:
@@ -68,11 +73,16 @@ targets:
       - path: Sources
         excludes:
           - "**/.DS_Store"
+      - path: Assets.xcassets
+        buildPhase: resources
     resources:
       - path: Resources
         excludes:
           - "**/.DS_Store"
-      - path: Assets.xcassets
+      - path: Resources/sapling-spend.params
+        buildPhase: resources
+      - path: Resources/sapling-output.params
+        buildPhase: resources
     info:
       path: Info-macOS.plist
       properties:
@@ -105,6 +115,8 @@ targets:
         com.apple.security.app-sandbox: false
         com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.zipherx.wallet.mac
 
   ZipherXTests:
     type: bundle.unit-test

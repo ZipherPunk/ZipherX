@@ -1,4 +1,10 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Modern iOS Theme
 /// Clean, minimal design following Apple's Human Interface Guidelines
@@ -7,22 +13,27 @@ struct ModernTheme: AppTheme {
     let name = "Modern"
     let identifier = "modern"
 
-    // MARK: - Colors - iOS-inspired
-    private static let iosBackground = Color(UIColor.systemBackground)
-    private static let iosSurface = Color(UIColor.secondarySystemBackground)
-    private static let iosPrimary = Color.blue
-    private static let iosSecondary = Color(UIColor.secondaryLabel)
-    private static let iosText = Color(UIColor.label)
-    private static let iosTextSecondary = Color(UIColor.secondaryLabel)
+    // MARK: - Colors - Platform-adaptive
+    #if os(macOS)
+    private static let systemBackground = Color(NSColor.windowBackgroundColor)
+    private static let secondarySystemBackground = Color(NSColor.controlBackgroundColor)
+    private static let labelColor = Color(NSColor.labelColor)
+    private static let secondaryLabelColor = Color(NSColor.secondaryLabelColor)
+    #else
+    private static let systemBackground = Color(UIColor.systemBackground)
+    private static let secondarySystemBackground = Color(UIColor.secondarySystemBackground)
+    private static let labelColor = Color(UIColor.label)
+    private static let secondaryLabelColor = Color(UIColor.secondaryLabel)
+    #endif
 
     // MARK: - Colors
-    var backgroundColor: Color { ModernTheme.iosBackground }
-    var surfaceColor: Color { ModernTheme.iosSurface }
+    var backgroundColor: Color { ModernTheme.systemBackground }
+    var surfaceColor: Color { ModernTheme.secondarySystemBackground }
     let primaryColor = Color.blue
     let secondaryColor = Color.gray
     let accentColor = Color.blue
-    var textPrimary: Color { ModernTheme.iosText }
-    var textSecondary: Color { ModernTheme.iosTextSecondary }
+    var textPrimary: Color { ModernTheme.labelColor }
+    var textSecondary: Color { ModernTheme.secondaryLabelColor }
     let borderColor = Color.gray.opacity(0.3)
     let shadowColor = Color.black.opacity(0.1)
 

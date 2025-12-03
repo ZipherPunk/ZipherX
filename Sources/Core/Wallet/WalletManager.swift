@@ -509,25 +509,41 @@ final class WalletManager: ObservableObject {
 
     /// Restore wallet from mnemonic
     func restoreWallet(from mnemonic: [String]) throws {
-        // Record creation time for accurate sync timing display
-        DispatchQueue.main.async {
+        // Use print() for crash debugging - debugLog() might be causing issues
+        print("🔑 RESTORE [1]: Starting restore with \(mnemonic.count) words")
+
+        // Record creation time - use async to avoid deadlock if called from main thread
+        if Thread.isMainThread {
             self.walletCreationTime = Date()
-            debugLog("⏱️ Wallet restore started at: \(self.walletCreationTime!)")
+        } else {
+            DispatchQueue.main.sync {
+                self.walletCreationTime = Date()
+            }
+        }
+        print("🔑 RESTORE [2]: walletCreationTime set")
+
+        print("🔑 RESTORE [3]: About to validate mnemonic...")
+
+        // Validate mnemonic - wrap in do/catch to see any errors
+        let isValid: Bool
+        do {
+            isValid = mnemonicGenerator.validateMnemonic(mnemonic)
+            print("🔑 RESTORE [4]: validateMnemonic returned \(isValid)")
+        } catch {
+            print("❌ RESTORE: validateMnemonic threw: \(error)")
+            throw error
         }
 
-        debugLog("🔑 Validating mnemonic (\(mnemonic.count) words)...")
-
-        // Validate mnemonic
-        guard mnemonicGenerator.validateMnemonic(mnemonic) else {
-            debugLog("❌ Mnemonic validation failed")
+        guard isValid else {
+            print("❌ RESTORE [5]: Mnemonic validation returned false")
             throw WalletError.invalidMnemonic
         }
-        debugLog("✅ Mnemonic validated")
+        print("✅ RESTORE [6]: Mnemonic validated successfully")
 
         // Derive seed
-        debugLog("🔑 Deriving seed from mnemonic...")
+        print("🔑 RESTORE [7]: Deriving seed from mnemonic...")
         let seed = try mnemonicGenerator.mnemonicToSeed(mnemonic: mnemonic)
-        debugLog("✅ Seed derived (\(seed.count) bytes)")
+        print("✅ RESTORE [8]: Seed derived (\(seed.count) bytes)")
 
         // Derive spending key
         let spendingKey = try deriveSpendingKey(from: seed)

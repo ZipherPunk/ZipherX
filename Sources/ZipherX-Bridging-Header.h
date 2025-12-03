@@ -171,11 +171,22 @@ bool zipherx_decode_spending_key(const char *encoded, uint8_t *output);
 // Transaction Building Functions
 // =============================================================================
 
-/// Initialize the prover with Sapling parameters
+/// Initialize the prover with Sapling parameters from file paths
+/// NOTE: May fail on macOS with Hardened Runtime - use zipherx_init_prover_from_bytes instead
 /// @param spend_path Path to sapling-spend.params
 /// @param output_path Path to sapling-output.params
 /// @return true on success
 bool zipherx_init_prover(const char *spend_path, const char *output_path);
+
+/// Initialize the prover with Sapling parameters from raw byte arrays
+/// Use this when file access from Rust is restricted (e.g., Hardened Runtime)
+/// @param spend_data Pointer to spend params bytes
+/// @param spend_len Length of spend params (47958396 bytes)
+/// @param output_data Pointer to output params bytes
+/// @param output_len Length of output params (3592860 bytes)
+/// @return true on success
+bool zipherx_init_prover_from_bytes(const uint8_t *spend_data, size_t spend_len,
+                                     const uint8_t *output_data, size_t output_len);
 
 /// Build a complete shielded transaction
 /// @param sk Extended spending key (169 bytes)
@@ -204,6 +215,40 @@ bool zipherx_build_transaction(const uint8_t *sk,
                                 uint64_t chain_height,
                                 uint8_t *tx_out,
                                 size_t *tx_out_len);
+
+/// Spend information for multi-input transactions
+typedef struct {
+    const uint8_t *witness_data;    // Serialized IncrementalWitness data
+    size_t witness_len;              // Length of witness data
+    uint64_t note_value;             // Note value in zatoshis
+    const uint8_t *note_rcm;         // Note commitment randomness (32 bytes)
+    const uint8_t *note_diversifier; // Note diversifier (11 bytes)
+} SpendInfo;
+
+/// Build a shielded transaction with multiple input notes
+/// @param sk Extended spending key (169 bytes)
+/// @param to_address Destination address bytes (43 bytes)
+/// @param amount Amount to send in zatoshis
+/// @param memo Optional memo (512 bytes, can be NULL)
+/// @param spends Array of SpendInfo pointers
+/// @param spend_count Number of spends
+/// @param chain_height Current chain height (for branch ID selection)
+/// @param tx_out Output buffer for transaction (at least 10000 bytes)
+/// @param tx_out_len Output for transaction length
+/// @param nullifiers_out Output buffer for nullifiers (32 bytes * spend_count)
+/// @return true on success
+bool zipherx_build_transaction_multi(
+    const uint8_t *sk,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const SpendInfo *const *spends,
+    size_t spend_count,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len,
+    uint8_t *nullifiers_out
+);
 
 /// Compute a value commitment
 /// @param value Value in zatoshis

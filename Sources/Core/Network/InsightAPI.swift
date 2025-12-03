@@ -7,6 +7,14 @@ final class InsightAPI {
 
     private let baseURL = "https://explorer.zcl.zelcore.io"
 
+    /// URLSession with 30 second timeout to prevent hanging
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
+    }()
+
     private init() {}
 
     // MARK: - Status
@@ -14,7 +22,7 @@ final class InsightAPI {
     /// Get blockchain status
     func getStatus() async throws -> BlockchainStatus {
         let url = URL(string: "\(baseURL)/api/status")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         let response = try JSONDecoder().decode(StatusResponse.self, from: data)
         return BlockchainStatus(
@@ -24,12 +32,97 @@ final class InsightAPI {
         )
     }
 
+    // MARK: - Consensus Chain Height
+
+    /// Get consensus chain height from multiple sources
+    /// Uses conservative approach: returns MINIMUM of sources that agree within tolerance
+    /// This prevents syncing beyond what's verified by multiple independent sources
+    ///
+    /// Sources: InsightAPI (Zelcore), P2P peers
+    /// Agreement: Sources must be within 5 blocks of each other
+    /// Result: Minimum of agreeing sources (conservative - never sync beyond verified height)
+    ///
+    /// SECURITY: Peers reporting heights >10 blocks above consensus are BANNED
+    func getConsensusChainHeight(networkManager: NetworkManager) async -> UInt64 {
+        let maxDeviation: UInt64 = 5
+        let banThreshold: UInt64 = 10  // Ban peers >10 blocks above consensus
+        var heights: [(source: String, height: UInt64, peer: Peer?)] = []
+
+        // 1. InsightAPI (Zelcore explorer) - trusted baseline
+        do {
+            let status = try await getStatus()
+            heights.append(("InsightAPI", status.height, nil))
+            print("📡 [Consensus] InsightAPI: \(status.height)")
+        } catch {
+            print("⚠️ [Consensus] InsightAPI failed: \(error)")
+        }
+
+        // 2. P2P peer heights (version handshake)
+        let p2pPeers = networkManager.peers
+        for (index, peer) in p2pPeers.enumerated() {
+            let h = UInt64(peer.peerStartHeight)
+            if h > 0 {
+                heights.append(("P2P-\(index):\(peer.host)", h, peer))
+                print("📡 [Consensus] P2P peer \(index) (\(peer.host)): \(h)")
+            }
+        }
+
+        // 3. Find consensus - sources that agree within tolerance
+        guard !heights.isEmpty else {
+            print("❌ [Consensus] No valid heights available!")
+            return 0
+        }
+
+        // Sort by height
+        let sortedHeights = heights.sorted { $0.height < $1.height }
+
+        // Find the largest group of heights that agree within maxDeviation
+        var bestGroup: [(source: String, height: UInt64, peer: Peer?)] = []
+
+        for i in 0..<sortedHeights.count {
+            var group: [(source: String, height: UInt64, peer: Peer?)] = [sortedHeights[i]]
+            let baseHeight = sortedHeights[i].height
+
+            for j in (i + 1)..<sortedHeights.count {
+                if sortedHeights[j].height <= baseHeight + maxDeviation {
+                    group.append(sortedHeights[j])
+                }
+            }
+
+            if group.count > bestGroup.count {
+                bestGroup = group
+            }
+        }
+
+        // Use MINIMUM of the agreeing group (conservative approach)
+        guard let minHeight = bestGroup.min(by: { $0.height < $1.height })?.height else {
+            print("❌ [Consensus] No consensus reached!")
+            return sortedHeights.first?.height ?? 0
+        }
+
+        let sources = bestGroup.map { $0.source }.joined(separator: ", ")
+        print("✅ [Consensus] \(bestGroup.count) sources agree: [\(sources)]")
+        print("✅ [Consensus] Using MINIMUM height: \(minHeight)")
+
+        // 4. SECURITY: BAN peers reporting fake heights (Sybil attack detection)
+        for entry in heights {
+            if let peer = entry.peer {
+                if entry.height > minHeight + banThreshold {
+                    print("🚫 [SECURITY] Banning peer \(peer.host) for fake height \(entry.height) (consensus: \(minHeight))")
+                    networkManager.banPeer(peer, reason: .fakeChainHeight)
+                }
+            }
+        }
+
+        return minHeight
+    }
+
     // MARK: - Blocks
 
     /// Get block hash by height
     func getBlockHash(height: UInt64) async throws -> String {
         let url = URL(string: "\(baseURL)/api/block-index/\(height)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         let response = try JSONDecoder().decode(BlockIndexResponse.self, from: data)
         return response.blockHash
@@ -38,7 +131,7 @@ final class InsightAPI {
     /// Get block by hash
     func getBlock(hash: String) async throws -> InsightBlock {
         let url = URL(string: "\(baseURL)/api/block/\(hash)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         return try JSONDecoder().decode(InsightBlock.self, from: data)
     }
@@ -46,7 +139,7 @@ final class InsightAPI {
     /// Get raw block data by hash
     func getRawBlock(hash: String) async throws -> Data {
         let url = URL(string: "\(baseURL)/api/rawblock/\(hash)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         let response = try JSONDecoder().decode(RawBlockResponse.self, from: data)
         guard let blockData = Data(hexString: response.rawblock) else {
@@ -60,7 +153,7 @@ final class InsightAPI {
     /// Get transaction by txid
     func getTransaction(txid: String) async throws -> InsightTransaction {
         let url = URL(string: "\(baseURL)/api/tx/\(txid)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         return try JSONDecoder().decode(InsightTransaction.self, from: data)
     }
@@ -144,7 +237,7 @@ final class InsightAPI {
 
         print("📡 Broadcasting transaction via InsightAPI (\(rawTx.count) bytes)...")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
 
         // Check HTTP status
         if let httpResponse = response as? HTTPURLResponse {
@@ -177,7 +270,7 @@ final class InsightAPI {
     /// Get raw transaction
     func getRawTransaction(txid: String) async throws -> Data {
         let url = URL(string: "\(baseURL)/api/rawtx/\(txid)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         let response = try JSONDecoder().decode(RawTxResponse.self, from: data)
         guard let txData = Data(hexString: response.rawtx) else {
@@ -324,7 +417,7 @@ final class InsightAPI {
         let body = ["rawtx": rawTx.map { String(format: "%02x", $0) }.joined()]
         request.httpBody = try JSONEncoder().encode(body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
 
         // Check HTTP status code
         if let httpResponse = response as? HTTPURLResponse {
@@ -359,7 +452,7 @@ final class InsightAPI {
     /// Get address info (for transparent addresses)
     func getAddressInfo(address: String) async throws -> InsightAddressInfo {
         let url = URL(string: "\(baseURL)/api/addr/\(address)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
 
         return try JSONDecoder().decode(InsightAddressInfo.self, from: data)
     }

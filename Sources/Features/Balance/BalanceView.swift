@@ -26,11 +26,20 @@ struct BalanceView: View {
     @State private var fireworksAmount: Double = 0
     @State private var previousBalance: UInt64 = 0
 
-    // Mined celebration state
-    @State private var showMinedCelebration = false
-    @State private var minedTxAmount: Double = 0
-    @State private var minedTxId: String = ""
-    @State private var minedIsOutgoing: Bool = true
+    // Settlement celebration state (for confirmed transactions)
+    @State private var showSettlementCelebration = false
+    @State private var settlementTxAmount: Double = 0
+    @State private var settlementTxId: String = ""
+    @State private var settlementIsOutgoing: Bool = true
+    @State private var settlementClearingTime: TimeInterval? = nil
+    @State private var settlementTime: TimeInterval? = nil
+
+    // Clearing celebration state (for mempool/unconfirmed tx)
+    @State private var showClearingCelebration = false
+    @State private var clearingTxAmount: Double = 0
+    @State private var clearingTxId: String = ""
+    @State private var clearingTime: TimeInterval? = nil
+    @State private var clearingIsOutgoing: Bool = false  // true for sender, false for receiver
 
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
@@ -59,16 +68,31 @@ struct BalanceView: View {
                     .zIndex(100)
             }
 
-            // Mined celebration overlay (for confirmed transactions)
-            if showMinedCelebration {
-                MinedCelebrationView(
-                    isShowing: $showMinedCelebration,
-                    amount: minedTxAmount,
-                    txid: minedTxId,
-                    isOutgoing: minedIsOutgoing
+            // Settlement celebration overlay (for confirmed transactions)
+            if showSettlementCelebration {
+                SettlementCelebrationView(
+                    isShowing: $showSettlementCelebration,
+                    amount: settlementTxAmount,
+                    txid: settlementTxId,
+                    isOutgoing: settlementIsOutgoing,
+                    clearingTime: settlementClearingTime,
+                    settlementTime: settlementTime
                 )
                 .transition(.opacity)
                 .zIndex(101)
+            }
+
+            // Clearing celebration overlay (for mempool/unconfirmed transactions)
+            if showClearingCelebration {
+                ClearingCelebrationView(
+                    isShowing: $showClearingCelebration,
+                    amount: clearingTxAmount,
+                    txid: clearingTxId,
+                    clearingTime: clearingTime,
+                    isOutgoing: clearingIsOutgoing
+                )
+                .transition(.opacity)
+                .zIndex(102)
             }
         }
         .background(themeManager.currentTheme.backgroundColor)
@@ -95,6 +119,67 @@ struct BalanceView: View {
             startAutoRefresh()
             // Load transaction history
             loadTransactionHistory()
+
+            // Check for pending Clearing celebration (receiver incoming mempool)
+            if let mempool = networkManager.justDetectedIncomingMempool {
+                print("📜 BALANCEVIEW: Found pending Clearing celebration on appear - triggering now!")
+                clearingTxId = mempool.txid
+                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+                clearingTime = mempool.clearingTime
+                clearingIsOutgoing = false  // Receiver side
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 CLEARING (onAppear)! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justDetectedIncomingMempool = nil
+                }
+            }
+
+            // Check for pending Clearing celebration (sender outgoing mempool verified)
+            if let cleared = networkManager.justClearedOutgoing {
+                print("📜 BALANCEVIEW: Found pending sender Clearing celebration on appear - triggering now!")
+                clearingTxId = cleared.txid
+                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+                clearingTime = cleared.clearingTime
+                clearingIsOutgoing = true  // Sender side
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justClearedOutgoing = nil
+                }
+            }
+
+            // Also check for pending Settlement celebration
+            if let confirmed = networkManager.justConfirmedTx {
+                print("📜 BALANCEVIEW: Found pending Settlement celebration on appear - triggering now!")
+                settlementTxId = confirmed.txid
+                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+                settlementIsOutgoing = confirmed.isOutgoing
+                settlementClearingTime = confirmed.clearingTime
+                settlementTime = confirmed.settlementTime
+                withAnimation {
+                    showSettlementCelebration = true
+                }
+                print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL")
+
+                // When outgoing tx is confirmed, clear balance tracking
+                if confirmed.isOutgoing {
+                    print("💰 Outgoing tx confirmed - clearing balance tracking")
+                    walletManager.clearBalanceBeforeLastSend()
+                }
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justConfirmedTx = nil
+                }
+            }
         }
         .onDisappear {
             // Stop auto refresh when leaving view
@@ -115,9 +200,16 @@ struct BalanceView: View {
                 // Use MULTIPLE criteria to be conservative (any TRUE = suppress fireworks)
                 var isLikelyChangeOutput = false
 
-                // Method 1: Check if there's a pending outgoing transaction (MOST RELIABLE)
+                // Method 1a: Check two-phase tracking (INSTANT detection)
+                // If pendingBroadcastAmount > 0, we just sent and this is almost certainly change
+                if networkManager.pendingBroadcastAmount > 0 {
+                    isLikelyChangeOutput = true
+                    print("💰 Change detection (pendingBroadcast): instant outgoing pending - suppressing fireworks")
+                }
+
+                // Method 1b: Check if there's a pending outgoing transaction (LEGACY)
                 // If mempoolOutgoing > 0, we just sent and this is almost certainly change
-                if networkManager.mempoolOutgoing > 0 {
+                if !isLikelyChangeOutput && networkManager.mempoolOutgoing > 0 {
                     isLikelyChangeOutput = true
                     print("💰 Change detection (mempoolOutgoing): outgoing pending - suppressing fireworks")
                 }
@@ -140,23 +232,23 @@ struct BalanceView: View {
                 }
 
                 if isLikelyChangeOutput {
-                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
+                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no celebration)")
                     // Change output detected means our tx was mined!
                     // Clear tracking after a brief delay to ensure UI is stable
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         // Only clear if still pending (confirmation handler might have cleared already)
-                        if networkManager.mempoolOutgoing > 0 {
+                        if networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0 {
                             print("💰 Change detected - clearing pending state (tx mined)")
+                            networkManager.clearPendingBroadcast()
                             networkManager.clearAllPendingOutgoing()
                             walletManager.clearBalanceBeforeLastSend()
                         }
                     }
                 } else {
-                    fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
-                    withAnimation {
-                        showFireworks = true
-                    }
-                    print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+                    // Real incoming transaction detected!
+                    // Don't show fireworks - the Settlement celebration will be shown via justConfirmedTx
+                    // or Clearing celebration via justDetectedIncomingMempool
+                    print("📥 Received \(Double(increase) / 100_000_000.0) ZCL (celebration will be triggered by confirmation/mempool handler)")
                     // Clear tracking after real incoming is processed
                     walletManager.clearBalanceBeforeLastSend()
                 }
@@ -170,23 +262,26 @@ struct BalanceView: View {
         }
         .onChange(of: walletManager.pendingBalance) { newPendingBalance in
             // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
-            // SAFETY: Clear mempoolOutgoing if it's stale (tx was mined but mempoolOutgoing wasn't cleared)
-            if newPendingBalance == 0 && networkManager.mempoolOutgoing > 0 {
-                print("💰 pendingBalance=0 but mempoolOutgoing=\(networkManager.mempoolOutgoing) - clearing stale pending state")
+            // SAFETY: Clear pending states if stale (tx was mined but tracking wasn't cleared)
+            if newPendingBalance == 0 && (networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0) {
+                print("💰 pendingBalance=0 but pending tracking active - clearing stale pending state")
+                networkManager.clearPendingBroadcast()
                 networkManager.clearAllPendingOutgoing()
                 walletManager.clearBalanceBeforeLastSend()
             }
         }
         .onChange(of: networkManager.justConfirmedTx?.txid) { txid in
-            // Transaction was mined - show celebration!
+            // Transaction was confirmed - show Settlement celebration!
             if let txid = txid, let confirmed = networkManager.justConfirmedTx {
-                minedTxId = txid
-                minedTxAmount = Double(confirmed.amount) / 100_000_000.0
-                minedIsOutgoing = confirmed.isOutgoing
+                settlementTxId = txid
+                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+                settlementIsOutgoing = confirmed.isOutgoing
+                settlementClearingTime = confirmed.clearingTime
+                settlementTime = confirmed.settlementTime
                 withAnimation {
-                    showMinedCelebration = true
+                    showSettlementCelebration = true
                 }
-                print("⛏️ MINED CELEBRATION! \(minedIsOutgoing ? "Sent" : "Received") \(minedTxAmount) ZCL")
+                print("⛏️ SETTLEMENT! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
 
                 // When outgoing tx is confirmed, clear balance tracking
                 // This happens AFTER change output is detected and added to balance
@@ -201,17 +296,63 @@ struct BalanceView: View {
                 }
             }
         }
+        .onChange(of: networkManager.mempoolIncomingCelebrationTrigger) { _ in
+            // Incoming ZCL detected in mempool - show Clearing celebration!
+            if let mempool = networkManager.justDetectedIncomingMempool {
+                clearingTxId = mempool.txid
+                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+                clearingTime = mempool.clearingTime
+                clearingIsOutgoing = false  // Receiver side
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justDetectedIncomingMempool = nil
+                }
+            }
+        }
+        .onChange(of: networkManager.outgoingClearingTrigger) { _ in
+            // Sender's tx verified in mempool - show Clearing celebration!
+            if let cleared = networkManager.justClearedOutgoing {
+                clearingTxId = cleared.txid
+                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+                clearingTime = cleared.clearingTime
+                clearingIsOutgoing = true  // Sender side
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+
+                // Clear the trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justClearedOutgoing = nil
+                }
+            }
+        }
     }
 
     /// Calculate the effective balance to display during pending transactions
     /// This prevents confusing balance fluctuations when change output is being detected
     private var effectiveDisplayBalance: UInt64 {
-        // If there's a pending outgoing transaction, use balanceBeforeLastSend - outgoing amount
-        // This shows the user the expected final balance rather than confusing intermediate states
+        // Two-phase tracking: Use pendingBroadcastAmount for INSTANT display
+        // This is set immediately when first peer accepts (before mempoolOutgoing)
+        if networkManager.pendingBroadcastAmount > 0, let beforeSend = walletManager.balanceBeforeLastSend {
+            // Expected balance = what we had before sending - what we sent
+            // NOTE: pendingBroadcastAmount is the SEND amount (no fee), add fee for accurate deduction
+            let totalDeduction = networkManager.pendingBroadcastAmount + 10_000 // amount + fee
+            let expected = beforeSend >= totalDeduction ? beforeSend - totalDeduction : 0
+            print("💰 effectiveDisplayBalance (instant): beforeSend=\(beforeSend) - amount=\(networkManager.pendingBroadcastAmount) - fee=10000 = \(expected)")
+            return expected
+        }
+
+        // Legacy fallback: If there's a pending outgoing transaction (mempoolOutgoing set by trackPendingOutgoing)
         if networkManager.mempoolOutgoing > 0, let beforeSend = walletManager.balanceBeforeLastSend {
             // Expected balance = what we had before sending - what we sent (including fees)
             let expected = beforeSend >= networkManager.mempoolOutgoing ? beforeSend - networkManager.mempoolOutgoing : 0
-            print("💰 effectiveDisplayBalance: beforeSend=\(beforeSend) - outgoing=\(networkManager.mempoolOutgoing) = \(expected) (raw=\(walletManager.shieldedBalance))")
+            print("💰 effectiveDisplayBalance (legacy): beforeSend=\(beforeSend) - outgoing=\(networkManager.mempoolOutgoing) = \(expected) (raw=\(walletManager.shieldedBalance))")
             return expected
         }
 
@@ -228,7 +369,18 @@ struct BalanceView: View {
     }
 
     private var balanceCard: some View {
-        VStack(spacing: 12) {
+        // Define isLikelyChange at outer scope so it's accessible throughout balanceCard
+        // Suppress conditions:
+        // 1. Change from our own send (pendingBroadcastAmount > 0 OR mempoolOutgoing > 0 or sent recently)
+        // 2. Transaction already mined (pendingBalance > 0 means it's in a block now, OR justConfirmedTx is set)
+        let isLikelyChange = networkManager.pendingBroadcastAmount > 0 ||
+            networkManager.mempoolOutgoing > 0 ||
+            (walletManager.lastSendTimestamp != nil && Date().timeIntervalSince(walletManager.lastSendTimestamp!) < 120.0)
+        // alreadyMined: true if note is in block (0 conf) OR if we just received a confirmation notification
+        let alreadyMined = walletManager.pendingBalance > 0 ||
+            (networkManager.justConfirmedTx != nil && !networkManager.justConfirmedTx!.isOutgoing)
+
+        return VStack(spacing: 12) {
             // Main balance
             VStack(spacing: 4) {
                 Text("Shielded Balance")
@@ -245,21 +397,57 @@ struct BalanceView: View {
                         .foregroundColor(theme.textSecondary)
                 }
 
-                // RECEIVER SIDE: Show pending INCOMING amount (mempool only, not yet mined)
-                // Suppress conditions:
-                // 1. Change from our own send (mempoolOutgoing > 0 or sent recently)
-                // 2. Transaction already mined (pendingBalance > 0 means it's in a block now)
-                let isLikelyChange = networkManager.mempoolOutgoing > 0 ||
-                    (walletManager.lastSendTimestamp != nil && Date().timeIntervalSince(walletManager.lastSendTimestamp!) < 120.0)
-                let alreadyMined = walletManager.pendingBalance > 0
+                // Debug: Always log the balance card state
+                let _ = {
+                    let mempoolIn = networkManager.mempoolIncoming
+                    let mempoolOut = networkManager.mempoolOutgoing
+                    let pending = walletManager.pendingBalance
+                    let lastSend = walletManager.lastSendTimestamp
+                    let lastSendAgo = lastSend != nil ? Date().timeIntervalSince(lastSend!) : -1
+                    let justConfirmed = networkManager.justConfirmedTx
+                    let pendingBroadcast = networkManager.pendingBroadcastAmount
+                    let isMempoolVerified = networkManager.isMempoolVerified
 
-                if networkManager.mempoolIncoming > 0 && !isLikelyChange && !alreadyMined {
+                    print("📊 BALANCE CARD STATE:")
+                    print("   pendingBroadcast=\(pendingBroadcast) (\(Double(pendingBroadcast)/100_000_000) ZCL), isMempoolVerified=\(isMempoolVerified)")
+                    print("   mempoolIncoming=\(mempoolIn) (\(Double(mempoolIn)/100_000_000) ZCL)")
+                    print("   mempoolOutgoing=\(mempoolOut) (\(Double(mempoolOut)/100_000_000) ZCL)")
+                    print("   pendingBalance=\(pending) (\(Double(pending)/100_000_000) ZCL)")
+                    print("   justConfirmedTx=\(justConfirmed != nil ? "\(justConfirmed!.txid.prefix(12))... isOutgoing=\(justConfirmed!.isOutgoing)" : "nil")")
+                    print("   isLikelyChange=\(isLikelyChange), alreadyMined=\(alreadyMined)")
+                    print("   lastSendTimestamp=\(lastSend?.description ?? "nil"), ago=\(Int(lastSendAgo))s")
+
+                    // What will be displayed:
+                    let hasPendingOut = pendingBroadcast > 0 || mempoolOut > 0
+                    if mempoolIn > 0 && !isLikelyChange && !alreadyMined && !hasPendingOut {
+                        print("   >>> DISPLAYING: GREEN mempool incoming +\(Double(mempoolIn)/100_000_000) ZCL (awaiting confirmation)")
+                    } else if mempoolIn > 0 && alreadyMined {
+                        print("   >>> HIDING mempool incoming: tx already mined (alreadyMined=true)")
+                    } else if mempoolIn > 0 && hasPendingOut {
+                        print("   >>> HIDING mempool incoming: have pending outgoing (likely change detection issue)")
+                    }
+                    if pendingBroadcast > 0 {
+                        let status = isMempoolVerified ? "in mempool, waiting for miners" : "awaiting confirmation"
+                        print("   >>> DISPLAYING: ORANGE outgoing -\(Double(pendingBroadcast)/100_000_000) ZCL (\(status))")
+                    } else if mempoolOut > 0 {
+                        print("   >>> DISPLAYING: ORANGE outgoing -\(Double(mempoolOut)/100_000_000) ZCL (in mempool)")
+                    } else if pending > 0 && !isLikelyChange {
+                        print("   >>> DISPLAYING: GREEN pending +\(Double(pending)/100_000_000) ZCL (0 confirmations)")
+                    } else if pending > 0 && isLikelyChange {
+                        print("   >>> SUPPRESSING: Change output \(Double(pending)/100_000_000) ZCL (isLikelyChange=true)")
+                    }
+                }()
+
+                // INCOMING mempool indicator
+                // CRITICAL: Hide when we have ANY pending outgoing tx (change could be misdetected as incoming)
+                let hasPendingOutgoing = networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0
+                if networkManager.mempoolIncoming > 0 && !isLikelyChange && !alreadyMined && !hasPendingOutgoing {
                     HStack(spacing: 4) {
                         Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 10))
                         Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        Text("awaiting confirmation")
+                        Text("in mempool")
                             .font(.system(size: 9, design: .monospaced))
                             .italic()
                     }
@@ -269,21 +457,46 @@ struct BalanceView: View {
 
             // PENDING indicator - shows notes with 0 confirmations (just mined)
             // For RECEIVER: shows incoming that was just mined
-            // For SENDER: mempoolOutgoing takes priority (tx not yet in block)
-            if networkManager.mempoolOutgoing > 0 {
-                // SENDER: Transaction in mempool - not yet mined
+            // For SENDER: Two-phase tracking for instant UI:
+            //   Phase 1: pendingBroadcastAmount > 0 (first peer accepted) → "awaiting confirmation"
+            //   Phase 2: isMempoolVerified = true → "in mempool, waiting for miners"
+            //   Legacy: mempoolOutgoing > 0 (fallback)
+            if networkManager.pendingBroadcastAmount > 0 {
+                // SENDER: Two-phase pending display (INSTANT on first peer accept!)
+                let displayAmount = networkManager.pendingBroadcastAmount
                 HStack(spacing: 4) {
-                    Image(systemName: "clock.arrow.circlepath")
+                    Image(systemName: networkManager.isMempoolVerified ? "hourglass" : "clock.arrow.circlepath")
                         .font(.system(size: 10))
-                    Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
+                    Text("-\(formatBalance(displayAmount)) ZCL")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    Text("awaiting confirmation")
+                    if networkManager.isMempoolVerified {
+                        Text("in mempool, waiting for miners")
+                            .font(.system(size: 9, design: .monospaced))
+                            .italic()
+                    } else {
+                        Text("awaiting confirmation")
+                            .font(.system(size: 9, design: .monospaced))
+                            .italic()
+                    }
+                }
+                .foregroundColor(theme.warningColor)
+            } else if networkManager.mempoolOutgoing > 0 {
+                // SENDER: Legacy fallback - transaction in mempool (trackPendingOutgoing was called)
+                // Display amount WITHOUT fee (subtract 10000 zatoshis = 0.0001 ZCL)
+                let displayAmount = networkManager.mempoolOutgoing > 10_000 ? networkManager.mempoolOutgoing - 10_000 : networkManager.mempoolOutgoing
+                HStack(spacing: 4) {
+                    Image(systemName: "hourglass")
+                        .font(.system(size: 10))
+                    Text("-\(formatBalance(displayAmount)) ZCL")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("in mempool, waiting for miners")
                         .font(.system(size: 9, design: .monospaced))
                         .italic()
                 }
                 .foregroundColor(theme.warningColor)
-            } else if walletManager.pendingBalance > 0 {
-                // RECEIVER: Transaction mined but 0 confirmations (GREEN - it's incoming!)
+            } else if walletManager.pendingBalance > 0 && !isLikelyChange {
+                // RECEIVER ONLY: Transaction mined but 0 confirmations (GREEN - it's incoming!)
+                // CRITICAL: Suppress on sender side when pendingBalance is actually change output
                 HStack(spacing: 4) {
                     Image(systemName: "checkmark.circle")
                         .font(.system(size: 10))
@@ -294,6 +507,18 @@ struct BalanceView: View {
                         .italic()
                 }
                 .foregroundColor(theme.successColor)  // GREEN for incoming (mined but 0 conf)
+            } else if walletManager.pendingBalance > 0 && isLikelyChange {
+                // SENDER: Change output coming back - show cypherpunk message
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.uturn.backward.circle")
+                        .font(.system(size: 10))
+                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("change returning")
+                        .font(.system(size: 9, design: .monospaced))
+                        .italic()
+                }
+                .foregroundColor(theme.accentColor)  // Different color for change
             }
 
             // Privacy indicator
@@ -499,7 +724,7 @@ struct BalanceView: View {
                             .font(theme.captionFont)
                             .foregroundColor(theme.warningColor)
                     } else {
-                        Text(tx.dateString ?? estimatedDateString(for: tx.height))
+                        Text(tx.dateString ?? realBlockDateString(for: tx.height))
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
                     }
@@ -535,53 +760,22 @@ struct BalanceView: View {
         return "\(prefix)...\(suffix)"
     }
 
-    /// Estimate date/time from block height
-    /// Zclassic has ~150 second block times (2.5 minutes)
-    private func estimatedDateString(for height: UInt64) -> String {
-        // Updated reference point: Dec 3, 2025 ~07:00 UTC
-        let referenceHeight: UInt64 = 2_930_657
-        let referenceTimestamp: TimeInterval = 1733212800 // Dec 3, 2025 08:00 UTC
-        let referenceDate = Date(timeIntervalSince1970: referenceTimestamp)
-
-        let currentHeight = networkManager.chainHeight
-        let currentDate = Date()
-
-        // If we have a valid chain height, use current tip for best accuracy
-        if currentHeight > 0 && height <= currentHeight {
-            // Calculate based on current chain tip (most accurate for past blocks)
-            let blockDifference = Int64(height) - Int64(currentHeight)
-            let secondsDifference = Double(blockDifference) * 150.0 // ~150 seconds per block
-            let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
-
-            // SAFETY: Never show future dates for confirmed transactions
-            // If estimate is in the future, fall back to reference-based calculation
-            if estimatedDate > currentDate {
-                // Use reference-based calculation instead
-                let refBlockDiff = Int64(height) - Int64(referenceHeight)
-                let refSecondsDiff = Double(refBlockDiff) * 150.0
-                let refEstimatedDate = referenceDate.addingTimeInterval(refSecondsDiff)
-
+    /// Get real block timestamp from HeaderStore
+    /// NEVER estimate - only use actual blockchain timestamps!
+    private func realBlockDateString(for height: UInt64) -> String {
+        // Get real timestamp from HeaderStore (contains blockchain unix timestamps)
+        if height > 0 {
+            if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
                 let formatter = DateFormatter()
                 formatter.dateStyle = .short
                 formatter.timeStyle = .short
-                return formatter.string(from: refEstimatedDate)
+                return formatter.string(from: date)
             }
-
-            let formatter = DateFormatter()
-            formatter.dateStyle = .short
-            formatter.timeStyle = .short
-            return formatter.string(from: estimatedDate)
         }
 
-        // Fallback: use reference-based calculation
-        let blockDifference = Int64(height) - Int64(referenceHeight)
-        let secondsDifference = Double(blockDifference) * 150.0
-        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
-
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter.string(from: estimatedDate)
+        // No real timestamp available - show "Syncing..." instead of fake date
+        return "Syncing..."
     }
 
     private func loadTransactionHistory() {

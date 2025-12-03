@@ -8,47 +8,56 @@ struct CypherpunkTheme: AppTheme {
     let name = "Cypherpunk"
     let identifier = "cypherpunk"
 
-    // MARK: - Platform-specific Colors
+    // MARK: - Platform Detection
     #if os(macOS)
-    // NEON FLUO Orange palette for macOS (bright like the neon green, Bitcoin-inspired)
-    private static let primaryAccent = Color(red: 1.0, green: 0.4, blue: 0.0)       // Bright neon orange
-    private static let primaryAccentDark = Color(red: 0.8, green: 0.3, blue: 0.0)   // Dark neon orange
-    private static let primaryAccentDim = Color(red: 0.5, green: 0.2, blue: 0.0)    // Dim orange
-    private static let terminalBlack = Color(red: 0.02, green: 0.02, blue: 0.02)
-    private static let terminalDark = Color(red: 0.06, green: 0.04, blue: 0.02)     // Slight orange tint
+    private static let isMacOS = true
     #else
-    // Neon Green palette for iOS (Matrix style)
-    private static let primaryAccent = Color(red: 0, green: 1, blue: 0.25)
-    private static let primaryAccentDark = Color(red: 0, green: 0.7, blue: 0.15)
-    private static let primaryAccentDim = Color(red: 0, green: 0.4, blue: 0.1)
-    private static let terminalBlack = Color(red: 0.02, green: 0.02, blue: 0.02)
-    private static let terminalDark = Color(red: 0.05, green: 0.08, blue: 0.05)
+    private static let isMacOS = false
     #endif
+
+    // MARK: - macOS Orange Colors
+    private static let orangePrimary = Color(red: 1.0, green: 0.4, blue: 0.0)
+    private static let orangePrimaryDark = Color(red: 0.8, green: 0.3, blue: 0.0)
+    private static let orangePrimaryDim = Color(red: 0.5, green: 0.2, blue: 0.0)
+    private static let orangeTerminalDark = Color(red: 0.06, green: 0.04, blue: 0.02)
+    private static let orangeProgressBg = Color(red: 0.15, green: 0.1, blue: 0.02)
+
+    // MARK: - iOS Green Colors
+    private static let greenPrimary = Color(red: 0, green: 1, blue: 0.25)
+    private static let greenPrimaryDark = Color(red: 0, green: 0.7, blue: 0.15)
+    private static let greenPrimaryDim = Color(red: 0, green: 0.4, blue: 0.1)
+    private static let greenTerminalDark = Color(red: 0.05, green: 0.08, blue: 0.05)
+    private static let greenProgressBg = Color(red: 0, green: 0.15, blue: 0.05)
+
+    // MARK: - Shared Colors
+    private static let terminalBlack = Color(red: 0.02, green: 0.02, blue: 0.02)
+
+    // MARK: - Platform-selected Colors
+    private static var primaryAccent: Color { isMacOS ? orangePrimary : greenPrimary }
+    private static var primaryAccentDark: Color { isMacOS ? orangePrimaryDark : greenPrimaryDark }
+    private static var primaryAccentDim: Color { isMacOS ? orangePrimaryDim : greenPrimaryDim }
+    private static var terminalDark: Color { isMacOS ? orangeTerminalDark : greenTerminalDark }
 
     // MARK: - Colors
     let backgroundColor = CypherpunkTheme.terminalBlack
-    let surfaceColor = CypherpunkTheme.terminalDark
-    let primaryColor = CypherpunkTheme.primaryAccent
-    let secondaryColor = CypherpunkTheme.primaryAccentDark
-    let accentColor = CypherpunkTheme.primaryAccent
-    let textPrimary = CypherpunkTheme.primaryAccent
-    let textSecondary = CypherpunkTheme.primaryAccentDark
-    let borderColor = CypherpunkTheme.primaryAccentDim
-    let shadowColor = CypherpunkTheme.primaryAccent.opacity(0.3)
+    var surfaceColor: Color { CypherpunkTheme.terminalDark }
+    var primaryColor: Color { CypherpunkTheme.primaryAccent }
+    var secondaryColor: Color { CypherpunkTheme.primaryAccentDark }
+    var accentColor: Color { CypherpunkTheme.primaryAccent }
+    var textPrimary: Color { CypherpunkTheme.primaryAccent }
+    var textSecondary: Color { CypherpunkTheme.primaryAccentDark }
+    var borderColor: Color { CypherpunkTheme.primaryAccentDim }
+    var shadowColor: Color { CypherpunkTheme.primaryAccent.opacity(0.3) }
 
     // Button colors
-    let buttonBackground = CypherpunkTheme.terminalDark
-    let buttonText = CypherpunkTheme.primaryAccent
-    let buttonBorder = CypherpunkTheme.primaryAccentDim
-    let buttonHighlight = CypherpunkTheme.primaryAccent
-    let buttonShadow = CypherpunkTheme.primaryAccentDim
+    var buttonBackground: Color { CypherpunkTheme.terminalDark }
+    var buttonText: Color { CypherpunkTheme.primaryAccent }
+    var buttonBorder: Color { CypherpunkTheme.primaryAccentDim }
+    var buttonHighlight: Color { CypherpunkTheme.primaryAccent }
+    var buttonShadow: Color { CypherpunkTheme.primaryAccentDim }
 
     // Status colors
-    #if os(macOS)
-    let successColor = Color(red: 0.2, green: 0.8, blue: 0.2)  // Green for success on orange theme
-    #else
-    let successColor = CypherpunkTheme.primaryAccent  // Neon green IS success on iOS
-    #endif
+    var successColor: Color { CypherpunkTheme.isMacOS ? Color(red: 0.2, green: 0.8, blue: 0.2) : CypherpunkTheme.primaryAccent }
     let errorColor = Color.red
     let warningColor = Color.yellow
 
@@ -79,9 +88,5 @@ struct CypherpunkTheme: AppTheme {
     // MARK: - Progress Bar
     let progressBarHeight: CGFloat = 12
     var progressBarFill: Color { CypherpunkTheme.primaryAccent }
-    #if os(macOS)
-    var progressBarBackground: Color { Color(red: 0.15, green: 0.1, blue: 0.02) }  // Dark orange tint
-    #else
-    var progressBarBackground: Color { Color(red: 0, green: 0.15, blue: 0.05) }    // Dark green tint
-    #endif
+    var progressBarBackground: Color { CypherpunkTheme.isMacOS ? CypherpunkTheme.orangeProgressBg : CypherpunkTheme.greenProgressBg }
 }

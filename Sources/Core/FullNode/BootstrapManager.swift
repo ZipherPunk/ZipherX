@@ -24,7 +24,7 @@ public class BootstrapManager: ObservableObject {
     private var lastProgressUpdate = Date()
     private var lastBytesDownloaded: Int64 = 0
 
-    public enum BootstrapStatus {
+    public enum BootstrapStatus: Equatable {
         case idle
         case checkingRelease
         case downloading

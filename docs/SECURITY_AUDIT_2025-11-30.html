@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZipherX Security Audit // 2025-11-30</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Share+Tech+Mono&display=swap');
+
+        :root {
+            --matrix-green: #00ff41;
+            --matrix-dark: #003b00;
+            --terminal-bg: #0a0a0a;
+            --critical: #ff0040;
+            --high: #ff6600;
+            --medium: #ffcc00;
+            --low: #00ccff;
+            --glow: 0 0 10px rgba(0, 255, 65, 0.5);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: var(--terminal-bg);
+            color: var(--matrix-green);
+            font-family: 'JetBrains Mono', 'Share Tech Mono', monospace;
+            line-height: 1.6;
+            min-height: 100vh;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        /* Matrix rain background */
+        .matrix-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            opacity: 0.03;
+            z-index: -1;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0, 255, 65, 0.03) 2px,
+                rgba(0, 255, 65, 0.03) 4px
+            );
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        header {
+            text-align: center;
+            padding: 40px 0;
+            border-bottom: 1px solid var(--matrix-dark);
+            margin-bottom: 40px;
+        }
+
+        .glitch {
+            font-size: 3rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            text-shadow: var(--glow);
+            animation: glitch 2s infinite;
+            letter-spacing: 4px;
+        }
+
+        @keyframes glitch {
+            0%, 90%, 100% { text-shadow: var(--glow); }
+            92% { text-shadow: -2px 0 var(--critical), 2px 0 #00ffff; }
+            94% { text-shadow: 2px 0 var(--critical), -2px 0 #00ffff; }
+        }
+
+        .subtitle {
+            color: #666;
+            margin-top: 10px;
+            font-size: 0.9rem;
+        }
+
+        .manifesto {
+            background: linear-gradient(135deg, rgba(0,59,0,0.3) 0%, rgba(10,10,10,0.9) 100%);
+            border: 1px solid var(--matrix-dark);
+            padding: 30px;
+            margin: 40px 0;
+            font-style: italic;
+            text-align: center;
+            position: relative;
+        }
+
+        .manifesto::before {
+            content: '"';
+            font-size: 4rem;
+            position: absolute;
+            top: 10px;
+            left: 20px;
+            opacity: 0.3;
+        }
+
+        .manifesto p {
+            font-size: 1.1rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .manifesto cite {
+            display: block;
+            margin-top: 15px;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 40px 0;
+        }
+
+        .stat-card {
+            background: rgba(0, 59, 0, 0.2);
+            border: 1px solid var(--matrix-dark);
+            padding: 20px;
+            text-align: center;
+            transition: all 0.3s;
+        }
+
+        .stat-card:hover {
+            border-color: var(--matrix-green);
+            box-shadow: var(--glow);
+        }
+
+        .stat-number {
+            font-size: 3rem;
+            font-weight: 700;
+        }
+
+        .stat-number.critical { color: var(--critical); }
+        .stat-number.high { color: var(--high); }
+        .stat-number.medium { color: var(--medium); }
+        .stat-number.low { color: var(--low); }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-top: 10px;
+        }
+
+        /* Sections */
+        section {
+            margin: 60px 0;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            border-bottom: 1px solid var(--matrix-dark);
+            padding-bottom: 10px;
+            margin-bottom: 30px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        h2::before {
+            content: '>';
+            color: var(--matrix-green);
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        h3 {
+            font-size: 1.1rem;
+            margin: 20px 0 10px;
+        }
+
+        /* Vulnerability cards */
+        .vuln-card {
+            background: rgba(0, 0, 0, 0.5);
+            border-left: 4px solid;
+            margin: 20px 0;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+
+        .vuln-card:hover {
+            background: rgba(0, 59, 0, 0.2);
+        }
+
+        .vuln-card.critical { border-color: var(--critical); }
+        .vuln-card.high { border-color: var(--high); }
+        .vuln-card.medium { border-color: var(--medium); }
+        .vuln-card.low { border-color: var(--low); }
+
+        .vuln-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .vuln-title {
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        .severity-badge {
+            padding: 4px 12px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 700;
+        }
+
+        .severity-badge.critical { background: var(--critical); color: #000; }
+        .severity-badge.high { background: var(--high); color: #000; }
+        .severity-badge.medium { background: var(--medium); color: #000; }
+        .severity-badge.low { background: var(--low); color: #000; }
+
+        .vuln-meta {
+            font-size: 0.85rem;
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .vuln-meta code {
+            background: rgba(0, 255, 65, 0.1);
+            padding: 2px 6px;
+            color: var(--matrix-green);
+        }
+
+        .vuln-desc {
+            margin-bottom: 15px;
+            color: #aaa;
+        }
+
+        .vuln-code {
+            background: #000;
+            border: 1px solid var(--matrix-dark);
+            padding: 15px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            margin: 15px 0;
+        }
+
+        .vuln-code code {
+            color: var(--matrix-green);
+        }
+
+        .vuln-fix {
+            background: rgba(0, 255, 65, 0.05);
+            border: 1px dashed var(--matrix-dark);
+            padding: 15px;
+            margin-top: 15px;
+        }
+
+        .vuln-fix h4 {
+            color: var(--matrix-green);
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+        }
+
+        /* Category tabs */
+        .category-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 30px;
+        }
+
+        .category-btn {
+            background: transparent;
+            border: 1px solid var(--matrix-dark);
+            color: var(--matrix-green);
+            padding: 10px 20px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            transition: all 0.3s;
+        }
+
+        .category-btn:hover, .category-btn.active {
+            background: var(--matrix-green);
+            color: #000;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            border: 1px solid var(--matrix-dark);
+            padding: 12px;
+            text-align: left;
+        }
+
+        th {
+            background: rgba(0, 255, 65, 0.1);
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 1px;
+        }
+
+        tr:hover td {
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        /* Timeline */
+        .timeline {
+            border-left: 2px solid var(--matrix-dark);
+            margin-left: 20px;
+            padding-left: 30px;
+        }
+
+        .timeline-item {
+            position: relative;
+            margin-bottom: 30px;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -36px;
+            top: 5px;
+            width: 10px;
+            height: 10px;
+            background: var(--matrix-green);
+            border-radius: 50%;
+            box-shadow: var(--glow);
+        }
+
+        .timeline-item.critical::before { background: var(--critical); }
+        .timeline-item.high::before { background: var(--high); }
+
+        .timeline-date {
+            font-size: 0.8rem;
+            color: #666;
+            margin-bottom: 5px;
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 40px 0;
+            border-top: 1px solid var(--matrix-dark);
+            margin-top: 60px;
+            color: #666;
+            font-size: 0.85rem;
+        }
+
+        footer .signature {
+            color: var(--matrix-green);
+            margin-top: 10px;
+            font-family: 'Share Tech Mono', monospace;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .glitch { font-size: 1.8rem; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .vuln-header { flex-direction: column; }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--terminal-bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--matrix-dark);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--matrix-green);
+        }
+
+        .warning-box {
+            background: rgba(255, 0, 64, 0.1);
+            border: 1px solid var(--critical);
+            padding: 20px;
+            margin: 30px 0;
+            text-align: center;
+        }
+
+        .warning-box h3 {
+            color: var(--critical);
+            margin-bottom: 10px;
+        }
+
+        .ascii-art {
+            font-size: 0.6rem;
+            line-height: 1.2;
+            color: var(--matrix-green);
+            opacity: 0.5;
+            text-align: center;
+            margin: 20px 0;
+            white-space: pre;
+        }
+    </style>
+</head>
+<body>
+    <div class="matrix-bg"></div>
+
+    <div class="container">
+        <header>
+            <pre class="ascii-art">
+   ███████╗██╗██████╗ ██╗  ██╗███████╗██████╗ ██╗  ██╗
+   ╚══███╔╝██║██╔══██╗██║  ██║██╔════╝██╔══██╗╚██╗██╔╝
+     ███╔╝ ██║██████╔╝███████║█████╗  ██████╔╝ ╚███╔╝
+    ███╔╝  ██║██╔═══╝ ██╔══██║██╔══╝  ██╔══██╗ ██╔██╗
+   ███████╗██║██║     ██║  ██║███████╗██║  ██║██╔╝ ██╗
+   ╚══════╝╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
+            </pre>
+            <h1 class="glitch">SECURITY AUDIT</h1>
+            <p class="subtitle">ZipherX iOS Wallet // Comprehensive Security Assessment</p>
+            <p class="subtitle">Generated: 2025-11-30 | Auditor: Claude Code // Anthropic</p>
+        </header>
+
+        <div class="manifesto">
+            <p>"Privacy is necessary for an open society in the electronic age. Privacy is not secrecy.
+            A private matter is something one doesn't want the whole world to know, but a secret matter
+            is something one doesn't want anybody to know. Privacy is the power to selectively reveal
+            oneself to the world."</p>
+            <cite>— Eric Hughes, A Cypherpunk's Manifesto (1993)</cite>
+        </div>
+
+        <div class="warning-box">
+            <h3>// AUDIT STATUS: VULNERABILITIES DETECTED</h3>
+            <p>This wallet contains security issues that must be addressed before production deployment.</p>
+            <p>DO NOT USE WITH REAL FUNDS until all CRITICAL issues are resolved.</p>
+        </div>
+
+        <!-- Stats Overview -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number critical">12</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number high">18</div>
+                <div class="stat-label">High</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number medium">14</div>
+                <div class="stat-label">Medium</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number low">9</div>
+                <div class="stat-label">Low</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" style="color: var(--matrix-green);">53</div>
+                <div class="stat-label">Total Issues</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" style="color: var(--matrix-green);">5</div>
+                <div class="stat-label">Categories</div>
+            </div>
+        </div>
+
+        <!-- Executive Summary -->
+        <section id="summary">
+            <h2>Executive Summary</h2>
+            <p>This security audit of ZipherX iOS wallet examined five critical areas: key storage, network layer,
+            transaction building, database persistence, and input validation. The audit identified <strong>53 security
+            vulnerabilities</strong> across these domains, with <strong>12 CRITICAL</strong> issues requiring immediate attention.</p>
+
+            <h3 style="margin-top: 30px;">Key Findings</h3>
+            <ul style="margin: 15px 0; padding-left: 20px;">
+                <li><strong>Key Storage:</strong> Spending keys stored unencrypted in SQLite database</li>
+                <li><strong>Network:</strong> Equihash PoW verification disabled, no certificate pinning</li>
+                <li><strong>Transactions:</strong> Spending key not kept in Secure Enclave during signing</li>
+                <li><strong>Database:</strong> PIN stored in plaintext, no SQLCipher encryption</li>
+                <li><strong>Input:</strong> Amount field vulnerable to integer overflow</li>
+            </ul>
+        </section>
+
+        <!-- Critical Issues -->
+        <section id="critical">
+            <h2>Critical Vulnerabilities</h2>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Spending Key Stored Unencrypted in Database</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>WalletDatabase.swift:90,319-336</code> | Category: Key Storage
+                </div>
+                <div class="vuln-desc">
+                    The spending key (96 bytes containing ask+nsk+ovk) is stored directly in the SQLite accounts
+                    table as a BLOB without any encryption layer. Although iOS Data Protection encrypts the file
+                    at rest, an attacker with access to an unlocked device can read the plaintext key.
+                </div>
+                <div class="vuln-code">
+                    <code>
+CREATE TABLE accounts (<br>
+&nbsp;&nbsp;spending_key BLOB NOT NULL,  -- UNENCRYPTED!<br>
+&nbsp;&nbsp;viewing_key BLOB NOT NULL<br>
+);
+                    </code>
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Remove spending_key and viewing_key columns. Derive keys from Secure Enclave on each use.
+                    Never persist cryptographic secrets in database.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Equihash Proof-of-Work Verification Disabled</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>HeaderSyncManager.swift:327-331</code> | Category: Network Security
+                </div>
+                <div class="vuln-desc">
+                    Block headers are accepted without cryptographic proof-of-work verification. The Equihash(200,9)
+                    verification is deliberately disabled with a TODO comment. This allows a malicious peer to feed
+                    arbitrary fake headers to the wallet.
+                </div>
+                <div class="vuln-code">
+                    <code>
+let header = try ZclassicBlockHeader.parseWithSolution(<br>
+&nbsp;&nbsp;data: fullHeaderData,<br>
+&nbsp;&nbsp;height: height,<br>
+&nbsp;&nbsp;verifyEquihash: false  // DISABLED!<br>
+)
+                    </code>
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Fix Equihash verification implementation. Add proper error handling instead of silently disabling.
+                    Temporarily sync headers from trusted checkpoints until verification is fixed.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">No Certificate Pinning for InsightAPI</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>InsightAPI.swift:8</code> | Category: TLS/SSL
+                </div>
+                <div class="vuln-desc">
+                    All HTTPS requests to explorer.zcl.zelcore.io use default certificate validation with no pinning.
+                    This enables man-in-the-middle attacks if a CA is compromised or through network-level interception.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Implement certificate pinning using public key SHA256 hash. Add backup pins for certificate rotation.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Insufficient Header Consensus Threshold</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>HeaderSyncManager.swift:15-16</code> | Category: Network Consensus
+                </div>
+                <div class="vuln-desc">
+                    Headers are accepted from a single peer (minPeers = 1, consensusThreshold = 1). A single malicious
+                    peer can completely control the blockchain view, enabling trivial eclipse attacks.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Change minPeers to at least 3-6. Require majority agreement (N/2 + 1) for header consensus.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Spending Key Exposed in Memory During Signing</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>TransactionBuilder.swift:73,281-292</code> | Category: Key Management
+                </div>
+                <div class="vuln-desc">
+                    The spending key is retrieved from Secure Enclave storage, then held in unprotected Swift Data
+                    memory during transaction building. The key is passed through multiple function layers and never
+                    zeroed after use.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Keep spending key in Secure Enclave throughout transaction signing. Use SecKeyCreateDecryptedData()
+                    to perform signing inside the enclave. Implement SecureData wrapper that zeros memory on deinit.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">PIN Stored in Plaintext in UserDefaults</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>SettingsView.swift:1297</code> | Category: Authentication
+                </div>
+                <div class="vuln-desc">
+                    The wallet PIN code is stored in plaintext in UserDefaults. UserDefaults is not encrypted and is
+                    accessible to any process with device access. The code even contains a comment: "in production, hash this!"
+                </div>
+                <div class="vuln-code">
+                    <code>
+// Line 1296: "in production, hash this!"<br>
+UserDefaults.standard.set(pinCode, forKey: "walletPIN")
+                    </code>
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Use PBKDF2 or bcrypt to hash PIN before storing. Store hashed PIN in Keychain, not UserDefaults.
+                    Add rate limiting on PIN verification attempts.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Sensitive Data (Nullifiers) Logged to Console</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>FilterScanner.swift, TransactionBuilder.swift</code> | Category: Information Disclosure
+                </div>
+                <div class="vuln-desc">
+                    Nullifiers (cryptographic commitments that uniquely identify spent notes) are logged in plaintext.
+                    This compromises transaction privacy and allows linking transactions to specific users.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Remove ALL logging of nullifiers, spending keys, and other cryptographic values. Use compile-time
+                    DEBUG_LOGGING flag that is FALSE in production builds.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Database Not Encrypted with SQLCipher</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>WalletDatabase.swift:60-62</code> | Category: Encryption
+                </div>
+                <div class="vuln-desc">
+                    The SQLite database relies only on iOS Data Protection, which only encrypts when the device is locked.
+                    The code comment mentions SQLCipher "can be added" but it's not implemented. Database contains spending
+                    keys, nullifiers, transaction history, and balance information.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Implement SQLCipher encryption layer with key stored in Secure Enclave. Use PRAGMA key='...' for
+                    database encryption. All database contents will then be encrypted at rest.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Amount Field Integer Overflow</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>SendView.swift:455</code> | Category: Input Validation
+                </div>
+                <div class="vuln-desc">
+                    Conversion from Double to UInt64 for amount field can cause silent overflow. If amountValue * 100,000,000
+                    exceeds UInt64.max, the conversion silently wraps/truncates, potentially causing incorrect transactions.
+                </div>
+                <div class="vuln-code">
+                    <code>
+let zatoshis = UInt64(amountValue * 100_000_000)  // OVERFLOW RISK!
+                    </code>
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Add explicit bounds checking before conversion. Use Decimal instead of Double for financial amounts.
+                    Validate maximum allowed amount before transaction building.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Anchor/Witness Can Be All-Zeros</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>TransactionBuilder.swift:197,252</code> | Category: Proof Validation
+                </div>
+                <div class="vuln-desc">
+                    Both anchor and witness can silently become all-zeros without detection. A placeholder with zero-filled
+                    anchor is created if header lookup fails, and the check happens AFTER witness rebuild.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Use Optional&lt;Data&gt; and require explicit anchor before transaction building. Add explicit
+                    validation that anchor is not all-zeros before passing to FFI layer.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Private Key Export Without Fresh Biometric Auth</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>WalletManager.swift:1673</code> | Category: Authentication
+                </div>
+                <div class="vuln-desc">
+                    The spending key can be exported without requiring fresh biometric authentication. The exported key is
+                    stored in a @State variable and copied to clipboard, where it persists and can be read by other apps.
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Require fresh Face ID for every key export. Never store exported key in @State. Clear clipboard
+                    automatically after 30 seconds. Warn user about clipboard persistence.</p>
+                </div>
+            </div>
+
+            <div class="vuln-card critical">
+                <div class="vuln-header">
+                    <span class="vuln-title">Weak Database Encryption Key Derivation</span>
+                    <span class="severity-badge critical">CRITICAL</span>
+                </div>
+                <div class="vuln-meta">
+                    <code>WalletManager.swift:145,518</code> | Category: Key Derivation
+                </div>
+                <div class="vuln-desc">
+                    The database encryption key is derived using SHA-256 directly from the spending key without salt.
+                    SHA-256 is not a key derivation function (KDF), making rainbow table attacks feasible if spending
+                    key is leaked.
+                </div>
+                <div class="vuln-code">
+                    <code>
+let dbKey = Data(SHA256.hash(data: spendingKey))  // No salt, no KDF!
+                    </code>
+                </div>
+                <div class="vuln-fix">
+                    <h4>// RECOMMENDATION</h4>
+                    <p>Use proper KDF like PBKDF2 with random salt and 100,000+ iterations. Or use Argon2id for
+                    memory-hard key derivation. Store salt in Keychain.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- High Severity Issues -->
+        <section id="high">
+            <h2>High Severity Vulnerabilities</h2>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Issue</th>
+                        <th>File:Line</th>
+                        <th>Category</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>1</td>
+                        <td>Weak Varint Validation (Integer Underflow Risk)</td>
+                        <td>Peer.swift:830-845</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>2</td>
+                        <td>No Transaction Data Validation</td>
+                        <td>Peer.swift:848-991</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>3</td>
+                        <td>Race Condition in FilterScanner Scan Lock</td>
+                        <td>FilterScanner.swift:73-79</td>
+                        <td>Concurrency</td>
+                    </tr>
+                    <tr>
+                        <td>4</td>
+                        <td>No DNSSEC Validation for DNS Seeds</td>
+                        <td>NetworkManager.swift:54-58</td>
+                        <td>DNS Security</td>
+                    </tr>
+                    <tr>
+                        <td>5</td>
+                        <td>Unverified Hardcoded Peer IP Addresses</td>
+                        <td>NetworkManager.swift:61-75</td>
+                        <td>Network Trust</td>
+                    </tr>
+                    <tr>
+                        <td>6</td>
+                        <td>Weak InsightAPI Response Validation</td>
+                        <td>InsightAPI.swift:162-170</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>7</td>
+                        <td>Biometric Protection Optional & Timeout-Bypassable</td>
+                        <td>BiometricAuthManager.swift:165-170</td>
+                        <td>Authentication</td>
+                    </tr>
+                    <tr>
+                        <td>8</td>
+                        <td>Spending Key in Unprotected Swift Memory</td>
+                        <td>WalletManager.swift:309,323,865</td>
+                        <td>Memory Safety</td>
+                    </tr>
+                    <tr>
+                        <td>9</td>
+                        <td>Private Key Accessible After App Lock</td>
+                        <td>SecureKeyStorage.swift:44,145</td>
+                        <td>Authentication</td>
+                    </tr>
+                    <tr>
+                        <td>10</td>
+                        <td>Insufficient Witness Validity Verification</td>
+                        <td>TransactionBuilder.swift:203,428</td>
+                        <td>Witness Validation</td>
+                    </tr>
+                    <tr>
+                        <td>11</td>
+                        <td>Fee Not Validated Against User Input</td>
+                        <td>lib.rs:1080,1083</td>
+                        <td>Transaction Building</td>
+                    </tr>
+                    <tr>
+                        <td>12</td>
+                        <td>Address Validation Missing Bech32 Checksum</td>
+                        <td>TransactionBuilder.swift:602-612</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>13</td>
+                        <td>Nullifier Prefixes Logged to Console</td>
+                        <td>WalletManager.swift:1439</td>
+                        <td>Privacy</td>
+                    </tr>
+                    <tr>
+                        <td>14</td>
+                        <td>Debug Log Export Unencrypted</td>
+                        <td>SettingsView.swift:577-595</td>
+                        <td>Encryption</td>
+                    </tr>
+                    <tr>
+                        <td>15</td>
+                        <td>No Keychain Query Parameter Validation</td>
+                        <td>SecureKeyStorage.swift:117-125</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>16</td>
+                        <td>Unvalidated Block Heights in Settings</td>
+                        <td>SettingsView.swift:124-149</td>
+                        <td>Input Validation</td>
+                    </tr>
+                    <tr>
+                        <td>17</td>
+                        <td>Private Key Import Weak Validation</td>
+                        <td>WalletManager.swift:1683-1712</td>
+                        <td>Crypto</td>
+                    </tr>
+                    <tr>
+                        <td>18</td>
+                        <td>QR Code Scanner No Validation</td>
+                        <td>SendView.swift:277-308</td>
+                        <td>Input Validation</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Medium & Low Severity -->
+        <section id="medium-low">
+            <h2>Medium & Low Severity Issues</h2>
+
+            <h3>Medium Severity (14 issues)</h3>
+            <ul style="margin: 15px 0; padding-left: 20px; color: #aaa;">
+                <li>Mempool Pattern Matching Too Weak (NetworkManager.swift:675-705)</li>
+                <li>No Large Block DoS Protection (Peer.swift:753-827)</li>
+                <li>Missing Request Timeouts on InsightAPI (InsightAPI.swift:15-25)</li>
+                <li>Addr Message IP Addresses Not Validated (Peer.swift:302-335)</li>
+                <li>Unencrypted P2P Communication (Peer.swift:187-194)</li>
+                <li>Flawed Header Consensus Logic (HeaderSyncManager.swift:374-387)</li>
+                <li>No Secure Enclave Attestation Check (SecureKeyStorage.swift:243-264)</li>
+                <li>Simulator Uses Plaintext Keychain (SecureKeyStorage.swift:33-36)</li>
+                <li>No Key Rotation Mechanism (SecureKeyStorage.swift)</li>
+                <li>Seed Phrase in Unprotected Memory (WalletManager.swift:394)</li>
+                <li>Weak Import Validation (WalletManager.swift:1683-1712)</li>
+                <li>Database File Permissions Weak (WalletDatabase.swift:24-35)</li>
+                <li>No PIN Rate Limiting (SettingsView.swift)</li>
+                <li>Memo Field Silent Truncation (SendView.swift:399-413)</li>
+            </ul>
+
+            <h3>Low Severity (9 issues)</h3>
+            <ul style="margin: 15px 0; padding-left: 20px; color: #666;">
+                <li>Generic Exception Handling Masks Real Errors</li>
+                <li>Insufficient Security Event Logging</li>
+                <li>No Peer Version Validation</li>
+                <li>Unused Viewing Key Storage Methods</li>
+                <li>No Key Access Audit Logging</li>
+                <li>Hard-Coded Keychain Tag Strings</li>
+                <li>Schema Error Messages Expose Structure</li>
+                <li>No Secure Memory Clearing Utilities</li>
+                <li>Address Length Pre-validation Missing</li>
+            </ul>
+        </section>
+
+        <!-- Remediation Timeline -->
+        <section id="timeline">
+            <h2>Recommended Remediation Timeline</h2>
+
+            <div class="timeline">
+                <div class="timeline-item critical">
+                    <div class="timeline-date">IMMEDIATE // Before Any Testing</div>
+                    <h3>Phase 0: Critical Blocking Issues</h3>
+                    <ul style="padding-left: 20px; color: #aaa;">
+                        <li>Remove spending_key from SQLite database</li>
+                        <li>Enable Equihash PoW verification</li>
+                        <li>Implement certificate pinning</li>
+                        <li>Hash PIN code with PBKDF2</li>
+                        <li>Remove ALL sensitive data logging</li>
+                    </ul>
+                </div>
+
+                <div class="timeline-item critical">
+                    <div class="timeline-date">WEEK 1 // High Priority</div>
+                    <h3>Phase 1: Core Security Fixes</h3>
+                    <ul style="padding-left: 20px; color: #aaa;">
+                        <li>Implement SQLCipher database encryption</li>
+                        <li>Increase header consensus threshold to 3+</li>
+                        <li>Add proper KDF for database key derivation</li>
+                        <li>Implement SecureData wrapper for key zeroing</li>
+                        <li>Add amount overflow bounds checking</li>
+                        <li>Fix race condition in FilterScanner lock</li>
+                    </ul>
+                </div>
+
+                <div class="timeline-item high">
+                    <div class="timeline-date">WEEK 2-3 // Important Fixes</div>
+                    <h3>Phase 2: Network & Input Validation</h3>
+                    <ul style="padding-left: 20px; color: #aaa;">
+                        <li>Add varint bounds checking</li>
+                        <li>Validate transaction data structures</li>
+                        <li>Add DNSSEC or trust-on-first-use for DNS</li>
+                        <li>Verify hardcoded peer IP addresses</li>
+                        <li>Add Bech32 checksum validation for addresses</li>
+                        <li>Require fresh biometric for key operations</li>
+                    </ul>
+                </div>
+
+                <div class="timeline-item">
+                    <div class="timeline-date">WEEK 4+ // Before Release</div>
+                    <h3>Phase 3: Polish & Defense in Depth</h3>
+                    <ul style="padding-left: 20px; color: #aaa;">
+                        <li>Add PIN rate limiting</li>
+                        <li>Implement encrypted backup functionality</li>
+                        <li>Add proper request timeouts</li>
+                        <li>Implement seed phrase memory protection</li>
+                        <li>Add security event audit logging</li>
+                        <li>External security audit</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Positive Findings -->
+        <section id="positive">
+            <h2>Positive Security Findings</h2>
+            <p style="color: #aaa; margin-bottom: 20px;">
+                The audit also identified several security measures already in place:
+            </p>
+            <ul style="padding-left: 20px; color: #aaa;">
+                <li style="color: var(--matrix-green);">Secure Enclave used for spending key storage (though not for signing)</li>
+                <li style="color: var(--matrix-green);">iOS Data Protection enabled on database file</li>
+                <li style="color: var(--matrix-green);">Sapling proofs verified locally using librustzcash</li>
+                <li style="color: var(--matrix-green);">BIP-39 mnemonic generation with proper entropy</li>
+                <li style="color: var(--matrix-green);">ZIP-32 compliant key derivation</li>
+                <li style="color: var(--matrix-green);">Transparent address rejection (shielded-only design)</li>
+                <li style="color: var(--matrix-green);">Zclassic Buttercup branch ID correctly implemented</li>
+                <li style="color: var(--matrix-green);">Multi-peer block consensus (when enabled)</li>
+                <li style="color: var(--matrix-green);">P2P-first architecture reduces API dependency</li>
+                <li style="color: var(--matrix-green);">Face ID authentication for send transactions</li>
+            </ul>
+        </section>
+
+        <!-- Conclusion -->
+        <section id="conclusion">
+            <h2>Conclusion</h2>
+            <p style="color: #aaa;">
+                ZipherX demonstrates a solid architectural foundation for a privacy-focused mobile wallet, with proper
+                use of Sapling cryptography, shielded-only transactions, and decentralized P2P networking. However,
+                the current implementation contains <strong style="color: var(--critical);">12 critical security
+                vulnerabilities</strong> that must be addressed before any production deployment.
+            </p>
+            <p style="color: #aaa; margin-top: 15px;">
+                The most urgent issues relate to key storage (unencrypted keys in database), network security
+                (disabled PoW verification), and authentication (plaintext PIN). These vulnerabilities could
+                enable complete wallet compromise and fund theft.
+            </p>
+            <p style="color: var(--matrix-green); margin-top: 20px; font-style: italic;">
+                "We the Cypherpunks are dedicated to building anonymous systems. We are defending our privacy
+                with cryptography, with anonymous mail forwarding systems, with digital signatures, and with
+                electronic money."
+            </p>
+            <p style="color: #666; margin-top: 10px;">
+                — Eric Hughes, A Cypherpunk's Manifesto
+            </p>
+        </section>
+
+        <footer>
+            <p>ZipherX Security Audit Report // Generated 2025-11-30</p>
+            <p>This report is provided for security improvement purposes only.</p>
+            <p class="signature">// AUDITOR: Claude Code // Anthropic</p>
+            <pre class="ascii-art" style="margin-top: 20px;">
+ ██████╗██╗   ██╗██████╗ ██╗  ██╗███████╗██████╗ ██████╗ ██╗   ██╗███╗   ██╗██╗  ██╗
+██╔════╝╚██╗ ██╔╝██╔══██╗██║  ██║██╔════╝██╔══██╗██╔══██╗██║   ██║████╗  ██║██║ ██╔╝
+██║      ╚████╔╝ ██████╔╝███████║█████╗  ██████╔╝██████╔╝██║   ██║██╔██╗ ██║█████╔╝
+██║       ╚██╔╝  ██╔═══╝ ██╔══██║██╔══╝  ██╔══██╗██╔═══╝ ██║   ██║██║╚██╗██║██╔═██╗
+╚██████╗   ██║   ██║     ██║  ██║███████╗██║  ██║██║     ╚██████╔╝██║ ╚████║██║  ██╗
+ ╚═════╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝
+            </pre>
+        </footer>
+    </div>
+
+    <script>
+        // Matrix rain effect (subtle)
+        document.addEventListener('DOMContentLoaded', () => {
+            // Add subtle glitch effect to header on scroll
+            window.addEventListener('scroll', () => {
+                const header = document.querySelector('.glitch');
+                if (window.scrollY > 100) {
+                    header.style.opacity = '0.8';
+                } else {
+                    header.style.opacity = '1';
+                }
+            });
+        });
+    </script>
+</body>
+</html>

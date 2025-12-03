@@ -58,14 +58,32 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - Wallet Notifications
 
-    /// Notify when ZCL is received (pending)
+    // Cypherpunk messages for incoming transactions
+    private let cypherpunkMessages = [
+        "Privacy preserved.",
+        "Financial sovereignty in action.",
+        "No middleman. No permission needed.",
+        "Trustless transfer complete.",
+        "Cryptographic proof verified.",
+        "Decentralized and free.",
+        "Your keys, your coins.",
+        "Shielded from prying eyes."
+    ]
+
+    /// Notify when ZCL is received (pending in mempool)
     func notifyReceived(amount: UInt64, txid: String, memo: String? = nil) {
         let zcl = Double(amount) / 100_000_000.0
-        let content = UNMutableNotificationContent()
-        content.title = "ZCL Received"
+        print("🔔 NOTIFICATION: notifyReceived called")
+        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   txid=\(txid.prefix(16))...")
+        print("   memo=\(memo ?? "nil")")
+        print("   >>> Sending MEMPOOL INCOMING notification")
 
-        // Build body with optional memo
-        var body = String(format: "+%.8f ZCL (pending)", zcl)
+        let content = UNMutableNotificationContent()
+        content.title = "Incoming ZCL"
+
+        // Build body with amount and pending status
+        var body = String(format: "+%.8f ZCL\n⏳ Awaiting confirmation", zcl)
         if let memo = memo, !memo.isEmpty {
             // Truncate memo for notification if too long
             let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
@@ -88,12 +106,60 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// Notify when transaction is confirmed
+    /// Notify when ZCL is received AND confirmed (mined in block)
+    func notifyReceivedConfirmed(amount: UInt64, txid: String, memo: String? = nil) {
+        let zcl = Double(amount) / 100_000_000.0
+        print("🔔 NOTIFICATION: notifyReceivedConfirmed called")
+        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   txid=\(txid.prefix(16))...")
+        print("   memo=\(memo ?? "nil")")
+        print("   >>> Sending MINED INCOMING notification")
+
+        // Remove the pending "Incoming" notification for this txid
+        // This replaces the "Awaiting confirmation" message with "Received"
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["received-\(txid)"])
+        print("   Removed pending notification: received-\(txid)")
+
+        let content = UNMutableNotificationContent()
+        content.title = "⛏️ ZCL Received"
+
+        // Build body with amount and cypherpunk message
+        let cypherpunkMessage = cypherpunkMessages.randomElement() ?? cypherpunkMessages[0]
+        var body = String(format: "+%.8f ZCL\n%@", zcl, cypherpunkMessage)
+        if let memo = memo, !memo.isEmpty {
+            // Truncate memo for notification if too long
+            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
+            body += "\n📝 \(truncatedMemo)"
+        }
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["type": "received_confirmed", "txid": txid, "amount": amount, "memo": memo ?? ""]
+
+        let request = UNNotificationRequest(
+            identifier: "received-confirmed-\(txid)",
+            content: content,
+            trigger: nil // Immediate
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("❌ Failed to send received confirmed notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Notify when transaction is confirmed (for outgoing txs)
     func notifyConfirmed(amount: UInt64, txid: String) {
         let zcl = Double(amount) / 100_000_000.0
+        print("🔔 NOTIFICATION: notifyConfirmed called")
+        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   txid=\(txid.prefix(16))...")
+        print("   >>> Sending OUTGOING TX MINED notification")
+
         let content = UNMutableNotificationContent()
-        content.title = "Transaction Confirmed"
-        content.body = String(format: "%.8f ZCL confirmed", zcl)
+        content.title = "⛏️ Transaction Mined"
+        let cypherpunkMessage = cypherpunkMessages.randomElement() ?? cypherpunkMessages[0]
+        content.body = String(format: "-%.8f ZCL\n%@", zcl, cypherpunkMessage)
         content.sound = .default
         content.userInfo = ["type": "confirmed", "txid": txid, "amount": amount]
 
@@ -113,6 +179,12 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// Notify when ZCL is sent
     func notifySent(amount: UInt64, txid: String, memo: String? = nil) {
         let zcl = Double(amount) / 100_000_000.0
+        print("🔔 NOTIFICATION: notifySent called")
+        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   txid=\(txid.prefix(16))...")
+        print("   memo=\(memo ?? "nil")")
+        print("   >>> Sending SENT notification (tx broadcast)")
+
         let content = UNMutableNotificationContent()
         content.title = "ZCL Sent"
 

@@ -51,6 +51,32 @@ bool zipherx_build_transaction(
     size_t *tx_out_len
 );
 
+// Spend information for multi-input transactions
+typedef struct {
+    const uint8_t *witness_data;    // Serialized IncrementalWitness data
+    size_t witness_len;              // Length of witness data
+    uint64_t note_value;             // Note value in zatoshis
+    const uint8_t *note_rcm;         // Note commitment randomness (32 bytes)
+    const uint8_t *note_diversifier; // Note diversifier (11 bytes)
+} SpendInfo;
+
+// Build a shielded transaction with multiple input notes
+// spends: array of SpendInfo pointers
+// spend_count: number of spends
+// nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
+bool zipherx_build_transaction_multi(
+    const uint8_t *sk,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const SpendInfo *const *spends,
+    size_t spend_count,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len,
+    uint8_t *nullifiers_out
+);
+
 // Commitment tree functions
 bool zipherx_tree_init(void);
 uint64_t zipherx_tree_append(const uint8_t *cmu);

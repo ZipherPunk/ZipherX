@@ -10,13 +10,34 @@ private let zipherxLog = OSLog(subsystem: "com.zipherx.wallet", category: "debug
 // MARK: - Global Print Override
 // Override Swift's print to use os_log for device visibility
 
-/// Global print override - uses os_log for reliable device logging
+/// Thread-safe timestamp generation using ISO8601DateFormatter
+/// Note: DateFormatter is NOT thread-safe, so we use ISO8601DateFormatter or manual formatting
+private func getCurrentTimestamp() -> String {
+    // Use POSIX strftime which is thread-safe
+    var now = time(nil)
+    var timeinfo = tm()
+    localtime_r(&now, &timeinfo)
+
+    var buffer = [CChar](repeating: 0, count: 24)
+    strftime(&buffer, 24, "%H:%M:%S", &timeinfo)
+
+    // Add milliseconds
+    var tv = timeval()
+    gettimeofday(&tv, nil)
+    let ms = tv.tv_usec / 1000
+
+    return String(cString: buffer) + String(format: ".%03d", ms)
+}
+
+/// Global print override - uses os_log for reliable device logging with timestamps
+/// NOTE: Only use os_log OR Swift.print, not both, to avoid duplicate log lines
 public func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
     let output = items.map { "\($0)" }.joined(separator: separator)
-    // Use os_log for device visibility (shows in Console.app and Xcode)
-    os_log("%{public}@", log: zipherxLog, type: .default, "DEBUGZIPHERX: \(output)")
-    // Also print to stdout for simulator
-    Swift.print("DEBUGZIPHERX: \(output)", terminator: terminator)
+    let timestamp = getCurrentTimestamp()
+    let formattedOutput = "[\(timestamp)] DEBUGZIPHERX: \(output)"
+    // Use Swift.print only - os_log can cause duplicate lines when both stdout and os_log
+    // are captured in the same log file (common on macOS)
+    Swift.print(formattedOutput, terminator: terminator)
 }
 
 /// Debug logging system that writes to a file for export
@@ -61,8 +82,8 @@ final class DebugLogger {
     /// Log a message with timestamp
     /// All logs are prefixed with "DEBUGZIPHERX" for easy filtering in Xcode console
     func log(_ message: String, file: String = #file, function: String = #function, line: Int = #line) {
-        // Always print to console with DEBUGZIPHERX prefix for filtering
-        print("DEBUGZIPHERX: \(message)")
+        // Always print to console with timestamp (print() already adds DEBUGZIPHERX prefix)
+        print(message)
 
         // Only write to file if enabled
         guard isEnabled else { return }

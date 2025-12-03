@@ -11,6 +11,9 @@ private actor TransactionTrackingState {
     /// Notified incoming mempool transactions (to avoid duplicate notifications)
     private var notifiedMempoolIncomingTxs: Set<String> = []
 
+    /// Pending incoming transactions (txid -> amount in zatoshis) - tracked until confirmed
+    private var pendingIncomingTxs: [String: UInt64] = [:]
+
     // MARK: - Outgoing Transaction Tracking
 
     func trackOutgoing(txid: String, amount: UInt64) -> (total: UInt64, count: Int) {
@@ -34,6 +37,11 @@ private actor TransactionTrackingState {
         pendingOutgoingTxs[txid] != nil
     }
 
+    /// Get all pending outgoing txids as a Set for efficient lookup
+    func getAllPendingOutgoingTxids() -> Set<String> {
+        Set(pendingOutgoingTxs.keys)
+    }
+
     // MARK: - Incoming Mempool Notification Tracking
 
     func checkAndMarkNotified(txid: String) -> Bool {
@@ -46,6 +54,41 @@ private actor TransactionTrackingState {
 
     func clearIncomingNotification(txid: String) {
         notifiedMempoolIncomingTxs.remove(txid)
+    }
+
+    // MARK: - Incoming Transaction Tracking (for confirmed celebration)
+
+    func trackIncoming(txid: String, amount: UInt64) {
+        pendingIncomingTxs[txid] = amount
+    }
+
+    func confirmIncoming(txid: String) -> UInt64? {
+        let amount = pendingIncomingTxs[txid]
+        pendingIncomingTxs.removeValue(forKey: txid)
+        return amount
+    }
+
+    func isPendingIncoming(txid: String) -> Bool {
+        pendingIncomingTxs[txid] != nil
+    }
+
+    func getPendingIncomingAmount(txid: String) -> UInt64? {
+        pendingIncomingTxs[txid]
+    }
+
+    /// Get all pending incoming txids (for periodic confirmation check)
+    func getPendingIncomingTxids() -> [(txid: String, amount: UInt64)] {
+        pendingIncomingTxs.map { ($0.key, $0.value) }
+    }
+
+    /// Get total pending incoming amount
+    func getTotalPendingIncoming() -> UInt64 {
+        pendingIncomingTxs.values.reduce(0, +)
+    }
+
+    /// Get count of pending incoming transactions
+    func getPendingIncomingCount() -> Int {
+        pendingIncomingTxs.count
     }
 }
 
@@ -948,10 +991,11 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // ALWAYS check if any outgoing pending txs have been confirmed
+        // ALWAYS check if any pending txs have been confirmed
         // (even during initial sync - user wants to see when their tx confirms)
         Task {
             await checkPendingOutgoingConfirmations()
+            await checkPendingIncomingConfirmations()
         }
     }
 
@@ -965,12 +1009,91 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var mempoolOutgoing: UInt64 = 0
     @Published private(set) var mempoolOutgoingTxCount: Int = 0
 
-    /// Published when a transaction is confirmed (for showing "mined" celebration)
-    /// Contains (txid, amount, isOutgoing) - cleared after UI handles it
-    @Published var justConfirmedTx: (txid: String, amount: UInt64, isOutgoing: Bool)? = nil
+    /// NEW: Two-phase outgoing tracking for instant UI feedback
+    /// Phase 1: Peer accepted (set when first peer accepts broadcast)
+    /// Phase 2: Mempool verified (set when tx confirmed in mempool)
+    @Published private(set) var pendingBroadcastAmount: UInt64 = 0
+    @Published private(set) var pendingBroadcastTxid: String? = nil
+    @Published private(set) var isMempoolVerified: Bool = false
+
+    /// Published when a transaction is confirmed (for showing "Settlement" celebration)
+    /// Contains (txid, amount, isOutgoing, clearingTime, settlementTime) - cleared after UI handles it
+    /// clearingTime: seconds from send click to mempool, settlementTime: seconds from send click to 1st confirmation
+    @Published var justConfirmedTx: (txid: String, amount: UInt64, isOutgoing: Bool, clearingTime: TimeInterval?, settlementTime: TimeInterval?)? = nil
+
+    /// Published when incoming ZCL is detected in mempool (for showing "Clearing" celebration)
+    /// Contains (txid, amount, clearingTime) - cleared after UI handles it
+    /// clearingTime: seconds from send click to mempool detection (only for sender)
+    @Published var justDetectedIncomingMempool: (txid: String, amount: UInt64, clearingTime: TimeInterval?)? = nil
+
+    /// Published when sender's tx is verified in mempool (for showing "Clearing" celebration on sender side)
+    /// Contains (txid, amount, clearingTime) - cleared after UI handles it
+    @Published var justClearedOutgoing: (txid: String, amount: UInt64, clearingTime: TimeInterval)? = nil
+
+    /// Counter to trigger onChange when outgoing clearing is detected
+    @Published var outgoingClearingTrigger: Int = 0
+
+    /// Counter to trigger onChange when mempool incoming is detected (workaround for tuple observation)
+    @Published var mempoolIncomingCelebrationTrigger: Int = 0
 
     /// Actor-based transaction tracking (eliminates priority inversion from NSLock)
     private let txTrackingState = TransactionTrackingState()
+
+    /// Called IMMEDIATELY when first peer accepts the broadcast
+    /// This provides instant UI feedback before mempool verification completes
+    /// ALSO adds txid to pendingOutgoingTxidSet so FilterScanner can detect change outputs
+    /// AND tracks in the actor so checkPendingOutgoingConfirmations works
+    @MainActor
+    func setPendingBroadcast(txid: String, amount: UInt64) {
+        pendingBroadcastTxid = txid
+        pendingBroadcastAmount = amount
+        isMempoolVerified = false
+
+        // CRITICAL: Add to pendingOutgoingTxidSet IMMEDIATELY so FilterScanner
+        // can detect change outputs even if trackPendingOutgoing hasn't been called yet
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.insert(txid)
+        pendingOutgoingLock.unlock()
+
+        // Also update mempoolOutgoing for immediate UI feedback
+        self.mempoolOutgoing = amount
+        self.mempoolOutgoingTxCount = 1
+
+        // Track in the actor (async but non-blocking) so confirmation checking works
+        Task {
+            _ = await txTrackingState.trackOutgoing(txid: txid, amount: amount)
+            print("📤 Actor tracking set for: \(txid.prefix(12))...")
+        }
+
+        print("⚡ Pending broadcast set: txid=\(txid.prefix(12))..., amount=\(amount) zatoshis (added to tracking)")
+    }
+
+    /// Called when mempool verification completes
+    @MainActor
+    func setMempoolVerified() {
+        isMempoolVerified = true
+        print("✅ Mempool verified for pending broadcast")
+
+        // Trigger Clearing celebration for sender
+        if let txid = pendingBroadcastTxid, pendingBroadcastAmount > 0 {
+            var clearingTime: TimeInterval = 0
+            if let sendTime = WalletManager.shared.lastSendTimestamp {
+                clearingTime = Date().timeIntervalSince(sendTime)
+            }
+            justClearedOutgoing = (txid: txid, amount: pendingBroadcastAmount, clearingTime: clearingTime)
+            outgoingClearingTrigger += 1
+            print("🏦 CLEARING! Outgoing tx \(txid.prefix(12))... verified in mempool after \(String(format: "%.1f", clearingTime))s")
+        }
+    }
+
+    /// Clear pending broadcast state (called when tx is confirmed/mined)
+    @MainActor
+    func clearPendingBroadcast() {
+        pendingBroadcastTxid = nil
+        pendingBroadcastAmount = 0
+        isMempoolVerified = false
+        print("🧹 Pending broadcast cleared")
+    }
 
     /// Called after successfully broadcasting a transaction
     /// Tracks the pending outgoing amount until it confirms
@@ -1013,14 +1136,32 @@ final class NetworkManager: ObservableObject {
                 self.mempoolOutgoing = result.total
                 self.mempoolOutgoingTxCount = result.count
 
-                // Publish confirmation for UI celebration (cypherpunk mined message!)
-                if let amount = result.amount {
-                    self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
+                // Clear two-phase broadcast tracking (instant UI was showing this)
+                self.clearPendingBroadcast()
+
+                // Calculate timing for Settlement celebration
+                var settlementTime: TimeInterval? = nil
+                var clearingTime: TimeInterval? = nil
+                if let sendTime = WalletManager.shared.lastSendTimestamp {
+                    settlementTime = Date().timeIntervalSince(sendTime)
+                    // Estimate clearing time (we don't have exact mempool verified time, but it's typically 2-5 seconds)
+                    clearingTime = min(5.0, settlementTime ?? 5.0)
                 }
 
-                print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing))")
+                // Publish confirmation for UI celebration (Settlement!)
+                if let amount = result.amount {
+                    self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true, clearingTime: clearingTime, settlementTime: settlementTime)
+                }
+
+                print("⛏️ SETTLEMENT! Outgoing tx confirmed: \(txid.prefix(12))... after \(String(format: "%.1f", settlementTime ?? 0))s (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing))")
             }
         } else {
+            // Even if not tracked, clear pending broadcast in case it was set
+            await MainActor.run {
+                if self.pendingBroadcastTxid == txid {
+                    self.clearPendingBroadcast()
+                }
+            }
             print("📤 confirmOutgoingTx: txid not found in pending list (already confirmed or never tracked)")
         }
     }
@@ -1030,6 +1171,74 @@ final class NetworkManager: ObservableObject {
     func clearMempoolIncomingNotification(txid: String) {
         Task {
             await txTrackingState.clearIncomingNotification(txid: txid)
+        }
+    }
+
+    /// Track a pending incoming transaction found during block scan (0 confirmations)
+    /// This will trigger the Settlement celebration once it has 1+ confirmations
+    func trackPendingIncoming(txid: String, amount: UInt64) async {
+        print("📥 trackPendingIncoming: txid=\(txid.prefix(16))... amount=\(amount)")
+        await txTrackingState.trackIncoming(txid: txid, amount: amount)
+        await MainActor.run {
+            // Update mempoolIncoming to show pending indicator
+            self.mempoolIncoming += amount
+            self.mempoolTxCount += 1
+        }
+    }
+
+    /// Called when an incoming transaction is confirmed (found in a mined block)
+    /// Removes from pending tracking and publishes confirmation for UI celebration
+    func confirmIncomingTx(txid: String, amount: UInt64) async {
+        print("📥 confirmIncomingTx called for: \(txid.prefix(16))... amount=\(amount)")
+
+        // Check if this was a tracked mempool incoming tx
+        let trackedAmount = await txTrackingState.confirmIncoming(txid: txid)
+
+        // Use tracked amount if available, otherwise use provided amount
+        let finalAmount = trackedAmount ?? amount
+
+        // Clear notification tracking
+        await txTrackingState.clearIncomingNotification(txid: txid)
+
+        // ALWAYS clear mempool incoming when a tx is confirmed
+        // This handles cases where:
+        // 1. Tx was tracked in mempool → clear tracked amount
+        // 2. Tx was NOT tracked (peer failures) but mempoolIncoming is set → clear the amount
+        // 3. Tx arrived directly in block without mempool detection → no-op (mempoolIncoming already 0)
+        await MainActor.run {
+            if trackedAmount != nil {
+                // Tracked case: reduce by confirmed amount
+                if self.mempoolIncoming >= finalAmount {
+                    self.mempoolIncoming -= finalAmount
+                } else {
+                    self.mempoolIncoming = 0
+                }
+                if self.mempoolTxCount > 0 {
+                    self.mempoolTxCount -= 1
+                }
+            } else if self.mempoolIncoming > 0 {
+                // NOT tracked but mempoolIncoming is set → clear it
+                // This happens when mempool scan set it but tracking failed
+                print("⚠️ mempoolIncoming=\(self.mempoolIncoming) but tx wasn't tracked - clearing")
+                if self.mempoolIncoming >= finalAmount {
+                    self.mempoolIncoming -= finalAmount
+                } else {
+                    self.mempoolIncoming = 0
+                }
+                if self.mempoolTxCount > 0 {
+                    self.mempoolTxCount -= 1
+                }
+            }
+        }
+
+        await MainActor.run {
+            // Publish confirmation for UI celebration (Settlement for receiver!)
+            // Receiver doesn't have send click time, so clearingTime/settlementTime are nil
+            self.justConfirmedTx = (txid: txid, amount: finalAmount, isOutgoing: false, clearingTime: nil, settlementTime: nil)
+            print("⛏️ SETTLEMENT! Incoming tx confirmed: \(txid.prefix(12))... +\(Double(finalAmount) / 100_000_000.0) ZCL")
+
+            // Also send system notification
+            NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
         }
     }
 
@@ -1114,6 +1323,61 @@ final class NetworkManager: ObservableObject {
         }
     }
 
+    /// Check if any pending incoming transactions have been confirmed (1+ confirmations)
+    /// Called periodically to detect when mempool txs get mined and show celebration
+    func checkPendingIncomingConfirmations() async {
+        let pendingIncoming = await txTrackingState.getPendingIncomingTxids()
+
+        // Always log current state for debugging
+        print("📥 checkPendingIncomingConfirmations: pendingIncoming.count=\(pendingIncoming.count), mempoolIncoming=\(mempoolIncoming)")
+
+        guard !pendingIncoming.isEmpty else {
+            // If we have mempoolIncoming > 0 but no pending txids, something is out of sync
+            // This can happen if mempool scan set it but tracking failed
+            if mempoolIncoming > 0 {
+                print("⚠️ mempoolIncoming=\(mempoolIncoming) but no pending txids! Clearing...")
+                await MainActor.run {
+                    self.mempoolIncoming = 0
+                    self.mempoolTxCount = 0
+                }
+            }
+            return
+        }
+
+        print("📥 Checking \(pendingIncoming.count) pending incoming transactions for confirmations...")
+        print("📥 Pending txids: \(pendingIncoming.map { $0.txid.prefix(16) + "..." })")
+
+        var confirmedCount = 0
+
+        for (txid, amount) in pendingIncoming {
+            // Check if transaction has confirmations via InsightAPI
+            do {
+                let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
+                print("📥 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
+                if txInfo.confirmations >= 1 {
+                    print("📥 Tx \(txid.prefix(16))... CONFIRMED (1+ conf)! Calling confirmIncomingTx...")
+                    await confirmIncomingTx(txid: txid, amount: amount)
+                    confirmedCount += 1
+                }
+            } catch {
+                print("📥 Failed to check tx \(txid.prefix(16))...: \(error)")
+            }
+        }
+
+        // Safety: If all pending txids were confirmed but mempoolIncoming is still > 0,
+        // force clear after a small delay (async race condition protection)
+        if confirmedCount == pendingIncoming.count && confirmedCount > 0 {
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second delay
+            await MainActor.run {
+                if self.mempoolIncoming > 0 {
+                    print("📥 Force clearing mempoolIncoming after all txids confirmed")
+                    self.mempoolIncoming = 0
+                    self.mempoolTxCount = 0
+                }
+            }
+        }
+    }
+
     /// Force clear all pending outgoing transactions
     /// Called when we detect they should be confirmed (e.g., wallet synced past tx block)
     func clearAllPendingOutgoing() {
@@ -1186,10 +1450,17 @@ final class NetworkManager: ObservableObject {
         }
 
         // Process mempool transactions
+        // NOTE: Don't clear mempoolIncoming when peer returns 0 txs if we have tracked pending incoming
+        // This prevents UI flickering when peers are unreliable
         guard !mempoolTxs.isEmpty else {
-            await MainActor.run {
-                self.mempoolIncoming = 0
-                self.mempoolTxCount = 0
+            let hasPendingIncoming = await txTrackingState.getPendingIncomingCount() > 0
+            if !hasPendingIncoming {
+                await MainActor.run {
+                    self.mempoolIncoming = 0
+                    self.mempoolTxCount = 0
+                }
+            } else {
+                print("🔮 Peer returned 0 txs but we have tracked pending incoming - keeping mempoolIncoming=\(self.mempoolIncoming)")
             }
             return
         }
@@ -1207,9 +1478,22 @@ final class NetworkManager: ObservableObject {
         var incomingCount = 0
         var newIncomingTxs: [(txid: String, amount: UInt64)] = []
 
+        // Get pending outgoing txids upfront to detect change outputs early
+        let pendingOutgoingTxids = await txTrackingState.getAllPendingOutgoingTxids()
+
         // Check each mempool transaction for shielded outputs
         for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
-            let txHashHex = txHashData.map { String(format: "%02x", $0) }.joined()
+            // P2P returns txids in wire format (little-endian)
+            // Convert to display format (big-endian) for consistency with InsightAPI
+            let txHashReversed = Data(txHashData.reversed())
+            let txHashHex = txHashReversed.map { String(format: "%02x", $0) }.joined()
+
+            // EARLY CHECK: Skip change outputs from our own pending transactions
+            // This prevents change from being counted in mempoolIncoming
+            if pendingOutgoingTxids.contains(txHashHex) {
+                print("🔮 MEMPOOL: Skipping tx \(txHashHex.prefix(12))... (change output from our pending send)")
+                continue
+            }
 
             // Try to get raw tx from P2P peer first, then InsightAPI fallback
             var rawTx: Data?
@@ -1254,57 +1538,66 @@ final class NetworkManager: ObservableObject {
                 }
 
                 if txIncomingAmount > 0 {
-                    incomingAmount += txIncomingAmount
-                    incomingCount += 1
+                    // EARLY check for change output - before counting toward mempoolIncoming
+                    let txidData = Data(hexString: txHashHex) ?? Data()
+                    var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
 
-                    // Check if this is a NEW incoming tx we haven't notified about (actor-based, no priority inversion)
-                    let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
-                    if isNewTx {
-                        newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
+                    if !isChangeOutput {
+                        let isPending = await txTrackingState.isPendingOutgoing(txid: txHashHex)
+                        if isPending {
+                            isChangeOutput = true
+                            print("🔔 MEMPOOL: Detected pending outgoing tx \(txHashHex.prefix(12))... (change output)")
+                        }
+                    }
+
+                    if !isChangeOutput {
+                        if let lastSend = WalletManager.shared.lastSendTimestamp,
+                           Date().timeIntervalSince(lastSend) < 120.0 {
+                            isChangeOutput = true
+                            print("🔔 MEMPOOL: Detected recent send activity - treating as change output")
+                        }
+                    }
+
+                    if !isChangeOutput && mempoolOutgoing > 0 {
+                        isChangeOutput = true
+                        print("🔔 MEMPOOL: mempoolOutgoing > 0 - treating as change output")
+                    }
+
+                    if isChangeOutput {
+                        // Change outputs are NOT counted in mempoolIncoming
+                        print("🔔 MEMPOOL: Excluding change output \(txIncomingAmount) zatoshis from tx \(txHashHex.prefix(12))...")
+                    } else {
+                        // Real incoming - count it and prepare for notification
+                        incomingAmount += txIncomingAmount
+                        incomingCount += 1
+
+                        // Check if this is a NEW incoming tx we haven't notified about
+                        let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
+                        print("🔮 MEMPOOL: tx \(txHashHex.prefix(12))... isNewTx=\(isNewTx)")
+                        if isNewTx {
+                            newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
+                        } else {
+                            print("🔮 MEMPOOL: Skipping already-notified tx \(txHashHex.prefix(12))...")
+                        }
                     }
                 }
             }
         }
 
-        // Send notifications for NEW incoming transactions
-        // But SKIP notifications for change outputs (where we already have a "sent" tx with same txid)
+        // Send notifications for NEW incoming transactions (already filtered for change)
         for (txid, amount) in newIncomingTxs {
-            // Check if this is a change output from our own send
-            // Method 1: Check database for existing "sent" record
-            let txidData = Data(hexString: txid) ?? Data()
-            var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+            print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
+            NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
 
-            // Method 2: Check if txid is in pendingOutgoingTxs (catches race condition
-            // where send is broadcast but not yet recorded in DB)
-            if !isChangeOutput {
-                let isPending = await txTrackingState.isPendingOutgoing(txid: txid)
-                if isPending {
-                    isChangeOutput = true
-                    print("🔔 MEMPOOL: Detected pending outgoing tx \(txid.prefix(12))... (change output)")
-                }
-            }
+            // Track this incoming tx so we can celebrate when it's confirmed
+            await txTrackingState.trackIncoming(txid: txid, amount: amount)
 
-            // Method 3: Check if we sent recently (within 120 seconds)
-            // This catches cases where DB and pendingOutgoingTxs might not have the tx yet
-            if !isChangeOutput {
-                if let lastSend = WalletManager.shared.lastSendTimestamp,
-                   Date().timeIntervalSince(lastSend) < 120.0 {
-                    isChangeOutput = true
-                    print("🔔 MEMPOOL: Detected recent send activity - treating as change output")
-                }
-            }
-
-            // Method 4: Check if mempoolOutgoing > 0 (we have pending outgoing tx)
-            if !isChangeOutput && mempoolOutgoing > 0 {
-                isChangeOutput = true
-                print("🔔 MEMPOOL: mempoolOutgoing > 0 - treating as change output")
-            }
-
-            if isChangeOutput {
-                print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
-            } else {
-                print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
-                NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
+            // Trigger UI celebration for incoming mempool transaction (Clearing for receiver)
+            // Receiver doesn't have send click time, so clearingTime is nil
+            await MainActor.run {
+                self.justDetectedIncomingMempool = (txid: txid, amount: amount, clearingTime: nil)
+                self.mempoolIncomingCelebrationTrigger += 1  // Increment to trigger onChange
+                print("🏦 CLEARING! Set justDetectedIncomingMempool: txid=\(txid.prefix(12))..., amount=\(amount), trigger=\(self.mempoolIncomingCelebrationTrigger)")
             }
         }
 
@@ -1701,7 +1994,8 @@ final class NetworkManager: ObservableObject {
     /// Primary: P2P broadcast to connected peers
     /// Fallback: InsightAPI broadcast if no P2P peers available
     /// Success = at least one peer/API accepted + mempool confirms (FAST EXIT)
-    func broadcastTransactionWithProgress(_ rawTx: Data, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
+    /// NEW: Pass amount to enable instant UI feedback when first peer accepts
+    func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
         // If no P2P peers, fall back to InsightAPI broadcast
@@ -1729,13 +2023,17 @@ final class NetworkManager: ObservableObject {
             var successCount = 0
             var txId: String?
             var mempoolVerified = false
+            var pendingBroadcastSet = false  // Track if we've set pending broadcast
 
-            func recordSuccess(_ id: String) -> Int {
+            func recordSuccess(_ id: String) -> (count: Int, isFirst: Bool) {
+                let isFirst = (successCount == 0)
                 successCount += 1
                 txId = id
-                return successCount
+                return (successCount, isFirst)
             }
 
+            func markPendingBroadcastSet() { pendingBroadcastSet = true }
+            func isPendingBroadcastSet() -> Bool { pendingBroadcastSet }
             func setVerified() { mempoolVerified = true }
             func isVerified() -> Bool { mempoolVerified }
             func getTxId() -> String? { txId }
@@ -1743,6 +2041,7 @@ final class NetworkManager: ObservableObject {
         }
 
         let state = BroadcastState()
+        let broadcastAmount = amount  // Capture for use in closures
 
         // Broadcast to all peers - but check mempool after FIRST success
         // Use short timeout (5s) to avoid waiting for slow/dead peers
@@ -1771,9 +2070,18 @@ final class NetworkManager: ObservableObject {
                             return result
                         }
                         print("✅ Peer \(peerHost) accepted tx: \(id)")
-                        let count = await state.recordSuccess(id)
+                        let result = await state.recordSuccess(id)
+
+                        // On FIRST peer acceptance, immediately set pending broadcast for instant UI feedback
+                        if result.isFirst && broadcastAmount > 0 {
+                            await MainActor.run {
+                                self.setPendingBroadcast(txid: id, amount: broadcastAmount)
+                            }
+                            await state.markPendingBroadcastSet()
+                        }
+
                         // Include txid in detail so UI can display it immediately
-                        onProgress?("peers", "Accepted by \(count)/\(peerCount) nodes [txid:\(id)]", Double(count) / Double(peerCount))
+                        onProgress?("peers", "Accepted by \(result.count)/\(peerCount) nodes [txid:\(id)]", Double(result.count) / Double(peerCount))
                     } catch {
                         print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
                     }
@@ -1802,6 +2110,10 @@ final class NetworkManager: ObservableObject {
                         print("✅ Transaction VERIFIED in mempool: \(txId)")
                         onProgress?("verify", "In mempool - awaiting miners", 1.0)
                         await state.setVerified()
+                        // Update UI state: mempool verified (for progressive messaging)
+                        await MainActor.run {
+                            self.setMempoolVerified()
+                        }
                         return // Exit immediately!
                     }
                     if attempt < 3 {
