@@ -501,25 +501,42 @@ struct TransactionDetailView: View {
     }
 
     private func estimatedDateString(for height: UInt64) -> String {
+        // Updated reference point: Dec 3, 2025 ~08:00 UTC
+        let referenceHeight: UInt64 = 2_930_657
+        let referenceTimestamp: TimeInterval = 1733212800 // Dec 3, 2025 08:00 UTC
+        let referenceDate = Date(timeIntervalSince1970: referenceTimestamp)
+
         let currentHeight = networkManager.chainHeight
         let currentDate = Date()
 
-        if currentHeight == 0 {
-            let referenceHeight: UInt64 = 2_926_100
-            let referenceDate = Date(timeIntervalSince1970: 1764072000) // Nov 25, 2025 12:00 UTC
-            let blockDifference = Int64(height) - Int64(referenceHeight)
+        // If we have a valid chain height, use current tip for best accuracy
+        if currentHeight > 0 && height <= currentHeight {
+            let blockDifference = Int64(height) - Int64(currentHeight)
             let secondsDifference = Double(blockDifference) * 150.0
-            let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+            let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
+
+            // SAFETY: Never show future dates for confirmed transactions
+            if estimatedDate > currentDate {
+                let refBlockDiff = Int64(height) - Int64(referenceHeight)
+                let refSecondsDiff = Double(refBlockDiff) * 150.0
+                let refEstimatedDate = referenceDate.addingTimeInterval(refSecondsDiff)
+
+                let formatter = DateFormatter()
+                formatter.dateStyle = .medium
+                formatter.timeStyle = .short
+                return formatter.string(from: refEstimatedDate)
+            }
 
             let formatter = DateFormatter()
-            formatter.dateStyle = .short
+            formatter.dateStyle = .medium
             formatter.timeStyle = .short
             return formatter.string(from: estimatedDate)
         }
 
-        let blockDifference = Int64(height) - Int64(currentHeight)
+        // Fallback: use reference-based calculation
+        let blockDifference = Int64(height) - Int64(referenceHeight)
         let secondsDifference = Double(blockDifference) * 150.0
-        let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
+        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
 
         let formatter = DateFormatter()
         formatter.dateStyle = .medium

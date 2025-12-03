@@ -1641,10 +1641,10 @@ final class WalletDatabase {
 
     /// Estimate block timestamp from height
     /// Zclassic averages 2.5 minutes (150 seconds) per block
-    /// Uses reference point: Block 2,926,100 ≈ Nov 29, 2024 ~12:00 UTC
+    /// Uses reference point: Block 2,930,657 ≈ Dec 3, 2025 ~08:00 UTC
     private func estimateBlockTime(height: UInt64) -> UInt64 {
-        let referenceHeight: UInt64 = 2_926_100
-        let referenceTimestamp: UInt64 = 1764072000 // Nov 25, 2025 12:00 UTC
+        let referenceHeight: UInt64 = 2_930_657
+        let referenceTimestamp: UInt64 = 1733212800 // Dec 3, 2025 08:00 UTC
         let blockInterval: Int64 = 150 // 2.5 minutes in seconds
 
         let heightDiff = Int64(height) - Int64(referenceHeight)
@@ -2252,9 +2252,9 @@ struct TransactionHistoryItem {
             // Fall back to estimation from block height
             // This should rarely happen now since we look up headers when loading from DB
             // Zclassic averages 2.5 minutes (150 seconds) per block
-            // Reference: Block 2,926,100 ≈ Nov 29, 2024 12:00 UTC
-            let referenceHeight: UInt64 = 2_926_100
-            let referenceTimestamp: TimeInterval = 1764072000 // Nov 25, 2025 12:00 UTC
+            // Reference: Block 2,930,657 ≈ Dec 3, 2025 08:00 UTC
+            let referenceHeight: UInt64 = 2_930_657
+            let referenceTimestamp: TimeInterval = 1733212800 // Dec 3, 2025 08:00 UTC
             let blockInterval: TimeInterval = 150 // 2.5 minutes in seconds
 
             let heightDiff = Int64(height) - Int64(referenceHeight)

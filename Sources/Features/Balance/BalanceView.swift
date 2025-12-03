@@ -530,20 +530,34 @@ struct BalanceView: View {
     /// Estimate date/time from block height
     /// Zclassic has ~150 second block times (2.5 minutes)
     private func estimatedDateString(for height: UInt64) -> String {
-        // Use current time and current chain height as reference for accurate estimation
-        // This avoids stale reference points that drift over time
+        // Updated reference point: Dec 3, 2025 ~07:00 UTC
+        let referenceHeight: UInt64 = 2_930_657
+        let referenceTimestamp: TimeInterval = 1733212800 // Dec 3, 2025 08:00 UTC
+        let referenceDate = Date(timeIntervalSince1970: referenceTimestamp)
+
         let currentHeight = networkManager.chainHeight
         let currentDate = Date()
 
-        // If we don't have chain height yet, use a recent known reference
-        if currentHeight == 0 {
-            // Fallback: block 2,926,100 on November 29, 2025 ~12:00 UTC
-            let referenceHeight: UInt64 = 2_926_100
-            let referenceDate = Date(timeIntervalSince1970: 1764072000) // Nov 25, 2025 12:00 UTC
+        // If we have a valid chain height, use current tip for best accuracy
+        if currentHeight > 0 && height <= currentHeight {
+            // Calculate based on current chain tip (most accurate for past blocks)
+            let blockDifference = Int64(height) - Int64(currentHeight)
+            let secondsDifference = Double(blockDifference) * 150.0 // ~150 seconds per block
+            let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
 
-            let blockDifference = Int64(height) - Int64(referenceHeight)
-            let secondsDifference = Double(blockDifference) * 150.0
-            let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
+            // SAFETY: Never show future dates for confirmed transactions
+            // If estimate is in the future, fall back to reference-based calculation
+            if estimatedDate > currentDate {
+                // Use reference-based calculation instead
+                let refBlockDiff = Int64(height) - Int64(referenceHeight)
+                let refSecondsDiff = Double(refBlockDiff) * 150.0
+                let refEstimatedDate = referenceDate.addingTimeInterval(refSecondsDiff)
+
+                let formatter = DateFormatter()
+                formatter.dateStyle = .short
+                formatter.timeStyle = .short
+                return formatter.string(from: refEstimatedDate)
+            }
 
             let formatter = DateFormatter()
             formatter.dateStyle = .short
@@ -551,11 +565,10 @@ struct BalanceView: View {
             return formatter.string(from: estimatedDate)
         }
 
-        // Calculate based on current chain tip (most accurate)
-        let blockDifference = Int64(height) - Int64(currentHeight)
-        let secondsDifference = Double(blockDifference) * 150.0 // ~150 seconds per block
-
-        let estimatedDate = currentDate.addingTimeInterval(secondsDifference)
+        // Fallback: use reference-based calculation
+        let blockDifference = Int64(height) - Int64(referenceHeight)
+        let secondsDifference = Double(blockDifference) * 150.0
+        let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)
 
         let formatter = DateFormatter()
         formatter.dateStyle = .short
