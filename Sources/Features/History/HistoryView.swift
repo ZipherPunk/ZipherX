@@ -173,14 +173,12 @@ struct HistoryView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // Only populate from notes if history is empty
-                // This avoids the CLEAR + rebuild cycle that causes change to briefly appear
-                let existingCount = try WalletDatabase.shared.getTransactionCount()
-                if existingCount == 0 {
-                    let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                    if populatedCount > 0 {
-                        print("📜 Populated \(populatedCount) new transaction history entries")
-                    }
+                // ALWAYS populate from notes to ensure SENT transactions are generated
+                // The populateHistoryFromNotes() function clears and rebuilds,
+                // which is necessary to correctly calculate SENT entries from spent notes
+                let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                if populatedCount > 0 {
+                    print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
                 }
 
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
