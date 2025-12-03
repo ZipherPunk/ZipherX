@@ -970,8 +970,13 @@ final class WalletDatabase {
     }
 
     /// Mark note as spent by height
+    /// NOTE: Also sets spent_in_tx using nullifier as synthetic txid for history tracking
     func markNoteSpent(nullifier: Data, spentHeight: UInt64) throws {
-        let sql = "UPDATE notes SET is_spent = 1, spent_height = ? WHERE nf = ?;"
+        // Use nullifier as synthetic txid if no real txid available
+        // This ensures populateHistoryFromNotes() can still create SENT entries
+        let syntheticTxid = nullifier.prefix(32)
+
+        let sql = "UPDATE notes SET is_spent = 1, spent_height = ?, spent_in_tx = ? WHERE nf = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -980,14 +985,17 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int64(stmt, 1, Int64(spentHeight))
+        syntheticTxid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(syntheticTxid.count), nil)
+        }
         nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(nullifier.count), nil)
+            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(nullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
-        print("📜 Marked note spent at height \(spentHeight)")
+        print("📜 Marked note spent at height \(spentHeight) with synthetic txid")
     }
 
     /// Mark note as unspent (recover from failed broadcast)
