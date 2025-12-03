@@ -980,6 +980,53 @@ struct CypherpunkSyncView: View {
         }
     }
 
+    // MARK: - Platform-specific font sizes
+    #if os(macOS)
+    private let titleSize: CGFloat = 36
+    private let subtitleSize: CGFloat = 14
+    private let messageSize: CGFloat = 16
+    private let taskHeaderSize: CGFloat = 12
+    private let taskTitleSize: CGFloat = 14
+    private let taskDetailSize: CGFloat = 12
+    private let percentageSize: CGFloat = 28
+    private let overallPercentSize: CGFloat = 32
+    private let statusSize: CGFloat = 14
+    private let quoteSize: CGFloat = 12
+    private let quoteAuthorSize: CGFloat = 11
+    // Completion view sizes
+    private let completionIconSize: CGFloat = 48
+    private let completionCircleSize: CGFloat = 100
+    private let completionTitleSize: CGFloat = 32
+    private let completionDurationLabelSize: CGFloat = 14
+    private let completionDurationValueSize: CGFloat = 36
+    private let completionButtonTextSize: CGFloat = 18
+    private let completionButtonIconSize: CGFloat = 16
+    private let completionQuoteSize: CGFloat = 13
+    private let completionFooterSize: CGFloat = 12
+    #else
+    private let titleSize: CGFloat = 28
+    private let subtitleSize: CGFloat = 10
+    private let messageSize: CGFloat = 12
+    private let taskHeaderSize: CGFloat = 9
+    private let taskTitleSize: CGFloat = 11
+    private let taskDetailSize: CGFloat = 9
+    private let percentageSize: CGFloat = 14
+    private let overallPercentSize: CGFloat = 22
+    private let statusSize: CGFloat = 10
+    private let quoteSize: CGFloat = 9
+    private let quoteAuthorSize: CGFloat = 8
+    // Completion view sizes
+    private let completionIconSize: CGFloat = 40
+    private let completionCircleSize: CGFloat = 80
+    private let completionTitleSize: CGFloat = 24
+    private let completionDurationLabelSize: CGFloat = 12
+    private let completionDurationValueSize: CGFloat = 28
+    private let completionButtonTextSize: CGFloat = 16
+    private let completionButtonIconSize: CGFloat = 14
+    private let completionQuoteSize: CGFloat = 11
+    private let completionFooterSize: CGFloat = 10
+    #endif
+
     // MARK: - Syncing View
     private var syncingView: some View {
         VStack(spacing: 16) {
@@ -988,13 +1035,13 @@ struct CypherpunkSyncView: View {
             // Matrix-style title with glitch effect
             ZStack {
                 Text("SYNCING")
-                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                    .font(.system(size: titleSize, weight: .bold, design: .monospaced))
                     .foregroundColor(NeonColors.primary)
                     .offset(x: showGlitch ? glitchOffset : 0)
 
                 if showGlitch {
                     Text("SYNCING")
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                        .font(.system(size: titleSize, weight: .bold, design: .monospaced))
                         .foregroundColor(.red.opacity(0.5))
                         .offset(x: -glitchOffset)
                 }
@@ -1002,7 +1049,7 @@ struct CypherpunkSyncView: View {
 
             // Subtitle
             Text("PROTECTING YOUR PRIVACY")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.system(size: subtitleSize, weight: .medium, design: .monospaced))
                 .foregroundColor(NeonColors.primaryDark)
                 .tracking(3)
 
@@ -1012,7 +1059,7 @@ struct CypherpunkSyncView: View {
 
             // Rotating cypherpunk message
             Text(currentMessage)
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: messageSize, design: .monospaced))
                 .foregroundColor(NeonColors.primary)
                 .multilineTextAlignment(.center)
                 .animation(.easeInOut(duration: 0.3), value: currentMessage)
@@ -1023,7 +1070,7 @@ struct CypherpunkSyncView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     // Section header
                     Text("TASKS")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .font(.system(size: taskHeaderSize, weight: .bold, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
                         .tracking(2)
                         .padding(.bottom, 8)
@@ -1051,12 +1098,12 @@ struct CypherpunkSyncView: View {
                let taskProgress = currentTask.progress {
                 VStack(spacing: 6) {
                     Text("CURRENT TASK")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .font(.system(size: taskHeaderSize, weight: .bold, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
                         .tracking(2)
 
                     Text(currentTask.title.uppercased())
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .font(.system(size: taskTitleSize, weight: .medium, design: .monospaced))
                         .foregroundColor(NeonColors.primary)
 
                     // Task progress bar (larger)
@@ -1081,13 +1128,13 @@ struct CypherpunkSyncView: View {
 
                     // Task percentage
                     Text("\(Int(taskProgress * 100))%")
-                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .font(.system(size: percentageSize, weight: .bold, design: .monospaced))
                         .foregroundColor(NeonColors.primary)
 
                     // Task detail if available
                     if let detail = currentTask.detail {
                         Text(detail)
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.system(size: taskDetailSize, design: .monospaced))
                             .foregroundColor(NeonColors.primaryDim)
                     }
                 }
@@ -1097,7 +1144,7 @@ struct CypherpunkSyncView: View {
             // Overall progress bar
             VStack(spacing: 6) {
                 Text("OVERALL PROGRESS")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .font(.system(size: taskHeaderSize, weight: .bold, design: .monospaced))
                     .foregroundColor(NeonColors.primaryDim)
                     .tracking(2)
 
@@ -1131,13 +1178,13 @@ struct CypherpunkSyncView: View {
 
                 // Progress percentage
                 Text("\(Int(progress * 100))%")
-                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                    .font(.system(size: overallPercentSize, weight: .bold, design: .monospaced))
                     .foregroundColor(NeonColors.primary)
 
                 // Status text
                 if !status.isEmpty {
                     Text(status)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: statusSize, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
                 }
             }
@@ -1148,12 +1195,12 @@ struct CypherpunkSyncView: View {
             // Footer quote
             VStack(spacing: 4) {
                 Text("\"We must defend our own privacy\"")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: quoteSize, design: .monospaced))
                     .foregroundColor(NeonColors.primaryVeryDim)
                     .italic()
 
                 Text("- Cypherpunk's Manifesto")
-                    .font(.system(size: 8, design: .monospaced))
+                    .font(.system(size: quoteAuthorSize, design: .monospaced))
                     .foregroundColor(NeonColors.primaryVeryDim)
             }
             .padding(.bottom, 30)
@@ -1169,19 +1216,19 @@ struct CypherpunkSyncView: View {
             ZStack {
                 Circle()
                     .stroke(NeonColors.primary, lineWidth: 3)
-                    .frame(width: 80, height: 80)
+                    .frame(width: completionCircleSize, height: completionCircleSize)
                     .scaleEffect(showCompletionAnimation ? 1.0 : 0.5)
                     .opacity(showCompletionAnimation ? 1.0 : 0.0)
 
                 Image(systemName: "checkmark")
-                    .font(.system(size: 40, weight: .bold))
+                    .font(.system(size: completionIconSize, weight: .bold))
                     .foregroundColor(NeonColors.primary)
                     .scaleEffect(showCompletionAnimation ? 1.0 : 0.0)
             }
 
             // Completion message
             Text(completionMessages.randomElement() ?? "SOVEREIGNTY UNLOCKED")
-                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                .font(.system(size: completionTitleSize, weight: .bold, design: .monospaced))
                 .foregroundColor(NeonColors.primary)
                 .scaleEffect(showCompletionAnimation ? 1.0 : 0.8)
                 .opacity(showCompletionAnimation ? 1.0 : 0.0)
@@ -1190,11 +1237,11 @@ struct CypherpunkSyncView: View {
             if let duration = completionDuration {
                 VStack(spacing: 4) {
                     Text("Initialization complete in")
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(.system(size: completionDurationLabelSize, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
 
                     Text(formatDuration(duration))
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                        .font(.system(size: completionDurationValueSize, weight: .bold, design: .monospaced))
                         .foregroundColor(NeonColors.primary)
                 }
                 .opacity(showCompletionAnimation ? 1.0 : 0.0)
@@ -1208,9 +1255,9 @@ struct CypherpunkSyncView: View {
                 Button(action: action) {
                     HStack(spacing: 12) {
                         Text(enterButtonMessages.randomElement() ?? "[ ENTER THE VOID ]")
-                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .font(.system(size: completionButtonTextSize, weight: .bold, design: .monospaced))
                         Image(systemName: "arrow.right")
-                            .font(.system(size: 14, weight: .bold))
+                            .font(.system(size: completionButtonIconSize, weight: .bold))
                     }
                     .foregroundColor(.black)
                     .padding(.horizontal, 32)
@@ -1231,12 +1278,12 @@ struct CypherpunkSyncView: View {
             // Cypherpunk footer
             VStack(spacing: 8) {
                 Text("\"Privacy is necessary for an open society\"")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: completionQuoteSize, design: .monospaced))
                     .foregroundColor(NeonColors.primaryDim)
                     .italic()
 
                 Text("Your financial sovereignty is now active.")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: completionFooterSize, design: .monospaced))
                     .foregroundColor(NeonColors.primaryVeryDim)
             }
             .opacity(showCompletionAnimation ? 1.0 : 0.0)
@@ -1327,6 +1374,17 @@ struct CypherpunkSyncView: View {
 struct CypherpunkSyncTaskRow: View {
     let task: SyncTask
 
+    // Platform-specific font sizes for task rows
+    #if os(macOS)
+    private let taskRowTitleSize: CGFloat = 13
+    private let taskRowDetailSize: CGFloat = 11
+    private let taskRowIconSize: CGFloat = 16
+    #else
+    private let taskRowTitleSize: CGFloat = 10
+    private let taskRowDetailSize: CGFloat = 8
+    private let taskRowIconSize: CGFloat = 14
+    #endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
@@ -1336,26 +1394,26 @@ struct CypherpunkSyncTaskRow: View {
                     case .pending:
                         Circle()
                             .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
-                            .frame(width: 14, height: 14)
+                            .frame(width: taskRowIconSize, height: taskRowIconSize)
                     case .inProgress:
                         ProgressView()
                             .progressViewStyle(CircularProgressViewStyle(tint: NeonColors.primary))
                             .scaleEffect(0.6)
-                            .frame(width: 14, height: 14)
+                            .frame(width: taskRowIconSize, height: taskRowIconSize)
                     case .completed:
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(NeonColors.progressFillStart)
-                            .font(.system(size: 14))
+                            .font(.system(size: taskRowIconSize))
                     case .failed:
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.red)
-                            .font(.system(size: 14))
+                            .font(.system(size: taskRowIconSize))
                     }
                 }
 
                 // Task title
                 Text(task.title)
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: taskRowTitleSize, design: .monospaced))
                     .foregroundColor(taskTextColor)
 
                 Spacer()
@@ -1363,7 +1421,7 @@ struct CypherpunkSyncTaskRow: View {
                 // Detail (e.g., "2923000 / 2924000")
                 if let detail = task.detail {
                     Text(detail)
-                        .font(.system(size: 8, design: .monospaced))
+                        .font(.system(size: taskRowDetailSize, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
                 }
             }

@@ -2566,6 +2566,57 @@ guard let rawTx = rawTx else {
 
 ---
 
+### 46. Bug Fixes and UI Improvements (December 3, 2025)
+
+**Changes Made:**
+
+1. **Seed Phrase Button in Danger Zone** (`SettingsView.swift`)
+   - Added "View Seed Phrase" button with eye icon
+   - Shows alert explaining seed phrase security (not stored for privacy)
+   - Cypherpunk quote in alert message
+
+2. **Sync Progress Stuck at 96% Fix** (`ContentView.swift`)
+   - Root cause: `currentSyncProgress` checked catch-up phase BEFORE completed tasks
+   - Fix: Reordered priority - completed tasks check comes first
+   - Progress now correctly shows 98%+ when tasks complete
+
+3. **Sync Timing Start Fix** (`WalletManager.swift`)
+   - Create Wallet: `walletCreationTime` now set when user clicks "I'VE SAVED MY SEED PHRASE"
+   - Restore/Import: Already correct (set at function start)
+   - Ensures accurate sync duration display
+
+4. **Thread-Safe Timestamp Generation** (`DebugLogger.swift`)
+   - Root cause: `DateFormatter` is NOT thread-safe (caused crashes during restore)
+   - Fix: Replaced with POSIX `strftime`/`localtime_r`/`gettimeofday`
+   - Added millisecond precision to timestamps
+
+5. **Database NULL Pointer Fix** (`WalletDatabase.swift`)
+   - Added `isOpen` property to check if database connection exists
+   - Guard check in `resetDatabaseForNewWallet()` prevents crash during early initialization
+
+6. **Mnemonic Validation Safety** (`MnemonicGenerator.swift`)
+   - Added detailed debug logging to `validateMnemonic()`
+   - Added safety checks to `mnemonicToEntropy()` for edge cases
+
+7. **macOS Font Size Improvements** (`System7Components.swift`)
+   - Added platform-specific font sizes for CypherpunkSyncView
+   - macOS uses larger fonts for better readability during sync
+   - Title: 36pt (macOS) vs 28pt (iOS)
+   - Percentages: 32pt (macOS) vs 22pt (iOS)
+   - Task text: 13-14pt (macOS) vs 10-11pt (iOS)
+   - Updated both syncing view and completion view
+
+**Files Modified**:
+- `Sources/Features/Settings/SettingsView.swift` - View Seed Phrase button
+- `Sources/App/ContentView.swift` - sync progress priority fix
+- `Sources/Core/Wallet/WalletManager.swift` - sync timing, debug logging
+- `Sources/Core/Storage/WalletDatabase.swift` - `isOpen` property
+- `Sources/Core/Services/DebugLogger.swift` - thread-safe timestamp
+- `Sources/Core/Wallet/MnemonicGenerator.swift` - debug logging, safety checks
+- `Sources/UI/Components/System7Components.swift` - macOS font sizes
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
