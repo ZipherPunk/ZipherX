@@ -628,17 +628,22 @@ final class FilterScanner {
                 let heights = Array(currentHeight...endHeight)
 
                 // Get current batch data (from pre-fetch or fetch now)
+                // Use 60-second timeout to prevent hanging on unresponsive P2P peers
                 var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
                 do {
                     if let prefetchTask = nextBatchTask {
-                        // Use pre-fetched data - this should be nearly instant!
+                        // Use pre-fetched data with timeout protection
                         print("🚀 Using pre-fetched data for blocks \(currentHeight)-\(endHeight)")
-                        blockData = try await prefetchTask.value
+                        blockData = try await withTimeout(seconds: 60) {
+                            try await prefetchTask.value
+                        }
                         nextBatchTask = nil
                     } else {
-                        // First batch or pre-fetch failed - fetch synchronously
+                        // First batch or pre-fetch failed - fetch synchronously with timeout
                         print("📦 Fetching blocks \(currentHeight) to \(endHeight) via \(useP2POnly ? "P2P only" : "P2P+fallback")...")
-                        blockData = try await fetchBlocksData(heights: heights.map { UInt64($0) })
+                        blockData = try await withTimeout(seconds: 60) {
+                            try await self.fetchBlocksData(heights: heights.map { UInt64($0) })
+                        }
                     }
                 } catch {
                     print("❌ Failed to fetch blocks \(currentHeight)-\(endHeight): \(error)")
@@ -646,8 +651,10 @@ final class FilterScanner {
                         throw error
                     }
                     // In fallback mode, continue with empty data for this batch
+                    // Cancel the pre-fetch task to prevent resource leak
+                    nextBatchTask?.cancel()
+                    nextBatchTask = nil
                     currentHeight = endHeight + 1
-                    nextBatchTask = nil // Clear failed pre-fetch
                     continue
                 }
 
@@ -670,17 +677,11 @@ final class FilterScanner {
                 for (height, txList) in blockData {
                     guard isScanning else { break }
 
-                    var blockTxWithShieldedCount = 0
                     for (txid, outputs, spends) in txList {
                         // Process if there are outputs OR spends (for nullifier detection)
                         let hasOutputs = !outputs.isEmpty
                         let hasSpends = spends?.isEmpty == false
                         if hasOutputs || hasSpends {
-                            blockTxWithShieldedCount += 1
-                            let outputCount = outputs.count
-                            let spendCount = spends?.count ?? 0
-                            print("🔍 Block \(height): Processing tx \(txid) with \(outputCount) outputs, \(spendCount) spends")
-
                             // Process on main actor to avoid SQLite threading issues
                             do {
                                 try await MainActor.run {
@@ -700,10 +701,6 @@ final class FilterScanner {
                         }
                     }
 
-                    if blockTxWithShieldedCount > 0 {
-                        print("📊 Block \(height): Found \(blockTxWithShieldedCount) shielded transactions")
-                    }
-
                     scannedBlocks += 1
                     // Report progress every 10 blocks for better UI feedback
                     if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
@@ -720,7 +717,10 @@ final class FilterScanner {
                     try? database.saveTreeState(treeData)
                 }
 
-                print("📦 Processed blocks \(currentHeight) to \(endHeight)")
+                // Log progress every 500 blocks to reduce verbosity
+                if scannedBlocks % 500 == 0 || scannedBlocks == totalBlocks {
+                    print("📦 Processed \(scannedBlocks) of \(totalBlocks) blocks (heights \(startHeight) to \(endHeight))")
+                }
 
                 currentHeight = endHeight + 1
             }
@@ -877,11 +877,6 @@ final class FilterScanner {
             if let tx = tx {
                 transactions.append(tx)
             }
-        }
-
-        let totalOutputs = transactions.reduce(0) { $0 + $1.outputs.count }
-        if totalOutputs > 0 {
-            print("🔍 Block \(height): \(transactions.count) txs, \(totalOutputs) Sapling outputs")
         }
 
         return CompactBlock(
@@ -1076,16 +1071,6 @@ final class FilterScanner {
             }
         }
 
-        // Count total outputs in this block
-        var totalOutputs = 0
-        for tx in block.transactions {
-            totalOutputs += tx.outputs.count
-        }
-
-        if totalOutputs > 0 {
-            print("🔍 Block \(height): \(block.transactions.count) txs, \(totalOutputs) shielded outputs to check")
-        }
-
         // Trial-decrypt each output to find notes for us
         for tx in block.transactions {
             for (outputIndex, output) in tx.outputs.enumerated() {
@@ -1140,7 +1125,6 @@ final class FilterScanner {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs
         if let spends = spends, !spends.isEmpty {
-            print("🔍 Checking \(spends.count) spend(s) at height \(height) against \(knownNullifiers.count) known nullifiers")
             // Convert txid from hex string to Data for database storage
             let txidData = Data(hexString: txid)
             for spend in spends {
@@ -1205,9 +1189,6 @@ final class FilterScanner {
             print("💰 Found note: \(value) zatoshis at height \(height)")
             print("📝 Diversifier bytes to store: \(Array(Data(diversifier)).map { String(format: "%02x", $0) }.joined(separator: ", "))")
 
-            // Send notification
-            NotificationManager.shared.notifyReceived(amount: value, txid: txid)
-
             let txidData = Data(hexString: txid) ?? Data()
 
             // Compute nullifier using spending key (required for proper PRF_nf)
@@ -1242,13 +1223,33 @@ final class FilterScanner {
             )
 
             // IMMEDIATELY record in transaction history for real-time consistency
-            let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
-            try database.recordReceivedTransaction(
-                txid: txidData,
-                height: height,
-                value: value,
-                memo: memoText
-            )
+            // CRITICAL: Check if this is a change output from our own send
+            // Method 1: Check database for existing "sent" record
+            var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
+
+            // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            if !isChangeOutput {
+                let isPending = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                if isPending {
+                    isChangeOutput = true
+                    print("💰 Detected pending outgoing tx \(txid.prefix(12))... (change output)")
+                }
+            }
+
+            if isChangeOutput {
+                print("💰 Skipping change output (txid already exists as sent): \(value) zatoshis")
+                // NO notification for change outputs - don't trigger fireworks on sender
+            } else {
+                // Send notification for real incoming payments only
+                NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+                let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
+                try database.recordReceivedTransaction(
+                    txid: txidData,
+                    height: height,
+                    value: value,
+                    memo: memoText
+                )
+            }
 
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
         }
@@ -1331,9 +1332,6 @@ final class FilterScanner {
             print("💰 Found note: \(value) zatoshis at height \(height)")
             print("📝 Diversifier bytes to store: \(Array(Data(diversifier)).map { String(format: "%02x", $0) }.joined(separator: ", "))")
 
-            // Send notification
-            NotificationManager.shared.notifyReceived(amount: value, txid: txid)
-
             let txidData = Data(hexString: txid) ?? Data()
 
             // Try to find real position from bundled CMU data
@@ -1375,13 +1373,33 @@ final class FilterScanner {
             )
 
             // IMMEDIATELY record in transaction history for real-time consistency
-            let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
-            try database.recordReceivedTransaction(
-                txid: txidData,
-                height: height,
-                value: value,
-                memo: memoText
-            )
+            // CRITICAL: Check if this is a change output from our own send
+            // Method 1: Check database for existing "sent" record
+            var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
+
+            // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            if !isChangeOutput {
+                let isPending = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                if isPending {
+                    isChangeOutput = true
+                    print("💰 Detected pending outgoing tx \(txid.prefix(12))... (change output)")
+                }
+            }
+
+            if isChangeOutput {
+                print("💰 Skipping change output (txid already exists as sent): \(value) zatoshis")
+                // NO notification for change outputs - don't trigger fireworks on sender
+            } else {
+                // Send notification for real incoming payments only
+                NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+                let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
+                try database.recordReceivedTransaction(
+                    txid: txidData,
+                    height: height,
+                    value: value,
+                    memo: memoText
+                )
+            }
 
             print("📝 Stored note \(noteId) with value \(value)")
         }
@@ -1466,9 +1484,6 @@ final class FilterScanner {
             // We found a note addressed to us!
             print("💰 Found note: \(value) zatoshis at height \(height)")
 
-            // Send notification for received ZCL
-            NotificationManager.shared.notifyReceived(amount: value, txid: txid)
-
             let txidData = Data(hexString: txid) ?? Data()
 
             // Use real tree position for nullifier computation
@@ -1507,18 +1522,38 @@ final class FilterScanner {
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
 
             // IMMEDIATELY record in transaction history for real-time consistency
-            let memoText: String? = {
-                let truncated = note.memo.prefix(512)
-                let filtered = truncated.filter { $0 != 0 }
-                guard !filtered.isEmpty else { return nil }
-                return String(data: Data(filtered), encoding: .utf8)
-            }()
-            try database.recordReceivedTransaction(
-                txid: txidData,
-                height: height,
-                value: note.value,
-                memo: memoText
-            )
+            // CRITICAL: Check if this is a change output from our own send
+            // Method 1: Check database for existing "sent" record
+            var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
+
+            // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            if !isChangeOutput {
+                let isPending = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                if isPending {
+                    isChangeOutput = true
+                    print("💰 Detected pending outgoing tx \(txid.prefix(12))... (change output)")
+                }
+            }
+
+            if isChangeOutput {
+                print("💰 Skipping change output (txid already exists as sent): \(note.value) zatoshis")
+                // NO notification for change outputs - don't trigger fireworks on sender
+            } else {
+                // Send notification for real incoming payments only
+                NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+                let memoText: String? = {
+                    let truncated = note.memo.prefix(512)
+                    let filtered = truncated.filter { $0 != 0 }
+                    guard !filtered.isEmpty else { return nil }
+                    return String(data: Data(filtered), encoding: .utf8)
+                }()
+                try database.recordReceivedTransaction(
+                    txid: txidData,
+                    height: height,
+                    value: note.value,
+                    memo: memoText
+                )
+            }
 
             print("💰 Stored note \(noteId): \(note.value) zatoshis at height \(height), tree pos \(position)")
         }
@@ -1567,24 +1602,49 @@ final class FilterScanner {
         )
 
         // Record transaction history for received note
-        // Extract memo string from memo data (filter null bytes, convert to UTF8)
-        let memoString: String? = {
-            let truncated = note.memo.prefix(512)
-            let filtered = truncated.filter { $0 != 0 }
-            guard !filtered.isEmpty else { return nil }
-            return String(data: Data(filtered), encoding: .utf8)
-        }()
-        _ = try database.insertTransactionHistory(
-            txid: txid,
-            height: height,
-            blockTime: nil, // Could fetch from block header if available
-            type: .received,
-            value: note.value,
-            fee: nil,
-            toAddress: nil, // We received it, so our address
-            fromDiversifier: note.diversifier,
-            memo: memoString
-        )
+        // CRITICAL: Check if this is a change output from our own send
+        // If we already have a "sent" transaction with this txid, this is change - don't record as received
+        // Note: txid parameter is already Data type, no conversion needed
+        // Method 1: Check database for existing "sent" record
+        var isChangeOutput = (try? database.transactionExists(txid: txid, type: .sent)) ?? false
+
+        // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+        if !isChangeOutput {
+            let txidHex = txid.map { String(format: "%02x", $0) }.joined()
+            let isPending = NetworkManager.shared.isPendingOutgoingSync(txid: txidHex)
+            if isPending {
+                isChangeOutput = true
+                print("💰 Detected pending outgoing tx \(txidHex.prefix(12))... (change output)")
+            }
+        }
+
+        if isChangeOutput {
+            print("💰 Skipping change output (txid already exists as sent): \(note.value) zatoshis")
+            // Don't record change outputs in transaction history - they would confuse the user
+            // The note is still saved and adds to balance, but won't show as separate "RECEIVED"
+            // NO notification for change outputs - don't trigger fireworks on sender
+        } else {
+            // Send notification for real incoming payments only
+            NotificationManager.shared.notifyReceived(amount: note.value, txid: txid.map { String(format: "%02x", $0) }.joined())
+            // Extract memo string from memo data (filter null bytes, convert to UTF8)
+            let memoString: String? = {
+                let truncated = note.memo.prefix(512)
+                let filtered = truncated.filter { $0 != 0 }
+                guard !filtered.isEmpty else { return nil }
+                return String(data: Data(filtered), encoding: .utf8)
+            }()
+            _ = try database.insertTransactionHistory(
+                txid: txid,
+                height: height,
+                blockTime: nil, // Could fetch from block header if available
+                type: .received,
+                value: note.value,
+                fee: nil,
+                toAddress: nil, // We received it, so our address
+                fromDiversifier: note.diversifier,
+                memo: memoString
+            )
+        }
 
         print("💰 Found note: \(note.value) zatoshis at height \(height)")
     }
@@ -1592,45 +1652,31 @@ final class FilterScanner {
     // MARK: - Helper Methods
 
     private func getChainHeight() async throws -> UInt64 {
-        // Get both HeaderStore height and P2P chain tip
-        // We use the MINIMUM to ensure we never scan beyond synced headers
-        // But if headers are fully synced, we'll scan to the true chain tip
+        // SECURITY: Use unified consensus function that:
+        // 1. Collects heights from InsightAPI + P2P peers
+        // 2. Finds agreeing sources within 5 blocks
+        // 3. Returns MINIMUM of agreeing sources (conservative)
+        // 4. BANS peers reporting heights >10 blocks above consensus
 
-        let headerStoreHeight = try? HeaderStore.shared.getLatestHeight()
-        var p2pHeight: UInt64? = nil
+        let consensusHeight = await insightAPI.getConsensusChainHeight(networkManager: networkManager)
 
-        // Try to get P2P chain tip
-        do {
-            p2pHeight = try await networkManager.getChainHeightP2POnly()
-        } catch {
-            if !useP2POnly {
-                // Try InsightAPI as fallback for chain tip
-                if let status = try? await insightAPI.getStatus() {
-                    p2pHeight = status.height
-                }
+        guard consensusHeight > 0 else {
+            print("❌ No valid chain heights available")
+            throw ScanError.networkError
+        }
+
+        // Also validate HeaderStore against consensus
+        let maxHeightDeviation: UInt64 = 10
+        if let hsHeight = try? HeaderStore.shared.getLatestHeight() {
+            if hsHeight > consensusHeight + maxHeightDeviation {
+                print("🚨 [SECURITY] HeaderStore has FAKE headers up to \(hsHeight)!")
+                print("🧹 [SECURITY] Clearing fake headers (consensus: \(consensusHeight))...")
+                try? HeaderStore.shared.clearAllHeaders()
+                print("✅ Fake headers cleared")
             }
         }
 
-        // Determine which height to use
-        if let hsHeight = headerStoreHeight, let chainTip = p2pHeight {
-            // Use minimum of HeaderStore and chain tip
-            // This ensures we don't scan beyond synced headers
-            let scanHeight = min(hsHeight, chainTip)
-            print("📡 Chain tip: \(chainTip), HeaderStore: \(hsHeight) → Scanning to: \(scanHeight)")
-            return scanHeight
-        } else if let hsHeight = headerStoreHeight {
-            // Only HeaderStore available - use it
-            print("📡 Using HeaderStore height: \(hsHeight)")
-            return hsHeight
-        } else if let chainTip = p2pHeight {
-            // Only P2P available (no headers synced yet) - this is for initial sync
-            print("⚠️ No headers synced, using P2P chain tip: \(chainTip)")
-            return chainTip
-        }
-
-        // No height available at all
-        print("❌ Cannot determine chain height")
-        throw ScanError.networkError
+        return consensusHeight
     }
 
     private func deriveIncomingViewingKey(from viewingKey: Data) -> Data {
@@ -1655,7 +1701,9 @@ final class FilterScanner {
     // MARK: - P2P Block Data Fetching
 
     /// Track if P2P block fetching is working (to avoid repeated failures)
-    private static var p2pBlockFetchingWorks: Bool? = nil
+    /// IMPORTANT: Default to false until P2P transaction parsing is verified working
+    /// The P2P block parsing currently returns empty transactions even for blocks with shielded tx
+    private static var p2pBlockFetchingWorks: Bool? = false
 
     /// Reset P2P status to re-test on next scan
     static func resetP2PStatus() {
@@ -1750,14 +1798,29 @@ final class FilterScanner {
                 let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count)
 
                 var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                var hasAnyShieldedData = false
                 for (h, _, txData) in results {
                     blockData.append((h, txData))
+                    // Check if any transaction has actual shielded data
+                    for (_, outputs, spends) in txData {
+                        if !outputs.isEmpty || spends?.isEmpty == false {
+                            hasAnyShieldedData = true
+                        }
+                    }
                 }
 
-                if !blockData.isEmpty {
+                // IMPORTANT: Only trust P2P if we actually got shielded data OR we know the blocks have none
+                // If we got blocks but zero shielded tx data, P2P parsing might be broken
+                // Fall back to InsightAPI to be safe
+                if !blockData.isEmpty && hasAnyShieldedData {
                     FilterScanner.p2pBlockFetchingWorks = true
-                    print("📡 P2P: Got data for \(blockData.count) blocks")
+                    print("📡 P2P: Got shielded data for \(blockData.count) blocks")
                     return blockData
+                } else if !blockData.isEmpty {
+                    // Got blocks but no shielded data - P2P parsing may be broken
+                    // Don't mark as working, fall through to InsightAPI
+                    print("⚠️ P2P: Got \(blockData.count) blocks but no shielded tx data - will try InsightAPI")
+                    FilterScanner.p2pBlockFetchingWorks = false
                 }
             } catch {
                 if FilterScanner.p2pBlockFetchingWorks == nil {

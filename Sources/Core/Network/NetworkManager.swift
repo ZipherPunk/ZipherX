@@ -30,6 +30,10 @@ private actor TransactionTrackingState {
         Array(pendingOutgoingTxs.keys)
     }
 
+    func isPendingOutgoing(txid: String) -> Bool {
+        pendingOutgoingTxs[txid] != nil
+    }
+
     // MARK: - Incoming Mempool Notification Tracking
 
     func checkAndMarkNotified(txid: String) -> Bool {
@@ -88,6 +92,7 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var chainHeight: UInt64 = 0
     @Published private(set) var walletHeight: UInt64 = 0
     @Published private(set) var zclPriceUSD: Double = 0.0
+    @Published private(set) var zclPriceFailed: Bool = false  // True if both price APIs failed
     @Published private(set) var lastBlockTxCount: Int = 0
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
@@ -95,6 +100,19 @@ final class NetworkManager: ObservableObject {
     /// Sybil attack detection - published when a fake peer is banned
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
     @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
+
+    /// Set of pending outgoing transaction IDs (for synchronous change detection)
+    /// This is updated alongside the actor's pendingOutgoingTxs for sync access
+    private var pendingOutgoingTxidSet: Set<String> = []
+    private let pendingOutgoingLock = NSLock()
+
+    /// Synchronous check if a transaction is pending outgoing (our own send)
+    /// Used by FilterScanner to detect change outputs without async
+    func isPendingOutgoingSync(txid: String) -> Bool {
+        pendingOutgoingLock.lock()
+        defer { pendingOutgoingLock.unlock() }
+        return pendingOutgoingTxidSet.contains(txid)
+    }
 
     /// Flag to suppress background sync during initial startup sync
     /// Set to true during ContentView's initial sync task, false after completion
@@ -917,16 +935,17 @@ final class NetworkManager: ObservableObject {
 
         // MEMPOOL SCAN: Check for incoming unconfirmed transactions
         // Uses message queue to prevent stream conflicts
-        // SKIP during initial sync to avoid interfering with header sync
+        // SKIP mempool scan during initial sync to avoid interfering with header sync
         if !suppressBackgroundSync {
             Task {
                 await scanMempoolForIncoming()
             }
+        }
 
-            // Check if any outgoing pending txs have been confirmed
-            Task {
-                await checkPendingOutgoingConfirmations()
-            }
+        // ALWAYS check if any outgoing pending txs have been confirmed
+        // (even during initial sync - user wants to see when their tx confirms)
+        Task {
+            await checkPendingOutgoingConfirmations()
         }
     }
 
@@ -949,35 +968,54 @@ final class NetworkManager: ObservableObject {
 
     /// Called after successfully broadcasting a transaction
     /// Tracks the pending outgoing amount until it confirms
-    func trackPendingOutgoing(txid: String, amount: UInt64) {
-        Task {
-            let result = await txTrackingState.trackOutgoing(txid: txid, amount: amount)
-            await MainActor.run {
-                self.mempoolOutgoing = result.total
-                self.mempoolOutgoingTxCount = result.count
-                print("📤 Tracking pending outgoing: \(txid.prefix(12))... = \(amount) zatoshis (total: \(result.total))")
-            }
+    /// This is now async and awaitable to ensure the tracking completes before UI updates
+    func trackPendingOutgoing(txid: String, amount: UInt64) async {
+        // Add to sync-accessible set first (for FilterScanner change detection)
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.insert(txid)
+        pendingOutgoingLock.unlock()
+
+        let result = await txTrackingState.trackOutgoing(txid: txid, amount: amount)
+        await MainActor.run {
+            self.mempoolOutgoing = result.total
+            self.mempoolOutgoingTxCount = result.count
+            print("📤 Tracking pending outgoing: \(txid.prefix(12))... = \(amount) zatoshis (total: \(result.total))")
         }
+    }
+
+    /// Check if a transaction is being tracked as pending outgoing (our own send)
+    /// Used to detect change outputs and suppress notifications
+    func isPendingOutgoing(txid: String) async -> Bool {
+        return await txTrackingState.isPendingOutgoing(txid: txid)
     }
 
     /// Called when a transaction is confirmed (found in a block)
     /// Removes from pending tracking and publishes confirmation for UI celebration
-    func confirmOutgoingTx(txid: String) {
-        Task {
-            let result = await txTrackingState.confirmOutgoing(txid: txid)
-            if result.removed {
-                await MainActor.run {
-                    self.mempoolOutgoing = result.total
-                    self.mempoolOutgoingTxCount = result.count
+    /// This is now async and awaitable to ensure proper completion ordering
+    func confirmOutgoingTx(txid: String) async {
+        print("📤 confirmOutgoingTx called for: \(txid.prefix(16))...")
 
-                    // Publish confirmation for UI celebration (cypherpunk mined message!)
-                    if let amount = result.amount {
-                        self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
-                    }
+        // Remove from sync-accessible set
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.remove(txid)
+        pendingOutgoingLock.unlock()
 
-                    print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(result.total))")
+        let result = await txTrackingState.confirmOutgoing(txid: txid)
+        print("📤 confirmOutgoing result: removed=\(result.removed), total=\(result.total), count=\(result.count)")
+        if result.removed {
+            await MainActor.run {
+                self.mempoolOutgoing = result.total
+                self.mempoolOutgoingTxCount = result.count
+
+                // Publish confirmation for UI celebration (cypherpunk mined message!)
+                if let amount = result.amount {
+                    self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true)
                 }
+
+                print("⛏️ MINED! Outgoing tx confirmed: \(txid.prefix(12))... (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing))")
             }
+        } else {
+            print("📤 confirmOutgoingTx: txid not found in pending list (already confirmed or never tracked)")
         }
     }
 
@@ -993,14 +1031,71 @@ final class NetworkManager: ObservableObject {
     /// Called periodically to clean up confirmed transactions
     func checkPendingOutgoingConfirmations() async {
         let pendingTxids = await txTrackingState.getPendingTxids()
-        guard !pendingTxids.isEmpty else { return }
+
+        // Always log current state for debugging
+        print("📤 checkPendingOutgoingConfirmations: pendingTxids.count=\(pendingTxids.count), mempoolOutgoing=\(mempoolOutgoing)")
+
+        guard !pendingTxids.isEmpty else {
+            // If we have mempoolOutgoing > 0 but no pending txids, something is out of sync
+            if mempoolOutgoing > 0 {
+                print("⚠️ mempoolOutgoing=\(mempoolOutgoing) but no pending txids! Clearing...")
+                await MainActor.run {
+                    self.mempoolOutgoing = 0
+                    self.mempoolOutgoingTxCount = 0
+                }
+            }
+            return
+        }
+
+        print("📤 Checking \(pendingTxids.count) pending outgoing transactions for confirmations...")
+        print("📤 Pending txids: \(pendingTxids.map { $0.prefix(16) + "..." })")
+
+        var confirmedCount = 0
 
         for txid in pendingTxids {
             // Check if transaction has confirmations via InsightAPI
-            if let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid) {
+            do {
+                let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
+                print("📤 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
                 if txInfo.confirmations > 0 {
-                    confirmOutgoingTx(txid: txid)
+                    print("📤 Tx \(txid.prefix(16))... CONFIRMED! Calling confirmOutgoingTx...")
+                    await confirmOutgoingTx(txid: txid)
+                    confirmedCount += 1
                 }
+            } catch {
+                print("📤 Failed to check tx \(txid.prefix(16))...: \(error)")
+                // If we can't find the tx and we've been tracking it, it might be confirmed
+                // with a different txid format. Check if mempoolOutgoing should be cleared
+                // after multiple failed lookups.
+            }
+        }
+
+        // Safety: If all pending txids were confirmed but mempoolOutgoing is still > 0,
+        // force clear after a small delay (async race condition protection)
+        if confirmedCount == pendingTxids.count && confirmedCount > 0 {
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second delay
+            await MainActor.run {
+                if self.mempoolOutgoing > 0 {
+                    print("📤 Force clearing mempoolOutgoing after all txids confirmed")
+                    self.mempoolOutgoing = 0
+                    self.mempoolOutgoingTxCount = 0
+                }
+            }
+        }
+    }
+
+    /// Force clear all pending outgoing transactions
+    /// Called when we detect they should be confirmed (e.g., wallet synced past tx block)
+    func clearAllPendingOutgoing() {
+        Task {
+            let txids = await txTrackingState.getPendingTxids()
+            for txid in txids {
+                await txTrackingState.confirmOutgoing(txid: txid)
+            }
+            await MainActor.run {
+                self.mempoolOutgoing = 0
+                self.mempoolOutgoingTxCount = 0
+                print("📤 Cleared all pending outgoing transactions")
             }
         }
     }
@@ -1008,14 +1103,23 @@ final class NetworkManager: ObservableObject {
     /// Scan mempool for incoming shielded transactions
     /// Uses trial decryption to detect payments before confirmation
     private func scanMempoolForIncoming() async {
-        guard isConnected else { return }
+        print("🔮 scanMempoolForIncoming: starting...")
+        guard isConnected else {
+            print("🔮 scanMempoolForIncoming: not connected, skipping")
+            return
+        }
 
         // Get a connected peer
-        guard let peer = getConnectedPeer() else { return }
+        guard let peer = getConnectedPeer() else {
+            print("🔮 scanMempoolForIncoming: no connected peer, skipping")
+            return
+        }
 
         do {
             // Get mempool transaction list
+            print("🔮 scanMempoolForIncoming: requesting mempool txs from peer...")
             let mempoolTxs = try await peer.getMempoolTransactions()
+            print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs")
 
             guard !mempoolTxs.isEmpty else {
                 await MainActor.run {
@@ -1029,8 +1133,10 @@ final class NetworkManager: ObservableObject {
 
             // Get spending key for trial decryption
             guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+                print("🔮 scanMempoolForIncoming: could not retrieve spending key, skipping")
                 return
             }
+            print("🔮 scanMempoolForIncoming: got spending key, checking txs...")
 
             var incomingAmount: UInt64 = 0
             var incomingCount = 0
@@ -1082,8 +1188,19 @@ final class NetworkManager: ObservableObject {
             // But SKIP notifications for change outputs (where we already have a "sent" tx with same txid)
             for (txid, amount) in newIncomingTxs {
                 // Check if this is a change output from our own send
+                // Method 1: Check database for existing "sent" record
                 let txidData = Data(hexString: txid) ?? Data()
-                let isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+                var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+
+                // Method 2: Check if txid is in pendingOutgoingTxs (catches race condition
+                // where send is broadcast but not yet recorded in DB)
+                if !isChangeOutput {
+                    let isPending = await txTrackingState.isPendingOutgoing(txid: txid)
+                    if isPending {
+                        isChangeOutput = true
+                        print("🔔 MEMPOOL: Detected pending outgoing tx \(txid.prefix(12))... (change output)")
+                    }
+                }
 
                 if isChangeOutput {
                     print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
@@ -1138,11 +1255,45 @@ final class NetworkManager: ObservableObject {
         return outputs.isEmpty ? nil : outputs
     }
 
-    /// Fetch ZCL price from API
+    /// Last time price was fetched (for rate limiting)
+    private var lastPriceFetchTime: Date?
+
+    /// Fetch ZCL price from API (with fallback, rate limited to every 60 seconds)
     private func fetchZCLPrice() async {
-        // Try CoinGecko API
-        guard let url = URL(string: "https://api.coingecko.com/api/v3/simple/price?ids=zclassic&vs_currencies=usd") else {
+        // Rate limit: only fetch every 60 seconds
+        if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 60 {
             return
+        }
+        lastPriceFetchTime = Date()
+
+        // Try CoinGecko API first
+        if let price = await fetchPriceFromCoinGecko() {
+            await MainActor.run {
+                self.zclPriceUSD = price
+                self.zclPriceFailed = false
+            }
+            return
+        }
+
+        // Fallback: Try CryptoCompare
+        if let price = await fetchPriceFromCryptoCompare() {
+            await MainActor.run {
+                self.zclPriceUSD = price
+                self.zclPriceFailed = false
+            }
+            return
+        }
+
+        // Both APIs failed
+        print("⚠️ Failed to fetch ZCL price from any source")
+        await MainActor.run {
+            self.zclPriceFailed = true
+        }
+    }
+
+    private func fetchPriceFromCoinGecko() async -> Double? {
+        guard let url = URL(string: "https://api.coingecko.com/api/v3/simple/price?ids=zclassic&vs_currencies=usd") else {
+            return nil
         }
 
         do {
@@ -1150,13 +1301,29 @@ final class NetworkManager: ObservableObject {
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let zclData = json["zclassic"] as? [String: Any],
                let price = zclData["usd"] as? Double {
-                await MainActor.run {
-                    self.zclPriceUSD = price
-                }
+                return price
             }
         } catch {
-            print("⚠️ Failed to fetch ZCL price: \(error)")
+            print("⚠️ CoinGecko price fetch failed: \(error)")
         }
+        return nil
+    }
+
+    private func fetchPriceFromCryptoCompare() async -> Double? {
+        guard let url = URL(string: "https://min-api.cryptocompare.com/data/price?fsym=ZCL&tsyms=USD") else {
+            return nil
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let price = json["USD"] as? Double {
+                return price
+            }
+        } catch {
+            print("⚠️ CryptoCompare price fetch failed: \(error)")
+        }
+        return nil
     }
 
     // MARK: - Peer Discovery
@@ -1364,13 +1531,12 @@ final class NetworkManager: ObservableObject {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
-                        // Ensure peer connection is still valid before broadcast
-                        try await peer.ensureConnected()
-
-                        // 5 second timeout per peer - don't wait for slow handshakes
+                        // 5 second timeout for ENTIRE operation (connect + broadcast)
                         let id = try await withThrowingTaskGroup(of: String.self) { timeoutGroup in
                             timeoutGroup.addTask {
-                                try await peer.broadcastTransaction(rawTx)
+                                // Ensure peer connection is still valid before broadcast
+                                try await peer.ensureConnected()
+                                return try await peer.broadcastTransaction(rawTx)
                             }
                             timeoutGroup.addTask {
                                 try await Task.sleep(nanoseconds: 5_000_000_000) // 5s timeout
@@ -1422,23 +1588,43 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
-            // Wait for either: mempool verified OR all broadcasts complete
-            // Check every 200ms if we can exit early
-            while true {
-                // Exit early if mempool verified
+            // The mempool verification task will set isVerified() and return
+            // The broadcast tasks will complete (success or fail)
+            // We just need to wait for all tasks to finish, but with a timeout
+
+            // Add a timeout task that cancels everything after 10 seconds
+            group.addTask {
+                try await Task.sleep(nanoseconds: 10_000_000_000) // 10 second max
+                print("⏱️ Broadcast timeout reached")
+            }
+
+            // Wait for tasks - but check verified status after each
+            var tasksRemaining = true
+            while tasksRemaining {
+                // Check if mempool verified - exit early!
                 if await state.isVerified() {
+                    print("✅ Mempool verified - exiting broadcast loop")
                     group.cancelAll()
                     break
                 }
 
-                // Check if a task completed
                 do {
                     guard let _ = try await group.next() else {
-                        // All tasks done
+                        tasksRemaining = false
+                        break
+                    }
+                    // A task finished - check verified status again immediately
+                    if await state.isVerified() {
+                        print("✅ Mempool verified after task completion - exiting")
+                        group.cancelAll()
                         break
                     }
                 } catch {
-                    // Task threw, continue waiting
+                    // Task threw (timeout or error), continue
+                    if await state.isVerified() {
+                        group.cancelAll()
+                        break
+                    }
                 }
             }
         }

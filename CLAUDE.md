@@ -2138,6 +2138,71 @@ Created comprehensive cypherpunk-styled HTML security audit report:
 
 ---
 
+### 37. Change Output Notification Suppression via Sync Tracking (December 3, 2025)
+
+**Problem**: Change outputs (leftover balance returning to sender) were triggering notifications as if they were incoming payments. User reported "the change txn activate a notification !!! which must not activate notification only real send/receive must activate noti"
+
+**Root Cause**: Race condition between broadcast and database recording:
+1. User sends transaction → `trackPendingOutgoing(txid)` called
+2. Transaction broadcast to network → mempool scanner detects change output
+3. `database.transactionExists(txid, type: .sent)` check fails because DB insert happens AFTER broadcast
+4. Change output treated as incoming → notification sent
+
+**Solution: Dual-Tracking System**
+
+Added synchronous tracking alongside the async actor to catch change outputs during the race window:
+
+1. **Actor-based tracking** (for async contexts like mempool scanner):
+   ```swift
+   // TransactionTrackingState actor
+   func isPendingOutgoing(txid: String) -> Bool {
+       pendingOutgoingTxs[txid] != nil
+   }
+   ```
+
+2. **NSLock-protected Set** (for sync contexts like FilterScanner):
+   ```swift
+   private var pendingOutgoingTxidSet: Set<String> = []
+   private let pendingOutgoingLock = NSLock()
+
+   func isPendingOutgoingSync(txid: String) -> Bool {
+       pendingOutgoingLock.lock()
+       defer { pendingOutgoingLock.unlock() }
+       return pendingOutgoingTxidSet.contains(txid)
+   }
+   ```
+
+3. **Updated tracking functions** to maintain both:
+   ```swift
+   func trackPendingOutgoing(txid: String, amount: UInt64) async {
+       // Add to sync set FIRST (for FilterScanner)
+       pendingOutgoingLock.lock()
+       pendingOutgoingTxidSet.insert(txid)
+       pendingOutgoingLock.unlock()
+       // Then add to actor
+       await txTrackingState.trackOutgoing(...)
+   }
+
+   func confirmOutgoingTx(txid: String) async {
+       // Remove from sync set
+       pendingOutgoingLock.lock()
+       pendingOutgoingTxidSet.remove(txid)
+       pendingOutgoingLock.unlock()
+       // Remove from actor
+       await txTrackingState.confirmOutgoing(...)
+   }
+   ```
+
+**Detection Logic** (in order of checks):
+1. `database.transactionExists(txid, type: .sent)` - DB already has the sent record
+2. `NetworkManager.shared.isPendingOutgoingSync(txid)` - catches race condition window
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - added `pendingOutgoingTxidSet`, `pendingOutgoingLock`, `isPendingOutgoingSync()`, updated `trackPendingOutgoing()` and `confirmOutgoingTx()`
+- `Sources/Core/Network/FilterScanner.swift` - changed 4 locations from async `isPendingOutgoing` to sync `isPendingOutgoingSync`
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
