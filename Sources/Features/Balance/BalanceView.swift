@@ -257,11 +257,11 @@ struct BalanceView: View {
                             .font(.system(size: 10))
                         Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        Text("incoming")
-                            .font(.system(size: 10, design: .monospaced))
+                        Text("awaiting confirmation")
+                            .font(.system(size: 9, design: .monospaced))
                             .italic()
                     }
-                    .foregroundColor(theme.successColor)
+                    .foregroundColor(theme.successColor)  // GREEN for incoming
                 }
             }
 
