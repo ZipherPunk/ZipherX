@@ -1201,13 +1201,10 @@ final class NetworkManager: ObservableObject {
                 print("🔮 Got raw tx \(txHashHex.prefix(12))... from P2P peer")
             } catch {
                 print("⚠️ P2P getMempoolTransaction failed for \(txHashHex.prefix(12))...: \(error.localizedDescription)")
-                // Fallback to InsightAPI
+                // Fallback to InsightAPI - use getRawTransaction endpoint
                 do {
-                    let txInfo = try await InsightAPI.shared.getTransaction(txid: txHashHex)
-                    if let rawHex = txInfo.rawtx {
-                        rawTx = Data(hexString: rawHex)
-                        print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
-                    }
+                    rawTx = try await InsightAPI.shared.getRawTransaction(txid: txHashHex)
+                    print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
                 } catch {
                     print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
                 }
