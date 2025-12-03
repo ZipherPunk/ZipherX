@@ -394,7 +394,7 @@ final class HeaderSyncManager {
         if locatorHash == nil, let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
             // Convert checkpoint hex (big-endian display format) to wire format (little-endian)
             if let hashData = Data(hexString: checkpointHex) {
-                locatorHash = hashData.reversed() // Reverse to wire format
+                locatorHash = Data(hashData.reversed()) // Reverse to wire format
                 print("📋 Using checkpoint hash for locator at height \(locatorHeight)")
             }
         }
