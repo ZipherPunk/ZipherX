@@ -1088,6 +1088,30 @@ final class NetworkManager: ObservableObject {
                 }
             }
         }
+
+        // CRITICAL FIX: If any tx was confirmed, trigger wallet sync to update balances
+        // This ensures the change note is discovered and has 1+ confirmations
+        if confirmedCount > 0 {
+            print("⛏️ \(confirmedCount) tx(s) confirmed - triggering wallet sync to update change notes...")
+
+            // Get current chain height from InsightAPI
+            if let status = try? await InsightAPI.shared.getStatus() {
+                let currentHeight = status.height
+                let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+
+                if currentHeight > walletHeight {
+                    print("⛏️ Chain height \(currentHeight) > wallet height \(walletHeight) - syncing...")
+                    // Trigger background sync to scan the confirmed tx block
+                    await WalletManager.shared.backgroundSyncToHeight(currentHeight)
+                    // Refresh balance to update confirmation counts
+                    try? await WalletManager.shared.refreshBalance()
+                } else {
+                    // Even if heights match, still refresh balance to update confirmations
+                    print("⛏️ Heights match but refreshing balance to update confirmations...")
+                    try? await WalletManager.shared.refreshBalance()
+                }
+            }
+        }
     }
 
     /// Force clear all pending outgoing transactions
