@@ -450,11 +450,8 @@ final class WalletManager: ObservableObject {
     /// Create a new wallet with a fresh mnemonic
     /// - Returns: The 24-word mnemonic for backup
     func createNewWallet() throws -> [String] {
-        // Record creation time for accurate sync timing display
-        DispatchQueue.main.async {
-            self.walletCreationTime = Date()
-            print("⏱️ Wallet creation started at: \(self.walletCreationTime!)")
-        }
+        // NOTE: walletCreationTime is set in confirmMnemonicBackup() when user clicks "I'VE SAVED MY SEED PHRASE"
+        // This ensures sync timing starts from user confirmation, not from wallet generation
 
         // Generate 24-word mnemonic (256-bit entropy)
         let mnemonic = try mnemonicGenerator.generateMnemonic(wordCount: 24)
@@ -498,6 +495,11 @@ final class WalletManager: ObservableObject {
     /// This completes the wallet creation process
     func confirmMnemonicBackup() {
         DispatchQueue.main.async {
+            // Record creation time NOW - when user clicks "I'VE SAVED MY SEED PHRASE"
+            // This is the true start of sync timing
+            self.walletCreationTime = Date()
+            print("⏱️ Wallet creation time set at: \(self.walletCreationTime!) (user confirmed backup)")
+
             self.isMnemonicBackupPending = false
             self.isWalletCreated = true
             self.saveWalletState()
