@@ -2339,6 +2339,56 @@ let referenceTimestamp: TimeInterval = 1764072000
 
 ---
 
+### 41. Mempool Raw Transaction Fetch with InsightAPI Fallback (December 3, 2025)
+
+**Problem**: Receiver's mempool scan was getting stuck after logging "checking txs..." - no further output or detection of incoming transactions.
+
+**Root Cause**: `getMempoolTransaction` in `scanMempoolForIncoming` was using `try?` which silently swallowed errors. When the P2P peer that returned the mempool inventory disconnected before raw tx could be fetched, the error was hidden and processing just stopped.
+
+**Solution: InsightAPI Fallback with Explicit Error Logging**
+
+```swift
+// OLD CODE - silently failed on peer disconnect
+guard let rawTx = try? await peer.getMempoolTransaction(txid: txHashData) else {
+    continue
+}
+
+// NEW CODE - explicit errors + InsightAPI fallback
+var rawTx: Data?
+do {
+    rawTx = try await peer.getMempoolTransaction(txid: txHashData)
+    print("🔮 Got raw tx \(txHashHex.prefix(12))... from P2P peer")
+} catch {
+    print("⚠️ P2P getMempoolTransaction failed for \(txHashHex.prefix(12))...: \(error)")
+    // Fallback to InsightAPI
+    do {
+        let txInfo = try await InsightAPI.shared.getTransaction(txid: txHashHex)
+        if let rawHex = txInfo.rawtx {
+            rawTx = Data(hexString: rawHex)
+            print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
+        }
+    } catch {
+        print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
+    }
+}
+
+guard let rawTx = rawTx else {
+    print("⚠️ Could not get raw tx for \(txHashHex.prefix(12))... - skipping")
+    continue
+}
+```
+
+**Result**:
+- P2P peer disconnect no longer silently fails
+- InsightAPI fallback ensures raw tx can still be fetched
+- Clear logging shows which source provided the data
+- Receiver can now detect incoming mempool transactions even if P2P peer disconnects
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - `scanMempoolForIncoming()` line ~1169
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

@@ -1170,7 +1170,27 @@ final class NetworkManager: ObservableObject {
         for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
             let txHashHex = txHashData.map { String(format: "%02x", $0) }.joined()
 
-            guard let rawTx = try? await peer.getMempoolTransaction(txid: txHashData) else {
+            // Try to get raw tx from P2P peer first, then InsightAPI fallback
+            var rawTx: Data?
+            do {
+                rawTx = try await peer.getMempoolTransaction(txid: txHashData)
+                print("🔮 Got raw tx \(txHashHex.prefix(12))... from P2P peer")
+            } catch {
+                print("⚠️ P2P getMempoolTransaction failed for \(txHashHex.prefix(12))...: \(error.localizedDescription)")
+                // Fallback to InsightAPI
+                do {
+                    let txInfo = try await InsightAPI.shared.getTransaction(txid: txHashHex)
+                    if let rawHex = txInfo.rawtx {
+                        rawTx = Data(hexString: rawHex)
+                        print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
+                    }
+                } catch {
+                    print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
+                }
+            }
+
+            guard let rawTx = rawTx else {
+                print("⚠️ Could not get raw tx for \(txHashHex.prefix(12))... - skipping")
                 continue
             }
 
