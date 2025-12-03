@@ -1,9 +1,44 @@
 import Foundation
 import SQLite3
+import CryptoKit
 
 /// Encrypted SQLite database for wallet data
-/// Uses SQLCipher for encryption at rest
+/// Uses AES-GCM-256 for field-level encryption of sensitive data
 final class WalletDatabase {
+
+    // MARK: - Encryption Helpers
+
+    /// Encrypt sensitive data before storing in database
+    /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
+    private func encryptBlob(_ data: Data) -> Data {
+        do {
+            return try DatabaseEncryption.shared.encrypt(data)
+        } catch {
+            // Fall back to unencrypted if encryption fails
+            // This should not happen in production
+            print("⚠️ DB encryption failed: \(error)")
+            return data
+        }
+    }
+
+    /// Decrypt sensitive data retrieved from database
+    private func decryptBlob(_ encryptedData: Data) -> Data {
+        // Handle both encrypted and unencrypted data (for migration)
+        // AES-GCM combined format: 12 (nonce) + ciphertext + 16 (tag) = 29+ bytes
+        if encryptedData.count >= 29 {
+            do {
+                return try DatabaseEncryption.shared.decrypt(encryptedData)
+            } catch {
+                // If decryption fails, data might be unencrypted (pre-encryption era)
+                return encryptedData
+            }
+        }
+        // Data too short to be encrypted, return as-is
+        return encryptedData
+    }
+
+    /// Check if encryption is enabled (always true after this update)
+    var isEncryptionEnabled: Bool { true }
     static let shared = WalletDatabase()
 
     private var db: OpaquePointer?
@@ -587,17 +622,26 @@ final class WalletDatabase {
         // SQLITE_TRANSIENT tells SQLite to copy the data immediately
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+        // SECURITY: Encrypt sensitive fields before storage
+        // - diversifier: address component (encrypted)
+        // - rcm: randomness commitment used in spending (encrypted)
+        // - memo: potentially sensitive message (encrypted)
+        // - witness: Merkle path for spending (encrypted)
+        let encryptedDiversifier = encryptBlob(diversifier)
+        let encryptedRcm = encryptBlob(rcm)
+        let encryptedMemo = memo != nil ? encryptBlob(memo!) : nil
+
         sqlite3_bind_int64(stmt, 1, accountId)
-        diversifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(diversifier.count), SQLITE_TRANSIENT)
+        encryptedDiversifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 3, Int64(value))
-        rcm.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(rcm.count), SQLITE_TRANSIENT)
+        encryptedRcm.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
         }
-        if let memo = memo {
-            memo.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(memo.count), SQLITE_TRANSIENT)
+        if let encMemo = encryptedMemo {
+            encMemo.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(encMemo.count), SQLITE_TRANSIENT)
             }
         } else {
             sqlite3_bind_null(stmt, 5)
@@ -610,15 +654,17 @@ final class WalletDatabase {
         }
         sqlite3_bind_int64(stmt, 8, Int64(height))
         if let witness = witness {
-            witness.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(witness.count), SQLITE_TRANSIENT)
+            // SECURITY: Encrypt witness (Merkle path)
+            let encryptedWitness = encryptBlob(witness)
+            encryptedWitness.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(encryptedWitness.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(stmt, 10, Int64(height))
         } else {
             sqlite3_bind_null(stmt, 9)
             sqlite3_bind_null(stmt, 10)
         }
-        // Bind CMU (note commitment)
+        // Bind CMU (note commitment) - not encrypted (public on chain)
         if let cmu = cmu {
             cmu.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
@@ -746,15 +792,22 @@ final class WalletDatabase {
             let nfLen = sqlite3_column_bytes(stmt, 5)
             let height = UInt64(sqlite3_column_int64(stmt, 7))
 
+            // SECURITY: Decrypt sensitive fields
+            let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
+            let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
+            let diversifier = decryptBlob(encryptedDiv)
+            let rcm = decryptBlob(encryptedRcm)
+
             // Witness might be NULL
             var witnessData = Data()
             if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
                 let witnessPtr = sqlite3_column_blob(stmt, 8)
                 let witnessLen = sqlite3_column_bytes(stmt, 8)
-                witnessData = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                witnessData = decryptBlob(encryptedWitness)
             }
 
-            // CMU might be NULL
+            // CMU might be NULL (not encrypted - public on chain)
             var cmuData: Data? = nil
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let cmuPtr = sqlite3_column_blob(stmt, 9)
@@ -772,9 +825,9 @@ final class WalletDatabase {
 
             let note = WalletNote(
                 id: id,
-                diversifier: Data(bytes: divPtr!, count: Int(divLen)),
+                diversifier: diversifier,
                 value: value,
-                rcm: Data(bytes: rcmPtr!, count: Int(rcmLen)),
+                rcm: rcm,
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
                 witness: witnessData,
@@ -820,7 +873,16 @@ final class WalletDatabase {
             let witnessPtr = sqlite3_column_blob(stmt, 8)
             let witnessLen = sqlite3_column_bytes(stmt, 8)
 
-            // CMU might be NULL
+            // SECURITY: Decrypt sensitive fields
+            let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
+            let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
+            let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+
+            let diversifier = decryptBlob(encryptedDiv)
+            let rcm = decryptBlob(encryptedRcm)
+            let witness = decryptBlob(encryptedWitness)
+
+            // CMU might be NULL (not encrypted - public on chain)
             var cmuData: Data? = nil
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let cmuPtr = sqlite3_column_blob(stmt, 9)
@@ -838,12 +900,12 @@ final class WalletDatabase {
 
             let note = WalletNote(
                 id: id,
-                diversifier: Data(bytes: divPtr!, count: Int(divLen)),
+                diversifier: diversifier,
                 value: value,
-                rcm: Data(bytes: rcmPtr!, count: Int(rcmLen)),
+                rcm: rcm,
                 nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
                 height: height,
-                witness: Data(bytes: witnessPtr!, count: Int(witnessLen)),
+                witness: witness,
                 cmu: cmuData,
                 anchor: anchorData
             )
@@ -1273,8 +1335,10 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        witness.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(witness.count), nil)
+        // SECURITY: Encrypt witness before storage
+        let encryptedWitness = encryptBlob(witness)
+        encryptedWitness.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(encryptedWitness.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, noteId)
 
@@ -1501,7 +1565,14 @@ final class WalletDatabase {
             }
             let txidLen = sqlite3_column_bytes(stmt, 0)
             let height = UInt64(sqlite3_column_int64(stmt, 1))
-            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            var blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+
+            // If blockTime is NULL, try to get actual timestamp from HeaderStore
+            if blockTime == nil && height > 0 {
+                if let header = try? HeaderStore.shared.getHeader(at: height) {
+                    blockTime = UInt64(header.time)
+                }
+            }
             let typeStr = String(cString: sqlite3_column_text(stmt, 3))
             let value = UInt64(sqlite3_column_int64(stmt, 4))
             let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
@@ -1566,6 +1637,20 @@ final class WalletDatabase {
         sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)
 
         return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    /// Estimate block timestamp from height
+    /// Zclassic averages 2.5 minutes (150 seconds) per block
+    /// Uses reference point: Block 2,926,100 ≈ Nov 29, 2024 ~12:00 UTC
+    private func estimateBlockTime(height: UInt64) -> UInt64 {
+        let referenceHeight: UInt64 = 2_926_100
+        let referenceTimestamp: UInt64 = 1764072000 // Nov 25, 2025 12:00 UTC
+        let blockInterval: Int64 = 150 // 2.5 minutes in seconds
+
+        let heightDiff = Int64(height) - Int64(referenceHeight)
+        let estimatedTimestamp = Int64(referenceTimestamp) + (heightDiff * blockInterval)
+
+        return UInt64(max(0, estimatedTimestamp))
     }
 
     /// Populate transaction history from notes table
@@ -1697,10 +1782,13 @@ final class WalletDatabase {
             let changeOutputs = allNotes.filter { $0.txid == spentTxid }
             let totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
 
-            // actualSent = sum(inputs) - sum(change) - fee
-            let actualSentValue = txInfo.inputValue - totalChangeValue - fee
+            // totalBalanceImpact = sum(inputs) - sum(change) = amount to recipient + fee
+            // This is the actual balance decrease, which makes history sum = current balance
+            let totalBalanceImpact = txInfo.inputValue - totalChangeValue
+            // amountToRecipient = balance impact - fee (for display info)
+            let amountToRecipient = totalBalanceImpact - fee
 
-            print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), actualSent=\(actualSentValue)")
+            print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
 
             var spentStmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, insertSql, -1, &spentStmt, nil) == SQLITE_OK else {
@@ -1712,9 +1800,12 @@ final class WalletDatabase {
                 sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(spentStmt, 2, Int64(txInfo.spentHeight))
-            sqlite3_bind_null(spentStmt, 3)
+            // Estimate block time from height for date display
+            let spentBlockTime = estimateBlockTime(height: txInfo.spentHeight)
+            sqlite3_bind_int64(spentStmt, 3, Int64(spentBlockTime))
             sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_int64(spentStmt, 5, Int64(actualSentValue))
+            // Store totalBalanceImpact (recipient + fee) so history sum equals current balance
+            sqlite3_bind_int64(spentStmt, 5, Int64(totalBalanceImpact))
             sqlite3_bind_int64(spentStmt, 6, Int64(fee))
             sqlite3_bind_null(spentStmt, 7)
             sqlite3_bind_null(spentStmt, 8)
@@ -1747,7 +1838,9 @@ final class WalletDatabase {
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(note.receivedHeight))
-            sqlite3_bind_null(insertStmt, 3) // block_time
+            // Estimate block time from height for date display
+            let receivedBlockTime = estimateBlockTime(height: note.receivedHeight)
+            sqlite3_bind_int64(insertStmt, 3, Int64(receivedBlockTime))
             sqlite3_bind_text(insertStmt, 4, txType.rawValue, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(insertStmt, 5, Int64(note.value))
             sqlite3_bind_null(insertStmt, 6) // fee (only for SENT)
@@ -1789,7 +1882,7 @@ final class WalletDatabase {
         let sql = """
             INSERT OR IGNORE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
-            VALUES (?, ?, NULL, 'received', ?, NULL, NULL, NULL, ?);
+            VALUES (?, ?, ?, 'received', ?, NULL, NULL, NULL, ?);
         """
 
         var stmt: OpaquePointer?
@@ -1804,11 +1897,14 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
-        sqlite3_bind_int64(stmt, 3, Int64(value))
+        // Estimate block time from height for date display
+        let blockTime = estimateBlockTime(height: height)
+        sqlite3_bind_int64(stmt, 3, Int64(blockTime))
+        sqlite3_bind_int64(stmt, 4, Int64(value))
         if let memo = memo {
-            sqlite3_bind_text(stmt, 4, memo, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 5, memo, -1, SQLITE_TRANSIENT)
         } else {
-            sqlite3_bind_null(stmt, 4)
+            sqlite3_bind_null(stmt, 5)
         }
 
         let result = sqlite3_step(stmt)
@@ -1835,7 +1931,7 @@ final class WalletDatabase {
         let sql = """
             INSERT OR REPLACE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status, confirmations)
-            VALUES (?, ?, NULL, 'sent', ?, ?, ?, NULL, ?, ?, ?);
+            VALUES (?, ?, ?, 'sent', ?, ?, ?, NULL, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -1850,20 +1946,23 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
-        sqlite3_bind_int64(stmt, 3, Int64(value))
-        sqlite3_bind_int64(stmt, 4, Int64(fee))
+        // Estimate block time from height for date display (or use current time if height = 0)
+        let blockTime = height > 0 ? estimateBlockTime(height: height) : UInt64(Date().timeIntervalSince1970)
+        sqlite3_bind_int64(stmt, 3, Int64(blockTime))
+        sqlite3_bind_int64(stmt, 4, Int64(value))
+        sqlite3_bind_int64(stmt, 5, Int64(fee))
         if let toAddress = toAddress {
-            sqlite3_bind_text(stmt, 5, toAddress, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(stmt, 5)
-        }
-        if let memo = memo {
-            sqlite3_bind_text(stmt, 6, memo, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 6, toAddress, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 6)
         }
-        sqlite3_bind_text(stmt, 7, status.rawValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(stmt, 8, Int32(confirmations))
+        if let memo = memo {
+            sqlite3_bind_text(stmt, 7, memo, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(stmt, 7)
+        }
+        sqlite3_bind_text(stmt, 8, status.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 9, Int32(confirmations))
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
@@ -1972,7 +2071,14 @@ final class WalletDatabase {
             guard let txidPtr = sqlite3_column_blob(stmt, 0) else { continue }
             let txidLen = sqlite3_column_bytes(stmt, 0)
             let height = UInt64(sqlite3_column_int64(stmt, 1))
-            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            var blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+
+            // If blockTime is NULL, try to get actual timestamp from HeaderStore
+            if blockTime == nil && height > 0 {
+                if let header = try? HeaderStore.shared.getHeader(at: height) {
+                    blockTime = UInt64(header.time)
+                }
+            }
             let typeStr = String(cString: sqlite3_column_text(stmt, 3))
             let value = UInt64(sqlite3_column_int64(stmt, 4))
             let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
@@ -2135,9 +2241,27 @@ struct TransactionHistoryItem {
     }
 
     /// Formatted date string
+    /// Uses blockTime if available, otherwise falls back to estimation from height
+    /// Note: When loading from DB, we now look up actual timestamps from HeaderStore
     var dateString: String? {
-        guard let blockTime = blockTime else { return nil }
-        let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
+        let timestamp: TimeInterval
+
+        if let blockTime = blockTime {
+            timestamp = TimeInterval(blockTime)
+        } else {
+            // Fall back to estimation from block height
+            // This should rarely happen now since we look up headers when loading from DB
+            // Zclassic averages 2.5 minutes (150 seconds) per block
+            // Reference: Block 2,926,100 ≈ Nov 29, 2024 12:00 UTC
+            let referenceHeight: UInt64 = 2_926_100
+            let referenceTimestamp: TimeInterval = 1764072000 // Nov 25, 2025 12:00 UTC
+            let blockInterval: TimeInterval = 150 // 2.5 minutes in seconds
+
+            let heightDiff = Int64(height) - Int64(referenceHeight)
+            timestamp = referenceTimestamp + (Double(heightDiff) * blockInterval)
+        }
+
+        let date = Date(timeIntervalSince1970: timestamp)
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short

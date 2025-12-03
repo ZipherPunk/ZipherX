@@ -122,8 +122,14 @@ final class NetworkManager: ObservableObject {
     internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
 
     /// Get a connected peer for block downloads
+    /// Returns the first peer with a ready connection
     func getConnectedPeer() -> Peer? {
-        return peers.first
+        return peers.first { $0.isConnectionReady }
+    }
+
+    /// Get all connected peers with ready connections
+    func getAllConnectedPeers() -> [Peer] {
+        return peers.filter { $0.isConnectionReady }
     }
 
     /// Update wallet height directly (called after sync completes)
@@ -1109,116 +1115,131 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        // Get a connected peer
-        guard let peer = getConnectedPeer() else {
+        // Get all connected peers and try them in order
+        let connectedPeers = getAllConnectedPeers()
+        guard !connectedPeers.isEmpty else {
             print("🔮 scanMempoolForIncoming: no connected peer, skipping")
             return
         }
 
-        do {
-            // Get mempool transaction list
-            print("🔮 scanMempoolForIncoming: requesting mempool txs from peer...")
-            let mempoolTxs = try await peer.getMempoolTransactions()
-            print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs")
+        // Try each peer until one succeeds
+        var mempoolTxs: [Data] = []
+        var successfulPeer: Peer?
 
-            guard !mempoolTxs.isEmpty else {
-                await MainActor.run {
-                    self.mempoolIncoming = 0
-                    self.mempoolTxCount = 0
-                }
-                return
+        for peer in connectedPeers {
+            do {
+                print("🔮 scanMempoolForIncoming: requesting mempool txs from peer \(peer.host)...")
+                mempoolTxs = try await peer.getMempoolTransactions()
+                successfulPeer = peer
+                print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host)")
+                break
+            } catch {
+                print("⚠️ scanMempoolForIncoming: peer \(peer.host) failed: \(error.localizedDescription)")
+                continue
             }
+        }
 
-            print("🔮 Scanning \(mempoolTxs.count) mempool transactions...")
+        guard let peer = successfulPeer else {
+            print("⚠️ scanMempoolForIncoming: all peers failed")
+            return
+        }
 
-            // Get spending key for trial decryption
-            guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
-                print("🔮 scanMempoolForIncoming: could not retrieve spending key, skipping")
-                return
-            }
-            print("🔮 scanMempoolForIncoming: got spending key, checking txs...")
-
-            var incomingAmount: UInt64 = 0
-            var incomingCount = 0
-            var newIncomingTxs: [(txid: String, amount: UInt64)] = []
-
-            // Check each mempool transaction for shielded outputs
-            for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
-                let txHashHex = txHashData.map { String(format: "%02x", $0) }.joined()
-
-                guard let rawTx = try? await peer.getMempoolTransaction(txid: txHashData) else {
-                    continue
-                }
-
-                // Parse transaction for shielded outputs
-                if let outputs = parseShieldedOutputs(from: rawTx) {
-                    var txIncomingAmount: UInt64 = 0
-                    for output in outputs {
-                        // Try to decrypt with our key
-                        if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
-                            spendingKey: spendingKey,
-                            epk: output.epk,
-                            cmu: output.cmu,
-                            ciphertext: output.ciphertext
-                        ) {
-                            // Found incoming payment!
-                            if decrypted.count >= 19 {
-                                let valueBytes = Data(decrypted[11..<19])
-                                let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
-                                txIncomingAmount += value
-                                print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHashHex.prefix(12))...")
-                            }
-                        }
-                    }
-
-                    if txIncomingAmount > 0 {
-                        incomingAmount += txIncomingAmount
-                        incomingCount += 1
-
-                        // Check if this is a NEW incoming tx we haven't notified about (actor-based, no priority inversion)
-                        let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
-                        if isNewTx {
-                            newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
-                        }
-                    }
-                }
-            }
-
-            // Send notifications for NEW incoming transactions
-            // But SKIP notifications for change outputs (where we already have a "sent" tx with same txid)
-            for (txid, amount) in newIncomingTxs {
-                // Check if this is a change output from our own send
-                // Method 1: Check database for existing "sent" record
-                let txidData = Data(hexString: txid) ?? Data()
-                var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
-
-                // Method 2: Check if txid is in pendingOutgoingTxs (catches race condition
-                // where send is broadcast but not yet recorded in DB)
-                if !isChangeOutput {
-                    let isPending = await txTrackingState.isPendingOutgoing(txid: txid)
-                    if isPending {
-                        isChangeOutput = true
-                        print("🔔 MEMPOOL: Detected pending outgoing tx \(txid.prefix(12))... (change output)")
-                    }
-                }
-
-                if isChangeOutput {
-                    print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
-                } else {
-                    print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
-                    NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
-                }
-            }
-
+        // Process mempool transactions
+        guard !mempoolTxs.isEmpty else {
             await MainActor.run {
-                self.mempoolIncoming = incomingAmount
-                self.mempoolTxCount = incomingCount
-                if incomingAmount > 0 {
-                    print("🔮 Mempool incoming: \(incomingAmount) zatoshis (\(incomingCount) tx)")
+                self.mempoolIncoming = 0
+                self.mempoolTxCount = 0
+            }
+            return
+        }
+
+        print("🔮 Scanning \(mempoolTxs.count) mempool transactions...")
+
+        // Get spending key for trial decryption
+        guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+            print("🔮 scanMempoolForIncoming: could not retrieve spending key, skipping")
+            return
+        }
+        print("🔮 scanMempoolForIncoming: got spending key, checking txs...")
+
+        var incomingAmount: UInt64 = 0
+        var incomingCount = 0
+        var newIncomingTxs: [(txid: String, amount: UInt64)] = []
+
+        // Check each mempool transaction for shielded outputs
+        for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
+            let txHashHex = txHashData.map { String(format: "%02x", $0) }.joined()
+
+            guard let rawTx = try? await peer.getMempoolTransaction(txid: txHashData) else {
+                continue
+            }
+
+            // Parse transaction for shielded outputs
+            if let outputs = parseShieldedOutputs(from: rawTx) {
+                var txIncomingAmount: UInt64 = 0
+                for output in outputs {
+                    // Try to decrypt with our key
+                    if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
+                        spendingKey: spendingKey,
+                        epk: output.epk,
+                        cmu: output.cmu,
+                        ciphertext: output.ciphertext
+                    ) {
+                        // Found incoming payment!
+                        if decrypted.count >= 19 {
+                            let valueBytes = Data(decrypted[11..<19])
+                            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                            txIncomingAmount += value
+                            print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHashHex.prefix(12))...")
+                        }
+                    }
+                }
+
+                if txIncomingAmount > 0 {
+                    incomingAmount += txIncomingAmount
+                    incomingCount += 1
+
+                    // Check if this is a NEW incoming tx we haven't notified about (actor-based, no priority inversion)
+                    let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
+                    if isNewTx {
+                        newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
+                    }
                 }
             }
-        } catch {
-            print("⚠️ Mempool scan failed: \(error.localizedDescription)")
+        }
+
+        // Send notifications for NEW incoming transactions
+        // But SKIP notifications for change outputs (where we already have a "sent" tx with same txid)
+        for (txid, amount) in newIncomingTxs {
+            // Check if this is a change output from our own send
+            // Method 1: Check database for existing "sent" record
+            let txidData = Data(hexString: txid) ?? Data()
+            var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+
+            // Method 2: Check if txid is in pendingOutgoingTxs (catches race condition
+            // where send is broadcast but not yet recorded in DB)
+            if !isChangeOutput {
+                let isPending = await txTrackingState.isPendingOutgoing(txid: txid)
+                if isPending {
+                    isChangeOutput = true
+                    print("🔔 MEMPOOL: Detected pending outgoing tx \(txid.prefix(12))... (change output)")
+                }
+            }
+
+            if isChangeOutput {
+                print("🔔 MEMPOOL: Skipping change output notification for tx \(txid.prefix(12))...")
+            } else {
+                print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
+                NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
+            }
+        }
+
+        await MainActor.run {
+            self.mempoolIncoming = incomingAmount
+            self.mempoolTxCount = incomingCount
+            if incomingAmount > 0 {
+                print("🔮 Mempool incoming: \(incomingAmount) zatoshis (\(incomingCount) tx)")
+            }
         }
     }
 

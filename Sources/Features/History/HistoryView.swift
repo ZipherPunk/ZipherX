@@ -172,11 +172,14 @@ struct HistoryView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // ALWAYS populate from notes first to catch any new transactions
-                // This ensures newly discovered notes appear in history
-                let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                if populatedCount > 0 {
-                    print("📜 Populated \(populatedCount) new transaction history entries")
+                // Only populate from notes if history is empty
+                // This avoids the CLEAR + rebuild cycle that causes change to briefly appear
+                let existingCount = try WalletDatabase.shared.getTransactionCount()
+                if existingCount == 0 {
+                    let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if populatedCount > 0 {
+                        print("📜 Populated \(populatedCount) new transaction history entries")
+                    }
                 }
 
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
@@ -503,7 +506,7 @@ struct TransactionDetailView: View {
 
         if currentHeight == 0 {
             let referenceHeight: UInt64 = 2_926_100
-            let referenceDate = Date(timeIntervalSince1970: 1732881600)
+            let referenceDate = Date(timeIntervalSince1970: 1764072000) // Nov 25, 2025 12:00 UTC
             let blockDifference = Int64(height) - Int64(referenceHeight)
             let secondsDifference = Double(blockDifference) * 150.0
             let estimatedDate = referenceDate.addingTimeInterval(secondsDifference)

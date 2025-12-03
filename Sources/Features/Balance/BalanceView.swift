@@ -107,33 +107,50 @@ struct BalanceView: View {
             }
 
             // Detect incoming ZCL - balance increased!
-            // IMPORTANT: Suppress fireworks for change outputs
+            // IMPORTANT: Suppress fireworks for change outputs from our own sends
             if newValue > previousBalance && previousBalance > 0 {
                 let increase = newValue - previousBalance
 
                 // Check if this is likely a change output from a recent send
-                // Method 1: Compare against balance before last send (most reliable)
-                // Method 2: Fallback to 30-second timer if balance tracking unavailable
-                let isLikelyChangeOutput: Bool
-                if let balanceBeforeSend = walletManager.balanceBeforeLastSend {
-                    // If new balance <= balance before send, it's change (not real incoming)
-                    // Because: after send, balance = original - amount - fee + change
-                    // So new balance should never exceed what we had before sending
-                    isLikelyChangeOutput = newValue <= balanceBeforeSend
-                    print("💰 Change detection: newBalance=\(newValue), balanceBeforeSend=\(balanceBeforeSend), isChange=\(isLikelyChangeOutput)")
-                } else if let lastSend = walletManager.lastSendTimestamp {
-                    // Fallback: use timestamp-based detection
+                // Use MULTIPLE criteria to be conservative (any TRUE = suppress fireworks)
+                var isLikelyChangeOutput = false
+
+                // Method 1: Check if there's a pending outgoing transaction (MOST RELIABLE)
+                // If mempoolOutgoing > 0, we just sent and this is almost certainly change
+                if networkManager.mempoolOutgoing > 0 {
+                    isLikelyChangeOutput = true
+                    print("💰 Change detection (mempoolOutgoing): outgoing pending - suppressing fireworks")
+                }
+
+                // Method 2: Time-based - any send in last 120 seconds means this might be change
+                if !isLikelyChangeOutput, let lastSend = walletManager.lastSendTimestamp {
                     let timeSinceSend = Date().timeIntervalSince(lastSend)
-                    isLikelyChangeOutput = timeSinceSend < 30.0
-                    print("💰 Change detection (fallback): timeSinceSend=\(timeSinceSend)s, isChange=\(isLikelyChangeOutput)")
-                } else {
-                    isLikelyChangeOutput = false
+                    if timeSinceSend < 120.0 {
+                        isLikelyChangeOutput = true
+                        print("💰 Change detection (time): sent \(Int(timeSinceSend))s ago - suppressing fireworks")
+                    }
+                }
+
+                // Method 3: Balance comparison - if new balance <= what we had before sending
+                if !isLikelyChangeOutput, let balanceBeforeSend = walletManager.balanceBeforeLastSend {
+                    if newValue <= balanceBeforeSend {
+                        isLikelyChangeOutput = true
+                        print("💰 Change detection (balance): newBalance=\(newValue) <= balanceBeforeSend=\(balanceBeforeSend)")
+                    }
                 }
 
                 if isLikelyChangeOutput {
                     print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
-                    // Clear tracking after change is processed
-                    walletManager.clearBalanceBeforeLastSend()
+                    // Change output detected means our tx was mined!
+                    // Clear tracking after a brief delay to ensure UI is stable
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        // Only clear if still pending (confirmation handler might have cleared already)
+                        if networkManager.mempoolOutgoing > 0 {
+                            print("💰 Change detected - clearing pending state (tx mined)")
+                            networkManager.clearAllPendingOutgoing()
+                            walletManager.clearBalanceBeforeLastSend()
+                        }
+                    }
                 } else {
                     fireworksAmount = Double(increase) / 100_000_000.0 // Convert zatoshis to ZCL
                     withAnimation {
@@ -151,6 +168,15 @@ struct BalanceView: View {
             print("📜 Transaction history version changed - reloading")
             loadTransactionHistory()
         }
+        .onChange(of: walletManager.pendingBalance) { newPendingBalance in
+            // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
+            // SAFETY: Clear mempoolOutgoing if it's stale (tx was mined but mempoolOutgoing wasn't cleared)
+            if newPendingBalance == 0 && networkManager.mempoolOutgoing > 0 {
+                print("💰 pendingBalance=0 but mempoolOutgoing=\(networkManager.mempoolOutgoing) - clearing stale pending state")
+                networkManager.clearAllPendingOutgoing()
+                walletManager.clearBalanceBeforeLastSend()
+            }
+        }
         .onChange(of: networkManager.justConfirmedTx?.txid) { txid in
             // Transaction was mined - show celebration!
             if let txid = txid, let confirmed = networkManager.justConfirmedTx {
@@ -162,12 +188,43 @@ struct BalanceView: View {
                 }
                 print("⛏️ MINED CELEBRATION! \(minedIsOutgoing ? "Sent" : "Received") \(minedTxAmount) ZCL")
 
+                // When outgoing tx is confirmed, clear balance tracking
+                // This happens AFTER change output is detected and added to balance
+                if confirmed.isOutgoing {
+                    print("💰 Outgoing tx confirmed - clearing balance tracking")
+                    walletManager.clearBalanceBeforeLastSend()
+                }
+
                 // Clear the trigger after handling
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justConfirmedTx = nil
                 }
             }
         }
+    }
+
+    /// Calculate the effective balance to display during pending transactions
+    /// This prevents confusing balance fluctuations when change output is being detected
+    private var effectiveDisplayBalance: UInt64 {
+        // If there's a pending outgoing transaction, use balanceBeforeLastSend - outgoing amount
+        // This shows the user the expected final balance rather than confusing intermediate states
+        if networkManager.mempoolOutgoing > 0, let beforeSend = walletManager.balanceBeforeLastSend {
+            // Expected balance = what we had before sending - what we sent (including fees)
+            let expected = beforeSend >= networkManager.mempoolOutgoing ? beforeSend - networkManager.mempoolOutgoing : 0
+            print("💰 effectiveDisplayBalance: beforeSend=\(beforeSend) - outgoing=\(networkManager.mempoolOutgoing) = \(expected) (raw=\(walletManager.shieldedBalance))")
+            return expected
+        }
+
+        // Also use balanceBeforeLastSend during the 120-second send window even if mempoolOutgoing is 0
+        // This handles the case where change came back but pending wasn't properly tracked
+        if let beforeSend = walletManager.balanceBeforeLastSend,
+           let lastSend = walletManager.lastSendTimestamp,
+           Date().timeIntervalSince(lastSend) < 120.0 {
+            print("💰 effectiveDisplayBalance: Using beforeSend=\(beforeSend) during send window (raw=\(walletManager.shieldedBalance))")
+            // We don't have mempoolOutgoing, so just show the raw balance but log it
+        }
+
+        return walletManager.shieldedBalance
     }
 
     private var balanceCard: some View {
@@ -179,7 +236,7 @@ struct BalanceView: View {
                     .foregroundColor(theme.textSecondary)
 
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(formatBalance(walletManager.shieldedBalance))
+                    Text(formatBalance(effectiveDisplayBalance))
                         .font(.system(size: 24, weight: .bold, design: theme.hasRetroStyling ? .monospaced : .default))
                         .foregroundColor(theme.textPrimary)
 
@@ -187,67 +244,48 @@ struct BalanceView: View {
                         .font(theme.bodyFont)
                         .foregroundColor(theme.textSecondary)
                 }
-            }
 
-            // Pending balance
-            if walletManager.pendingBalance > 0 {
-                HStack(spacing: 4) {
-                    Text("Pending:")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-
-                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                }
-            }
-
-            // Mempool incoming (cypherpunk style)
-            if networkManager.mempoolIncoming > 0 {
-                VStack(spacing: 2) {
+                // RECEIVER SIDE: Show pending INCOMING amount right below balance
+                if networkManager.mempoolIncoming > 0 {
                     HStack(spacing: 4) {
-                        Image(systemName: "arrow.down.circle.fill")
+                        Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 10))
-                        Text("INCOMING")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
                         Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        Text("incoming")
+                            .font(.system(size: 10, design: .monospaced))
+                            .italic()
                     }
                     .foregroundColor(theme.successColor)
-
-                    Text("propagating through the network...")
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(theme.textSecondary)
-                        .italic()
                 }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 8)
-                .background(theme.successColor.opacity(0.1))
-                .cornerRadius(theme.cornerRadius)
             }
 
-            // Mempool outgoing (cypherpunk style)
+            // UNIFIED Pending indicator - shows OUTGOING in mempool OR notes with 0 confirmations
+            // Priority: mempoolOutgoing (tx not yet mined) > pendingBalance (mined but 0 conf)
             if networkManager.mempoolOutgoing > 0 {
-                VStack(spacing: 2) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 10))
-                        Text("OUTGOING")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    }
-                    .foregroundColor(theme.warningColor)
-
-                    Text("awaiting miners' confirmation...")
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(theme.textSecondary)
+                // Transaction in mempool - not yet mined
+                HStack(spacing: 4) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 10))
+                    Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("awaiting confirmation")
+                        .font(.system(size: 9, design: .monospaced))
                         .italic()
                 }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 8)
-                .background(theme.warningColor.opacity(0.1))
-                .cornerRadius(theme.cornerRadius)
+                .foregroundColor(theme.warningColor)
+            } else if walletManager.pendingBalance > 0 {
+                // Transaction mined but 0 confirmations (change not yet spendable)
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 10))
+                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("pending")
+                        .font(.system(size: 9, design: .monospaced))
+                        .italic()
+                }
+                .foregroundColor(theme.textSecondary)
             }
 
             // Privacy indicator
@@ -320,9 +358,23 @@ struct BalanceView: View {
                 }
                 .padding(8)
             } else {
-                // Filter out change transactions - user doesn't want to see internal change outputs
-                let visibleTransactions = transactions.filter { $0.type != .change }
-                let _ = print("📜 TXHIST VIEW: Showing \(visibleTransactions.count) of \(transactions.count) transactions (hidden: change)")
+                // Transaction history shows ONLY confirmed sent/received transactions
+                // Filter out:
+                // 1. Change transactions - internal, user doesn't need to see
+                // 2. ALL pending transactions - they're shown in the pending section below balance
+                let visibleTransactions = transactions.filter { tx in
+                    // Always filter out change type
+                    if tx.type == .change { return false }
+
+                    // Filter out ALL pending transactions - only show confirmed
+                    if tx.isPending {
+                        print("📜 Hiding pending tx from history: \(tx.txidString.prefix(12))... type=\(tx.type)")
+                        return false
+                    }
+
+                    return true
+                }
+                let _ = print("📜 TXHIST VIEW: Showing \(visibleTransactions.count) of \(transactions.count) transactions (hidden: change + all pending)")
                 // Show up to 5 recent transactions (excluding change)
                 VStack(spacing: 1) {
                     ForEach(visibleTransactions.prefix(5), id: \.uniqueId) { tx in
@@ -487,7 +539,7 @@ struct BalanceView: View {
         if currentHeight == 0 {
             // Fallback: block 2,926,100 on November 29, 2025 ~12:00 UTC
             let referenceHeight: UInt64 = 2_926_100
-            let referenceDate = Date(timeIntervalSince1970: 1732881600) // Nov 29, 2025 12:00 UTC
+            let referenceDate = Date(timeIntervalSince1970: 1764072000) // Nov 25, 2025 12:00 UTC
 
             let blockDifference = Int64(height) - Int64(referenceHeight)
             let secondsDifference = Double(blockDifference) * 150.0
@@ -517,10 +569,16 @@ struct BalanceView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // First, always try to populate from notes (it uses INSERT OR REPLACE so it's safe)
-                print("📜 TXHIST: Populating history from notes...")
-                let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                print("📜 TXHIST: Populate result: \(populated) entries")
+                // Check if history is empty - only populate from notes if needed
+                // This avoids the CLEAR + rebuild cycle that causes change to briefly appear
+                let existingCount = try WalletDatabase.shared.getTransactionCount()
+                if existingCount == 0 {
+                    print("📜 TXHIST: History empty, populating from notes...")
+                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                    print("📜 TXHIST: Populate result: \(populated) entries")
+                } else {
+                    print("📜 TXHIST: History has \(existingCount) entries, skipping populate")
+                }
 
                 // Now fetch the history
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)
@@ -603,7 +661,9 @@ struct BalanceView: View {
                         statRow("Height:", "\(networkManager.walletHeight) / \(networkManager.chainHeight)")
 
                         // ZCL Price
-                        if networkManager.zclPriceUSD > 0 {
+                        if networkManager.zclPriceFailed {
+                            statRow("ZCL Price:", "N/A")
+                        } else if networkManager.zclPriceUSD > 0 {
                             statRow("ZCL Price:", String(format: "$%.4f", networkManager.zclPriceUSD))
                         }
 

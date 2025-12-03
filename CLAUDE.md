@@ -2203,6 +2203,94 @@ Added synchronous tracking alongside the async actor to catch change outputs dur
 
 ---
 
+### 38. Mempool Scan Peer Retry Logic (December 3, 2025)
+
+**Problem**: Mempool scan was failing with "Peer handshake failed" / "Socket is not connected" errors. The receiver was not detecting incoming transactions in mempool.
+
+**Root Cause**: `getConnectedPeer()` returned `peers.first` without checking if the peer's NWConnection was actually ready. Stale peers with disconnected sockets were being used for P2P operations.
+
+**Solution: Connection State Filtering + Multi-Peer Retry**
+
+1. **Updated `getConnectedPeer()`** (`NetworkManager.swift`):
+   ```swift
+   /// Get a connected peer for block downloads
+   /// Returns the first peer with a ready connection
+   func getConnectedPeer() -> Peer? {
+       return peers.first { $0.isConnectionReady }
+   }
+   ```
+
+2. **Added `getAllConnectedPeers()`** (`NetworkManager.swift`):
+   ```swift
+   /// Get all connected peers with ready connections
+   func getAllConnectedPeers() -> [Peer] {
+       return peers.filter { $0.isConnectionReady }
+   }
+   ```
+
+3. **Updated `scanMempoolForIncoming()`** to try multiple peers:
+   ```swift
+   let connectedPeers = getAllConnectedPeers()
+   guard !connectedPeers.isEmpty else {
+       print("🔮 scanMempoolForIncoming: no connected peer, skipping")
+       return
+   }
+
+   // Try each peer until one succeeds
+   var mempoolTxs: [Data] = []
+   var successfulPeer: Peer?
+
+   for peer in connectedPeers {
+       do {
+           mempoolTxs = try await peer.getMempoolTransactions()
+           successfulPeer = peer
+           break
+       } catch {
+           print("⚠️ scanMempoolForIncoming: peer \(peer.host) failed: \(error.localizedDescription)")
+           continue
+       }
+   }
+   ```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - peer selection, mempool scan retry logic
+
+---
+
+### 39. Wrong Date Estimation in History (December 3, 2025)
+
+**Problem**: Transaction history was showing "Dec 7th" for a block at height 2,930,642 when the actual date should be around "Dec 3rd". The date was ~4 days in the future!
+
+**Root Cause**: The reference timestamp `1732881600` used for block date estimation was November 29, **2024**, but we're in **2025**. The timestamp was off by 1 year (365 days × 86400 seconds = 31,536,000 seconds).
+
+**Solution**: Updated all 4 occurrences of the reference timestamp from `1732881600` (Nov 29, 2024) to `1764072000` (Nov 25, 2025):
+
+1. `WalletDatabase.swift` (2 locations):
+   - `estimatedTimestamp(for height:)` function
+   - `dateString` computed property
+
+2. `BalanceView.swift`:
+   - `estimatedDateString(for:)` function
+
+3. `HistoryView.swift`:
+   - `estimatedDateString(for:)` function
+
+**Code Change Example**:
+```swift
+// OLD (wrong - Nov 29, 2024):
+let referenceTimestamp: TimeInterval = 1732881600
+
+// NEW (correct - Nov 25, 2025):
+let referenceTimestamp: TimeInterval = 1764072000
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - 2 timestamp references
+- `Sources/Features/Balance/BalanceView.swift` - 1 timestamp reference
+- `Sources/Features/History/HistoryView.swift` - 1 timestamp reference
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
