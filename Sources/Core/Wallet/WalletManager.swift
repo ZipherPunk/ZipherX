@@ -734,6 +734,9 @@ final class WalletManager: ObservableObject {
                 let stats = try HeaderStore.shared.getStats()
                 print("✅ Header sync complete! Stored \(stats.count) headers (latest: \(stats.latestHeight ?? 0))")
 
+                // Fix any transaction timestamps that were estimated instead of real block times
+                try? WalletDatabase.shared.fixTransactionBlockTimes()
+
                 await updateTask("headers", status: .completed)
                 headerSyncSuccess = true
                 break // Success - exit retry loop

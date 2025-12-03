@@ -1877,7 +1877,8 @@ final class WalletDatabase {
         txid: Data,
         height: UInt64,
         value: UInt64,
-        memo: String? = nil
+        memo: String? = nil,
+        blockTime: UInt64? = nil
     ) throws {
         let sql = """
             INSERT OR IGNORE INTO transaction_history
@@ -1897,9 +1898,18 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
-        // Estimate block time from height for date display
-        let blockTime = estimateBlockTime(height: height)
-        sqlite3_bind_int64(stmt, 3, Int64(blockTime))
+
+        // Use real block time if provided, otherwise try to get from HeaderStore, fallback to estimate
+        let actualBlockTime: UInt64
+        if let bt = blockTime {
+            actualBlockTime = bt
+        } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
+            actualBlockTime = UInt64(headerTime)
+        } else {
+            actualBlockTime = estimateBlockTime(height: height)
+        }
+        sqlite3_bind_int64(stmt, 3, Int64(actualBlockTime))
+
         sqlite3_bind_int64(stmt, 4, Int64(value))
         if let memo = memo {
             sqlite3_bind_text(stmt, 5, memo, -1, SQLITE_TRANSIENT)
@@ -1911,7 +1921,7 @@ final class WalletDatabase {
         if result == SQLITE_DONE {
             let changes = sqlite3_changes(db)
             if changes > 0 {
-                print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis")
+                print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis, time=\(actualBlockTime)")
             }
         }
     }
@@ -1946,9 +1956,17 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
-        // Estimate block time from height for date display (or use current time if height = 0)
-        let blockTime = height > 0 ? estimateBlockTime(height: height) : UInt64(Date().timeIntervalSince1970)
-        sqlite3_bind_int64(stmt, 3, Int64(blockTime))
+
+        // Use real block time: current time for height=0, HeaderStore for confirmed, fallback to estimate
+        let actualBlockTime: UInt64
+        if height == 0 {
+            actualBlockTime = UInt64(Date().timeIntervalSince1970)
+        } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
+            actualBlockTime = UInt64(headerTime)
+        } else {
+            actualBlockTime = estimateBlockTime(height: height)
+        }
+        sqlite3_bind_int64(stmt, 3, Int64(actualBlockTime))
         sqlite3_bind_int64(stmt, 4, Int64(value))
         sqlite3_bind_int64(stmt, 5, Int64(fee))
         if let toAddress = toAddress {
@@ -2047,6 +2065,55 @@ final class WalletDatabase {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Fix block_time for all transactions using actual timestamps from HeaderStore
+    /// This corrects estimated timestamps saved by older code
+    func fixTransactionBlockTimes() throws {
+        // Get all transactions with their heights
+        let selectSql = "SELECT id, block_height FROM transaction_history WHERE block_height > 0;"
+
+        var selectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(selectStmt) }
+
+        var updates: [(id: Int64, time: UInt32)] = []
+
+        while sqlite3_step(selectStmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(selectStmt, 0)
+            let height = UInt64(sqlite3_column_int64(selectStmt, 1))
+
+            // Get actual block time from HeaderStore
+            if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
+                updates.append((id: id, time: blockTime))
+            }
+        }
+
+        // Update each transaction with the real block time
+        let updateSql = "UPDATE transaction_history SET block_time = ? WHERE id = ?;"
+
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+
+        var fixedCount = 0
+        for update in updates {
+            sqlite3_reset(updateStmt)
+            sqlite3_bind_int64(updateStmt, 1, Int64(update.time))
+            sqlite3_bind_int64(updateStmt, 2, update.id)
+
+            if sqlite3_step(updateStmt) == SQLITE_DONE {
+                fixedCount += 1
+            }
+        }
+
+        if fixedCount > 0 {
+            print("📜 Fixed block_time for \(fixedCount) transactions using real timestamps from HeaderStore")
         }
     }
 

@@ -284,6 +284,25 @@ final class HeaderStore {
         return headers
     }
 
+    /// Get block timestamp by height
+    /// Returns the actual Unix timestamp from the block header
+    func getBlockTime(at height: UInt64) throws -> UInt32? {
+        let sql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return UInt32(sqlite3_column_int64(stmt, 0))
+        }
+        return nil
+    }
+
     /// Check if header exists at height
     func hasHeader(at height: UInt64) throws -> Bool {
         let sql = "SELECT 1 FROM headers WHERE height = ? LIMIT 1;"
@@ -325,6 +344,34 @@ final class HeaderStore {
         }
 
         print("🗑️ Cleared all headers")
+    }
+
+    /// Delete the entire header database file (for wallet deletion)
+    func deleteDatabase() throws {
+        // Close connection first
+        close()
+
+        // Delete the database file
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: dbPath) {
+            try fileManager.removeItem(atPath: dbPath)
+            print("🗑️ Header store deleted: \(dbPath)")
+        }
+
+        // Also delete any journal/wal files
+        let walPath = dbPath + "-wal"
+        let shmPath = dbPath + "-shm"
+        let journalPath = dbPath + "-journal"
+
+        if fileManager.fileExists(atPath: walPath) {
+            try? fileManager.removeItem(atPath: walPath)
+        }
+        if fileManager.fileExists(atPath: shmPath) {
+            try? fileManager.removeItem(atPath: shmPath)
+        }
+        if fileManager.fileExists(atPath: journalPath) {
+            try? fileManager.removeItem(atPath: journalPath)
+        }
     }
 
     // MARK: - Helper Methods
