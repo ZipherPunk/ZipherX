@@ -80,27 +80,40 @@ final class MnemonicGenerator {
 
     /// Validate a mnemonic phrase
     func validateMnemonic(_ words: [String]) -> Bool {
+        Swift.print("🔍 VALIDATE [1]: Starting validation for \(words.count) words")
+
         // Check word count
         guard [12, 15, 18, 21, 24].contains(words.count) else {
+            Swift.print("❌ VALIDATE: Invalid word count")
             return false
         }
+        Swift.print("🔍 VALIDATE [2]: Word count OK")
 
         // Check all words are in wordlist
-        for word in words {
-            guard Self.wordlist.contains(word.lowercased()) else {
+        Swift.print("🔍 VALIDATE [3]: Checking words against wordlist (size: \(Self.wordlist.count))...")
+        for (idx, word) in words.enumerated() {
+            let lowered = word.lowercased()
+            if !Self.wordlist.contains(lowered) {
+                Swift.print("❌ VALIDATE: Word '\(word)' not in wordlist at index \(idx)")
                 return false
             }
         }
+        Swift.print("🔍 VALIDATE [4]: All words found in wordlist")
 
         // Verify checksum
+        Swift.print("🔍 VALIDATE [5]: Converting to entropy...")
         guard let entropy = try? mnemonicToEntropy(words) else {
+            Swift.print("❌ VALIDATE: mnemonicToEntropy failed")
             return false
         }
+        Swift.print("🔍 VALIDATE [6]: Entropy obtained (\(entropy.count) bytes)")
 
         // Recalculate checksum
+        Swift.print("🔍 VALIDATE [7]: Computing checksum...")
         let hash = SHA256.hash(data: entropy)
         let hashData = Data(hash)
         let expectedChecksum = hashData.toBitArray().prefix(words.count / 3)
+        Swift.print("🔍 VALIDATE [8]: Expected checksum computed")
 
         // Get actual checksum from mnemonic
         var bits: [Bool] = []
@@ -112,9 +125,14 @@ final class MnemonicGenerator {
         }
 
         let entropyBitCount = (words.count * 11) - (words.count / 3)
-        let actualChecksum = bits.suffix(from: entropyBitCount)
+        Swift.print("🔍 VALIDATE [9]: bits.count=\(bits.count), entropyBitCount=\(entropyBitCount)")
 
-        return Array(expectedChecksum) == Array(actualChecksum)
+        let actualChecksum = bits.suffix(from: entropyBitCount)
+        Swift.print("🔍 VALIDATE [10]: Comparing checksums...")
+
+        let result = Array(expectedChecksum) == Array(actualChecksum)
+        Swift.print("🔍 VALIDATE [11]: Result = \(result)")
+        return result
     }
 
     /// Convert mnemonic back to entropy
@@ -130,9 +148,21 @@ final class MnemonicGenerator {
 
         // Remove checksum bits
         let checksumBits = words.count / 3
+
+        // Safety check: ensure we have enough bits
+        guard bits.count > checksumBits else {
+            throw MnemonicError.invalidWordCount
+        }
+
         let entropyBits = Array(bits.dropLast(checksumBits))
 
-        return Data(entropyBits.toBytes())
+        // Safety check: entropy bits should be divisible by 8
+        guard entropyBits.count % 8 == 0 && entropyBits.count > 0 else {
+            throw MnemonicError.invalidWordCount
+        }
+
+        let bytes = entropyBits.toBytes()
+        return Data(bytes)
     }
 
     // MARK: - Seed Derivation
