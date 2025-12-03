@@ -12,8 +12,6 @@ struct ReceiveView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var themeManager: ThemeManager
     @State private var showCopied = false
-    @State private var showExportAlert = false
-    @State private var exportedKey = ""
 
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
@@ -32,11 +30,6 @@ struct ReceiveView: View {
                     copyAddress()
                 }
 
-                // Export key button
-                System7Button(title: "Export Private Key") {
-                    exportKey()
-                }
-
                 // Privacy notice
                 privacyNotice
             }
@@ -47,14 +40,6 @@ struct ReceiveView: View {
         .overlay(
             copiedToast
         )
-        .alert("Private Key", isPresented: $showExportAlert) {
-            Button("Copy to Clipboard") {
-                copyToClipboard(exportedKey)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("WARNING: Never share this key!\n\n\(exportedKey)")
-        }
     }
 
     private var qrCodeSection: some View {
@@ -177,16 +162,6 @@ struct ReceiveView: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(string, forType: .string)
         #endif
-    }
-
-    private func exportKey() {
-        do {
-            exportedKey = try walletManager.exportSpendingKey()
-            showExportAlert = true
-            // SECURITY: Never log private keys
-        } catch {
-            print("❌ Key export failed")
-        }
     }
 }
 

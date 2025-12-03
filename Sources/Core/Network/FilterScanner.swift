@@ -61,6 +61,11 @@ final class FilterScanner {
     // MUST match bundledTreeCMUCount in WalletManager.swift and bundledTreeHeight in Checkpoints.swift
     private let bundledTreeCMUCount: UInt64 = 1_041_891
 
+    // NEW WALLET OPTIMIZATION: Skip note decryption for brand new wallets
+    // New wallets can't have any notes yet (address was just created)
+    // We still append CMUs to tree but skip tryDecryptNote() calls
+    private var isNewWalletInitialSync = false
+
     init(networkManager: NetworkManager = .shared,
          database: WalletDatabase = .shared,
          rustBridge: RustBridge = .shared,
@@ -168,7 +173,8 @@ final class FilterScanner {
                 } else {
                     // NEW WALLET: Fast startup - no historical notes possible
                     startHeight = bundledTreeHeight + 1
-                    print("📦 New wallet with bundled tree - fast startup from \(startHeight)")
+                    isNewWalletInitialSync = true  // Skip note decryption (no notes can exist)
+                    print("📦 New wallet with bundled tree - fast startup from \(startHeight) (skip note decryption)")
                 }
             } else {
                 // No tree anywhere - full scan from Sapling activation
@@ -1085,7 +1091,8 @@ final class FilterScanner {
                         outputIndex: UInt32(outputIndex),
                         accountId: accountId,
                         height: height,
-                        spendingKey: spendingKey
+                        spendingKey: spendingKey,
+                        blockTime: block.time
                     )
                 }
             }
@@ -1161,6 +1168,13 @@ final class FilterScanner {
 
             // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
             let treePosition = ZipherXFFI.treeAppend(cmu: cmu)
+
+            // NEW WALLET OPTIMIZATION: Skip note decryption for new wallets
+            // No notes can exist for a brand new address that was just created
+            if isNewWalletInitialSync {
+                _ = treePosition  // Silence unused variable warning
+                continue  // Skip decryption, just append CMUs to tree
+            }
 
             // Try to decrypt with spending key
             guard let decryptedData = ZipherXFFI.tryDecryptNoteWithSK(
@@ -1240,8 +1254,11 @@ final class FilterScanner {
                 print("💰 Skipping change output (txid already exists as sent): \(value) zatoshis")
                 // NO notification for change outputs - don't trigger fireworks on sender
             } else {
-                // Send notification for real incoming payments only
-                NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+                // Real incoming tx found in block (0 confirmations)
+                // Track it as pending incoming - notification will be sent once it has 1+ confirmations
+                Task { @MainActor in
+                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
+                }
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1307,6 +1324,12 @@ final class FilterScanner {
             // Reverse byte order: display format (big-endian) -> wire format (little-endian)
             let epk = epkDisplay.reversedBytes()
             let cmu = cmuDisplay.reversedBytes()
+
+            // NEW WALLET OPTIMIZATION: Skip note decryption for new wallets
+            // No notes can exist for a brand new address that was just created
+            if isNewWalletInitialSync {
+                continue  // Skip decryption entirely
+            }
 
             // Skip tree operations for speed - just try to decrypt
             guard let decryptedData = ZipherXFFI.tryDecryptNoteWithSK(
@@ -1390,8 +1413,11 @@ final class FilterScanner {
                 print("💰 Skipping change output (txid already exists as sent): \(value) zatoshis")
                 // NO notification for change outputs - don't trigger fireworks on sender
             } else {
-                // Send notification for real incoming payments only
-                NotificationManager.shared.notifyReceived(amount: value, txid: txid)
+                // Real incoming tx found in block (0 confirmations)
+                // Track it as pending incoming - notification will be sent once it has 1+ confirmations
+                Task { @MainActor in
+                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
+                }
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1568,7 +1594,8 @@ final class FilterScanner {
         outputIndex: UInt32,
         accountId: Int64,
         height: UInt64,
-        spendingKey: Data
+        spendingKey: Data,
+        blockTime: UInt32
     ) async throws {
         // Calculate position in commitment tree (simplified)
         let position = height * 1000 + UInt64(outputIndex)
@@ -1624,8 +1651,12 @@ final class FilterScanner {
             // The note is still saved and adds to balance, but won't show as separate "RECEIVED"
             // NO notification for change outputs - don't trigger fireworks on sender
         } else {
-            // Send notification for real incoming payments only
-            NotificationManager.shared.notifyReceived(amount: note.value, txid: txid.map { String(format: "%02x", $0) }.joined())
+            // This is a real incoming payment found in a mined block!
+            let txidHex = txid.map { String(format: "%02x", $0) }.joined()
+
+            // Trigger the mined celebration for incoming confirmed tx
+            // This will show the cypherpunk "mined" message and system notification
+            await NetworkManager.shared.confirmIncomingTx(txid: txidHex, amount: note.value)
             // Extract memo string from memo data (filter null bytes, convert to UTF8)
             let memoString: String? = {
                 let truncated = note.memo.prefix(512)
@@ -1636,7 +1667,7 @@ final class FilterScanner {
             _ = try database.insertTransactionHistory(
                 txid: txid,
                 height: height,
-                blockTime: nil, // Could fetch from block header if available
+                blockTime: UInt64(blockTime), // Real blockchain timestamp from block header
                 type: .received,
                 value: note.value,
                 fee: nil,

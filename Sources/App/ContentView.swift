@@ -14,11 +14,17 @@ struct ContentView: View {
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
 
-    // Startup timing
-    @State private var syncStartTime: Date? = nil
+    // Startup timing - uses walletCreationTime from WalletManager
+    // This ensures timing starts from when user clicks create/import/restore, not app launch
     @State private var syncCompletionDuration: TimeInterval? = nil
     @State private var showCompletionScreen: Bool = false
-    private let estimatedSyncDuration: TimeInterval = 45  // ~45 seconds estimated
+    private let estimatedSyncDuration: TimeInterval = 60  // ~60 seconds estimated for new wallet
+
+    /// Get the effective start time for sync timing display
+    /// Uses walletCreationTime if available (when user clicked create/import), otherwise falls back to appStartupTime
+    private var effectiveStartTime: Date {
+        walletManager.walletCreationTime ?? appStartupTime
+    }
 
     // Cypherpunk mode sheet states
     @State private var showCypherpunkSettings = false
@@ -35,7 +41,10 @@ struct ContentView: View {
             themeManager.currentTheme.backgroundColor
                 .ignoresSafeArea()
 
-            if walletManager.isWalletCreated {
+            // Show main wallet view ONLY if:
+            // 1. Wallet is created AND
+            // 2. Mnemonic backup is NOT pending (user has confirmed backup)
+            if walletManager.isWalletCreated && !walletManager.isMnemonicBackupPending {
                 mainWalletView
                     .task {
                         print("DEBUGZIPHERX: 🚀 Task: Starting initial sync task...")
@@ -49,10 +58,8 @@ struct ContentView: View {
                         // Suppress background sync during initial startup to avoid race conditions
                         networkManager.suppressBackgroundSync = true
 
-                        // Start the timer
-                        await MainActor.run {
-                            syncStartTime = Date()
-                        }
+                        // Note: Timing uses global appStartupTime (from ZipherXApp.swift)
+                        // which is captured at the very first moment of app launch
 
                         print("DEBUGZIPHERX: 🚀 Task: isTreeLoaded = \(walletManager.isTreeLoaded)")
 
@@ -199,6 +206,8 @@ struct ContentView: View {
                             // Sanity check: should only be a few blocks, not thousands
                             guard missedBlocks < 100 else {
                                 print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
+                                // CRITICAL: Must clear suppressBackgroundSync even on early return!
+                                networkManager.suppressBackgroundSync = false
                                 await MainActor.run {
                                     walletManager.setConnecting(false, status: nil)
                                     isInitialSync = false
@@ -234,10 +243,9 @@ struct ContentView: View {
                         networkManager.suppressBackgroundSync = false
 
                         // Calculate final duration and show completion screen
+                        // Uses effectiveStartTime (walletCreationTime if set, otherwise appStartupTime)
                         await MainActor.run {
-                            if let start = syncStartTime {
-                                syncCompletionDuration = Date().timeIntervalSince(start)
-                            }
+                            syncCompletionDuration = Date().timeIntervalSince(effectiveStartTime)
                             showCompletionScreen = true
                         }
 
@@ -252,7 +260,7 @@ struct ContentView: View {
                         progress: currentSyncProgress,
                         status: currentSyncStatus,
                         tasks: currentSyncTasks,
-                        startTime: syncStartTime,
+                        startTime: effectiveStartTime,  // Use wallet creation time for accurate duration
                         estimatedDuration: estimatedSyncDuration,
                         isComplete: showCompletionScreen,
                         completionDuration: syncCompletionDuration,
@@ -410,26 +418,38 @@ struct ContentView: View {
             return walletManager.isConnecting ? 0.45 : 0.40
         }
 
-        // Sync phase (50-95%)
-        // Check if still syncing OR tasks exist and not all completed
+        // Check if all tasks are completed
         let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
             if case .completed = $0.status { return true }
             if case .failed = $0.status { return true }
             return false
         }
 
+        // Check if balance task is completed (strong completion signal)
+        let balanceCompleted = walletManager.syncTasks.contains {
+            $0.id == "balance" && $0.status == .completed
+        }
+
+        // Sync phase (50-95%)
         if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !allTasksCompleted) {
-            // Check if balance task is completed
-            let balanceCompleted = walletManager.syncTasks.contains {
-                $0.id == "balance" && $0.status == .completed
-            }
             if balanceCompleted {
                 return 0.98
             }
             return 0.50 + (walletManager.syncProgress * 0.45)
         }
 
-        // Finalizing phase (95-100%) - only if we're truly done
+        // Catch-up phase (95-98%) - when isConnecting is set but not syncing
+        // This happens between initial sync complete and catch-up sync starting
+        if walletManager.isConnecting && !walletManager.isSyncing {
+            return 0.96
+        }
+
+        // All tasks completed but still in initial sync - show near complete
+        if allTasksCompleted || balanceCompleted {
+            return 0.98
+        }
+
+        // Finalizing phase (100%) - only if we're truly done
         if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
             return 1.0
         }
@@ -448,27 +468,38 @@ struct ContentView: View {
         if !networkManager.isConnected {
             return walletManager.isConnecting ? "Connecting to network..." : "Waiting for network..."
         }
-        // Syncing (includes waiting for sync to start)
-        // Only show sync status if still syncing or tasks not all completed
+
+        // Check completion status
         let statusAllTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
             if case .completed = $0.status { return true }
             if case .failed = $0.status { return true }
             return false
         }
 
+        // Syncing (includes waiting for sync to start)
         if walletManager.isSyncing || (!walletManager.syncTasks.isEmpty && !statusAllTasksCompleted) {
             if walletManager.syncStatus.isEmpty {
                 return "Starting blockchain sync..."
             }
             return walletManager.syncStatus
         }
+
+        // Catch-up phase - waiting for new blocks
+        if walletManager.isConnecting && !walletManager.isSyncing {
+            // Use the status set by WalletManager if available
+            if !walletManager.syncStatus.isEmpty {
+                return walletManager.syncStatus
+            }
+            return "Catching up new blocks..."
+        }
+
         // Tree loaded, network connected, sync complete
         if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
             return "Ready!"
         }
-        // All tasks completed - show ready message
+        // All tasks completed - almost done
         if statusAllTasksCompleted {
-            return "Finalizing..."
+            return "Almost ready..."
         }
         // Waiting for sync to start
         return "Preparing sync..."

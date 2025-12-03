@@ -34,7 +34,8 @@ enum ZclassicCheckpoints {
         2900000: "0000000000recentcheckpoint2900000placeholder0123456789abcdef",
         2916559: "0000000000bootstrap20251120checkpoint0123456789abcdef01234567",
         // Bundled tree checkpoint (must match bundledTreeHeight in FilterScanner/WalletManager)
-        2926122: "000004496018943355cdf6c313e2aac3f3356bb7f31a31d1a5b5b582dfe594ef",
+        // IMPORTANT: This hash was corrected on Dec 3, 2025 - previous hash was wrong causing header misalignment
+        2926122: "0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd",
     ]
 
     /// Sapling activation height on Zclassic mainnet
@@ -195,18 +196,41 @@ extension BlockHeader {
         return true
     }
 
-    /// Get block hash
+    /// Get block hash (SHA256(SHA256(header + solution)))
     var hash: Data {
         headerData.doubleSHA256()
     }
 
-    /// Get raw header data for hashing
+    /// Alias for hash - used throughout codebase
+    var blockHash: Data {
+        hash
+    }
+
+    /// Get raw header data for hashing (140 bytes base + solution)
+    /// Block hash = SHA256(SHA256(headerData + solution))
     var headerData: Data {
         var data = Data()
+        // Version (4 bytes)
         data.append(contentsOf: withUnsafeBytes(of: version.littleEndian) { Array($0) })
+        // Previous block hash (32 bytes)
         data.append(prevBlockHash)
+        // Merkle root (32 bytes)
         data.append(merkleRoot)
-        // ... additional fields
+        // Final sapling root / reserved (32 bytes)
+        data.append(finalSaplingRoot)
+        // Timestamp (4 bytes)
+        data.append(contentsOf: withUnsafeBytes(of: timestamp.littleEndian) { Array($0) })
+        // Bits (4 bytes)
+        data.append(contentsOf: withUnsafeBytes(of: bits.littleEndian) { Array($0) })
+        // Nonce (32 bytes)
+        data.append(nonce)
+        // Equihash solution (1344 bytes for Equihash(200,9))
+        // Solution is prefixed with compactSize (3 bytes for 1344: fd 40 05)
+        // For hash computation, we include: fd + len(2 bytes) + solution data
+        let solutionLen = UInt16(solution.count)
+        data.append(0xfd) // compactSize prefix for 253-65535
+        data.append(contentsOf: withUnsafeBytes(of: solutionLen.littleEndian) { Array($0) })
+        data.append(solution)
         return data
     }
 }

@@ -30,6 +30,7 @@ final class WalletManager: ObservableObject {
     // MARK: - Published Properties
     @Published private(set) var isWalletCreated: Bool = false
     @Published private(set) var isImportedWallet: Bool = false  // True if wallet was imported (may have historical notes)
+    @Published private(set) var isMnemonicBackupPending: Bool = false  // True when new wallet created, waiting for backup confirmation
     @Published private(set) var shieldedBalance: UInt64 = 0 // in zatoshis
     @Published private(set) var pendingBalance: UInt64 = 0
     @Published private(set) var zAddress: String = ""
@@ -49,11 +50,18 @@ final class WalletManager: ObservableObject {
     /// Balance before the most recent send - used to detect change vs real incoming
     @Published private(set) var balanceBeforeLastSend: UInt64? = nil
 
+    /// Timestamp when wallet was created/imported - used for accurate sync timing display
+    /// This is set when user clicks Create/Import/Restore, not when app launches
+    @Published private(set) var walletCreationTime: Date? = nil
+
     /// Clear the balance tracking after change output is processed
+    /// NOTE: We do NOT clear lastSendTimestamp here - it should persist for the full 120 seconds
+    /// so that isLikelyChange remains true and suppresses the pending balance indicator
     @MainActor
     func clearBalanceBeforeLastSend() {
         balanceBeforeLastSend = nil
-        lastSendTimestamp = nil
+        // Don't clear lastSendTimestamp - it's needed for isLikelyChange detection
+        // lastSendTimestamp will naturally expire after 120 seconds
     }
 
     // MARK: - Private Properties
@@ -414,7 +422,8 @@ final class WalletManager: ObservableObject {
 
             for note in notes {
                 // Calculate confirmations: targetHeight - noteHeight + 1
-                let confirmations = targetHeight > note.height ? Int(targetHeight - note.height + 1) : 0
+                // Note at same height as target = 1 confirmation (it's in a block)
+                let confirmations = targetHeight >= note.height ? Int(targetHeight - note.height + 1) : 0
                 if confirmations >= 1 {
                     confirmedBalance += note.value
                 } else {
@@ -441,6 +450,12 @@ final class WalletManager: ObservableObject {
     /// Create a new wallet with a fresh mnemonic
     /// - Returns: The 24-word mnemonic for backup
     func createNewWallet() throws -> [String] {
+        // Record creation time for accurate sync timing display
+        DispatchQueue.main.async {
+            self.walletCreationTime = Date()
+            print("⏱️ Wallet creation started at: \(self.walletCreationTime!)")
+        }
+
         // Generate 24-word mnemonic (256-bit entropy)
         let mnemonic = try mnemonicGenerator.generateMnemonic(wordCount: 24)
 
@@ -466,18 +481,38 @@ final class WalletManager: ObservableObject {
         try? resetDatabaseForNewWallet()
 
         // Update state - new wallet (not imported, no historical notes possible)
+        // NOTE: We set isMnemonicBackupPending = true instead of isWalletCreated = true
+        // This allows the mnemonic backup sheet to be shown BEFORE switching to main view
+        // isWalletCreated will be set to true when user confirms backup via confirmMnemonicBackup()
         DispatchQueue.main.async {
             self.zAddress = address
-            self.isWalletCreated = true
+            self.isMnemonicBackupPending = true  // Flag that backup sheet should be shown
             self.isImportedWallet = false  // New wallet - fast startup OK
-            self.saveWalletState()
+            // Don't save wallet state yet - wait for backup confirmation
         }
 
         return mnemonic
     }
 
+    /// Called when user confirms they have saved their seed phrase
+    /// This completes the wallet creation process
+    func confirmMnemonicBackup() {
+        DispatchQueue.main.async {
+            self.isMnemonicBackupPending = false
+            self.isWalletCreated = true
+            self.saveWalletState()
+            print("✅ Mnemonic backup confirmed, wallet creation complete")
+        }
+    }
+
     /// Restore wallet from mnemonic
     func restoreWallet(from mnemonic: [String]) throws {
+        // Record creation time for accurate sync timing display
+        DispatchQueue.main.async {
+            self.walletCreationTime = Date()
+            print("⏱️ Wallet restore started at: \(self.walletCreationTime!)")
+        }
+
         // Validate mnemonic
         guard mnemonicGenerator.validateMnemonic(mnemonic) else {
             throw WalletError.invalidMnemonic
@@ -895,10 +930,13 @@ final class WalletManager: ObservableObject {
 
         for i in unspentNotes.indices {
             // Calculate confirmations: chainHeight - noteHeight + 1
-            let confirmations = chainHeight > unspentNotes[i].height ? Int(chainHeight - unspentNotes[i].height + 1) : 0
+            // Note at same height as chain tip = 1 confirmation (it's in a block)
+            // Note above chain tip = 0 confirmations (shouldn't happen but be safe)
+            let confirmations = chainHeight >= unspentNotes[i].height ? Int(chainHeight - unspentNotes[i].height + 1) : 0
             unspentNotes[i].confirmations = confirmations
 
-            // Require only 1 confirmation for balance (10 is too slow for UX)
+            // Require only 1 confirmation for balance (note must be in a block)
+            // Once mined, immediately show in balance (no pending message needed)
             if confirmations >= 1 {
                 totalBalance += unspentNotes[i].value
             } else {
@@ -1558,8 +1596,9 @@ final class WalletManager: ObservableObject {
         onProgress("broadcast", "Preparing to broadcast...", 0.0)
 
         // Broadcast through multi-peer network with progress
+        // Pass amount for instant UI feedback when first peer accepts
         let networkManager = NetworkManager.shared
-        let txId = try await networkManager.broadcastTransactionWithProgress(rawTx) { phase, detail, progress in
+        let txId = try await networkManager.broadcastTransactionWithProgress(rawTx, amount: amount) { phase, detail, progress in
             // Forward broadcast progress to the UI
             // Use actual phase ("peers", "verify", "api") so UI can show txid immediately on first peer accept
             onProgress(phase, detail, progress)
@@ -2060,6 +2099,12 @@ final class WalletManager: ObservableObject {
     /// Import spending key from Bech32 string (secret-extended-key-main1...)
     /// Also accepts legacy hex format (338 chars)
     func importSpendingKey(_ keyString: String) throws {
+        // Record creation time for accurate sync timing display
+        DispatchQueue.main.async {
+            self.walletCreationTime = Date()
+            print("⏱️ Wallet import started at: \(self.walletCreationTime!)")
+        }
+
         // Clean the input - remove whitespace and newlines
         let cleanKey = keyString.trimmingCharacters(in: .whitespacesAndNewlines)
 

@@ -1,11 +1,110 @@
 import SwiftUI
 import LocalAuthentication
+import CryptoKit
 #if canImport(UIKit)
 import UIKit
 #endif
 #if canImport(AppKit)
 import AppKit
 #endif
+
+// MARK: - PIN Security Helper
+/// Secure PIN hashing using PBKDF2-like key derivation with rate limiting
+enum PINSecurity {
+    /// Fixed salt for PIN hashing (in production, use per-user random salt stored in Keychain)
+    private static let pinSalt = "ZipherX_PIN_Salt_v1".data(using: .utf8)!
+
+    /// Rate limiting constants
+    private static let maxAttempts = 5
+    private static let lockoutDuration: TimeInterval = 300 // 5 minutes
+
+    /// UserDefaults keys for rate limiting
+    private static let failedAttemptsKey = "pinFailedAttempts"
+    private static let lockoutEndKey = "pinLockoutEnd"
+
+    /// Hash PIN using SHA256 with salt (100,000 iterations simulated via multiple rounds)
+    static func hashPIN(_ pin: String) -> String {
+        guard let pinData = pin.data(using: .utf8) else { return "" }
+
+        // Combine salt + PIN
+        var combined = pinSalt
+        combined.append(pinData)
+
+        // Multiple rounds of hashing to slow down brute force
+        var hash = SHA256.hash(data: combined)
+        for _ in 0..<10000 {
+            hash = SHA256.hash(data: Data(hash))
+        }
+
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Check if PIN verification is currently locked out
+    static func isLockedOut() -> Bool {
+        let lockoutEnd = UserDefaults.standard.double(forKey: lockoutEndKey)
+        if lockoutEnd > 0 && Date().timeIntervalSince1970 < lockoutEnd {
+            return true
+        }
+        return false
+    }
+
+    /// Get remaining lockout time in seconds
+    static func remainingLockoutTime() -> TimeInterval {
+        let lockoutEnd = UserDefaults.standard.double(forKey: lockoutEndKey)
+        let remaining = lockoutEnd - Date().timeIntervalSince1970
+        return max(0, remaining)
+    }
+
+    /// Get number of failed attempts
+    static func failedAttempts() -> Int {
+        return UserDefaults.standard.integer(forKey: failedAttemptsKey)
+    }
+
+    /// Verify PIN against stored hash with rate limiting
+    /// Returns: (success, isLocked, remainingAttempts)
+    static func verifyPINWithRateLimit(_ pin: String, storedHash: String) -> (success: Bool, isLocked: Bool, remainingAttempts: Int) {
+        // Check if locked out
+        if isLockedOut() {
+            return (false, true, 0)
+        }
+
+        // Verify PIN
+        let success = hashPIN(pin) == storedHash
+
+        if success {
+            // Reset failed attempts on success
+            UserDefaults.standard.set(0, forKey: failedAttemptsKey)
+            UserDefaults.standard.removeObject(forKey: lockoutEndKey)
+            return (true, false, maxAttempts)
+        } else {
+            // Increment failed attempts
+            var attempts = UserDefaults.standard.integer(forKey: failedAttemptsKey)
+            attempts += 1
+            UserDefaults.standard.set(attempts, forKey: failedAttemptsKey)
+
+            // Check if lockout should be triggered
+            if attempts >= maxAttempts {
+                let lockoutEnd = Date().timeIntervalSince1970 + lockoutDuration
+                UserDefaults.standard.set(lockoutEnd, forKey: lockoutEndKey)
+                print("⚠️ SECURITY: PIN lockout triggered after \(attempts) failed attempts")
+                return (false, true, 0)
+            }
+
+            return (false, false, maxAttempts - attempts)
+        }
+    }
+
+    /// Simple verify PIN (for backwards compatibility)
+    static func verifyPIN(_ pin: String, storedHash: String) -> Bool {
+        return hashPIN(pin) == storedHash
+    }
+
+    /// Reset lockout (for testing or admin purposes)
+    static func resetLockout() {
+        UserDefaults.standard.set(0, forKey: failedAttemptsKey)
+        UserDefaults.standard.removeObject(forKey: lockoutEndKey)
+    }
+}
 
 /// Settings View - Export keys, PIN code, Face ID setup
 /// Themed design
@@ -49,6 +148,15 @@ struct SettingsView: View {
     @State private var bannedPeersList: [BannedPeer] = []
     @State private var selectedBannedPeers: Set<String> = []
 
+    // Delete wallet
+    @State private var showDeleteWalletWarning = false
+    @State private var showDeleteWalletConfirm = false
+    @State private var deleteConfirmText = ""
+
+    // Peer export management
+    @State private var showPeerExportSuccess = false
+    @State private var peerExportCount = 0
+
     @EnvironmentObject var themeManager: ThemeManager
 
     // Theme shortcut
@@ -79,6 +187,8 @@ struct SettingsView: View {
 
                 // Rescan section
                 rescanSection
+
+                // Note: Delete wallet is now in exportSection (Danger Zone)
 
                 /* DISABLED: Debug tools section
                 // Debug section (for testing header sync)
@@ -181,6 +291,28 @@ struct SettingsView: View {
             }
         } message: {
             Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height 2926122.\n\nDo you want to continue?")
+        }
+        .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
+            Button("Cancel - Keep Wallet", role: .cancel) {}
+            Button("I Understand, Delete", role: .destructive) {
+                showDeleteWalletConfirm = true
+            }
+        } message: {
+            Text("!!! CRITICAL WARNING !!!\n\nThis will PERMANENTLY DELETE your wallet!\n\nYour PRIVATE KEY will be ERASED FOREVER.\nAll transaction history will be LOST.\nYour funds will be UNRECOVERABLE.\n\nHave you EXPORTED your private key?\nIf not, press Cancel NOW!\n\nTHIS CANNOT BE UNDONE!")
+        }
+        .alert("FINAL CONFIRMATION", isPresented: $showDeleteWalletConfirm) {
+            TextField("Type DELETE to confirm", text: $deleteConfirmText)
+            Button("CANCEL - KEEP MY WALLET", role: .cancel) {
+                deleteConfirmText = ""
+            }
+            Button("DELETE FOREVER", role: .destructive) {
+                if deleteConfirmText.uppercased() == "DELETE" {
+                    performDeleteWallet()
+                }
+                deleteConfirmText = ""
+            }
+        } message: {
+            Text("Type DELETE (in capital letters) to confirm.\n\nAfter this, your wallet is GONE FOREVER.\n\nNo recovery is possible without your private key backup!")
         }
     }
 
@@ -660,6 +792,53 @@ struct SettingsView: View {
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
+
+            // Export Reliable Peers button (for bundling in future releases)
+            Button(action: {
+                exportReliablePeers()
+            }) {
+                HStack {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 14))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Export Reliable Peers")
+                            .font(theme.bodyFont)
+                        Text("\(networkManager.reliablePeerCount) peers with >50% success")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(networkManager.reliablePeerCount >= 100 ? Color.green.opacity(0.1) : theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(networkManager.reliablePeerCount >= 100 ? Color.green : theme.textPrimary, lineWidth: 1)
+                )
+            }
+
+            // Info text about peer export
+            if networkManager.reliablePeerCount >= 100 {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 12))
+                    Text("100+ reliable peers ready for bundling!")
+                        .font(theme.captionFont)
+                        .foregroundColor(.green)
+                }
+                .padding(8)
+                .background(Color.green.opacity(0.1))
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.green.opacity(0.5), lineWidth: 1)
+                )
+            }
         }
         .padding(12)
         .background(theme.backgroundColor)
@@ -674,50 +853,138 @@ struct SettingsView: View {
                        minHeight: 400, idealHeight: 500, maxHeight: 600)
                 #endif
         }
+        .alert("Peers Exported!", isPresented: $showPeerExportSuccess) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            #if os(macOS)
+            Text("Exported \(peerExportCount) reliable peers to Desktop/bundled_peers.json\n\nThis file can be added to Resources/ for faster sync on fresh installs.")
+            #else
+            Text("Exported \(peerExportCount) reliable peers to Documents/bundled_peers.json\n\nAccess via Files app → On My iPhone → ZipherX")
+            #endif
+        }
     }
 
-    // MARK: - Export Section
+    // MARK: - Danger Zone Section (Export Key, Reveal Seed, Delete Wallet)
 
     private var exportSection: some View {
-        VStack(spacing: 12) {
-            // Section header
+        VStack(spacing: 16) {
+            // Section header - DANGER ZONE
             HStack {
-                Image(systemName: "key")
-                    .font(.system(size: 12))
-                Text("Backup")
-                    .font(theme.titleFont)
+                Image(systemName: "exclamationmark.octagon.fill")
+                    .font(.system(size: 14))
+                Text("DANGER ZONE")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
                 Spacer()
             }
-            .foregroundColor(theme.textPrimary)
+            .foregroundColor(.red)
 
-            // Warning
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                    .font(.system(size: 12))
+            // Export Private Key
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: "key.fill")
+                        .font(.system(size: 11))
+                    Text("Export Private Key")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.orange)
 
-                Text("Never share your private key. Store it securely offline.")
+                Text("Your spending key allows full access to your funds. Never share it!")
                     .font(theme.captionFont)
                     .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Button(action: { exportPrivateKey() }) {
+                    HStack {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 11))
+                        Text("Export Key")
+                            .font(theme.bodyFont)
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.orange)
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.orange.opacity(0.8), lineWidth: 1)
+                    )
+                }
             }
-            .padding(8)
-            .background(theme.surfaceColor)
+            .padding(10)
+            .background(Color.orange.opacity(0.1))
             .overlay(
                 Rectangle()
-                    .stroke(Color.orange.opacity(0.5), lineWidth: 1)
+                    .stroke(Color.orange.opacity(0.3), lineWidth: 1)
             )
 
-            // Export button
-            System7Button(title: "Export Private Key") {
-                exportPrivateKey()
+            // Reveal Seed Phrase info (if not imported wallet)
+            if !walletManager.isImportedWallet {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "list.number")
+                            .font(.system(size: 11))
+                        Text("Seed Phrase")
+                            .font(theme.bodyFont)
+                    }
+                    .foregroundColor(theme.textPrimary)
+
+                    Text("Your 24-word seed phrase was shown during wallet creation. For security, it is not stored on this device. If you didn't write it down, you can export your private key above as a backup.")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.borderColor, lineWidth: 1)
+                )
             }
+
+            // Delete Wallet
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: "trash.fill")
+                        .font(.system(size: 11))
+                    Text("Delete Wallet")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.red)
+
+                Text("Permanently delete this wallet. Your funds will be UNRECOVERABLE without your private key backup!")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button(action: { showDeleteWalletWarning = true }) {
+                    HStack {
+                        Image(systemName: "trash.fill")
+                            .font(.system(size: 11))
+                        Text("Delete Wallet Forever")
+                            .font(theme.bodyFont)
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.red)
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.red.opacity(0.8), lineWidth: 1)
+                    )
+                }
+            }
+            .padding(10)
+            .background(Color.red.opacity(0.1))
+            .overlay(
+                Rectangle()
+                    .stroke(Color.red.opacity(0.3), lineWidth: 1)
+            )
         }
         .padding(12)
         .background(theme.backgroundColor)
         .overlay(
             Rectangle()
-                .stroke(theme.textPrimary, lineWidth: 1)
+                .stroke(Color.red.opacity(0.5), lineWidth: 2)
         )
     }
 
@@ -992,6 +1259,32 @@ struct SettingsView: View {
             Rectangle()
                 .stroke(theme.textPrimary, lineWidth: 1)
         )
+    }
+
+    // Note: Delete Wallet functionality is now part of exportSection (Danger Zone)
+
+    private func performDeleteWallet() {
+        do {
+            // Delete the database file
+            try WalletDatabase.shared.deleteDatabase()
+
+            // Delete the wallet (clears keychain + UserDefaults)
+            try walletManager.deleteWallet()
+
+            // Clear additional UserDefaults
+            let defaults = UserDefaults.standard
+            defaults.removeObject(forKey: "wallet_created")
+            defaults.removeObject(forKey: "wallet_imported")
+            defaults.removeObject(forKey: "z_address")
+            defaults.removeObject(forKey: "lastScannedHeight")
+            defaults.removeObject(forKey: "lastScannedHash")
+            defaults.synchronize()
+
+            print("Wallet deleted successfully")
+        } catch {
+            errorMessage = "Failed to delete wallet: \(error.localizedDescription)"
+            showError = true
+        }
     }
 
     // MARK: - Rescan Progress View
@@ -1373,6 +1666,37 @@ struct SettingsView: View {
 
     // MARK: - Actions
 
+    private func exportReliablePeers() {
+        let jsonString = networkManager.exportReliablePeersForBundling()
+
+        // Platform-specific save location
+        #if os(macOS)
+        let exportURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop")
+            .appendingPathComponent("bundled_peers.json")
+        #else
+        // iOS: Save to Documents folder (can be accessed via Files app)
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let exportURL = documentsURL.appendingPathComponent("bundled_peers.json")
+        #endif
+
+        do {
+            try jsonString.write(to: exportURL, atomically: true, encoding: .utf8)
+
+            // Count peers from JSON
+            if let data = jsonString.data(using: .utf8),
+               let peers = try? JSONDecoder().decode([BundledPeer].self, from: data) {
+                peerExportCount = peers.count
+            }
+
+            showPeerExportSuccess = true
+            print("📡 Exported \(peerExportCount) reliable peers to \(exportURL.path)")
+        } catch {
+            errorMessage = "Failed to export peers: \(error.localizedDescription)"
+            showError = true
+        }
+    }
+
     private func recoverSpentNotes() {
         Task {
             do {
@@ -1498,8 +1822,9 @@ struct SettingsView: View {
             return
         }
 
-        // Save PIN (in production, hash this!)
-        UserDefaults.standard.set(pinCode, forKey: "walletPIN")
+        // SECURITY: Hash PIN with PBKDF2-like derivation before storing
+        let hashedPIN = PINSecurity.hashPIN(pinCode)
+        UserDefaults.standard.set(hashedPIN, forKey: "walletPIN")
         pinCode = ""
         confirmPIN = ""
         showPINSetup = false

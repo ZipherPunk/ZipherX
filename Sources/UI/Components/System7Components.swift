@@ -1018,11 +1018,23 @@ struct CypherpunkSyncView: View {
                 .animation(.easeInOut(duration: 0.3), value: currentMessage)
                 .padding(.top, 8)
 
-            // Task list (if available)
+            // Task list with individual progress bars
             if !tasks.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Section header
+                    Text("TASKS")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(NeonColors.primaryDim)
+                        .tracking(2)
+                        .padding(.bottom, 8)
+
                     ForEach(tasks) { task in
                         CypherpunkSyncTaskRow(task: task)
+                        if task.id != tasks.last?.id {
+                            Divider()
+                                .background(NeonColors.primaryVeryDim)
+                                .padding(.vertical, 4)
+                        }
                     }
                 }
                 .padding(16)
@@ -1034,13 +1046,66 @@ struct CypherpunkSyncView: View {
                 .padding(.horizontal, 20)
             }
 
-            // Progress bar
-            VStack(spacing: 8) {
+            // Current task progress (larger, more prominent)
+            if let currentTask = tasks.first(where: { if case .inProgress = $0.status { return true } else { return false } }),
+               let taskProgress = currentTask.progress {
+                VStack(spacing: 6) {
+                    Text("CURRENT TASK")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(NeonColors.primaryDim)
+                        .tracking(2)
+
+                    Text(currentTask.title.uppercased())
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(NeonColors.primary)
+
+                    // Task progress bar (larger)
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            Rectangle()
+                                .fill(NeonColors.progressBg)
+                                .frame(height: 8)
+
+                            Rectangle()
+                                .fill(NeonColors.progressFillStart)
+                                .frame(width: geometry.size.width * min(max(taskProgress, 0.02), 1.0), height: 8)
+                                .animation(.linear(duration: 0.3), value: taskProgress)
+
+                            Rectangle()
+                                .stroke(NeonColors.primaryDim, lineWidth: 1)
+                                .frame(height: 8)
+                        }
+                    }
+                    .frame(height: 8)
+                    .padding(.horizontal, 40)
+
+                    // Task percentage
+                    Text("\(Int(taskProgress * 100))%")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(NeonColors.primary)
+
+                    // Task detail if available
+                    if let detail = currentTask.detail {
+                        Text(detail)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(NeonColors.primaryDim)
+                    }
+                }
+                .padding(.top, 12)
+            }
+
+            // Overall progress bar
+            VStack(spacing: 6) {
+                Text("OVERALL PROGRESS")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(NeonColors.primaryDim)
+                    .tracking(2)
+
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Rectangle()
                             .fill(NeonColors.progressBg)
-                            .frame(height: 12)
+                            .frame(height: 14)
 
                         Rectangle()
                             .fill(
@@ -1053,20 +1118,20 @@ struct CypherpunkSyncView: View {
                                     endPoint: .trailing
                                 )
                             )
-                            .frame(width: geometry.size.width * min(max(progress, 0.02), 1.0), height: 12)
+                            .frame(width: geometry.size.width * min(max(progress, 0.02), 1.0), height: 14)
                             .animation(.linear(duration: 0.3), value: progress)
 
                         Rectangle()
                             .stroke(NeonColors.primaryDim, lineWidth: 1)
-                            .frame(height: 12)
+                            .frame(height: 14)
                     }
                 }
-                .frame(height: 12)
+                .frame(height: 14)
                 .padding(.horizontal, 40)
 
                 // Progress percentage
                 Text("\(Int(progress * 100))%")
-                    .font(.system(size: 20, weight: .bold, design: .monospaced))
+                    .font(.system(size: 22, weight: .bold, design: .monospaced))
                     .foregroundColor(NeonColors.primary)
 
                 // Status text
@@ -1076,7 +1141,7 @@ struct CypherpunkSyncView: View {
                         .foregroundColor(NeonColors.primaryDim)
                 }
             }
-            .padding(.top, 8)
+            .padding(.top, 12)
 
             Spacer()
 
@@ -1365,6 +1430,8 @@ struct CypherpunkMainView: View {
     private let receivedGreen = Color(red: 0, green: 0.85, blue: 0.25)
 
     private let glitchTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+    // Periodic mempool check for incoming transactions (every 15 seconds)
+    private let mempoolCheckTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -1427,12 +1494,57 @@ struct CypherpunkMainView: View {
             if newValue != previousBalance {
                 loadTransactionHistory()
             }
-            // Detect incoming ZCL
+            // Detect incoming ZCL - balance increased!
+            // IMPORTANT: Suppress fireworks for change outputs from our own sends
             if newValue > previousBalance && previousBalance > 0 {
                 let increase = newValue - previousBalance
-                fireworksAmount = Double(increase) / 100_000_000.0
-                withAnimation {
-                    showFireworks = true
+
+                // Check if this is likely a change output from a recent send
+                var isLikelyChangeOutput = false
+
+                // Method 1: Check if there's a pending outgoing transaction (most reliable)
+                if networkManager.mempoolOutgoing > 0 {
+                    isLikelyChangeOutput = true
+                    print("💰 Change detection (mempoolOutgoing): outgoing pending - suppressing fireworks")
+                }
+
+                // Method 2: Time-based - any send in last 120 seconds means this might be change
+                if !isLikelyChangeOutput, let lastSend = walletManager.lastSendTimestamp {
+                    let timeSinceSend = Date().timeIntervalSince(lastSend)
+                    if timeSinceSend < 120.0 {
+                        isLikelyChangeOutput = true
+                        print("💰 Change detection (time): sent \(Int(timeSinceSend))s ago - suppressing fireworks")
+                    }
+                }
+
+                // Method 3: Balance comparison - if new balance <= what we had before sending
+                if !isLikelyChangeOutput, let balanceBeforeSend = walletManager.balanceBeforeLastSend {
+                    if newValue <= balanceBeforeSend {
+                        isLikelyChangeOutput = true
+                        print("💰 Change detection (balance): newBalance=\(newValue) <= balanceBeforeSend=\(balanceBeforeSend)")
+                    }
+                }
+
+                if !isLikelyChangeOutput {
+                    fireworksAmount = Double(increase) / 100_000_000.0
+                    withAnimation {
+                        showFireworks = true
+                    }
+                    print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+                    // Clear tracking after real incoming is processed
+                    walletManager.clearBalanceBeforeLastSend()
+                } else {
+                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
+                    // Change output detected means our tx was mined!
+                    // Clear tracking after a brief delay to ensure UI is stable
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        // Only clear if still pending (confirmation handler might have cleared already)
+                        if networkManager.mempoolOutgoing > 0 {
+                            print("💰 Change detected - clearing pending state (tx mined)")
+                            networkManager.clearAllPendingOutgoing()
+                            walletManager.clearBalanceBeforeLastSend()
+                        }
+                    }
                 }
             }
             previousBalance = newValue
@@ -1444,6 +1556,15 @@ struct CypherpunkMainView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     showGlitch = false
                     glitchOffset = 0
+                }
+            }
+        }
+        .onReceive(mempoolCheckTimer) { _ in
+            // Periodically check mempool for incoming transactions
+            // This allows receivers to see pending incoming funds before first confirmation
+            if networkManager.isConnected && !walletManager.isSyncing {
+                Task {
+                    await networkManager.fetchNetworkStats()
                 }
             }
         }
@@ -1517,6 +1638,48 @@ struct CypherpunkMainView: View {
                 .font(.system(size: 16, weight: .bold, design: .monospaced))
                 .foregroundColor(matrixGreenDark)
 
+            // RECEIVER SIDE: Show pending INCOMING amount right below balance
+            if networkManager.mempoolIncoming > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 12))
+                    Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    Text("INCOMING")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(matrixGreen)
+                .shadow(color: matrixGreen.opacity(0.5), radius: 4)
+            }
+
+            // UNIFIED Pending indicator - shows OUTGOING in mempool OR notes with 0 confirmations
+            // Priority: mempoolOutgoing (tx not yet mined) > pendingBalance (mined but 0 conf)
+            if networkManager.mempoolOutgoing > 0 {
+                // Transaction in mempool - not yet mined
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 12))
+                    Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    Text("awaiting confirmation")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                .foregroundColor(Color.orange)
+                .shadow(color: Color.orange.opacity(0.5), radius: 4)
+            } else if walletManager.pendingBalance > 0 {
+                // Transaction mined but 0 confirmations (change not yet spendable)
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 12))
+                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    Text("pending")
+                        .font(.system(size: 9, design: .monospaced))
+                }
+                .foregroundColor(Color.yellow)
+                .shadow(color: Color.yellow.opacity(0.5), radius: 4)
+            }
+
             // USD value (placeholder - would need price feed)
             Text("≈ $\(formatUSDValue()) USD")
                 .font(.system(size: 14, design: .monospaced))
@@ -1532,18 +1695,6 @@ struct CypherpunkMainView: View {
             }
             .foregroundColor(matrixGreenDark)
             .padding(.top, 4)
-
-            // Pending balance
-            if walletManager.pendingBalance > 0 {
-                HStack(spacing: 4) {
-                    Text("PENDING:")
-                        .font(.system(size: 10, design: .monospaced))
-                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                }
-                .foregroundColor(Color.yellow)
-                .padding(.top, 4)
-            }
         }
     }
 
@@ -1668,7 +1819,7 @@ struct CypherpunkMainView: View {
                 if let date = tx.dateString {
                     Text(date)
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(matrixGreenDarker)
+                        .foregroundColor(tx.type == .received ? matrixGreenDarker : Color.orange.opacity(0.7))
                 }
             }
 
@@ -1771,11 +1922,16 @@ struct CypherpunkMainView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // ALWAYS populate from notes to ensure sent transactions are included
-                // This uses INSERT OR REPLACE so it's safe to call multiple times
-                print("📜 TXHIST [S7]: Populating history from notes...")
-                let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                print("📜 TXHIST [S7]: Populated \(populated) entries from notes")
+                // Only populate from notes if history is empty
+                // This avoids the CLEAR + rebuild cycle that causes change to briefly appear
+                let existingCount = try WalletDatabase.shared.getTransactionCount()
+                if existingCount == 0 {
+                    print("📜 TXHIST [S7]: History empty, populating from notes...")
+                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                    print("📜 TXHIST [S7]: Populated \(populated) entries from notes")
+                } else {
+                    print("📜 TXHIST [S7]: History has \(existingCount) entries, skipping populate")
+                }
 
                 // Now fetch the history
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
@@ -1933,8 +2089,8 @@ struct FireworksView: View {
                         .foregroundColor(.green)
                         .shadow(color: .green, radius: 10)
 
-                    Text("INCOMING!")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                    Text("Successfully Received!")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
                         .shadow(color: .white, radius: 5)
                 }
@@ -2033,6 +2189,111 @@ struct FireworksView: View {
     }
 }
 
+// MARK: - Mempool Celebration View
+
+/// Cypherpunk celebration when incoming ZCL detected in mempool (unconfirmed)
+struct MempoolCelebrationView: View {
+    @Binding var isShowing: Bool
+    let amount: Double // Amount in ZCL
+    let txid: String
+
+    // Cypherpunk messages for mempool detection
+    private let mempoolMessages = [
+        "ZCL detected in the mempool. Miners, wake up!",
+        "Someone sent you privacy coins. Pending miner attention.",
+        "Shielded funds incoming. Let proof-of-work do its thing.",
+        "Detected unconfirmed ZCL. The network is processing.",
+        "Privacy-preserving transfer in progress. Stand by.",
+        "Trustless money inbound. Awaiting block inclusion.",
+        "Cryptographic transfer detected. Miners are on it.",
+        "ZCL in transit. No middlemen, no delays."
+    ]
+
+    @State private var selectedMessage: String = ""
+    @State private var showContent = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Dark overlay with purple/blue tint for mempool
+                Color.black.opacity(0.85)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 20) {
+                    // Mempool/hourglass icon
+                    Text("⏳")
+                        .font(.system(size: 72))
+                        .scaleEffect(showContent ? 1.0 : 0.5)
+                        .animation(.spring(response: 0.4, dampingFraction: 0.6), value: showContent)
+
+                    // INCOMING title
+                    Text("INCOMING!")
+                        .font(.system(size: 42, weight: .bold, design: .monospaced))
+                        .foregroundColor(.cyan)
+                        .shadow(color: .cyan.opacity(0.8), radius: 10)
+
+                    // Amount
+                    Text("+\(String(format: "%.8f", amount)) ZCL")
+                        .font(.system(size: 36, weight: .bold, design: .monospaced))
+                        .foregroundColor(.green)
+                        .shadow(color: .green.opacity(0.5), radius: 5)
+
+                    // Status
+                    Text("AWAITING CONFIRMATION")
+                        .font(.system(size: 20, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.8))
+
+                    // Cypherpunk message
+                    Text(selectedMessage)
+                        .font(.system(size: 16, design: .monospaced))
+                        .foregroundColor(.cyan.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 30)
+                        .padding(.top, 8)
+
+                    // TXID
+                    VStack(spacing: 6) {
+                        Text("TXID:")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+
+                        Text("\(txid.prefix(20))...")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.cyan.opacity(0.6))
+                    }
+                    .padding(.top, 16)
+
+                    // Tap to dismiss
+                    Text("tap to dismiss")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.5))
+                        .padding(.top, 24)
+                }
+                .scaleEffect(showContent ? 1.0 : 0.8)
+                .opacity(showContent ? 1.0 : 0.0)
+            }
+            .onAppear {
+                selectedMessage = mempoolMessages.randomElement() ?? mempoolMessages[0]
+                withAnimation(.easeOut(duration: 0.3)) {
+                    showContent = true
+                }
+
+                // Auto-dismiss after 4 seconds
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        isShowing = false
+                    }
+                }
+            }
+            .onTapGesture {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    isShowing = false
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Mined Celebration View
 
 /// Cypherpunk celebration when transaction is mined (confirmed)
@@ -2064,55 +2325,55 @@ struct MinedCelebrationView: View {
                 Color.black.opacity(0.85)
                     .ignoresSafeArea()
 
-                VStack(spacing: 16) {
+                VStack(spacing: 20) {
                     // Mining/pickaxe icon
                     Text("⛏️")
-                        .font(.system(size: 50))
+                        .font(.system(size: 72))
                         .scaleEffect(showContent ? 1.0 : 0.5)
                         .animation(.spring(response: 0.4, dampingFraction: 0.6), value: showContent)
 
                     // MINED! title
                     Text("MINED!")
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                        .font(.system(size: 42, weight: .bold, design: .monospaced))
                         .foregroundColor(NeonColors.primary)
                         .shadow(color: NeonColors.primary.opacity(0.8), radius: 10)
 
                     // Amount
                     Text("\(isOutgoing ? "-" : "+")\(String(format: "%.8f", amount)) ZCL")
-                        .font(.system(size: 22, weight: .bold, design: .monospaced))
+                        .font(.system(size: 36, weight: .bold, design: .monospaced))
                         .foregroundColor(isOutgoing ? .orange : .green)
                         .shadow(color: isOutgoing ? .orange.opacity(0.5) : .green.opacity(0.5), radius: 5)
 
                     // Transaction type
                     Text(isOutgoing ? "SENT CONFIRMED" : "RECEIVED CONFIRMED")
-                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        .font(.system(size: 20, weight: .medium, design: .monospaced))
                         .foregroundColor(.white.opacity(0.8))
 
                     // Cypherpunk message
                     Text(selectedMessage)
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(.system(size: 16, design: .monospaced))
                         .foregroundColor(NeonColors.primary.opacity(0.7))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 30)
                         .padding(.top, 8)
 
                     // TXID
-                    VStack(spacing: 4) {
+                    VStack(spacing: 6) {
                         Text("TXID:")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
                             .foregroundColor(.gray)
 
                         Text("\(txid.prefix(20))...")
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.system(size: 14, design: .monospaced))
                             .foregroundColor(NeonColors.primary.opacity(0.6))
                     }
-                    .padding(.top, 12)
+                    .padding(.top, 16)
 
                     // Tap to dismiss
                     Text("tap to dismiss")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: 14, design: .monospaced))
                         .foregroundColor(.gray.opacity(0.5))
-                        .padding(.top, 20)
+                        .padding(.top, 24)
                 }
                 .scaleEffect(showContent ? 1.0 : 0.8)
                 .opacity(showContent ? 1.0 : 0.0)
@@ -2136,6 +2397,342 @@ struct MinedCelebrationView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Clearing Celebration View
+
+/// Celebration when transaction enters mempool (unconfirmed) - for both sender and receiver
+struct ClearingCelebrationView: View {
+    @Binding var isShowing: Bool
+    let amount: Double // Amount in ZCL
+    let txid: String
+    let clearingTime: TimeInterval? // Time from send click to mempool detection
+    let isOutgoing: Bool // true = sender, false = receiver
+
+    // Messages for sender (outgoing)
+    private let senderMessages = [
+        "Transaction broadcast to the network. Miners are racing.",
+        "Your shielded transaction is propagating. No turning back now.",
+        "ZCL dispatched. The cypherpunk dream in motion.",
+        "Peer-to-peer transmission complete. Awaiting consensus.",
+        "Transaction in flight. Privacy preserved at every hop."
+    ]
+
+    // Messages for receiver (incoming)
+    private let receiverMessages = [
+        "ZCL detected in the mempool. Miners, wake up!",
+        "Someone sent you privacy coins. Pending miner attention.",
+        "Shielded funds incoming. Let proof-of-work do its thing.",
+        "Privacy-preserving transfer in progress. Stand by.",
+        "Trustless money inbound. Awaiting block inclusion."
+    ]
+
+    @State private var selectedMessage: String = ""
+    @State private var showContent = false
+
+    private func formatTime(_ interval: TimeInterval) -> String {
+        if interval < 60 {
+            return String(format: "%.1fs", interval)
+        } else {
+            let minutes = Int(interval) / 60
+            let seconds = Int(interval) % 60
+            return "\(minutes)m \(seconds)s"
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Dark overlay with cyan/purple tint
+                Color.black.opacity(0.85)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 16) {
+                    // Hourglass icon for clearing
+                    Text("⏳")
+                        .font(.system(size: 72))
+                        .scaleEffect(showContent ? 1.0 : 0.5)
+                        .animation(.spring(response: 0.4, dampingFraction: 0.6), value: showContent)
+
+                    // CLEARING title
+                    Text("CLEARING")
+                        .font(.system(size: 42, weight: .bold, design: .monospaced))
+                        .foregroundColor(.cyan)
+                        .shadow(color: .cyan.opacity(0.8), radius: 10)
+
+                    // Amount with direction
+                    Text("\(isOutgoing ? "-" : "+")\(String(format: "%.8f", amount)) ZCL")
+                        .font(.system(size: 32, weight: .bold, design: .monospaced))
+                        .foregroundColor(isOutgoing ? .orange : .green)
+                        .shadow(color: isOutgoing ? .orange.opacity(0.5) : .green.opacity(0.5), radius: 5)
+
+                    // Success message based on direction
+                    Text(isOutgoing ? "Successfully sent in" : "Successfully received in")
+                        .font(.system(size: 18, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+
+                    // Clearing time display
+                    if let time = clearingTime {
+                        HStack(spacing: 8) {
+                            Text("Clearing:")
+                                .font(.system(size: 16, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.cyan.opacity(0.8))
+                            Text(formatTime(time))
+                                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 16)
+                        .background(Color.cyan.opacity(0.15))
+                        .cornerRadius(8)
+                    }
+
+                    // Cypherpunk message
+                    Text(selectedMessage)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.cyan.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 30)
+                        .padding(.top, 4)
+
+                    // TXID
+                    VStack(spacing: 4) {
+                        Text("TXID:")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+
+                        Text("\(txid.prefix(20))...")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(.cyan.opacity(0.6))
+                    }
+                    .padding(.top, 12)
+
+                    // Dismiss button
+                    Button(action: {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            isShowing = false
+                        }
+                    }) {
+                        Text(dismissButtonText)
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                            .background(
+                                LinearGradient(
+                                    gradient: Gradient(colors: [.cyan, .cyan.opacity(0.7)]),
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .cornerRadius(8)
+                            .shadow(color: .cyan.opacity(0.5), radius: 8)
+                    }
+                    .padding(.top, 20)
+                }
+                .scaleEffect(showContent ? 1.0 : 0.8)
+                .opacity(showContent ? 1.0 : 0.0)
+            }
+            .onAppear {
+                let messages = isOutgoing ? senderMessages : receiverMessages
+                selectedMessage = messages.randomElement() ?? messages[0]
+                withAnimation(.easeOut(duration: 0.3)) {
+                    showContent = true
+                }
+                // No auto-dismiss - user must click button
+            }
+        }
+    }
+
+    // Cypherpunk dismiss button messages
+    private let dismissButtons = [
+        "Got it, cypherpunk",
+        "Privacy acknowledged",
+        "Onwards to freedom",
+        "Trustless & verified",
+        "No middlemen needed"
+    ]
+
+    private var dismissButtonText: String {
+        dismissButtons.randomElement() ?? dismissButtons[0]
+    }
+}
+
+// MARK: - Settlement Celebration View
+
+/// Celebration when transaction is mined (confirmed) - for both sender and receiver
+struct SettlementCelebrationView: View {
+    @Binding var isShowing: Bool
+    let amount: Double // Amount in ZCL
+    let txid: String
+    let isOutgoing: Bool // true = sender, false = receiver
+    let clearingTime: TimeInterval? // Time to mempool
+    let settlementTime: TimeInterval? // Time to first confirmation
+
+    // Messages for sender (outgoing)
+    private let senderMessages = [
+        "Your transaction is now immutable. Privacy delivered.",
+        "Block sealed. The recipient's balance updated forever.",
+        "Consensus achieved. Financial freedom in action.",
+        "Proof of work complete. Your sovereignty preserved.",
+        "Hash verified. Another cypherpunk victory."
+    ]
+
+    // Messages for receiver (incoming)
+    private let receiverMessages = [
+        "Proof of work complete. Your ZCL is now immutable.",
+        "Consensus achieved. The network validates your privacy.",
+        "Block sealed. Your financial sovereignty preserved.",
+        "Hash verified. Another step toward freedom.",
+        "Miners have spoken. Your transaction lives forever."
+    ]
+
+    @State private var selectedMessage: String = ""
+    @State private var showContent = false
+
+    private func formatTime(_ interval: TimeInterval) -> String {
+        if interval < 60 {
+            return String(format: "%.1fs", interval)
+        } else if interval < 3600 {
+            let minutes = Int(interval) / 60
+            let seconds = Int(interval) % 60
+            return "\(minutes)m \(seconds)s"
+        } else {
+            let hours = Int(interval) / 3600
+            let minutes = (Int(interval) % 3600) / 60
+            return "\(hours)h \(minutes)m"
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Dark overlay with green/gold tint
+                Color.black.opacity(0.85)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 14) {
+                    // Mining pickaxe icon for settlement
+                    Text("⛏️")
+                        .font(.system(size: 72))
+                        .scaleEffect(showContent ? 1.0 : 0.5)
+                        .animation(.spring(response: 0.4, dampingFraction: 0.6), value: showContent)
+
+                    // SETTLEMENT title
+                    Text("SETTLEMENT")
+                        .font(.system(size: 40, weight: .bold, design: .monospaced))
+                        .foregroundColor(NeonColors.primary)
+                        .shadow(color: NeonColors.primary.opacity(0.8), radius: 10)
+
+                    // Amount with direction
+                    Text("\(isOutgoing ? "-" : "+")\(String(format: "%.8f", amount)) ZCL")
+                        .font(.system(size: 30, weight: .bold, design: .monospaced))
+                        .foregroundColor(isOutgoing ? .orange : .green)
+                        .shadow(color: isOutgoing ? .orange.opacity(0.5) : .green.opacity(0.5), radius: 5)
+
+                    // Success message based on direction
+                    Text(isOutgoing ? "Successfully sent in" : "Successfully received in")
+                        .font(.system(size: 18, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+
+                    // Timing display
+                    VStack(spacing: 8) {
+                        if let clearing = clearingTime {
+                            HStack(spacing: 8) {
+                                Text("Clearing:")
+                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.cyan.opacity(0.8))
+                                Text(formatTime(clearing))
+                                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.cyan)
+                            }
+                        }
+
+                        if let settlement = settlementTime {
+                            HStack(spacing: 8) {
+                                Text("Settlement:")
+                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(NeonColors.primary.opacity(0.8))
+                                Text(formatTime(settlement))
+                                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                    .foregroundColor(NeonColors.primary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 16)
+                    .background(Color.white.opacity(0.1))
+                    .cornerRadius(8)
+
+                    // Cypherpunk message
+                    Text(selectedMessage)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(NeonColors.primary.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 30)
+                        .padding(.top, 4)
+
+                    // TXID
+                    VStack(spacing: 4) {
+                        Text("TXID:")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+
+                        Text("\(txid.prefix(20))...")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(NeonColors.primary.opacity(0.6))
+                    }
+                    .padding(.top, 10)
+
+                    // Dismiss button
+                    Button(action: {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            isShowing = false
+                        }
+                    }) {
+                        Text(dismissButtonText)
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                            .background(
+                                LinearGradient(
+                                    gradient: Gradient(colors: [NeonColors.primary, NeonColors.primary.opacity(0.7)]),
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .cornerRadius(8)
+                            .shadow(color: NeonColors.primary.opacity(0.5), radius: 8)
+                    }
+                    .padding(.top, 18)
+                }
+                .scaleEffect(showContent ? 1.0 : 0.8)
+                .opacity(showContent ? 1.0 : 0.0)
+            }
+            .onAppear {
+                let messages = isOutgoing ? senderMessages : receiverMessages
+                selectedMessage = messages.randomElement() ?? messages[0]
+                withAnimation(.easeOut(duration: 0.3)) {
+                    showContent = true
+                }
+                // No auto-dismiss - user must click button
+            }
+        }
+    }
+
+    // Cypherpunk dismiss button messages
+    private let dismissButtons = [
+        "Block verified",
+        "Consensus achieved",
+        "Hash confirmed",
+        "Freedom delivered",
+        "Miners have spoken"
+    ]
+
+    private var dismissButtonText: String {
+        dismissButtons.randomElement() ?? dismissButtons[0]
     }
 }
 

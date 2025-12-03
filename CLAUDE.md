@@ -2389,6 +2389,183 @@ guard let rawTx = rawTx else {
 
 ---
 
+### 42. CRITICAL: Wrong Checkpoint Hash Causing Header Misalignment (December 3, 2025)
+
+**Problem**: Transaction history was showing dates ~2.65 days in the past (e.g., block 2931054 showing "Nov 30" instead of "Dec 3").
+
+**Root Cause Investigation**:
+1. HeaderStore timestamps were consistently ~229,000 seconds behind real blockchain timestamps
+2. Checked stored block hashes vs InsightAPI - they didn't match at all
+3. The headers stored at height N were actually for completely different blocks!
+
+**Root Cause Found**: The checkpoint hash at height 2926122 was **WRONG**:
+- **Wrong checkpoint**: `000004496018943355cdf6c313e2aac3f3356bb7f31a31d1a5b5b582dfe594ef`
+- **Correct hash**:    `0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd`
+
+**How Wrong Checkpoint Caused the Bug**:
+1. App sends `getheaders` P2P message with wrong locator hash
+2. P2P peer can't find that hash in the real blockchain
+3. Peer returns headers starting from wherever it can find a match
+4. App ASSUMES headers start at requested height (2926123)
+5. Headers are stored with **completely wrong height assignments**
+6. All timestamps, hashes, and data are for blocks at different actual heights
+
+**Fix Applied**:
+```swift
+// Checkpoints.swift - CORRECTED
+2926122: "0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd",
+```
+
+**User Action Required**:
+1. Rebuild the app with the fixed checkpoint
+2. Go to Settings → "Clear Block Headers"
+3. Headers will re-sync with correct alignment
+4. Transaction dates will now display correctly
+
+**Files Modified**:
+- `Sources/Core/Network/Checkpoints.swift` - corrected checkpoint hash at 2926122
+
+---
+
+### 43. Seed Words Not Showing After New Wallet Creation (December 3, 2025)
+
+**Problem**: When creating a new wallet, the seed phrase backup sheet was never shown. User had no opportunity to save their recovery words.
+
+**Root Cause**: Race condition between wallet state and UI sheet presentation:
+1. `WalletSetupView.createNewWallet()` calls `walletManager.createNewWallet()`
+2. `WalletManager.createNewWallet()` sets `isWalletCreated = true` via `DispatchQueue.main.async`
+3. ContentView watches `isWalletCreated` and switches from WalletSetupView to main wallet view
+4. Before `showMnemonicBackup = true` in WalletSetupView, the view has already been replaced
+5. The sheet was attached to WalletSetupView which is no longer visible
+
+**Solution**: Two-phase wallet creation with backup confirmation:
+
+1. **Don't set `isWalletCreated = true` immediately** in `createNewWallet()`:
+   ```swift
+   // WalletManager.createNewWallet()
+   DispatchQueue.main.async {
+       self.zAddress = address
+       self.isMnemonicBackupPending = true  // NEW: Flag that backup sheet should be shown
+       self.isImportedWallet = false
+       // Don't save wallet state yet - wait for backup confirmation
+   }
+   ```
+
+2. **Add `confirmMnemonicBackup()` function**:
+   ```swift
+   func confirmMnemonicBackup() {
+       DispatchQueue.main.async {
+           self.isMnemonicBackupPending = false
+           self.isWalletCreated = true
+           self.saveWalletState()
+           print("✅ Mnemonic backup confirmed, wallet creation complete")
+       }
+   }
+   ```
+
+3. **Update ContentView to check both flags**:
+   ```swift
+   // Show main wallet view ONLY if wallet is created AND backup is confirmed
+   if walletManager.isWalletCreated && !walletManager.isMnemonicBackupPending {
+       mainWalletView
+   ```
+
+4. **Call `confirmMnemonicBackup()` when user clicks "I'VE SAVED MY SEED PHRASE"**:
+   ```swift
+   Button(action: {
+       showMnemonicWords = false
+       showMnemonicBackup = false
+       walletManager.confirmMnemonicBackup()  // NEW: Complete wallet creation
+   }) {
+       Text("I'VE SAVED MY SEED PHRASE")
+   }
+   ```
+
+**Flow After Fix**:
+1. User clicks "CREATE NEW WALLET"
+2. `createNewWallet()` generates mnemonic, sets `isMnemonicBackupPending = true`
+3. WalletSetupView remains visible (ContentView checks `isMnemonicBackupPending`)
+4. `showMnemonicBackup = true` triggers the sheet
+5. User sees 24-word seed phrase
+6. User clicks "I'VE SAVED MY SEED PHRASE"
+7. `confirmMnemonicBackup()` sets `isWalletCreated = true` and clears `isMnemonicBackupPending`
+8. ContentView now switches to main wallet view
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - added `confirmMnemonicBackup()`, modified `createNewWallet()` to set `isMnemonicBackupPending` instead of `isWalletCreated`
+- `Sources/App/ContentView.swift` - check `!isMnemonicBackupPending` before showing main view
+- `Sources/App/WalletSetupView.swift` - call `confirmMnemonicBackup()` on backup confirmation
+
+---
+
+### 44. Skip Note Decryption for New Wallets (December 3, 2025)
+
+**Optimization**: New wallets can't have historical notes since the z-address was just created. Skip trial decryption during initial sync for faster startup.
+
+**Implementation**:
+- Added `isNewWalletInitialSync` flag to FilterScanner
+- Flag is set to `true` when:
+  - Bundled tree is available
+  - Wallet is NOT imported (`isImportedWallet = false`)
+  - Starting from `bundledTreeHeight + 1`
+
+**What still happens for new wallets**:
+- ✅ Commitment tree CMUs are appended (needed for future transactions)
+- ✅ Block heights are tracked
+- ✅ Tree state is saved to database
+
+**What is skipped for new wallets**:
+- ❌ `ZipherXFFI.tryDecryptNoteWithSK()` calls (no notes to find)
+- ❌ Note storage to database (no notes exist)
+- ❌ Nullifier computation (no notes to spend)
+
+**Performance Impact**:
+- Each `tryDecryptNoteWithSK` call takes ~1-2ms
+- Typical block has 0-10 shielded outputs
+- ~5000 blocks from bundledTreeHeight to chain tip = ~50,000 outputs
+- Savings: ~50-100 seconds of decryption time on initial sync
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - added `isNewWalletInitialSync` flag and early continue in `processShieldedOutputsSync()` and `processShieldedOutputsForNotesOnly()`
+
+---
+
+### 45. UI/UX Improvements (December 3, 2025)
+
+**Changes Made:**
+
+1. **Dual Progress Bars in Sync View** (`System7Components.swift`)
+   - Added "CURRENT TASK" section with larger progress bar for active task
+   - Added "OVERALL PROGRESS" section with overall sync progress bar
+   - Each task row shows individual progress with labeled sections
+   - Clear visual separation between task progress and overall progress
+
+2. **Danger Zone in Settings** (`SettingsView.swift`)
+   - Created unified "DANGER ZONE" section with red border
+   - Moved "Export Private Key" button from Receive screen to Settings
+   - Added "Seed Phrase" info box (explains seed was shown at creation, not stored)
+   - Moved "Delete Wallet" button into Danger Zone
+   - All dangerous actions now in one clearly marked section
+
+3. **Removed Export from Receive** (`ReceiveView.swift`)
+   - Removed "Export Private Key" button from Receive screen
+   - Receive screen now only shows QR code, address, and copy button
+   - Cleaner, more focused receive experience
+
+4. **Seed Phrase Display Fixed** (`WalletSetupView.swift`)
+   - Changed from 3-column to 4-column grid (24 words = 6 rows × 4 columns)
+   - Removed ScrollView - all 24 words visible at once
+   - Reduced padding and font sizes for compact display
+   - Added `minimumScaleFactor(0.8)` for word text to handle long words
+
+**Files Modified**:
+- `Sources/UI/Components/System7Components.swift` - dual progress bars
+- `Sources/Features/Settings/SettingsView.swift` - Danger Zone section
+- `Sources/Features/Receive/ReceiveView.swift` - removed export button
+- `Sources/App/WalletSetupView.swift` - fixed seed phrase display
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
