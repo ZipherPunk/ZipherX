@@ -966,6 +966,69 @@ enum ZipherXFFI {
         return (position: position, witness: Data(witnessBuffer.prefix(witnessLen)))
     }
 
+    /// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+    /// This is MUCH faster than calling treeCreateWitnessForCMU multiple times
+    /// because it only builds the tree ONCE instead of N times.
+    ///
+    /// For 9 notes with 1M CMUs: ~57 seconds total vs ~9 minutes (9 × 57s)
+    ///
+    /// - Parameters:
+    ///   - cmuData: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - targetCMUs: Array of 32-byte CMUs to create witnesses for
+    /// - Returns: Array of (position, witness) tuples, or nil for CMUs not found
+    static func treeCreateWitnessesBatch(cmuData: Data, targetCMUs: [Data]) -> [(position: UInt64, witness: Data)?] {
+        guard !targetCMUs.isEmpty else { return [] }
+
+        // Validate all CMUs are 32 bytes
+        for cmu in targetCMUs {
+            guard cmu.count == 32 else {
+                print("❌ Invalid CMU size: \(cmu.count)")
+                return targetCMUs.map { _ in nil }
+            }
+        }
+
+        let targetCount = targetCMUs.count
+
+        // Pack all target CMUs into a single contiguous buffer
+        var packedCMUs = Data(capacity: targetCount * 32)
+        for cmu in targetCMUs {
+            packedCMUs.append(cmu)
+        }
+
+        // Allocate output buffers
+        var positions = [UInt64](repeating: UInt64.max, count: targetCount)
+        var witnesses = [UInt8](repeating: 0, count: targetCount * 1028)
+
+        let successCount = cmuData.withUnsafeBytes { cmuDataPtr in
+            packedCMUs.withUnsafeBytes { targetsPtr in
+                zipherx_tree_create_witnesses_batch(
+                    cmuDataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    cmuData.count,
+                    targetsPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    targetCount,
+                    &positions,
+                    &witnesses
+                )
+            }
+        }
+
+        print("✅ Batch witness: \(successCount)/\(targetCount) witnesses created")
+
+        // Parse results
+        var results: [(position: UInt64, witness: Data)?] = []
+        for i in 0..<targetCount {
+            if positions[i] != UInt64.max {
+                let witnessStart = i * 1028
+                let witnessData = Data(witnesses[witnessStart..<(witnessStart + 1028)])
+                results.append((position: positions[i], witness: witnessData))
+            } else {
+                results.append(nil)
+            }
+        }
+
+        return results
+    }
+
     // MARK: - OVK Output Recovery (Transaction History)
 
     /// Derive outgoing viewing key from spending key

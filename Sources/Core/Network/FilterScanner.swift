@@ -644,10 +644,10 @@ final class FilterScanner {
                 print("✅ PHASE 1.6 complete: detected \(spendsDetected) spent notes")
             }
 
-            // PHASE 1.5: Pre-compute witnesses for notes discovered in bundled range
-            // This runs in background so user doesn't wait at spend time
+            // PHASE 1.5: Pre-compute witnesses using BATCH function (single tree pass)
+            // This computes all witnesses in ~57 seconds total instead of 57s × N notes
             if let bundledData = cmuDataForPositionLookup {
-                await computeWitnessesForBundledNotes(bundledData: bundledData)
+                await computeWitnessesForBundledNotesBatch(bundledData: bundledData)
             }
 
             // Move to blocks after bundled tree height for PHASE 2
@@ -2324,6 +2324,80 @@ final class FilterScanner {
 
         } catch {
             print("❌ Error pre-computing witnesses: \(error)")
+        }
+    }
+
+    /// Pre-compute witnesses using BATCH function (single tree pass)
+    /// This is MUCH faster than the sequential version - builds tree ONCE for all notes
+    private func computeWitnessesForBundledNotesBatch(bundledData: Data) async {
+        print("🔧 PHASE 1.5: Pre-computing witnesses (BATCH mode - single tree pass)...")
+
+        do {
+            // Get the account ID
+            guard let account = try database.getAccount(index: 0) else {
+                print("⚠️ No account found, skipping witness pre-computation")
+                return
+            }
+
+            // Get all notes that have empty witnesses (from bundled range scanning)
+            let notes = try database.getAllUnspentNotes(accountId: account.id)
+            let notesNeedingWitness = notes.filter { note in
+                // Check if witness is empty (all zeros) or wrong size
+                note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
+            }
+
+            if notesNeedingWitness.isEmpty {
+                print("✅ All notes already have valid witnesses")
+                return
+            }
+
+            print("📝 Found \(notesNeedingWitness.count) note(s) needing witness computation")
+
+            // Collect all CMUs that need witnesses
+            var targetCMUs: [Data] = []
+            var noteIdMap: [Int: Int64] = [:] // index -> note.id
+
+            for (index, note) in notesNeedingWitness.enumerated() {
+                guard let cmu = note.cmu, cmu.count == 32 else {
+                    print("⚠️ Note \(note.id) missing CMU, skipping")
+                    continue
+                }
+                targetCMUs.append(cmu)
+                noteIdMap[targetCMUs.count - 1] = note.id
+            }
+
+            guard !targetCMUs.isEmpty else {
+                print("⚠️ No valid CMUs found for batch witness computation")
+                return
+            }
+
+            print("🌲 Computing \(targetCMUs.count) witnesses in single tree pass...")
+            let startTime = Date()
+
+            // Call batch witness function (single tree build for ALL notes!)
+            let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: bundledData, targetCMUs: targetCMUs)
+
+            let elapsed = Date().timeIntervalSince(startTime)
+            print("⏱️ Batch witness computation took \(String(format: "%.1f", elapsed))s")
+
+            // Update database with computed witnesses
+            var successCount = 0
+            for (index, result) in results.enumerated() {
+                guard let noteId = noteIdMap[index] else { continue }
+
+                if let (position, witness) = result {
+                    try database.updateNoteWitness(noteId: noteId, witness: witness)
+                    print("✅ Note \(noteId): witness at position \(position)")
+                    successCount += 1
+                } else {
+                    print("⚠️ Note \(noteId): CMU not found in bundled data")
+                }
+            }
+
+            print("✅ PHASE 1.5 complete: \(successCount)/\(targetCMUs.count) witnesses computed in \(String(format: "%.1f", elapsed))s")
+
+        } catch {
+            print("❌ Error in batch witness computation: \(error)")
         }
     }
 }

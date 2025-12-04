@@ -2404,6 +2404,153 @@ pub unsafe extern "C" fn zipherx_find_cmu_position(
     u64::MAX
 }
 
+/// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+/// This is much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+/// because it only builds the tree ONCE instead of N times.
+///
+/// Parameters:
+/// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+/// - cmu_data_len: Length of CMU data
+/// - target_cmus: Array of 32-byte CMUs to create witnesses for
+/// - target_count: Number of target CMUs
+/// - positions_out: Output array for positions (u64 * target_count)
+/// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmus: *const u8,
+    target_count: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+) -> usize {
+    if cmu_data_len < 8 || target_count == 0 {
+        return 0;
+    }
+
+    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
+    let targets = slice::from_raw_parts(target_cmus, target_count * 32);
+
+    // Read CMU count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        return 0;
+    }
+
+    debug_log!("🔧 Batch witness: {} targets, {} total CMUs", target_count, count);
+
+    // First pass: find all target positions (fast linear scan)
+    let mut target_positions: Vec<Option<u64>> = vec![None; target_count];
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        for (t_idx, target_offset) in (0..target_count).map(|t| (t, t * 32)) {
+            if target_positions[t_idx].is_none() && &targets[target_offset..target_offset + 32] == cmu_bytes {
+                target_positions[t_idx] = Some(i);
+                debug_log!("📍 Target {} found at position {}", t_idx, i);
+            }
+        }
+        offset += 32;
+    }
+
+    // Find the maximum position we need to build to
+    let max_pos = target_positions.iter().filter_map(|p| *p).max();
+    let max_pos = match max_pos {
+        Some(p) => p,
+        None => {
+            debug_log!("❌ No target CMUs found in bundled data");
+            return 0;
+        }
+    };
+
+    debug_log!("🌲 Building tree to position {} for batch witnesses", max_pos);
+
+    // Second pass: build tree and create witnesses at target positions
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut witnesses: Vec<Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = vec![None; target_count];
+
+    offset = 8;
+    for i in 0..=max_pos {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if tree.append(node).is_err() {
+            continue;
+        }
+
+        // Check if this position matches any target
+        for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
+            if let Some(pos) = pos_opt {
+                if pos == i {
+                    // Create witness at this position
+                    witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
+                    debug_log!("✅ Created witness for target {} at position {}", t_idx, i);
+                } else if pos < i {
+                    // Update existing witness
+                    if let Some(ref mut w) = witnesses[t_idx] {
+                        w.append(node).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    // Continue updating witnesses until end of data (to get final root)
+    while offset + 32 <= cmu_data_len {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Update all witnesses
+        for witness_opt in witnesses.iter_mut() {
+            if let Some(ref mut w) = witness_opt {
+                w.append(node).ok();
+            }
+        }
+    }
+
+    // Serialize witnesses to output
+    let mut success_count = 0;
+    for (t_idx, witness_opt) in witnesses.iter().enumerate() {
+        let pos_ptr = positions_out.add(t_idx);
+        let witness_ptr = witnesses_out.add(t_idx * 1028);
+
+        if let (Some(pos), Some(witness)) = (target_positions[t_idx], witness_opt) {
+            let mut serialized = Vec::new();
+            if write_incremental_witness(witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+                *pos_ptr = pos;
+                std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                // Zero-pad
+                if serialized.len() < 1028 {
+                    std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                }
+                success_count += 1;
+                debug_log!("📝 Serialized witness {} ({} bytes)", t_idx, serialized.len());
+            } else {
+                *pos_ptr = u64::MAX;
+            }
+        } else {
+            *pos_ptr = u64::MAX;
+        }
+    }
+
+    debug_log!("✅ Batch witness complete: {}/{} successful", success_count, target_count);
+    success_count
+}
+
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)
 // =============================================================================

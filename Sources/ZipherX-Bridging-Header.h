@@ -467,6 +467,26 @@ uint64_t zipherx_find_cmu_position(
     const uint8_t *target_cmu
 );
 
+/// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+/// Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+/// because it only builds the tree ONCE instead of N times.
+///
+/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param target_cmus Array of 32-byte CMUs to create witnesses for
+/// @param target_count Number of target CMUs
+/// @param positions_out Output array for positions (u64 * target_count)
+/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
+/// @return Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_batch(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmus,
+    size_t target_count,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)
 // =============================================================================
