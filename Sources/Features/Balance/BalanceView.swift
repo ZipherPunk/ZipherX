@@ -270,10 +270,11 @@ struct BalanceView: View {
                 walletManager.clearBalanceBeforeLastSend()
             }
         }
-        .onChange(of: networkManager.justConfirmedTx?.txid) { txid in
+        .onChange(of: networkManager.settlementCelebrationTrigger) { _ in
             // Transaction was confirmed - show Settlement celebration!
-            if let txid = txid, let confirmed = networkManager.justConfirmedTx {
-                settlementTxId = txid
+            // Using trigger counter instead of optional txid for reliable SwiftUI observation
+            if let confirmed = networkManager.justConfirmedTx {
+                settlementTxId = confirmed.txid
                 settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
                 settlementIsOutgoing = confirmed.isOutgoing
                 settlementClearingTime = confirmed.clearingTime
@@ -281,7 +282,7 @@ struct BalanceView: View {
                 withAnimation {
                     showSettlementCelebration = true
                 }
-                print("⛏️ SETTLEMENT! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
+                print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
 
                 // When outgoing tx is confirmed, clear balance tracking
                 // This happens AFTER change output is detected and added to balance

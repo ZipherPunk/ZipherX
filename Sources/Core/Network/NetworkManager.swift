@@ -1036,6 +1036,9 @@ final class NetworkManager: ObservableObject {
     /// Counter to trigger onChange when mempool incoming is detected (workaround for tuple observation)
     @Published var mempoolIncomingCelebrationTrigger: Int = 0
 
+    /// Counter to trigger onChange when settlement (confirmation) is detected (workaround for tuple observation)
+    @Published var settlementCelebrationTrigger: Int = 0
+
     /// Actor-based transaction tracking (eliminates priority inversion from NSLock)
     private let txTrackingState = TransactionTrackingState()
 
@@ -1151,9 +1154,10 @@ final class NetworkManager: ObservableObject {
                 // Publish confirmation for UI celebration (Settlement!)
                 if let amount = result.amount {
                     self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true, clearingTime: clearingTime, settlementTime: settlementTime)
+                    self.settlementCelebrationTrigger += 1  // Increment to trigger onChange
                 }
 
-                print("⛏️ SETTLEMENT! Outgoing tx confirmed: \(txid.prefix(12))... after \(String(format: "%.1f", settlementTime ?? 0))s (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing))")
+                print("⛏️ SETTLEMENT! Outgoing tx confirmed: \(txid.prefix(12))... after \(String(format: "%.1f", settlementTime ?? 0))s (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing), trigger=\(self.settlementCelebrationTrigger))")
             }
         } else {
             // Even if not tracked, clear pending broadcast in case it was set
@@ -1235,7 +1239,8 @@ final class NetworkManager: ObservableObject {
             // Publish confirmation for UI celebration (Settlement for receiver!)
             // Receiver doesn't have send click time, so clearingTime/settlementTime are nil
             self.justConfirmedTx = (txid: txid, amount: finalAmount, isOutgoing: false, clearingTime: nil, settlementTime: nil)
-            print("⛏️ SETTLEMENT! Incoming tx confirmed: \(txid.prefix(12))... +\(Double(finalAmount) / 100_000_000.0) ZCL")
+            self.settlementCelebrationTrigger += 1  // Increment to trigger onChange
+            print("⛏️ SETTLEMENT! Incoming tx confirmed: \(txid.prefix(12))... +\(Double(finalAmount) / 100_000_000.0) ZCL (trigger=\(self.settlementCelebrationTrigger))")
 
             // Also send system notification
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
