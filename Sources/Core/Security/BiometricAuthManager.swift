@@ -161,20 +161,58 @@ final class BiometricAuthManager: ObservableObject {
     }
 
     /// Authenticate specifically for sending transactions
-    /// Requires Face ID if enabled in settings, otherwise skips biometric
+    /// SECURITY VUL-005 FIX: Always requires authentication - biometric OR passcode
+    /// If biometric is enabled: require Face ID/Touch ID
+    /// If biometric is disabled: still require device passcode for security
     func authenticateForSend(amount: UInt64, completion: @escaping (Bool, Error?) -> Void) {
+        let zcl = Double(amount) / 100_000_000.0
+        let reason = String(format: "Authenticate to send %.8f ZCL", zcl)
+
         // Check if biometric auth is enabled in settings
         let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
 
-        guard biometricEnabled else {
-            // Biometric disabled in settings - skip authentication
-            completion(true, nil)
-            return
+        if biometricEnabled {
+            // Biometric enabled - require Face ID/Touch ID (fresh, no cache)
+            authenticateFresh(reason: reason, completion: completion)
+        } else {
+            // VUL-005 FIX: Even with biometric disabled, require device passcode
+            // This ensures every transaction requires authentication
+            authenticateWithPasscode(reason: reason, completion: completion)
         }
+    }
 
-        let zcl = Double(amount) / 100_000_000.0
-        let reason = String(format: "Authenticate to send %.8f ZCL", zcl)
-        authenticateFresh(reason: reason, completion: completion)
+    /// Authenticate using device passcode only (no biometrics)
+    /// SECURITY: Required when biometric auth is disabled to ensure transactions are authorized
+    private func authenticateWithPasscode(reason: String, completion: @escaping (Bool, Error?) -> Void) {
+        let context = LAContext()
+        context.localizedFallbackTitle = "" // Hide biometric fallback option
+        context.localizedCancelTitle = "Cancel"
+
+        var error: NSError?
+
+        // Use deviceOwnerAuthentication which allows passcode
+        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, authError in
+                DispatchQueue.main.async {
+                    if success {
+                        self?.lastAuthTime = Date()
+                        self?.lastActivityTime = Date()
+                        self?.isLocked = false
+                    }
+                    completion(success, authError)
+                }
+            }
+        } else {
+            // No passcode set on device - this is a security risk
+            // Block the operation with clear error
+            print("🔐 VUL-005: No device passcode configured - blocking transaction")
+            let securityError = NSError(
+                domain: "BiometricAuthManager",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Device passcode required. Please set a passcode in iOS Settings."]
+            )
+            completion(false, securityError)
+        }
     }
 
     /// Authenticate with FRESH biometrics - ALWAYS prompts, no cache

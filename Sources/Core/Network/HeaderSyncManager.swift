@@ -124,76 +124,87 @@ final class HeaderSyncManager {
         print("🎉 Header sync complete! Synced to height \(chainTip)")
     }
 
-    /// Get the current chain tip height with InsightAPI as authoritative source
-    /// InsightAPI provides the trusted chain height; P2P heights are validated against it
+    /// Get the current chain tip height using P2P consensus
+    /// SECURITY VUL-006 FIX: Uses locally verified headers as primary source, P2P consensus as secondary
+    /// InsightAPI is only used as a last-resort fallback when P2P is unavailable
     func getChainTip() async throws -> UInt64 {
-        // SECURITY FIX: Use InsightAPI as authoritative chain height source
-        // Malicious P2P peers can report fake heights (e.g., 110+ blocks in future)
-        // InsightAPI connects to real blockchain and provides correct height
+        // VUL-006: P2P-first chain height determination
+        // 1. PRIMARY: Locally verified headers (cryptographically validated with Equihash)
+        // 2. SECONDARY: P2P peer consensus (median height from multiple peers)
+        // 3. FALLBACK: InsightAPI (only if P2P unavailable)
 
-        // Maximum blocks a P2P peer can be ahead of InsightAPI (network propagation tolerance)
-        let maxP2PAheadTolerance: UInt64 = 5
+        // Maximum acceptable height difference between header store and P2P
+        let maxHeightDrift: UInt64 = 20
 
-        // 1. Get authoritative chain height from InsightAPI FIRST
-        var trustedHeight: UInt64 = 0
-        do {
-            let status = try await InsightAPI.shared.getStatus()
-            trustedHeight = status.height
-            print("📡 [TRUSTED] InsightAPI chain tip: \(trustedHeight)")
-        } catch {
-            print("⚠️ InsightAPI unavailable: \(error)")
-        }
-
-        // 2. Check header store (locally verified headers)
+        // 1. PRIMARY: Check locally verified header store (Equihash-validated)
         var headerStoreHeight: UInt64 = 0
         if let headerHeight = try? headerStore.getLatestHeight() {
-            print("📡 [LOCAL] HeaderStore height: \(headerHeight)")
             headerStoreHeight = headerHeight
+            print("📡 [LOCAL] HeaderStore height: \(headerStoreHeight) (Equihash verified)")
         }
 
-        // 3. Get peer heights from version handshake
-        var p2pMaxHeight: UInt64 = 0
-        let peers = try await networkManager.getConnectedPeers(min: minPeers)
-        for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
-            if h > p2pMaxHeight && h > 0 {
-                p2pMaxHeight = h
+        // 2. SECONDARY: Get P2P peer heights and compute consensus (median)
+        var peerHeights: [UInt64] = []
+        do {
+            let peers = try await networkManager.getConnectedPeers(min: minPeers)
+            for peer in peers {
+                let h = UInt64(peer.peerStartHeight)
+                if h > 0 {
+                    peerHeights.append(h)
+                }
             }
+        } catch {
+            print("⚠️ Could not get peer list: \(error)")
         }
 
-        if p2pMaxHeight > 0 {
-            print("📡 [P2P] Max peer height: \(p2pMaxHeight)")
+        var p2pConsensusHeight: UInt64 = 0
+        if peerHeights.count >= 3 {
+            // Use median for Byzantine fault tolerance
+            let sorted = peerHeights.sorted()
+            p2pConsensusHeight = sorted[sorted.count / 2]
+            print("📡 [P2P] Consensus height (median of \(peerHeights.count) peers): \(p2pConsensusHeight)")
+        } else if !peerHeights.isEmpty {
+            // Not enough peers for median, use max with caution
+            p2pConsensusHeight = peerHeights.max() ?? 0
+            print("📡 [P2P] Height from \(peerHeights.count) peer(s): \(p2pConsensusHeight) (insufficient for median)")
         }
 
-        // 4. SECURITY CHECK: Validate P2P height against trusted source
+        // 3. Determine chain tip using P2P-first logic
         var maxHeight: UInt64 = 0
 
-        if trustedHeight > 0 {
-            // We have trusted height - use it as baseline
-            maxHeight = trustedHeight
+        if headerStoreHeight > 0 {
+            // We have locally verified headers - use as baseline
+            maxHeight = headerStoreHeight
 
-            // Check if P2P peers are reporting suspiciously high heights
-            if p2pMaxHeight > trustedHeight + maxP2PAheadTolerance {
-                print("🚨 [SECURITY] P2P peer reporting FAKE height \(p2pMaxHeight) (trusted: \(trustedHeight))")
-                print("🚨 [SECURITY] Rejecting P2P height - \(p2pMaxHeight - trustedHeight) blocks in future!")
-                // Don't use fake P2P height - stick with trusted
-            } else if p2pMaxHeight > trustedHeight {
-                // P2P is slightly ahead (within tolerance) - might have newer block
-                print("ℹ️ P2P slightly ahead (\(p2pMaxHeight - trustedHeight) blocks) - acceptable")
-                maxHeight = p2pMaxHeight
+            // Validate P2P heights against locally verified data
+            if p2pConsensusHeight > 0 {
+                if p2pConsensusHeight > headerStoreHeight + maxHeightDrift {
+                    // P2P is way ahead - could be legitimate new blocks OR fake heights
+                    // Trust it cautiously but cap at reasonable drift from verified headers
+                    print("⚠️ P2P \(p2pConsensusHeight - headerStoreHeight) blocks ahead of local store")
+                    maxHeight = headerStoreHeight + maxHeightDrift
+                    print("📡 Capping at \(maxHeight) until headers are synced")
+                } else if p2pConsensusHeight > headerStoreHeight {
+                    // P2P slightly ahead - accept (new blocks since last sync)
+                    maxHeight = p2pConsensusHeight
+                }
             }
+        } else if p2pConsensusHeight > 0 {
+            // No local headers, use P2P consensus
+            maxHeight = p2pConsensusHeight
+            print("📡 Using P2P consensus (no local headers)")
+        }
 
-            // Check header store too - auto-clear fake headers
-            if headerStoreHeight > trustedHeight + maxP2PAheadTolerance {
-                print("🚨 [SECURITY] HeaderStore has FAKE headers up to \(headerStoreHeight)")
-                print("🧹 [SECURITY] Auto-clearing all headers to remove fake data...")
-                try? headerStore.clearAllHeaders()
-                print("✅ Fake headers cleared - will re-sync from trusted height")
+        // 4. FALLBACK: If P2P consensus unavailable, try InsightAPI as last resort
+        if maxHeight == 0 {
+            print("⚠️ VUL-006: No P2P consensus available, falling back to InsightAPI")
+            do {
+                let status = try await InsightAPI.shared.getStatus()
+                maxHeight = status.height
+                print("📡 [FALLBACK] InsightAPI chain tip: \(maxHeight)")
+            } catch {
+                print("❌ InsightAPI also unavailable: \(error)")
             }
-        } else {
-            // InsightAPI unavailable - use P2P with caution
-            print("⚠️ InsightAPI unavailable, using P2P height with caution")
-            maxHeight = max(headerStoreHeight, p2pMaxHeight)
         }
 
         if maxHeight > 0 {
@@ -413,7 +424,8 @@ final class HeaderSyncManager {
         return payload
     }
 
-    /// Parse headers from P2P message with Equihash verification
+    /// Parse headers from P2P message with Equihash(200,9) PoW verification
+    /// SECURITY VUL-003: Equihash verification is ENABLED to ensure trustless header validation
     /// Format: count (varint) + headers (140 bytes + varint solution_len + solution each) + tx_count (varint, always 0)
     private func parseHeadersPayload(_ data: Data, startingAt startHeight: UInt64) throws -> [ZclassicBlockHeader] {
         var offset = 0
@@ -492,13 +504,14 @@ final class HeaderSyncManager {
             // Extract full header with solution (exclude tx_count)
             let fullHeaderData = data.subdata(in: offset..<(offset + 140 + varintLen + solutionLen))
 
-            // Parse WITHOUT Equihash verification (disabled due to InvalidParams errors)
-            // TODO: Fix Equihash verification - currently failing with Error(InvalidParams)
+            // SECURITY VUL-003: Enable Equihash PoW verification for trustless header validation
+            // This prevents accepting fake headers from malicious peers
             let height = startHeight + UInt64(i)
             do {
-                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: false)
+                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: true)
                 headers.append(header)
             } catch ParseError.equihashVerificationFailed(let failHeight) {
+                print("🚨 [SECURITY] Equihash verification FAILED at height \(failHeight) - rejecting header")
                 throw SyncError.invalidHeadersPayload(reason: "Equihash verification failed for header at height \(failHeight)")
             }
 
@@ -506,7 +519,7 @@ final class HeaderSyncManager {
             offset += entrySize
         }
 
-        print("✅ Parsed \(count) headers (Equihash verification disabled)")
+        print("✅ Parsed \(count) headers with Equihash verification")
 
         return headers
     }

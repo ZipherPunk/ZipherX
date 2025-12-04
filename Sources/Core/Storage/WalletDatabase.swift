@@ -9,33 +9,51 @@ final class WalletDatabase {
 
     // MARK: - Encryption Helpers
 
+    /// Encryption error types - VUL-002 fix
+    enum EncryptionError: Error, LocalizedError {
+        case encryptionFailed(String)
+        case decryptionFailed(String)
+        case dataCorrupted
+
+        var errorDescription: String? {
+            switch self {
+            case .encryptionFailed(let msg): return "Encryption failed: \(msg)"
+            case .decryptionFailed(let msg): return "Decryption failed: \(msg)"
+            case .dataCorrupted: return "Data is corrupted or in unexpected format"
+            }
+        }
+    }
+
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
-    private func encryptBlob(_ data: Data) -> Data {
+    /// SECURITY VUL-002: NEVER returns plaintext - throws on failure
+    private func encryptBlob(_ data: Data) throws -> Data {
         do {
             return try DatabaseEncryption.shared.encrypt(data)
         } catch {
-            // Fall back to unencrypted if encryption fails
-            // This should not happen in production
-            print("⚠️ DB encryption failed: \(error)")
-            return data
+            // SECURITY: Never store unencrypted data - throw error
+            print("🔐 SECURITY ERROR: Encryption failed - refusing to store plaintext")
+            throw EncryptionError.encryptionFailed(error.localizedDescription)
         }
     }
 
     /// Decrypt sensitive data retrieved from database
-    private func decryptBlob(_ encryptedData: Data) -> Data {
-        // Handle both encrypted and unencrypted data (for migration)
+    /// SECURITY VUL-002: Throws on failure instead of returning corrupted data
+    private func decryptBlob(_ encryptedData: Data) throws -> Data {
         // AES-GCM combined format: 12 (nonce) + ciphertext + 16 (tag) = 29+ bytes
-        if encryptedData.count >= 29 {
-            do {
-                return try DatabaseEncryption.shared.decrypt(encryptedData)
-            } catch {
-                // If decryption fails, data might be unencrypted (pre-encryption era)
-                return encryptedData
-            }
+        guard encryptedData.count >= 29 else {
+            // Data too short to be encrypted - this is a security issue
+            print("🔐 SECURITY WARNING: Data too short to be encrypted (\(encryptedData.count) bytes)")
+            throw EncryptionError.dataCorrupted
         }
-        // Data too short to be encrypted, return as-is
-        return encryptedData
+
+        do {
+            return try DatabaseEncryption.shared.decrypt(encryptedData)
+        } catch {
+            // SECURITY: Don't return potentially corrupted/wrong data
+            print("🔐 SECURITY ERROR: Decryption failed - data may be corrupted")
+            throw EncryptionError.decryptionFailed(error.localizedDescription)
+        }
     }
 
     /// Check if encryption is enabled (always true after this update)
@@ -141,8 +159,13 @@ final class WalletDatabase {
                 }
             }
         } else {
-            // Fallback: iOS Data Protection + field-level encryption
-            print("📂 Using iOS Data Protection + field-level encryption")
+            // VUL-007 SECURITY FIX: SQLCipher is REQUIRED for wallet creation
+            // iOS Data Protection alone is insufficient - database is readable after first unlock
+            // Field-level encryption is a mitigation but doesn't protect metadata
+            sqlite3_close(db)
+            db = nil
+            print("🔐 VUL-007: SQLCipher required but not available - refusing to create wallet")
+            throw DatabaseError.encryptionRequired
         }
 
         // Create tables
@@ -710,14 +733,14 @@ final class WalletDatabase {
         // SQLITE_TRANSIENT tells SQLite to copy the data immediately
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-        // SECURITY: Encrypt sensitive fields before storage
+        // SECURITY: Encrypt sensitive fields before storage (VUL-002: throws on failure)
         // - diversifier: address component (encrypted)
         // - rcm: randomness commitment used in spending (encrypted)
         // - memo: potentially sensitive message (encrypted)
         // - witness: Merkle path for spending (encrypted)
-        let encryptedDiversifier = encryptBlob(diversifier)
-        let encryptedRcm = encryptBlob(rcm)
-        let encryptedMemo = memo != nil ? encryptBlob(memo!) : nil
+        let encryptedDiversifier = try encryptBlob(diversifier)
+        let encryptedRcm = try encryptBlob(rcm)
+        let encryptedMemo = memo != nil ? try encryptBlob(memo!) : nil
 
         sqlite3_bind_int64(stmt, 1, accountId)
         encryptedDiversifier.withUnsafeBytes { ptr in
@@ -742,8 +765,8 @@ final class WalletDatabase {
         }
         sqlite3_bind_int64(stmt, 8, Int64(height))
         if let witness = witness {
-            // SECURITY: Encrypt witness (Merkle path)
-            let encryptedWitness = encryptBlob(witness)
+            // SECURITY: Encrypt witness (Merkle path) - VUL-002: throws on failure
+            let encryptedWitness = try encryptBlob(witness)
             encryptedWitness.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(encryptedWitness.count), SQLITE_TRANSIENT)
             }
@@ -880,11 +903,11 @@ final class WalletDatabase {
             let nfLen = sqlite3_column_bytes(stmt, 5)
             let height = UInt64(sqlite3_column_int64(stmt, 7))
 
-            // SECURITY: Decrypt sensitive fields
+            // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
             let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
             let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
-            let diversifier = decryptBlob(encryptedDiv)
-            let rcm = decryptBlob(encryptedRcm)
+            let diversifier = try decryptBlob(encryptedDiv)
+            let rcm = try decryptBlob(encryptedRcm)
 
             // Witness might be NULL
             var witnessData = Data()
@@ -892,7 +915,7 @@ final class WalletDatabase {
                 let witnessPtr = sqlite3_column_blob(stmt, 8)
                 let witnessLen = sqlite3_column_bytes(stmt, 8)
                 let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
-                witnessData = decryptBlob(encryptedWitness)
+                witnessData = try decryptBlob(encryptedWitness)
             }
 
             // CMU might be NULL (not encrypted - public on chain)
@@ -961,14 +984,14 @@ final class WalletDatabase {
             let witnessPtr = sqlite3_column_blob(stmt, 8)
             let witnessLen = sqlite3_column_bytes(stmt, 8)
 
-            // SECURITY: Decrypt sensitive fields
+            // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
             let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
             let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
             let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
 
-            let diversifier = decryptBlob(encryptedDiv)
-            let rcm = decryptBlob(encryptedRcm)
-            let witness = decryptBlob(encryptedWitness)
+            let diversifier = try decryptBlob(encryptedDiv)
+            let rcm = try decryptBlob(encryptedRcm)
+            let witness = try decryptBlob(encryptedWitness)
 
             // CMU might be NULL (not encrypted - public on chain)
             var cmuData: Data? = nil
@@ -1431,8 +1454,8 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        // SECURITY: Encrypt witness before storage
-        let encryptedWitness = encryptBlob(witness)
+        // SECURITY: Encrypt witness before storage - VUL-002: throws on failure
+        let encryptedWitness = try encryptBlob(witness)
         encryptedWitness.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(encryptedWitness.count), nil)
         }
@@ -2486,6 +2509,7 @@ struct TransactionHistoryItem {
 enum DatabaseError: LocalizedError {
     case openFailed(String)
     case encryptionFailed
+    case encryptionRequired  // VUL-007: SQLCipher required but not available
     case schemaCreationFailed(String)
     case prepareFailed(String)
     case insertFailed(String)
@@ -2500,6 +2524,8 @@ enum DatabaseError: LocalizedError {
             return "Failed to open database: \(msg)"
         case .encryptionFailed:
             return "Database encryption failed"
+        case .encryptionRequired:
+            return "SQLCipher encryption required but not available. Wallet cannot be created without full database encryption."
         case .schemaCreationFailed(let msg):
             return "Schema creation failed: \(msg)"
         case .prepareFailed(let msg):

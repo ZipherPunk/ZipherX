@@ -908,22 +908,30 @@ final class SecureData {
     }
 
     /// Manually zero the memory (call this when done with the key)
-    /// Uses volatile-like pattern to prevent compiler optimization
+    /// SECURITY VUL-008 FIX: Uses memset_s for secure zeroing that cannot be optimized away
     func zero() {
-        // Use withUnsafeMutableBytes to ensure the zeroing isn't optimized away
         bytes.withUnsafeMutableBytes { ptr in
             guard let baseAddress = ptr.baseAddress else { return }
-            // Zero byte by byte to prevent optimization
+
+            #if os(iOS) || os(macOS)
+            // Use memset_s which is guaranteed not to be optimized away (C11 Annex K)
+            // Even if compiler thinks bytes are not used, memset_s must execute
+            _ = Darwin.memset_s(baseAddress, ptr.count, 0, ptr.count)
+            #else
+            // Fallback: volatile-like pattern for other platforms
             for i in 0..<ptr.count {
                 baseAddress.storeBytes(of: 0 as UInt8, toByteOffset: i, as: UInt8.self)
             }
+            #endif
         }
     }
 
     /// Automatically zero memory when deallocated
     deinit {
         zero()
+        #if DEBUG
         print("🔐 SecureData: Memory zeroed (\(bytes.count) bytes)")
+        #endif
     }
 }
 
@@ -938,19 +946,31 @@ extension SecureKeyStorage {
     }
 
     /// Execute a closure with the spending key, then automatically zero the key memory
-    /// This is the RECOMMENDED way to use the spending key for signing operations
+    /// SECURITY VUL-008 FIX: This is the REQUIRED way to use the spending key
+    /// The key is passed as UnsafeRawBufferPointer to avoid creating copies in Swift memory
     ///
     /// Example:
     /// ```swift
-    /// let signature = try SecureKeyStorage.shared.withSpendingKey { keyData in
-    ///     return try signTransaction(with: keyData)
+    /// let result = try SecureKeyStorage.shared.withSpendingKey { keyPtr in
+    ///     // Pass keyPtr to FFI functions
+    ///     return someFFIFunction(keyPtr.baseAddress, keyPtr.count)
     /// }
     /// // Key memory is now zeroed
     /// ```
-    func withSpendingKey<T>(_ operation: (Data) throws -> T) throws -> T {
+    func withSpendingKey<T>(_ operation: (UnsafeRawBufferPointer) throws -> T) throws -> T {
         let secureKey = try retrieveSpendingKeySecure()
         defer { secureKey.zero() }  // Ensure zeroing even on throw
-        return try operation(secureKey.data)
+        return try secureKey.withUnsafeBytes(operation)
+    }
+
+    /// Execute a closure with the spending key as Data
+    /// WARNING: This creates a copy in Swift managed memory that may not be zeroed!
+    /// Use withSpendingKey(UnsafeRawBufferPointer) for FFI calls when possible.
+    /// Only use this when the API requires Data and zeroing is handled in Rust.
+    func withSpendingKeyData<T>(_ operation: (Data) throws -> T) throws -> T {
+        let secureKey = try retrieveSpendingKeySecure()
+        defer { secureKey.zero() }  // Zeros our local copy
+        return try operation(secureKey.data)  // WARNING: Data copy may linger
     }
 
     // MARK: - VUL-002 FIX: Encrypted Key Access for FFI

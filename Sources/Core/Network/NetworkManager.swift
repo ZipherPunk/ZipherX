@@ -118,7 +118,7 @@ final class NetworkManager: ObservableObject {
     private let MIN_PEERS = 8  // Increased from 3 for better reliability
     private let MAX_PEERS = 30  // Increased from 20
     private let TARGET_PEER_PERCENT = 0.15 // Connect to 15% of known addresses
-    private let CONSENSUS_THRESHOLD = 2 // SECURITY: Require at least 2 peers to agree
+    private let CONSENSUS_THRESHOLD = 5 // SECURITY: Byzantine fault tolerance (n=8, f=2) - VUL-001 fix
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 3600 // 1 hour (was 24 hours - too aggressive)
