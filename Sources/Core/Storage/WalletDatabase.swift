@@ -1632,6 +1632,28 @@ final class WalletDatabase {
         }
     }
 
+    /// Update nullifier for a note (used when recomputing nullifiers with correct positions)
+    func updateNoteNullifier(noteId: Int64, nullifier: Data) throws {
+        // Hash the nullifier before storage for privacy
+        let hashedNullifier = hashNullifier(nullifier)
+        let sql = "UPDATE notes SET nullifier = ? WHERE id = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+        sqlite3_bind_int64(stmt, 2, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// Reset sync state for full rescan
     /// Deletes notes, nullifiers, tree state, and resets scan height
     func resetSyncState() throws {
@@ -2690,10 +2712,10 @@ struct TransactionHistoryItem {
 
         // Final fallback: estimate based on block height
         // Zclassic has 2.5 minute block time (150 seconds)
-        // Reference: block 2931180 was mined around Dec 3, 2025 18:09 UTC
+        // Reference: block 2932265 was mined around Dec 4, 2025 17:00 UTC
         if height > 0 {
-            let referenceHeight: UInt64 = 2931180
-            let referenceTimestamp: TimeInterval = 1733249340 // Dec 3, 2025 18:09 UTC
+            let referenceHeight: UInt64 = 2932265
+            let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (CORRECT 2025 timestamp)
             let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
 
             let heightDiff = Int64(height) - Int64(referenceHeight)

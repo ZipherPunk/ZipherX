@@ -127,6 +127,43 @@ bool zipherx_compute_nullifier(
 );
 
 // =============================================================================
+// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
+// =============================================================================
+
+// Batch decrypt multiple shielded outputs in parallel using Rayon
+//
+// Input format (per output, 644 bytes total):
+// - epk: 32 bytes (ephemeral public key)
+// - cmu: 32 bytes (note commitment)
+// - ciphertext: 580 bytes (encrypted note)
+//
+// Output format (per output, 564 bytes total):
+// - found: 1 byte (0 = not ours, 1 = decrypted successfully)
+// - diversifier: 11 bytes (only valid if found == 1)
+// - value: 8 bytes little-endian u64 (only valid if found == 1)
+// - rcm: 32 bytes (only valid if found == 1)
+// - memo: 512 bytes (only valid if found == 1)
+//
+// Parameters:
+// - sk: spending key (169 bytes)
+// - outputs_data: packed array of outputs (644 bytes each)
+// - output_count: number of outputs to process
+// - height: block height (for version byte validation)
+// - results: output buffer (564 bytes per output)
+//
+// Returns: number of successfully decrypted notes
+size_t zipherx_try_decrypt_notes_parallel(
+    const uint8_t *sk,
+    const uint8_t *outputs_data,
+    size_t output_count,
+    uint64_t height,
+    uint8_t *results
+);
+
+// Get the number of CPU threads Rayon will use for parallel decryption
+size_t zipherx_get_rayon_threads(void);
+
+// =============================================================================
 // Equihash Proof-of-Work Verification (for trustless header validation)
 // =============================================================================
 

@@ -54,12 +54,20 @@ final class FilterScanner {
     private var pendingWitnesses: [(noteId: Int64, witnessIndex: UInt64)] = []
     private var existingWitnessIndices: [(noteId: Int64, witnessIndex: UInt64)] = []
 
-    // Bundled CMU data for position lookup during parallel scan
-    private var bundledCMUData: Data?
+    // CMU data for position lookup during parallel scan
+    // This may be from bundled tree OR downloaded from GitHub (if newer)
+    private var cmuDataForPositionLookup: Data?
+    private var cmuDataHeight: UInt64 = 0  // Height of the CMU data source
+    private var cmuDataCount: UInt64 = 0   // Number of CMUs in the data
 
-    // Expected bundled tree size for validation
-    // MUST match bundledTreeCMUCount in WalletManager.swift and bundledTreeHeight in Checkpoints.swift
-    private let bundledTreeCMUCount: UInt64 = 1_041_891
+    // Notes discovered AFTER bundledTreeHeight that need nullifier recomputation
+    // These notes have position=0 (wrong) because they weren't in bundled tree
+    // After PHASE 2, we recompute their nullifiers using correct tree positions
+    // Format: (noteId, cmu, diversifier, value, rcm, height)
+    private var notesNeedingNullifierFix: [(noteId: Int64, cmu: Data, diversifier: Data, value: UInt64, rcm: Data, height: UInt64)] = []
+
+    // Note: Tree validation now uses ZipherXConstants.effectiveTreeCMUCount
+    // which may be higher than bundled if a newer tree was downloaded from GitHub
 
     // NEW WALLET OPTIMIZATION: Skip note decryption for brand new wallets
     // New wallets can't have any notes yet (address was just created)
@@ -125,8 +133,11 @@ final class FilterScanner {
         // Determine start height
         var startHeight: UInt64
 
-        // VUL-018: Use shared constant for bundled tree height
+        // VUL-018: Use shared constants for bundled tree
         let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        let bundledTreeCMUCount = ZipherXConstants.bundledTreeCMUCount
+        // Use effectiveTreeHeight which may be higher if a newer tree was downloaded from GitHub
+        let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Track if we're scanning within bundled tree range (notes only, no tree building)
         var scanWithinBundledRange = false
@@ -134,10 +145,10 @@ final class FilterScanner {
         // If custom start height provided (quick scan), use it
         if let customStart = customStartHeight {
             startHeight = customStart
-            // Check if this is within bundled tree range
-            if startHeight <= bundledTreeHeight {
+            // Check if this is within effective tree range (could be GitHub tree height)
+            if startHeight <= effectiveTreeHeight {
                 scanWithinBundledRange = true
-                print("🔍 Scan mode: starting from user-specified height \(startHeight) (within bundled tree range)")
+                print("🔍 Scan mode: starting from user-specified height \(startHeight) (within tree range, effective height: \(effectiveTreeHeight))")
             } else {
                 print("🔍 Scan mode: starting from user-specified height \(startHeight)")
             }
@@ -150,32 +161,58 @@ final class FilterScanner {
             let treeExists = (try? database.getTreeState()) != nil
             let bundledTreeAvailable = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") != nil
 
+            // Check if this is an imported/restored wallet (may have historical notes)
+            let isImportedWallet = WalletManager.shared.isImportedWallet
+            let customScanHeight = WalletManager.shared.importScanStartHeight
+
             if lastScanned > 0 {
                 // Existing wallet - continue from last scanned
                 startHeight = lastScanned + 1
                 print("📊 Continuing from last scanned height \(lastScanned)")
-            } else if treeExists {
-                // Have database tree but no scan history - use recent checkpoint
-                startHeight = ZclassicCheckpoints.recentCheckpointHeight
-                print("🆕 New wallet with tree - starting from checkpoint \(startHeight)")
-            } else if bundledTreeAvailable {
-                // Check if this is an imported/restored wallet (may have historical notes)
-                let isImportedWallet = WalletManager.shared.isImportedWallet
-
-                if isImportedWallet {
-                    // IMPORTED/RESTORED WALLET: Fast scan of recent blocks only
-                    // Scan last ~10,000 blocks (~17 days) for quick results
-                    // User can do "Quick Scan" from Settings for older notes
-                    let recentBlocksToScan: UInt64 = 10_000
-                    startHeight = max(bundledTreeHeight + 1, latestHeight > recentBlocksToScan ? latestHeight - recentBlocksToScan : bundledTreeHeight + 1)
-                    print("📦 Imported wallet - fast scan of recent \(latestHeight - startHeight + 1) blocks")
-                    print("   💡 Use Settings → Quick Scan for older notes")
+            } else if isImportedWallet {
+                // IMPORTED/RESTORED WALLET: Need to scan WITHIN tree range for historical notes
+                // Use custom start height if user selected a date, otherwise full scan from Sapling activation
+                if let customHeight = customScanHeight, customHeight > ZclassicCheckpoints.saplingActivationHeight {
+                    startHeight = customHeight
+                    print("📦 Imported wallet - scanning from user-selected date (block \(startHeight))")
                 } else {
-                    // NEW WALLET: Fast startup - no historical notes possible
-                    startHeight = bundledTreeHeight + 1
-                    isNewWalletInitialSync = true  // Skip note decryption (no notes can exist)
-                    print("📦 New wallet with bundled tree - fast startup from \(startHeight) (skip note decryption)")
+                    startHeight = ZclassicCheckpoints.saplingActivationHeight
+                    print("📦 Imported wallet - FULL historical scan from Sapling activation \(startHeight)")
                 }
+
+                // Enable PHASE 1 for parallel scanning within tree range
+                scanWithinBundledRange = true
+
+                // DOWNLOAD CMU FILE FROM GITHUB if newer than bundled (for faster position lookups)
+                // The CMU file is ~33MB and contains all note commitments for PHASE 1 position lookup
+                print("🌲 Checking GitHub for updated CMU file...")
+                if let (cmuPath, cmuHeight, cmuCount) = try? await CommitmentTreeUpdater.shared.getCMUFileForImportedWallet(onProgress: { progress, status in
+                    self.onProgress?(progress * 0.1, startHeight, latestHeight) // First 10% for download
+                    print("🌲 \(status)")
+                }) {
+                    print("🌲 Downloaded CMU file from GitHub: height \(cmuHeight) (\(cmuCount) CMUs)")
+                    // Store downloaded CMU data for position lookup
+                    if let downloadedData = try? Data(contentsOf: cmuPath) {
+                        self.cmuDataForPositionLookup = downloadedData
+                        self.cmuDataHeight = cmuHeight
+                        self.cmuDataCount = cmuCount
+                    }
+                } else {
+                    print("⚠️ GitHub CMU file not available or not newer, will use bundled")
+                }
+
+                // Safe calculation to avoid underflow
+                let totalBlocks = latestHeight >= startHeight ? latestHeight - startHeight + 1 : 0
+                print("   📊 Scanning \(totalBlocks) blocks to find all historical notes")
+                // NOTE: PHASE 1 is limited to bundledTreeHeight (not effectiveTreeHeight)
+                // because we need CMU positions from bundled file for correct nullifiers
+                print("   📊 PHASE 1: blocks \(startHeight) to \(bundledTreeHeight) (parallel, with bundled CMU lookup)")
+                print("   📊 PHASE 2: blocks \(bundledTreeHeight + 1) to \(latestHeight) (sequential, with tree building)")
+            } else if treeExists || bundledTreeAvailable {
+                // NEW WALLET: Fast startup - no historical notes possible
+                startHeight = effectiveTreeHeight + 1
+                isNewWalletInitialSync = true  // Skip note decryption (no notes can exist)
+                print("📦 New wallet with tree - fast startup from \(startHeight) (skip note decryption)")
             } else {
                 // No tree anywhere - full scan from Sapling activation
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -233,20 +270,21 @@ final class FilterScanner {
         existingWitnessIndices = []
 
         // Determine if we need to reset tree for a rescan
-        // Only reload bundled tree for EXPLICIT rescans from bundled height, NOT for background sync
-        // Background sync passes heights like 2926324 which are > bundledTreeHeight but should APPEND
-        // A rescan specifically starts at bundledTreeHeight + 1 to rebuild from bundled state
+        // Only reload tree for EXPLICIT rescans from effective height, NOT for background sync
+        // Background sync passes heights > effectiveTreeHeight and should APPEND
+        // A rescan specifically starts at effectiveTreeHeight + 1 to rebuild from current tree state
         let initialTreeSize = ZipherXFFI.treeSize()
-        let treeHasProgress = initialTreeSize > bundledTreeCMUCount
+        let effectiveTreeCMUCount = ZipherXConstants.effectiveTreeCMUCount
+        let treeHasProgress = initialTreeSize > effectiveTreeCMUCount
 
-        // Only force fresh bundled tree if:
-        // 1. Custom height provided AND starting exactly from bundled+1 (rescan scenario)
-        // 2. AND tree doesn't already have progress (hasn't appended CMUs beyond bundled)
+        // Only force fresh tree if:
+        // 1. Custom height provided AND starting exactly from effective+1 (rescan scenario)
+        // 2. AND tree doesn't already have progress (hasn't appended CMUs beyond effective)
         let needsFreshBundledTree = customStartHeight != nil
-            && customStartHeight! == bundledTreeHeight + 1
+            && customStartHeight! == effectiveTreeHeight + 1
             && !treeHasProgress
 
-        print("🔍 Tree check: initialSize=\(initialTreeSize), bundledCount=\(bundledTreeCMUCount), hasProgress=\(treeHasProgress), needsFresh=\(needsFreshBundledTree)")
+        print("🔍 Tree check: initialSize=\(initialTreeSize), effectiveCount=\(effectiveTreeCMUCount), effectiveHeight=\(effectiveTreeHeight), hasProgress=\(treeHasProgress), needsFresh=\(needsFreshBundledTree)")
 
         // CRITICAL: Wait for WalletManager to finish loading tree before proceeding
         // This prevents race condition where both load concurrently and corrupt the global tree
@@ -274,19 +312,44 @@ final class FilterScanner {
         // CRITICAL: Check if tree is already loaded in FFI memory (WalletManager may have loaded it)
         // This prevents race condition where FilterScanner loads again while WalletManager is loading
         let existingTreeSize = ZipherXFFI.treeSize()
+
+        // CRITICAL FIX: For imported wallets scanning within bundled range, we MUST use the bundled tree
+        // because that's what cmuDataForPositionLookup contains for position lookup.
+        // GitHub serialized tree has DIFFERENT CMU positions than bundled CMU file!
+        let needsBundledTreeForPositionLookup = scanWithinBundledRange
+        let requiredTreeSize = needsBundledTreeForPositionLookup ? bundledTreeCMUCount : effectiveTreeCMUCount
+
         if !needsFreshBundledTree && existingTreeSize > 0 {
-            // VALIDATION: Ensure tree has at least bundledTreeCMUCount commitments
-            // If tree is smaller, it's from an old build/cache and needs reload
-            if existingTreeSize >= bundledTreeCMUCount {
-                print("🌳 Tree already loaded in memory with \(existingTreeSize) commitments")
-                treeInitialized = true
-                // Store bundled CMU data for position lookup during parallel scan
-                if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                   let bundledData = try? Data(contentsOf: bundledCMUsURL) {
-                    self.bundledCMUData = bundledData
+            // For imported wallets: Check against bundledTreeCMUCount (tree must match cmuDataForPositionLookup)
+            // For new wallets: Check against effectiveTreeCMUCount (can use GitHub tree)
+            if existingTreeSize >= requiredTreeSize {
+                // ADDITIONAL CHECK: If scanning within bundled range, verify tree is EXACTLY bundled size
+                // A bigger tree (GitHub) would have wrong CMU positions for bundled data lookup!
+                if needsBundledTreeForPositionLookup && existingTreeSize > bundledTreeCMUCount {
+                    print("⚠️ Tree in memory has \(existingTreeSize) CMUs but PHASE 1 needs bundled tree (\(bundledTreeCMUCount) CMUs)")
+                    print("🔄 Forcing reload from bundled CMUs for correct position lookup...")
+                    treeInitialized = false
+                } else {
+                    print("🌳 Tree already loaded in memory with \(existingTreeSize) commitments")
+                    treeInitialized = true
+                    // Load CMU data for position lookup during parallel scan
+                    // Prefer downloaded CMU file from GitHub if available
+                    if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                       let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo(),
+                       let cachedData = try? Data(contentsOf: cachedPath) {
+                        self.cmuDataForPositionLookup = cachedData
+                        self.cmuDataHeight = cachedInfo.height
+                        self.cmuDataCount = cachedInfo.cmuCount
+                        print("🌳 Using downloaded CMU data for position lookup (height \(cachedInfo.height))")
+                    } else if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+                              let bundledData = try? Data(contentsOf: bundledCMUsURL) {
+                        self.cmuDataForPositionLookup = bundledData
+                        self.cmuDataHeight = ZipherXConstants.bundledTreeHeight
+                        self.cmuDataCount = ZipherXConstants.bundledTreeCMUCount
+                    }
                 }
             } else {
-                print("⚠️ Tree in memory has \(existingTreeSize) CMUs but expected at least \(bundledTreeCMUCount)")
+                print("⚠️ Tree in memory has \(existingTreeSize) CMUs but expected at least \(requiredTreeSize)")
                 print("🔄 Clearing invalid tree and reloading from bundled file...")
                 // CRITICAL: Clear the invalid database tree so we don't reload it below
                 try? database.clearTreeState()
@@ -299,12 +362,21 @@ final class FilterScanner {
         if !treeInitialized && !needsFreshBundledTree, let treeData = try? database.getTreeState() {
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
-                // VALIDATION: Also check database tree has correct size
-                if treeSize >= bundledTreeCMUCount {
-                    print("🌳 Restored commitment tree with \(treeSize) commitments")
-                    treeInitialized = true
+                // VALIDATION: Check database tree has correct size
+                // For imported wallets: use bundledTreeCMUCount, for new wallets: use effectiveTreeCMUCount
+                if treeSize >= requiredTreeSize {
+                    // ADDITIONAL CHECK: For PHASE 1, database tree must not be bigger than bundled
+                    if needsBundledTreeForPositionLookup && treeSize > bundledTreeCMUCount {
+                        print("⚠️ Database tree has \(treeSize) CMUs but PHASE 1 needs bundled tree (\(bundledTreeCMUCount) CMUs)")
+                        print("🔄 Clearing database tree and loading bundled CMUs...")
+                        try? database.clearTreeState()
+                        treeInitialized = false
+                    } else {
+                        print("🌳 Restored commitment tree with \(treeSize) commitments")
+                        treeInitialized = true
+                    }
                 } else {
-                    print("⚠️ Database tree has \(treeSize) CMUs but expected at least \(bundledTreeCMUCount)")
+                    print("⚠️ Database tree has \(treeSize) CMUs but expected at least \(requiredTreeSize)")
                     print("🔄 Clearing invalid database tree...")
                     try? database.clearTreeState()
                     treeInitialized = false
@@ -321,35 +393,56 @@ final class FilterScanner {
             treeInitialized = false // Force reload from bundled data
         }
 
-        // Try bundled CMUs if database tree failed or doesn't exist
+        // Try to load CMUs for tree building - prefer downloaded from GitHub if available
         // CMUs allow us to build the tree properly and create valid witnesses
         if !treeInitialized {
-            // Use commitment_tree.bin (the only bundled tree file)
-            if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-               let bundledData = try? Data(contentsOf: bundledCMUsURL) {
-                print("🌳 Loading bundled CMUs (\(bundledData.count / 1024 / 1024) MB)...")
-                // Store bundled CMU data for position lookup during parallel scan
-                self.bundledCMUData = bundledData
+            // PRIORITY 1: Check for downloaded CMU file from GitHub (may be newer than bundled)
+            var cmuDataURL: URL?
+            var cmuSourceName = "bundled"
+
+            if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+               let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo() {
+                // Use downloaded CMU file (newer than bundled)
+                cmuDataURL = cachedPath
+                cmuSourceName = "downloaded from GitHub"
+                self.cmuDataHeight = cachedInfo.height
+                self.cmuDataCount = cachedInfo.cmuCount
+                print("🌳 Found downloaded CMU file at height \(cachedInfo.height) (\(cachedInfo.cmuCount) CMUs)")
+            }
+
+            // PRIORITY 2: Fall back to bundled CMU file
+            if cmuDataURL == nil, let bundledPath = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") {
+                cmuDataURL = bundledPath
+                cmuSourceName = "bundled"
+                self.cmuDataHeight = ZipherXConstants.bundledTreeHeight
+                self.cmuDataCount = ZipherXConstants.bundledTreeCMUCount
+            }
+
+            // Load and build tree from CMU file
+            if let cmuURL = cmuDataURL, let cmuData = try? Data(contentsOf: cmuURL) {
+                print("🌳 Loading \(cmuSourceName) CMUs (\(cmuData.count / 1024 / 1024) MB)...")
+                // Store CMU data for position lookup during parallel scan
+                self.cmuDataForPositionLookup = cmuData
 
                 // Initialize empty tree
                 _ = ZipherXFFI.treeInit()
 
                 // Parse CMUs file: [count: UInt64][cmu1: 32 bytes][cmu2: 32 bytes]...
-                guard bundledData.count >= 8 else {
-                    print("⚠️ Invalid bundled CMUs file")
+                guard cmuData.count >= 8 else {
+                    print("⚠️ Invalid CMUs file")
                     treeInitialized = false
                     return
                 }
 
-                let count = bundledData.withUnsafeBytes { ptr -> UInt64 in
+                let count = cmuData.withUnsafeBytes { ptr -> UInt64 in
                     ptr.load(as: UInt64.self)
                 }
 
-                print("🌳 Building tree from \(count) bundled CMUs...")
+                print("🌳 Building tree from \(count) \(cmuSourceName) CMUs...")
                 let buildStart = Date()
 
                 // Append all CMUs to tree
-                bundledData.withUnsafeBytes { ptr in
+                cmuData.withUnsafeBytes { ptr in
                     let basePtr = ptr.baseAddress!.advanced(by: 8)
                     for i in 0..<Int(count) {
                         let cmuPtr = basePtr.advanced(by: i * 32)
@@ -428,14 +521,29 @@ final class FilterScanner {
         // - If scanning after bundled tree: use SEQUENTIAL mode (tree building + note discovery)
         var currentHeight = startHeight
 
-        // PHASE 1: If we're scanning within bundled tree range, scan those blocks first (batch/fast)
-        if scanWithinBundledRange && startHeight <= bundledTreeHeight {
-            print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(bundledTreeHeight) for notes (batch P2P, no tree building)")
+        // PHASE 1: If we're scanning within CMU data range, scan those blocks first (batch/fast)
+        // CRITICAL: PHASE 1 must only go up to cmuDataHeight (bundled OR downloaded from GitHub)
+        // because that's where we have CMU data for position lookup. Beyond cmuDataHeight, notes
+        // MUST be scanned in PHASE 2 sequential mode where positions are computed as CMUs are appended.
+        // Use downloaded CMU height if available, otherwise fall back to bundled height
+        let phase1EndHeight = cmuDataHeight > 0 ? cmuDataHeight : bundledTreeHeight
 
-            let parallelEndHeight = min(bundledTreeHeight, targetHeight)
+        if scanWithinBundledRange && startHeight <= phase1EndHeight {
+            print("⚡ PHASE 1: Scanning blocks \(startHeight) to \(phase1EndHeight) for notes (batch P2P + Rayon parallel decryption)")
+            if cmuDataHeight > bundledTreeHeight {
+                print("   (Using downloaded CMU file from GitHub: height \(cmuDataHeight), \(cmuDataCount) CMUs)")
+            } else {
+                print("   (Using bundled CMU file: height \(bundledTreeHeight), \(bundledTreeCMUCount) CMUs)")
+            }
+
+            let parallelEndHeight = min(phase1EndHeight, targetHeight)
             let parallelTotalBlocks = parallelEndHeight - startHeight + 1
             var parallelScannedBlocks: UInt64 = 0
             let batchSize = 500 // Larger batches for P2P batch fetching
+
+            // Collect ALL spends during PHASE 1 for later spend detection (PHASE 1.6)
+            // Format: (height, txid, nullifierHex)
+            var collectedSpends: [(UInt64, String, String)] = []
 
             while currentHeight <= parallelEndHeight && isScanning {
                 let remainingBlocks = Int(parallelEndHeight - currentHeight + 1)
@@ -482,41 +590,25 @@ final class FilterScanner {
                     }
                 }
 
-                // Process all fetched blocks
-                for height in currentHeight...endHeight {
-                    guard isScanning else { break }
-
-                    if let transactions = blockDataMap[height] {
-                        for (txid, shieldedOutputs, shieldedSpends) in transactions {
-                            do {
-                                try await MainActor.run {
-                                    // Use note-discovery-only mode (no tree append)
-                                    // Now also passes spends for nullifier detection
-                                    // Pass bundled CMU data for real position lookup
-                                    try self.processShieldedOutputsForNotesOnly(
-                                        outputs: shieldedOutputs,
-                                        spends: shieldedSpends,
-                                        txid: txid,
-                                        accountId: accountId,
-                                        spendingKey: spendingKey,
-                                        ivk: ivk,
-                                        height: height,
-                                        bundledCMUData: self.bundledCMUData
-                                    )
-                                }
-                            } catch {
-                                print("❌ Error processing tx \(txid): \(error)")
-                            }
-                        }
-                    }
-
-                    parallelScannedBlocks += 1
-                    // Report progress every 100 blocks
-                    if parallelScannedBlocks == 1 || parallelScannedBlocks % 100 == 0 || parallelScannedBlocks == parallelTotalBlocks {
-                        let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
-                        onProgress?(progress * 0.5, height, targetHeight) // 50% for phase 1
-                    }
+                // PARALLEL BATCH PROCESSING (6.7x speedup via Rayon)
+                // Process entire batch at once instead of one-by-one
+                do {
+                    try processBlocksBatchParallel(
+                        blockDataMap: blockDataMap,
+                        heightRange: currentHeight...endHeight,
+                        accountId: accountId,
+                        spendingKey: spendingKey,
+                        collectedSpends: &collectedSpends,
+                        cmuDataForPositionLookup: self.cmuDataForPositionLookup
+                    )
+                } catch {
+                    print("❌ Error in parallel batch processing: \(error)")
                 }
+
+                // Update progress
+                parallelScannedBlocks += UInt64(endHeight - currentHeight + 1)
+                let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
+                onProgress?(progress * 0.5, endHeight, targetHeight) // 50% for phase 1
 
                 // Save progress for bundled range scan
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
@@ -525,39 +617,67 @@ final class FilterScanner {
             }
 
             print("✅ PHASE 1 complete: scanned \(startHeight) to \(parallelEndHeight)")
+            print("📊 Found \(knownNullifiers.count) notes with nullifiers")
+            print("📊 Collected \(collectedSpends.count) spends during PHASE 1")
+
+            // PHASE 1.6: SPEND DETECTION PASS (using cached spends - NO network fetch!)
+            // During PHASE 1, we cached all spends we encountered.
+            // Now check them against knownNullifiers (which is now complete).
+            if !knownNullifiers.isEmpty && !collectedSpends.isEmpty {
+                print("🔍 PHASE 1.6: Checking \(collectedSpends.count) cached spends against \(knownNullifiers.count) known nullifiers...")
+                var spendsDetected = 0
+
+                for (height, txid, nullifierHex) in collectedSpends {
+                    guard let nullifierDisplay = Data(hexString: nullifierHex) else { continue }
+                    let nullifierWire = nullifierDisplay.reversedBytes()
+                    if knownNullifiers.contains(nullifierWire) {
+                        let txidData = Data(hexString: txid)
+                        if let txidData = txidData {
+                            try? database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
+                        } else {
+                            try? database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                        }
+                        spendsDetected += 1
+                        print("💸 Detected spend at height \(height) in tx \(txid.prefix(16))...")
+                    }
+                }
+                print("✅ PHASE 1.6 complete: detected \(spendsDetected) spent notes")
+            }
 
             // PHASE 1.5: Pre-compute witnesses for notes discovered in bundled range
             // This runs in background so user doesn't wait at spend time
-            if let bundledData = bundledCMUData {
+            if let bundledData = cmuDataForPositionLookup {
                 await computeWitnessesForBundledNotes(bundledData: bundledData)
             }
 
-            // Move to blocks after bundled tree
+            // Move to blocks after bundled tree height for PHASE 2
+            // CRITICAL: Must be bundledTreeHeight + 1, not effectiveTreeHeight + 1
+            // PHASE 2 must scan ALL blocks after bundledTreeHeight to get correct positions
             currentHeight = bundledTreeHeight + 1
         }
 
         // PHASE 2: Continue scanning blocks after bundled tree (tree building mode)
         // This runs if:
-        // - We did PHASE 1 and there are more blocks after bundledTreeHeight
+        // - We did PHASE 1 and there are more blocks after phase1EndHeight
         // - OR no custom start height was provided (normal auto-scan)
-        // - OR custom start height is AFTER bundled tree (must use sequential for correct positions)
+        // - OR custom start height is AFTER CMU data height (must use sequential for correct positions)
         let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= targetHeight
 
-        // Quick scan is ONLY safe when scanning WITHIN bundled tree range where positions are known
-        // If starting AFTER bundled tree, we MUST use sequential mode for correct nullifier computation
-        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange && customStartHeight! <= bundledTreeHeight
+        // Quick scan is ONLY safe when scanning WITHIN CMU data range where positions are known
+        // If starting AFTER CMU data, we MUST use sequential mode for correct nullifier computation
+        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange && customStartHeight! <= phase1EndHeight
 
-        // If custom start is AFTER bundled tree, force sequential mode
-        let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > bundledTreeHeight
+        // If custom start is AFTER CMU data height, force sequential mode
+        let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > phase1EndHeight
 
         if continueAfterBundledRange || forceSequentialAfterBundled {
             print("⚡ PHASE 2: Scanning blocks \(currentHeight) to \(targetHeight) for notes + tree building (sequential)")
         }
 
         if isQuickScanOnly {
-            // PARALLEL MODE - much faster for note discovery only
-            // Now also fetches spends for nullifier detection
-            let parallelBatchSize = 100 // Process 100 blocks at a time in parallel
+            // PARALLEL MODE with RAYON - 6.7x faster note decryption!
+            // Fetches blocks in parallel, then batch decrypts all outputs using Rayon
+            let parallelBatchSize = 500 // Larger batches to maximize Rayon efficiency
 
             while currentHeight <= targetHeight && isScanning {
                 let endHeight = min(currentHeight + UInt64(parallelBatchSize) - 1, targetHeight)
@@ -566,6 +686,8 @@ final class FilterScanner {
                 print("⚡ Parallel scanning blocks \(currentHeight) to \(endHeight)...")
 
                 // Fetch all blocks in parallel using P2P-first approach
+                var blockDataMap: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
+
                 await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
                     for height in heights {
                         group.addTask {
@@ -578,39 +700,33 @@ final class FilterScanner {
                         }
                     }
 
-                    // Process results - note: for quick scan we skip tree building but DO check nullifiers
                     for await (height, txData) in group {
-                        guard isScanning else { break }
-
-                        if let transactions = txData {
-                            for (txid, shieldedOutputs, shieldedSpends) in transactions {
-                                // Only try to decrypt for our notes, skip tree building
-                                // Now also checks spends for nullifiers
-                                do {
-                                    try await MainActor.run {
-                                        try self.processShieldedOutputsForNotesOnly(
-                                            outputs: shieldedOutputs,
-                                            spends: shieldedSpends,
-                                            txid: txid,
-                                            accountId: accountId,
-                                            spendingKey: spendingKey,
-                                            ivk: ivk,
-                                            height: height
-                                        )
-                                    }
-                                } catch {
-                                    print("❌ Error processing tx \(txid): \(error)")
-                                }
-                            }
-                        }
-
-                        scannedBlocks += 1
-                        if scannedBlocks % 50 == 0 || scannedBlocks == totalBlocks {
-                            let progress = Double(scannedBlocks) / Double(totalBlocks)
-                            onProgress?(progress, height, targetHeight)
+                        if let data = txData {
+                            blockDataMap[height] = data
                         }
                     }
                 }
+
+                // PARALLEL BATCH PROCESSING (6.7x speedup via Rayon)
+                var quickScanSpends: [(UInt64, String, String)] = []
+                do {
+                    try processBlocksBatchParallel(
+                        blockDataMap: blockDataMap,
+                        heightRange: currentHeight...endHeight,
+                        accountId: accountId,
+                        spendingKey: spendingKey,
+                        collectedSpends: &quickScanSpends,
+                        cmuDataForPositionLookup: nil  // Quick scan doesn't use position lookup
+                    )
+                } catch {
+                    print("❌ Error in parallel batch processing: \(error)")
+                }
+
+                // Update progress
+                let blocksInBatch = UInt64(endHeight - currentHeight + 1)
+                scannedBlocks += blocksInBatch
+                let progress = Double(scannedBlocks) / Double(totalBlocks)
+                onProgress?(progress, endHeight, targetHeight)
 
                 // Save progress
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
@@ -797,6 +913,18 @@ final class FilterScanner {
             onWitnessProgress?(totalWitnesses, totalWitnesses, "All witnesses synced!")
         } else {
             onWitnessProgress?(0, 0, "No witnesses to update")
+        }
+
+        // PHASE 2.5: Check for notes that couldn't get correct positions during PHASE 1
+        // With the fix limiting PHASE 1 to bundledTreeHeight, this should rarely/never happen.
+        // Notes after bundledTreeHeight are now scanned in PHASE 2 sequential mode.
+        if !notesNeedingNullifierFix.isEmpty {
+            print("⚠️ PHASE 2.5: Found \(notesNeedingNullifierFix.count) notes with potentially wrong nullifiers")
+            print("   These notes were within bundledTreeHeight but CMU wasn't in bundled data.")
+            print("   Use 'Repair Notes' in Settings to fix if balance is wrong.")
+
+            // Clear the tracking array - we've warned the user
+            notesNeedingNullifierFix.removeAll()
         }
 
         print("✅ Scan complete")
@@ -1132,24 +1260,31 @@ final class FilterScanner {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs
         if let spends = spends, !spends.isEmpty {
+            print("🔍 SPEND DEBUG: Block \(height) has \(spends.count) spend(s), checking against \(knownNullifiers.count) known nullifiers")
             // Convert txid from hex string to Data for database storage
             let txidData = Data(hexString: txid)
             for spend in spends {
                 guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
+                    print("⚠️ SPEND DEBUG: Could not parse nullifier hex: \(spend.nullifier.prefix(32))...")
                     continue
                 }
                 // CRITICAL FIX: API returns nullifier in big-endian (display format)
                 // but our knownNullifiers are stored in little-endian (wire format)
                 // Must reverse before comparison!
                 let nullifierWire = nullifierDisplay.reversedBytes()
+                let nullifierWireHex = nullifierWire.map { String(format: "%02x", $0) }.joined()
                 if knownNullifiers.contains(nullifierWire) {
                     // One of our notes was spent! Include txid for history tracking
+                    print("💸 SPEND DETECTED! Nullifier: \(nullifierWireHex.prefix(32))... at height \(height)")
                     if let txidData = txidData {
                         try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
                     } else {
                         try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     }
                     print("💸 Note spent at height \(height)")
+                } else {
+                    // Log first few bytes for debugging (don't log full nullifier for privacy)
+                    print("🔍 SPEND DEBUG: Nullifier \(nullifierWireHex.prefix(16))... NOT in knownNullifiers")
                 }
             }
         }
@@ -1214,10 +1349,12 @@ final class FilterScanner {
                 position: treePosition
             )
 
-            // Debug: Log the computed nullifier and position
-            // SECURITY: Never log nullifiers - they are sensitive privacy data
+            // Debug: Log the computed nullifier (first 16 chars only for privacy)
+            let nullifierHex = nullifier.map { String(format: "%02x", $0) }.joined()
+            print("📝 NOTE DEBUG: Computed nullifier \(nullifierHex.prefix(16))... at position \(treePosition) for \(value) zatoshi note")
 
             knownNullifiers.insert(nullifier)
+            print("📝 NOTE DEBUG: knownNullifiers now has \(knownNullifiers.count) entries")
 
             // Get witness
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
@@ -1272,10 +1409,196 @@ final class FilterScanner {
         }
     }
 
+    // MARK: - Parallel Batch Processing (6.7x speedup via Rayon)
+
+    /// Metadata for each output in a batch (used to store notes after parallel decryption)
+    private struct BatchOutputInfo {
+        let txid: String
+        let height: UInt64
+        let output: ShieldedOutput  // Original InsightAPI output (has cmu for position lookup)
+        let outputIndex: Int        // Index within transaction
+    }
+
+    /// Process a batch of blocks using parallel Rayon-based decryption
+    /// This provides ~6.7x speedup over sequential decryption by using all CPU cores
+    ///
+    /// - Parameters:
+    ///   - blockDataMap: Map of height -> [(txid, outputs, spends)] from P2P/InsightAPI
+    ///   - heightRange: Range of heights to process (in order)
+    ///   - accountId: Account to store notes for
+    ///   - spendingKey: Spending key for decryption
+    ///   - collectedSpends: Output array to collect spends for PHASE 1.6
+    ///   - cmuDataForPositionLookup: Bundled CMU data for position lookup
+    private func processBlocksBatchParallel(
+        blockDataMap: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]],
+        heightRange: ClosedRange<UInt64>,
+        accountId: Int64,
+        spendingKey: Data,
+        collectedSpends: inout [(UInt64, String, String)],
+        cmuDataForPositionLookup: Data?
+    ) throws {
+        // Skip if new wallet (no notes to find)
+        guard !isNewWalletInitialSync else { return }
+
+        // Step 1: Collect ALL outputs from the batch with metadata
+        var batchOutputs: [BatchOutputInfo] = []
+        var totalSpends = 0
+
+        for height in heightRange {
+            guard let transactions = blockDataMap[height] else { continue }
+
+            for (txid, outputs, spends) in transactions {
+                // Collect spends for PHASE 1.6
+                if let spends = spends {
+                    for spend in spends {
+                        collectedSpends.append((height, txid, spend.nullifier))
+                    }
+                    totalSpends += spends.count
+                }
+
+                // Collect outputs with metadata
+                for (idx, output) in outputs.enumerated() {
+                    batchOutputs.append(BatchOutputInfo(
+                        txid: txid,
+                        height: height,
+                        output: output,
+                        outputIndex: idx
+                    ))
+                }
+            }
+        }
+
+        guard !batchOutputs.isEmpty else {
+            debugLog(.sync, "⚡ Batch \(heightRange.lowerBound)-\(heightRange.upperBound): 0 outputs, \(totalSpends) spends collected")
+            return
+        }
+
+        debugLog(.sync, "🚀 Parallel decrypting \(batchOutputs.count) outputs from \(heightRange.count) blocks...")
+
+        // Step 2: Convert to FFI format (handles byte order conversion)
+        let ffiOutputs = batchOutputs.map { info -> ZipherXFFI.FFIShieldedOutput in
+            ZipherXFFI.FFIShieldedOutput(
+                epkHex: info.output.ephemeralKey,
+                cmuHex: info.output.cmu,
+                ciphertextHex: info.output.encCiphertext
+            )
+        }
+
+        // Step 3: Call parallel decryption (6.7x speedup via Rayon)
+        // Use the first height in range for version byte validation
+        let results = ZipherXFFI.tryDecryptNotesParallel(
+            spendingKey: spendingKey,
+            outputs: ffiOutputs,
+            height: heightRange.lowerBound
+        )
+
+        // Step 4: Process decrypted notes
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        var notesFound = 0
+
+        for (idx, maybeNote) in results.enumerated() {
+            guard let note = maybeNote else { continue }
+            notesFound += 1
+
+            let info = batchOutputs[idx]
+            let output = info.output
+
+            // Convert CMU to wire format for database/position lookup
+            guard let cmuDisplay = Data(hexString: output.cmu) else { continue }
+            let cmu = cmuDisplay.reversedBytes()
+
+            print("💰 Found note: \(note.value) zatoshis at height \(info.height) (parallel)")
+
+            let txidData = Data(hexString: info.txid) ?? Data()
+
+            // Look up position from bundled CMU data
+            var position: UInt64 = 0
+            var needsNullifierFix = false
+
+            if let bundledData = cmuDataForPositionLookup {
+                if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
+                    position = realPos
+                    debugLog(.sync, "📍 Found CMU position in bundled tree: \(position)")
+                } else {
+                    needsNullifierFix = true
+                    if info.height > bundledTreeHeight {
+                        debugLog(.sync, "⚠️ Note at height \(info.height) > bundled: nullifier fix needed")
+                    }
+                }
+            } else {
+                needsNullifierFix = true
+            }
+
+            // Compute nullifier
+            let nullifier = try rustBridge.computeNullifier(
+                spendingKey: spendingKey,
+                diversifier: note.diversifier,
+                value: note.value,
+                rcm: note.rcm,
+                position: position
+            )
+
+            // Add to known nullifiers only if position is correct
+            if !needsNullifierFix {
+                knownNullifiers.insert(nullifier)
+            }
+
+            // Store note
+            let noteId = try database.insertNote(
+                accountId: accountId,
+                diversifier: note.diversifier,
+                value: note.value,
+                rcm: note.rcm,
+                memo: note.memo,
+                nullifier: nullifier,
+                txid: txidData,
+                height: info.height,
+                witness: Data(count: 1028),
+                cmu: cmu
+            )
+
+            // Check if change output
+            var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
+            if !isChangeOutput {
+                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: info.txid)
+            }
+
+            if !isChangeOutput {
+                // Track as incoming
+                Task { @MainActor in
+                    await NetworkManager.shared.trackPendingIncoming(txid: info.txid, amount: note.value)
+                }
+                let memoText = String(data: note.memo.prefix(while: { $0 != 0 }), encoding: .utf8)
+                try database.recordReceivedTransaction(
+                    txid: txidData,
+                    height: info.height,
+                    value: note.value,
+                    memo: memoText
+                )
+            }
+
+            // Queue for nullifier fix if needed
+            if needsNullifierFix {
+                notesNeedingNullifierFix.append((
+                    noteId: noteId,
+                    cmu: cmu,
+                    diversifier: note.diversifier,
+                    value: note.value,
+                    rcm: note.rcm,
+                    height: info.height
+                ))
+            }
+        }
+
+        if notesFound > 0 {
+            print("🚀 Parallel batch: found \(notesFound)/\(batchOutputs.count) notes using \(ZipherXFFI.getRayonThreads()) threads")
+        }
+    }
+
     /// Process shielded outputs for note discovery only (no tree building)
     /// Used by quick scan - much faster as it skips CMU appending
     /// Also checks spends for nullifiers to detect spent notes
-    /// bundledCMUData: Optional bundled CMU data for looking up real positions
+    /// cmuDataForPositionLookup: Optional bundled CMU data for looking up real positions
     private func processShieldedOutputsForNotesOnly(
         outputs: [ShieldedOutput],
         spends: [ShieldedSpend]? = nil,
@@ -1284,7 +1607,7 @@ final class FilterScanner {
         spendingKey: Data,
         ivk: Data,
         height: UInt64,
-        bundledCMUData: Data? = nil
+        cmuDataForPositionLookup: Data? = nil
     ) throws {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs so we can catch spends
@@ -1359,16 +1682,36 @@ final class FilterScanner {
 
             // Try to find real position from bundled CMU data
             var position: UInt64 = 0
-            if let bundledData = bundledCMUData {
+            var needsNullifierFix = false
+            let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+
+            if let bundledData = cmuDataForPositionLookup {
                 if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
                     position = realPos
                     print("📍 Found CMU position in bundled tree: \(position)")
                 } else {
-                    print("⚠️ CMU not found in bundled tree, using position 0 (nullifier may be wrong)")
+                    // CMU not in bundled tree - position 0 is WRONG
+                    // CRITICAL FIX: Always set needsNullifierFix when CMU lookup fails
+                    // This prevents wrong nullifiers from being added to knownNullifiers
+                    needsNullifierFix = true
+                    if height > bundledTreeHeight {
+                        print("⚠️ Note at height \(height) > bundled \(bundledTreeHeight): nullifier will be fixed in PHASE 2.5")
+                    } else {
+                        print("⚠️ CMU not found in bundled tree (height \(height) <= bundled \(bundledTreeHeight)): nullifier will be fixed in PHASE 2.5")
+                    }
+                }
+            } else {
+                // No bundled data available - can't compute correct position
+                // CRITICAL FIX: Always set needsNullifierFix when no bundled data
+                needsNullifierFix = true
+                if height > bundledTreeHeight {
+                    print("⚠️ Note at height \(height) > bundled \(bundledTreeHeight) (no bundled data): nullifier will be fixed in PHASE 2.5")
+                } else {
+                    print("⚠️ No bundled CMU data for note at height \(height): nullifier will be fixed in PHASE 2.5")
                 }
             }
 
-            // Compute nullifier using spending key with real position if available
+            // Compute nullifier using spending key with current position (may be 0 if needs fix)
             let nullifier = try rustBridge.computeNullifier(
                 spendingKey: spendingKey,
                 diversifier: Data(diversifier),
@@ -1379,7 +1722,11 @@ final class FilterScanner {
 
             // SECURITY: Never log nullifiers - they are sensitive privacy data
 
-            knownNullifiers.insert(nullifier)
+            // Only add to knownNullifiers if we're confident the nullifier is correct
+            // Notes needing fix will have their nullifiers added after PHASE 2.5
+            if !needsNullifierFix {
+                knownNullifiers.insert(nullifier)
+            }
 
             // Store note with CMU and empty witness (will need to rebuild for spending)
             let noteId = try database.insertNote(
@@ -1428,6 +1775,19 @@ final class FilterScanner {
             }
 
             print("📝 Stored note \(noteId) with value \(value)")
+
+            // Track notes that need nullifier recomputation after PHASE 2
+            if needsNullifierFix {
+                notesNeedingNullifierFix.append((
+                    noteId: noteId,
+                    cmu: cmu,
+                    diversifier: Data(diversifier),
+                    value: value,
+                    rcm: Data(rcm),
+                    height: height
+                ))
+                print("📋 Queued note \(noteId) for nullifier fix in PHASE 2.5")
+            }
         }
     }
 

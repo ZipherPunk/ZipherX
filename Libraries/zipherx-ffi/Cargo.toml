@@ -28,13 +28,27 @@ ff = "0.13"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
 rand = "0.8"
+rayon = "1.8"
 sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+ureq = { version = "2.9", features = ["json"] }
+base64 = "0.21"
 bls12_381 = "0.8"
 equihash = "0.2"
 
 [[bin]]
 name = "verify_tree"
 path = "src/bin/verify_tree.rs"
+
+[[bin]]
+name = "bench_decrypt"
+path = "src/bin/bench_decrypt.rs"
+
+[[bin]]
+name = "verify_balance"
+path = "src/bin/verify_balance.rs"
 
 [profile.release]
 lto = true

@@ -20,13 +20,13 @@ enum NeonColors {
     private static let orangeProgressFillStart = Color(red: 0.8, green: 0.3, blue: 0.0)
     private static let orangeProgressFillEnd = Color(red: 1.0, green: 0.5, blue: 0.0)
 
-    // iOS Green colors
+    // iOS Green colors - BRIGHTER for better visibility
     private static let greenPrimary = Color(red: 0, green: 1, blue: 0.25)
-    private static let greenPrimaryDark = Color(red: 0, green: 0.7, blue: 0.2)
-    private static let greenPrimaryDim = Color(red: 0, green: 0.5, blue: 0.1)
-    private static let greenPrimaryVeryDim = Color(red: 0, green: 0.3, blue: 0.08)
-    private static let greenProgressBg = Color(red: 0, green: 0.2, blue: 0.05)
-    private static let greenProgressFillStart = Color(red: 0, green: 0.8, blue: 0.2)
+    private static let greenPrimaryDark = Color(red: 0, green: 0.85, blue: 0.25)   // Was 0.7/0.2 - brighter
+    private static let greenPrimaryDim = Color(red: 0, green: 0.7, blue: 0.18)     // Was 0.5/0.1 - brighter
+    private static let greenPrimaryVeryDim = Color(red: 0, green: 0.5, blue: 0.12) // Was 0.3/0.08 - brighter
+    private static let greenProgressBg = Color(red: 0, green: 0.25, blue: 0.06)    // Slightly brighter
+    private static let greenProgressFillStart = Color(red: 0, green: 0.9, blue: 0.25) // Brighter
     private static let greenProgressFillEnd = Color(red: 0, green: 1, blue: 0.4)
 
     // Runtime platform detection (guaranteed to work)

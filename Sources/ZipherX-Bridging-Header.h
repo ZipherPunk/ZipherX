@@ -191,6 +191,28 @@ size_t zipherx_try_decrypt_note_with_sk(const uint8_t *sk,
                                          uint8_t *output);
 
 // =============================================================================
+// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
+// =============================================================================
+
+/// Batch decrypt multiple shielded outputs in parallel using Rayon
+/// Input format (per output, 644 bytes): epk(32) + cmu(32) + ciphertext(580)
+/// Output format (per output, 564 bytes): found(1) + diversifier(11) + value(8) + rcm(32) + memo(512)
+/// @param sk 169-byte spending key
+/// @param outputs_data Packed array of outputs (644 bytes each)
+/// @param output_count Number of outputs to process
+/// @param height Block height for version byte validation
+/// @param results Output buffer (564 bytes per output)
+/// @return Number of successfully decrypted notes
+size_t zipherx_try_decrypt_notes_parallel(const uint8_t *sk,
+                                           const uint8_t *outputs_data,
+                                           size_t output_count,
+                                           uint64_t height,
+                                           uint8_t *results);
+
+/// Get the number of CPU threads Rayon will use for parallel decryption
+size_t zipherx_get_rayon_threads(void);
+
+// =============================================================================
 // Utility Functions
 // =============================================================================
 

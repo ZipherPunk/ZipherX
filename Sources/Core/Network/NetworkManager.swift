@@ -140,6 +140,10 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
 
+    /// Warning: P2P connection issues prevent mempool scanning
+    /// UI should show warning when this is true (incoming tx detection disabled)
+    @Published private(set) var p2pMempoolWarning: Bool = false
+
     /// Sybil attack detection - published when a fake peer is banned
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
     @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
@@ -1403,16 +1407,46 @@ final class NetworkManager: ObservableObject {
     /// Uses trial decryption to detect payments before confirmation
     private func scanMempoolForIncoming() async {
         print("🔮 scanMempoolForIncoming: starting...")
-        guard isConnected else {
-            print("🔮 scanMempoolForIncoming: not connected, skipping")
+
+        // Get all connected peers and try them in order
+        var connectedPeers = getAllConnectedPeers()
+
+        // If no ready peers, try to reconnect
+        if connectedPeers.isEmpty {
+            print("🔮 scanMempoolForIncoming: no ready peers, attempting reconnection...")
+
+            // Try to reconnect disconnected peers
+            for peer in peers where !peer.isConnectionReady {
+                do {
+                    try await peer.connect()
+                    try await peer.performHandshake()
+                    print("✅ scanMempoolForIncoming: reconnected to \(peer.host)")
+                } catch {
+                    // Silently continue - we'll try other peers
+                }
+            }
+
+            // Check again after reconnect attempt
+            connectedPeers = getAllConnectedPeers()
+        }
+
+        guard !connectedPeers.isEmpty else {
+            print("⚠️ scanMempoolForIncoming: no connected peer after reconnect attempt - mempool scanning disabled!")
+            await MainActor.run {
+                if !self.p2pMempoolWarning {
+                    self.p2pMempoolWarning = true
+                    print("⚠️ P2P mempool warning activated - incoming tx detection may be delayed")
+                }
+            }
             return
         }
 
-        // Get all connected peers and try them in order
-        let connectedPeers = getAllConnectedPeers()
-        guard !connectedPeers.isEmpty else {
-            print("🔮 scanMempoolForIncoming: no connected peer, skipping")
-            return
+        // Clear warning if we have peers now
+        await MainActor.run {
+            if self.p2pMempoolWarning {
+                self.p2pMempoolWarning = false
+                print("✅ P2P mempool warning cleared - peers available")
+            }
         }
 
         // Try each peer until one succeeds
@@ -1799,9 +1833,9 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        // Fallback: Try CryptoCompare
-        if let price = await fetchPriceFromCryptoCompare() {
-            print("💰 CryptoCompare price: $\(price)")
+        // Fallback: Try CoinMarketCap (free tier)
+        if let price = await fetchPriceFromCoinMarketCap() {
+            print("💰 CoinMarketCap price: $\(price)")
             await MainActor.run {
                 self.zclPriceUSD = price
                 self.zclPriceFailed = false
@@ -1809,7 +1843,7 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        // Both APIs failed
+        // Both APIs failed - keep existing price if we have one
         print("⚠️ Failed to fetch ZCL price from any source")
         await MainActor.run {
             self.zclPriceFailed = true
@@ -1838,23 +1872,41 @@ final class NetworkManager: ObservableObject {
         return nil
     }
 
-    private func fetchPriceFromCryptoCompare() async -> Double? {
-        guard let url = URL(string: "https://min-api.cryptocompare.com/data/price?fsym=ZCL&tsyms=USD") else {
+    private func fetchPriceFromCoinMarketCap() async -> Double? {
+        // CoinMarketCap free tier - uses their web API endpoint (no API key needed)
+        // ZCL ID on CoinMarketCap is 1447
+        guard let url = URL(string: "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?id=1447&convertId=2781") else {
             return nil
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
-                print("💰 CryptoCompare HTTP status: \(httpResponse.statusCode)")
+                print("💰 CoinMarketCap HTTP status: \(httpResponse.statusCode)")
+                if httpResponse.statusCode != 200 {
+                    print("💰 CoinMarketCap: non-200 status")
+                    return nil
+                }
             }
+
+            // Parse response: {"data":{"id":1447,"name":"Zclassic",...,"quote":[{"price":0.49,...}]}}
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let price = json["USD"] as? Double {
+               let dataObj = json["data"] as? [String: Any],
+               let quotes = dataObj["quote"] as? [[String: Any]],
+               let firstQuote = quotes.first,
+               let price = firstQuote["price"] as? Double {
                 return price
             }
-            print("💰 CryptoCompare: couldn't parse response: \(String(data: data, encoding: .utf8) ?? "nil")")
+
+            // Log response for debugging
+            let responseStr = String(data: data, encoding: .utf8) ?? "nil"
+            print("💰 CoinMarketCap: couldn't parse response: \(responseStr.prefix(500))")
         } catch {
-            print("⚠️ CryptoCompare price fetch failed: \(error)")
+            print("⚠️ CoinMarketCap price fetch failed: \(error)")
         }
         return nil
     }
@@ -2993,8 +3045,10 @@ final class NetworkManager: ObservableObject {
             }
 
             DispatchQueue.main.async {
-                self.connectedPeers = self.peers.count
-                self.isConnected = self.peers.count > 0
+                // BUGFIX: Only count peers with READY connections, not all peers in array
+                let readyPeers = self.peers.filter { $0.isConnectionReady }
+                self.connectedPeers = readyPeers.count
+                self.isConnected = readyPeers.count > 0
             }
         }
     }

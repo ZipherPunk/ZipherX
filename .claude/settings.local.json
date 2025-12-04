@@ -148,7 +148,19 @@
       "Bash(git rev-parse:*)",
       "Bash(then grep -E \"TXHIST|getTransactionHistory|Duplicate|populateHistory\" /Users/chris/ZipherX/zmac.log)",
       "Bash(then grep -E \"TXHIST.*First 5|tx\\[0\\]|tx\\[1\\]|tx\\[2\\]\" /Users/chris/ZipherX/zmac.log)",
-      "Bash(git pull:*)"
+      "Bash(git pull:*)",
+      "Bash(then grep -i \"boost\\|manifest\\|download\\|commitment.*tree\\|CommitmentTree\\|update\" /Users/chris/ZipherX/z.log)",
+      "Bash(then grep -E \"Imported wallet|restoreWallet|importSpendingKey|importScanStartHeight|FULL historical|scanning from|START SCAN\" /Users/chris/ZipherX/z.log)",
+      "Bash(./target/release/bench_decrypt:*)",
+      "Bash(then tail -1000 /Users/chris/ZipherX/z.log)",
+      "Bash(defaults read:*)",
+      "Bash(plutil:*)",
+      "Bash(./target/release/verify_balance:*)",
+      "Bash(lsof:*)",
+      "Bash(then grep -E \"PHASE|phase|commitment|tree|bundled|GitHub|serialized|effective\" /Users/chris/ZipherX/z.log)",
+      "Bash(then grep -E \"Scan mode|FULL historical|Imported wallet|scanning from|startHeight\" /Users/chris/ZipherX/z.log)",
+      "Bash(then grep -E \"peer|Peer|connect|Connect|P2P\" /Users/chris/ZipherX/zmac.log)",
+      "Bash(then grep -E \"GitHub|download|CMU|manifest|effectiveTree\" /Users/chris/ZipherX/zmac.log)"
     ],
     "deny": [],
     "ask": []

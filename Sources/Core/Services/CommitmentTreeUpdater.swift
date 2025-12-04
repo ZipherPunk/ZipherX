@@ -16,6 +16,10 @@ actor CommitmentTreeUpdater {
     /// GitHub raw URL for the compressed tree file (fallback if serialized not available)
     private static let compressedTreeURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree.bin.zst"
 
+    /// GitHub raw URL for the uncompressed CMU file (needed for imported wallets - position lookups)
+    /// This is a large file (~33MB) but required for nullifier computation on imported wallets
+    private static let cmuFileURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree.bin"
+
     /// Whether tree updates from GitHub are enabled
     /// Set to false to disable remote tree updates (use bundled only)
     private static let enableRemoteUpdates = true
@@ -206,6 +210,122 @@ actor CommitmentTreeUpdater {
         print("🌲 Tree cache cleared")
     }
 
+    // MARK: - CMU File Access (for imported wallets)
+
+    /// Get CMU file for imported wallet position lookups
+    /// This downloads the full 33MB CMU file from GitHub if a newer version is available
+    /// Returns: (cmuFilePath, height, cmuCount) or nil if using bundled only
+    ///
+    /// IMPORTANT: This is needed for imported wallets because:
+    /// 1. The serialized tree (~574 bytes) only contains the tree frontier (final state)
+    /// 2. Imported wallets need to find CMU positions for notes within the tree range
+    /// 3. Position lookup requires the full list of CMUs in blockchain order
+    func getCMUFileForImportedWallet(onProgress: ((Double, String) -> Void)? = nil) async throws -> (URL, UInt64, UInt64)? {
+        guard Self.enableRemoteUpdates else {
+            print("🌲 Remote updates disabled, using bundled CMU file")
+            return nil  // Caller should use bundled tree
+        }
+
+        // Check for cached CMU file first
+        if let cachedManifest = loadCachedManifest() {
+            if FileManager.default.fileExists(atPath: cachedTreePath.path),
+               verifySHA256(file: cachedTreePath, expected: cachedManifest.files.uncompressed.sha256) {
+                print("🌲 Using cached CMU file at height \(cachedManifest.height)")
+                return (cachedTreePath, cachedManifest.height, cachedManifest.cmu_count)
+            }
+        }
+
+        // Try to fetch remote manifest
+        onProgress?(0.0, "Checking for updated CMU data...")
+        let remoteManifest: TreeManifest
+        do {
+            remoteManifest = try await fetchRemoteManifest()
+        } catch {
+            print("⚠️ Could not fetch manifest: \(error)")
+            return nil
+        }
+
+        // Check if remote is newer than bundled
+        let bundledHeight = ZipherXConstants.bundledTreeHeight
+        if remoteManifest.height <= bundledHeight {
+            print("🌲 Bundled CMU file is current, no download needed")
+            return nil  // Use bundled
+        }
+
+        // Download the uncompressed CMU file (33MB) directly
+        // Note: We download uncompressed because iOS cannot decompress zstd
+        print("🌲 Downloading CMU file (\(remoteManifest.files.uncompressed.size / 1024 / 1024) MB)...")
+        onProgress?(0.1, "Downloading CMU data...")
+
+        guard let url = URL(string: Self.cmuFileURL) else {
+            throw TreeUpdaterError.invalidURL
+        }
+
+        // Create a download delegate to track progress
+        let delegate = DownloadProgressDelegate { progress in
+            onProgress?(0.1 + progress * 0.8, "Downloading... \(Int(progress * 100))%")
+        }
+
+        let (tempURL, response) = try await URLSession.shared.download(from: url, delegate: delegate)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw TreeUpdaterError.networkError("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+
+        // Move to cache
+        if FileManager.default.fileExists(atPath: cachedTreePath.path) {
+            try FileManager.default.removeItem(at: cachedTreePath)
+        }
+        try FileManager.default.moveItem(at: tempURL, to: cachedTreePath)
+
+        onProgress?(0.9, "Verifying checksum...")
+
+        // Verify checksum
+        guard verifySHA256(file: cachedTreePath, expected: remoteManifest.files.uncompressed.sha256) else {
+            try? FileManager.default.removeItem(at: cachedTreePath)
+            throw TreeUpdaterError.checksumMismatch
+        }
+
+        // Save manifest
+        try saveManifest(remoteManifest)
+
+        // Update UserDefaults for effective tree height (used by ZipherXConstants)
+        await MainActor.run {
+            UserDefaults.standard.set(Int(remoteManifest.height), forKey: "effectiveTreeHeight")
+            UserDefaults.standard.set(Int(remoteManifest.cmu_count), forKey: "effectiveTreeCMUCount")
+        }
+
+        print("🌲 Downloaded CMU file at height \(remoteManifest.height) with \(remoteManifest.cmu_count) CMUs")
+        onProgress?(1.0, "CMU data ready!")
+
+        return (cachedTreePath, remoteManifest.height, remoteManifest.cmu_count)
+    }
+
+    /// Check if we have a cached CMU file that's newer than bundled
+    func hasCachedCMUFile() -> Bool {
+        guard let manifest = loadCachedManifest() else { return false }
+        guard FileManager.default.fileExists(atPath: cachedTreePath.path) else { return false }
+        return manifest.height > ZipherXConstants.bundledTreeHeight
+    }
+
+    /// Get the cached CMU file path if available and valid
+    func getCachedCMUFilePath() -> URL? {
+        guard let manifest = loadCachedManifest(),
+              manifest.height > ZipherXConstants.bundledTreeHeight,
+              FileManager.default.fileExists(atPath: cachedTreePath.path),
+              verifySHA256(file: cachedTreePath, expected: manifest.files.uncompressed.sha256) else {
+            return nil
+        }
+        return cachedTreePath
+    }
+
+    /// Get the height and CMU count of the cached tree (if available)
+    func getCachedTreeInfo() -> (height: UInt64, cmuCount: UInt64)? {
+        guard let manifest = loadCachedManifest() else { return nil }
+        return (manifest.height, manifest.cmu_count)
+    }
+
     // MARK: - Private Methods
 
     private func fetchRemoteManifest() async throws -> TreeManifest {
@@ -370,5 +490,31 @@ enum TreeUpdaterError: LocalizedError {
         case .decompressionFailed(let details):
             return "Failed to decompress tree: \(details)"
         }
+    }
+}
+
+// MARK: - Download Progress Delegate
+
+/// URLSession delegate for tracking download progress
+private class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    let progressHandler: (Double) -> Void
+
+    init(progressHandler: @escaping (Double) -> Void) {
+        self.progressHandler = progressHandler
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        let progress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        DispatchQueue.main.async {
+            self.progressHandler(progress)
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        // This is handled by the async/await pattern - no action needed here
     }
 }

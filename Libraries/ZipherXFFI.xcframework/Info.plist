@@ -40,13 +40,13 @@
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
-			<string>libzipherx_ffi_macos.a</string>
+			<string>libzipherx_ffi_macos_universal.a</string>
 			<key>HeadersPath</key>
 			<string>Headers</string>
 			<key>LibraryIdentifier</key>
 			<string>macos-arm64_x86_64</string>
 			<key>LibraryPath</key>
-			<string>libzipherx_ffi_macos.a</string>
+			<string>libzipherx_ffi_macos_universal.a</string>
 			<key>SupportedArchitectures</key>
 			<array>
 				<string>arm64</string>

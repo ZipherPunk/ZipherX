@@ -1147,7 +1147,11 @@ struct BalanceView: View {
             return "Connecting..."
         } else if networkManager.isConnected {
             let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
-            let warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
+            var warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
+            // Add mempool warning if P2P mempool scanning is unavailable
+            if networkManager.p2pMempoolWarning {
+                warning = " ⚠️ (mempool disabled)"
+            }
             return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning) (\(networkManager.knownAddressCount) known)"
         } else {
             return "Disconnected"
