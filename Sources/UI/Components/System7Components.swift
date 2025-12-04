@@ -2057,7 +2057,8 @@ struct CypherpunkMainView: View {
 
                 // Debug: print first 5 items to trace duplicates
                 for (i, item) in deduped.prefix(5).enumerated() {
-                    print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
+                    let fullTxid = item.txid.map { String(format: "%02x", $0) }.joined()
+                    print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), txid=\(fullTxid), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
                 }
 
                 DispatchQueue.main.async {

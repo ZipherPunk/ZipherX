@@ -2635,11 +2635,11 @@ struct TransactionHistoryItem {
         txid.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Unique identifier for ForEach - uses txid prefix + type + height
-    /// txid prefix ensures different transactions don't collide
+    /// Unique identifier for ForEach - uses txid prefix + type + height + value
+    /// All components needed to distinguish transactions in the same block
     var uniqueId: String {
         let txidPrefix = txid.prefix(8).map { String(format: "%02x", $0) }.joined()
-        return "\(txidPrefix)_\(type.rawValue)_\(height)"
+        return "\(txidPrefix)_\(type.rawValue)_\(height)_\(value)"
     }
 
     /// Status display string
