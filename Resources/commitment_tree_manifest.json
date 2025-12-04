@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "created_at": "2025-12-04T09:30:36.680840+00:00",
+  "height": 2931955,
+  "cmu_count": 1042351,
+  "block_hash": "000004ef48877c3238b425917a891bca165d1ee2f653c5b92c7d7d3578352c42",
+  "tree_root": "3e8712a591362cf7e4ab4d987be98bc83965351b3db2f24c99c96bd098f26bf4",
+  "files": {
+    "uncompressed": {
+      "name": "commitment_tree.bin",
+      "size": 33355240,
+      "sha256": "a1ada6c78a436d152e39475c90bd97c6314657b199365c96df381dc3af4ce651"
+    },
+    "compressed": {
+      "name": "commitment_tree.bin.zst",
+      "size": 33356019,
+      "sha256": "24eed645046d9fdca1e50e86e8ab0edbde0680a642610f9c67adbbf03c7b0ec1"
+    }
+  }
+}
