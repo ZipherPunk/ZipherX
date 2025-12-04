@@ -1755,10 +1755,15 @@ final class WalletDatabase {
     ///    - Otherwise → it's a RECEIVED transaction
     /// 3. For each SENT tx: actualSent = input.value - sum(change outputs) - fee
     ///
-    /// NOTE: This function CLEARS existing history and rebuilds from notes
+    /// NOTE: This function uses INSERT OR IGNORE to only ADD missing entries.
+    /// It does NOT clear existing history - WalletManager's entries are preserved.
     func populateHistoryFromNotes() throws -> Int {
-        // Clear existing history first to ensure correct values
-        try clearTransactionHistory()
+        // IMPORTANT: Do NOT clear transaction history here!
+        // WalletManager records SENT transactions with the correct amount at send time.
+        // Clearing would wipe out that correct value, then we'd recalculate from notes
+        // which may not yet reflect the pending transaction.
+        // Instead, we use INSERT OR IGNORE to only add missing entries.
+        // try clearTransactionHistory() // REMOVED - this was wiping WalletManager's correct entries
 
         // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
         let sql = """
@@ -1845,16 +1850,18 @@ final class WalletDatabase {
             }
         }
 
-        // IMPORTANT: Use INSERT OR IGNORE for SENT - WalletManager records correct amount at send time
-        // Using INSERT OR REPLACE would overwrite with wrong value calculated from notes
+        // IMPORTANT: Use INSERT OR IGNORE for ALL transaction types
+        // WalletManager records SENT transactions with correct amounts at send time.
+        // We don't want to overwrite those with recalculated values.
+        // For RECEIVED/CHANGE, INSERT OR IGNORE is also fine - only adds new entries.
         let insertSentSql = """
             INSERT OR IGNORE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
-        // For RECEIVED/CHANGE, INSERT OR REPLACE is fine since notes are the source of truth
+        // Also use INSERT OR IGNORE for received (keeps existing entries intact)
         let insertReceivedSql = """
-            INSERT OR REPLACE INTO transaction_history
+            INSERT OR IGNORE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
