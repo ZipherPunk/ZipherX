@@ -1887,7 +1887,7 @@ struct CypherpunkMainView: View {
                 }
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 0) {
+                    VStack(spacing: 0) {
                         ForEach(transactions, id: \.uniqueId) { tx in
                             transactionRow(tx)
                                 .onTapGesture {
@@ -1906,19 +1906,22 @@ struct CypherpunkMainView: View {
             // Direction icon
             Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
                 .font(.system(size: 14, weight: .medium))
-                .foregroundColor(tx.type == .received ? receivedGreen : Color.orange)
+                // RECEIVED = green (money in), SENT = red (money out)
+                .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
                 .frame(width: 24)
 
             // Details
             VStack(alignment: .leading, spacing: 2) {
                 Text(tx.type == .received ? "RECEIVED" : "SENT")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(tx.type == .received ? receivedGreen : Color.orange)
+                    // RECEIVED = green (money in), SENT = red (money out)
+                    .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
 
                 if let date = tx.dateString {
                     Text(date)
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(tx.type == .received ? matrixGreenDarker : Color.orange.opacity(0.7))
+                        // RECEIVED = green (money in), SENT = red (money out)
+                        .foregroundColor(tx.type == .received ? receivedGreen.opacity(0.8) : Color.red.opacity(0.7))
                 }
             }
 
@@ -1927,7 +1930,8 @@ struct CypherpunkMainView: View {
             // Amount
             Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.8f", tx.valueInZCL))")
                 .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundColor(tx.type == .received ? receivedGreen : Color.orange)
+                // RECEIVED = green (money in), SENT = red (money out)
+                .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
 
             // Chevron
             Image(systemName: "chevron.right")
@@ -2032,13 +2036,27 @@ struct CypherpunkMainView: View {
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
                 print("📜 TXHIST [S7]: getTransactionHistory returned \(items.count) items")
 
+                // Deduplicate by type+value+height (same transaction shouldn't appear twice)
+                // Using height instead of txid because same tx can have different txid representations
+                var seen = Set<String>()
+                let deduped = items.filter { item in
+                    let key = "\(item.type.rawValue)_\(item.value)_\(item.height)"
+                    if seen.contains(key) {
+                        print("📜 TXHIST [S7]: Duplicate filtered out: \(key)")
+                        return false
+                    }
+                    seen.insert(key)
+                    return true
+                }
+                print("📜 TXHIST [S7]: After dedup: \(deduped.count) items (removed \(items.count - deduped.count) dupes)")
+
                 // Debug: count sent vs received
-                let sentCount = items.filter { $0.type == .sent }.count
-                let receivedCount = items.filter { $0.type == .received }.count
+                let sentCount = deduped.filter { $0.type == .sent }.count
+                let receivedCount = deduped.filter { $0.type == .received }.count
                 print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
 
                 DispatchQueue.main.async {
-                    self.transactions = items
+                    self.transactions = deduped
                     self.isLoadingHistory = false
                 }
             } catch {

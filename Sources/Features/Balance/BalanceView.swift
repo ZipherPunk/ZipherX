@@ -610,9 +610,15 @@ struct BalanceView: View {
                 }
                 let _ = print("📜 TXHIST VIEW: Showing \(visibleTransactions.count) of \(transactions.count) transactions (hidden: change + all pending)")
                 // Show up to 5 recent transactions (excluding change)
-                VStack(spacing: 1) {
+                VStack(spacing: 0) {
                     ForEach(visibleTransactions.prefix(5), id: \.uniqueId) { tx in
-                        transactionRow(tx)
+                        VStack(spacing: 0) {
+                            transactionRow(tx)
+                            // Separator line between rows
+                            Rectangle()
+                                .fill(theme.borderColor)
+                                .frame(height: 1)
+                        }
                     }
                 }
 
@@ -727,7 +733,8 @@ struct BalanceView: View {
                     } else {
                         Text(tx.dateString ?? realBlockDateString(for: tx.height))
                             .font(theme.captionFont)
-                            .foregroundColor(theme.textSecondary)
+                            // Red for sent, green for received
+                            .foregroundColor(txColor(for: tx.type))
                     }
                 }
 
@@ -796,8 +803,17 @@ struct BalanceView: View {
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)
                 print("📜 TXHIST: getTransactionHistory returned \(items.count) items")
 
+                // Deduplicate by type+value+height (same transaction shouldn't appear twice)
+                var seen = Set<String>()
+                let deduped = items.filter { item in
+                    let key = "\(item.type.rawValue)_\(item.value)_\(item.height)"
+                    if seen.contains(key) { return false }
+                    seen.insert(key)
+                    return true
+                }
+
                 // Debug: print first item if exists
-                if let first = items.first {
+                if let first = deduped.first {
                     let txidShort = String(first.txidString.prefix(12))
                     print("📜 TXHIST: First tx: type=\(first.type), value=\(first.value)zat, height=\(first.height), txid=\(txidShort)")
                 } else {
@@ -805,8 +821,8 @@ struct BalanceView: View {
                 }
 
                 DispatchQueue.main.async {
-                    print("📜 TXHIST: Main thread - setting transactions array to \(items.count) items")
-                    self.transactions = items
+                    print("📜 TXHIST: Main thread - setting transactions array to \(deduped.count) items")
+                    self.transactions = deduped
                     self.isLoadingHistory = false
                     print("📜 TXHIST: Main thread - isLoadingHistory=false, transactions.count=\(self.transactions.count)")
                 }

@@ -207,18 +207,21 @@ final class WalletManager: ObservableObject {
                 let treeSize = ZipherXFFI.treeSize()
 
                 // VALIDATION: Check if tree size is reasonable
-                // The tree should have bundledTreeCMUCount plus CMUs from blocks scanned after bundledTreeHeight
-                // A typical block has 0-30 shielded outputs, so expect ~30 CMUs per block max
-                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
-                let blocksAfterBundled = max(0, Int64(lastScanned) - Int64(bundledTreeHeight))
-                let maxExpectedCMUs = bundledTreeCMUCount + UInt64(blocksAfterBundled) * 20 // realistic max ~20 per block
+                // Use effectiveTreeCMUCount (from UserDefaults) which may be from a downloaded tree
+                // that's newer than the bundled one. This prevents false corruption detection.
+                let effectiveHeight = ZipherXConstants.effectiveTreeHeight
+                let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
 
-                if treeSize < bundledTreeCMUCount || treeSize > maxExpectedCMUs {
-                    print("⚠️ Tree size \(treeSize) seems invalid (expected \(bundledTreeCMUCount)-\(maxExpectedCMUs))")
+                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? effectiveHeight
+                let blocksAfterEffective = max(0, Int64(lastScanned) - Int64(effectiveHeight))
+                let maxExpectedCMUs = effectiveCMUCount + UInt64(blocksAfterEffective) * 20 // realistic max ~20 per block
+
+                if treeSize < effectiveCMUCount || treeSize > maxExpectedCMUs {
+                    print("⚠️ Tree size \(treeSize) seems invalid (expected \(effectiveCMUCount)-\(maxExpectedCMUs))")
                     print("🔄 Clearing corrupted tree state, will reload from bundled CMUs...")
                     // Clear the corrupted state from database
                     try? WalletDatabase.shared.clearTreeState()
-                    try? WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+                    try? WalletDatabase.shared.updateLastScannedHeight(effectiveHeight, hash: Data(count: 32))
                     // Fall through to reload from bundled CMUs
                     // (treeLoadFromCMUs will replace the tree in FFI memory)
                 } else {
@@ -285,68 +288,114 @@ final class WalletManager: ObservableObject {
             self.treeLoadProgress = 0.0
         }
 
-        if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-           let bundledData = try? Data(contentsOf: bundledTreeURL) {
+        // Check for updated tree on GitHub - ONLY on first installation
+        // After initial setup, the app syncs new blocks incrementally via P2P
+        var treeURL: URL?
+        var effectiveTreeHeight = bundledTreeHeight
+        var effectiveCMUCount = bundledTreeCMUCount
 
-            // Cypherpunk messages for tree building
-            let treeLoadMessages = [
-                "Constructing zero-knowledge tree...",
-                "Assembling cryptographic proofs...",
-                "Building Merkle commitments...",
-                "Weaving the privacy lattice...",
-                "Forging shielded infrastructure...",
-                "Computing Pedersen hashes...",
-                "Anchoring the privacy chain...",
-                "Establishing trust anchors..."
-            ]
+        // Check if this is first installation (no tree state in database yet)
+        let hasExistingTreeState = (try? WalletDatabase.shared.getTreeState()) != nil
+        let isFirstInstallation = !hasExistingTreeState
 
-            // Run the heavy FFI call on a background thread so UI updates can process
-            let success = await withCheckedContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let result = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { current, total in
-                        let progress = Double(current) / Double(total)
-                        let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
-                        let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
-
-                        // Rotate through cypherpunk messages
-                        let messageIndex = Int(current / 100000) % treeLoadMessages.count
-                        let statusMessage = treeLoadMessages[messageIndex]
-
-                        // Update UI on main thread
-                        DispatchQueue.main.async {
-                            self?.treeLoadProgress = progress
-                            self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
-                        }
+        if isFirstInstallation {
+            // First installation - check GitHub for newer tree
+            print("🌲 First installation detected - checking for updated tree...")
+            do {
+                let (bestTreeURL, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableTree { progress, status in
+                    Task { @MainActor in
+                        self.treeLoadProgress = progress * 0.1  // 0-10% for update check
+                        self.treeLoadStatus = status
                     }
-                    continuation.resume(returning: result)
                 }
-            }
+                treeURL = bestTreeURL
+                effectiveTreeHeight = height
+                effectiveCMUCount = cmuCount
 
-            if success {
-                let treeSize = ZipherXFFI.treeSize()
-                print("✅ Bundled commitment tree loaded: \(treeSize) commitments")
-
-                // Save to database for next time
-                if let serializedTree = ZipherXFFI.treeSerialize() {
-                    try? WalletDatabase.shared.saveTreeState(serializedTree)
-                    print("💾 Tree state saved to database for future use")
+                if height > bundledTreeHeight {
+                    print("🌲 Using updated tree from GitHub: height \(height) (\(cmuCount) CMUs)")
                 }
-
-                await MainActor.run {
-                    self.isTreeLoaded = true
-                    self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
-                }
-            } else {
-                print("❌ Failed to load bundled tree")
-                await MainActor.run {
-                    self.treeLoadStatus = "Cryptographic tree build failed"
-                }
+            } catch {
+                print("⚠️ Tree update check failed: \(error.localizedDescription)")
+                // Fall back to bundled tree
+                treeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
             }
         } else {
-            print("❌ Bundled tree file not found")
+            // Not first installation - use bundled tree (database tree state handles the rest)
+            print("🌲 Existing wallet - using bundled tree as fallback")
+            treeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
+        }
+
+        guard let finalTreeURL = treeURL ?? Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
+              let bundledData = try? Data(contentsOf: finalTreeURL) else {
+            print("❌ No commitment tree available")
             await MainActor.run {
                 self.treeLoadStatus = "Privacy data not found"
+            }
+            return
+        }
+
+        // Update effective height if using downloaded tree (first installation only)
+        if isFirstInstallation && effectiveTreeHeight > bundledTreeHeight {
+            // Store the effective height for FilterScanner to use
+            UserDefaults.standard.set(Int(effectiveTreeHeight), forKey: "effectiveTreeHeight")
+            UserDefaults.standard.set(Int(effectiveCMUCount), forKey: "effectiveTreeCMUCount")
+        }
+
+        // Proceed with loading tree from CMUs
+        // Cypherpunk messages for tree building
+        let treeLoadMessages = [
+            "Constructing zero-knowledge tree...",
+            "Assembling cryptographic proofs...",
+            "Building Merkle commitments...",
+            "Weaving the privacy lattice...",
+            "Forging shielded infrastructure...",
+            "Computing Pedersen hashes...",
+            "Anchoring the privacy chain...",
+            "Establishing trust anchors..."
+        ]
+
+        // Run the heavy FFI call on a background thread so UI updates can process
+        let success = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { current, total in
+                    let progress = Double(current) / Double(total)
+                    let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
+                    let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
+
+                    // Rotate through cypherpunk messages
+                    let messageIndex = Int(current / 100000) % treeLoadMessages.count
+                    let statusMessage = treeLoadMessages[messageIndex]
+
+                    // Update UI on main thread
+                    DispatchQueue.main.async {
+                        self?.treeLoadProgress = progress
+                        self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
+                    }
+                }
+                continuation.resume(returning: result)
+            }
+        }
+
+        if success {
+            let treeSize = ZipherXFFI.treeSize()
+            print("✅ Commitment tree loaded: \(treeSize) commitments")
+
+            // Save to database for next time
+            if let serializedTree = ZipherXFFI.treeSerialize() {
+                try? WalletDatabase.shared.saveTreeState(serializedTree)
+                print("💾 Tree state saved to database for future use")
+            }
+
+            await MainActor.run {
+                self.isTreeLoaded = true
+                self.treeLoadProgress = 1.0
+                self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+            }
+        } else {
+            print("❌ Failed to load commitment tree")
+            await MainActor.run {
+                self.treeLoadStatus = "Cryptographic tree build failed"
             }
         }
     }
@@ -1694,7 +1743,8 @@ final class WalletManager: ObservableObject {
         }
 
         // Mark the spent note
-        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
+        // NOTE: spentNullifier from WalletNote is already hashed (stored as SHA256 in database)
+        try WalletDatabase.shared.markNoteSpentByHashedNullifier(hashedNullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
         print("✅ Note marked as spent in database")
 
         // CRITICAL: Record transaction in history - MUST succeed before showing success
@@ -1817,7 +1867,8 @@ final class WalletManager: ObservableObject {
 
         // Mark the spent note
         // SECURITY: Never log nullifiers
-        try WalletDatabase.shared.markNoteSpent(nullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
+        // NOTE: spentNullifier from WalletNote is already hashed (stored as SHA256 in database)
+        try WalletDatabase.shared.markNoteSpentByHashedNullifier(hashedNullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
         print("✅ Note marked as spent in database at height \(chainHeight)")
 
         // CRITICAL: Record transaction in history - MUST succeed before showing success
@@ -2301,7 +2352,8 @@ final class WalletManager: ObservableObject {
 
             if isSpent {
                 print("💸 Found spent note: \(note.value) zatoshis (nullifier found on chain)")
-                try database.markNoteSpent(nullifier: note.nullifier, spentHeight: 0) // Height unknown
+                // NOTE: note.nullifier from WalletNote is already hashed (stored as SHA256 in database)
+                try database.markNoteSpentByHashedNullifier(hashedNullifier: note.nullifier, spentHeight: 0) // Height unknown
                 spentCount += 1
             }
         }

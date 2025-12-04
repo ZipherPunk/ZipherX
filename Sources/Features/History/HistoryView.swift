@@ -92,17 +92,23 @@ struct HistoryView: View {
 
     private var transactionList: some View {
         ScrollView {
-            LazyVStack(spacing: 1) {
-                ForEach(transactions, id: \.txidString) { transaction in
-                    transactionRow(transaction)
-                        .onTapGesture {
-                            selectedTransaction = transaction
-                        }
+            LazyVStack(spacing: 0) {
+                ForEach(transactions, id: \.uniqueId) { transaction in
+                    VStack(spacing: 0) {
+                        transactionRow(transaction)
+
+                        // Separator line between rows
+                        Rectangle()
+                            .fill(theme.borderColor)
+                            .frame(height: 1)
+                    }
+                    .onTapGesture {
+                        selectedTransaction = transaction
+                    }
                 }
             }
-            .padding(.vertical, 1)
         }
-        .background(theme.borderColor)
+        .background(theme.backgroundColor)
     }
 
     private func transactionRow(_ transaction: TransactionHistoryItem) -> some View {
@@ -135,8 +141,8 @@ struct HistoryView: View {
                     if let dateString = transaction.dateString {
                         Text(dateString)
                             .font(theme.captionFont)
-                            // Green for received, red for sent - explicit colors for consistency
-                            .foregroundColor(transaction.type == .received ? Color.green : Color.red)
+                            // Red for sent, green for received
+                            .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
                     }
 
                     Spacer()
@@ -144,14 +150,6 @@ struct HistoryView: View {
                     Text("Block \(transaction.height)")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
-                }
-
-                // Address preview (if available)
-                if let address = transaction.toAddress {
-                    Text(shortenAddress(address))
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                        .lineLimit(1)
                 }
             }
 
@@ -183,8 +181,17 @@ struct HistoryView: View {
 
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
 
+                // Deduplicate by type+value+height (same transaction shouldn't appear twice)
+                var seen = Set<String>()
+                let deduped = items.filter { item in
+                    let key = "\(item.type.rawValue)_\(item.value)_\(item.height)"
+                    if seen.contains(key) { return false }
+                    seen.insert(key)
+                    return true
+                }
+
                 DispatchQueue.main.async {
-                    self.transactions = items
+                    self.transactions = deduped
                     self.isLoading = false
                 }
             } catch {
@@ -196,14 +203,6 @@ struct HistoryView: View {
         }
     }
 
-    // MARK: - Helpers
-
-    private func shortenAddress(_ address: String) -> String {
-        guard address.count > 20 else { return address }
-        let prefix = address.prefix(12)
-        let suffix = address.suffix(8)
-        return "\(prefix)...\(suffix)"
-    }
 }
 
 // MARK: - Transaction Detail View
@@ -548,7 +547,7 @@ struct TransactionDetailView: View {
 // MARK: - Identifiable conformance for sheet presentation
 
 extension TransactionHistoryItem: Identifiable {
-    var id: String { txidString + String(value) }
+    var id: String { uniqueId }
 }
 
 #Preview {

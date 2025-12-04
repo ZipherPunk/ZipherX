@@ -1077,11 +1077,20 @@ final class WalletDatabase {
     }
 
     /// Mark note as spent and record sent transaction in history
+    /// NOTE: This function expects an UNHASHED nullifier from the blockchain
+    /// Use markNoteSpentByHashedNullifier() if you have an already-hashed nullifier from the database
     func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64) throws {
         // SECURITY: Never log nullifiers - they are sensitive privacy data
 
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
+        try markNoteSpentByHashedNullifier(hashedNullifier: hashedNullifier, txid: txid, spentHeight: spentHeight)
+    }
+
+    /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
+    /// This is used when we have the nullifier from a WalletNote which is already hashed
+    func markNoteSpentByHashedNullifier(hashedNullifier: Data, txid: Data, spentHeight: UInt64) throws {
+        // SECURITY: Never log nullifiers - they are sensitive privacy data
 
         // First, get the note's value so we can record it in transaction history
         var noteValue: UInt64 = 0
@@ -1129,11 +1138,18 @@ final class WalletDatabase {
     }
 
     /// Mark note as spent by height
-    /// NOTE: Also sets spent_in_tx using nullifier as synthetic txid for history tracking
+    /// NOTE: This function expects an UNHASHED nullifier from the blockchain
+    /// Use markNoteSpentByHashedNullifier() if you have an already-hashed nullifier from the database
+    /// Also sets spent_in_tx using nullifier as synthetic txid for history tracking
     func markNoteSpent(nullifier: Data, spentHeight: UInt64) throws {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
+        try markNoteSpentByHashedNullifier(hashedNullifier: hashedNullifier, spentHeight: spentHeight)
+    }
 
+    /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
+    /// This is used when we have the nullifier from a WalletNote which is already hashed
+    func markNoteSpentByHashedNullifier(hashedNullifier: Data, spentHeight: UInt64) throws {
         // Use nullifier hash as synthetic txid if no real txid available
         // This ensures populateHistoryFromNotes() can still create SENT entries
         let syntheticTxid = hashedNullifier.prefix(32)
@@ -1781,9 +1797,10 @@ final class WalletDatabase {
             sqlite3_finalize(countStmt)
         }
 
-        // Exclude change outputs:
+        // Exclude change outputs and deduplicate:
         // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
         // 2. Also exclude received transactions where the same txid exists as sent
+        // 3. GROUP BY tx_type, value, block_height to deduplicate same transactions with different txids
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
@@ -1795,6 +1812,7 @@ final class WalletDatabase {
                     WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
                 )
             )
+            GROUP BY tx_type, value, block_height
             ORDER BY block_height DESC, created_at DESC
             LIMIT ? OFFSET ?;
         """
