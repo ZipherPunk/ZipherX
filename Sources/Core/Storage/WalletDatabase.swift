@@ -2355,12 +2355,18 @@ struct TransactionHistoryItem {
         if height > 0 {
             let referenceHeight: UInt64 = 2931180
             let referenceTimestamp: TimeInterval = 1733249340 // Dec 3, 2025 18:09 UTC
-            let blockTime: TimeInterval = 150 // 2.5 minutes
+            let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
 
             let heightDiff = Int64(height) - Int64(referenceHeight)
-            let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTime)
+            let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTimeInterval)
             let date = Date(timeIntervalSince1970: estimatedTimestamp)
-            return formatter.string(from: date) + " (est)"
+
+            // Only show "(est)" suffix for older transactions
+            // Recent transactions (within 10 minutes) are likely accurate since
+            // the estimation is based on a recent reference point
+            let now = Date().timeIntervalSince1970
+            let isRecent = abs(estimatedTimestamp - now) < 600 // 10 minutes
+            return formatter.string(from: date) + (isRecent ? "" : " (est)")
         }
 
         // No timestamp available
