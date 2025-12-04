@@ -136,7 +136,19 @@
       "Bash(./build_sqlcipher.sh:*)",
       "Bash(for lib in /Users/chris/ZipherX/Libraries/SQLCipher.xcframework/*/libsqlcipher.a)",
       "Bash(ls:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(if [ -n \"$SIM_DB\" ])",
+      "Bash(then echo \"=== Recent Transactions ===\")",
+      "Bash(then tail -500 /Users/chris/ZipherX/z.log)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo search:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(git rm:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(then grep -E \"TXHIST|getTransactionHistory|Duplicate|populateHistory\" /Users/chris/ZipherX/zmac.log)",
+      "Bash(then grep -E \"TXHIST.*First 5|tx\\[0\\]|tx\\[1\\]|tx\\[2\\]\" /Users/chris/ZipherX/zmac.log)",
+      "Bash(git pull:*)"
     ],
     "deny": [],
     "ask": []

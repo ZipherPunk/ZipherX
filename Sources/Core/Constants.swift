@@ -7,7 +7,9 @@ enum ZipherXConstants {
     // MARK: - Bundled Commitment Tree
 
     /// Height at which the bundled commitment tree ends
-    /// Update this when regenerating the bundled tree file
+    /// Update this when regenerating the bundled tree file AND rebuilding the app
+    /// NOTE: This describes the tree IN THE APP BUNDLE, not the one on GitHub!
+    /// GitHub may have a newer tree - the app downloads it and stores height in UserDefaults
     static let bundledTreeHeight: UInt64 = 2926122
 
     /// Number of CMUs in the bundled tree file
@@ -15,6 +17,19 @@ enum ZipherXConstants {
 
     /// Expected tree root at bundledTreeHeight (for verification)
     static let bundledTreeRoot = "5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945"
+
+    /// Get the effective tree height (downloaded or bundled)
+    /// This is used by FilterScanner to know where to start scanning
+    static var effectiveTreeHeight: UInt64 {
+        let downloaded = UserDefaults.standard.integer(forKey: "effectiveTreeHeight")
+        return downloaded > 0 ? UInt64(downloaded) : bundledTreeHeight
+    }
+
+    /// Get the effective CMU count (downloaded or bundled)
+    static var effectiveTreeCMUCount: UInt64 {
+        let downloaded = UserDefaults.standard.integer(forKey: "effectiveTreeCMUCount")
+        return downloaded > 0 ? UInt64(downloaded) : bundledTreeCMUCount
+    }
 
     // MARK: - Network
 

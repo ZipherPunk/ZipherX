@@ -350,8 +350,10 @@ final class SecureKeyStorage {
         let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        // Write encrypted data with protection
-        try encryptedData.write(to: fileURL, options: [.atomic, .completeFileProtection])
+        // Write encrypted data atomically
+        // NOTE: Don't use .completeFileProtection on macOS - it causes permission errors
+        // The file is already AES-GCM encrypted with a device-bound key
+        try encryptedData.write(to: fileURL, options: [.atomic])
 
         print("✓ macOS: Encrypted key stored at \(fileURL.path)")
     }

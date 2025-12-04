@@ -22,6 +22,7 @@
 		1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */; };
 		2181FB4B936836564DCC5956 /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1AF6B2117E203E51A3F91E /* ThemeManager.swift */; };
 		21856055B80A98DEA5620668 /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
+		21E26CDC970AD9BF5E8EF5C1 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		259A2EDB88C817E0EC89AA3D /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
 		27CCF442814D053CBF8F12A9 /* RustBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD65941062D3050BEA2765F9 /* RustBridge.swift */; };
 		28DAAC08B988CB003CA4C56E /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */; };
@@ -88,6 +89,7 @@
 		A2ADB56D4E059E232CD01868 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
 		A4C736922B9D119338E16056 /* commitment_tree_serialized.bin in Resources */ = {isa = PBXBuildFile; fileRef = 8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */; };
 		A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */; };
+		AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
 		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
@@ -188,6 +190,7 @@
 		ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletSetupView.swift; sourceTree = "<group>"; };
 		ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Theme.swift; sourceTree = "<group>"; };
 		ED775F7A258C12CD4FDBF173 /* ZipherX-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "ZipherX-Bridging-Header.h"; sourceTree = "<group>"; };
+		EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommitmentTreeUpdater.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -261,6 +264,7 @@
 		1BB02293A68E4F3B9A692C67 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */,
 				9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */,
 				119FB9D2179DC1425CABD79E /* NotificationManager.swift */,
 			);
@@ -651,6 +655,7 @@
 				F89810E6B5612D18E485A0D7 /* BootstrapManager.swift in Sources */,
 				A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */,
 				ECE7A8EBCC60183A2F686044 /* Checkpoints.swift in Sources */,
+				AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */,
 				060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */,
 				F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */,
 				C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */,
@@ -706,6 +711,7 @@
 				F81EE61689207BA67EB8D590 /* BootstrapManager.swift in Sources */,
 				36A75F1FA4D8DFF11BDB6137 /* BootstrapProgressView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
+				21E26CDC970AD9BF5E8EF5C1 /* CommitmentTreeUpdater.swift in Sources */,
 				F49F08F7B04F1E25AB55812B /* Constants.swift in Sources */,
 				8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */,
 				4349DCD1E3A8528A99795205 /* CypherpunkTheme.swift in Sources */,

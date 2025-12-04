@@ -1775,7 +1775,34 @@ final class WalletDatabase {
     func getTransactionHistory(limit: Int = 100, offset: Int = 0) throws -> [TransactionHistoryItem] {
         print("📜 getTransactionHistory called")
 
-        // First check total count (excluding change outputs for accurate count)
+        // FIRST: Clean up any duplicate transactions in the database
+        // Duplicates can occur when same tx is recorded with different txid byte orders
+        // Keep the one with the lowest id (first inserted)
+        // VUL-015 fix: Normalize tx_type before grouping to handle both plaintext and obfuscated codes
+        // 'sent' and 'α' are the same, 'received' and 'β' are the same, 'change' and 'γ' are the same
+        let cleanupSql = """
+            DELETE FROM transaction_history
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM transaction_history
+                GROUP BY
+                    CASE
+                        WHEN tx_type IN ('sent', 'α') THEN 'sent'
+                        WHEN tx_type IN ('received', 'β') THEN 'received'
+                        WHEN tx_type IN ('change', 'γ') THEN 'change'
+                        ELSE tx_type
+                    END,
+                    value,
+                    block_height
+            );
+        """
+        if sqlite3_exec(db, cleanupSql, nil, nil, nil) == SQLITE_OK {
+            let deleted = sqlite3_changes(db)
+            if deleted > 0 {
+                print("📜 DB: Cleaned up \(deleted) duplicate transaction(s)")
+            }
+        }
+
+        // Check total count (excluding change outputs for accurate count)
         // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
@@ -1800,7 +1827,7 @@ final class WalletDatabase {
         // Exclude change outputs and deduplicate:
         // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
         // 2. Also exclude received transactions where the same txid exists as sent
-        // 3. GROUP BY tx_type, value, block_height to deduplicate same transactions with different txids
+        // 3. GROUP BY normalized_type, value, block_height to deduplicate (handles plaintext + obfuscated codes)
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
@@ -1812,7 +1839,15 @@ final class WalletDatabase {
                     WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
                 )
             )
-            GROUP BY tx_type, value, block_height
+            GROUP BY
+                CASE
+                    WHEN t1.tx_type IN ('sent', 'α') THEN 'sent'
+                    WHEN t1.tx_type IN ('received', 'β') THEN 'received'
+                    WHEN t1.tx_type IN ('change', 'γ') THEN 'change'
+                    ELSE t1.tx_type
+                END,
+                value,
+                block_height
             ORDER BY block_height DESC, created_at DESC
             LIMIT ? OFFSET ?;
         """
@@ -2467,11 +2502,20 @@ final class WalletDatabase {
             let statusStr = String(cString: sqlite3_column_text(stmt, 8))
             let confirmations = Int(sqlite3_column_int(stmt, 9))
 
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            let decodedType = decryptTxType(typeStr)
+
+            // Debug: Log first 5 items to trace duplicates
+            if items.count < 5 {
+                let txidHex = txidData.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("📜 DB row[\(items.count)]: type=\(typeStr)→\(decodedType.rawValue), height=\(height), value=\(value), txid=\(txidHex)...")
+            }
+
             items.append(TransactionHistoryItem(
-                txid: Data(bytes: txidPtr, count: Int(txidLen)),
+                txid: txidData,
                 height: height,
                 blockTime: blockTime,
-                type: TransactionType(rawValue: typeStr) ?? .sent,
+                type: decodedType,  // VUL-015: Handle both obfuscated (α,β,γ) and plaintext types
                 value: value,
                 fee: fee,
                 toAddress: toAddress,
@@ -2480,6 +2524,8 @@ final class WalletDatabase {
                 confirmations: confirmations
             ))
         }
+
+        print("📜 DB: getTransactionHistory returning \(items.count) items")
 
         return items
     }

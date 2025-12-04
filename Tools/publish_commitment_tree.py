@@ -51,6 +51,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 RESOURCES_DIR = PROJECT_ROOT / "Resources"
 TREE_FILE = RESOURCES_DIR / "commitment_tree.bin"
 COMPRESSED_FILE = RESOURCES_DIR / "commitment_tree.bin.zst"
+SERIALIZED_FILE = RESOURCES_DIR / "commitment_tree_serialized.bin"
 MANIFEST_FILE = RESOURCES_DIR / "commitment_tree_manifest.json"
 FFI_DIR = PROJECT_ROOT / "Libraries" / "zipherx-ffi"
 
@@ -462,6 +463,46 @@ def compress_tree(input_path, output_path):
 
     return True
 
+def generate_serialized_tree(tree_path, output_path):
+    """Generate serialized tree using Rust binary for instant loading"""
+    print(f"\n⚡ Generating serialized tree (for instant app loading)...")
+
+    # Build the serializer if needed
+    serializer_path = FFI_DIR / "target" / "release" / "serialize_tree"
+    if not serializer_path.exists():
+        print("   Building serialize_tree...")
+        result = subprocess.run(
+            ["cargo", "build", "--release", "--bin", "serialize_tree"],
+            cwd=FFI_DIR,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"❌ Build failed: {result.stderr}")
+            return False
+
+    # Run serializer
+    result = subprocess.run(
+        [str(serializer_path), str(tree_path), str(output_path)],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print(f"❌ Serialization failed: {result.stderr}")
+        return False
+
+    # Parse output for stats
+    for line in result.stdout.split('\n'):
+        if 'Serialized' in line or 'bytes' in line.lower():
+            print(f"   {line.strip()}")
+
+    serialized_size = output_path.stat().st_size
+    print(f"   Serialized size: {serialized_size} bytes")
+    print(f"   ✅ App will load tree instantly (<1 second) instead of ~50 seconds!")
+
+    return True
+
 def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, compressed_checksum):
     """Create manifest.json with tree metadata"""
     manifest = {
@@ -491,80 +532,143 @@ def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, com
     print(f"\n📋 Created manifest: {MANIFEST_FILE}")
     return manifest
 
-def git_commit_and_push(height, cmu_count, tree_root, no_push=False):
-    """Commit and push the new tree to GitHub"""
-    print(f"\n📤 Committing to git...")
+def git_commit_push_and_merge(height, cmu_count, tree_root, no_push=False):
+    """Commit, push, and merge to main branch"""
+    print(f"\n📤 Git workflow starting...")
 
     os.chdir(PROJECT_ROOT)
+
+    # Get current branch (using rev-parse for older git compatibility)
+    result = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    current_branch = result.stdout.strip()
+    print(f"   Current branch: {current_branch}")
+
+    # Fetch latest from remote
+    print("   Fetching from remote...")
+    subprocess.run(["git", "fetch", "origin"], capture_output=True)
+
+    # Pull latest changes for current branch
+    print(f"   Pulling latest {current_branch}...")
+    result = subprocess.run(["git", "pull", "origin", current_branch], capture_output=True, text=True)
+    if result.returncode != 0 and "Already up to date" not in result.stdout:
+        print(f"   ⚠️ Pull warning: {result.stderr}")
 
     # Check if there are changes to commit
     result = subprocess.run(["git", "status", "--porcelain", "Resources/"], capture_output=True, text=True)
     if not result.stdout.strip():
         print("   ℹ️ No changes to commit (tree already up to date)")
-        return True
+        # Still try to merge to main if branches differ
+    else:
+        # Add files
+        files_to_add = [
+            "Resources/commitment_tree.bin",
+            "Resources/commitment_tree.bin.zst",
+            "Resources/commitment_tree_serialized.bin",
+            "Resources/commitment_tree_manifest.json"
+        ]
 
-    # Add files
-    files_to_add = [
-        "Resources/commitment_tree.bin",
-        "Resources/commitment_tree.bin.zst",
-        "Resources/commitment_tree_manifest.json"
-    ]
+        for f in files_to_add:
+            file_path = PROJECT_ROOT / f
+            if file_path.exists():
+                subprocess.run(["git", "add", f], check=True)
 
-    for f in files_to_add:
-        file_path = PROJECT_ROOT / f
-        if file_path.exists():
-            subprocess.run(["git", "add", f], check=True)
-
-    # Create detailed commit message
-    commit_msg = f"""Update commitment tree to height {height:,}
+        # Create detailed commit message
+        commit_msg = f"""Update commitment tree to height {height:,}
 
 Tree Statistics:
 - Height: {height:,}
 - CMU Count: {cmu_count:,}
 - Tree Root: {tree_root}
 
-This tree allows ZipherX users to sync faster by skipping historical
-block scanning. The app automatically downloads this on first install.
-
-To use in app bundle (optional):
-1. Copy Resources/commitment_tree.bin to app bundle
-2. Update Constants.swift:
-   - bundledTreeHeight = {height}
-   - bundledTreeCMUCount = {cmu_count}
-   - bundledTreeRoot = "{tree_root}"
-3. Rebuild app
+Files updated:
+- commitment_tree.bin (raw CMUs for download)
+- commitment_tree.bin.zst (compressed for GitHub)
+- commitment_tree_serialized.bin (instant load for app bundle)
+- commitment_tree_manifest.json (metadata)
 
 🤖 Generated with publish_commitment_tree.py"""
 
-    result = subprocess.run(
-        ["git", "commit", "-m", commit_msg],
-        capture_output=True,
-        text=True
-    )
+        result = subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True
+        )
 
-    if result.returncode != 0:
-        if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
-            print("   ℹ️ No changes to commit")
-            return True
-        print(f"   ⚠️ Commit failed: {result.stderr}")
-        return False
+        if result.returncode != 0:
+            if "nothing to commit" not in result.stdout and "nothing to commit" not in result.stderr:
+                print(f"   ⚠️ Commit failed: {result.stderr}")
+                return False
 
-    print(f"   ✅ Committed")
+        print(f"   ✅ Committed to {current_branch}")
 
     if no_push:
-        print("   ⏭️ Skipping push (--no-push flag)")
+        print("   ⏭️ Skipping push and merge (--no-push flag)")
         return True
 
-    # Push
-    print("   Pushing to remote...")
-    result = subprocess.run(["git", "push"], capture_output=True, text=True)
+    # Push current branch
+    print(f"   Pushing {current_branch} to remote...")
+    result = subprocess.run(["git", "push", "origin", current_branch], capture_output=True, text=True)
 
     if result.returncode != 0:
         print(f"   ⚠️ Push failed: {result.stderr}")
         print(f"   You can manually push with: git push")
         return False
 
-    print("   ✅ Pushed to remote")
+    print(f"   ✅ Pushed {current_branch} to remote")
+
+    # Merge to main branch (detect main vs master)
+    # Check which branch exists
+    result = subprocess.run(["git", "branch", "--list", "main"], capture_output=True, text=True)
+    main_branch = "main" if result.stdout.strip() else "master"
+    if current_branch == main_branch:
+        print(f"   ✅ Already on {main_branch}, no merge needed")
+        return True
+
+    print(f"\n🔀 Merging {current_branch} → {main_branch}...")
+
+    # Checkout main
+    result = subprocess.run(["git", "checkout", main_branch], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"   ⚠️ Could not checkout {main_branch}: {result.stderr}")
+        # Go back to original branch
+        subprocess.run(["git", "checkout", current_branch], capture_output=True)
+        return False
+
+    # Pull latest main
+    print(f"   Pulling latest {main_branch}...")
+    subprocess.run(["git", "pull", "origin", main_branch], capture_output=True)
+
+    # Merge current branch into main
+    print(f"   Merging {current_branch} into {main_branch}...")
+    result = subprocess.run(
+        ["git", "merge", current_branch, "-m", f"Merge {current_branch}: Update commitment tree to height {height:,}"],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print(f"   ⚠️ Merge failed: {result.stderr}")
+        print(f"   You may need to resolve conflicts manually")
+        # Go back to original branch
+        subprocess.run(["git", "checkout", current_branch], capture_output=True)
+        return False
+
+    # Push main
+    print(f"   Pushing {main_branch} to remote...")
+    result = subprocess.run(["git", "push", "origin", main_branch], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"   ⚠️ Push {main_branch} failed: {result.stderr}")
+        # Go back to original branch
+        subprocess.run(["git", "checkout", current_branch], capture_output=True)
+        return False
+
+    print(f"   ✅ Merged and pushed to {main_branch}")
+
+    # Go back to original branch
+    subprocess.run(["git", "checkout", current_branch], capture_output=True)
+    print(f"   ✅ Back on {current_branch}")
+
     return True
 
 async def main():
@@ -642,6 +746,11 @@ async def main():
         compressed_checksum = compute_sha256(COMPRESSED_FILE)
         print(f"   Compressed SHA256: {compressed_checksum}")
 
+        # Generate serialized tree for instant app loading
+        if not generate_serialized_tree(tree_path, SERIALIZED_FILE):
+            print("⚠️ Serialized tree generation failed, but continuing...")
+            # Don't fail - serialized tree is optional optimization
+
         # Create manifest
         manifest = create_manifest(
             chain_height,
@@ -665,8 +774,8 @@ async def main():
         print("   No app update required - users get faster sync automatically.")
         print("=" * 60)
 
-        # Git commit and push
-        if git_commit_and_push(chain_height, cmu_count, computed_root, no_push):
+        # Git commit, push, and merge to main
+        if git_commit_push_and_merge(chain_height, cmu_count, computed_root, no_push):
             print(f"\n✅ Tree published successfully!")
         else:
             print(f"\n⚠️ Tree created but git push failed")

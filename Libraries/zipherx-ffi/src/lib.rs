@@ -2446,16 +2446,19 @@ pub unsafe extern "C" fn zipherx_derive_ovk(
 ///
 /// Returns true if the Equihash solution is valid
 ///
-/// Zclassic uses Equihash(200, 9) - same as Zcash
+/// Zclassic uses Equihash(192, 7) since the Bubbles upgrade at height 585,318
+/// Before that it used Equihash(200, 9) like Zcash
+/// Solution size: (2^K) * (N/(K+1) + 1) / 8 = 128 * 25 / 8 = 400 bytes
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_verify_equihash(
     header_bytes: *const u8,
     solution: *const u8,
     solution_len: usize,
 ) -> bool {
-    // Zclassic/Zcash Equihash parameters
-    const N: u32 = 200;
-    const K: u32 = 9;
+    // Zclassic Equihash parameters (post-Bubbles upgrade at height 585,318)
+    // Changed from Zcash's (200, 9) to (192, 7) for ASIC resistance
+    const N: u32 = 192;
+    const K: u32 = 7;
 
     // Header is 140 bytes total:
     // - First 108 bytes: header data (input for Equihash)

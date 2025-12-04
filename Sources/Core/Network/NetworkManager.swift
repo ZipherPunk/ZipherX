@@ -1495,7 +1495,9 @@ final class NetworkManager: ObservableObject {
 
             // EARLY CHECK: Skip change outputs from our own pending transactions
             // This prevents change from being counted in mempoolIncoming
-            if pendingOutgoingTxids.contains(txHashHex) {
+            // Check BOTH the actor set AND the sync-accessible set to handle race condition
+            // where setPendingBroadcast has updated the sync set but actor update is still pending
+            if pendingOutgoingTxids.contains(txHashHex) || isPendingOutgoingSync(txid: txHashHex) {
                 print("🔮 MEMPOOL: Skipping tx \(txHashHex.prefix(12))... (change output from our pending send)")
                 continue
             }
