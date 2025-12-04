@@ -135,8 +135,8 @@ struct HistoryView: View {
                     if let dateString = transaction.dateString {
                         Text(dateString)
                             .font(theme.captionFont)
-                            // Green for received (same as icon/amount), red for sent
-                            .foregroundColor(transaction.type == .received ? Color(red: 0.2, green: 0.8, blue: 0.2) : theme.errorColor)
+                            // Green for received, red for sent - explicit colors for consistency
+                            .foregroundColor(transaction.type == .received ? Color.green : Color.red)
                     }
 
                     Spacer()

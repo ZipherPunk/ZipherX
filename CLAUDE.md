@@ -2915,12 +2915,52 @@ int sqlite3_prepare_v2(...);
    - Minimize battery/network usage
    - Push notification for incoming transactions
 
-## Contact
+---
 
-For questions about this project, refer to the architecture document or review the security model section.
-- z.log is available as usual here : /Users/chris/ZipherX
-- never kill any processes !
-- never kill any processes !
+### 50. Comprehensive Security Audit (December 4, 2025)
+
+**Full security audit performed covering:**
+- Architecture review
+- Vulnerability assessment (28 findings: 4 Critical, 4 High, 12 Medium, 8 Low)
+- Network security analysis
+- Cryptographic implementation review
+- Performance analysis
+- High availability assessment
+
+**Audit Documents Created:**
+- `/Users/chris/ZipherX/docs/SECURITY_AUDIT_FULL_2025-12-04.md` - Full markdown report
+- `/Users/chris/ZipherX/docs/SECURITY_AUDIT_FULL_2025-12-04.html` - Styled HTML report
+
+**Security Score: 72/100** - Suitable for beta testing only
+
+**Critical Findings (P0):**
+1. VUL-001: Consensus threshold too low (2 instead of 5+)
+2. VUL-002: Encryption silent fallback to plaintext
+3. VUL-003: Equihash PoW not verified
+4. VUL-004: Single-input transactions only
+
+**High Severity Findings (P1):**
+1. VUL-005: Biometric disabled = zero authentication
+2. VUL-006: InsightAPI dependency for chain height
+3. VUL-007: SQLCipher fallback to plaintext database
+4. VUL-008: Spending key unzeroed in memory
+
+**View full audit:** `open /Users/chris/ZipherX/docs/SECURITY_AUDIT_FULL_2025-12-04.html`
+
+---
+
+### 51. History View Date Color Fix (December 4, 2025)
+
+**Problem**: Incoming transaction dates displayed in red/orange on macOS instead of green.
+
+**Fix**: Changed date color to use explicit `Color.green` for received transactions instead of relying on `theme.successColor` which may have platform-specific variations.
+
+**File Modified:**
+- `Sources/Features/History/HistoryView.swift` - line 139
+
+---
+
+## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
 - z.log is available as usual here : /Users/chris/ZipherX
