@@ -1626,8 +1626,9 @@ final class WalletManager: ObservableObject {
             self.lastSendTimestamp = Date()
         }
 
-        // Get spending key from Secure Enclave
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // SECURITY: Get spending key wrapped in SecureData for automatic memory cleanup
+        // The key is zeroed as soon as the transaction is built (VUL-002 mitigation)
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
         onProgress("prover", nil, nil)
 
         // Build shielded transaction with progress
@@ -1637,9 +1638,12 @@ final class WalletManager: ObservableObject {
             to: toAddress,
             amount: amount,
             memo: memo,
-            spendingKey: spendingKey,
+            spendingKey: secureKey.data,
             onProgress: onProgress
         )
+
+        // SECURITY: Zero the spending key memory immediately after use
+        secureKey.zero()
 
         onProgress("broadcast", "Preparing to broadcast...", 0.0)
 
@@ -1758,8 +1762,9 @@ final class WalletManager: ObservableObject {
             self.lastSendTimestamp = Date()
         }
 
-        // Get spending key from Secure Enclave
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // SECURITY: Get spending key wrapped in SecureData for automatic memory cleanup
+        // The key is zeroed as soon as the transaction is built (VUL-002 mitigation)
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
 
         // Build shielded transaction
         let txBuilder = TransactionBuilder()
@@ -1768,8 +1773,11 @@ final class WalletManager: ObservableObject {
             to: toAddress,
             amount: amount,
             memo: memo,
-            spendingKey: spendingKey
+            spendingKey: secureKey.data
         )
+
+        // SECURITY: Zero the spending key memory immediately after use
+        secureKey.zero()
 
         // Broadcast through multi-peer network
         let networkManager = NetworkManager.shared

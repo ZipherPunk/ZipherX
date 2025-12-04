@@ -180,4 +180,62 @@ bool zipherx_verify_block_header(
     uint8_t *hash_out
 );
 
+// =============================================================================
+// VUL-002 FIX: Encrypted Key Operations
+// =============================================================================
+// These functions accept AES-GCM-256 encrypted spending keys and decrypt them
+// in Rust where memory can be explicitly zeroed. The decrypted key never leaves
+// Rust's control and is zeroed immediately after use.
+//
+// Encryption format (197 bytes):
+// - 12 bytes: Nonce
+// - 169 bytes: Encrypted spending key
+// - 16 bytes: Authentication tag
+//
+// The encryption key (32 bytes) is derived from device ID + salt using HKDF
+// on the Swift side and passed separately.
+
+// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
+// encrypted_sk: 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
+// encrypted_sk_len: length of encrypted key (should be 197)
+// encryption_key: 32-byte AES-256 key for decryption
+// Other parameters same as zipherx_build_transaction
+bool zipherx_build_transaction_encrypted(
+    const uint8_t *encrypted_sk,
+    size_t encrypted_sk_len,
+    const uint8_t *encryption_key,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const uint8_t *anchor,
+    const uint8_t *witness_data,
+    size_t witness_len,
+    uint64_t note_value,
+    const uint8_t *note_rcm,
+    const uint8_t *note_diversifier,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len
+);
+
+// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
+// encrypted_sk: 197-byte AES-GCM encrypted spending key
+// encrypted_sk_len: length of encrypted key (should be 197)
+// encryption_key: 32-byte AES-256 key for decryption
+// Other parameters same as zipherx_build_transaction_multi
+bool zipherx_build_transaction_multi_encrypted(
+    const uint8_t *encrypted_sk,
+    size_t encrypted_sk_len,
+    const uint8_t *encryption_key,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const SpendInfo *const *spends,
+    size_t spend_count,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len,
+    uint8_t *nullifiers_out
+);
+
 #endif // ZIPHERX_FFI_H

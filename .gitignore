@@ -53,3 +53,7 @@ secrets/
 *.log
 *.tmp
 Libraries/librustzcash/
+
+# SQLCipher build artifacts (xcframework is kept)
+Libraries/sqlcipher-src/
+Libraries/sqlcipher-build/

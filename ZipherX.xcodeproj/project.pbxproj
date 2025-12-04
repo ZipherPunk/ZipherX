@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		06B12D7857EFEC8AC250FC21 /* Win95Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA9A163DB79D1C4871FD5D /* Win95Theme.swift */; };
@@ -58,7 +59,9 @@
 		6B254DA0AB46A3D05A144574 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
 		6EE32FD3ED6A227AA235757E /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */; };
 		71011647034F4C4BEBD2C1CF /* RPCClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */; };
+		7452567C2A4A2B9E1EDE3B36 /* SQLCipher.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */; };
 		745902783803843898150674 /* TransactionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */; };
+		7641927DD93D363970BBAEE6 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD9AE42E2111119140BAC99 /* AppDelegate.swift */; };
 		76CAA651280ABA8925035994 /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */; };
 		76E34B0E07EC1B8587C2BE12 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		772BD4E27BC23CDF88246433 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */; };
@@ -91,9 +94,12 @@
 		BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6C673DA8922F1FE8EAAB2C04 /* Assets.xcassets */; };
 		BE9229075EDEE71F40F43823 /* ModernTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */; };
 		BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */; };
+		C0B80B951C400D297715A372 /* SQLCipher.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */; };
 		C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */; };
+		C6307F815EFF9450C89C86CD /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
+		CEA228C1D6634E2A20C27D04 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD9AE42E2111119140BAC99 /* AppDelegate.swift */; };
 		D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235376F572F89B6D83EDA88C /* WalletTests.swift */; };
 		DCB48F14E31DBA6705F0BC79 /* Peer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D92FD9B357E6379040DA58 /* Peer.swift */; };
 		DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
@@ -124,6 +130,8 @@
 		04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyQuotes.swift; sourceTree = "<group>"; };
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
 		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = SQLCipher.xcframework; path = Libraries/SQLCipher.xcframework; sourceTree = "<group>"; };
+		0CD9AE42E2111119140BAC99 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		0D75DBA8AB67E579618328D1 /* ZipherXMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZipherXMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0DFA9A163DB79D1C4871FD5D /* Win95Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Win95Theme.swift; sourceTree = "<group>"; };
 		119FB9D2179DC1425CABD79E /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
@@ -154,6 +162,7 @@
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
 		8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = commitment_tree_serialized.bin; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
+		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
@@ -184,6 +193,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				462B43AF87D801C815856A0F /* ZipherXFFI.xcframework in Frameworks */,
+				C0B80B951C400D297715A372 /* SQLCipher.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -192,6 +202,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				2D96C7EA7C24EED23DBAFFCD /* ZipherXFFI.xcframework in Frameworks */,
+				7452567C2A4A2B9E1EDE3B36 /* SQLCipher.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -218,6 +229,7 @@
 		09CCC4CE13F9688905FC13C9 /* App */ = {
 			isa = PBXGroup;
 			children = (
+				0CD9AE42E2111119140BAC99 /* AppDelegate.swift */,
 				630CFD90F45505D02500501A /* ContentView.swift */,
 				ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */,
 				69E10579679A9004FDC0EDFB /* ZipherXApp.swift */,
@@ -375,6 +387,7 @@
 				9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */,
 				20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */,
 				1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */,
+				9068ED711254490CAD1CD553 /* SQLCipherManager.swift */,
 				7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */,
 			);
 			path = Storage;
@@ -464,6 +477,7 @@
 		BF076F58239E016FB50CB85E /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */,
 				58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */,
 			);
 			name = Frameworks;
@@ -625,6 +639,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CEA228C1D6634E2A20C27D04 /* AppDelegate.swift in Sources */,
 				46D80759524E31A7309DEA25 /* BIP39Wordlist.swift in Sources */,
 				53AD3883AF96C239472094A2 /* BalanceView.swift in Sources */,
 				92A36FAFBBE9E6E5CE516875 /* BiometricAuthManager.swift in Sources */,
@@ -654,6 +669,7 @@
 				3D08C9F31B8F9C6F1837B406 /* RPCClient.swift in Sources */,
 				28DAAC08B988CB003CA4C56E /* ReceiveView.swift in Sources */,
 				8B6D4C9B2735242DFEC82611 /* RustBridge.swift in Sources */,
+				002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */,
 				6B254DA0AB46A3D05A144574 /* SaplingParams.swift in Sources */,
 				3AF8215663CEA8C7DE065E19 /* SecureKeyStorage.swift in Sources */,
 				5914C82375A7F26280EC072B /* SendView.swift in Sources */,
@@ -677,6 +693,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7641927DD93D363970BBAEE6 /* AppDelegate.swift in Sources */,
 				6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */,
 				415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */,
 				39DBED283CC3B60CAF879629 /* BiometricAuthManager.swift in Sources */,
@@ -706,6 +723,7 @@
 				71011647034F4C4BEBD2C1CF /* RPCClient.swift in Sources */,
 				596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */,
 				27CCF442814D053CBF8F12A9 /* RustBridge.swift in Sources */,
+				C6307F815EFF9450C89C86CD /* SQLCipherManager.swift in Sources */,
 				B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */,
 				081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */,
 				4331F01B9D809A6E140AC797 /* SendView.swift in Sources */,
@@ -789,6 +807,7 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -813,6 +832,11 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/$(PLATFORM_NAME)-$(CURRENT_ARCH)/Headers",
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64_x86_64-simulator/Headers",
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64/Headers",
+				);
 				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -835,6 +859,11 @@
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"Libraries\"",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/$(PLATFORM_NAME)-$(CURRENT_ARCH)/Headers",
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64_x86_64-simulator/Headers",
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64/Headers",
 				);
 				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -862,6 +891,7 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

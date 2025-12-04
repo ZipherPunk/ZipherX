@@ -8,7 +8,8 @@
 // When SQLCipher is not available, falls back to field-level encryption.
 
 import Foundation
-import SQLite3
+// Note: sqlite3 functions are available via bridging header (SQLCipher)
+// Do NOT import SQLite3 here as it conflicts with SQLCipher's sqlite3.h
 import CryptoKit
 #if os(iOS)
 import UIKit
@@ -105,9 +106,16 @@ final class SQLCipherManager {
     }
 
     /// Get the encryption key as a hex string (for PRAGMA key)
+    /// SQLCipher requires format: "x'..hex..'" with double quotes around the blob
     func getEncryptionKeyHex() throws -> String {
         let keyData = try getEncryptionKey()
-        return "x'" + keyData.map { String(format: "%02x", $0) }.joined() + "'"
+        // SQLCipher syntax: PRAGMA key = "x'..hex..'";
+        // The hex blob must be wrapped in double quotes
+        let hex = "\"x'" + keyData.map { String(format: "%02x", $0) }.joined() + "'\""
+        // Log key fingerprint (first 4 bytes) for debugging
+        let fingerprint = keyData.prefix(4).map { String(format: "%02x", $0) }.joined()
+        print("🔑 Key fingerprint: \(fingerprint)...")
+        return hex
     }
 
     /// Get or create salt for key derivation
@@ -196,11 +204,12 @@ final class SQLCipherManager {
         }
 
         let keyHex = try getEncryptionKeyHex()
+        var errMsg: UnsafeMutablePointer<CChar>?
 
         // Apply the key using PRAGMA key
-        let sql = "PRAGMA key = \(keyHex);"
-        var errMsg: UnsafeMutablePointer<CChar>?
-        let result = sqlite3_exec(db, sql, nil, nil, &errMsg)
+        // SQLCipher 4.x uses secure defaults (AES-256-CBC, HMAC-SHA512, 256000 iterations)
+        let keySQL = "PRAGMA key = \(keyHex);"
+        let result = sqlite3_exec(db, keySQL, nil, nil, &errMsg)
 
         if result != SQLITE_OK {
             let error = errMsg != nil ? String(cString: errMsg!) : "Unknown error"
@@ -210,8 +219,12 @@ final class SQLCipherManager {
 
         // Verify encryption is working by querying something
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master;", -1, &stmt, nil) != SQLITE_OK {
-            throw SQLCipherError.encryptionFailed("Database key verification failed")
+        let prepResult = sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master;", -1, &stmt, nil)
+        if prepResult != SQLITE_OK {
+            let errorCode = sqlite3_errcode(db)
+            let errorMsg = String(cString: sqlite3_errmsg(db))
+            print("🔐 Key verification failed: code=\(errorCode), msg=\(errorMsg)")
+            throw SQLCipherError.encryptionFailed("Database key verification failed: \(errorMsg)")
         }
         sqlite3_finalize(stmt)
 
@@ -234,8 +247,13 @@ final class SQLCipherManager {
         }
         defer { sqlite3_close(sourceDb) }
 
-        // Attach encrypted destination database
+        // Attach encrypted destination database with SQLCipher 4.x defaults
+        // The key and cipher settings are passed in the ATTACH statement
         let keyHex = try getEncryptionKeyHex()
+
+        // SQLCipher 4.x uses these defaults - we explicitly set them to ensure consistency
+        // cipher_page_size=4096, kdf_iter=256000, HMAC_SHA512, PBKDF2_HMAC_SHA512
+        // These are the defaults for SQLCipher 4.x so we don't need to override them
         let attachSQL = "ATTACH DATABASE '\(destPath)' AS encrypted KEY \(keyHex);"
 
         var errMsg: UnsafeMutablePointer<CChar>?

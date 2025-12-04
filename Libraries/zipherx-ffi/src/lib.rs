@@ -2685,3 +2685,600 @@ pub unsafe extern "C" fn zipherx_verify_block_header(
 
     true
 }
+
+// =============================================================================
+// VUL-002 FIX: Encrypted Key Operations
+// =============================================================================
+// These functions accept AES-GCM-256 encrypted spending keys and decrypt them
+// in Rust where memory can be explicitly zeroed. The decrypted key never leaves
+// Rust's control and is zeroed immediately after use.
+//
+// Encryption format (197 bytes):
+// - 12 bytes: Nonce
+// - 169 bytes: Encrypted spending key
+// - 16 bytes: Authentication tag
+//
+// The encryption key (32 bytes) is derived from device ID + salt using HKDF on
+// the Swift side and passed separately.
+
+/// Zero-fill a mutable byte slice to securely erase sensitive data
+/// Uses volatile write pattern to prevent compiler optimization
+#[inline(never)]
+fn secure_zero(data: &mut [u8]) {
+    use std::ptr;
+    for byte in data.iter_mut() {
+        unsafe {
+            ptr::write_volatile(byte, 0);
+        }
+    }
+    // Memory barrier to ensure the writes are not optimized away
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Decrypt an AES-GCM-256 encrypted spending key
+/// Returns a vector that should be zeroed after use
+fn decrypt_spending_key(
+    encrypted_sk: &[u8],   // 197 bytes: nonce(12) + ciphertext(169) + tag(16)
+    encryption_key: &[u8], // 32 bytes: AES-256 key
+) -> Result<Vec<u8>, &'static str> {
+    use chacha20poly1305::aead::generic_array::GenericArray;
+
+    if encrypted_sk.len() != 197 {
+        return Err("Invalid encrypted key length (expected 197 bytes)");
+    }
+    if encryption_key.len() != 32 {
+        return Err("Invalid encryption key length (expected 32 bytes)");
+    }
+
+    // Parse components
+    let nonce = &encrypted_sk[0..12];
+    let ciphertext_with_tag = &encrypted_sk[12..197]; // 169 + 16 = 185 bytes
+
+    // Use AES-256-GCM for decryption
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray as AesGenericArray;
+
+    let key = AesGenericArray::from_slice(encryption_key);
+    let cipher = Aes256Gcm::new(key);
+    let nonce_arr = AesGenericArray::from_slice(nonce);
+
+    match cipher.decrypt(nonce_arr, ciphertext_with_tag) {
+        Ok(decrypted) => {
+            if decrypted.len() != 169 {
+                return Err("Decrypted key has wrong length");
+            }
+            Ok(decrypted)
+        }
+        Err(_) => Err("AES-GCM decryption failed (wrong key or corrupted data)"),
+    }
+}
+
+/// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
+///
+/// This is the secure version of zipherx_build_transaction. The spending key is:
+/// 1. Encrypted with AES-GCM-256 on the Swift side
+/// 2. Passed to Rust encrypted
+/// 3. Decrypted only within this function
+/// 4. Used for transaction building
+/// 5. Immediately zeroed after use
+///
+/// # Safety
+/// - encrypted_sk: 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
+/// - encryption_key: 32-byte AES-256 key for decryption
+/// - to_address: 43-byte payment address
+/// - amount: amount to send in zatoshis
+/// - memo: 512-byte memo or null for empty
+/// - witness_data: serialized IncrementalWitness
+/// - witness_len: length of witness data
+/// - note_value: value of note being spent in zatoshis
+/// - note_rcm: 32-byte note commitment randomness
+/// - note_diversifier: 11-byte diversifier
+/// - chain_height: current chain height for branch ID
+/// - tx_out: output buffer (at least 10000 bytes)
+/// - tx_out_len: receives actual transaction length
+///
+/// Returns true on success, false on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
+    encrypted_sk: *const u8,
+    encrypted_sk_len: usize,
+    encryption_key: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    _anchor: *const u8,
+    witness_data: *const u8,
+    witness_len: usize,
+    note_value: u64,
+    note_rcm: *const u8,
+    note_diversifier: *const u8,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+) -> bool {
+    // Validate input lengths
+    if encrypted_sk_len != 197 {
+        eprintln!("❌ Invalid encrypted key length: {} (expected 197)", encrypted_sk_len);
+        return false;
+    }
+
+    let encrypted_slice = slice::from_raw_parts(encrypted_sk, 197);
+    let enc_key_slice = slice::from_raw_parts(encryption_key, 32);
+
+    // Decrypt the spending key
+    let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
+        Ok(sk) => sk,
+        Err(e) => {
+            eprintln!("❌ Failed to decrypt spending key: {}", e);
+            return false;
+        }
+    };
+
+    debug_log!("🔐 VUL-002: Spending key decrypted in Rust (will zero after use)");
+
+    // === Use the decrypted key ===
+
+    // Get the prover
+    let prover_guard = PROVER.lock().unwrap();
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // Parse inputs
+    let to_addr_slice = slice::from_raw_parts(to_address, 43);
+    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+    let rcm_slice = slice::from_raw_parts(note_rcm, 32);
+    let div_slice = slice::from_raw_parts(note_diversifier, 11);
+
+    // Deserialize spending key from decrypted data
+    let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // Parse destination address
+    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // Parse note commitment randomness
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid rcm");
+            return false;
+        }
+    };
+
+    // Parse diversifier
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    // Get the address that received this note using the note's diversifier
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid diversifier for note address");
+            return false;
+        }
+    };
+
+    // Calculate fee
+    let fee = 10000u64;
+
+    // Verify funds
+    if note_value < amount + fee {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Insufficient funds: have {}, need {}", note_value, amount + fee);
+        return false;
+    }
+
+    // Create note to spend using the diversifier's address
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(note_value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    // Deserialize the IncrementalWitness
+    let mut reader = std::io::Cursor::new(witness_slice);
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(e) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Failed to deserialize witness: {:?}", e);
+                return false;
+            }
+        };
+
+    // Get the merkle path from the witness
+    let merkle_path = match witness.path() {
+        Some(p) => p,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to get merkle path from witness");
+            return false;
+        }
+    };
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Add spend
+    if let Err(e) = builder.add_sapling_spend(
+        extsk.clone(),
+        diversifier,
+        note.clone(),
+        merkle_path,
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add spend: {:?}", e);
+        return false;
+    }
+
+    // Prepare memo
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        let memo_slice = slice::from_raw_parts(memo, 512);
+        let mut m = [0u8; 512];
+        m.copy_from_slice(memo_slice);
+        m
+    };
+    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+
+    // Convert amount to Amount type
+    let amount_val = Amount::from_i64(amount as i64).unwrap();
+
+    // Add output to recipient
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // Add change output if needed
+    let change = note_value - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let (_, change_addr) = extsk.default_address();
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+    }
+
+    // Build the transaction with proofs
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+        Ok(result) => result,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // === CRITICAL: Zero the decrypted spending key ===
+    secure_zero(&mut decrypted_sk);
+    debug_log!("🔐 VUL-002: Spending key zeroed from memory");
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    // Copy to output
+    if tx_bytes.len() > 10000 {
+        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+}
+
+/// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
+///
+/// This is the secure version of zipherx_build_transaction_multi.
+///
+/// # Safety
+/// - encrypted_sk: 197-byte AES-GCM encrypted spending key
+/// - encryption_key: 32-byte AES-256 key
+/// - Other parameters same as zipherx_build_transaction_multi
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
+    encrypted_sk: *const u8,
+    encrypted_sk_len: usize,
+    encryption_key: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    spends: *const *const SpendInfo,
+    spend_count: usize,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+    nullifiers_out: *mut u8,
+) -> bool {
+    if spend_count == 0 || spend_count > 100 {
+        eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
+        return false;
+    }
+
+    // Validate input lengths
+    if encrypted_sk_len != 197 {
+        eprintln!("❌ Invalid encrypted key length: {} (expected 197)", encrypted_sk_len);
+        return false;
+    }
+
+    let encrypted_slice = slice::from_raw_parts(encrypted_sk, 197);
+    let enc_key_slice = slice::from_raw_parts(encryption_key, 32);
+
+    // Decrypt the spending key
+    let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
+        Ok(sk) => sk,
+        Err(e) => {
+            eprintln!("❌ Failed to decrypt spending key: {}", e);
+            return false;
+        }
+    };
+
+    debug_log!("🔐 VUL-002: Spending key decrypted in Rust for multi-spend (will zero after use)");
+
+    // Get the prover
+    let prover_guard = PROVER.lock().unwrap();
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // Parse inputs
+    let to_addr_slice = slice::from_raw_parts(to_address, 43);
+
+    // Deserialize spending key
+    let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // Parse destination address
+    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // Calculate fee
+    let fee = 10000u64;
+
+    // Parse all spends and calculate total input value
+    let spend_infos = slice::from_raw_parts(spends, spend_count);
+    let mut total_input: u64 = 0;
+    let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
+
+    for (i, spend_ptr) in spend_infos.iter().enumerate() {
+        let spend = &**spend_ptr;
+
+        let witness_slice = slice::from_raw_parts(spend.witness_data, spend.witness_len);
+        let rcm_slice = slice::from_raw_parts(spend.note_rcm, 32);
+        let div_slice = slice::from_raw_parts(spend.note_diversifier, 11);
+
+        // Parse note commitment randomness
+        let mut rcm_bytes = [0u8; 32];
+        rcm_bytes.copy_from_slice(rcm_slice);
+        let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+            Some(r) => r,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid rcm for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse diversifier
+        let mut div_bytes = [0u8; 11];
+        div_bytes.copy_from_slice(div_slice);
+        let diversifier = Diversifier(div_bytes);
+
+        // Get the address that received this note
+        let fvk = extsk.to_diversifiable_full_viewing_key();
+        let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+            Some(addr) => addr,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid diversifier for spend {}", i);
+                return false;
+            }
+        };
+
+        // Create note to spend
+        let note = zcash_primitives::sapling::Note::from_parts(
+            note_addr,
+            NoteValue::from_raw(spend.note_value),
+            Rseed::BeforeZip212(rcm),
+        );
+
+        // Deserialize witness
+        let mut reader = std::io::Cursor::new(witness_slice);
+        let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => w,
+                Err(e) => {
+                    secure_zero(&mut decrypted_sk);
+                    eprintln!("❌ Failed to deserialize witness {}: {:?}", i, e);
+                    return false;
+                }
+            };
+
+        let merkle_path = match witness.path() {
+            Some(p) => p,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Failed to get merkle path for spend {}", i);
+                return false;
+            }
+        };
+
+        total_input += spend.note_value;
+        parsed_spends.push((note, merkle_path, diversifier));
+    }
+
+    // Verify funds
+    if total_input < amount + fee {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Insufficient funds: have {}, need {}", total_input, amount + fee);
+        return false;
+    }
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Add all spends
+    for (note, merkle_path, diversifier) in parsed_spends.iter() {
+        if let Err(e) = builder.add_sapling_spend(
+            extsk.clone(),
+            *diversifier,
+            note.clone(),
+            merkle_path.clone(),
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add spend: {:?}", e);
+            return false;
+        }
+    }
+
+    // Prepare memo
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        let memo_slice = slice::from_raw_parts(memo, 512);
+        let mut m = [0u8; 512];
+        m.copy_from_slice(memo_slice);
+        m
+    };
+    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+
+    // Add output to recipient
+    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // Add change output if needed
+    let change = total_input - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let (_, change_addr) = extsk.default_address();
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+    }
+
+    // Build the transaction with proofs
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+        Ok(result) => result,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // Compute and output nullifiers for all spent notes
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let nk = dfvk.fvk().vk.nk;
+
+    for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
+        let position = u64::try_from(merkle_path.position()).unwrap_or(0);
+        let nf_result = note.nf(&nk, position);
+        let nf_bytes = nf_result.0;
+        let offset = i * 32;
+        std::ptr::copy_nonoverlapping(nf_bytes.as_ptr(), nullifiers_out.add(offset), 32);
+    }
+
+    // === CRITICAL: Zero the decrypted spending key ===
+    secure_zero(&mut decrypted_sk);
+    debug_log!("🔐 VUL-002: Spending key zeroed from memory (multi-spend)");
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    if tx_bytes.len() > 10000 {
+        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+}

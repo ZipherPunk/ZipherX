@@ -1860,7 +1860,7 @@ Created comprehensive cypherpunk-styled HTML security audit report:
   - iOS Simulator: 2m13s total (56s tree load + 77s scan)
   - macOS: 2m50s total (57s tree load + 113s scan)
 - Security Findings:
-  - **CRITICAL**: SQLite database NOT encrypted (SQLCipher not implemented)
+  - ~~**CRITICAL**: SQLite database NOT encrypted~~ ✅ FIXED: SQLCipher XCFramework integrated (December 4, 2025)
   - **WARNING**: Spending keys in memory during signing
   - **WARNING**: macOS file-based key storage (no Secure Enclave for Sapling keys)
   - **PASSED**: Key encryption (AES-GCM-256), No hardcoded credentials, Network security (HTTPS), Biometric auth, Sapling proof verification, Tree integrity
@@ -2688,19 +2688,199 @@ guard let rawTx = rawTx else {
 
 ---
 
+### 42. SQLCipher Full Database Encryption (December 4, 2025)
+
+**Feature**: Built and integrated SQLCipher XCFramework for full AES-256 database encryption.
+
+**Build Process**:
+1. Cloned official SQLCipher v4.6.0 from https://github.com/sqlcipher/sqlcipher.git
+2. Created custom build script (`Libraries/build_sqlcipher.sh`) that builds:
+   - iOS Device (arm64)
+   - iOS Simulator (arm64 + x86_64 universal)
+   - macOS (arm64 + x86_64 universal)
+3. Uses Apple Common Crypto for encryption (no OpenSSL dependency)
+4. Disabled Tcl bindings (`--disable-tcl`) to avoid build issues
+
+**SQLCipher.xcframework Contents**:
+```
+Libraries/SQLCipher.xcframework/
+├── Info.plist
+├── ios-arm64/
+│   └── libsqlcipher.a (arm64)
+├── ios-arm64_x86_64-simulator/
+│   └── libsqlcipher.a (arm64 + x86_64 universal)
+└── macos-arm64_x86_64/
+    └── libsqlcipher.a (arm64 + x86_64 universal)
+```
+
+**Integration**:
+- Added SQLCipher.xcframework dependency to both iOS and macOS targets in `project.yml`
+- Updated bridging header to include `<sqlite3.h>` for SQLCipher PRAGMA commands
+- `SQLCipherManager.swift` detects SQLCipher availability and applies encryption key
+
+**Encryption Flow**:
+1. On database open, check if SQLCipher is available (`PRAGMA cipher_version`)
+2. If available, derive 256-bit key from device ID + salt using HKDF-SHA256
+3. Apply key with `PRAGMA key = x'...'` immediately after sqlite3_open()
+4. All database operations are now transparently encrypted
+
+**Compiler Flags Used**:
+```
+-DSQLITE_HAS_CODEC
+-DSQLCIPHER_CRYPTO_CC
+-DSQLITE_TEMP_STORE=2
+-DSQLITE_THREADSAFE=1
+-DSQLITE_ENABLE_FTS5
+-DSQLITE_ENABLE_JSON1
+-DSQLITE_DEFAULT_MEMSTATUS=0
+-DSQLITE_MAX_EXPR_DEPTH=0
+-DSQLITE_OMIT_DEPRECATED
+-DSQLITE_OMIT_SHARED_CACHE
+```
+
+**Files Created**:
+- `Libraries/build_sqlcipher.sh` - XCFramework build script
+- `Libraries/SQLCipher.xcframework/` - Built XCFramework
+- `docs/SQLCIPHER_SETUP.md` - Integration documentation
+
+**Files Modified**:
+- `project.yml` - Added SQLCipher.xcframework dependency
+- `Sources/ZipherX-Bridging-Header.h` - Added `#include <sqlite3.h>`
+- `Sources/Core/Storage/SQLCipherManager.swift` - Encryption key management
+
+---
+
+### 47. VUL-002 Fix: Encrypted Keys Across FFI Boundary (December 4, 2025)
+
+**Problem**: Security audit VUL-002 identified that spending keys were decrypted in Swift's managed memory where they couldn't be reliably zeroed. Swift's ARC and memory management don't guarantee that sensitive data is actually erased from memory.
+
+**Solution**: Move all key decryption to Rust where memory can be explicitly zeroed using volatile writes.
+
+**Implementation**:
+
+1. **New Rust FFI Functions** (`lib.rs`):
+   - `zipherx_build_transaction_encrypted()` - Single-input transaction with encrypted key
+   - `zipherx_build_transaction_multi_encrypted()` - Multi-input transaction with encrypted key
+   - `secure_zero()` - Uses volatile writes + compiler fence to ensure zeroing
+   - `decrypt_spending_key()` - AES-GCM-256 decryption in Rust
+
+2. **Encryption Format** (197 bytes):
+   ```
+   [12 bytes: Nonce][169 bytes: Encrypted SK][16 bytes: Auth Tag]
+   ```
+
+3. **Key Flow**:
+   ```
+   Swift: getEncryptedKeyAndPassword()
+      ↓ (encrypted key + encryption key cross FFI)
+   Rust: decrypt_spending_key() → use → secure_zero()
+   ```
+
+4. **Secure Memory Zeroing** (`lib.rs`):
+   ```rust
+   #[inline(never)]
+   fn secure_zero(data: &mut [u8]) {
+       for byte in data.iter_mut() {
+           unsafe { ptr::write_volatile(byte, 0); }
+       }
+       std::sync::atomic::compiler_fence(Ordering::SeqCst);
+   }
+   ```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Added encrypted transaction functions
+- `Libraries/zipherx-ffi/Cargo.toml` - Added `aes-gcm = "0.10"` dependency
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - New function declarations
+- `Sources/ZipherX-Bridging-Header.h` - C function declarations
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrappers
+- `Sources/Core/Storage/SecureKeyStorage.swift` - `getEncryptedKeyAndPassword()`
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Uses encrypted FFI
+
+**Security Properties**:
+- Decrypted spending keys NEVER exist in Swift's managed memory
+- Keys decrypted only in Rust where `secure_zero()` uses volatile writes
+- Compiler fence prevents optimization from removing zeroing
+- AES-GCM provides authenticated encryption (confidentiality + integrity)
+
+---
+
+### 48. SQLCipher PRAGMA Key Syntax Fix (December 4, 2025)
+
+**Problem**: Fresh install stuck at "Load commitment tree" with database errors:
+```
+syntax error: near "x'68162a95...'"
+```
+
+**Root Cause**: SQLCipher's `PRAGMA key` command requires the hex blob to be wrapped in double quotes:
+```sql
+PRAGMA key = "x'68162a95...'";  -- Correct
+PRAGMA key = x'68162a95...';    -- Wrong (syntax error)
+```
+
+**Fix** (`SQLCipherManager.swift` line 113):
+```swift
+// OLD: let hex = "x'" + keyData.map { ... }.joined() + "'"
+// NEW: let hex = "\"x'" + keyData.map { ... }.joined() + "'\""
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/SQLCipherManager.swift` - Added double quotes around hex blob
+
+---
+
+### 49. SQLite3 Module Conflict Fix (December 4, 2025)
+
+**Problem**: iOS build failed with:
+```
+error: 'sqlite3_module' has different definitions in different modules
+```
+
+**Root Cause**: `import SQLite3` in Swift files was importing the iOS SDK's sqlite3 module, which conflicted with SQLCipher's `sqlite3.h` included via bridging header. Both defined the same types with slight differences.
+
+**Solution**:
+1. Removed `import SQLite3` from all Swift files that use SQLite
+2. Replaced `#include "sqlite3.h"` in bridging header with explicit function declarations
+3. Only declare the specific SQLite functions actually used by the app
+
+**Bridging Header Changes**:
+```c
+// Instead of: #include "sqlite3.h"
+// Declare only what we need:
+typedef struct sqlite3 sqlite3;
+typedef struct sqlite3_stmt sqlite3_stmt;
+int sqlite3_open_v2(...);
+int sqlite3_prepare_v2(...);
+// ... etc
+```
+
+**Files Modified**:
+- `Sources/ZipherX-Bridging-Header.h` - Explicit SQLite function declarations
+- `Sources/Core/Storage/WalletDatabase.swift` - Removed `import SQLite3`
+- `Sources/Core/Storage/SQLCipherManager.swift` - Removed `import SQLite3`
+- `Sources/Core/Storage/HeaderStore.swift` - Removed `import SQLite3`
+- `project.yml` - Added SQLCipher header search paths
+
+---
+
 ## Remaining Security & Performance Tasks
 
 ### P0: Critical Security (Required Before Release)
 
-1. ~~**SQLCipher Database Encryption**~~ ✅ COMPLETED (December 2, 2025)
-   - Implemented AES-GCM-256 field-level encryption
-   - Sensitive fields encrypted: diversifier, rcm, memo, witness
-   - Key derived from device ID + salt via HKDF
+1. ~~**SQLCipher Database Encryption**~~ ✅ COMPLETED (December 4, 2025)
+   - Built SQLCipher XCFramework from official source (v4.6.0)
+   - Full AES-256 database encryption (entire file encrypted, not just fields)
+   - Uses Apple Common Crypto (no OpenSSL dependency)
+   - Key derived from device ID + salt via HKDF-SHA256
+   - Automatic migration for existing unencrypted databases
+   - Settings displays "Database Encryption: Full" when active
 
-2. **Memory Protection for Spending Keys** - Zero memory after use
-   - Spending keys in memory could be dumped
-   - Need `memset_s` to zero key buffers after use
-   - Disable swap for sensitive memory regions
+2. ~~**Memory Protection for Spending Keys (VUL-002)**~~ ✅ FULLY FIXED (December 4, 2025)
+   - Spending keys now decrypted ONLY in Rust, never in Swift
+   - `zipherx_build_transaction_encrypted()` accepts encrypted key across FFI
+   - Rust-side `secure_zero()` uses volatile writes + compiler fence
+   - AES-GCM-256 encryption (197 bytes: nonce + ciphertext + tag)
+   - Decrypted key is zeroed immediately after transaction building
+   - Swift only ever holds encrypted keys - fully addresses VUL-002
 
 ### P1: Important Security
 

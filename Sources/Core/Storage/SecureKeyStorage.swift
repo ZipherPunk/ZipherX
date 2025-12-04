@@ -884,6 +884,8 @@ final class SecureData {
     private(set) var bytes: [UInt8]
 
     /// Access the data as Data (creates a copy - use sparingly)
+    /// WARNING: The returned Data is a COPY and won't be zeroed!
+    /// Prefer using withUnsafeBytes for FFI calls when possible.
     var data: Data {
         return Data(bytes)
     }
@@ -898,10 +900,23 @@ final class SecureData {
         self.bytes = bytes
     }
 
+    /// Execute a closure with direct access to the bytes (no copy)
+    /// Use this for FFI calls to avoid creating additional copies in Swift memory
+    @discardableResult
+    func withUnsafeBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
+        return try bytes.withUnsafeBytes(body)
+    }
+
     /// Manually zero the memory (call this when done with the key)
+    /// Uses volatile-like pattern to prevent compiler optimization
     func zero() {
-        for i in 0..<bytes.count {
-            bytes[i] = 0
+        // Use withUnsafeMutableBytes to ensure the zeroing isn't optimized away
+        bytes.withUnsafeMutableBytes { ptr in
+            guard let baseAddress = ptr.baseAddress else { return }
+            // Zero byte by byte to prevent optimization
+            for i in 0..<ptr.count {
+                baseAddress.storeBytes(of: 0 as UInt8, toByteOffset: i, as: UInt8.self)
+            }
         }
     }
 
@@ -936,5 +951,112 @@ extension SecureKeyStorage {
         let secureKey = try retrieveSpendingKeySecure()
         defer { secureKey.zero() }  // Ensure zeroing even on throw
         return try operation(secureKey.data)
+    }
+
+    // MARK: - VUL-002 FIX: Encrypted Key Access for FFI
+    // These functions provide encrypted key data that can be passed to Rust for
+    // decryption in memory that Rust can explicitly zero.
+
+    /// Retrieve the encrypted spending key data (197 bytes)
+    /// Format: nonce(12) + ciphertext(169) + tag(16)
+    /// This data can be passed to Rust for decryption where memory can be explicitly zeroed
+    func retrieveEncryptedSpendingKey() throws -> Data {
+        if isSimulator {
+            // Simulator: key is stored encrypted in keychain
+            print("📱 Simulator: Retrieving encrypted key from keychain")
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "ZipherX",
+                kSecAttrAccount as String: spendingKeyTag,
+                kSecReturnData as String: true
+            ]
+
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+            guard status == errSecSuccess, let encryptedData = result as? Data else {
+                throw SecureStorageError.keyNotFound
+            }
+
+            // Verify correct length (should be 197 bytes)
+            guard encryptedData.count == 197 else {
+                throw SecureStorageError.keyNotFound
+            }
+
+            return encryptedData
+        }
+
+        if isMacOS {
+            // macOS: key is stored encrypted in file
+            print("🖥️ macOS: Retrieving encrypted key from file")
+            let fileURL = try getMacOSKeyFileURL(for: spendingKeyTag)
+
+            guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                throw SecureStorageError.keyNotFound
+            }
+
+            let encryptedData = try Data(contentsOf: fileURL)
+
+            // Verify correct length (should be 197 bytes)
+            guard encryptedData.count == 197 else {
+                throw SecureStorageError.keyNotFound
+            }
+
+            return encryptedData
+        }
+
+        // iOS device with Secure Enclave - key is stored encrypted
+        // We need to retrieve the encrypted form, not decrypt it
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: spendingKeyTag,
+            kSecReturnData as String: true
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess, let encryptedData = result as? Data else {
+            throw SecureStorageError.keyNotFound
+        }
+
+        // Verify correct length (should be 197 bytes)
+        guard encryptedData.count == 197 else {
+            throw SecureStorageError.keyNotFound
+        }
+
+        return encryptedData
+    }
+
+    /// Get the raw encryption key bytes for passing to Rust FFI (32 bytes)
+    /// WARNING: This key is sensitive - only pass to Rust FFI for key decryption
+    func getEncryptionKeyForFFI() throws -> Data {
+        let encryptionKey: SymmetricKey
+
+        if isSimulator {
+            encryptionKey = try getSimulatorEncryptionKey()
+        } else if isMacOS {
+            encryptionKey = try getMacOSEncryptionKey()
+        } else {
+            // iOS device - use the same encryption key as store
+            encryptionKey = try getSimulatorEncryptionKey()
+        }
+
+        // Convert SymmetricKey to Data
+        return encryptionKey.withUnsafeBytes { Data($0) }
+    }
+
+    /// Get both encrypted key and encryption key for VUL-002 secure FFI transaction building
+    /// Returns (encryptedKey: 197 bytes, encryptionKey: 32 bytes)
+    func getEncryptedKeyAndPassword() throws -> (encryptedKey: Data, encryptionKey: Data) {
+        let encryptedKey = try retrieveEncryptedSpendingKey()
+        let encryptionKey = try getEncryptionKeyForFFI()
+
+        guard encryptedKey.count == 197, encryptionKey.count == 32 else {
+            throw SecureStorageError.keyNotFound
+        }
+
+        return (encryptedKey, encryptionKey)
     }
 }

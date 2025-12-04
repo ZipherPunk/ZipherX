@@ -12,6 +12,74 @@
 #include <stdbool.h>
 
 // =============================================================================
+// SQLCipher - Encrypted Database Support
+// =============================================================================
+// SQLCipher provides transparent 256-bit AES encryption of the SQLite database.
+// NOTE: We do NOT include sqlite3.h here to avoid module conflicts.
+// Instead, we manually declare the SQLite3/SQLCipher functions we need.
+
+// Core SQLite types
+typedef struct sqlite3 sqlite3;
+typedef struct sqlite3_stmt sqlite3_stmt;
+
+// Result codes
+#define SQLITE_OK           0
+#define SQLITE_ERROR        1
+#define SQLITE_ROW          100
+#define SQLITE_DONE         101
+#define SQLITE_NOTADB       26
+
+// Open flags
+#define SQLITE_OPEN_READWRITE     0x00000002
+#define SQLITE_OPEN_CREATE        0x00000004
+#define SQLITE_OPEN_FULLMUTEX     0x00010000
+
+// Core SQLite functions (these are provided by libsqlcipher.a)
+int sqlite3_open(const char *filename, sqlite3 **ppDb);
+int sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
+int sqlite3_close(sqlite3 *);
+int sqlite3_exec(sqlite3*, const char *sql, int (*callback)(void*,int,char**,char**), void *, char **errmsg);
+void sqlite3_free(void*);
+int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte, sqlite3_stmt **ppStmt, const char **pzTail);
+int sqlite3_step(sqlite3_stmt*);
+int sqlite3_finalize(sqlite3_stmt *pStmt);
+int sqlite3_reset(sqlite3_stmt *pStmt);
+int sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int n, void(*)(void*));
+int sqlite3_bind_int(sqlite3_stmt*, int, int);
+int sqlite3_bind_int64(sqlite3_stmt*, int, long long);
+int sqlite3_bind_text(sqlite3_stmt*, int, const char*, int n, void(*)(void*));
+int sqlite3_bind_null(sqlite3_stmt*, int);
+int sqlite3_bind_double(sqlite3_stmt*, int, double);
+double sqlite3_column_double(sqlite3_stmt*, int iCol);
+const void *sqlite3_column_blob(sqlite3_stmt*, int iCol);
+int sqlite3_column_bytes(sqlite3_stmt*, int iCol);
+int sqlite3_column_int(sqlite3_stmt*, int iCol);
+long long sqlite3_column_int64(sqlite3_stmt*, int iCol);
+const unsigned char *sqlite3_column_text(sqlite3_stmt*, int iCol);
+int sqlite3_column_type(sqlite3_stmt*, int iCol);
+int sqlite3_column_count(sqlite3_stmt *pStmt);
+int sqlite3_errcode(sqlite3 *db);
+const char *sqlite3_errmsg(sqlite3*);
+long long sqlite3_last_insert_rowid(sqlite3*);
+int sqlite3_changes(sqlite3*);
+int sqlite3_clear_bindings(sqlite3_stmt*);
+const char *sqlite3_libversion(void);
+
+// Destructor type
+typedef void (*sqlite3_destructor_type)(void*);
+
+// Destructor constants
+#define SQLITE_STATIC      ((sqlite3_destructor_type)0)
+#define SQLITE_TRANSIENT   ((sqlite3_destructor_type)-1)
+
+// Column types
+#define SQLITE_INTEGER  1
+#define SQLITE_FLOAT    2
+#define SQLITE_BLOB     4
+#define SQLITE_NULL     5
+#define SQLITE_TEXT     3
+
+// =============================================================================
 // Mnemonic Functions
 // =============================================================================
 
@@ -449,5 +517,86 @@ bool zipherx_verify_header_chain(const uint8_t *headers_data,
 bool zipherx_verify_block_header(const uint8_t *header_and_solution,
                                   size_t total_len,
                                   uint8_t *hash_out);
+
+// =============================================================================
+// VUL-002 FIX: Encrypted Key Operations
+// =============================================================================
+// These functions accept AES-GCM-256 encrypted spending keys and decrypt them
+// in Rust where memory can be explicitly zeroed. The decrypted key never leaves
+// Rust's control and is zeroed immediately after use.
+//
+// Encryption format (197 bytes):
+// - 12 bytes: Nonce
+// - 169 bytes: Encrypted spending key
+// - 16 bytes: Authentication tag
+//
+// The encryption key (32 bytes) is derived from device ID + salt using HKDF
+// on the Swift side and passed separately.
+
+/// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
+/// The spending key is decrypted only within Rust and zeroed after use
+/// @param encrypted_sk 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
+/// @param encrypted_sk_len Length of encrypted key (should be 197)
+/// @param encryption_key 32-byte AES-256 key for decryption
+/// @param to_address Destination address bytes (43 bytes)
+/// @param amount Amount in zatoshis
+/// @param memo Optional memo (512 bytes)
+/// @param anchor Merkle tree anchor (32 bytes)
+/// @param witness_data Serialized witness
+/// @param witness_len Length of witness data
+/// @param note_value Value of note being spent
+/// @param note_rcm Note randomness (32 bytes)
+/// @param note_diversifier Note diversifier (11 bytes)
+/// @param chain_height Current chain height
+/// @param tx_out Output buffer for transaction (at least 10000 bytes)
+/// @param tx_out_len Output for transaction length
+/// @return true on success
+bool zipherx_build_transaction_encrypted(
+    const uint8_t *encrypted_sk,
+    size_t encrypted_sk_len,
+    const uint8_t *encryption_key,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const uint8_t *anchor,
+    const uint8_t *witness_data,
+    size_t witness_len,
+    uint64_t note_value,
+    const uint8_t *note_rcm,
+    const uint8_t *note_diversifier,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len
+);
+
+/// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
+/// The spending key is decrypted only within Rust and zeroed after use
+/// @param encrypted_sk 197-byte AES-GCM encrypted spending key
+/// @param encrypted_sk_len Length of encrypted key (should be 197)
+/// @param encryption_key 32-byte AES-256 key for decryption
+/// @param to_address Destination address bytes (43 bytes)
+/// @param amount Amount to send in zatoshis
+/// @param memo Optional memo (512 bytes, can be NULL)
+/// @param spends Array of SpendInfo pointers
+/// @param spend_count Number of spends
+/// @param chain_height Current chain height
+/// @param tx_out Output buffer for transaction (at least 10000 bytes)
+/// @param tx_out_len Output for transaction length
+/// @param nullifiers_out Output buffer for nullifiers (32 bytes * spend_count)
+/// @return true on success
+bool zipherx_build_transaction_multi_encrypted(
+    const uint8_t *encrypted_sk,
+    size_t encrypted_sk_len,
+    const uint8_t *encryption_key,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const SpendInfo *const *spends,
+    size_t spend_count,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len,
+    uint8_t *nullifiers_out
+);
 
 #endif /* ZipherX_Bridging_Header_h */

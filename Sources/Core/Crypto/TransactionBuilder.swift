@@ -313,9 +313,14 @@ final class TransactionBuilder {
             }
         }
 
-        // Build transaction using FFI
-        guard let rawTx = ZipherXFFI.buildTransaction(
-            spendingKey: spendingKey,
+        // VUL-002 FIX: Use encrypted key FFI to ensure key is decrypted only in Rust
+        // and immediately zeroed after use by Rust's secure_zero()
+        let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
+        print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
+
+        guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
+            encryptedSpendingKey: encryptedKey,
+            encryptionKey: encryptionKey,
             toAddress: toAddressBytes,
             amount: amount,
             memo: memoData,
@@ -549,9 +554,13 @@ final class TransactionBuilder {
                 spendInfos.append(info)
             }
 
-            // Build multi-input transaction
-            guard let result = ZipherXFFI.buildTransactionMulti(
-                spendingKey: spendingKey,
+            // VUL-002 FIX: Use encrypted key FFI for multi-input transaction
+            let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
+            print("🔐 VUL-002: Using encrypted key FFI for multi-input (key decrypted only in Rust)")
+
+            guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
+                encryptedSpendingKey: encryptedKey,
+                encryptionKey: encryptionKey,
                 toAddress: toAddressBytes,
                 amount: amount,
                 memo: memoData,
@@ -584,9 +593,13 @@ final class TransactionBuilder {
                 anchorFromHeader = Data(count: 32)
             }
 
-            // Build single-input transaction
-            guard let rawTx = ZipherXFFI.buildTransaction(
-                spendingKey: spendingKey,
+            // VUL-002 FIX: Use encrypted key FFI for single-input transaction
+            let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
+            print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
+
+            guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
+                encryptedSpendingKey: encryptedKey,
+                encryptionKey: encryptionKey,
                 toAddress: toAddressBytes,
                 amount: amount,
                 memo: memoData,

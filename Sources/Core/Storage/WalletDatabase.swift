@@ -1,5 +1,6 @@
 import Foundation
-import SQLite3
+// Note: sqlite3 functions are available via bridging header (SQLCipher)
+// Do NOT import SQLite3 here as it conflicts with SQLCipher's sqlite3.h
 import CryptoKit
 
 /// Encrypted SQLite database for wallet data
@@ -116,10 +117,28 @@ final class WalletDatabase {
                 try sqlCipher.applyEncryption(to: db!)
                 print("🔐 Full database encryption active (SQLCipher)")
             } catch {
-                // SQLCipher failed - close and report error
+                // SQLCipher failed - close the connection
                 sqlite3_close(db)
                 db = nil
-                throw DatabaseError.encryptionFailed
+
+                // If database is encrypted but key doesn't work, it may be corrupted
+                // from a failed migration. Try to recover by deleting it.
+                print("⚠️ Database encryption failed - attempting recovery...")
+                if sqlCipher.isDatabaseEncrypted(path: dbPath) {
+                    print("🗑️ Removing corrupted encrypted database...")
+                    try? FileManager.default.removeItem(atPath: dbPath)
+                    try? FileManager.default.removeItem(atPath: dbPath + "-wal")
+                    try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+
+                    // Retry opening (will create fresh database)
+                    guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
+                        throw DatabaseError.openFailed("Recovery failed")
+                    }
+                    try sqlCipher.applyEncryption(to: db!)
+                    print("✅ Database recovered - created fresh encrypted database")
+                } else {
+                    throw DatabaseError.encryptionFailed
+                }
             }
         } else {
             // Fallback: iOS Data Protection + field-level encryption

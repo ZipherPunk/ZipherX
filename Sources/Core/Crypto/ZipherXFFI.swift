@@ -1054,4 +1054,192 @@ enum ZipherXFFI {
             }
         }
     }
+
+    // MARK: - VUL-002 FIX: Encrypted Key Operations
+    // These functions pass encrypted spending keys to Rust where they are:
+    // 1. Decrypted only within Rust
+    // 2. Used for transaction building
+    // 3. Immediately zeroed after use
+    // This ensures the decrypted spending key never exists in Swift managed memory.
+
+    /// Build a complete shielded transaction using encrypted spending key (VUL-002 secure)
+    /// The spending key is encrypted with AES-GCM-256 and decrypted only in Rust
+    /// Returns raw transaction bytes ready for broadcast
+    static func buildTransactionEncrypted(
+        encryptedSpendingKey: Data,  // 197 bytes: nonce(12) + ciphertext(169) + tag(16)
+        encryptionKey: Data,          // 32 bytes: AES-256 key
+        toAddress: Data,
+        amount: UInt64,
+        memo: Data?,
+        anchor: Data,
+        witness: Data,
+        noteValue: UInt64,
+        noteRcm: Data,
+        noteDiversifier: Data,
+        chainHeight: UInt64
+    ) -> Data? {
+        guard encryptedSpendingKey.count == 197,
+              encryptionKey.count == 32,
+              toAddress.count == 43,
+              anchor.count == 32,
+              noteRcm.count == 32,
+              noteDiversifier.count == 11 else {
+            print("❌ buildTransactionEncrypted: invalid inputs")
+            return nil
+        }
+
+        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txLen: Int = 0
+
+        let memoData = memo ?? Data(repeating: 0, count: 512)
+        guard memoData.count == 512 else { return nil }
+
+        let success = encryptedSpendingKey.withUnsafeBytes { encSkPtr in
+            encryptionKey.withUnsafeBytes { encKeyPtr in
+                toAddress.withUnsafeBytes { toPtr in
+                    memoData.withUnsafeBytes { memoPtr in
+                        anchor.withUnsafeBytes { anchorPtr in
+                            witness.withUnsafeBytes { witnessPtr in
+                                noteRcm.withUnsafeBytes { rcmPtr in
+                                    noteDiversifier.withUnsafeBytes { divPtr in
+                                        zipherx_build_transaction_encrypted(
+                                            encSkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            encryptedSpendingKey.count,
+                                            encKeyPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            toPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            amount,
+                                            memoPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            anchorPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            witnessPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            witness.count,
+                                            noteValue,
+                                            rcmPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            divPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                            chainHeight,
+                                            &txOutput,
+                                            &txLen
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        guard success, txLen > 0 else {
+            return nil
+        }
+
+        return Data(txOutput.prefix(txLen))
+    }
+
+    /// Build a multi-input shielded transaction using encrypted spending key (VUL-002 secure)
+    /// The spending key is encrypted with AES-GCM-256 and decrypted only in Rust
+    /// Returns tuple of (raw transaction bytes, array of nullifiers for spent notes)
+    static func buildTransactionMultiEncrypted(
+        encryptedSpendingKey: Data,  // 197 bytes: nonce(12) + ciphertext(169) + tag(16)
+        encryptionKey: Data,          // 32 bytes: AES-256 key
+        toAddress: Data,
+        amount: UInt64,
+        memo: Data?,
+        spends: [SpendInfoSwift],
+        chainHeight: UInt64
+    ) -> (txData: Data, nullifiers: [Data])? {
+        guard encryptedSpendingKey.count == 197,
+              encryptionKey.count == 32,
+              toAddress.count == 43,
+              !spends.isEmpty,
+              spends.count <= 100 else {
+            print("❌ buildTransactionMultiEncrypted: invalid inputs")
+            return nil
+        }
+
+        // Validate all spends
+        for (i, spend) in spends.enumerated() {
+            guard spend.rcm.count == 32,
+                  spend.diversifier.count == 11,
+                  !spend.witness.isEmpty else {
+                print("❌ buildTransactionMultiEncrypted: invalid spend \(i)")
+                return nil
+            }
+        }
+
+        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txLen: Int = 0
+        var nullifiersOutput = [UInt8](repeating: 0, count: 32 * spends.count)
+
+        let memoData = memo ?? Data(repeating: 0, count: 512)
+        guard memoData.count == 512 else { return nil }
+
+        // Create C-compatible SpendInfo structs
+        var spendInfos: [SpendInfo] = []
+        var witnessBuffers: [[UInt8]] = []
+        var rcmBuffers: [[UInt8]] = []
+        var divBuffers: [[UInt8]] = []
+
+        for spend in spends {
+            witnessBuffers.append(Array(spend.witness))
+            rcmBuffers.append(Array(spend.rcm))
+            divBuffers.append(Array(spend.diversifier))
+        }
+
+        // Create SpendInfo structs pointing to our buffers
+        for i in 0..<spends.count {
+            let info = SpendInfo(
+                witness_data: UnsafePointer(witnessBuffers[i]),
+                witness_len: witnessBuffers[i].count,
+                note_value: spends[i].value,
+                note_rcm: UnsafePointer(rcmBuffers[i]),
+                note_diversifier: UnsafePointer(divBuffers[i])
+            )
+            spendInfos.append(info)
+        }
+
+        // Create array of pointers to SpendInfo
+        var spendPtrs: [UnsafePointer<SpendInfo>?] = []
+        for i in 0..<spendInfos.count {
+            spendPtrs.append(withUnsafePointer(to: &spendInfos[i]) { $0 })
+        }
+
+        let success = encryptedSpendingKey.withUnsafeBytes { encSkPtr in
+            encryptionKey.withUnsafeBytes { encKeyPtr in
+                toAddress.withUnsafeBytes { toPtr in
+                    memoData.withUnsafeBytes { memoPtr in
+                        spendPtrs.withUnsafeBufferPointer { spendsPtr in
+                            zipherx_build_transaction_multi_encrypted(
+                                encSkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                encryptedSpendingKey.count,
+                                encKeyPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                toPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                amount,
+                                memoPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                spendsPtr.baseAddress,
+                                spends.count,
+                                chainHeight,
+                                &txOutput,
+                                &txLen,
+                                &nullifiersOutput
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        guard success, txLen > 0 else {
+            return nil
+        }
+
+        // Extract nullifiers
+        var nullifiers: [Data] = []
+        for i in 0..<spends.count {
+            let offset = i * 32
+            let nfData = Data(nullifiersOutput[offset..<(offset + 32)])
+            nullifiers.append(nfData)
+        }
+
+        return (Data(txOutput.prefix(txLen)), nullifiers)
+    }
 }

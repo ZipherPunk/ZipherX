@@ -2,7 +2,8 @@
 // Block header storage for header-sync approach
 
 import Foundation
-import SQLite3
+// Note: sqlite3 functions are available via bridging header (SQLCipher)
+// Do NOT import SQLite3 here as it conflicts with SQLCipher's sqlite3.h
 
 /// SQLite storage for block headers
 /// Stores headers with finalsaplingroot (anchor) for trustless transaction building
