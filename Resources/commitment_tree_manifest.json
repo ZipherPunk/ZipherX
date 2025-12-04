@@ -1,9 +1,9 @@
 {
   "version": 2,
-  "created_at": "2025-12-04T09:35:16.703777+00:00",
-  "height": 2931958,
+  "created_at": "2025-12-04T09:46:54.843067+00:00",
+  "height": 2931966,
   "cmu_count": 1042351,
-  "block_hash": "0000006bb52618128c19cdf7351b192db8e6e7336e07aebee529efa0d19908d1",
+  "block_hash": "0000043b9e1921853797df630b593464e3341df3cbe062117ff1e837d0d02a34",
   "tree_root": "3e8712a591362cf7e4ab4d987be98bc83965351b3db2f24c99c96bd098f26bf4",
   "files": {
     "uncompressed": {
