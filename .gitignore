@@ -63,3 +63,6 @@ Resources/commitment_tree.bin
 Resources/commitment_tree.bin.zst
 Resources/commitment_tree_serialized.bin
 Resources/commitment_tree_manifest.json
+
+# Tools directory (private scripts, not for public repo)
+Tools/
