@@ -1848,6 +1848,16 @@ struct CypherpunkMainView: View {
 
     // MARK: - Transaction History
 
+    /// Count of received (IN) transactions
+    private var inCount: Int {
+        transactions.filter { $0.type == .received }.count
+    }
+
+    /// Count of sent (OUT) transactions
+    private var outCount: Int {
+        transactions.filter { $0.type == .sent }.count
+    }
+
     private var transactionHistory: some View {
         VStack(spacing: 0) {
             // Header
@@ -1856,6 +1866,13 @@ struct CypherpunkMainView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(matrixGreenDark)
                     .tracking(2)
+
+                // IN/OUT counts
+                if !transactions.isEmpty {
+                    Text("(\(inCount) IN, \(outCount) OUT)")
+                        .font(.system(size: 9, weight: .regular, design: .monospaced))
+                        .foregroundColor(matrixGreenDark)
+                }
 
                 Spacer()
 
@@ -1960,7 +1977,7 @@ struct CypherpunkMainView: View {
                 Text("ZCL v2.1.2-1")
                     .font(.system(size: 10, design: .monospaced))
             }
-            .foregroundColor(matrixGreenDarker)
+            .foregroundColor(matrixGreenDark)
 
             Spacer()
 
@@ -1986,6 +2003,19 @@ struct CypherpunkMainView: View {
 
             Spacer()
 
+            // ZCL Price
+            if networkManager.zclPriceUSD > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "dollarsign.circle")
+                        .font(.system(size: 9))
+                    Text(String(format: "$%.4f", networkManager.zclPriceUSD))
+                        .font(.system(size: 10, design: .monospaced))
+                }
+                .foregroundColor(matrixGreenDark)
+
+                Spacer()
+            }
+
             // Block height
             HStack(spacing: 4) {
                 Image(systemName: "cube.fill")
@@ -1993,7 +2023,7 @@ struct CypherpunkMainView: View {
                 Text("\(networkManager.chainHeight)")
                     .font(.system(size: 10, design: .monospaced))
             }
-            .foregroundColor(matrixGreenDarker)
+            .foregroundColor(matrixGreenDark)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)

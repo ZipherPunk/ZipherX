@@ -57,3 +57,9 @@ Libraries/librustzcash/
 # SQLCipher build artifacts (xcframework is kept)
 Libraries/sqlcipher-src/
 Libraries/sqlcipher-build/
+
+# Commitment tree files (now hosted in ZipherX_Boost public repo)
+Resources/commitment_tree.bin
+Resources/commitment_tree.bin.zst
+Resources/commitment_tree_serialized.bin
+Resources/commitment_tree_manifest.json

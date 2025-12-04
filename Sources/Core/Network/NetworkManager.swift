@@ -1779,16 +1779,19 @@ final class NetworkManager: ObservableObject {
     /// Last time price was fetched (for rate limiting)
     private var lastPriceFetchTime: Date?
 
-    /// Fetch ZCL price from API (with fallback, rate limited to every 60 seconds)
+    /// Fetch ZCL price from API (with fallback, rate limited to every hour)
     private func fetchZCLPrice() async {
-        // Rate limit: only fetch every 60 seconds
-        if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 60 {
+        // Rate limit: only fetch every hour (3600 seconds)
+        if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 3600 {
+            print("💰 Price fetch skipped (rate limited - hourly)")
             return
         }
         lastPriceFetchTime = Date()
+        print("💰 Fetching ZCL price...")
 
         // Try CoinGecko API first
         if let price = await fetchPriceFromCoinGecko() {
+            print("💰 CoinGecko price: $\(price)")
             await MainActor.run {
                 self.zclPriceUSD = price
                 self.zclPriceFailed = false
@@ -1798,6 +1801,7 @@ final class NetworkManager: ObservableObject {
 
         // Fallback: Try CryptoCompare
         if let price = await fetchPriceFromCryptoCompare() {
+            print("💰 CryptoCompare price: $\(price)")
             await MainActor.run {
                 self.zclPriceUSD = price
                 self.zclPriceFailed = false
@@ -1818,12 +1822,16 @@ final class NetworkManager: ObservableObject {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let httpResponse = response as? HTTPURLResponse {
+                print("💰 CoinGecko HTTP status: \(httpResponse.statusCode)")
+            }
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let zclData = json["zclassic"] as? [String: Any],
                let price = zclData["usd"] as? Double {
                 return price
             }
+            print("💰 CoinGecko: couldn't parse response: \(String(data: data, encoding: .utf8) ?? "nil")")
         } catch {
             print("⚠️ CoinGecko price fetch failed: \(error)")
         }
@@ -1836,11 +1844,15 @@ final class NetworkManager: ObservableObject {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let httpResponse = response as? HTTPURLResponse {
+                print("💰 CryptoCompare HTTP status: \(httpResponse.statusCode)")
+            }
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let price = json["USD"] as? Double {
                 return price
             }
+            print("💰 CryptoCompare: couldn't parse response: \(String(data: data, encoding: .utf8) ?? "nil")")
         } catch {
             print("⚠️ CryptoCompare price fetch failed: \(error)")
         }
