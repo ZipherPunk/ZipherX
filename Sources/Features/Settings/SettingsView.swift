@@ -141,6 +141,7 @@ struct SettingsView: View {
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
     @State private var debugLoggingEnabled = DebugLogger.shared.isEnabled
     @State private var showDebugLogShare = false
+    @State private var showLogExportWarning = false  // Privacy warning before export
     @State private var debugLogSize: String = "0 KB"
 
     // Banned peers management
@@ -692,6 +693,44 @@ struct SettingsView: View {
                 Rectangle()
                     .stroke(theme.textPrimary, lineWidth: 1)
             )
+
+            // Database Encryption Status
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: "lock.doc")
+                        .font(.system(size: 14))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Database Encryption")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Image(systemName: SQLCipherManager.shared.isSQLCipherAvailable ? "checkmark.shield.fill" : "shield")
+                            .font(.system(size: 12))
+                            .foregroundColor(SQLCipherManager.shared.isSQLCipherAvailable ? .green : .orange)
+
+                        Text(SQLCipherManager.shared.isSQLCipherAvailable ? "Full" : "Field-level")
+                            .font(theme.captionFont)
+                            .foregroundColor(SQLCipherManager.shared.isSQLCipherAvailable ? .green : .orange)
+                    }
+                }
+
+                Text(SQLCipherManager.shared.isSQLCipherAvailable
+                    ? "SQLCipher: AES-256 full database encryption"
+                    : "iOS Data Protection + AES-GCM field encryption")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary, lineWidth: 1)
+            )
         }
         .padding(12)
         .background(theme.backgroundColor)
@@ -1064,9 +1103,9 @@ struct SettingsView: View {
 
             // Export and Clear buttons
             HStack(spacing: 12) {
-                // Export button
+                // Export button - shows privacy warning first
                 Button(action: {
-                    showDebugLogShare = true
+                    showLogExportWarning = true
                 }) {
                     HStack {
                         Image(systemName: "square.and.arrow.up")
@@ -1124,6 +1163,14 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showDebugLogShare) {
             ShareSheet(activityItems: [DebugLogger.shared.getLogFileURL()])
+        }
+        .alert("Privacy Warning", isPresented: $showLogExportWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Export Anyway") {
+                showDebugLogShare = true
+            }
+        } message: {
+            Text("Debug logs may contain sensitive information including:\n\n• Transaction IDs\n• Block heights\n• Peer IP addresses\n• Wallet addresses (partial)\n\nOnly share with trusted parties for debugging purposes.")
         }
     }
 

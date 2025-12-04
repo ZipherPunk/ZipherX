@@ -203,3 +203,97 @@ func debugLog(_ message: String, file: String = #file, function: String = #funct
 func debugLog(_ category: LogCategory, _ message: String, file: String = #file, function: String = #function, line: Int = #line) {
     DebugLogger.shared.log(category, message, file: file, function: function, line: line)
 }
+
+// MARK: - Log Redaction for Privacy (VUL-004)
+
+/// Redacts sensitive data from log messages
+/// Use these functions when logging potentially sensitive information
+struct LogRedaction {
+
+    /// Redact a z-address (zs1...) - shows only first/last 6 characters
+    /// "zs1abc123...xyz789" -> "zs1abc...xyz789"
+    static func redactAddress(_ address: String) -> String {
+        guard address.count > 16 else { return address }
+        if address.hasPrefix("zs1") || address.hasPrefix("zt") {
+            let prefix = String(address.prefix(8))
+            let suffix = String(address.suffix(6))
+            return "\(prefix)...\(suffix)"
+        }
+        return address
+    }
+
+    /// Redact a transaction ID - shows only first/last 8 characters
+    /// "abc123...def456" (64 char hex) -> "abc123de...f4567890"
+    static func redactTxid(_ txid: String) -> String {
+        guard txid.count > 20 else { return txid }
+        let prefix = String(txid.prefix(8))
+        let suffix = String(txid.suffix(8))
+        return "\(prefix)...\(suffix)"
+    }
+
+    /// Redact an amount - shows only order of magnitude
+    /// 12345678 zatoshis -> "~0.1 ZCL"
+    static func redactAmount(_ zatoshis: UInt64) -> String {
+        let zcl = Double(zatoshis) / 100_000_000.0
+        if zcl >= 10 {
+            return "~\(Int(zcl)) ZCL"
+        } else if zcl >= 1 {
+            return "~\(Int(zcl)) ZCL"
+        } else if zcl >= 0.1 {
+            return "~0.X ZCL"
+        } else if zcl >= 0.01 {
+            return "~0.0X ZCL"
+        } else if zcl >= 0.001 {
+            return "~0.00X ZCL"
+        } else {
+            return "~0.000X ZCL"
+        }
+    }
+
+    /// Redact nullifier hex - shows only first 8 characters
+    static func redactNullifier(_ nullifier: String) -> String {
+        guard nullifier.count > 12 else { return nullifier }
+        return String(nullifier.prefix(8)) + "..."
+    }
+
+    /// Redact IP address for privacy
+    /// "192.168.1.100" -> "192.168.x.x"
+    static func redactIP(_ ip: String) -> String {
+        let parts = ip.split(separator: ".")
+        guard parts.count == 4 else { return ip }
+        return "\(parts[0]).\(parts[1]).x.x"
+    }
+
+    /// Redact memo content - shows only length
+    static func redactMemo(_ memo: String?) -> String {
+        guard let memo = memo, !memo.isEmpty else { return "[empty]" }
+        return "[memo: \(memo.count) chars]"
+    }
+
+    /// Redact diversifier or other 11-byte hex values
+    static func redactDiversifier(_ hex: String) -> String {
+        guard hex.count > 8 else { return hex }
+        return String(hex.prefix(4)) + "..." + String(hex.suffix(4))
+    }
+}
+
+// MARK: - Privacy-Safe Logging Extensions
+
+extension String {
+    /// Return redacted version of this string if it looks like an address
+    var redactedAddress: String {
+        LogRedaction.redactAddress(self)
+    }
+
+    /// Return redacted version of this string if it looks like a txid
+    var redactedTxid: String {
+        LogRedaction.redactTxid(self)
+    }
+}
+
+extension UInt64 {
+    /// Return redacted amount string
+    var redactedAmount: String {
+        LogRedaction.redactAmount(self)
+    }
+}

@@ -55,6 +55,14 @@ struct SendView: View {
     @State private var sendProgress: [SendProgressStep] = []
     @State private var currentStepIndex: Int = 0
 
+    // Clearing celebration state (mempool verified)
+    @State private var showClearingCelebration = false
+    @State private var clearingTime: TimeInterval = 0
+
+    // Settlement celebration state (transaction mined/confirmed)
+    @State private var showSettlementCelebration = false
+    @State private var settlementTime: TimeInterval = 0
+
     var body: some View {
         ZStack {
             ScrollView {
@@ -111,16 +119,59 @@ struct SendView: View {
                             .foregroundColor(NeonColors.progressFillEnd) // Bright fluo green
                             .shadow(color: NeonColors.progressFillEnd.opacity(0.8), radius: 20)
 
-                        Text("TRANSACTION BROADCAST")
-                            .font(.system(size: 18, weight: .bold, design: .monospaced))
-                            .foregroundColor(NeonColors.progressFillEnd)
-                            .shadow(color: NeonColors.progressFillEnd.opacity(0.5), radius: 5)
+                        // Title changes based on transaction state: Broadcast → Cleared → Mined
+                        if showSettlementCelebration {
+                            // MINED - Transaction confirmed in a block
+                            HStack(spacing: 8) {
+                                Text("⛏️")
+                                    .font(.system(size: 24))
+                                Text("MINED!")
+                                    .font(.system(size: 18, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Color.orange)
+                            }
+                            .shadow(color: Color.orange.opacity(0.5), radius: 5)
 
-                        Text("Your shielded transaction has been sent to the network.")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(Color.green.opacity(0.7))
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
+                            Text("Transaction confirmed in \(String(format: "%.0f", settlementTime))s")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(Color.orange.opacity(0.7))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+
+                            Text("\"Proof of work complete. Your transaction is now immutable.\"")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(Color.orange.opacity(0.5))
+                                .italic()
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        } else if showClearingCelebration {
+                            // CLEARED - Transaction verified in mempool
+                            HStack(spacing: 8) {
+                                Text("🏦")
+                                    .font(.system(size: 24))
+                                Text("CLEARED!")
+                                    .font(.system(size: 18, weight: .bold, design: .monospaced))
+                                    .foregroundColor(Color.cyan)
+                            }
+                            .shadow(color: Color.cyan.opacity(0.5), radius: 5)
+
+                            Text("Transaction verified in mempool in \(String(format: "%.1f", clearingTime))s")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(Color.cyan.opacity(0.7))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        } else {
+                            // BROADCAST - Peers accepted, waiting for mempool
+                            Text("TRANSACTION BROADCAST")
+                                .font(.system(size: 18, weight: .bold, design: .monospaced))
+                                .foregroundColor(NeonColors.progressFillEnd)
+                                .shadow(color: NeonColors.progressFillEnd.opacity(0.5), radius: 5)
+
+                            Text("Your shielded transaction has been sent to the network.")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(Color.green.opacity(0.7))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        }
 
                         VStack(alignment: .leading, spacing: 8) {
                             Text("TXID:")
@@ -214,6 +265,34 @@ struct SendView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(errorMessage)
+        }
+        .onChange(of: networkManager.outgoingClearingTrigger) { _ in
+            // Sender's tx verified in mempool - show Clearing celebration!
+            if let cleared = networkManager.justClearedOutgoing, showSuccess {
+                clearingTime = cleared.clearingTime
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 CLEARING! Send confirmed in mempool after \(String(format: "%.1f", cleared.clearingTime))s")
+                // Clear trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justClearedOutgoing = nil
+                }
+            }
+        }
+        .onChange(of: networkManager.settlementCelebrationTrigger) { _ in
+            // Sender's tx mined in a block - show Settlement celebration!
+            if let confirmed = networkManager.justConfirmedTx, showSuccess, confirmed.isOutgoing {
+                settlementTime = confirmed.settlementTime ?? 0
+                withAnimation {
+                    showSettlementCelebration = true
+                }
+                print("⛏️ MINED! Transaction confirmed after \(String(format: "%.0f", settlementTime))s")
+                // Clear trigger after handling
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justConfirmedTx = nil
+                }
+            }
         }
     }
 

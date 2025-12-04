@@ -440,6 +440,23 @@ final class WalletManager: ObservableObject {
             // Update wallet height in NetworkManager for UI display
             NetworkManager.shared.updateWalletHeight(targetHeight)
 
+            // Sync headers for the new blocks so we have real timestamps
+            // This ensures transaction history shows correct dates instead of "(est)"
+            do {
+                let hsm = HeaderSyncManager(
+                    headerStore: HeaderStore.shared,
+                    networkManager: NetworkManager.shared
+                )
+                try await hsm.syncHeaders(from: currentHeight + 1)
+
+                // Fix any transactions that have estimated timestamps
+                try? WalletDatabase.shared.fixTransactionBlockTimes()
+                print("📜 Fixed transaction timestamps after background sync")
+            } catch {
+                // Header sync failed but block scan succeeded - not critical
+                print("⚠️ Background header sync failed: \(error.localizedDescription)")
+            }
+
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")
         }
@@ -1602,8 +1619,11 @@ final class WalletManager: ObservableObject {
         }
 
         // Record balance BEFORE send - used to detect change vs real incoming
+        // Also set lastSendTimestamp EARLY so clearingTime calculation works
+        // (setMempoolVerified() uses lastSendTimestamp to calculate clearing duration)
         await MainActor.run {
             self.balanceBeforeLastSend = currentBalance
+            self.lastSendTimestamp = Date()
         }
 
         // Get spending key from Secure Enclave
@@ -1641,10 +1661,8 @@ final class WalletManager: ObservableObject {
         // Show "Saving transaction..." while we record to database
         onProgress("broadcast", "Saving transaction (txid: \(txId.prefix(16))...)...", 0.95)
 
-        // Record send timestamp - used to suppress fireworks for change outputs
-        await MainActor.run {
-            self.lastSendTimestamp = Date()
-        }
+        // Note: lastSendTimestamp is set BEFORE broadcast starts (line 1627)
+        // so that setMempoolVerified() can calculate accurate clearing time
 
         // CRITICAL: Record transaction IMMEDIATELY after broadcast success
         // This ensures the sent tx is in history even if subsequent operations fail
@@ -1734,8 +1752,10 @@ final class WalletManager: ObservableObject {
         print("✅ Balance check passed")
 
         // Record balance BEFORE send - used to detect change vs real incoming
+        // Also set lastSendTimestamp EARLY so clearingTime calculation works
         await MainActor.run {
             self.balanceBeforeLastSend = currentBalance
+            self.lastSendTimestamp = Date()
         }
 
         // Get spending key from Secure Enclave
@@ -1761,10 +1781,8 @@ final class WalletManager: ObservableObject {
         let pendingFee: UInt64 = 10_000
         await networkManager.trackPendingOutgoing(txid: txId, amount: amount + pendingFee)
 
-        // Record send timestamp - used to suppress fireworks for change outputs
-        await MainActor.run {
-            self.lastSendTimestamp = Date()
-        }
+        // Note: lastSendTimestamp is set BEFORE broadcast starts (line 1759)
+        // so that setMempoolVerified() can calculate accurate clearing time
 
         // CRITICAL: Record transaction IMMEDIATELY after broadcast success
         guard let txidData = Data(hexString: txId) else {

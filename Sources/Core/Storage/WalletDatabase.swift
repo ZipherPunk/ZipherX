@@ -78,6 +78,7 @@ final class WalletDatabase {
     private let openLock = NSLock()
 
     /// Open database with encryption key (thread-safe)
+    /// Uses SQLCipher for full database encryption when available
     func open(encryptionKey: Data) throws {
         openLock.lock()
         defer { openLock.unlock() }
@@ -88,6 +89,18 @@ final class WalletDatabase {
             return
         }
 
+        let sqlCipher = SQLCipherManager.shared
+
+        // Check if we need to migrate an existing unencrypted database
+        let fileExists = FileManager.default.fileExists(atPath: dbPath)
+        let needsMigration = fileExists &&
+                             sqlCipher.isSQLCipherAvailable &&
+                             !sqlCipher.isDatabaseEncrypted(path: dbPath)
+
+        if needsMigration {
+            try migrateToEncryptedDatabase()
+        }
+
         print("📂 Opening database at: \(dbPath)")
         // Use FULLMUTEX for thread safety
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -96,13 +109,65 @@ final class WalletDatabase {
             throw DatabaseError.openFailed(errorMsg)
         }
 
-        // SECURITY: Database is protected by iOS Data Protection API
-        // File is encrypted at rest with device-bound key (FileProtectionType.completeUnlessOpen)
-        // Additional SQLCipher can be added for defense-in-depth
+        // SECURITY: Apply SQLCipher encryption if available
+        // This calls PRAGMA key with the derived encryption key
+        if sqlCipher.isSQLCipherAvailable {
+            do {
+                try sqlCipher.applyEncryption(to: db!)
+                print("🔐 Full database encryption active (SQLCipher)")
+            } catch {
+                // SQLCipher failed - close and report error
+                sqlite3_close(db)
+                db = nil
+                throw DatabaseError.encryptionFailed
+            }
+        } else {
+            // Fallback: iOS Data Protection + field-level encryption
+            print("📂 Using iOS Data Protection + field-level encryption")
+        }
 
         // Create tables
         try createTables()
         print("📂 Database opened successfully")
+    }
+
+    /// Migrate existing unencrypted database to encrypted format
+    private func migrateToEncryptedDatabase() throws {
+        print("🔐 Migrating existing database to encrypted format...")
+
+        let backupPath = dbPath + ".backup"
+        let tempEncryptedPath = dbPath + ".encrypted"
+        let fileManager = FileManager.default
+
+        // Create backup of original
+        try? fileManager.removeItem(atPath: backupPath)
+        try fileManager.copyItem(atPath: dbPath, toPath: backupPath)
+
+        do {
+            // Migrate to encrypted format
+            try SQLCipherManager.shared.migrateToEncrypted(
+                sourcePath: dbPath,
+                destPath: tempEncryptedPath
+            )
+
+            // Replace original with encrypted version
+            try fileManager.removeItem(atPath: dbPath)
+            try fileManager.moveItem(atPath: tempEncryptedPath, toPath: dbPath)
+
+            // Remove backup on success
+            try? fileManager.removeItem(atPath: backupPath)
+
+            print("🔐 Database migration to encrypted format complete")
+
+        } catch {
+            // Restore from backup on failure
+            try? fileManager.removeItem(atPath: dbPath)
+            try? fileManager.moveItem(atPath: backupPath, toPath: dbPath)
+            try? fileManager.removeItem(atPath: tempEncryptedPath)
+
+            print("⚠️ Database migration failed, restored original: \(error)")
+            throw error
+        }
     }
 
     /// Close database connection
@@ -1761,7 +1826,15 @@ final class WalletDatabase {
             }
         }
 
-        let insertSql = """
+        // IMPORTANT: Use INSERT OR IGNORE for SENT - WalletManager records correct amount at send time
+        // Using INSERT OR REPLACE would overwrite with wrong value calculated from notes
+        let insertSentSql = """
+            INSERT OR IGNORE INTO transaction_history
+            (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        // For RECEIVED/CHANGE, INSERT OR REPLACE is fine since notes are the source of truth
+        let insertReceivedSql = """
             INSERT OR REPLACE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
@@ -1769,7 +1842,7 @@ final class WalletDatabase {
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let fee: UInt64 = 10_000
 
-        // PASS 1: Insert all SENT transactions
+        // PASS 1: Insert all SENT transactions (only if not already recorded by WalletManager)
         // Group spent notes by their spent_in_tx to handle multi-input transactions
         var sentTxData: [Data: (inputValue: UInt64, spentHeight: UInt64)] = [:]
         for note in allNotes where note.isSpent {
@@ -1794,7 +1867,8 @@ final class WalletDatabase {
             print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
 
             var spentStmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, insertSql, -1, &spentStmt, nil) == SQLITE_OK else {
+            // Use insertSentSql (INSERT OR IGNORE) - WalletManager already recorded correct amount
+            guard sqlite3_prepare_v2(db, insertSentSql, -1, &spentStmt, nil) == SQLITE_OK else {
                 print("📜 SENT: Failed to prepare statement for txid=\(spentTxid.prefix(8).hexString)")
                 continue
             }
@@ -1819,11 +1893,17 @@ final class WalletDatabase {
 
             let stepResult = sqlite3_step(spentStmt)
             if stepResult == SQLITE_DONE {
-                count += 1
-                print("📜 SENT: Successfully inserted txid=\(spentTxid.prefix(8).hexString)")
+                // INSERT OR IGNORE: check if row was actually inserted or ignored
+                let changes = sqlite3_changes(db)
+                if changes > 0 {
+                    count += 1
+                    print("📜 SENT: Inserted from notes txid=\(spentTxid.prefix(8).hexString) (no prior record)")
+                } else {
+                    print("📜 SENT: Skipped txid=\(spentTxid.prefix(8).hexString) (already recorded by WalletManager)")
+                }
             } else {
                 let errMsg = String(cString: sqlite3_errmsg(db))
-                print("📜 SENT: Failed to insert txid=\(spentTxid.prefix(8).hexString), error=\(errMsg), stepResult=\(stepResult)")
+                print("📜 SENT: Failed for txid=\(spentTxid.prefix(8).hexString), error=\(errMsg)")
             }
             sqlite3_finalize(spentStmt)
         }
@@ -1835,7 +1915,8 @@ final class WalletDatabase {
             let txType = isChange ? TransactionType.change : TransactionType.received
 
             var insertStmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK else {
+            // Use insertReceivedSql (INSERT OR REPLACE) - notes are the source of truth for received
+            guard sqlite3_prepare_v2(db, insertReceivedSql, -1, &insertStmt, nil) == SQLITE_OK else {
                 print("📜 Failed to prepare insert statement")
                 continue
             }
@@ -2090,11 +2171,11 @@ final class WalletDatabase {
         }
     }
 
-    /// Fix block_time for all transactions using actual timestamps from HeaderStore
-    /// This corrects estimated timestamps saved by older code
+    /// Fix block_time for transactions that have NULL or zero timestamps using actual timestamps from HeaderStore
+    /// This corrects estimated timestamps saved by older code or newly synced transactions
     func fixTransactionBlockTimes() throws {
-        // Get all transactions with their heights
-        let selectSql = "SELECT id, block_height FROM transaction_history WHERE block_height > 0;"
+        // Get all transactions with NULL or zero block_time
+        let selectSql = "SELECT id, block_height FROM transaction_history WHERE block_height > 0 AND (block_time IS NULL OR block_time = 0);"
 
         var selectStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
