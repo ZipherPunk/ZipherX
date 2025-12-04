@@ -121,7 +121,7 @@ final class NetworkManager: ObservableObject {
     private let CONSENSUS_THRESHOLD = 5 // SECURITY: Byzantine fault tolerance (n=8, f=2) - VUL-001 fix
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
-    private let BAN_DURATION: TimeInterval = 3600 // 1 hour (was 24 hours - too aggressive)
+    private let BAN_DURATION: TimeInterval = 604800 // VUL-010: 7 days for stronger Sybil protection
     private let MAX_KNOWN_ADDRESSES = 1000
     private let GETADDR_INTERVAL: TimeInterval = 30 // Request addresses every 30 seconds
 

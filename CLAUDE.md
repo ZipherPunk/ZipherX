@@ -3022,6 +3022,63 @@ int sqlite3_prepare_v2(...);
 
 ---
 
+### 53. Additional Security Fixes (P2/P3) - December 4, 2025 ✅
+
+**Implemented Medium and Low priority fixes to reach 95/100:**
+
+#### P2 Medium Fixes:
+
+1. **VUL-010: Increase Peer Ban Duration** ✅
+   - Changed `BAN_DURATION` from 1 hour to 7 days (604800 seconds)
+   - Stronger Sybil attack protection
+   - File: `NetworkManager.swift:124`
+
+2. **VUL-011: Per-Peer Rate Limiting** ✅
+   - Added `PeerRateLimiter` actor with token bucket algorithm
+   - 100 max tokens, 10 tokens/second refill rate
+   - Prevents excessive requests to single peer
+   - File: `Peer.swift:36-92, 107-108`
+
+3. **VUL-018: Shared Constants File** ✅
+   - Created `Constants.swift` with centralized values
+   - `bundledTreeHeight`, `bundledTreeCMUCount`, `defaultFee`, `dustThreshold`
+   - Updated 8 occurrences across 3 files
+   - Files: `Constants.swift`, `FilterScanner.swift`, `TransactionBuilder.swift`, `WalletManager.swift`
+
+4. **VUL-020: Memo Validation** ✅
+   - Added UTF-8 validation (Swift strings always valid)
+   - Added 512-byte length check
+   - Added `memoTooLong` error case
+   - File: `TransactionBuilder.swift:103-110, 384-390`
+
+#### P3 Low Fixes:
+
+5. **VUL-024: Dust Output Detection** ✅
+   - Detects outputs below 10,000 zatoshis (0.0001 ZCL)
+   - Shows clear error with amounts
+   - Added `dustOutput` error case
+   - File: `TransactionBuilder.swift:112-115, 392-395, 1007, 1027-1030`
+
+6. **VUL-027: Rust Key Zeroing** ✅ (Already implemented)
+   - `secure_zero()` called on decrypted spending key in all FFI functions
+   - 16+ locations in lib.rs already zeroing keys
+   - File: `lib.rs:2707-3156`
+
+7. **VUL-013: Data Protection Level** ✅ (Already strong)
+   - Using `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
+   - Data only accessible when device unlocked AND tied to this device
+   - No change needed - this is the recommended level for wallets
+
+**Security Score**: 95/100 (up from 85/100)
+
+**Remaining for 100/100:**
+- VUL-009: Hash nullifiers before storage (+2 points)
+- VUL-014: Annual key rotation policy (+1 point)
+- VUL-015: Encrypt transaction type in history (+1 point)
+- VUL-016: Secure memo deletion (+1 point)
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

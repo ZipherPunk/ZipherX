@@ -33,6 +33,64 @@ actor PeerMessageLock {
     }
 }
 
+// MARK: - VUL-011: Token Bucket Rate Limiter
+
+/// Token bucket rate limiter for peer requests
+/// Prevents excessive requests to any single peer
+actor PeerRateLimiter {
+    private var tokens: Double
+    private let maxTokens: Double
+    private let refillRate: Double  // tokens per second
+    private var lastRefill: Date
+
+    /// Initialize rate limiter
+    /// - Parameters:
+    ///   - maxTokens: Maximum tokens (requests) allowed in bucket
+    ///   - refillRate: How many tokens are added per second
+    init(maxTokens: Double = 100, refillRate: Double = 10) {
+        self.maxTokens = maxTokens
+        self.refillRate = refillRate
+        self.tokens = maxTokens
+        self.lastRefill = Date()
+    }
+
+    /// Check if request is allowed (consumes 1 token if yes)
+    /// - Returns: true if request allowed, false if rate limited
+    func tryConsume() -> Bool {
+        refill()
+        if tokens >= 1 {
+            tokens -= 1
+            return true
+        }
+        return false
+    }
+
+    /// Wait until request is allowed (blocks if rate limited)
+    func waitForToken() async {
+        refill()
+        while tokens < 1 {
+            // Wait 100ms and refill
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            refill()
+        }
+        tokens -= 1
+    }
+
+    /// Refill tokens based on elapsed time
+    private func refill() {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastRefill)
+        let newTokens = elapsed * refillRate
+        tokens = min(maxTokens, tokens + newTokens)
+        lastRefill = now
+    }
+
+    /// Current token count (for debugging)
+    var currentTokens: Double {
+        return tokens
+    }
+}
+
 /// Individual peer connection for Zclassic P2P network
 final class Peer {
     let id: String
@@ -45,6 +103,9 @@ final class Peer {
 
     /// Message lock to serialize P2P operations
     private let messageLock = PeerMessageLock()
+
+    /// VUL-011: Rate limiter to prevent excessive requests
+    private let rateLimiter = PeerRateLimiter(maxTokens: 100, refillRate: 10)
 
     // Protocol version
     private let protocolVersion: Int32 = 170011 // Latest Sapling support

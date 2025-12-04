@@ -125,8 +125,8 @@ final class FilterScanner {
         // Determine start height
         var startHeight: UInt64
 
-        // Height where bundled commitment tree ends (verified root matches chain)
-        let bundledTreeHeight: UInt64 = 2926122
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         // Track if we're scanning within bundled tree range (notes only, no tree building)
         var scanWithinBundledRange = false

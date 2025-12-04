@@ -811,8 +811,8 @@ final class WalletManager: ObservableObject {
                 // Get starting height for sync
                 // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
                 // The getheaders protocol returns headers AFTER the locator hash
-                // Checkpoint at bundledTreeHeight (2923123) will be used as locator
-                let bundledTreeHeight: UInt64 = 2926122
+                // VUL-018: Use shared constant for bundled tree height
+                let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
                 let startHeight: UInt64
                 if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
                     // Resume from where we left off
@@ -860,8 +860,8 @@ final class WalletManager: ObservableObject {
         await updateTask("scan", status: .inProgress)
         let scanner = FilterScanner()
 
-        // Bundled tree height for PHASE detection
-        let bundledTreeHeight: UInt64 = 2926122
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
@@ -1158,8 +1158,8 @@ final class WalletManager: ObservableObject {
         }
         print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
-        // Clear existing notes but keep tree if we're starting from a specific height
-        let bundledTreeHeight: UInt64 = 2926122  // Height where bundled tree ends
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         // Wait for any existing scan to complete (with timeout)
         if FilterScanner.isScanInProgress {
@@ -1235,7 +1235,8 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
-        let bundledTreeHeight: UInt64 = 2926122
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
@@ -1366,7 +1367,8 @@ final class WalletManager: ObservableObject {
             // All notes have CMU - check if any are beyond bundled range
             print("🚀 Checking notes for witness rebuild...")
 
-            let bundledTreeHeight: UInt64 = 2926122 // Height where bundled tree ends
+            // VUL-018: Use shared constant for bundled tree height
+            let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
             // Check if ANY note is beyond bundled range
             let notesBeyondBundled = notesWithCMU.filter { $0.height > bundledTreeHeight }

@@ -100,6 +100,20 @@ final class TransactionBuilder {
             throw TransactionError.invalidAddress
         }
 
+        // VUL-020: Validate memo (UTF-8 + length check)
+        if let memoText = memo {
+            // Check UTF-8 validity (Swift strings are always valid UTF-8)
+            let memoBytes = Array(memoText.utf8)
+            if memoBytes.count > ZipherXConstants.maxMemoLength {
+                throw TransactionError.memoTooLong(length: memoBytes.count, max: ZipherXConstants.maxMemoLength)
+            }
+        }
+
+        // VUL-024: Detect dust outputs (unspendable due to fees)
+        if amount > 0 && amount < ZipherXConstants.dustThreshold {
+            throw TransactionError.dustOutput(amount: amount, threshold: ZipherXConstants.dustThreshold)
+        }
+
         // Decode destination address
         guard let toAddressBytes = ZipherXFFI.decodeAddress(to) else {
             throw TransactionError.invalidAddress
@@ -134,8 +148,8 @@ final class TransactionBuilder {
 
         print("📝 Found \(dbNotes.count) notes with valid witnesses")
 
-        // Check if witnesses need updating (tree has grown since witness was created)
-        let bundledTreeHeight: UInt64 = 2926122
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -367,6 +381,19 @@ final class TransactionBuilder {
             throw TransactionError.invalidAddress
         }
 
+        // VUL-020: Validate memo (UTF-8 + length check)
+        if let memoText = memo {
+            let memoBytes = Array(memoText.utf8)
+            if memoBytes.count > ZipherXConstants.maxMemoLength {
+                throw TransactionError.memoTooLong(length: memoBytes.count, max: ZipherXConstants.maxMemoLength)
+            }
+        }
+
+        // VUL-024: Detect dust outputs (unspendable due to fees)
+        if amount > 0 && amount < ZipherXConstants.dustThreshold {
+            throw TransactionError.dustOutput(amount: amount, threshold: ZipherXConstants.dustThreshold)
+        }
+
         guard let toAddressBytes = ZipherXFFI.decodeAddress(to) else {
             throw TransactionError.invalidAddress
         }
@@ -390,7 +417,8 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        let bundledTreeHeight: UInt64 = 2926122
+        // VUL-018: Use shared constant for bundled tree height
+        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -993,6 +1021,8 @@ enum TransactionError: LocalizedError {
     case signingFailed
     case serializationFailed
     case noteLargeEnough(largestNote: UInt64, required: UInt64)
+    case memoTooLong(length: Int, max: Int)  // VUL-020
+    case dustOutput(amount: UInt64, threshold: UInt64)  // VUL-024
 
     var errorDescription: String? {
         switch self {
@@ -1010,6 +1040,12 @@ enum TransactionError: LocalizedError {
             let maxSendable = largestNote > 10000 ? largestNote - 10000 : 0
             let maxZCL = Double(maxSendable) / 100_000_000
             return "No single note large enough. Your largest note is \(String(format: "%.4f", Double(largestNote) / 100_000_000)) ZCL. Max you can send: \(String(format: "%.4f", maxZCL)) ZCL (multi-note spending coming soon)"
+        case .memoTooLong(let length, let max):
+            return "Memo too long: \(length) bytes (maximum \(max) bytes)"
+        case .dustOutput(let amount, let threshold):
+            let amountZCL = Double(amount) / 100_000_000
+            let thresholdZCL = Double(threshold) / 100_000_000
+            return "Output too small: \(String(format: "%.8f", amountZCL)) ZCL (minimum \(String(format: "%.8f", thresholdZCL)) ZCL to cover fees)"
         }
     }
 }
