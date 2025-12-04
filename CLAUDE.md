@@ -2960,6 +2960,58 @@ int sqlite3_prepare_v2(...);
 
 ---
 
+### 52. Critical Security Fixes Implementation (December 4, 2025)
+
+**Implementing all P0 (Critical) and P1 (High) security fixes from the audit:**
+
+#### P0 - Critical Fixes:
+
+1. **VUL-001: Increase Consensus Threshold**
+   - Changed `CONSENSUS_THRESHOLD` from 2 to 5
+   - Provides Byzantine fault tolerance (n=8, f=2)
+   - File: `NetworkManager.swift`
+
+2. **VUL-002: Encryption Must Not Fallback to Plaintext**
+   - Changed `encryptBlob()` to throw error instead of returning plaintext
+   - Changed `decryptBlob()` to throw error on failure
+   - All callers updated to handle errors properly
+   - File: `WalletDatabase.swift`
+
+3. **VUL-003: Enable Equihash PoW Verification**
+   - Added `verifyEquihashPoW()` call in `HeaderSyncManager`
+   - Headers with invalid PoW are rejected
+   - File: `HeaderSyncManager.swift`
+
+4. **VUL-004: Multi-Input Transaction Support**
+   - Updated `TransactionBuilder` to support multiple input notes
+   - Allows spending from multiple notes in single transaction
+   - Enables full balance spending when fragmented
+   - File: `TransactionBuilder.swift`
+
+#### P1 - High Priority Fixes:
+
+5. **VUL-005: Require Passcode When Biometric Disabled**
+   - If biometric disabled, require device passcode for send
+   - Uses `LAContext.evaluatePolicy(.deviceOwnerAuthentication)`
+   - File: `BiometricAuthManager.swift`
+
+6. **VUL-006: Remove InsightAPI Dependency for Chain Height**
+   - Chain height consensus now P2P-only
+   - InsightAPI only used as informational fallback (not trusted)
+   - File: `HeaderSyncManager.swift`, `NetworkManager.swift`
+
+7. **VUL-007: Fail Wallet Creation if SQLCipher Unavailable**
+   - Added check in `WalletDatabase.open()`
+   - Throws error if SQLCipher not available
+   - File: `WalletDatabase.swift`
+
+8. **VUL-008: Explicit Memory Zeroing for Keys**
+   - Added `memset_s` equivalent zeroing after key use
+   - Keys zeroed in `TransactionBuilder` after proof generation
+   - File: `TransactionBuilder.swift`, `SecureKeyStorage.swift`
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
