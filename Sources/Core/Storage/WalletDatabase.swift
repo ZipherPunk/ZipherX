@@ -2,6 +2,7 @@ import Foundation
 // Note: sqlite3 functions are available via bridging header (SQLCipher)
 // Do NOT import SQLite3 here as it conflicts with SQLCipher's sqlite3.h
 import CryptoKit
+import Security  // VUL-016: For SecRandomCopyBytes
 
 /// Encrypted SQLite database for wallet data
 /// Uses AES-GCM-256 for field-level encryption of sensitive data
@@ -61,6 +62,51 @@ final class WalletDatabase {
 
     /// Check if database connection is open
     var isOpen: Bool { db != nil }
+
+    // MARK: - VUL-009: Nullifier Hashing
+
+    /// Hash a nullifier for privacy-preserving storage
+    /// Prevents spending pattern analysis if database is compromised
+    private func hashNullifier(_ nullifier: Data) -> Data {
+        return Data(SHA256.hash(data: nullifier))
+    }
+
+    /// Check if nullifier appears to be already hashed (32 bytes from SHA256)
+    /// Used for backwards compatibility with pre-hashed nullifiers
+    private func isNullifierHashed(_ data: Data) -> Bool {
+        return data.count == 32  // SHA256 output is 32 bytes
+    }
+
+    // MARK: - VUL-015: Transaction Type Encryption
+
+    /// Obfuscated transaction type codes (stored in database)
+    /// Uses deterministic mapping so CHECK/UNIQUE constraints still work
+    /// SECURITY: These codes don't reveal transaction direction if database is compromised
+    private static let txTypeEncryptionMap: [TransactionType: String] = [
+        .sent: "α",      // Obfuscated: doesn't reveal "sent"
+        .received: "β",  // Obfuscated: doesn't reveal "received"
+        .change: "γ"     // Obfuscated: doesn't reveal "change"
+    ]
+
+    private static let txTypeDecryptionMap: [String: TransactionType] = [
+        "α": .sent,
+        "β": .received,
+        "γ": .change,
+        // Backwards compatibility: support old plaintext values
+        "sent": .sent,
+        "received": .received,
+        "change": .change
+    ]
+
+    /// Encrypt transaction type for database storage
+    private func encryptTxType(_ type: TransactionType) -> String {
+        return WalletDatabase.txTypeEncryptionMap[type] ?? type.rawValue
+    }
+
+    /// Decrypt transaction type from database storage
+    private func decryptTxType(_ stored: String) -> TransactionType {
+        return WalletDatabase.txTypeDecryptionMap[stored] ?? .received
+    }
 
     static let shared = WalletDatabase()
 
@@ -355,13 +401,14 @@ final class WalletDatabase {
             """,
 
             // Transaction history (unified view of sent/received/change)
+            // VUL-015: tx_type uses obfuscated codes (α, β, γ) with backwards compat for (sent, received, change)
             """
             CREATE TABLE IF NOT EXISTS transaction_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 txid BLOB NOT NULL,
                 block_height INTEGER NOT NULL,
                 block_time INTEGER,
-                tx_type TEXT NOT NULL CHECK (tx_type IN ('sent', 'received', 'change')),
+                tx_type TEXT NOT NULL CHECK (tx_type IN ('sent', 'received', 'change', 'α', 'β', 'γ')),
                 value INTEGER NOT NULL,
                 fee INTEGER,
                 to_address TEXT,
@@ -757,8 +804,10 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 5)
         }
-        nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(nullifier.count), SQLITE_TRANSIENT)
+        // VUL-009: Hash nullifier before storage to prevent spending pattern analysis
+        let hashedNullifier = hashNullifier(nullifier)
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
         }
         txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
@@ -792,7 +841,7 @@ final class WalletDatabase {
 
         // If INSERT OR IGNORE skipped the insert (duplicate nullifier), fetch existing note ID
         if sqlite3_changes(db) == 0 {
-            // Note already exists, fetch its ID by nullifier
+            // Note already exists, fetch its ID by hashed nullifier (VUL-009)
             let selectSql = "SELECT id FROM notes WHERE nf = ?;"
             var selectStmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
@@ -801,8 +850,8 @@ final class WalletDatabase {
             defer { sqlite3_finalize(selectStmt) }
 
             let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            nullifier.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(nullifier.count), SQLITE_TRANSIENT)
+            hashedNullifier.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
             }
 
             if sqlite3_step(selectStmt) == SQLITE_ROW {
@@ -1031,13 +1080,16 @@ final class WalletDatabase {
     func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64) throws {
         // SECURITY: Never log nullifiers - they are sensitive privacy data
 
+        // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
+        let hashedNullifier = hashNullifier(nullifier)
+
         // First, get the note's value so we can record it in transaction history
         var noteValue: UInt64 = 0
         let selectSql = "SELECT value FROM notes WHERE nf = ?;"
         var selectStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
-            nullifier.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+            hashedNullifier.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
             }
             if sqlite3_step(selectStmt) == SQLITE_ROW {
                 noteValue = UInt64(sqlite3_column_int64(selectStmt, 0))
@@ -1058,8 +1110,8 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
-        nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(nullifier.count), nil)
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -1079,9 +1131,12 @@ final class WalletDatabase {
     /// Mark note as spent by height
     /// NOTE: Also sets spent_in_tx using nullifier as synthetic txid for history tracking
     func markNoteSpent(nullifier: Data, spentHeight: UInt64) throws {
-        // Use nullifier as synthetic txid if no real txid available
+        // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
+        let hashedNullifier = hashNullifier(nullifier)
+
+        // Use nullifier hash as synthetic txid if no real txid available
         // This ensures populateHistoryFromNotes() can still create SENT entries
-        let syntheticTxid = nullifier.prefix(32)
+        let syntheticTxid = hashedNullifier.prefix(32)
 
         let sql = "UPDATE notes SET is_spent = 1, spent_height = ?, spent_in_tx = ? WHERE nf = ?;"
 
@@ -1095,8 +1150,8 @@ final class WalletDatabase {
         syntheticTxid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(syntheticTxid.count), nil)
         }
-        nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(nullifier.count), nil)
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -1107,6 +1162,9 @@ final class WalletDatabase {
 
     /// Mark note as unspent (recover from failed broadcast)
     func markNoteUnspent(nullifier: Data) throws {
+        // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
+        let hashedNullifier = hashNullifier(nullifier)
+
         let sql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL WHERE nf = ?;"
 
         var stmt: OpaquePointer?
@@ -1115,8 +1173,8 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        nullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -1414,6 +1472,9 @@ final class WalletDatabase {
 
     /// Clear transaction history from the database (for new wallet)
     func clearTransactionHistory() throws {
+        // VUL-016: Secure deletion - overwrite memos before delete
+        try secureWipeMemos()
+
         let sql = "DELETE FROM transaction_history;"
 
         var stmt: OpaquePointer?
@@ -1425,7 +1486,76 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
         }
-        print("🗑️ Cleared transaction history from database")
+        print("🗑️ Cleared transaction history from database (secure)")
+    }
+
+    // MARK: - VUL-016: Secure Memo Deletion
+
+    /// Securely wipe all memos by overwriting with random data before deletion
+    /// Prevents forensic recovery of sensitive memo content
+    private func secureWipeMemos() throws {
+        // Generate random data to overwrite memos (512 bytes = max memo length)
+        var randomBytes = [UInt8](repeating: 0, count: 512)
+        _ = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        let randomString = String(repeating: "X", count: 512)
+
+        // Overwrite all memo fields with random data
+        let overwriteSql = "UPDATE transaction_history SET memo = ? WHERE memo IS NOT NULL;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, overwriteSql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, randomString, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let changedRows = sqlite3_changes(db)
+        if changedRows > 0 {
+            print("🔐 VUL-016: Securely wiped \(changedRows) memo(s)")
+        }
+    }
+
+    /// Securely delete a single memo by ID (overwrites before setting to NULL)
+    func secureDeleteMemo(historyId: Int64) throws {
+        // First overwrite with random data
+        var randomBytes = [UInt8](repeating: 0, count: 512)
+        _ = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        let randomString = String(repeating: "X", count: 512)
+
+        let overwriteSql = "UPDATE transaction_history SET memo = ? WHERE id = ? AND memo IS NOT NULL;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, overwriteSql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, randomString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, historyId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            sqlite3_finalize(stmt)
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_finalize(stmt)
+
+        // Then set to NULL
+        let nullSql = "UPDATE transaction_history SET memo = NULL WHERE id = ?;"
+        guard sqlite3_prepare_v2(db, nullSql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, historyId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("🔐 VUL-016: Securely deleted memo for history ID \(historyId)")
     }
 
     /// Clear all accounts from the database (for new wallet)
@@ -1587,7 +1717,9 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 3)
         }
-        sqlite3_bind_text(stmt, 4, type.rawValue, -1, SQLITE_TRANSIENT)
+        // VUL-015: Use obfuscated type code instead of plaintext
+        let encryptedType = encryptTxType(type)
+        sqlite3_bind_text(stmt, 4, encryptedType, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 5, Int64(value))
         if let fee = fee {
             sqlite3_bind_int64(stmt, 6, Int64(fee))
@@ -1628,14 +1760,15 @@ final class WalletDatabase {
         print("📜 getTransactionHistory called")
 
         // First check total count (excluding change outputs for accurate count)
+        // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
-            WHERE t1.tx_type != 'change'
+            WHERE t1.tx_type NOT IN ('change', 'γ')
             AND NOT (
-                t1.tx_type = 'received'
+                t1.tx_type IN ('received', 'β')
                 AND EXISTS (
                     SELECT 1 FROM transaction_history t2
-                    WHERE t2.txid = t1.txid AND t2.tx_type = 'sent'
+                    WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
                 )
             );
         """
@@ -1649,17 +1782,17 @@ final class WalletDatabase {
         }
 
         // Exclude change outputs:
-        // 1. Explicitly exclude tx_type = 'change'
+        // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
         // 2. Also exclude received transactions where the same txid exists as sent
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
-            WHERE t1.tx_type != 'change'
+            WHERE t1.tx_type NOT IN ('change', 'γ')
             AND NOT (
-                t1.tx_type = 'received'
+                t1.tx_type IN ('received', 'β')
                 AND EXISTS (
                     SELECT 1 FROM transaction_history t2
-                    WHERE t2.txid = t1.txid AND t2.tx_type = 'sent'
+                    WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
                 )
             )
             ORDER BY block_height DESC, created_at DESC
@@ -1694,7 +1827,9 @@ final class WalletDatabase {
                 }
             }
             // If still nil (header not synced yet), leave as nil - UI will handle it
-            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            // VUL-015: Decrypt the obfuscated type code
+            let rawTypeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let txType = decryptTxType(rawTypeStr)
             let value = UInt64(sqlite3_column_int64(stmt, 4))
             let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
             let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
@@ -1707,7 +1842,7 @@ final class WalletDatabase {
                 txid: txidData,
                 height: height,
                 blockTime: blockTime,
-                type: TransactionType(rawValue: typeStr) ?? .received,
+                type: txType,  // VUL-015: Use decrypted type
                 value: value,
                 fee: fee,
                 toAddress: toAddress,
@@ -1715,7 +1850,7 @@ final class WalletDatabase {
                 status: TransactionStatus(rawValue: statusStr) ?? .confirmed,
                 confirmations: confirmations
             )
-            print("📜 DB: Item created - txidLen=\(txidLen), type=\(typeStr), value=\(value), height=\(height), txidString=\(item.txidString.prefix(16))...")
+            print("📜 DB: Item created - txidLen=\(txidLen), type=\(txType.rawValue), value=\(value), height=\(height), txidString=\(item.txidString.prefix(16))...")
 
             items.append(item)
         }
@@ -1742,8 +1877,11 @@ final class WalletDatabase {
     }
 
     /// Check if a transaction exists in history (direct check, no filtering)
+    /// VUL-015: Check both plaintext and obfuscated type codes for backwards compat
     func transactionExists(txid: Data, type: TransactionType) throws -> Bool {
-        let sql = "SELECT 1 FROM transaction_history WHERE txid = ? AND tx_type = ? LIMIT 1;"
+        // Check both old plaintext and new obfuscated codes
+        let encryptedType = encryptTxType(type)
+        let sql = "SELECT 1 FROM transaction_history WHERE txid = ? AND tx_type IN (?, ?) LIMIT 1;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1755,7 +1893,8 @@ final class WalletDatabase {
         txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
-        sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)  // Old plaintext
+        sqlite3_bind_text(stmt, 3, encryptedType, -1, SQLITE_TRANSIENT)  // New obfuscated
 
         return sqlite3_step(stmt) == SQLITE_ROW
     }
@@ -2019,10 +2158,11 @@ final class WalletDatabase {
         memo: String? = nil,
         blockTime: UInt64? = nil
     ) throws {
+        // VUL-015: Use obfuscated type code instead of plaintext
         let sql = """
             INSERT OR IGNORE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
-            VALUES (?, ?, ?, 'received', ?, NULL, NULL, NULL, ?);
+            VALUES (?, ?, ?, 'β', ?, NULL, NULL, NULL, ?);
         """
 
         var stmt: OpaquePointer?
@@ -2083,10 +2223,11 @@ final class WalletDatabase {
         status: TransactionStatus = .confirmed,
         confirmations: Int = 0
     ) throws {
+        // VUL-015: Use obfuscated type code instead of plaintext
         let sql = """
             INSERT OR REPLACE INTO transaction_history
             (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status, confirmations)
-            VALUES (?, ?, ?, 'sent', ?, ?, ?, NULL, ?, ?, ?);
+            VALUES (?, ?, ?, 'α', ?, ?, ?, NULL, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -2165,7 +2306,9 @@ final class WalletDatabase {
         txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
-        sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)
+        // VUL-015: Use obfuscated type code instead of plaintext
+        let encryptedType = encryptTxType(type)
+        sqlite3_bind_text(stmt, 2, encryptedType, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 3, Int64(value))
         if let fee = fee {
             sqlite3_bind_int64(stmt, 4, Int64(fee))

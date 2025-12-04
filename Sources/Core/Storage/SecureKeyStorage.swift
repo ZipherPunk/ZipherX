@@ -804,6 +804,82 @@ final class SecureKeyStorage {
         }
     }
 
+    // MARK: - VUL-014: Key Rotation Policy
+
+    private let keyCreationDateKey = "ZipherX.KeyCreationDate"
+    private let keyRotationWarningDays: Int = 365  // Recommend rotation after 1 year
+
+    /// Record the key creation date (call after generating new wallet)
+    func recordKeyCreationDate() {
+        let now = Date()
+        UserDefaults.standard.set(now, forKey: keyCreationDateKey)
+        print("🔑 Key creation date recorded: \(now)")
+    }
+
+    /// Get the key creation date
+    func getKeyCreationDate() -> Date? {
+        return UserDefaults.standard.object(forKey: keyCreationDateKey) as? Date
+    }
+
+    /// Clear the key creation date (call when deleting wallet)
+    func clearKeyCreationDate() {
+        UserDefaults.standard.removeObject(forKey: keyCreationDateKey)
+        print("🔑 Key creation date cleared")
+    }
+
+    /// Check if key rotation is recommended (> 365 days old)
+    /// Returns: number of days since creation, or nil if no creation date recorded
+    func getKeyAgeDays() -> Int? {
+        guard let creationDate = getKeyCreationDate() else { return nil }
+        let daysSinceCreation = Calendar.current.dateComponents([.day], from: creationDate, to: Date()).day
+        return daysSinceCreation
+    }
+
+    /// Check if key rotation should be recommended to the user
+    /// Returns true if key is older than 365 days
+    func shouldRecommendKeyRotation() -> Bool {
+        guard let ageDays = getKeyAgeDays() else {
+            // No creation date recorded - could be old wallet, recommend setting up date
+            if hasSpendingKey() {
+                // Has key but no date - assume it's old and should rotate
+                print("⚠️ VUL-014: Key exists but no creation date - recommend rotation")
+                return true
+            }
+            return false
+        }
+        let shouldRotate = ageDays >= keyRotationWarningDays
+        if shouldRotate {
+            print("⚠️ VUL-014: Key is \(ageDays) days old - rotation recommended")
+        }
+        return shouldRotate
+    }
+
+    /// Get a user-friendly message about key age for display in Settings
+    func getKeyAgeMessage() -> String {
+        guard let ageDays = getKeyAgeDays() else {
+            if hasSpendingKey() {
+                return "Unknown age (pre-dating tracking)"
+            }
+            return "No key stored"
+        }
+
+        if ageDays < 30 {
+            return "Created recently (\(ageDays) days ago)"
+        } else if ageDays < 365 {
+            let months = ageDays / 30
+            return "Created \(months) month\(months == 1 ? "" : "s") ago"
+        } else {
+            let years = ageDays / 365
+            let remainingMonths = (ageDays % 365) / 30
+            var message = "Created \(years) year\(years == 1 ? "" : "s")"
+            if remainingMonths > 0 {
+                message += " \(remainingMonths) month\(remainingMonths == 1 ? "" : "s")"
+            }
+            message += " ago"
+            return message
+        }
+    }
+
     /// Check if Secure Enclave is available on this device
     static var isSecureEnclaveAvailable: Bool {
         let attributes: [String: Any] = [

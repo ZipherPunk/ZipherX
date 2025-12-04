@@ -731,6 +731,59 @@ struct SettingsView: View {
                 Rectangle()
                     .stroke(theme.textPrimary, lineWidth: 1)
             )
+
+            // VUL-014: Key Rotation Policy
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: "key.horizontal.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Spending Key Age")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    Spacer()
+
+                    if SecureKeyStorage.shared.shouldRecommendKeyRotation() {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.orange)
+                            Text("Rotate Recommended")
+                                .font(theme.captionFont)
+                                .foregroundColor(.orange)
+                        }
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.green)
+                            Text("Valid")
+                                .font(theme.captionFont)
+                                .foregroundColor(.green)
+                        }
+                    }
+                }
+
+                Text(SecureKeyStorage.shared.getKeyAgeMessage())
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+
+                if SecureKeyStorage.shared.shouldRecommendKeyRotation() {
+                    Text("Security best practice: Create a new wallet and transfer funds annually")
+                        .font(.system(size: 9))
+                        .foregroundColor(.orange)
+                        .padding(.top, 2)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(SecureKeyStorage.shared.shouldRecommendKeyRotation() ? Color.orange : theme.textPrimary, lineWidth: 1)
+            )
         }
         .padding(12)
         .background(theme.backgroundColor)

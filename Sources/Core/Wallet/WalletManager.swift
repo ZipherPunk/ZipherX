@@ -482,6 +482,9 @@ final class WalletManager: ObservableObject {
         // Store spending key in Secure Enclave
         try secureStorage.storeSpendingKey(spendingKey)
 
+        // VUL-014: Record key creation date for rotation policy
+        secureStorage.recordKeyCreationDate()
+
         // Derive z-address from spending key
         let address = try deriveZAddress(from: spendingKey)
 
@@ -567,6 +570,10 @@ final class WalletManager: ObservableObject {
 
         // Store in Secure Enclave
         try secureStorage.storeSpendingKey(spendingKey)
+
+        // VUL-014: Record key creation date for rotation policy
+        // For imported keys, this marks the import date (not original creation)
+        secureStorage.recordKeyCreationDate()
 
         // Derive z-address
         let address = try deriveZAddress(from: spendingKey)
@@ -2078,7 +2085,9 @@ final class WalletManager: ObservableObject {
         // 2. Delete spending key from keychain
         do {
             try secureStorage.deleteSpendingKey()
-            print("🗑️ Deleted spending key")
+            // VUL-014: Clear key creation date when deleting wallet
+            secureStorage.clearKeyCreationDate()
+            print("🗑️ Deleted spending key and creation date")
         } catch {
             print("⚠️ Failed to delete spending key: \(error) (continuing anyway)")
         }
@@ -2203,6 +2212,8 @@ final class WalletManager: ObservableObject {
         print("🔑 Storing key in secure storage...")
         do {
             try secureStorage.storeSpendingKey(spendingKey)
+            // VUL-014: Record key creation date for rotation policy
+            secureStorage.recordKeyCreationDate()
             print("✓ Key stored successfully")
         } catch {
             print("❌ Failed to store key: \(error.localizedDescription)")

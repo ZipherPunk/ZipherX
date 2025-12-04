@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
+		060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		06B12D7857EFEC8AC250FC21 /* Win95Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA9A163DB79D1C4871FD5D /* Win95Theme.swift */; };
 		06EFE4825D0A38F6B1659224 /* DatabaseEncryption.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */; };
@@ -112,6 +113,7 @@
 		ED160AAE5D5BE3EE9480FEF2 /* WalletSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */; };
 		EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 716A65BFF58BBC7334E13C13 /* sapling_tree.bin */; };
 		F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 630CFD90F45505D02500501A /* ContentView.swift */; };
+		F49F08F7B04F1E25AB55812B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
 		F81EE61689207BA67EB8D590 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AB898B285954293A4942B3D /* BootstrapManager.swift */; };
 		F89810E6B5612D18E485A0D7 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AB898B285954293A4942B3D /* BootstrapManager.swift */; };
 /* End PBXBuildFile section */
@@ -167,6 +169,7 @@
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseEncryption.swift; sourceTree = "<group>"; };
+		A9C06A2912C98B98AD2E5D87 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
 		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
@@ -241,6 +244,7 @@
 		1475AFA394F4459F1E0D0535 /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				A9C06A2912C98B98AD2E5D87 /* Constants.swift */,
 				A57133D73210DCD2789FEF97 /* Crypto */,
 				89B060A782EF443EA7627E21 /* Data */,
 				20F71A132FD8A2BB39D5BE63 /* FullNode */,
@@ -647,6 +651,7 @@
 				F89810E6B5612D18E485A0D7 /* BootstrapManager.swift in Sources */,
 				A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */,
 				ECE7A8EBCC60183A2F686044 /* Checkpoints.swift in Sources */,
+				060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */,
 				F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */,
 				C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */,
 				838503AC50687F8879C1AAC1 /* DatabaseEncryption.swift in Sources */,
@@ -701,6 +706,7 @@
 				F81EE61689207BA67EB8D590 /* BootstrapManager.swift in Sources */,
 				36A75F1FA4D8DFF11BDB6137 /* BootstrapProgressView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
+				F49F08F7B04F1E25AB55812B /* Constants.swift in Sources */,
 				8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */,
 				4349DCD1E3A8528A99795205 /* CypherpunkTheme.swift in Sources */,
 				06EFE4825D0A38F6B1659224 /* DatabaseEncryption.swift in Sources */,
