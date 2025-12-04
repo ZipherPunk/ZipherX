@@ -2055,6 +2055,11 @@ struct CypherpunkMainView: View {
                 let receivedCount = deduped.filter { $0.type == .received }.count
                 print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
 
+                // Debug: print first 5 items to trace duplicates
+                for (i, item) in deduped.prefix(5).enumerated() {
+                    print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
+                }
+
                 DispatchQueue.main.async {
                     self.transactions = deduped
                     self.isLoadingHistory = false
