@@ -160,6 +160,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when transaction is confirmed (for outgoing txs)
     func notifyConfirmed(amount: UInt64, txid: String) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !isInitialSyncInProgress else { return }
+
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifyConfirmed called")
         print("   amount=\(amount) (\(zcl) ZCL)")
@@ -188,6 +191,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is sent
     func notifySent(amount: UInt64, txid: String, memo: String? = nil) {
+        // Note: notifySent is NOT suppressed during sync because user explicitly initiates sends
+        // This is intentional - user should always see confirmation of their own actions
+
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifySent called")
         print("   amount=\(amount) (\(zcl) ZCL)")
