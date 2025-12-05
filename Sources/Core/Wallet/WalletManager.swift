@@ -39,6 +39,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var isSyncing: Bool = false
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
+    @Published private(set) var syncPhase: String = ""  // "phase1", "phase1.5", "phase1.6", "phase2"
     @Published private(set) var lastError: WalletError?
     @Published private(set) var syncTasks: [SyncTask] = []
     @Published private(set) var syncCurrentHeight: UInt64 = 0
@@ -967,6 +968,30 @@ final class WalletManager: ObservableObject {
         // VUL-018: Use shared constant for bundled tree height
         let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
 
+        // Status update callback - handles phase transitions and messages
+        scanner.onStatusUpdate = { [weak self] phase, status in
+            Task { @MainActor in
+                self?.syncPhase = phase
+                self?.syncStatus = status
+
+                // Update task detail based on phase
+                if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
+                    switch phase {
+                    case "phase1":
+                        self?.syncTasks[index].detail = "Parallel note decryption"
+                    case "phase1.5":
+                        self?.syncTasks[index].detail = "Computing Merkle witnesses"
+                    case "phase1.6":
+                        self?.syncTasks[index].detail = "Detecting spent notes"
+                    case "phase2":
+                        self?.syncTasks[index].detail = "Sequential tree building"
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
                 self?.syncProgress = progress
@@ -981,13 +1006,24 @@ final class WalletManager: ObservableObject {
                     let estimatedDate = self?.estimateDateForBlock(height: currentHeight) ?? ""
                     let dateString = estimatedDate.isEmpty ? "" : " (\(estimatedDate))"
 
-                    self?.syncTasks[index].detail = "Block \(currentHeight.formatted())\(dateString)"
-                    self?.syncTasks[index].progress = blocksToScan > 0 ? Double(blocksScanned) / Double(blocksToScan) : progress
+                    // Include phase in the detail if available
+                    let phasePrefix: String
+                    switch self?.syncPhase {
+                    case "phase1": phasePrefix = "⚡ "
+                    case "phase1.5": phasePrefix = "🌲 "
+                    case "phase1.6": phasePrefix = "🔍 "
+                    case "phase2": phasePrefix = "📦 "
+                    default: phasePrefix = ""
+                    }
+
+                    self?.syncTasks[index].detail = "\(phasePrefix)Block \(currentHeight.formatted())\(dateString)"
+                    self?.syncTasks[index].progress = progress
                 }
 
                 // Update syncStatus with cypherpunk messages based on scan phase
-                if currentHeight <= bundledTreeHeight {
-                    // PHASE 1: Scanning within bundled tree range
+                // Only update if no specific status was set by onStatusUpdate
+                if self?.syncPhase == "phase1" {
+                    // PHASE 1: Parallel note discovery
                     let phase1Messages = [
                         "Hunting for your shielded notes...",
                         "Decrypting the shadows...",
@@ -1000,7 +1036,7 @@ final class WalletManager: ObservableObject {
                     ]
                     let messageIndex = Int(currentHeight / 50000) % phase1Messages.count
                     self?.syncStatus = phase1Messages[messageIndex]
-                } else {
+                } else if self?.syncPhase == "phase2" {
                     // PHASE 2: Sequential tree building
                     let phase2Messages = [
                         "Building commitment tree...",
@@ -1009,10 +1045,11 @@ final class WalletManager: ObservableObject {
                         "Securing new commitments...",
                         "Zero-knowledge sync active..."
                     ]
-                    let blocksAfterBundled = currentHeight - bundledTreeHeight
+                    let blocksAfterBundled = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
                     let messageIndex = Int(blocksAfterBundled / 1000) % phase2Messages.count
                     self?.syncStatus = phase2Messages[messageIndex]
                 }
+                // Note: phase1.5 and phase1.6 status is set by onStatusUpdate
             }
         }
 

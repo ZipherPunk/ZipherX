@@ -1029,6 +1029,73 @@ enum ZipherXFFI {
         return results
     }
 
+    /// Create witnesses for multiple CMUs using PARALLEL processing (Rayon)
+    /// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+    /// Each witness gets its own thread building tree to that position.
+    ///
+    /// For 9 notes: uses 9 parallel threads, each builds tree to its position
+    /// Expected speedup: 3-8x depending on CPU cores and note positions
+    ///
+    /// - Parameters:
+    ///   - cmuData: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - targetCMUs: Array of 32-byte CMUs to create witnesses for
+    /// - Returns: Array of (position, witness) tuples, or nil for CMUs not found
+    static func treeCreateWitnessesParallel(cmuData: Data, targetCMUs: [Data]) -> [(position: UInt64, witness: Data)?] {
+        guard !targetCMUs.isEmpty else { return [] }
+
+        // Validate all CMUs are 32 bytes
+        for cmu in targetCMUs {
+            guard cmu.count == 32 else {
+                print("❌ Invalid CMU size: \(cmu.count)")
+                return targetCMUs.map { _ in nil }
+            }
+        }
+
+        let targetCount = targetCMUs.count
+
+        // Pack all target CMUs into a single contiguous buffer
+        var packedCMUs = Data(capacity: targetCount * 32)
+        for cmu in targetCMUs {
+            packedCMUs.append(cmu)
+        }
+
+        // Allocate output buffers
+        var positions = [UInt64](repeating: UInt64.max, count: targetCount)
+        var witnesses = [UInt8](repeating: 0, count: targetCount * 1028)
+
+        let startTime = Date()
+
+        let successCount = packedCMUs.withUnsafeBytes { targetsPtr in
+            cmuData.withUnsafeBytes { cmuDataPtr in
+                zipherx_tree_create_witnesses_parallel(
+                    targetsPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    targetCount,
+                    cmuDataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    cmuData.count,
+                    &positions,
+                    &witnesses
+                )
+            }
+        }
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        print("✅ Parallel witness: \(successCount)/\(targetCount) created in \(String(format: "%.1f", elapsed))s")
+
+        // Parse results
+        var results: [(position: UInt64, witness: Data)?] = []
+        for i in 0..<targetCount {
+            if positions[i] != UInt64.max {
+                let witnessStart = i * 1028
+                let witnessData = Data(witnesses[witnessStart..<(witnessStart + 1028)])
+                results.append((position: positions[i], witness: witnessData))
+            } else {
+                results.append(nil)
+            }
+        }
+
+        return results
+    }
+
     // MARK: - OVK Output Recovery (Transaction History)
 
     /// Derive outgoing viewing key from spending key

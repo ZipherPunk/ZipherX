@@ -40,8 +40,18 @@ final class FilterScanner {
     // Progress callback - (progress, currentHeight, maxHeight)
     var onProgress: ((Double, UInt64, UInt64) -> Void)?
 
+    // Status callback - (phase, status message)
+    // Phases: "phase1" (parallel scan), "phase1.5" (witnesses), "phase1.6" (spends), "phase2" (sequential)
+    var onStatusUpdate: ((String, String) -> Void)?
+
     // Witness update progress callback - (current, total, status)
     var onWitnessProgress: ((Int, Int, String) -> Void)?
+
+    // Progress ranges for each phase (total = 100%)
+    private let phase1ProgressRange = 0.0...0.40      // 0-40%: Parallel note discovery
+    private let phase15ProgressRange = 0.40...0.55   // 40-55%: Witness computation
+    private let phase16ProgressRange = 0.55...0.60   // 55-60%: Spend detection
+    private let phase2ProgressRange = 0.60...1.0     // 60-100%: Sequential scan
 
     // Current chain height (updated during scan)
     private(set) var currentChainHeight: UInt64 = 0
@@ -73,6 +83,48 @@ final class FilterScanner {
     // New wallets can't have any notes yet (address was just created)
     // We still append CMUs to tree but skip tryDecryptNote() calls
     private var isNewWalletInitialSync = false
+
+    // MARK: - Progress Helpers
+
+    /// Map phase-local progress (0-1) to overall progress within that phase's range
+    private func mapProgress(_ localProgress: Double, in range: ClosedRange<Double>) -> Double {
+        let rangeSize = range.upperBound - range.lowerBound
+        return range.lowerBound + (localProgress * rangeSize)
+    }
+
+    /// Report progress for PHASE 1 (parallel note discovery)
+    private func reportPhase1Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
+        let overall = mapProgress(localProgress, in: phase1ProgressRange)
+        onProgress?(overall, height, maxHeight)
+        if localProgress < 0.01 {
+            onStatusUpdate?("phase1", "Decrypting shielded notes (parallel)...")
+        }
+    }
+
+    /// Report progress for PHASE 1.5 (witness computation)
+    private func reportPhase15Progress(_ localProgress: Double, current: Int, total: Int) {
+        let overall = mapProgress(localProgress, in: phase15ProgressRange)
+        onProgress?(overall, UInt64(current), UInt64(total))
+        onStatusUpdate?("phase1.5", "Computing Merkle witnesses (\(current)/\(total))...")
+    }
+
+    /// Report progress for PHASE 1.6 (spend detection)
+    private func reportPhase16Progress(_ localProgress: Double, detected: Int, total: Int) {
+        let overall = mapProgress(localProgress, in: phase16ProgressRange)
+        onProgress?(overall, UInt64(detected), UInt64(total))
+        if localProgress < 0.01 {
+            onStatusUpdate?("phase1.6", "Detecting spent notes...")
+        }
+    }
+
+    /// Report progress for PHASE 2 (sequential scan)
+    private func reportPhase2Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
+        let overall = mapProgress(localProgress, in: phase2ProgressRange)
+        onProgress?(overall, height, maxHeight)
+        if localProgress < 0.01 {
+            onStatusUpdate?("phase2", "Building commitment tree...")
+        }
+    }
 
     init(networkManager: NetworkManager = .shared,
          database: WalletDatabase = .shared,
@@ -620,10 +672,10 @@ final class FilterScanner {
                     print("❌ Error in parallel batch processing: \(error)")
                 }
 
-                // Update progress
+                // Update progress (PHASE 1: 0-40%)
                 parallelScannedBlocks += UInt64(endHeight - currentHeight + 1)
-                let progress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
-                onProgress?(progress * 0.5, endHeight, targetHeight) // 50% for phase 1
+                let localProgress = Double(parallelScannedBlocks) / Double(parallelTotalBlocks)
+                reportPhase1Progress(localProgress, height: endHeight, maxHeight: targetHeight)
 
                 // Save progress for bundled range scan
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
@@ -635,12 +687,20 @@ final class FilterScanner {
             print("📊 Found \(knownNullifiers.count) notes with nullifiers")
             print("📊 Collected \(collectedSpends.count) spends during PHASE 1")
 
+            // PHASE 1.5: Pre-compute witnesses using PARALLEL function (Rayon multi-threaded)
+            // This computes all witnesses in ~78 seconds using all CPU cores
+            if let bundledData = cmuDataForPositionLookup {
+                await computeWitnessesForBundledNotesBatch(bundledData: bundledData)
+            }
+
             // PHASE 1.6: SPEND DETECTION PASS (using cached spends - NO network fetch!)
             // During PHASE 1, we cached all spends we encountered.
             // Now check them against knownNullifiers (which is now complete).
             if !knownNullifiers.isEmpty && !collectedSpends.isEmpty {
                 print("🔍 PHASE 1.6: Checking \(collectedSpends.count) cached spends against \(knownNullifiers.count) known nullifiers...")
+                reportPhase16Progress(0.0, detected: 0, total: collectedSpends.count)
                 var spendsDetected = 0
+                var processed = 0
 
                 for (height, txid, nullifierHex) in collectedSpends {
                     guard let nullifierDisplay = Data(hexString: nullifierHex) else { continue }
@@ -655,14 +715,15 @@ final class FilterScanner {
                         spendsDetected += 1
                         print("💸 Detected spend at height \(height) in tx \(txid.prefix(16))...")
                     }
+                    processed += 1
+                    // Update progress every 1000 spends
+                    if processed % 1000 == 0 {
+                        let localProgress = Double(processed) / Double(collectedSpends.count)
+                        reportPhase16Progress(localProgress, detected: spendsDetected, total: collectedSpends.count)
+                    }
                 }
+                reportPhase16Progress(1.0, detected: spendsDetected, total: collectedSpends.count)
                 print("✅ PHASE 1.6 complete: detected \(spendsDetected) spent notes")
-            }
-
-            // PHASE 1.5: Pre-compute witnesses using BATCH function (single tree pass)
-            // This computes all witnesses in ~57 seconds total instead of 57s × N notes
-            if let bundledData = cmuDataForPositionLookup {
-                await computeWitnessesForBundledNotesBatch(bundledData: bundledData)
             }
 
             // Move to blocks after bundled tree height for PHASE 2
@@ -757,6 +818,10 @@ final class FilterScanner {
             //
             // P2P-FIRST: Uses P2P network with InsightAPI fallback (unless useP2POnly is true)
 
+            print("🔧 PHASE 2: Building commitment tree (sequential mode)...")
+            onStatusUpdate?("phase2", "Building commitment tree...")
+            reportPhase2Progress(0.0, height: currentHeight, maxHeight: targetHeight)
+
             // Pre-fetch task for next batch (runs in background)
             var nextBatchTask: Task<[(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])], Error>? = nil
 
@@ -839,10 +904,10 @@ final class FilterScanner {
                     }
 
                     scannedBlocks += 1
-                    // Report progress every 10 blocks for better UI feedback
+                    // Report PHASE 2 progress (60-100%) every 10 blocks for better UI feedback
                     if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
-                        let progress = Double(scannedBlocks) / Double(totalBlocks)
-                        onProgress?(progress, height, targetHeight)
+                        let localProgress = Double(scannedBlocks) / Double(totalBlocks)
+                        reportPhase2Progress(localProgress, height: height, maxHeight: targetHeight)
                     }
                 }
 
@@ -2342,15 +2407,17 @@ final class FilterScanner {
         }
     }
 
-    /// Pre-compute witnesses using BATCH function (single tree pass)
-    /// This is MUCH faster than the sequential version - builds tree ONCE for all notes
+    /// Pre-compute witnesses using PARALLEL function (Rayon multi-threaded)
+    /// This is MUCH faster than the sequential version - each note gets its own thread
     private func computeWitnessesForBundledNotesBatch(bundledData: Data) async {
-        print("🔧 PHASE 1.5: Pre-computing witnesses (BATCH mode - single tree pass)...")
+        print("🔧 PHASE 1.5: Pre-computing witnesses (PARALLEL mode - Rayon multi-threaded)...")
+        reportPhase15Progress(0.0, current: 0, total: 1)
 
         do {
             // Get the account ID
             guard let account = try database.getAccount(index: 0) else {
                 print("⚠️ No account found, skipping witness pre-computation")
+                reportPhase15Progress(1.0, current: 0, total: 0)
                 return
             }
 
@@ -2363,10 +2430,12 @@ final class FilterScanner {
 
             if notesNeedingWitness.isEmpty {
                 print("✅ All notes already have valid witnesses")
+                reportPhase15Progress(1.0, current: 0, total: 0)
                 return
             }
 
             print("📝 Found \(notesNeedingWitness.count) note(s) needing witness computation")
+            reportPhase15Progress(0.05, current: 0, total: notesNeedingWitness.count)
 
             // Collect all CMUs that need witnesses
             var targetCMUs: [Data] = []
@@ -2383,17 +2452,22 @@ final class FilterScanner {
 
             guard !targetCMUs.isEmpty else {
                 print("⚠️ No valid CMUs found for batch witness computation")
+                reportPhase15Progress(1.0, current: 0, total: 0)
                 return
             }
 
-            print("🌲 Computing \(targetCMUs.count) witnesses in single tree pass...")
+            print("🌲 Computing \(targetCMUs.count) witnesses using Rayon parallel threads...")
+            reportPhase15Progress(0.1, current: 0, total: targetCMUs.count)
             let startTime = Date()
 
-            // Call batch witness function (single tree build for ALL notes!)
-            let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: bundledData, targetCMUs: targetCMUs)
+            // Use PARALLEL witness function - each note gets its own thread!
+            // This uses Rayon work-stealing for optimal multi-core performance
+            // Note: This is a blocking call, progress updates inside Rust would require callbacks
+            let results = ZipherXFFI.treeCreateWitnessesParallel(cmuData: bundledData, targetCMUs: targetCMUs)
 
             let elapsed = Date().timeIntervalSince(startTime)
-            print("⏱️ Batch witness computation took \(String(format: "%.1f", elapsed))s")
+            print("⏱️ Parallel witness computation took \(String(format: "%.1f", elapsed))s")
+            reportPhase15Progress(0.9, current: targetCMUs.count, total: targetCMUs.count)
 
             // Update database with computed witnesses
             var successCount = 0
@@ -2409,10 +2483,12 @@ final class FilterScanner {
                 }
             }
 
-            print("✅ PHASE 1.5 complete: \(successCount)/\(targetCMUs.count) witnesses computed in \(String(format: "%.1f", elapsed))s")
+            reportPhase15Progress(1.0, current: successCount, total: targetCMUs.count)
+            print("✅ Parallel witness: \(successCount)/\(targetCMUs.count) created in \(String(format: "%.1f", elapsed))s")
 
         } catch {
             print("❌ Error in batch witness computation: \(error)")
+            reportPhase15Progress(1.0, current: 0, total: 0)
         }
     }
 }

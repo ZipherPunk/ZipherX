@@ -2744,14 +2744,51 @@ final class NetworkManager: ObservableObject {
     /// Distributes block ranges across peers - each peer fetches its range SEQUENTIALLY
     /// All peers work in PARALLEL for maximum throughput
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        let availablePeers = peers
+        // Ensure at least some peers are connected before checking
+        // This prevents race condition where peers are reconnecting
+        var availablePeers = peers.filter { $0.isConnectionReady }
+
+        if availablePeers.isEmpty && !peers.isEmpty {
+            // No ready peers but we have peers - try to reconnect them
+            print("⏳ P2P: No ready peers, attempting reconnection...")
+
+            // Try to reconnect up to 3 peers in parallel
+            let peersToReconnect = Array(peers.prefix(3))
+            await withTaskGroup(of: Void.self) { group in
+                for peer in peersToReconnect {
+                    group.addTask {
+                        do {
+                            try await peer.ensureConnected()
+                        } catch {
+                            print("⚠️ P2P: Failed to reconnect \(peer.host): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+
+            // Check again after reconnection attempt
+            availablePeers = peers.filter { $0.isConnectionReady }
+
+            if availablePeers.isEmpty {
+                print("⚠️ P2P: Still no ready peers after reconnection attempt")
+            } else {
+                print("✅ P2P: Reconnected \(availablePeers.count) peers")
+            }
+        }
+
         guard !availablePeers.isEmpty else {
+            debugLog(.network, "⚠️ No ready peers for P2P block fetch")
             throw NetworkError.notConnected
         }
 
         let peerCount = availablePeers.count
         let blocksPerPeer = (count + peerCount - 1) / peerCount  // Ceiling division
 
+        // Check if block hashes are available for this range
+        let bundledAvailable = BundledBlockHashes.shared.isLoaded && BundledBlockHashes.shared.contains(height: height)
+        let headerStoreAvailable = (try? HeaderStore.shared.getHeader(at: height)) != nil
+
+        debugLog(.network, "🚀 P2P fetch: \(count) blocks from height \(height), \(peerCount) ready peers, bundled=\(bundledAvailable), headers=\(headerStoreAvailable)")
         print("🚀 P2P parallel fetch: \(count) blocks across \(peerCount) peers (~\(blocksPerPeer) blocks each)")
         let startTime = Date()
 
@@ -2787,6 +2824,13 @@ final class NetworkManager: ObservableObject {
 
         let elapsed = Date().timeIntervalSince(startTime)
         let rate = Double(results.count) / max(elapsed, 0.001)
+
+        // If we got less than 10% of requested blocks, consider it a failure
+        if results.count < count / 10 {
+            print("⚠️ P2P fetch failed: only got \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s")
+            throw NetworkError.p2pFetchFailed
+        }
+
         print("✅ P2P parallel fetch complete: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
 
         // Sort by height to maintain order
@@ -2819,16 +2863,23 @@ final class NetworkManager: ObservableObject {
             }
 
             if headerStoreCount > 0 || bundledCount > 0 {
-                debugLog("P2P fetch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes", category: .net)
+                print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
             }
 
             guard !blockHashes.isEmpty else {
-                print("⚠️ No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
+                print("⚠️ [\(peer.host)] No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
+                return nil
+            }
+
+            // Check peer connection before attempting fetches
+            guard peer.isConnectionReady else {
+                print("⚠️ [\(peer.host)] Peer not ready, skipping batch of \(count) blocks")
                 return nil
             }
 
             // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
             var blocks: [(UInt64, CompactBlock)] = []
+            var failCount = 0
             for (height, hash) in blockHashes {
                 do {
                     let block = try await withTimeout(seconds: 10) {
@@ -2836,9 +2887,18 @@ final class NetworkManager: ObservableObject {
                     }
                     blocks.append((height, block))
                 } catch {
-                    // Skip blocks that fail to fetch
+                    failCount += 1
+                    // If too many failures, peer is likely dead
+                    if failCount > 3 {
+                        print("⚠️ [\(peer.host)] Too many failures (\(failCount)), aborting batch")
+                        break
+                    }
                     continue
                 }
+            }
+
+            if blocks.isEmpty && !blockHashes.isEmpty {
+                print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
             }
 
             var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
@@ -3197,6 +3257,7 @@ enum NetworkError: LocalizedError {
     case connectionTimeout
     case invalidData
     case notFound
+    case p2pFetchFailed
 
     var errorDescription: String? {
         switch self {
@@ -3224,6 +3285,8 @@ enum NetworkError: LocalizedError {
             return "Invalid data format"
         case .notFound:
             return "Data not found on peer"
+        case .p2pFetchFailed:
+            return "P2P block fetch failed"
         }
     }
 }

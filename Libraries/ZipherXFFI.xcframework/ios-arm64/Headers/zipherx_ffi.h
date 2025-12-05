@@ -138,6 +138,21 @@ size_t zipherx_tree_create_witnesses_batch(
     uint8_t *witnesses_out
 );
 
+// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
+// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+// Each witness gets its own thread building tree to that position.
+//
+// Parameters: same as zipherx_tree_create_witnesses_batch
+// Returns: Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_parallel(
+    const uint8_t *target_cmus,
+    size_t target_count,
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
 // Compute nullifier for a note
 bool zipherx_compute_nullifier(
     const uint8_t *spending_key,

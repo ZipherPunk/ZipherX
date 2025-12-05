@@ -487,6 +487,25 @@ size_t zipherx_tree_create_witnesses_batch(
     uint8_t *witnesses_out
 );
 
+/// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
+/// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+/// Each witness gets its own thread building tree to that position.
+/// @param target_cmus Array of 32-byte CMUs to create witnesses for
+/// @param target_count Number of target CMUs
+/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param positions_out Output array for positions (u64 * target_count)
+/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
+/// @return Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_parallel(
+    const uint8_t *target_cmus,
+    size_t target_count,
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)
 // =============================================================================

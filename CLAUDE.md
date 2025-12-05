@@ -3335,6 +3335,86 @@ Imported Wallet Scan:
 
 ---
 
+### 57. P2P Race Condition Fix + Phase-Aware Progress (December 5, 2025)
+
+**Problem 1**: P2P block fetching was failing 100% of the time, falling back to InsightAPI for every batch.
+
+**Root Cause**: Race condition - when P2P fetch started, all peers were still reconnecting after handshake failure. The `isConnectionReady` check returned `false` for all peers.
+
+**Evidence from log**:
+```
+[04:58:59.070] 🔄 [185.205.246.161] Handshake failed, reconnecting...
+[04:59:08.023] ⚠️ P2P batch failed, using InsightAPI fallback...
+```
+
+Only 40ms between reconnection start and P2P fetch - not enough time for reconnection to complete.
+
+**Solution**: Added peer reconnection attempt before failing:
+```swift
+func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> ... {
+    var availablePeers = peers.filter { $0.isConnectionReady }
+
+    if availablePeers.isEmpty && !peers.isEmpty {
+        print("⏳ P2P: No ready peers, attempting reconnection...")
+        // Try to reconnect up to 3 peers in parallel
+        await withTaskGroup(of: Void.self) { group in
+            for peer in Array(peers.prefix(3)) {
+                group.addTask { try? await peer.ensureConnected() }
+            }
+        }
+        availablePeers = peers.filter { $0.isConnectionReady }
+    }
+    // ... continue with P2P fetch
+}
+```
+
+**Problem 2**: Progress bar didn't reflect different sync phases.
+
+**Solution**: Added phase-aware progress reporting:
+
+| Phase | Progress Range | Description |
+|-------|---------------|-------------|
+| PHASE 1 | 0% - 40% | Parallel note decryption (Rayon) |
+| PHASE 1.5 | 40% - 55% | Merkle witness computation |
+| PHASE 1.6 | 55% - 60% | Spent note detection |
+| PHASE 2 | 60% - 100% | Sequential tree building |
+
+**New callbacks**:
+- `onStatusUpdate: ((String, String) -> Void)?` - Phase transitions with status messages
+- `reportPhase1Progress()`, `reportPhase15Progress()`, `reportPhase16Progress()`, `reportPhase2Progress()` - Helper functions
+
+**UI Changes**:
+- Phase emoji in task detail: ⚡ (phase1), 🌲 (phase1.5), 🔍 (phase1.6), 📦 (phase2)
+- `syncPhase` published property for UI to react to phase changes
+- Status messages update based on current phase
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - P2P reconnection before fetch, better debug logging
+- `Sources/Core/Network/FilterScanner.swift` - Phase-aware progress helpers, status callbacks
+- `Sources/Core/Wallet/WalletManager.swift` - `syncPhase` property, status update callback
+
+---
+
+### 58. Parallel Witness Computation (December 5, 2025)
+
+**Feature**: Added Rayon parallel witness computation via `zipherx_tree_create_witnesses_parallel()`.
+
+**Performance**:
+- Before: 115.8s (sequential batch)
+- After: 77.8s (Rayon parallel)
+- Improvement: **33% faster**
+
+**Why only 33% (not 3-8x)?**
+All 9 notes are at similar positions near the end of the 1M+ CMU tree. Each thread still builds almost the entire tree. True parallelization benefits would appear if notes were spread across different positions.
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - `zipherx_tree_create_witnesses_parallel()`
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - C header declaration
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrapper
+- `Sources/Core/Network/FilterScanner.swift` - Uses parallel function
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

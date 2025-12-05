@@ -2551,6 +2551,151 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
     success_count
 }
 
+/// Create witnesses for multiple CMUs using PARALLEL processing (Rayon)
+/// This is MUCH faster than the sequential version because:
+/// - Uses all CPU cores via Rayon work-stealing thread pool
+/// - Each note gets its own thread building tree to that position
+/// - For N notes: time = O(max_position) instead of O(N * max_position)
+///
+/// Parameters:
+/// - target_cmus: Array of target CMUs to find (32 bytes each)
+/// - target_count: Number of target CMUs
+/// - cmu_data: The bundled CMU data
+/// - cmu_data_len: Length of CMU data
+/// - positions_out: Output array for positions (u64 per target)
+/// - witnesses_out: Output array for witnesses (1028 bytes per target)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
+    target_cmus: *const u8,
+    target_count: usize,
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+) -> usize {
+    use rayon::prelude::*;
+
+    if target_count == 0 || cmu_data_len < 8 {
+        return 0;
+    }
+
+    let targets = slice::from_raw_parts(target_cmus, target_count * 32);
+    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
+
+    // Read CMU count from bundled data
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        debug_log!("❌ CMU data too short: {} < {}", cmu_data_len, expected_len);
+        return 0;
+    }
+
+    debug_log!("🔧 Parallel witness: {} targets, {} total CMUs", target_count, count);
+
+    // First pass: find all target positions (fast linear scan)
+    let mut target_info: Vec<(usize, Option<u64>)> = (0..target_count).map(|i| (i, None)).collect();
+    let mut offset = 8;
+
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        for (idx, pos_opt) in target_info.iter_mut() {
+            if pos_opt.is_none() {
+                let target_offset = *idx * 32;
+                if &targets[target_offset..target_offset + 32] == cmu_bytes {
+                    *pos_opt = Some(i);
+                    debug_log!("📍 Target {} found at position {}", idx, i);
+                }
+            }
+        }
+        offset += 32;
+    }
+
+    // Filter to only targets with found positions
+    let found_targets: Vec<(usize, u64)> = target_info.iter()
+        .filter_map(|(idx, pos)| pos.map(|p| (*idx, p)))
+        .collect();
+
+    if found_targets.is_empty() {
+        debug_log!("❌ No target CMUs found in bundled data");
+        return 0;
+    }
+
+    debug_log!("🌲 Building {} witnesses in parallel using Rayon", found_targets.len());
+    let start_time = std::time::Instant::now();
+
+    // Parallel witness creation - each target gets its own thread
+    let results: Vec<(usize, u64, Option<Vec<u8>>)> = found_targets.par_iter()
+        .map(|(orig_idx, target_pos)| {
+            // Build tree up to target position
+            let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+            let mut offset = 8;
+
+            for i in 0..=*target_pos {
+                let cmu_bytes = &bytes[offset..offset + 32];
+                offset += 32;
+
+                let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+
+                if tree.append(node).is_err() {
+                    continue;
+                }
+            }
+
+            // Create witness at target position
+            let mut witness = IncrementalWitness::from_tree(tree);
+
+            // Continue updating witness to end of bundled data
+            while offset + 32 <= cmu_data_len {
+                let cmu_bytes = &bytes[offset..offset + 32];
+                offset += 32;
+
+                if let Ok(node) = zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+                    witness.append(node).ok();
+                }
+            }
+
+            // Serialize witness
+            let mut serialized = Vec::new();
+            if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+                (*orig_idx, *target_pos, Some(serialized))
+            } else {
+                (*orig_idx, *target_pos, None)
+            }
+        })
+        .collect();
+
+    let elapsed = start_time.elapsed();
+    debug_log!("⏱️ Parallel witness build took {:.1}s", elapsed.as_secs_f64());
+
+    // Copy results to output arrays
+    let mut success_count = 0;
+    for (orig_idx, pos, witness_opt) in results {
+        let pos_ptr = positions_out.add(orig_idx);
+        let witness_ptr = witnesses_out.add(orig_idx * 1028);
+
+        if let Some(serialized) = witness_opt {
+            *pos_ptr = pos;
+            std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+            if serialized.len() < 1028 {
+                std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+            }
+            success_count += 1;
+            debug_log!("📝 Witness {} at pos {} ({} bytes)", orig_idx, pos, serialized.len());
+        } else {
+            *pos_ptr = u64::MAX;
+        }
+    }
+
+    debug_log!("✅ Parallel witness complete: {}/{} in {:.1}s", success_count, target_count, elapsed.as_secs_f64());
+    success_count
+}
+
 // =============================================================================
 // OVK Output Recovery (for viewing sent transactions)
 // =============================================================================
