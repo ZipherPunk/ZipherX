@@ -750,6 +750,14 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
+        // Suppress notifications during initial sync for imported wallets
+        // to avoid notification spam from historical transactions
+        let wasImported = isImportedWallet
+        if wasImported {
+            NotificationManager.shared.isInitialSyncInProgress = true
+            print("🔕 Notifications suppressed during initial import sync")
+        }
+
         // Initialize sync tasks
         await MainActor.run {
             self.isSyncing = true
@@ -772,6 +780,10 @@ final class WalletManager: ObservableObject {
         defer {
             DispatchQueue.main.async {
                 self.isSyncing = false
+            }
+            // Always re-enable notifications on exit (success or failure)
+            if wasImported {
+                NotificationManager.shared.isInitialSyncInProgress = false
             }
         }
 

@@ -1397,11 +1397,14 @@ final class FilterScanner {
         }
 
         guard !batchOutputs.isEmpty else {
-            debugLog(.sync, "⚡ Batch \(heightRange.lowerBound)-\(heightRange.upperBound): 0 outputs, \(totalSpends) spends collected")
+            // Empty batch - no debug logging (too spammy for 2.4M blocks)
             return
         }
 
-        debugLog(.sync, "🚀 Parallel decrypting \(batchOutputs.count) outputs from \(heightRange.count) blocks...")
+        // Only log every 10th batch with outputs to reduce spam
+        if heightRange.lowerBound % 5000 == 0 {
+            debugLog(.sync, "🚀 Parallel decrypting \(batchOutputs.count) outputs...")
+        }
 
         // Step 2: Convert to FFI format (handles byte order conversion)
         let ffiOutputs = batchOutputs.map { info -> ZipherXFFI.FFIShieldedOutput in

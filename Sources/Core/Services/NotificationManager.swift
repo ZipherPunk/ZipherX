@@ -11,6 +11,10 @@ import AppKit
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
+    /// Flag to suppress notifications during initial sync for imported wallets
+    /// (avoids notification spam when scanning through historical transactions)
+    var isInitialSyncInProgress: Bool = false
+
     private override init() {
         super.init()
         // Set self as delegate to show notifications in foreground
@@ -72,6 +76,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is received (pending in mempool)
     func notifyReceived(amount: UInt64, txid: String, memo: String? = nil) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !isInitialSyncInProgress else { return }
+
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifyReceived called")
         print("   amount=\(amount) (\(zcl) ZCL)")
@@ -108,6 +115,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is received AND confirmed (mined in block)
     func notifyReceivedConfirmed(amount: UInt64, txid: String, memo: String? = nil) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !isInitialSyncInProgress else { return }
+
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifyReceivedConfirmed called")
         print("   amount=\(amount) (\(zcl) ZCL)")
