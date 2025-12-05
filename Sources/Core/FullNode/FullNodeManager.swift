@@ -152,41 +152,45 @@ public class FullNodeManager: ObservableObject {
     }
 
     /// Check if daemon is currently running
+    /// Detection priority: RPC connection (most reliable) > binary path check
     @MainActor
     private func checkDaemonRunning() async {
-        guard isNodeInstalled else {
-            print("🔴 Full Node: daemon not installed")
+        // FIRST: Try to connect via RPC - this detects ANY running zclassicd
+        // regardless of where the binary is installed (Zipher.app, /usr/local/bin, etc.)
+        do {
+            try RPCClient.shared.loadConfig()
+            print("✅ Full Node: config loaded successfully")
+
+            // Try to connect to running daemon
+            let connected = await RPCClient.shared.checkConnection()
+            print("🔄 Full Node: RPC connection result = \(connected)")
+
+            if connected {
+                daemonStatus = .running
+                isNodeInstalled = true  // Daemon is running, so it's "installed" somewhere
+                print("✅ Full Node: daemon is RUNNING (detected via RPC)")
+
+                // Check sync status
+                await checkSyncStatus()
+
+                // Load wallet addresses
+                await loadWalletAddresses()
+                return
+            }
+        } catch {
+            print("⚠️ Full Node: config/RPC check failed - \(error.localizedDescription)")
+        }
+
+        // FALLBACK: Check if binary exists at standard path
+        if !isNodeInstalled {
+            print("🔴 Full Node: daemon not installed at standard path")
             daemonStatus = .notInstalled
             return
         }
 
-        // Try to connect via RPC
-        do {
-            try RPCClient.shared.loadConfig()
-            print("✅ Full Node: config loaded successfully")
-        } catch {
-            print("⚠️ Full Node: config load failed - \(error.localizedDescription)")
-            daemonStatus = hasBlockchain ? .installed : .notInstalled
-            return
-        }
-
-        // Now try to connect
-        let connected = await RPCClient.shared.checkConnection()
-        print("🔄 Full Node: connection check result = \(connected)")
-
-        if connected {
-            daemonStatus = .running
-            print("✅ Full Node: daemon is RUNNING")
-
-            // Check sync status
-            await checkSyncStatus()
-
-            // Load wallet addresses
-            await loadWalletAddresses()
-        } else {
-            print("🔴 Full Node: daemon connection FAILED, marking as \(hasBlockchain ? "installed" : "not installed")")
-            daemonStatus = hasBlockchain ? .installed : .notInstalled
-        }
+        // Binary exists but daemon not running
+        print("🔴 Full Node: daemon installed but not running")
+        daemonStatus = hasBlockchain ? .installed : .notInstalled
     }
 
     /// Check blockchain sync status

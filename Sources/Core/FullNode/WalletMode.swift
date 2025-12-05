@@ -85,17 +85,57 @@ public class WalletModeManager: ObservableObject {
 
     @Published public private(set) var currentMode: WalletMode
     @Published public private(set) var hasSelectedMode: Bool
+    @Published public private(set) var daemonDetected: Bool = false
 
     private init() {
-        // Load saved mode or default to light
-        if let savedMode = UserDefaults.standard.string(forKey: userDefaultsKey),
+        // Default to light mode
+        self.currentMode = .light
+        self.hasSelectedMode = UserDefaults.standard.bool(forKey: hasSelectedModeKey)
+
+        // If user already selected a mode, load it
+        if hasSelectedMode,
+           let savedMode = UserDefaults.standard.string(forKey: userDefaultsKey),
            let mode = WalletMode(rawValue: savedMode) {
             self.currentMode = mode
-        } else {
-            self.currentMode = .light
+        }
+    }
+
+    /// Check if a zclassicd daemon is running (call this at startup)
+    /// Returns true if daemon detected and user hasn't selected a mode yet
+    public func checkForRunningDaemon() async -> Bool {
+        #if os(macOS)
+        // Only check on macOS
+        guard !hasSelectedMode else {
+            print("🔄 WalletMode: User already selected mode, skipping daemon detection")
+            return false
         }
 
-        self.hasSelectedMode = UserDefaults.standard.bool(forKey: hasSelectedModeKey)
+        print("🔍 WalletMode: Checking for running zclassicd daemon...")
+
+        // Try to load config and connect
+        do {
+            try RPCClient.shared.loadConfig()
+            let connected = await RPCClient.shared.checkConnection()
+
+            if connected {
+                print("✅ WalletMode: Running zclassicd daemon DETECTED!")
+                await MainActor.run {
+                    self.daemonDetected = true
+                }
+                return true
+            }
+        } catch {
+            print("⚠️ WalletMode: No daemon detected - \(error.localizedDescription)")
+        }
+
+        await MainActor.run {
+            self.daemonDetected = false
+        }
+        return false
+        #else
+        // iOS always uses light mode
+        return false
+        #endif
     }
 
     /// Set the wallet mode (called from mode selection UI)
@@ -114,14 +154,17 @@ public class WalletModeManager: ObservableObject {
         print("✅ Wallet mode set to: \(mode.displayName)")
     }
 
-    /// Check if mode selection is needed (first launch)
+    /// Check if mode selection is needed
+    /// Returns true if:
+    /// - macOS first launch AND daemon detected (user should choose)
+    /// Note: If no daemon detected, default to light mode silently
     public var needsModeSelection: Bool {
         #if os(iOS)
         // iOS always uses light mode, no selection needed
         return false
         #else
-        // macOS needs mode selection on first launch
-        return !hasSelectedMode
+        // Only show mode selection if daemon detected AND user hasn't chosen yet
+        return !hasSelectedMode && daemonDetected
         #endif
     }
 
