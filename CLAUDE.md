@@ -3415,6 +3415,39 @@ All 9 notes are at similar positions near the end of the 1M+ CMU tree. Each thre
 
 ---
 
+### 59. PHASE 2 Start Height Fix + Batch CMU Append (December 5, 2025)
+
+**Problem**: PHASE 2 was scanning ~7500 blocks unnecessarily, taking 4+ minutes.
+
+**Root Cause**: PHASE 2 started from `bundledTreeHeight + 1` (2926123) instead of using the GitHub CMU file height (2932456). This caused re-scanning of 6300+ blocks that were already covered by the downloaded CMU data.
+
+**Fix Applied** (FilterScanner.swift:633):
+```swift
+// OLD (wrong): currentHeight = bundledTreeHeight + 1
+// NEW (correct): currentHeight = phase1EndHeight + 1
+```
+
+`phase1EndHeight` is set to `cmuDataHeight` (from GitHub) when available, or falls back to `bundledTreeHeight`.
+
+**New FFI Function**: Added `zipherx_tree_append_batch()` for faster tree building:
+- Appends multiple CMUs with a single lock acquisition
+- Reduces FFI call overhead and lock contention
+
+**Performance Improvement**:
+| Phase | Before | After |
+|-------|--------|-------|
+| PHASE 2 | 248s (~7500 blocks) | ~40s (~1150 blocks) |
+| **Total sync** | **~6.3 min** | **~3 min** |
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Fixed PHASE 2 start height
+- `Libraries/zipherx-ffi/src/lib.rs` - Added `zipherx_tree_append_batch()`
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - C header declaration
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrapper `treeAppendBatch()`
+- `Sources/ZipherX-Bridging-Header.h` - Bridging declaration
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

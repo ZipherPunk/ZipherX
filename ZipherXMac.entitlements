@@ -10,7 +10,7 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)com.zipherx.wallet.mac</string>
+		<string>$(AppIdentifierPrefix)com.zipherpunk.zipherx.mac</string>
 	</array>
 </dict>
 </plist>

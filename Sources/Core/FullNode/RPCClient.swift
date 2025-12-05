@@ -148,7 +148,9 @@ public class RPCClient: ObservableObject {
     /// Check if daemon is running and responsive
     public func checkConnection() async -> Bool {
         do {
+            print("🔄 RPCClient: checking connection to daemon...")
             let info = try await getInfo()
+            print("✅ RPCClient: daemon responded - height=\(info.height), peers=\(info.connections), version=\(info.version)")
             await MainActor.run {
                 self.isConnected = true
                 self.blockHeight = info.height
@@ -157,6 +159,7 @@ public class RPCClient: ObservableObject {
             }
             return true
         } catch {
+            print("❌ RPCClient: connection check failed - \(error.localizedDescription)")
             await MainActor.run {
                 self.isConnected = false
             }
@@ -179,6 +182,40 @@ public class RPCClient: ObservableObject {
 
         let version = formatVersion(versionNum)
         return (UInt64(blocks), connections, version)
+    }
+
+    /// Get blockchain info as dictionary (for sync progress)
+    public func getInfoDict() async throws -> [String: Any] {
+        let result = try await call(method: "getinfo", params: [])
+        guard let dict = result as? [String: Any] else {
+            throw RPCError.invalidResponse
+        }
+        return dict
+    }
+
+    /// Get balance for a specific z-address
+    public func getZBalance(address: String) async throws -> Double {
+        let result = try await call(method: "z_getbalance", params: [address])
+        if let balance = result as? Double {
+            return balance
+        }
+        if let balanceStr = result as? String, let balance = Double(balanceStr) {
+            return balance
+        }
+        throw RPCError.invalidResponse
+    }
+
+    /// Get balance for a specific t-address
+    public func getTBalance(address: String) async throws -> Double {
+        // Use getreceivedbyaddress for t-addresses
+        let result = try await call(method: "getreceivedbyaddress", params: [address, 1])
+        if let balance = result as? Double {
+            return balance
+        }
+        if let balanceInt = result as? Int {
+            return Double(balanceInt)
+        }
+        throw RPCError.invalidResponse
     }
 
     /// Get total balance (confirmed, unconfirmed, transparent, private)

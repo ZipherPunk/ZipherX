@@ -829,6 +829,21 @@ enum ZipherXFFI {
         return zipherx_tree_append(cmu)
     }
 
+    /// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
+    /// cmus: Array of 32-byte CMUs in wire format
+    /// Returns the starting position of the first CMU, or UInt64.max on error
+    static func treeAppendBatch(cmus: Data) -> UInt64 {
+        guard cmus.count > 0 && cmus.count % 32 == 0 else { return UInt64.max }
+        let cmuCount = cmus.count / 32
+
+        return cmus.withUnsafeBytes { cmusPtr in
+            zipherx_tree_append_batch(
+                cmusPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                cmuCount
+            )
+        }
+    }
+
     /// Load a witness into memory for tracking/updating
     /// Returns the witness index or UInt64.max on error
     static func treeLoadWitness(witnessData: UnsafePointer<UInt8>, witnessLen: Int) -> UInt64 {

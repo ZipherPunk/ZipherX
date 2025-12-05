@@ -64,5 +64,21 @@ Resources/commitment_tree.bin.zst
 Resources/commitment_tree_serialized.bin
 Resources/commitment_tree_manifest.json
 
+# Large shielded outputs data files (hosted externally)
+Resources/shielded_outputs.bin
+Resources/shielded_outputs.bin.zst
+Resources/shielded_outputs_manifest.json
+Resources/block_timestamps.bin
+Sources/Resources/shielded_outputs.bin
+
+# Build artifacts for FFI (not needed in repo)
+Libraries/zipherx-ffi/libzipherx_ffi_ios.a
+
 # Tools directory (private scripts, not for public repo)
 Tools/
+
+# Security audit docs (never commit to public repo)
+docs/
+
+# Claude Code settings (never commit)
+.claude/

@@ -22,6 +22,7 @@ struct WalletSetupView: View {
     @State private var showPrivateKeyInput = false  // Hidden by default
     @State private var showMnemonicInput = false  // Hidden by default for restore
 
+    /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
     // Scan options for imported wallets
     @State private var showScanOptions = false
     @State private var scanOptionSelected: ScanOption = .fullScan
@@ -32,6 +33,7 @@ struct WalletSetupView: View {
         case fullScan
         case fromDate
     }
+    */
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -168,6 +170,7 @@ struct WalletSetupView: View {
                 .frame(minWidth: 550, idealWidth: 600, minHeight: 650, idealHeight: 750)
                 #endif
         }
+        /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
         .sheet(isPresented: $showScanOptions) {
             scanOptionsView
                 .environmentObject(themeManager)
@@ -175,6 +178,7 @@ struct WalletSetupView: View {
                 .frame(minWidth: 500, idealWidth: 550, minHeight: 550, idealHeight: 600)
                 #endif
         }
+        */
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -415,9 +419,9 @@ struct WalletSetupView: View {
                         )
 
                         warningSection(
-                            title: "HISTORICAL SCAN",
+                            title: "FULL BLOCKCHAIN SCAN",
                             icon: "clock.arrow.circlepath",
-                            content: "Finding old transactions requires scanning blockchain history. Quick scan: 2-5 min. Full scan: 30-60 min."
+                            content: "ZipherX will scan the entire blockchain to find your transactions. This takes approximately 2-5 minutes."
                         )
 
                         warningSection(
@@ -426,17 +430,17 @@ struct WalletSetupView: View {
                             content: "Never import keys from untrusted sources. Anyone with your key can spend your funds."
                         )
 
-                        // Fast start info
+                        // Parallel scanning info
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Image(systemName: "bolt.fill")
                                     .foregroundColor(theme.primaryColor)
-                                Text("FAST START")
+                                Text("PARALLEL SCANNING")
                                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                                     .foregroundColor(theme.textPrimary)
                             }
 
-                            Text("ZipherX scans recent blocks by default. Use Settings → Quick Scan for older notes.")
+                            Text("ZipherX uses parallel note decryption and pre-built commitment trees for fast imports.")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.textSecondary)
                         }
@@ -507,6 +511,7 @@ struct WalletSetupView: View {
         )
     }
 
+    /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
     // MARK: - Scan Options View
 
     private var scanOptionsView: some View {
@@ -728,6 +733,7 @@ struct WalletSetupView: View {
         }
         .buttonStyle(PlainButtonStyle())
     }
+    */
 
     // MARK: - Import Key View
 
@@ -1274,35 +1280,30 @@ struct WalletSetupView: View {
     }
 
     private func importPrivateKey() {
-        // Close import sheet and show scan options
+        // Close import sheet and start full scan immediately (fast with parallel decryption)
         let keyToImport = privateKeyInput
         showImportKey = false
 
-        // Store the action to execute after scan option is selected
-        pendingImportAction = {
-            self.isProcessing = true
+        // Set full scan mode (nil = scan from Sapling activation)
+        walletManager.importScanStartHeight = nil
 
-            Task {
-                do {
-                    try self.walletManager.importSpendingKey(keyToImport)
+        isProcessing = true
 
-                    await MainActor.run {
-                        self.privateKeyInput = ""
-                        self.isProcessing = false
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.showError = true
-                        self.isProcessing = false
-                    }
+        Task {
+            do {
+                try self.walletManager.importSpendingKey(keyToImport)
+
+                await MainActor.run {
+                    self.privateKeyInput = ""
+                    self.isProcessing = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                    self.showError = true
+                    self.isProcessing = false
                 }
             }
-        }
-
-        // Show scan options after a short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            showScanOptions = true
         }
     }
 
@@ -1312,35 +1313,30 @@ struct WalletSetupView: View {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
 
-        // Close restore sheet and show scan options
+        // Close restore sheet and start full scan immediately (fast with parallel decryption)
         showRestoreMnemonic = false
         showMnemonicInput = false
 
-        // Store the action to execute after scan option is selected
-        pendingImportAction = {
-            self.isProcessing = true
+        // Set full scan mode (nil = scan from Sapling activation)
+        walletManager.importScanStartHeight = nil
 
-            Task {
-                do {
-                    try self.walletManager.restoreWallet(from: cleanedWords)
+        isProcessing = true
 
-                    await MainActor.run {
-                        self.mnemonicInputWords = Array(repeating: "", count: 24)
-                        self.isProcessing = false
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.errorMessage = error.localizedDescription
-                        self.showError = true
-                        self.isProcessing = false
-                    }
+        Task {
+            do {
+                try self.walletManager.restoreWallet(from: cleanedWords)
+
+                await MainActor.run {
+                    self.mnemonicInputWords = Array(repeating: "", count: 24)
+                    self.isProcessing = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                    self.showError = true
+                    self.isProcessing = false
                 }
             }
-        }
-
-        // Show scan options after a short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            showScanOptions = true
         }
     }
 }

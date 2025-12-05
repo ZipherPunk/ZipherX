@@ -31,6 +31,10 @@ struct ContentView: View {
     @State private var showCypherpunkSend = false
     @State private var showCypherpunkReceive = false
 
+    // Disk space warning
+    @State private var showInsufficientDiskSpaceAlert = false
+    @State private var availableDiskSpace: String = ""
+
     enum Tab {
         case balance, send, receive, settings
     }
@@ -53,6 +57,25 @@ struct ContentView: View {
                         guard !hasCompletedInitialSync else {
                             print("DEBUGZIPHERX: 🚀 Task: Already completed, returning")
                             return
+                        }
+
+                        // CHECK DISK SPACE AT STARTUP (need ~750 MB for shielded outputs download + processing)
+                        let diskSpaceBytes = BundledShieldedOutputs.getAvailableDiskSpace()
+                        let requiredBytes: Int64 = 750_000_000 // 750 MB
+                        if diskSpaceBytes < requiredBytes {
+                            let formatter = ByteCountFormatter()
+                            formatter.allowedUnits = [.useGB, .useMB]
+                            formatter.countStyle = .file
+                            availableDiskSpace = formatter.string(fromByteCount: diskSpaceBytes)
+                            await MainActor.run {
+                                showInsufficientDiskSpaceAlert = true
+                            }
+                            print("🚨 INSUFFICIENT DISK SPACE: \(availableDiskSpace) available, need ~750 MB")
+                        } else {
+                            let formatter = ByteCountFormatter()
+                            formatter.allowedUnits = [.useGB, .useMB]
+                            formatter.countStyle = .file
+                            print("✅ Disk space OK: \(formatter.string(fromByteCount: diskSpaceBytes)) available")
                         }
 
                         // Suppress background sync during initial startup to avoid race conditions
@@ -279,6 +302,26 @@ struct ContentView: View {
 
                             // Start inactivity timer now that sync is done
                             startInactivityTimer()
+                        },
+                        onStopSync: {
+                            // User clicked STOP - cancel sync and go to main wallet
+                            walletManager.stopSync()
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                isInitialSync = false
+                                hasCompletedInitialSync = true
+                                showCompletionScreen = false
+                            }
+                            // Start inactivity timer
+                            startInactivityTimer()
+                        },
+                        onDeleteAndRestart: {
+                            // User wants to delete everything and start over
+                            walletManager.stopSync()
+                            do {
+                                try walletManager.deleteWallet()
+                            } catch {
+                                print("❌ Failed to delete wallet: \(error)")
+                            }
                         }
                     )
                     .transition(.opacity)
@@ -656,6 +699,11 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             recordUserActivity()
+        }
+        .alert("Insufficient Disk Space", isPresented: $showInsufficientDiskSpaceAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.")
         }
     }
 

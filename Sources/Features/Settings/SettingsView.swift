@@ -169,8 +169,10 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                /* DISABLED: Appearance section - hide themes for now
                 // Appearance section (themes)
                 appearanceSection
+                */
 
                 #if os(macOS)
                 // Wallet mode section (macOS only)
@@ -186,11 +188,15 @@ struct SettingsView: View {
                 // Export section
                 exportSection
 
+                /* DISABLED: Debug logging section - hide for now
                 // Debug section
                 debugLoggingSection
+                */
 
+                /* DISABLED: Blockchain data section - hide for now
                 // Rescan section
                 rescanSection
+                */
 
                 // Note: Delete wallet is now in exportSection (Danger Zone)
 

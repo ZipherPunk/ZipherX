@@ -71,6 +71,9 @@ final class WalletManager: ObservableObject {
     private let mnemonicGenerator: MnemonicGenerator
     private var cancellables = Set<AnyCancellable>()
 
+    /// Currently active scanner instance (used for stopSync)
+    private var currentScanner: FilterScanner?
+
     // MARK: - Constants
     private let zclassicCoinType: UInt32 = 147 // ZCL coin type for BIP44
 
@@ -756,6 +759,8 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
                 SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
                 SyncTask(id: "database", title: "Unlock encrypted vault", status: .pending),
+                SyncTask(id: "download_outputs", title: "Download shielded outputs", status: .pending),
+                SyncTask(id: "download_timestamps", title: "Download block timestamps", status: .pending),
                 SyncTask(id: "headers", title: "Verify peer consensus (3/3)", status: .pending),
                 SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
                 SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
@@ -964,6 +969,7 @@ final class WalletManager: ObservableObject {
         // Task 4: Scan blockchain
         await updateTask("scan", status: .inProgress)
         let scanner = FilterScanner()
+        self.currentScanner = scanner  // Store reference for stopSync()
 
         // VUL-018: Use shared constant for bundled tree height
         let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
@@ -1166,6 +1172,19 @@ final class WalletManager: ObservableObject {
         // Update wallet height in NetworkManager for UI display
         let lastScannedHeight = (try? database.getLastScannedHeight()) ?? 0
         NetworkManager.shared.updateWalletHeight(lastScannedHeight)
+
+        // CRITICAL FIX: Clear isImportedWallet after first successful sync
+        // This prevents the app from doing a full historical scan on every startup
+        // The flag should only be true during the FIRST sync after importing a wallet
+        if isImportedWallet {
+            print("✅ First import sync complete - clearing isImportedWallet flag for fast future startups")
+            DispatchQueue.main.async {
+                self.isImportedWallet = false
+                UserDefaults.standard.set(false, forKey: "wallet_imported")
+                UserDefaults.standard.synchronize()
+            }
+        }
+
         print("✅ Sync complete: balance task finished")
     }
 
@@ -1294,6 +1313,9 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
         print("👤 Account ID: \(account.id)")
+
+        // Download reliable peers from GitHub (for faster initial connection)
+        let _ = await NetworkManager.shared.downloadReliablePeersFromGitHub()
 
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
@@ -1709,6 +1731,10 @@ final class WalletManager: ObservableObject {
                     self.syncStatus = "Deriving keys from seed entropy..."
                 case "database":
                     self.syncStatus = "Unlocking encrypted vault..."
+                case "download_outputs":
+                    self.syncStatus = "Downloading shielded outputs from GitHub..."
+                case "download_timestamps":
+                    self.syncStatus = "Downloading block timestamps from GitHub..."
                 case "headers":
                     self.syncStatus = "Reaching consensus with 3 peers..."
                 case "height":
@@ -1737,6 +1763,26 @@ final class WalletManager: ObservableObject {
             syncTasks[index].detail = detail
             syncTasks[index].progress = progress
         }
+    }
+
+    // MARK: - Public Task Update Methods (for FilterScanner)
+
+    /// Update download task status - called from FilterScanner
+    @MainActor
+    func updateDownloadTask(_ taskId: String, status: SyncTaskStatus, detail: String? = nil) {
+        updateTask(taskId, status: status, detail: detail)
+    }
+
+    /// Update download task progress - called from FilterScanner
+    @MainActor
+    func updateDownloadTaskProgress(_ taskId: String, detail: String, progress: Double) {
+        // First set to in progress if not already
+        if let index = syncTasks.firstIndex(where: { $0.id == taskId }) {
+            if case .pending = syncTasks[index].status {
+                syncTasks[index].status = .inProgress
+            }
+        }
+        updateTaskWithProgress(taskId, detail: detail, progress: progress)
     }
 
     /// Estimate date for a given block height
@@ -2283,6 +2329,27 @@ final class WalletManager: ObservableObject {
         defaults.set(isWalletCreated, forKey: "wallet_created")
         defaults.set(isImportedWallet, forKey: "wallet_imported")
         defaults.set(zAddress, forKey: "z_address")
+    }
+
+    /// Stop any ongoing sync operation
+    /// Called when user clicks STOP button during initial sync
+    func stopSync() {
+        print("🛑 STOP SYNC: User requested sync cancellation")
+
+        // Stop the current scanner if active
+        currentScanner?.stopScan()
+        currentScanner = nil
+
+        // Reset sync state
+        DispatchQueue.main.async {
+            self.isSyncing = false
+            self.isConnecting = false
+            self.syncProgress = 0.0
+            self.syncStatus = "Sync stopped by user"
+            self.syncTasks = []
+        }
+
+        print("✅ STOP SYNC: Sync cancelled. Wallet may have incomplete data.")
     }
 
     /// Delete wallet and all associated data, then terminate the app

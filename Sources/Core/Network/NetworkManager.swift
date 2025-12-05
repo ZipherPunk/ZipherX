@@ -667,6 +667,80 @@ final class NetworkManager: ObservableObject {
         print("📡 Loaded \(loadedCount) bundled peer addresses")
     }
 
+    // MARK: - GitHub Peer Download
+
+    /// GitHub URL for reliable peers list
+    private static let GITHUB_PEERS_URL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/reliable_peers.json"
+
+    /// Download and load reliable peers from GitHub
+    /// Call this at startup to get the latest peer list
+    func downloadReliablePeersFromGitHub() async -> Int {
+        print("📡 Checking GitHub for reliable peers...")
+
+        guard let url = URL(string: Self.GITHUB_PEERS_URL) else {
+            print("❌ Invalid GitHub peers URL")
+            return 0
+        }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                print("⚠️ GitHub peers fetch failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                return 0
+            }
+
+            let bundledPeers = try JSONDecoder().decode([BundledPeer].self, from: data)
+            print("📡 Downloaded \(bundledPeers.count) peers from GitHub")
+
+            addressLock.lock()
+            defer { addressLock.unlock() }
+
+            var loadedCount = 0
+            for peer in bundledPeers {
+                let key = "\(peer.host):\(peer.port)"
+
+                // Skip if banned
+                if isBanned(peer.host) {
+                    continue
+                }
+
+                // If already known, update reliability info if GitHub has better data
+                if let existing = knownAddresses[key] {
+                    // Only update if GitHub peer has higher reliability and our local has few attempts
+                    if existing.attempts < 5 && peer.reliability > 0.7 {
+                        knownAddresses[key]?.successes = max(existing.successes, 1)
+                        triedAddresses.insert(key)
+                    }
+                    continue
+                }
+
+                let address = PeerAddress(host: peer.host, port: peer.port)
+                knownAddresses[key] = AddressInfo(
+                    address: address,
+                    source: "github",
+                    firstSeen: Date(),
+                    lastSeen: peer.lastSeen,
+                    attempts: 0,
+                    successes: peer.reliability > 0.5 ? 1 : 0
+                )
+
+                // High reliability peers go to tried set (prioritized for connection)
+                if peer.reliability > 0.5 {
+                    triedAddresses.insert(key)
+                } else {
+                    newAddresses.insert(key)
+                }
+                loadedCount += 1
+            }
+
+            print("✅ Added \(loadedCount) new peers from GitHub (total known: \(knownAddresses.count))")
+            return loadedCount
+        } catch {
+            print("⚠️ GitHub peers download error: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
     /// Export current reliable peers for bundling in future releases
     /// Call this from Settings when 100+ peers have been discovered
     func exportReliablePeersForBundling() -> String {

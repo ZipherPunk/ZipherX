@@ -512,7 +512,15 @@ struct TransactionDetailView: View {
             return formatter.string(from: date)
         }
 
-        // Fallback: try to get from HeaderStore directly
+        // Fallback 1: Try BlockTimestampManager (uses bundled block_timestamps.bin + runtime cache)
+        if transaction.height > 0 {
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: transaction.height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+                return formatter.string(from: date)
+            }
+        }
+
+        // Fallback 2: Try HeaderStore directly
         if transaction.height > 0 {
             if let header = try? HeaderStore.shared.getHeader(at: transaction.height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(header.time))

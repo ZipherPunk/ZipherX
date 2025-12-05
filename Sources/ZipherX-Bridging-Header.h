@@ -382,6 +382,12 @@ bool zipherx_tree_init(void);
 /// @return Position of the added commitment, or UINT64_MAX on error
 uint64_t zipherx_tree_append(const uint8_t *cmu);
 
+/// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
+/// @param cmus_data Packed CMU data (32 bytes per CMU, in wire format)
+/// @param cmu_count Number of CMUs to append
+/// @return Starting position of the first CMU, or UINT64_MAX on error
+uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);
+
 /// Create a witness for the current position
 /// @return Witness index, or UINT64_MAX on error
 uint64_t zipherx_tree_witness_current(void);
