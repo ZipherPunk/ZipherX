@@ -201,6 +201,21 @@ final class FilterScanner {
                     print("⚠️ GitHub CMU file not available or not newer, will use bundled")
                 }
 
+                // LOAD BLOCK HASHES for fast P2P block fetching
+                // Block hashes enable P2P fetching even when HeaderStore is empty (historical scan)
+                if !BundledBlockHashes.shared.isLoaded {
+                    print("🔗 Loading block hashes for P2P fetching...")
+                    do {
+                        try await BundledBlockHashes.shared.loadBundledHashes { current, total in
+                            if current == total {
+                                print("✅ Block hashes loaded: \(total) hashes for heights \(BundledBlockHashes.shared.startHeight)-\(BundledBlockHashes.shared.endHeight)")
+                            }
+                        }
+                    } catch {
+                        print("⚠️ Failed to load block hashes: \(error) - will fall back to InsightAPI")
+                    }
+                }
+
                 // Safe calculation to avoid underflow
                 let totalBlocks = latestHeight >= startHeight ? latestHeight - startHeight + 1 : 0
                 print("   📊 Scanning \(totalBlocks) blocks to find all historical notes")

@@ -84,7 +84,25 @@ final class WalletManager: ObservableObject {
                 await preloadCommitmentTree()
                 // Pre-initialize prover for faster first transaction
                 await preloadProver()
+                // Load bundled block hashes for fast P2P fetching (historical scans)
+                await preloadBlockHashes()
             }
+        }
+    }
+
+    /// Pre-load bundled block hashes for fast P2P block fetching
+    /// Enables P2P fetching even for blocks not in HeaderStore (historical scans)
+    private func preloadBlockHashes() async {
+        do {
+            try await BundledBlockHashes.shared.loadBundledHashes { current, total in
+                // Progress callback (optional logging)
+                if current == total {
+                    print("✅ Block hashes loaded: \(total) hashes")
+                }
+            }
+        } catch {
+            print("⚠️ Failed to load bundled block hashes: \(error)")
+            // Non-fatal - will fall back to InsightAPI for historical blocks
         }
     }
 

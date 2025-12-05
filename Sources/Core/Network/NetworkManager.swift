@@ -2793,21 +2793,37 @@ final class NetworkManager: ObservableObject {
         return results.sorted { $0.0 < $1.0 }
     }
 
-    /// Fetch a batch of blocks from a single peer using HeaderStore hashes
+    /// Fetch a batch of blocks from a single peer using HeaderStore or BundledBlockHashes
     /// Uses sequential getdata calls (batch getdata had parsing issues)
+    /// PRIORITY: 1) HeaderStore (synced headers), 2) BundledBlockHashes (for historical scan)
     private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
         do {
-            // Get block hashes from HeaderStore (already synced, no network call needed)
+            // Get block hashes - try HeaderStore first, then BundledBlockHashes
             var blockHashes: [(UInt64, Data)] = []
+            var headerStoreCount = 0
+            var bundledCount = 0
+
             for i in 0..<count {
                 let height = startHeight + UInt64(i)
+
+                // First try HeaderStore (synced headers from P2P)
                 if let header = try? HeaderStore.shared.getHeader(at: height) {
                     blockHashes.append((height, header.blockHash))
+                    headerStoreCount += 1
+                }
+                // Then try BundledBlockHashes (for historical blocks)
+                else if let hash = BundledBlockHashes.shared.getBlockHash(at: height) {
+                    blockHashes.append((height, hash))
+                    bundledCount += 1
                 }
             }
 
+            if headerStoreCount > 0 || bundledCount > 0 {
+                debugLog("P2P fetch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes", category: .net)
+            }
+
             guard !blockHashes.isEmpty else {
-                print("⚠️ No headers in HeaderStore for height \(startHeight)")
+                print("⚠️ No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
                 return nil
             }
 
