@@ -80,6 +80,7 @@ bool zipherx_build_transaction_multi(
 // Commitment tree functions
 bool zipherx_tree_init(void);
 uint64_t zipherx_tree_append(const uint8_t *cmu);
+uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);  // Batch append (faster)
 uint64_t zipherx_tree_witness_current(void);
 bool zipherx_tree_root(uint8_t *root_out);
 bool zipherx_tree_get_witness(uint64_t witness_index, uint8_t *witness_out);
@@ -116,6 +117,43 @@ uint64_t zipherx_find_cmu_position(
     const uint8_t *target_cmu
 );
 
+// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+// Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+// because it only builds the tree ONCE instead of N times.
+//
+// Parameters:
+// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+// - cmu_data_len: Length of CMU data
+// - target_cmus: Array of 32-byte CMUs to create witnesses for
+// - target_count: Number of target CMUs
+// - positions_out: Output array for positions (u64 * target_count)
+// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+//
+// Returns: Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_batch(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmus,
+    size_t target_count,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
+// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
+// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+// Each witness gets its own thread building tree to that position.
+//
+// Parameters: same as zipherx_tree_create_witnesses_batch
+// Returns: Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_parallel(
+    const uint8_t *target_cmus,
+    size_t target_count,
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
 // Compute nullifier for a note
 bool zipherx_compute_nullifier(
     const uint8_t *spending_key,
@@ -125,6 +163,43 @@ bool zipherx_compute_nullifier(
     uint64_t position,
     uint8_t *nf_out
 );
+
+// =============================================================================
+// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
+// =============================================================================
+
+// Batch decrypt multiple shielded outputs in parallel using Rayon
+//
+// Input format (per output, 644 bytes total):
+// - epk: 32 bytes (ephemeral public key)
+// - cmu: 32 bytes (note commitment)
+// - ciphertext: 580 bytes (encrypted note)
+//
+// Output format (per output, 564 bytes total):
+// - found: 1 byte (0 = not ours, 1 = decrypted successfully)
+// - diversifier: 11 bytes (only valid if found == 1)
+// - value: 8 bytes little-endian u64 (only valid if found == 1)
+// - rcm: 32 bytes (only valid if found == 1)
+// - memo: 512 bytes (only valid if found == 1)
+//
+// Parameters:
+// - sk: spending key (169 bytes)
+// - outputs_data: packed array of outputs (644 bytes each)
+// - output_count: number of outputs to process
+// - height: block height (for version byte validation)
+// - results: output buffer (564 bytes per output)
+//
+// Returns: number of successfully decrypted notes
+size_t zipherx_try_decrypt_notes_parallel(
+    const uint8_t *sk,
+    const uint8_t *outputs_data,
+    size_t output_count,
+    uint64_t height,
+    uint8_t *results
+);
+
+// Get the number of CPU threads Rayon will use for parallel decryption
+size_t zipherx_get_rayon_threads(void);
 
 // =============================================================================
 // Equihash Proof-of-Work Verification (for trustless header validation)

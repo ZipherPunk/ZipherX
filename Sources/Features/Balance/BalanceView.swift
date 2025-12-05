@@ -1124,6 +1124,24 @@ struct BalanceView: View {
     // MARK: - Computed Properties
 
     private var connectionColor: Color {
+        #if os(macOS)
+        // Full Node mode - use daemon status for color
+        if WalletModeManager.shared.currentMode == .fullNode {
+            let daemonStatus = FullNodeManager.shared.daemonStatus
+            switch daemonStatus {
+            case .running:
+                return .green
+            case .syncing:
+                return .orange
+            case .starting:
+                return .yellow
+            default:
+                return .red
+            }
+        }
+        #endif
+
+        // Light mode - P2P connection status
         if networkManager.isConnected {
             // RED if less than 3 peers (insufficient for trustless operation)
             return networkManager.connectedPeers >= 3 ? .green : .red
@@ -1136,6 +1154,15 @@ struct BalanceView: View {
 
     /// Text color for connection status - RED when peers < 3
     private var connectionTextColor: Color {
+        #if os(macOS)
+        // Full Node mode - text color based on daemon status
+        if WalletModeManager.shared.currentMode == .fullNode {
+            let daemonStatus = FullNodeManager.shared.daemonStatus
+            return daemonStatus.isRunning ? theme.textPrimary : theme.errorColor
+        }
+        #endif
+
+        // Light mode - text color based on peer count
         if networkManager.isConnected && networkManager.connectedPeers < 3 {
             return theme.errorColor
         }
@@ -1143,11 +1170,47 @@ struct BalanceView: View {
     }
 
     private var connectionStatusText: String {
+        #if os(macOS)
+        // Show Full Node status if in Full Node mode
+        if WalletModeManager.shared.currentMode == .fullNode {
+            let daemonStatus = FullNodeManager.shared.daemonStatus
+            let rpcClient = RPCClient.shared
+            switch daemonStatus {
+            case .running:
+                // Show block height and data size
+                let height = rpcClient.blockHeight
+                let size = FullNodeManager.shared.blockchainSize
+                if height > 0 {
+                    return "🖥️ Full Node · Block \(height) · \(size)"
+                } else {
+                    return "🖥️ Full Node · \(size)"
+                }
+            case .syncing(let progress):
+                return "🖥️ Full Node (Syncing \(Int(progress * 100))%)"
+            case .starting:
+                return "🖥️ Full Node (Starting...)"
+            case .installed, .stopped:
+                return "🖥️ Full Node (Daemon Offline)"
+            case .notInstalled:
+                return "🖥️ Full Node (Not Installed)"
+            case .error(let msg):
+                return "🖥️ Full Node (Error: \(msg))"
+            case .unknown:
+                return "🖥️ Full Node (Checking...)"
+            }
+        }
+        #endif
+
+        // Light mode - show P2P peer count
         if isRefreshing && !networkManager.isConnected {
             return "Connecting..."
         } else if networkManager.isConnected {
             let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
-            let warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
+            var warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
+            // Add mempool warning if P2P mempool scanning is unavailable
+            if networkManager.p2pMempoolWarning {
+                warning = " ⚠️ (mempool disabled)"
+            }
             return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning) (\(networkManager.knownAddressCount) known)"
         } else {
             return "Disconnected"

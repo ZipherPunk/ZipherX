@@ -140,6 +140,10 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
 
+    /// Warning: P2P connection issues prevent mempool scanning
+    /// UI should show warning when this is true (incoming tx detection disabled)
+    @Published private(set) var p2pMempoolWarning: Bool = false
+
     /// Sybil attack detection - published when a fake peer is banned
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
     @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
@@ -661,6 +665,80 @@ final class NetworkManager: ObservableObject {
         }
 
         print("📡 Loaded \(loadedCount) bundled peer addresses")
+    }
+
+    // MARK: - GitHub Peer Download
+
+    /// GitHub URL for reliable peers list
+    private static let GITHUB_PEERS_URL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/reliable_peers.json"
+
+    /// Download and load reliable peers from GitHub
+    /// Call this at startup to get the latest peer list
+    func downloadReliablePeersFromGitHub() async -> Int {
+        print("📡 Checking GitHub for reliable peers...")
+
+        guard let url = URL(string: Self.GITHUB_PEERS_URL) else {
+            print("❌ Invalid GitHub peers URL")
+            return 0
+        }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                print("⚠️ GitHub peers fetch failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                return 0
+            }
+
+            let bundledPeers = try JSONDecoder().decode([BundledPeer].self, from: data)
+            print("📡 Downloaded \(bundledPeers.count) peers from GitHub")
+
+            addressLock.lock()
+            defer { addressLock.unlock() }
+
+            var loadedCount = 0
+            for peer in bundledPeers {
+                let key = "\(peer.host):\(peer.port)"
+
+                // Skip if banned
+                if isBanned(peer.host) {
+                    continue
+                }
+
+                // If already known, update reliability info if GitHub has better data
+                if let existing = knownAddresses[key] {
+                    // Only update if GitHub peer has higher reliability and our local has few attempts
+                    if existing.attempts < 5 && peer.reliability > 0.7 {
+                        knownAddresses[key]?.successes = max(existing.successes, 1)
+                        triedAddresses.insert(key)
+                    }
+                    continue
+                }
+
+                let address = PeerAddress(host: peer.host, port: peer.port)
+                knownAddresses[key] = AddressInfo(
+                    address: address,
+                    source: "github",
+                    firstSeen: Date(),
+                    lastSeen: peer.lastSeen,
+                    attempts: 0,
+                    successes: peer.reliability > 0.5 ? 1 : 0
+                )
+
+                // High reliability peers go to tried set (prioritized for connection)
+                if peer.reliability > 0.5 {
+                    triedAddresses.insert(key)
+                } else {
+                    newAddresses.insert(key)
+                }
+                loadedCount += 1
+            }
+
+            print("✅ Added \(loadedCount) new peers from GitHub (total known: \(knownAddresses.count))")
+            return loadedCount
+        } catch {
+            print("⚠️ GitHub peers download error: \(error.localizedDescription)")
+            return 0
+        }
     }
 
     /// Export current reliable peers for bundling in future releases
@@ -1403,16 +1481,46 @@ final class NetworkManager: ObservableObject {
     /// Uses trial decryption to detect payments before confirmation
     private func scanMempoolForIncoming() async {
         print("🔮 scanMempoolForIncoming: starting...")
-        guard isConnected else {
-            print("🔮 scanMempoolForIncoming: not connected, skipping")
+
+        // Get all connected peers and try them in order
+        var connectedPeers = getAllConnectedPeers()
+
+        // If no ready peers, try to reconnect
+        if connectedPeers.isEmpty {
+            print("🔮 scanMempoolForIncoming: no ready peers, attempting reconnection...")
+
+            // Try to reconnect disconnected peers
+            for peer in peers where !peer.isConnectionReady {
+                do {
+                    try await peer.connect()
+                    try await peer.performHandshake()
+                    print("✅ scanMempoolForIncoming: reconnected to \(peer.host)")
+                } catch {
+                    // Silently continue - we'll try other peers
+                }
+            }
+
+            // Check again after reconnect attempt
+            connectedPeers = getAllConnectedPeers()
+        }
+
+        guard !connectedPeers.isEmpty else {
+            print("⚠️ scanMempoolForIncoming: no connected peer after reconnect attempt - mempool scanning disabled!")
+            await MainActor.run {
+                if !self.p2pMempoolWarning {
+                    self.p2pMempoolWarning = true
+                    print("⚠️ P2P mempool warning activated - incoming tx detection may be delayed")
+                }
+            }
             return
         }
 
-        // Get all connected peers and try them in order
-        let connectedPeers = getAllConnectedPeers()
-        guard !connectedPeers.isEmpty else {
-            print("🔮 scanMempoolForIncoming: no connected peer, skipping")
-            return
+        // Clear warning if we have peers now
+        await MainActor.run {
+            if self.p2pMempoolWarning {
+                self.p2pMempoolWarning = false
+                print("✅ P2P mempool warning cleared - peers available")
+            }
         }
 
         // Try each peer until one succeeds
@@ -1779,16 +1887,19 @@ final class NetworkManager: ObservableObject {
     /// Last time price was fetched (for rate limiting)
     private var lastPriceFetchTime: Date?
 
-    /// Fetch ZCL price from API (with fallback, rate limited to every 60 seconds)
+    /// Fetch ZCL price from API (with fallback, rate limited to every hour)
     private func fetchZCLPrice() async {
-        // Rate limit: only fetch every 60 seconds
-        if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 60 {
+        // Rate limit: only fetch every hour (3600 seconds)
+        if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 3600 {
+            print("💰 Price fetch skipped (rate limited - hourly)")
             return
         }
         lastPriceFetchTime = Date()
+        print("💰 Fetching ZCL price...")
 
         // Try CoinGecko API first
         if let price = await fetchPriceFromCoinGecko() {
+            print("💰 CoinGecko price: $\(price)")
             await MainActor.run {
                 self.zclPriceUSD = price
                 self.zclPriceFailed = false
@@ -1796,8 +1907,9 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        // Fallback: Try CryptoCompare
-        if let price = await fetchPriceFromCryptoCompare() {
+        // Fallback: Try CoinMarketCap (free tier)
+        if let price = await fetchPriceFromCoinMarketCap() {
+            print("💰 CoinMarketCap price: $\(price)")
             await MainActor.run {
                 self.zclPriceUSD = price
                 self.zclPriceFailed = false
@@ -1805,7 +1917,7 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        // Both APIs failed
+        // Both APIs failed - keep existing price if we have one
         print("⚠️ Failed to fetch ZCL price from any source")
         await MainActor.run {
             self.zclPriceFailed = true
@@ -1818,31 +1930,57 @@ final class NetworkManager: ObservableObject {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let httpResponse = response as? HTTPURLResponse {
+                print("💰 CoinGecko HTTP status: \(httpResponse.statusCode)")
+            }
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let zclData = json["zclassic"] as? [String: Any],
                let price = zclData["usd"] as? Double {
                 return price
             }
+            print("💰 CoinGecko: couldn't parse response: \(String(data: data, encoding: .utf8) ?? "nil")")
         } catch {
             print("⚠️ CoinGecko price fetch failed: \(error)")
         }
         return nil
     }
 
-    private func fetchPriceFromCryptoCompare() async -> Double? {
-        guard let url = URL(string: "https://min-api.cryptocompare.com/data/price?fsym=ZCL&tsyms=USD") else {
+    private func fetchPriceFromCoinMarketCap() async -> Double? {
+        // CoinMarketCap free tier - uses their web API endpoint (no API key needed)
+        // ZCL ID on CoinMarketCap is 1447
+        guard let url = URL(string: "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?id=1447&convertId=2781") else {
             return nil
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse {
+                print("💰 CoinMarketCap HTTP status: \(httpResponse.statusCode)")
+                if httpResponse.statusCode != 200 {
+                    print("💰 CoinMarketCap: non-200 status")
+                    return nil
+                }
+            }
+
+            // Parse response: {"data":{"id":1447,"name":"Zclassic",...,"quote":[{"price":0.49,...}]}}
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let price = json["USD"] as? Double {
+               let dataObj = json["data"] as? [String: Any],
+               let quotes = dataObj["quote"] as? [[String: Any]],
+               let firstQuote = quotes.first,
+               let price = firstQuote["price"] as? Double {
                 return price
             }
+
+            // Log response for debugging
+            let responseStr = String(data: data, encoding: .utf8) ?? "nil"
+            print("💰 CoinMarketCap: couldn't parse response: \(responseStr.prefix(500))")
         } catch {
-            print("⚠️ CryptoCompare price fetch failed: \(error)")
+            print("⚠️ CoinMarketCap price fetch failed: \(error)")
         }
         return nil
     }
@@ -2680,14 +2818,51 @@ final class NetworkManager: ObservableObject {
     /// Distributes block ranges across peers - each peer fetches its range SEQUENTIALLY
     /// All peers work in PARALLEL for maximum throughput
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        let availablePeers = peers
+        // Ensure at least some peers are connected before checking
+        // This prevents race condition where peers are reconnecting
+        var availablePeers = peers.filter { $0.isConnectionReady }
+
+        if availablePeers.isEmpty && !peers.isEmpty {
+            // No ready peers but we have peers - try to reconnect them
+            print("⏳ P2P: No ready peers, attempting reconnection...")
+
+            // Try to reconnect up to 3 peers in parallel
+            let peersToReconnect = Array(peers.prefix(3))
+            await withTaskGroup(of: Void.self) { group in
+                for peer in peersToReconnect {
+                    group.addTask {
+                        do {
+                            try await peer.ensureConnected()
+                        } catch {
+                            print("⚠️ P2P: Failed to reconnect \(peer.host): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+
+            // Check again after reconnection attempt
+            availablePeers = peers.filter { $0.isConnectionReady }
+
+            if availablePeers.isEmpty {
+                print("⚠️ P2P: Still no ready peers after reconnection attempt")
+            } else {
+                print("✅ P2P: Reconnected \(availablePeers.count) peers")
+            }
+        }
+
         guard !availablePeers.isEmpty else {
+            debugLog(.network, "⚠️ No ready peers for P2P block fetch")
             throw NetworkError.notConnected
         }
 
         let peerCount = availablePeers.count
         let blocksPerPeer = (count + peerCount - 1) / peerCount  // Ceiling division
 
+        // Check if block hashes are available for this range
+        let bundledAvailable = BundledBlockHashes.shared.isLoaded && BundledBlockHashes.shared.contains(height: height)
+        let headerStoreAvailable = (try? HeaderStore.shared.getHeader(at: height)) != nil
+
+        debugLog(.network, "🚀 P2P fetch: \(count) blocks from height \(height), \(peerCount) ready peers, bundled=\(bundledAvailable), headers=\(headerStoreAvailable)")
         print("🚀 P2P parallel fetch: \(count) blocks across \(peerCount) peers (~\(blocksPerPeer) blocks each)")
         let startTime = Date()
 
@@ -2723,32 +2898,62 @@ final class NetworkManager: ObservableObject {
 
         let elapsed = Date().timeIntervalSince(startTime)
         let rate = Double(results.count) / max(elapsed, 0.001)
+
+        // If we got less than 10% of requested blocks, consider it a failure
+        if results.count < count / 10 {
+            print("⚠️ P2P fetch failed: only got \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s")
+            throw NetworkError.p2pFetchFailed
+        }
+
         print("✅ P2P parallel fetch complete: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
 
         // Sort by height to maintain order
         return results.sorted { $0.0 < $1.0 }
     }
 
-    /// Fetch a batch of blocks from a single peer using HeaderStore hashes
+    /// Fetch a batch of blocks from a single peer using HeaderStore or BundledBlockHashes
     /// Uses sequential getdata calls (batch getdata had parsing issues)
+    /// PRIORITY: 1) HeaderStore (synced headers), 2) BundledBlockHashes (for historical scan)
     private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
         do {
-            // Get block hashes from HeaderStore (already synced, no network call needed)
+            // Get block hashes - try HeaderStore first, then BundledBlockHashes
             var blockHashes: [(UInt64, Data)] = []
+            var headerStoreCount = 0
+            var bundledCount = 0
+
             for i in 0..<count {
                 let height = startHeight + UInt64(i)
+
+                // First try HeaderStore (synced headers from P2P)
                 if let header = try? HeaderStore.shared.getHeader(at: height) {
                     blockHashes.append((height, header.blockHash))
+                    headerStoreCount += 1
+                }
+                // Then try BundledBlockHashes (for historical blocks)
+                else if let hash = BundledBlockHashes.shared.getBlockHash(at: height) {
+                    blockHashes.append((height, hash))
+                    bundledCount += 1
                 }
             }
 
+            if headerStoreCount > 0 || bundledCount > 0 {
+                print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
+            }
+
             guard !blockHashes.isEmpty else {
-                print("⚠️ No headers in HeaderStore for height \(startHeight)")
+                print("⚠️ [\(peer.host)] No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
+                return nil
+            }
+
+            // Check peer connection before attempting fetches
+            guard peer.isConnectionReady else {
+                print("⚠️ [\(peer.host)] Peer not ready, skipping batch of \(count) blocks")
                 return nil
             }
 
             // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
             var blocks: [(UInt64, CompactBlock)] = []
+            var failCount = 0
             for (height, hash) in blockHashes {
                 do {
                     let block = try await withTimeout(seconds: 10) {
@@ -2756,9 +2961,18 @@ final class NetworkManager: ObservableObject {
                     }
                     blocks.append((height, block))
                 } catch {
-                    // Skip blocks that fail to fetch
+                    failCount += 1
+                    // If too many failures, peer is likely dead
+                    if failCount > 3 {
+                        print("⚠️ [\(peer.host)] Too many failures (\(failCount)), aborting batch")
+                        break
+                    }
                     continue
                 }
+            }
+
+            if blocks.isEmpty && !blockHashes.isEmpty {
+                print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
             }
 
             var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
@@ -2981,8 +3195,10 @@ final class NetworkManager: ObservableObject {
             }
 
             DispatchQueue.main.async {
-                self.connectedPeers = self.peers.count
-                self.isConnected = self.peers.count > 0
+                // BUGFIX: Only count peers with READY connections, not all peers in array
+                let readyPeers = self.peers.filter { $0.isConnectionReady }
+                self.connectedPeers = readyPeers.count
+                self.isConnected = readyPeers.count > 0
             }
         }
     }
@@ -3115,6 +3331,7 @@ enum NetworkError: LocalizedError {
     case connectionTimeout
     case invalidData
     case notFound
+    case p2pFetchFailed
 
     var errorDescription: String? {
         switch self {
@@ -3142,6 +3359,8 @@ enum NetworkError: LocalizedError {
             return "Invalid data format"
         case .notFound:
             return "Data not found on peer"
+        case .p2pFetchFailed:
+            return "P2P block fetch failed"
         }
     }
 }

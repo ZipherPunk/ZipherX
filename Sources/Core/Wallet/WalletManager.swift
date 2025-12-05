@@ -31,6 +31,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var isWalletCreated: Bool = false
     @Published private(set) var isImportedWallet: Bool = false  // True if wallet was imported (may have historical notes)
     @Published private(set) var isMnemonicBackupPending: Bool = false  // True when new wallet created, waiting for backup confirmation
+    @Published var importScanStartHeight: UInt64? = nil  // Custom scan start height for imported wallets (nil = full scan)
     @Published private(set) var shieldedBalance: UInt64 = 0 // in zatoshis
     @Published private(set) var pendingBalance: UInt64 = 0
     @Published private(set) var zAddress: String = ""
@@ -38,6 +39,7 @@ final class WalletManager: ObservableObject {
     @Published private(set) var isSyncing: Bool = false
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
+    @Published private(set) var syncPhase: String = ""  // "phase1", "phase1.5", "phase1.6", "phase2"
     @Published private(set) var lastError: WalletError?
     @Published private(set) var syncTasks: [SyncTask] = []
     @Published private(set) var syncCurrentHeight: UInt64 = 0
@@ -69,6 +71,9 @@ final class WalletManager: ObservableObject {
     private let mnemonicGenerator: MnemonicGenerator
     private var cancellables = Set<AnyCancellable>()
 
+    /// Currently active scanner instance (used for stopSync)
+    private var currentScanner: FilterScanner?
+
     // MARK: - Constants
     private let zclassicCoinType: UInt32 = 147 // ZCL coin type for BIP44
 
@@ -83,7 +88,25 @@ final class WalletManager: ObservableObject {
                 await preloadCommitmentTree()
                 // Pre-initialize prover for faster first transaction
                 await preloadProver()
+                // Load bundled block hashes for fast P2P fetching (historical scans)
+                await preloadBlockHashes()
             }
+        }
+    }
+
+    /// Pre-load bundled block hashes for fast P2P block fetching
+    /// Enables P2P fetching even for blocks not in HeaderStore (historical scans)
+    private func preloadBlockHashes() async {
+        do {
+            try await BundledBlockHashes.shared.loadBundledHashes { current, total in
+                // Progress callback (optional logging)
+                if current == total {
+                    print("✅ Block hashes loaded: \(total) hashes")
+                }
+            }
+        } catch {
+            print("⚠️ Failed to load bundled block hashes: \(error)")
+            // Non-fatal - will fall back to InsightAPI for historical blocks
         }
     }
 
@@ -236,18 +259,89 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // FAST PATH: Try loading pre-serialized tree (instant - <1 second)
-        // The serialized tree file contains the Merkle frontier, not all CMUs
-        print("🌳 Loading bundled commitment tree...")
+        // CHECK GITHUB FIRST for newer serialized tree (on first installation)
+        // This allows users to get the latest tree without app update
+        let hasExistingTreeState = (try? WalletDatabase.shared.getTreeState()) != nil
+        let isFirstInstallation = !hasExistingTreeState
+
+        var useGitHubTree = false
+        var gitHubSerializedData: Data?
+        var effectiveTreeHeight = bundledTreeHeight
+        var effectiveCMUCount = bundledTreeCMUCount
+
+        if isFirstInstallation {
+            print("🌲 First installation - checking GitHub for updated tree...")
+            await MainActor.run {
+                self.treeLoadStatus = "Checking for tree updates..."
+                self.treeLoadProgress = 0.1
+            }
+
+            do {
+                let (bestTreeURL, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableTree { progress, status in
+                    Task { @MainActor in
+                        self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for update check/download
+                        self.treeLoadStatus = status
+                    }
+                }
+
+                if height > bundledTreeHeight {
+                    // GitHub has newer tree - try to load the serialized version
+                    if bestTreeURL.lastPathComponent.contains("serialized") {
+                        if let data = try? Data(contentsOf: bestTreeURL) {
+                            print("🌲 Downloaded newer serialized tree from GitHub: height \(height) (\(cmuCount) CMUs)")
+                            gitHubSerializedData = data
+                            useGitHubTree = true
+                            effectiveTreeHeight = height
+                            effectiveCMUCount = cmuCount
+                        }
+                    }
+                }
+            } catch {
+                print("⚠️ GitHub tree check failed: \(error.localizedDescription)")
+                // Continue with bundled tree
+            }
+        }
+
+        // FAST PATH: Load serialized tree (either from GitHub or bundled)
+        print("🌳 Loading commitment tree...")
         await MainActor.run {
             self.treeLoadStatus = "Restoring privacy infrastructure..."
             self.treeLoadProgress = 0.3
+        }
+
+        // Try GitHub downloaded tree first
+        if useGitHubTree, let serializedData = gitHubSerializedData {
+            print("🌲 Using GitHub serialized tree...")
+            if ZipherXFFI.treeDeserialize(data: serializedData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ GitHub commitment tree loaded instantly: \(treeSize) commitments (height \(effectiveTreeHeight))")
+
+                // Store effective height for FilterScanner
+                UserDefaults.standard.set(Int(effectiveTreeHeight), forKey: "effectiveTreeHeight")
+                UserDefaults.standard.set(Int(effectiveCMUCount), forKey: "effectiveTreeCMUCount")
+
+                // Save to database for next time
+                if let serializedTree = ZipherXFFI.treeSerialize() {
+                    try? WalletDatabase.shared.saveTreeState(serializedTree)
+                    print("💾 Tree state saved to database for future use")
+                }
+
+                await MainActor.run {
+                    self.isTreeLoaded = true
+                    self.treeLoadProgress = 1.0
+                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                }
+                return
+            } else {
+                print("⚠️ GitHub tree deserialization failed, falling back to bundled...")
+            }
         }
 
         // DEBUG: Log bundle path to help diagnose resource loading issues
         print("📁 Bundle path: \(Bundle.main.bundlePath)")
         print("📁 Resource path: \(Bundle.main.resourcePath ?? "nil")")
 
+        // Fall back to bundled serialized tree
         if let serializedTreeURL = Bundle.main.url(forResource: "commitment_tree_serialized", withExtension: "bin") {
             print("✅ Found serialized tree at: \(serializedTreeURL.path)")
             if let serializedData = try? Data(contentsOf: serializedTreeURL) {
@@ -280,7 +374,7 @@ final class WalletManager: ObservableObject {
             print("⚠️ commitment_tree_serialized.bin not found in bundle, falling back to CMU rebuild...")
         }
 
-        // SLOW FALLBACK: Build tree from CMUs (only if serialized file fails/missing)
+        // SLOW FALLBACK: Build tree from CMUs (only if serialized files fail/missing)
         // This takes ~50 seconds but ensures all spending operations are instant
         print("🌳 Rebuilding commitment tree from CMUs (slow fallback)...")
         await MainActor.run {
@@ -288,43 +382,8 @@ final class WalletManager: ObservableObject {
             self.treeLoadProgress = 0.0
         }
 
-        // Check for updated tree on GitHub - ONLY on first installation
-        // After initial setup, the app syncs new blocks incrementally via P2P
-        var treeURL: URL?
-        var effectiveTreeHeight = bundledTreeHeight
-        var effectiveCMUCount = bundledTreeCMUCount
-
-        // Check if this is first installation (no tree state in database yet)
-        let hasExistingTreeState = (try? WalletDatabase.shared.getTreeState()) != nil
-        let isFirstInstallation = !hasExistingTreeState
-
-        if isFirstInstallation {
-            // First installation - check GitHub for newer tree
-            print("🌲 First installation detected - checking for updated tree...")
-            do {
-                let (bestTreeURL, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableTree { progress, status in
-                    Task { @MainActor in
-                        self.treeLoadProgress = progress * 0.1  // 0-10% for update check
-                        self.treeLoadStatus = status
-                    }
-                }
-                treeURL = bestTreeURL
-                effectiveTreeHeight = height
-                effectiveCMUCount = cmuCount
-
-                if height > bundledTreeHeight {
-                    print("🌲 Using updated tree from GitHub: height \(height) (\(cmuCount) CMUs)")
-                }
-            } catch {
-                print("⚠️ Tree update check failed: \(error.localizedDescription)")
-                // Fall back to bundled tree
-                treeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
-            }
-        } else {
-            // Not first installation - use bundled tree (database tree state handles the rest)
-            print("🌲 Existing wallet - using bundled tree as fallback")
-            treeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
-        }
+        // Use bundled tree for CMU rebuild
+        var treeURL: URL? = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
 
         guard let finalTreeURL = treeURL ?? Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
               let bundledData = try? Data(contentsOf: finalTreeURL) else {
@@ -335,14 +394,7 @@ final class WalletManager: ObservableObject {
             return
         }
 
-        // Update effective height if using downloaded tree (first installation only)
-        if isFirstInstallation && effectiveTreeHeight > bundledTreeHeight {
-            // Store the effective height for FilterScanner to use
-            UserDefaults.standard.set(Int(effectiveTreeHeight), forKey: "effectiveTreeHeight")
-            UserDefaults.standard.set(Int(effectiveCMUCount), forKey: "effectiveTreeCMUCount")
-        }
-
-        // Proceed with loading tree from CMUs
+        // Proceed with loading tree from CMUs (slow fallback - only used if serialized fails)
         // Cypherpunk messages for tree building
         let treeLoadMessages = [
             "Constructing zero-knowledge tree...",
@@ -707,6 +759,8 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
                 SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
                 SyncTask(id: "database", title: "Unlock encrypted vault", status: .pending),
+                SyncTask(id: "download_outputs", title: "Download shielded outputs", status: .pending),
+                SyncTask(id: "download_timestamps", title: "Download block timestamps", status: .pending),
                 SyncTask(id: "headers", title: "Verify peer consensus (3/3)", status: .pending),
                 SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
                 SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
@@ -915,9 +969,34 @@ final class WalletManager: ObservableObject {
         // Task 4: Scan blockchain
         await updateTask("scan", status: .inProgress)
         let scanner = FilterScanner()
+        self.currentScanner = scanner  // Store reference for stopSync()
 
         // VUL-018: Use shared constant for bundled tree height
         let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+
+        // Status update callback - handles phase transitions and messages
+        scanner.onStatusUpdate = { [weak self] phase, status in
+            Task { @MainActor in
+                self?.syncPhase = phase
+                self?.syncStatus = status
+
+                // Update task detail based on phase
+                if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
+                    switch phase {
+                    case "phase1":
+                        self?.syncTasks[index].detail = "Parallel note decryption"
+                    case "phase1.5":
+                        self?.syncTasks[index].detail = "Computing Merkle witnesses"
+                    case "phase1.6":
+                        self?.syncTasks[index].detail = "Detecting spent notes"
+                    case "phase2":
+                        self?.syncTasks[index].detail = "Sequential tree building"
+                    default:
+                        break
+                    }
+                }
+            }
+        }
 
         scanner.onProgress = { [weak self] progress, currentHeight, maxHeight in
             Task { @MainActor in
@@ -925,16 +1004,32 @@ final class WalletManager: ObservableObject {
                 self?.syncCurrentHeight = currentHeight
                 self?.syncMaxHeight = maxHeight
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
-                    // Show context: scanning from checkpoint to current
+                    // Show context: scanning from checkpoint to current with estimated date
                     let blocksToScan = maxHeight > bundledTreeHeight ? maxHeight - bundledTreeHeight : 0
                     let blocksScanned = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
-                    self?.syncTasks[index].detail = "Block \(currentHeight.formatted()) / \(maxHeight.formatted())"
-                    self?.syncTasks[index].progress = blocksToScan > 0 ? Double(blocksScanned) / Double(blocksToScan) : progress
+
+                    // Estimate date for current block height
+                    let estimatedDate = self?.estimateDateForBlock(height: currentHeight) ?? ""
+                    let dateString = estimatedDate.isEmpty ? "" : " (\(estimatedDate))"
+
+                    // Include phase in the detail if available
+                    let phasePrefix: String
+                    switch self?.syncPhase {
+                    case "phase1": phasePrefix = "⚡ "
+                    case "phase1.5": phasePrefix = "🌲 "
+                    case "phase1.6": phasePrefix = "🔍 "
+                    case "phase2": phasePrefix = "📦 "
+                    default: phasePrefix = ""
+                    }
+
+                    self?.syncTasks[index].detail = "\(phasePrefix)Block \(currentHeight.formatted())\(dateString)"
+                    self?.syncTasks[index].progress = progress
                 }
 
                 // Update syncStatus with cypherpunk messages based on scan phase
-                if currentHeight <= bundledTreeHeight {
-                    // PHASE 1: Scanning within bundled tree range
+                // Only update if no specific status was set by onStatusUpdate
+                if self?.syncPhase == "phase1" {
+                    // PHASE 1: Parallel note discovery
                     let phase1Messages = [
                         "Hunting for your shielded notes...",
                         "Decrypting the shadows...",
@@ -947,7 +1042,7 @@ final class WalletManager: ObservableObject {
                     ]
                     let messageIndex = Int(currentHeight / 50000) % phase1Messages.count
                     self?.syncStatus = phase1Messages[messageIndex]
-                } else {
+                } else if self?.syncPhase == "phase2" {
                     // PHASE 2: Sequential tree building
                     let phase2Messages = [
                         "Building commitment tree...",
@@ -956,10 +1051,11 @@ final class WalletManager: ObservableObject {
                         "Securing new commitments...",
                         "Zero-knowledge sync active..."
                     ]
-                    let blocksAfterBundled = currentHeight - bundledTreeHeight
+                    let blocksAfterBundled = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
                     let messageIndex = Int(blocksAfterBundled / 1000) % phase2Messages.count
                     self?.syncStatus = phase2Messages[messageIndex]
                 }
+                // Note: phase1.5 and phase1.6 status is set by onStatusUpdate
             }
         }
 
@@ -1076,6 +1172,19 @@ final class WalletManager: ObservableObject {
         // Update wallet height in NetworkManager for UI display
         let lastScannedHeight = (try? database.getLastScannedHeight()) ?? 0
         NetworkManager.shared.updateWalletHeight(lastScannedHeight)
+
+        // CRITICAL FIX: Clear isImportedWallet after first successful sync
+        // This prevents the app from doing a full historical scan on every startup
+        // The flag should only be true during the FIRST sync after importing a wallet
+        if isImportedWallet {
+            print("✅ First import sync complete - clearing isImportedWallet flag for fast future startups")
+            DispatchQueue.main.async {
+                self.isImportedWallet = false
+                UserDefaults.standard.set(false, forKey: "wallet_imported")
+                UserDefaults.standard.synchronize()
+            }
+        }
+
         print("✅ Sync complete: balance task finished")
     }
 
@@ -1204,6 +1313,9 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
         print("👤 Account ID: \(account.id)")
+
+        // Download reliable peers from GitHub (for faster initial connection)
+        let _ = await NetworkManager.shared.downloadReliablePeersFromGitHub()
 
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
@@ -1619,6 +1731,10 @@ final class WalletManager: ObservableObject {
                     self.syncStatus = "Deriving keys from seed entropy..."
                 case "database":
                     self.syncStatus = "Unlocking encrypted vault..."
+                case "download_outputs":
+                    self.syncStatus = "Downloading shielded outputs from GitHub..."
+                case "download_timestamps":
+                    self.syncStatus = "Downloading block timestamps from GitHub..."
                 case "headers":
                     self.syncStatus = "Reaching consensus with 3 peers..."
                 case "height":
@@ -1646,6 +1762,105 @@ final class WalletManager: ObservableObject {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
             syncTasks[index].detail = detail
             syncTasks[index].progress = progress
+        }
+    }
+
+    // MARK: - Public Task Update Methods (for FilterScanner)
+
+    /// Update download task status - called from FilterScanner
+    @MainActor
+    func updateDownloadTask(_ taskId: String, status: SyncTaskStatus, detail: String? = nil) {
+        updateTask(taskId, status: status, detail: detail)
+    }
+
+    /// Update download task progress - called from FilterScanner
+    @MainActor
+    func updateDownloadTaskProgress(_ taskId: String, detail: String, progress: Double) {
+        // First set to in progress if not already
+        if let index = syncTasks.firstIndex(where: { $0.id == taskId }) {
+            if case .pending = syncTasks[index].status {
+                syncTasks[index].status = .inProgress
+            }
+        }
+        updateTaskWithProgress(taskId, detail: detail, progress: progress)
+    }
+
+    /// Estimate date for a given block height
+    /// Uses reference point: block 2931180 = Dec 3, 2025 18:09 UTC
+    /// Zclassic block time: 2.5 minutes
+    private func estimateDateForBlock(height: UInt64) -> String {
+        guard height > 0 else { return "" }
+
+        let referenceHeight: UInt64 = 2932265
+        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (CORRECT 2025 timestamp)
+        let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
+
+        let heightDiff = Int64(height) - Int64(referenceHeight)
+        let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTimeInterval)
+        let date = Date(timeIntervalSince1970: estimatedTimestamp)
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, yyyy"
+        return formatter.string(from: date)
+    }
+
+    /// Convert a date to estimated block height
+    /// Uses reference point: block 2932265 = Dec 4, 2025 17:00 UTC
+    /// Zclassic block time: 2.5 minutes (150 seconds)
+    /// - Parameter date: The date to convert
+    /// - Returns: Estimated block height (clamped to Sapling activation minimum and current chain height)
+    static func blockHeightForDate(_ date: Date) -> UInt64 {
+        let referenceHeight: UInt64 = 2932265
+        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (correct 2025 timestamp)
+        let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
+
+        let targetTimestamp = date.timeIntervalSince1970
+        let timeDiff = targetTimestamp - referenceTimestamp
+        let blockDiff = Int64(timeDiff / blockTimeInterval)
+
+        let estimatedHeight = Int64(referenceHeight) + blockDiff
+
+        // Clamp to Sapling activation as minimum and current chain height as maximum
+        let saplingActivation: UInt64 = 476_969
+        let maxHeight = referenceHeight // Can't scan future blocks
+        let clampedHeight = UInt64(max(Int64(saplingActivation), min(estimatedHeight, Int64(maxHeight))))
+        return clampedHeight
+    }
+
+    /// Sapling activation date: November 6, 2016
+    static let saplingActivationDate: Date = {
+        var components = DateComponents()
+        components.year = 2016
+        components.month = 11
+        components.day = 6
+        return Calendar.current.date(from: components) ?? Date.distantPast
+    }()
+
+    /// Get estimated scan duration based on start height
+    /// - Parameter startHeight: Block height to start scanning from
+    /// - Returns: Estimated duration string (e.g., "~55 minutes")
+    static func estimatedScanDuration(from startHeight: UInt64) -> String {
+        let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
+        let blocksToScan = effectiveTreeHeight > startHeight ? effectiveTreeHeight - startHeight : 0
+
+        // Estimate: ~750 blocks/second for parallel scanning
+        let estimatedSeconds = Double(blocksToScan) / 750.0
+        let estimatedMinutes = Int(ceil(estimatedSeconds / 60.0))
+
+        if estimatedMinutes < 1 {
+            return "< 1 minute"
+        } else if estimatedMinutes == 1 {
+            return "~1 minute"
+        } else if estimatedMinutes < 60 {
+            return "~\(estimatedMinutes) minutes"
+        } else {
+            let hours = estimatedMinutes / 60
+            let mins = estimatedMinutes % 60
+            if mins == 0 {
+                return "~\(hours) hour\(hours > 1 ? "s" : "")"
+            } else {
+                return "~\(hours)h \(mins)m"
+            }
         }
     }
 
@@ -2114,6 +2329,27 @@ final class WalletManager: ObservableObject {
         defaults.set(isWalletCreated, forKey: "wallet_created")
         defaults.set(isImportedWallet, forKey: "wallet_imported")
         defaults.set(zAddress, forKey: "z_address")
+    }
+
+    /// Stop any ongoing sync operation
+    /// Called when user clicks STOP button during initial sync
+    func stopSync() {
+        print("🛑 STOP SYNC: User requested sync cancellation")
+
+        // Stop the current scanner if active
+        currentScanner?.stopScan()
+        currentScanner = nil
+
+        // Reset sync state
+        DispatchQueue.main.async {
+            self.isSyncing = false
+            self.isConnecting = false
+            self.syncProgress = 0.0
+            self.syncStatus = "Sync stopped by user"
+            self.syncTasks = []
+        }
+
+        print("✅ STOP SYNC: Sync cancelled. Wallet may have incomplete data.")
     }
 
     /// Delete wallet and all associated data, then terminate the app

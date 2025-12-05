@@ -31,8 +31,8 @@ enum ZclassicCheckpoints {
         558000: "000000000saplingactivationhashplaceholder0123456789abcdef01234",
 
         // Recent checkpoints for faster sync
-        2900000: "0000000000recentcheckpoint2900000placeholder0123456789abcdef",
-        2916559: "0000000000bootstrap20251120checkpoint0123456789abcdef01234567",
+        // Real checkpoint at 2900000 for imported wallets starting around this height
+        2900000: "000000746aedab2734c87be0ea7c7337523ed14f3ee2cc212eee6b22a442c9af",
         // Bundled tree checkpoint (must match bundledTreeHeight in FilterScanner/WalletManager)
         // IMPORTANT: This hash was corrected on Dec 3, 2025 - previous hash was wrong causing header misalignment
         2926122: "0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd",

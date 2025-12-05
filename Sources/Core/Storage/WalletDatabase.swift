@@ -1632,6 +1632,28 @@ final class WalletDatabase {
         }
     }
 
+    /// Update nullifier for a note (used when recomputing nullifiers with correct positions)
+    func updateNoteNullifier(noteId: Int64, nullifier: Data) throws {
+        // Hash the nullifier before storage for privacy
+        let hashedNullifier = hashNullifier(nullifier)
+        let sql = "UPDATE notes SET nullifier = ? WHERE id = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+        sqlite3_bind_int64(stmt, 2, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// Reset sync state for full rescan
     /// Deletes notes, nullifiers, tree state, and resets scan height
     func resetSyncState() throws {
@@ -1872,10 +1894,11 @@ final class WalletDatabase {
             let height = UInt64(sqlite3_column_int64(stmt, 1))
             var blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
 
-            // ALWAYS try to get real timestamp from HeaderStore (contains blockchain unix timestamp)
-            // This ensures we use the actual block timestamp, not any estimated value
+            // ALWAYS try to get real timestamp - BlockTimestampManager first (bundled data), then HeaderStore
             if height > 0 {
-                if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
+                if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+                    blockTime = UInt64(timestamp)
+                } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
                     blockTime = UInt64(headerTime)
                 }
             }
@@ -2118,11 +2141,13 @@ final class WalletDatabase {
                 sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(spentStmt, 2, Int64(txInfo.spentHeight))
-            // Get real block time from HeaderStore - NEVER estimate!
-            if let headerTime = try? HeaderStore.shared.getBlockTime(at: txInfo.spentHeight) {
+            // Get real block time - try BlockTimestampManager first (has bundled data), then HeaderStore
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: txInfo.spentHeight) {
+                sqlite3_bind_int64(spentStmt, 3, Int64(timestamp))
+            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: txInfo.spentHeight) {
                 sqlite3_bind_int64(spentStmt, 3, Int64(headerTime))
             } else {
-                sqlite3_bind_null(spentStmt, 3) // Will be fetched from HeaderStore when displayed
+                sqlite3_bind_null(spentStmt, 3) // Will be fetched from BlockTimestampManager when displayed
             }
             sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
             // Store totalBalanceImpact (recipient + fee) so history sum equals current balance
@@ -2166,11 +2191,13 @@ final class WalletDatabase {
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(note.receivedHeight))
-            // Get real block time from HeaderStore - NEVER estimate!
-            if let headerTime = try? HeaderStore.shared.getBlockTime(at: note.receivedHeight) {
+            // Get real block time - try BlockTimestampManager first (has bundled data), then HeaderStore
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: note.receivedHeight) {
+                sqlite3_bind_int64(insertStmt, 3, Int64(timestamp))
+            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: note.receivedHeight) {
                 sqlite3_bind_int64(insertStmt, 3, Int64(headerTime))
             } else {
-                sqlite3_bind_null(insertStmt, 3) // Will be fetched from HeaderStore when displayed
+                sqlite3_bind_null(insertStmt, 3) // Will be fetched from BlockTimestampManager when displayed
             }
             sqlite3_bind_text(insertStmt, 4, txType.rawValue, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(insertStmt, 5, Int64(note.value))
@@ -2231,11 +2258,13 @@ final class WalletDatabase {
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
 
-        // Use real block time if provided, otherwise try to get from HeaderStore
+        // Use real block time if provided, otherwise try to get from BlockTimestampManager/HeaderStore
         // NEVER estimate - only use real blockchain timestamp!
         let actualBlockTime: UInt64?
         if let bt = blockTime {
             actualBlockTime = bt
+        } else if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+            actualBlockTime = UInt64(timestamp)
         } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
             actualBlockTime = UInt64(headerTime)
         } else {
@@ -2296,12 +2325,14 @@ final class WalletDatabase {
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
 
-        // Use real block time: current time for height=0 (pending), HeaderStore for confirmed
+        // Use real block time: current time for height=0 (pending), BlockTimestampManager/HeaderStore for confirmed
         // NEVER estimate - only use real blockchain timestamp!
         let actualBlockTime: UInt64?
         if height == 0 {
             // Pending transaction - use current time (will be updated when confirmed)
             actualBlockTime = UInt64(Date().timeIntervalSince1970)
+        } else if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+            actualBlockTime = UInt64(timestamp)
         } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
             actualBlockTime = UInt64(headerTime)
         } else {
@@ -2434,8 +2465,10 @@ final class WalletDatabase {
             let id = sqlite3_column_int64(selectStmt, 0)
             let height = UInt64(sqlite3_column_int64(selectStmt, 1))
 
-            // Get actual block time from HeaderStore
-            if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
+            // Get actual block time - try BlockTimestampManager first (bundled data), then HeaderStore
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+                updates.append((id: id, time: timestamp))
+            } else if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
                 updates.append((id: id, time: blockTime))
             }
         }
@@ -2635,9 +2668,11 @@ struct TransactionHistoryItem {
         txid.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Unique identifier for ForEach (combines txid + type to handle same txid with different types)
+    /// Unique identifier for ForEach - uses txid prefix + type + height + value
+    /// All components needed to distinguish transactions in the same block
     var uniqueId: String {
-        txidString + "_" + type.rawValue
+        let txidPrefix = txid.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(txidPrefix)_\(type.rawValue)_\(height)_\(value)"
     }
 
     /// Status display string
@@ -2688,10 +2723,10 @@ struct TransactionHistoryItem {
 
         // Final fallback: estimate based on block height
         // Zclassic has 2.5 minute block time (150 seconds)
-        // Reference: block 2931180 was mined around Dec 3, 2025 18:09 UTC
+        // Reference: block 2932265 was mined around Dec 4, 2025 17:00 UTC
         if height > 0 {
-            let referenceHeight: UInt64 = 2931180
-            let referenceTimestamp: TimeInterval = 1733249340 // Dec 3, 2025 18:09 UTC
+            let referenceHeight: UInt64 = 2932265
+            let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (CORRECT 2025 timestamp)
             let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
 
             let heightDiff = Int64(height) - Int64(referenceHeight)

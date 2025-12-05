@@ -8,6 +8,7 @@
 // When SQLCipher is not available, falls back to field-level encryption.
 
 import Foundation
+import LocalAuthentication
 // Note: sqlite3 functions are available via bridging header (SQLCipher)
 // Do NOT import SQLite3 here as it conflicts with SQLCipher's sqlite3.h
 import CryptoKit
@@ -17,25 +18,36 @@ import UIKit
 
 /// Manages SQLCipher database encryption
 /// Provides transparent encryption/decryption for the entire SQLite database
+///
+/// SECURITY (CRIT-001): Key derivation uses biometric-protected secret
+/// The encryption key cannot be derived without Face ID/Touch ID authentication
 final class SQLCipherManager {
     static let shared = SQLCipherManager()
 
     /// Whether SQLCipher is available (compiled with encryption support)
     private(set) var isSQLCipherAvailable: Bool = false
 
-    /// Cached encryption key (derived from Secure Enclave)
+    /// Cached encryption key (derived with biometric protection)
     private var encryptionKey: Data?
 
     /// Salt for key derivation (stored in keychain)
     private var salt: Data?
 
+    /// Biometric-protected secret (stored in keychain with LAContext)
+    /// SECURITY (CRIT-001): This secret requires biometric auth to access
+    private var biometricSecret: Data?
+
     /// Keychain identifiers
     private let keychainService = "com.zipherx.wallet.sqlcipher"
     private let saltKey = "sqlcipher-salt"
     private let keyVersionKey = "sqlcipher-key-version"
+    private let biometricSecretKey = "sqlcipher-biometric-secret"
 
     /// Current key version (for future key rotation)
-    private let currentKeyVersion: Int = 1
+    private let currentKeyVersion: Int = 2  // Bumped for biometric gate
+
+    /// Whether biometric secret is available (set after first successful auth)
+    private(set) var hasBiometricProtection: Bool = false
 
     private init() {
         // Check if SQLCipher is available by looking for cipher_version
@@ -45,6 +57,9 @@ final class SQLCipherManager {
         } else {
             print("⚠️ SQLCipher not available - using field-level encryption only")
         }
+
+        // Check if biometric protection is available
+        hasBiometricProtection = checkBiometricSecretExists()
     }
 
     // MARK: - SQLCipher Detection
@@ -74,10 +89,25 @@ final class SQLCipherManager {
         return false
     }
 
+    // MARK: - Biometric Protection Check
+
+    /// Check if biometric secret exists in keychain
+    private func checkBiometricSecretExists() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: biometricSecretKey,
+            kSecReturnData as String: false,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+    }
+
     // MARK: - Key Management
 
     /// Get or create the database encryption key
-    /// Key is derived from device ID + salt using HKDF-SHA256
+    /// SECURITY (CRIT-001): Key is derived from device ID + salt + biometric-protected secret
+    /// The biometric secret requires Face ID/Touch ID to access
     func getEncryptionKey() throws -> Data {
         if let key = encryptionKey {
             return key
@@ -89,8 +119,16 @@ final class SQLCipherManager {
         // Get device-specific identifier
         let deviceId = getDeviceIdentifier()
 
+        // SECURITY (CRIT-001): Get biometric-protected secret
+        // This adds an additional layer that requires biometric auth
+        let biometricData = try getOrCreateBiometricSecret()
+
+        // Combine all inputs: deviceId + biometricSecret
+        var combinedInput = Data(deviceId.utf8)
+        combinedInput.append(biometricData)
+
         // Derive 256-bit key using HKDF
-        let inputKey = SymmetricKey(data: Data(deviceId.utf8))
+        let inputKey = SymmetricKey(data: combinedInput)
         let derivedKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: inputKey,
             salt: salt,
@@ -103,6 +141,139 @@ final class SQLCipherManager {
         self.encryptionKey = keyData
 
         return keyData
+    }
+
+    /// Get encryption key with explicit biometric authentication
+    /// Call this when opening the database after app launch
+    func getEncryptionKeyWithAuth() async throws -> Data {
+        // If already cached, return immediately
+        if let key = encryptionKey {
+            return key
+        }
+
+        // Perform biometric authentication first
+        let context = LAContext()
+        context.localizedFallbackTitle = "Use Passcode"
+
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+            print("🔐 [CRIT-001] Biometric auth not available, using device ID only")
+            return try getEncryptionKey()
+        }
+
+        // This will trigger Face ID/Touch ID or passcode
+        do {
+            let success = try await context.evaluatePolicy(
+                .deviceOwnerAuthentication,
+                localizedReason: "Authenticate to access your wallet"
+            )
+            guard success else {
+                throw SQLCipherError.authenticationFailed
+            }
+        } catch {
+            print("🔐 [CRIT-001] Authentication failed: \(error)")
+            throw SQLCipherError.authenticationFailed
+        }
+
+        // Now get the key (biometric secret will be accessible)
+        return try getEncryptionKey()
+    }
+
+    /// Get or create biometric-protected secret
+    /// SECURITY (CRIT-001): Stored with LAContext requiring biometric auth
+    private func getOrCreateBiometricSecret() throws -> Data {
+        if let secret = self.biometricSecret {
+            return secret
+        }
+
+        // Try to load from keychain (requires biometric)
+        if let existingSecret = loadBiometricSecret() {
+            self.biometricSecret = existingSecret
+            self.hasBiometricProtection = true
+            return existingSecret
+        }
+
+        // Generate new random secret
+        var newSecret = Data(count: 32)
+        let result = newSecret.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!)
+        }
+
+        guard result == errSecSuccess else {
+            throw SQLCipherError.keyGenerationFailed
+        }
+
+        // Store with biometric protection
+        try saveBiometricSecret(newSecret)
+        self.biometricSecret = newSecret
+        self.hasBiometricProtection = true
+
+        print("🔐 [CRIT-001] Created biometric-protected secret")
+        return newSecret
+    }
+
+    /// Load biometric secret from keychain (may prompt for Face ID)
+    private func loadBiometricSecret() -> Data? {
+        // Create LAContext for biometric access
+        let context = LAContext()
+        context.localizedReason = "Access wallet encryption key"
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: biometricSecretKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: context
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess {
+            return result as? Data
+        } else if status == errSecUserCanceled || status == errSecAuthFailed {
+            print("🔐 [CRIT-001] Biometric authentication cancelled/failed")
+        }
+
+        return nil
+    }
+
+    /// Save biometric secret to keychain with LAContext protection
+    private func saveBiometricSecret(_ secret: Data) throws {
+        // Create access control requiring biometric auth
+        var error: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+            .userPresence,  // Requires Face ID/Touch ID or passcode
+            &error
+        ) else {
+            throw SQLCipherError.keychainError
+        }
+
+        // Delete existing if any
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: biometricSecretKey
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add with biometric protection
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: biometricSecretKey,
+            kSecValueData as String: secret,
+            kSecAttrAccessControl as String: accessControl
+        ]
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            print("🔐 [CRIT-001] Failed to save biometric secret: \(status)")
+            throw SQLCipherError.keychainError
+        }
     }
 
     /// Get the encryption key as a hex string (for PRAGMA key)
@@ -356,6 +527,7 @@ enum SQLCipherError: Error, LocalizedError {
     case encryptionFailed(String)
     case migrationFailed(String)
     case keychainError
+    case authenticationFailed  // CRIT-001: Biometric auth required
 
     var errorDescription: String? {
         switch self {
@@ -369,6 +541,8 @@ enum SQLCipherError: Error, LocalizedError {
             return "Migration failed: \(msg)"
         case .keychainError:
             return "Keychain operation failed"
+        case .authenticationFailed:
+            return "Authentication required to access wallet"
         }
     }
 }

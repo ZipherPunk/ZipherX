@@ -325,6 +325,102 @@ If tree root doesn't match chain's `finalsaplingroot`:
 
 ---
 
+## GitHub Commitment Tree Updates (December 2025)
+
+### Overview
+
+The app can download updated commitment trees from GitHub to reduce sync time. This allows users to benefit from newer tree data without requiring an app update.
+
+### Repository Structure
+
+The ZipherX_Boost public repository (`https://github.com/VictorLux/ZipherX_Boost`) contains:
+
+| File | Size | Purpose |
+|------|------|---------|
+| `commitment_tree.bin` | ~33 MB | Full CMU file for position lookups |
+| `commitment_tree.bin.zst` | ~33 MB | Compressed CMU file (zstd) |
+| `commitment_tree_serialized.bin` | ~574 bytes | Serialized tree frontier (instant load) |
+| `commitment_tree_manifest.json` | ~800 bytes | Metadata (height, CMU count, checksums) |
+
+### File Differences
+
+**commitment_tree.bin (CMU file)**:
+- Contains: `[count: UInt64][cmu1: 32 bytes][cmu2: 32 bytes]...`
+- Required for: Imported wallets (position lookup for nullifier computation)
+- Size: ~33 MB (32 bytes × 1M+ CMUs + 8 byte header)
+
+**commitment_tree_serialized.bin (Serialized tree)**:
+- Contains: Merkle frontier only (tree state without individual CMUs)
+- Used for: New wallets (instant tree loading, no position lookup needed)
+- Size: ~574 bytes (just the frontier hashes)
+
+### When Each File is Used
+
+| Scenario | File Used | Reason |
+|----------|-----------|--------|
+| New wallet (first launch) | Serialized (~574 bytes) | No historical notes to find |
+| Imported wallet (private key) | CMU file (~33 MB) | Need CMU positions for nullifier computation |
+| Subsequent launches | Database cache | Tree state saved to SQLite |
+
+### Publishing Updated Tree
+
+Run the publish script after zclassicd syncs new blocks:
+
+```bash
+cd /Users/chris/ZipherX/Tools
+python3 publish_commitment_tree.py
+
+# Options:
+#   --no-push    Don't push to git (local test only)
+#   --full       Export full tree from Sapling activation (slow, ~20 min)
+```
+
+The script:
+1. Reads existing tree from ZipherX_Boost
+2. Fetches new CMUs from local zcashd node
+3. Verifies tree root matches `finalsaplingroot`
+4. Generates all 4 files (CMU, compressed, serialized, manifest)
+5. Commits and pushes to GitHub
+
+### App Integration
+
+**CommitmentTreeUpdater.swift** handles downloading:
+- Checks manifest for newer tree on GitHub
+- For new wallets: Downloads serialized tree (~574 bytes, instant)
+- For imported wallets: Downloads CMU file (~33 MB)
+- Verifies SHA256 checksums
+- Saves to `Documents/TreeCache/`
+
+**FilterScanner.swift** uses downloaded data:
+- Prefers downloaded CMU file over bundled
+- Falls back to bundled if download unavailable
+- Uses `cmuDataForPositionLookup` for nullifier computation
+
+**ZipherXConstants.swift** tracks effective height:
+- `effectiveTreeHeight` returns downloaded or bundled height
+- `effectiveTreeCMUCount` returns downloaded or bundled count
+- Stored in UserDefaults when downloaded
+
+### Example Manifest
+
+```json
+{
+  "version": 3,
+  "created_at": "2025-12-04T15:18:47+00:00",
+  "height": 2932223,
+  "cmu_count": 1042367,
+  "block_hash": "0000027415df6fd835ba7d5b1200235358f63be577b9fb83f84376c7dc51e077",
+  "tree_root": "318351c2e5e5d47e1f92ba4eb27e989f6835de678a8602e1d27a65b2eeafb9ec",
+  "files": {
+    "uncompressed": { "name": "commitment_tree.bin", "sha256": "..." },
+    "compressed": { "name": "commitment_tree.bin.zst", "sha256": "..." },
+    "serialized": { "name": "commitment_tree_serialized.bin", "sha256": "..." }
+  }
+}
+```
+
+---
+
 ## Two-Phase Scanning Architecture
 
 ### Problem Solved
@@ -3116,6 +3212,239 @@ int sqlite3_prepare_v2(...);
 - 4 High (P1): ✅ All fixed
 - 12 Medium (P2): ✅ All fixed
 - 8 Low (P3): ✅ All fixed
+
+---
+
+### 55. Rayon Parallel Note Decryption (December 4, 2025)
+
+**Feature**: 6.7x faster note decryption using Rayon work-stealing thread pool.
+
+**Problem**: Sequential note decryption was slow for imported wallets scanning historical blocks. Each `tryDecryptNoteWithSK()` call takes ~74μs, and scanning 2.4M blocks with ~1M shielded outputs took too long.
+
+**Solution**: Batch parallel decryption using Rayon in Rust FFI.
+
+**Benchmark Results** (10,000 outputs on M1 Mac):
+| Method | Time | Speedup |
+|--------|------|---------|
+| Sequential | 744ms | 1x |
+| Rayon Parallel | 112ms | **6.7x** |
+
+**New FFI Functions** (`lib.rs`):
+```rust
+// Batch decrypt multiple shielded outputs in parallel
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
+    sk: *const u8,           // 169-byte spending key
+    outputs_data: *const u8, // Packed outputs (644 bytes each)
+    output_count: usize,
+    height: u64,
+    results: *mut u8,        // Results buffer (564 bytes each)
+) -> usize;                  // Returns count of decrypted notes
+
+// Get number of Rayon worker threads
+#[no_mangle]
+pub extern "C" fn zipherx_get_rayon_threads() -> usize;
+```
+
+**Data Format**:
+- Input per output (644 bytes): `epk(32) + cmu(32) + ciphertext(580)`
+- Output per result (564 bytes): `found(1) + diversifier(11) + value(8) + rcm(32) + memo(512)`
+
+**Swift Integration** (`ZipherXFFI.swift`):
+```swift
+struct FFIShieldedOutput {
+    let epk: Data      // 32 bytes (wire format)
+    let cmu: Data      // 32 bytes (wire format)
+    let ciphertext: Data // 580 bytes
+}
+
+struct FFIDecryptedNote {
+    let diversifier: Data  // 11 bytes
+    let value: UInt64
+    let rcm: Data         // 32 bytes
+    let memo: Data        // 512 bytes
+}
+
+static func tryDecryptNotesParallel(
+    spendingKey: Data,
+    outputs: [FFIShieldedOutput],
+    height: UInt64
+) -> [FFIDecryptedNote?]
+```
+
+**FilterScanner Integration**:
+- `processBlocksBatchParallel()` - New batch processing function
+- PHASE 1 now uses parallel decryption for imported wallet scans
+- Quick scan mode also uses parallel decryption
+- Batch size increased to 500 blocks to maximize Rayon efficiency
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Rayon parallel decryption
+- `Libraries/zipherx-ffi/Cargo.toml` - Added `rayon = "1.10"`
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - C header declarations
+- `Sources/ZipherX-Bridging-Header.h` - Swift bridging declarations
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrapper with structs
+- `Sources/Core/Network/FilterScanner.swift` - Batch parallel processing
+
+---
+
+### 56. GitHub CMU File Download for Imported Wallets (December 4, 2025)
+
+**Feature**: Automatic download of full CMU file from GitHub for imported wallet scanning.
+
+**Problem**: Imported wallets need the full CMU file (~33 MB) for position lookup during PHASE 1 parallel scanning. The serialized tree (574 bytes) only contains the frontier, not individual CMU positions.
+
+**Solution**: Download full CMU file from GitHub if newer than bundled.
+
+**Download URLs** (ZipherX_Boost repo):
+- Manifest: `https://raw.githubusercontent.com/.../manifest.json`
+- CMU File: `https://raw.githubusercontent.com/.../commitment_tree.bin`
+- Serialized: `https://raw.githubusercontent.com/.../commitment_tree_serialized.bin`
+
+**CommitmentTreeUpdater Functions**:
+```swift
+// Download full CMU file for imported wallets (with progress)
+func getCMUFileForImportedWallet(
+    onProgress: ((Double, String) -> Void)?
+) async throws -> (URL, UInt64, UInt64)?
+
+// Check for cached CMU file
+func getCachedCMUFilePath() -> URL?
+func getCachedTreeInfo() -> (height: UInt64, cmuCount: UInt64)?
+func hasCachedCMUFile() -> Bool
+```
+
+**FilterScanner Integration**:
+- For imported wallets, checks GitHub before scanning
+- Downloads CMU file if newer than bundled (height comparison)
+- PHASE 1 end height dynamically set to downloaded CMU height
+- Falls back to bundled CMU file if download fails
+
+**Flow**:
+```
+Imported Wallet Scan:
+1. Check GitHub manifest for latest CMU file height
+2. If height > bundled → download full CMU file (33 MB)
+3. PHASE 1: Scan up to downloaded height with parallel decryption
+4. PHASE 2: Sequential scan for remaining blocks
+```
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - CMU download functions
+- `Sources/Core/Network/FilterScanner.swift` - GitHub download integration
+
+---
+
+### 57. P2P Race Condition Fix + Phase-Aware Progress (December 5, 2025)
+
+**Problem 1**: P2P block fetching was failing 100% of the time, falling back to InsightAPI for every batch.
+
+**Root Cause**: Race condition - when P2P fetch started, all peers were still reconnecting after handshake failure. The `isConnectionReady` check returned `false` for all peers.
+
+**Evidence from log**:
+```
+[04:58:59.070] 🔄 [185.205.246.161] Handshake failed, reconnecting...
+[04:59:08.023] ⚠️ P2P batch failed, using InsightAPI fallback...
+```
+
+Only 40ms between reconnection start and P2P fetch - not enough time for reconnection to complete.
+
+**Solution**: Added peer reconnection attempt before failing:
+```swift
+func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> ... {
+    var availablePeers = peers.filter { $0.isConnectionReady }
+
+    if availablePeers.isEmpty && !peers.isEmpty {
+        print("⏳ P2P: No ready peers, attempting reconnection...")
+        // Try to reconnect up to 3 peers in parallel
+        await withTaskGroup(of: Void.self) { group in
+            for peer in Array(peers.prefix(3)) {
+                group.addTask { try? await peer.ensureConnected() }
+            }
+        }
+        availablePeers = peers.filter { $0.isConnectionReady }
+    }
+    // ... continue with P2P fetch
+}
+```
+
+**Problem 2**: Progress bar didn't reflect different sync phases.
+
+**Solution**: Added phase-aware progress reporting:
+
+| Phase | Progress Range | Description |
+|-------|---------------|-------------|
+| PHASE 1 | 0% - 40% | Parallel note decryption (Rayon) |
+| PHASE 1.5 | 40% - 55% | Merkle witness computation |
+| PHASE 1.6 | 55% - 60% | Spent note detection |
+| PHASE 2 | 60% - 100% | Sequential tree building |
+
+**New callbacks**:
+- `onStatusUpdate: ((String, String) -> Void)?` - Phase transitions with status messages
+- `reportPhase1Progress()`, `reportPhase15Progress()`, `reportPhase16Progress()`, `reportPhase2Progress()` - Helper functions
+
+**UI Changes**:
+- Phase emoji in task detail: ⚡ (phase1), 🌲 (phase1.5), 🔍 (phase1.6), 📦 (phase2)
+- `syncPhase` published property for UI to react to phase changes
+- Status messages update based on current phase
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - P2P reconnection before fetch, better debug logging
+- `Sources/Core/Network/FilterScanner.swift` - Phase-aware progress helpers, status callbacks
+- `Sources/Core/Wallet/WalletManager.swift` - `syncPhase` property, status update callback
+
+---
+
+### 58. Parallel Witness Computation (December 5, 2025)
+
+**Feature**: Added Rayon parallel witness computation via `zipherx_tree_create_witnesses_parallel()`.
+
+**Performance**:
+- Before: 115.8s (sequential batch)
+- After: 77.8s (Rayon parallel)
+- Improvement: **33% faster**
+
+**Why only 33% (not 3-8x)?**
+All 9 notes are at similar positions near the end of the 1M+ CMU tree. Each thread still builds almost the entire tree. True parallelization benefits would appear if notes were spread across different positions.
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - `zipherx_tree_create_witnesses_parallel()`
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - C header declaration
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrapper
+- `Sources/Core/Network/FilterScanner.swift` - Uses parallel function
+
+---
+
+### 59. PHASE 2 Start Height Fix + Batch CMU Append (December 5, 2025)
+
+**Problem**: PHASE 2 was scanning ~7500 blocks unnecessarily, taking 4+ minutes.
+
+**Root Cause**: PHASE 2 started from `bundledTreeHeight + 1` (2926123) instead of using the GitHub CMU file height (2932456). This caused re-scanning of 6300+ blocks that were already covered by the downloaded CMU data.
+
+**Fix Applied** (FilterScanner.swift:633):
+```swift
+// OLD (wrong): currentHeight = bundledTreeHeight + 1
+// NEW (correct): currentHeight = phase1EndHeight + 1
+```
+
+`phase1EndHeight` is set to `cmuDataHeight` (from GitHub) when available, or falls back to `bundledTreeHeight`.
+
+**New FFI Function**: Added `zipherx_tree_append_batch()` for faster tree building:
+- Appends multiple CMUs with a single lock acquisition
+- Reduces FFI call overhead and lock contention
+
+**Performance Improvement**:
+| Phase | Before | After |
+|-------|--------|-------|
+| PHASE 2 | 248s (~7500 blocks) | ~40s (~1150 blocks) |
+| **Total sync** | **~6.3 min** | **~3 min** |
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Fixed PHASE 2 start height
+- `Libraries/zipherx-ffi/src/lib.rs` - Added `zipherx_tree_append_batch()`
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - C header declaration
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrapper `treeAppendBatch()`
+- `Sources/ZipherX-Bridging-Header.h` - Bridging declaration
 
 ---
 

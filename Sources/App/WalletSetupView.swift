@@ -22,6 +22,19 @@ struct WalletSetupView: View {
     @State private var showPrivateKeyInput = false  // Hidden by default
     @State private var showMnemonicInput = false  // Hidden by default for restore
 
+    /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
+    // Scan options for imported wallets
+    @State private var showScanOptions = false
+    @State private var scanOptionSelected: ScanOption = .fullScan
+    @State private var customScanDate: Date = Date()
+    @State private var pendingImportAction: (() -> Void)? = nil  // Action to execute after scan option selected
+
+    enum ScanOption {
+        case fullScan
+        case fromDate
+    }
+    */
+
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
@@ -157,6 +170,15 @@ struct WalletSetupView: View {
                 .frame(minWidth: 550, idealWidth: 600, minHeight: 650, idealHeight: 750)
                 #endif
         }
+        /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
+        .sheet(isPresented: $showScanOptions) {
+            scanOptionsView
+                .environmentObject(themeManager)
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 550, minHeight: 550, idealHeight: 600)
+                #endif
+        }
+        */
         .alert("Error", isPresented: $showError) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -397,9 +419,9 @@ struct WalletSetupView: View {
                         )
 
                         warningSection(
-                            title: "HISTORICAL SCAN",
+                            title: "FULL BLOCKCHAIN SCAN",
                             icon: "clock.arrow.circlepath",
-                            content: "Finding old transactions requires scanning blockchain history. Quick scan: 2-5 min. Full scan: 30-60 min."
+                            content: "ZipherX will scan the entire blockchain to find your transactions. This takes approximately 2-5 minutes."
                         )
 
                         warningSection(
@@ -408,17 +430,17 @@ struct WalletSetupView: View {
                             content: "Never import keys from untrusted sources. Anyone with your key can spend your funds."
                         )
 
-                        // Fast start info
+                        // Parallel scanning info
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Image(systemName: "bolt.fill")
                                     .foregroundColor(theme.primaryColor)
-                                Text("FAST START")
+                                Text("PARALLEL SCANNING")
                                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                                     .foregroundColor(theme.textPrimary)
                             }
 
-                            Text("ZipherX scans recent blocks by default. Use Settings → Quick Scan for older notes.")
+                            Text("ZipherX uses parallel note decryption and pre-built commitment trees for fast imports.")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.textSecondary)
                         }
@@ -488,6 +510,230 @@ struct WalletSetupView: View {
                 .stroke(theme.warningColor.opacity(0.3), lineWidth: 1)
         )
     }
+
+    /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
+    // MARK: - Scan Options View
+
+    private var scanOptionsView: some View {
+        ZStack {
+            theme.backgroundColor.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Header
+                VStack(spacing: 16) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 56))
+                        .foregroundColor(theme.primaryColor)
+
+                    Text("SCAN OPTIONS")
+                        .font(.system(size: 20, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Choose how far back to scan for your notes")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 32)
+                .padding(.horizontal)
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        // Option 1: Full Scan
+                        scanOptionButton(
+                            title: "FULL HISTORICAL SCAN",
+                            subtitle: "From Sapling activation (Nov 2016)",
+                            duration: WalletManager.estimatedScanDuration(from: 476_969),
+                            icon: "clock.fill",
+                            isSelected: scanOptionSelected == .fullScan,
+                            action: { scanOptionSelected = .fullScan }
+                        )
+
+                        // Option 2: From Date
+                        VStack(spacing: 12) {
+                            scanOptionButton(
+                                title: "SCAN FROM DATE",
+                                subtitle: "Faster if you know when you first received ZCL",
+                                duration: scanOptionSelected == .fromDate
+                                    ? WalletManager.estimatedScanDuration(from: WalletManager.blockHeightForDate(customScanDate))
+                                    : nil,
+                                icon: "calendar",
+                                isSelected: scanOptionSelected == .fromDate,
+                                action: { scanOptionSelected = .fromDate }
+                            )
+
+                            // Date picker (only shown when fromDate is selected)
+                            if scanOptionSelected == .fromDate {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text("Select the earliest date you may have received ZCL:")
+                                        .font(theme.captionFont)
+                                        .foregroundColor(theme.textSecondary)
+
+                                    // Compact date picker - tap to open calendar, auto-closes on selection
+                                    HStack {
+                                        DatePicker(
+                                            "Start Date",
+                                            selection: $customScanDate,
+                                            in: WalletManager.saplingActivationDate...Date(),
+                                            displayedComponents: .date
+                                        )
+                                        .datePickerStyle(.compact)
+                                        .labelsHidden()
+                                        .accentColor(theme.primaryColor)
+                                        .colorScheme(.dark)  // Force dark mode for better contrast
+
+                                        Spacer()
+                                    }
+                                    .padding(12)
+                                    .background(Color.black.opacity(0.4))
+                                    .cornerRadius(8)
+
+                                    // Show estimated block height with brighter colors
+                                    let estimatedHeight = WalletManager.blockHeightForDate(customScanDate)
+                                    HStack {
+                                        Text("≈ Block")
+                                            .font(.system(size: 12, design: .monospaced))
+                                            .foregroundColor(theme.textPrimary)
+                                        Text("\(estimatedHeight.formatted())")
+                                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                            .foregroundColor(theme.primaryColor)
+
+                                        Spacer()
+
+                                        // Show estimated duration for this date
+                                        Text(WalletManager.estimatedScanDuration(from: estimatedHeight))
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(theme.primaryColor.opacity(0.8))
+                                    }
+                                }
+                                .padding()
+                                .background(theme.surfaceColor)
+                                .cornerRadius(theme.cornerRadius)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                        .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                                )
+                            }
+                        }
+
+                        // Info box
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Image(systemName: "info.circle.fill")
+                                    .foregroundColor(theme.primaryColor)
+                                Text("NOTE")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.textPrimary)
+                            }
+
+                            Text("If you scan from a date AFTER your first transaction, those early notes won't be found. When in doubt, use Full Scan.")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        .padding()
+                        .background(theme.primaryColor.opacity(0.1))
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .padding()
+                }
+
+                // Action buttons
+                VStack(spacing: 12) {
+                    Button(action: {
+                        // Set the scan start height based on selection
+                        if scanOptionSelected == .fullScan {
+                            walletManager.importScanStartHeight = nil  // Full scan
+                        } else {
+                            walletManager.importScanStartHeight = WalletManager.blockHeightForDate(customScanDate)
+                        }
+
+                        showScanOptions = false
+
+                        // Execute the pending import action
+                        if let action = pendingImportAction {
+                            action()
+                            pendingImportAction = nil
+                        }
+                    }) {
+                        HStack {
+                            Image(systemName: "play.fill")
+                            Text("START SCAN")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.backgroundColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(theme.primaryColor)
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: {
+                        showScanOptions = false
+                        pendingImportAction = nil
+                    }) {
+                        Text("Cancel")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding(24)
+                .background(theme.surfaceColor)
+            }
+        }
+    }
+
+    private func scanOptionButton(title: String, subtitle: String, duration: String?, icon: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 16) {
+                // Radio button
+                Circle()
+                    .stroke(isSelected ? theme.primaryColor : theme.borderColor, lineWidth: 2)
+                    .frame(width: 24, height: 24)
+                    .overlay(
+                        Circle()
+                            .fill(isSelected ? theme.primaryColor : Color.clear)
+                            .frame(width: 14, height: 14)
+                    )
+
+                // Icon
+                Image(systemName: icon)
+                    .font(.system(size: 24))
+                    .foregroundColor(isSelected ? theme.primaryColor : theme.textSecondary)
+                    .frame(width: 32)
+
+                // Text
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundColor(isSelected ? theme.textPrimary : theme.textSecondary)
+
+                    Text(subtitle)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let duration = duration {
+                        Text("Est. time: \(duration)")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.primaryColor)
+                    }
+                }
+
+                Spacer()
+            }
+            .padding()
+            .background(isSelected ? theme.primaryColor.opacity(0.1) : theme.surfaceColor)
+            .cornerRadius(theme.cornerRadius)
+            .overlay(
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(isSelected ? theme.primaryColor : theme.borderColor, lineWidth: isSelected ? 2 : 1)
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+    */
 
     // MARK: - Import Key View
 
@@ -1034,50 +1280,61 @@ struct WalletSetupView: View {
     }
 
     private func importPrivateKey() {
+        // Close import sheet and start full scan immediately (fast with parallel decryption)
+        let keyToImport = privateKeyInput
+        showImportKey = false
+
+        // Set full scan mode (nil = scan from Sapling activation)
+        walletManager.importScanStartHeight = nil
+
         isProcessing = true
 
         Task {
             do {
-                try walletManager.importSpendingKey(privateKeyInput)
+                try self.walletManager.importSpendingKey(keyToImport)
 
                 await MainActor.run {
-                    showImportKey = false
-                    privateKeyInput = ""
-                    isProcessing = false
+                    self.privateKeyInput = ""
+                    self.isProcessing = false
                 }
             } catch {
                 await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showError = true
-                    isProcessing = false
+                    self.errorMessage = error.localizedDescription
+                    self.showError = true
+                    self.isProcessing = false
                 }
             }
         }
     }
 
     private func restoreFromMnemonic() {
-        isProcessing = true
-
         // Clean up words (trim whitespace, lowercase)
         let cleanedWords = mnemonicInputWords.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
 
+        // Close restore sheet and start full scan immediately (fast with parallel decryption)
+        showRestoreMnemonic = false
+        showMnemonicInput = false
+
+        // Set full scan mode (nil = scan from Sapling activation)
+        walletManager.importScanStartHeight = nil
+
+        isProcessing = true
+
         Task {
             do {
-                try walletManager.restoreWallet(from: cleanedWords)
+                try self.walletManager.restoreWallet(from: cleanedWords)
 
                 await MainActor.run {
-                    showRestoreMnemonic = false
-                    showMnemonicInput = false
-                    mnemonicInputWords = Array(repeating: "", count: 24)
-                    isProcessing = false
+                    self.mnemonicInputWords = Array(repeating: "", count: 24)
+                    self.isProcessing = false
                 }
             } catch {
                 await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showError = true
-                    isProcessing = false
+                    self.errorMessage = error.localizedDescription
+                    self.showError = true
+                    self.isProcessing = false
                 }
             }
         }

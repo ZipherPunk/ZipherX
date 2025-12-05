@@ -1,6 +1,6 @@
 name: ZipherX
 options:
-  bundleIdPrefix: com.zipherx
+  bundleIdPrefix: com.zipherpunk
   deploymentTarget:
     iOS: "15.0"
     macOS: "12.0"
@@ -11,7 +11,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     ENABLE_BITCODE: false
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: "5MW334LMXL"
 
 targets:
   # iOS Target
@@ -32,6 +32,8 @@ targets:
         buildPhase: resources
       - path: Resources/sapling-output.params
         buildPhase: resources
+      # block_timestamps.bin is NOT bundled (~12 MB) - downloaded from GitHub on first sync
+      # shielded_outputs.bin is NOT bundled (585 MB) - downloaded from GitHub on first sync
     info:
       path: Info.plist
       properties:
@@ -44,9 +46,10 @@ targets:
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
         UIBackgroundModes:
           - fetch
+        ITSAppUsesNonExemptEncryption: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx
         INFOPLIST_FILE: Info.plist
         CODE_SIGN_ENTITLEMENTS: ZipherX.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -69,7 +72,7 @@ targets:
       path: ZipherX.entitlements
       properties:
         keychain-access-groups:
-          - $(AppIdentifierPrefix)com.zipherx.wallet
+          - $(AppIdentifierPrefix)com.zipherpunk.zipherx
         com.apple.developer.default-data-protection: NSFileProtectionComplete
 
   # macOS Target
@@ -90,6 +93,8 @@ targets:
         buildPhase: resources
       - path: Resources/sapling-output.params
         buildPhase: resources
+      # block_timestamps.bin is NOT bundled (~12 MB) - downloaded from GitHub on first sync
+      # shielded_outputs.bin is NOT bundled (585 MB) - downloaded from GitHub on first sync
     info:
       path: Info-macOS.plist
       properties:
@@ -100,9 +105,10 @@ targets:
         LSMinimumSystemVersion: "12.0"
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
         NSHumanReadableCopyright: "Copyright © 2025 ZipherX. All rights reserved."
+        ITSAppUsesNonExemptEncryption: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet.mac
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx.mac
         INFOPLIST_FILE: Info-macOS.plist
         CODE_SIGN_ENTITLEMENTS: ZipherXMac.entitlements
         # Bridging header for Rust FFI
@@ -128,7 +134,7 @@ targets:
         com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         keychain-access-groups:
-          - $(AppIdentifierPrefix)com.zipherx.wallet.mac
+          - $(AppIdentifierPrefix)com.zipherpunk.zipherx.mac
 
   ZipherXTests:
     type: bundle.unit-test
@@ -141,7 +147,7 @@ targets:
       - target: ZipherX
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.zipherx.wallet.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx.tests
 
 schemes:
   ZipherX:

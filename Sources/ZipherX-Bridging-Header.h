@@ -191,6 +191,28 @@ size_t zipherx_try_decrypt_note_with_sk(const uint8_t *sk,
                                          uint8_t *output);
 
 // =============================================================================
+// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
+// =============================================================================
+
+/// Batch decrypt multiple shielded outputs in parallel using Rayon
+/// Input format (per output, 644 bytes): epk(32) + cmu(32) + ciphertext(580)
+/// Output format (per output, 564 bytes): found(1) + diversifier(11) + value(8) + rcm(32) + memo(512)
+/// @param sk 169-byte spending key
+/// @param outputs_data Packed array of outputs (644 bytes each)
+/// @param output_count Number of outputs to process
+/// @param height Block height for version byte validation
+/// @param results Output buffer (564 bytes per output)
+/// @return Number of successfully decrypted notes
+size_t zipherx_try_decrypt_notes_parallel(const uint8_t *sk,
+                                           const uint8_t *outputs_data,
+                                           size_t output_count,
+                                           uint64_t height,
+                                           uint8_t *results);
+
+/// Get the number of CPU threads Rayon will use for parallel decryption
+size_t zipherx_get_rayon_threads(void);
+
+// =============================================================================
 // Utility Functions
 // =============================================================================
 
@@ -360,6 +382,12 @@ bool zipherx_tree_init(void);
 /// @return Position of the added commitment, or UINT64_MAX on error
 uint64_t zipherx_tree_append(const uint8_t *cmu);
 
+/// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
+/// @param cmus_data Packed CMU data (32 bytes per CMU, in wire format)
+/// @param cmu_count Number of CMUs to append
+/// @return Starting position of the first CMU, or UINT64_MAX on error
+uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);
+
 /// Create a witness for the current position
 /// @return Witness index, or UINT64_MAX on error
 uint64_t zipherx_tree_witness_current(void);
@@ -443,6 +471,45 @@ uint64_t zipherx_find_cmu_position(
     const uint8_t *cmu_data,
     size_t cmu_data_len,
     const uint8_t *target_cmu
+);
+
+/// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+/// Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+/// because it only builds the tree ONCE instead of N times.
+///
+/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param target_cmus Array of 32-byte CMUs to create witnesses for
+/// @param target_count Number of target CMUs
+/// @param positions_out Output array for positions (u64 * target_count)
+/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
+/// @return Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_batch(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmus,
+    size_t target_count,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
+/// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
+/// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+/// Each witness gets its own thread building tree to that position.
+/// @param target_cmus Array of 32-byte CMUs to create witnesses for
+/// @param target_count Number of target CMUs
+/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
+/// @param cmu_data_len Length of CMU data
+/// @param positions_out Output array for positions (u64 * target_count)
+/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
+/// @return Number of witnesses successfully created
+size_t zipherx_tree_create_witnesses_parallel(
+    const uint8_t *target_cmus,
+    size_t target_count,
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out
 );
 
 // =============================================================================

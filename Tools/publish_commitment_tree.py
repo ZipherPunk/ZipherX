@@ -48,12 +48,14 @@ MAX_WORKERS = 10
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
-RESOURCES_DIR = PROJECT_ROOT / "Resources"
-TREE_FILE = RESOURCES_DIR / "commitment_tree.bin"
-COMPRESSED_FILE = RESOURCES_DIR / "commitment_tree.bin.zst"
-SERIALIZED_FILE = RESOURCES_DIR / "commitment_tree_serialized.bin"
-MANIFEST_FILE = RESOURCES_DIR / "commitment_tree_manifest.json"
 FFI_DIR = PROJECT_ROOT / "Libraries" / "zipherx-ffi"
+
+# Output to ZipherX_Boost public repo (not private ZipherX repo)
+BOOST_REPO = Path.home() / "ZipherX_Boost"
+TREE_FILE = BOOST_REPO / "commitment_tree.bin"
+COMPRESSED_FILE = BOOST_REPO / "commitment_tree.bin.zst"
+SERIALIZED_FILE = BOOST_REPO / "commitment_tree_serialized.bin"
+MANIFEST_FILE = BOOST_REPO / "commitment_tree_manifest.json"
 
 # These will be read from the manifest file (if exists) or use defaults
 # The defaults match the original bundled tree shipped with app v1.0
@@ -503,10 +505,10 @@ def generate_serialized_tree(tree_path, output_path):
 
     return True
 
-def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, compressed_checksum):
+def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, compressed_checksum, serialized_checksum=None):
     """Create manifest.json with tree metadata"""
     manifest = {
-        "version": 2,
+        "version": 3,  # Version 3 adds serialized tree
         "created_at": datetime.now(timezone.utc).isoformat(),
         "height": height,
         "cmu_count": cmu_count,
@@ -526,6 +528,14 @@ def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, com
         }
     }
 
+    # Add serialized tree info if available (for instant loading)
+    if serialized_checksum and SERIALIZED_FILE.exists():
+        manifest["files"]["serialized"] = {
+            "name": "commitment_tree_serialized.bin",
+            "size": SERIALIZED_FILE.stat().st_size,
+            "sha256": serialized_checksum
+        }
+
     with open(MANIFEST_FILE, 'w') as f:
         json.dump(manifest, f, indent=2)
 
@@ -533,47 +543,32 @@ def create_manifest(height, cmu_count, block_hash, tree_root, tree_checksum, com
     return manifest
 
 def git_commit_push_and_merge(height, cmu_count, tree_root, no_push=False):
-    """Commit, push, and merge to main branch"""
-    print(f"\n📤 Git workflow starting...")
+    """Commit and push to ZipherX_Boost public repository"""
+    print(f"\n📤 Git workflow starting (ZipherX_Boost)...")
 
-    os.chdir(PROJECT_ROOT)
-
-    # Get current branch (using rev-parse for older git compatibility)
-    result = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
-    current_branch = result.stdout.strip()
-    print(f"   Current branch: {current_branch}")
-
-    # Fetch latest from remote
-    print("   Fetching from remote...")
-    subprocess.run(["git", "fetch", "origin"], capture_output=True)
-
-    # Pull latest changes for current branch
-    print(f"   Pulling latest {current_branch}...")
-    result = subprocess.run(["git", "pull", "origin", current_branch], capture_output=True, text=True)
-    if result.returncode != 0 and "Already up to date" not in result.stdout:
-        print(f"   ⚠️ Pull warning: {result.stderr}")
+    os.chdir(BOOST_REPO)
 
     # Check if there are changes to commit
-    result = subprocess.run(["git", "status", "--porcelain", "Resources/"], capture_output=True, text=True)
+    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
     if not result.stdout.strip():
         print("   ℹ️ No changes to commit (tree already up to date)")
-        # Still try to merge to main if branches differ
-    else:
-        # Add files
-        files_to_add = [
-            "Resources/commitment_tree.bin",
-            "Resources/commitment_tree.bin.zst",
-            "Resources/commitment_tree_serialized.bin",
-            "Resources/commitment_tree_manifest.json"
-        ]
+        return True
 
-        for f in files_to_add:
-            file_path = PROJECT_ROOT / f
-            if file_path.exists():
-                subprocess.run(["git", "add", f], check=True)
+    # Add files
+    files_to_add = [
+        "commitment_tree.bin",
+        "commitment_tree.bin.zst",
+        "commitment_tree_serialized.bin",
+        "commitment_tree_manifest.json"
+    ]
 
-        # Create detailed commit message
-        commit_msg = f"""Update commitment tree to height {height:,}
+    for f in files_to_add:
+        file_path = BOOST_REPO / f
+        if file_path.exists():
+            subprocess.run(["git", "add", f], check=True)
+
+    # Create detailed commit message
+    commit_msg = f"""Update commitment tree to height {height:,}
 
 Tree Statistics:
 - Height: {height:,}
@@ -581,93 +576,41 @@ Tree Statistics:
 - Tree Root: {tree_root}
 
 Files updated:
-- commitment_tree.bin (raw CMUs for download)
-- commitment_tree.bin.zst (compressed for GitHub)
-- commitment_tree_serialized.bin (instant load for app bundle)
+- commitment_tree.bin (raw CMUs)
+- commitment_tree.bin.zst (compressed)
+- commitment_tree_serialized.bin (instant load)
 - commitment_tree_manifest.json (metadata)
 
 🤖 Generated with publish_commitment_tree.py"""
 
-        result = subprocess.run(
-            ["git", "commit", "-m", commit_msg],
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            if "nothing to commit" not in result.stdout and "nothing to commit" not in result.stderr:
-                print(f"   ⚠️ Commit failed: {result.stderr}")
-                return False
-
-        print(f"   ✅ Committed to {current_branch}")
-
-    if no_push:
-        print("   ⏭️ Skipping push and merge (--no-push flag)")
-        return True
-
-    # Push current branch
-    print(f"   Pushing {current_branch} to remote...")
-    result = subprocess.run(["git", "push", "origin", current_branch], capture_output=True, text=True)
-
-    if result.returncode != 0:
-        print(f"   ⚠️ Push failed: {result.stderr}")
-        print(f"   You can manually push with: git push")
-        return False
-
-    print(f"   ✅ Pushed {current_branch} to remote")
-
-    # Merge to main branch (detect main vs master)
-    # Check which branch exists
-    result = subprocess.run(["git", "branch", "--list", "main"], capture_output=True, text=True)
-    main_branch = "main" if result.stdout.strip() else "master"
-    if current_branch == main_branch:
-        print(f"   ✅ Already on {main_branch}, no merge needed")
-        return True
-
-    print(f"\n🔀 Merging {current_branch} → {main_branch}...")
-
-    # Checkout main
-    result = subprocess.run(["git", "checkout", main_branch], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"   ⚠️ Could not checkout {main_branch}: {result.stderr}")
-        # Go back to original branch
-        subprocess.run(["git", "checkout", current_branch], capture_output=True)
-        return False
-
-    # Pull latest main
-    print(f"   Pulling latest {main_branch}...")
-    subprocess.run(["git", "pull", "origin", main_branch], capture_output=True)
-
-    # Merge current branch into main
-    print(f"   Merging {current_branch} into {main_branch}...")
     result = subprocess.run(
-        ["git", "merge", current_branch, "-m", f"Merge {current_branch}: Update commitment tree to height {height:,}"],
+        ["git", "commit", "-m", commit_msg],
         capture_output=True,
         text=True
     )
 
     if result.returncode != 0:
-        print(f"   ⚠️ Merge failed: {result.stderr}")
-        print(f"   You may need to resolve conflicts manually")
-        # Go back to original branch
-        subprocess.run(["git", "checkout", current_branch], capture_output=True)
-        return False
+        if "nothing to commit" not in result.stdout and "nothing to commit" not in result.stderr:
+            print(f"   ⚠️ Commit failed: {result.stderr}")
+            return False
 
-    # Push main
-    print(f"   Pushing {main_branch} to remote...")
-    result = subprocess.run(["git", "push", "origin", main_branch], capture_output=True, text=True)
+    print(f"   ✅ Committed to ZipherX_Boost")
+
+    if no_push:
+        print("   ⏭️ Skipping push (--no-push flag)")
+        return True
+
+    # Push to remote
+    print(f"   Pushing to ZipherX_Boost...")
+    result = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
 
     if result.returncode != 0:
-        print(f"   ⚠️ Push {main_branch} failed: {result.stderr}")
-        # Go back to original branch
-        subprocess.run(["git", "checkout", current_branch], capture_output=True)
+        print(f"   ⚠️ Push failed: {result.stderr}")
+        print(f"   You can manually push with: cd ~/ZipherX_Boost && git push")
         return False
 
-    print(f"   ✅ Merged and pushed to {main_branch}")
-
-    # Go back to original branch
-    subprocess.run(["git", "checkout", current_branch], capture_output=True)
-    print(f"   ✅ Back on {current_branch}")
+    print(f"   ✅ Pushed to ZipherX_Boost (public)")
+    print(f"   📎 https://github.com/VictorLux/ZipherX_Boost")
 
     return True
 
@@ -747,9 +690,14 @@ async def main():
         print(f"   Compressed SHA256: {compressed_checksum}")
 
         # Generate serialized tree for instant app loading
+        serialized_checksum = None
         if not generate_serialized_tree(tree_path, SERIALIZED_FILE):
             print("⚠️ Serialized tree generation failed, but continuing...")
             # Don't fail - serialized tree is optional optimization
+        else:
+            # Calculate checksum of serialized tree
+            serialized_checksum = compute_sha256(SERIALIZED_FILE)
+            print(f"   Serialized SHA256: {serialized_checksum}")
 
         # Create manifest
         manifest = create_manifest(
@@ -758,7 +706,8 @@ async def main():
             block_hash,
             computed_root,
             tree_checksum,
-            compressed_checksum
+            compressed_checksum,
+            serialized_checksum
         )
 
         # Print summary

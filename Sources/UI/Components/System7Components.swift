@@ -20,13 +20,13 @@ enum NeonColors {
     private static let orangeProgressFillStart = Color(red: 0.8, green: 0.3, blue: 0.0)
     private static let orangeProgressFillEnd = Color(red: 1.0, green: 0.5, blue: 0.0)
 
-    // iOS Green colors
+    // iOS Green colors - BRIGHTER for better visibility
     private static let greenPrimary = Color(red: 0, green: 1, blue: 0.25)
-    private static let greenPrimaryDark = Color(red: 0, green: 0.7, blue: 0.2)
-    private static let greenPrimaryDim = Color(red: 0, green: 0.5, blue: 0.1)
-    private static let greenPrimaryVeryDim = Color(red: 0, green: 0.3, blue: 0.08)
-    private static let greenProgressBg = Color(red: 0, green: 0.2, blue: 0.05)
-    private static let greenProgressFillStart = Color(red: 0, green: 0.8, blue: 0.2)
+    private static let greenPrimaryDark = Color(red: 0, green: 0.85, blue: 0.25)   // Was 0.7/0.2 - brighter
+    private static let greenPrimaryDim = Color(red: 0, green: 0.7, blue: 0.18)     // Was 0.5/0.1 - brighter
+    private static let greenPrimaryVeryDim = Color(red: 0, green: 0.5, blue: 0.12) // Was 0.3/0.08 - brighter
+    private static let greenProgressBg = Color(red: 0, green: 0.25, blue: 0.06)    // Slightly brighter
+    private static let greenProgressFillStart = Color(red: 0, green: 0.9, blue: 0.25) // Brighter
     private static let greenProgressFillEnd = Color(red: 0, green: 1, blue: 0.4)
 
     // Runtime platform detection (guaranteed to work)
@@ -897,12 +897,16 @@ struct CypherpunkSyncView: View {
     var isComplete: Bool = false  // Show completion message
     var completionDuration: TimeInterval? = nil  // Actual duration when complete
     var onEnterWallet: (() -> Void)? = nil  // Callback when user clicks enter button
+    var onStopSync: (() -> Void)? = nil  // Callback when user clicks STOP button
+    var onDeleteAndRestart: (() -> Void)? = nil  // Callback when user wants to delete all data
 
     @State private var currentMessage: String = "Synchronizing with the network..."
     @State private var glitchOffset: CGFloat = 0
     @State private var showGlitch: Bool = false
     @State private var elapsedTime: TimeInterval = 0
     @State private var showCompletionAnimation: Bool = false
+    @State private var showStopConfirmation: Bool = false
+    @State private var showDeleteConfirmation: Bool = false
 
     // MARK: - ZClassic History Story (shown during sync)
     // A cypherpunk tale of freedom, forks, and fighting the 20% tax
@@ -1233,6 +1237,12 @@ struct CypherpunkSyncView: View {
 
             Spacer()
 
+            // STOP button (when callbacks are provided)
+            if onStopSync != nil || onDeleteAndRestart != nil {
+                stopButtonSection
+                    .padding(.bottom, 16)
+            }
+
             // Footer quote
             VStack(spacing: 4) {
                 Text("\"We must defend our own privacy\"")
@@ -1246,6 +1256,50 @@ struct CypherpunkSyncView: View {
             }
             .padding(.bottom, 30)
         }
+        .alert("Stop Sync?", isPresented: $showStopConfirmation) {
+            Button("Continue Syncing", role: .cancel) { }
+            Button("Stop & Keep Data", role: .destructive) {
+                onStopSync?()
+            }
+            if onDeleteAndRestart != nil {
+                Button("Delete All & Restart", role: .destructive) {
+                    showDeleteConfirmation = true
+                }
+            }
+        } message: {
+            Text("Stopping sync will leave your wallet partially synced. Your balance may be incorrect until sync completes.")
+        }
+        .alert("Delete All Data?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("DELETE EVERYTHING", role: .destructive) {
+                onDeleteAndRestart?()
+            }
+        } message: {
+            Text("This will permanently delete your wallet, all data, and settings. You will need to restore from your seed phrase. THIS CANNOT BE UNDONE.")
+        }
+    }
+
+    // MARK: - Stop Button Section
+    private var stopButtonSection: some View {
+        Button(action: {
+            showStopConfirmation = true
+        }) {
+            HStack(spacing: 8) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 12, weight: .bold))
+                Text("STOP")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+            }
+            .foregroundColor(.red)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
+            .background(Color.black)
+            .overlay(
+                RoundedRectangle(cornerRadius: 0)
+                    .stroke(Color.red.opacity(0.6), lineWidth: 1)
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
     }
 
     // MARK: - Completion View
@@ -1848,6 +1902,16 @@ struct CypherpunkMainView: View {
 
     // MARK: - Transaction History
 
+    /// Count of received (IN) transactions
+    private var inCount: Int {
+        transactions.filter { $0.type == .received }.count
+    }
+
+    /// Count of sent (OUT) transactions
+    private var outCount: Int {
+        transactions.filter { $0.type == .sent }.count
+    }
+
     private var transactionHistory: some View {
         VStack(spacing: 0) {
             // Header
@@ -1856,6 +1920,13 @@ struct CypherpunkMainView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(matrixGreenDark)
                     .tracking(2)
+
+                // IN/OUT counts
+                if !transactions.isEmpty {
+                    Text("(\(inCount) IN, \(outCount) OUT)")
+                        .font(.system(size: 9, weight: .regular, design: .monospaced))
+                        .foregroundColor(matrixGreenDark)
+                }
 
                 Spacer()
 
@@ -1960,7 +2031,7 @@ struct CypherpunkMainView: View {
                 Text("ZCL v2.1.2-1")
                     .font(.system(size: 10, design: .monospaced))
             }
-            .foregroundColor(matrixGreenDarker)
+            .foregroundColor(matrixGreenDark)
 
             Spacer()
 
@@ -1986,6 +2057,19 @@ struct CypherpunkMainView: View {
 
             Spacer()
 
+            // ZCL Price
+            if networkManager.zclPriceUSD > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "dollarsign.circle")
+                        .font(.system(size: 9))
+                    Text(String(format: "$%.4f", networkManager.zclPriceUSD))
+                        .font(.system(size: 10, design: .monospaced))
+                }
+                .foregroundColor(matrixGreenDark)
+
+                Spacer()
+            }
+
             // Block height
             HStack(spacing: 4) {
                 Image(systemName: "cube.fill")
@@ -1993,7 +2077,7 @@ struct CypherpunkMainView: View {
                 Text("\(networkManager.chainHeight)")
                     .font(.system(size: 10, design: .monospaced))
             }
-            .foregroundColor(matrixGreenDarker)
+            .foregroundColor(matrixGreenDark)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
@@ -2054,6 +2138,12 @@ struct CypherpunkMainView: View {
                 let sentCount = deduped.filter { $0.type == .sent }.count
                 let receivedCount = deduped.filter { $0.type == .received }.count
                 print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
+
+                // Debug: print first 5 items to trace duplicates
+                for (i, item) in deduped.prefix(5).enumerated() {
+                    let fullTxid = item.txid.map { String(format: "%02x", $0) }.joined()
+                    print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), txid=\(fullTxid), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
+                }
 
                 DispatchQueue.main.async {
                     self.transactions = deduped
