@@ -337,10 +337,14 @@ struct SettingsView: View {
     #if os(macOS)
     @State private var showBootstrapSheet = false
     @State private var showModeChangeAlert = false
+    @State private var showDaemonInstallChoice = false
+    @State private var showDaemonInstallProgress = false
+    @State private var daemonInstallError: String?
 
     private var walletModeSection: some View {
         let modeManager = WalletModeManager.shared
         let bootstrapManager = BootstrapManager.shared
+        let fullNodeManager = FullNodeManager.shared
 
         return VStack(spacing: 12) {
             // Section header
@@ -441,10 +445,17 @@ struct SettingsView: View {
         )
         .alert("Switch to Full Node Mode?", isPresented: $showModeChangeAlert) {
             Button("Cancel", role: .cancel) {}
-            Button("I Understand, Switch") {
-                modeManager.setMode(.fullNode)
-                if bootstrapManager.needsBootstrap {
-                    showBootstrapSheet = true
+            Button("I Understand, Continue") {
+                // Check if daemon is already installed
+                if fullNodeManager.isDaemonInstalledAtPath {
+                    // Daemon already installed, proceed directly
+                    modeManager.setMode(.fullNode)
+                    if bootstrapManager.needsBootstrap {
+                        showBootstrapSheet = true
+                    }
+                } else {
+                    // Show daemon installation choice
+                    showDaemonInstallChoice = true
                 }
             }
         } message: {
@@ -466,10 +477,6 @@ The daemon's wallet is NEVER accessed for signing.
 • Stable internet connection during sync
 • zclassicd + zclassic-cli must be installed
 
-📦 DAEMON INSTALLATION:
-ZipherX can install the daemon binaries for you, or you can verify and compile yourself from the official source:
-https://github.com/ZclassicCommunity/zclassic
-
 🚀 BOOTSTRAP:
 ZipherX downloads the latest blockchain bootstrap for fast sync:
 https://github.com/VictorLux/zclassic-bootstrap
@@ -478,6 +485,60 @@ https://github.com/VictorLux/zclassic-bootstrap
 
 Thank you for strengthening the network! 🛡️
 """)
+        }
+        // Daemon installation choice alert
+        .alert("Install Daemon Binaries?", isPresented: $showDaemonInstallChoice) {
+            Button("Cancel", role: .cancel) {}
+            Button("I'll Install Myself") {
+                // User will handle installation, show info
+                if let url = URL(string: FullNodeManager.officialSourceURL) {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            if fullNodeManager.hasBundledDaemon {
+                Button("Install from ZipherX") {
+                    // Install bundled binaries
+                    Task {
+                        do {
+                            try await fullNodeManager.installDaemonFromBundle()
+                            await MainActor.run {
+                                modeManager.setMode(.fullNode)
+                                if bootstrapManager.needsBootstrap {
+                                    showBootstrapSheet = true
+                                }
+                            }
+                        } catch {
+                            await MainActor.run {
+                                daemonInstallError = error.localizedDescription
+                            }
+                        }
+                    }
+                }
+            }
+        } message: {
+            Text("""
+zclassicd and zclassic-cli are required for Full Node mode.
+
+📦 INSTALL FROM ZIPHERX:
+ZipherX includes pre-built binaries that will be installed to /usr/local/bin
+
+🔧 INSTALL YOURSELF:
+Download and compile from the official source. This allows you to verify the code yourself (recommended for maximum security):
+https://github.com/ZclassicCommunity/zclassic
+
+Both binaries must be installed to /usr/local/bin:
+• /usr/local/bin/zclassicd
+• /usr/local/bin/zclassic-cli
+""")
+        }
+        // Installation error alert
+        .alert("Installation Failed", isPresented: .init(
+            get: { daemonInstallError != nil },
+            set: { if !$0 { daemonInstallError = nil } }
+        )) {
+            Button("OK") { daemonInstallError = nil }
+        } message: {
+            Text(daemonInstallError ?? "Unknown error")
         }
         .sheet(isPresented: $showBootstrapSheet) {
             BootstrapProgressView()

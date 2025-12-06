@@ -95,6 +95,9 @@ targets:
         buildPhase: resources
       # block_timestamps.bin is NOT bundled (~12 MB) - downloaded from GitHub on first sync
       # shielded_outputs.bin is NOT bundled (585 MB) - downloaded from GitHub on first sync
+      # macOS only: Bundled zclassicd and zclassic-cli for Full Node mode
+      - path: Resources/Binaries
+        buildPhase: resources
     info:
       path: Info-macOS.plist
       properties:

@@ -334,7 +334,7 @@ public class FullNodeManager: ObservableObject {
         print("✅ Created zclassic.conf")
     }
 
-    // MARK: - Daemon Installation Info
+    // MARK: - Daemon Installation
 
     /// Official source URL for building from source
     public static let officialSourceURL = "https://github.com/ZclassicCommunity/zclassic"
@@ -342,11 +342,66 @@ public class FullNodeManager: ObservableObject {
     /// Bootstrap download URL for fast sync
     public static let bootstrapURL = "https://github.com/VictorLux/zclassic-bootstrap"
 
+    /// Path to bundled daemon in app bundle
+    private static var bundledDaemonPath: URL? {
+        Bundle.main.url(forResource: "zclassicd", withExtension: nil, subdirectory: "Binaries")
+    }
+
+    /// Path to bundled CLI in app bundle
+    private static var bundledCliPath: URL? {
+        Bundle.main.url(forResource: "zclassic-cli", withExtension: nil, subdirectory: "Binaries")
+    }
+
+    /// Check if daemon binaries are bundled with the app
+    public var hasBundledDaemon: Bool {
+        Self.bundledDaemonPath != nil && Self.bundledCliPath != nil
+    }
+
     /// Check if daemon is installed at /usr/local/bin
     public var isDaemonInstalledAtPath: Bool {
         let fm = FileManager.default
         return fm.fileExists(atPath: Self.daemonPath.path) &&
                fm.fileExists(atPath: Self.cliPath.path)
+    }
+
+    /// Install daemon binaries from app bundle to /usr/local/bin
+    /// Returns true on success
+    public func installDaemonFromBundle() async throws {
+        guard let daemonSource = Self.bundledDaemonPath,
+              let cliSource = Self.bundledCliPath else {
+            throw FullNodeError.daemonNotBundled
+        }
+
+        let fm = FileManager.default
+
+        // Check if /usr/local/bin exists, create if not
+        let binDir = URL(fileURLWithPath: "/usr/local/bin")
+        if !fm.fileExists(atPath: binDir.path) {
+            try fm.createDirectory(at: binDir, withIntermediateDirectories: true)
+        }
+
+        // Copy daemon binary (overwrite if exists)
+        let daemonDest = Self.daemonPath
+        if fm.fileExists(atPath: daemonDest.path) {
+            try fm.removeItem(at: daemonDest)
+        }
+        try fm.copyItem(at: daemonSource, to: daemonDest)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
+        print("✅ Installed zclassicd to \(daemonDest.path)")
+
+        // Copy CLI binary (overwrite if exists)
+        let cliDest = Self.cliPath
+        if fm.fileExists(atPath: cliDest.path) {
+            try fm.removeItem(at: cliDest)
+        }
+        try fm.copyItem(at: cliSource, to: cliDest)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
+        print("✅ Installed zclassic-cli to \(cliDest.path)")
+
+        await MainActor.run {
+            isNodeInstalled = true
+            daemonStatus = .installed
+        }
     }
 
     /// Get daemon version if installed
@@ -367,7 +422,6 @@ public class FullNodeManager: ObservableObject {
 
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if let output = String(data: data, encoding: .utf8) {
-                // Extract version from output (e.g., "Zclassic Daemon version v2.1.2-1")
                 return output.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         } catch {
@@ -404,8 +458,10 @@ public class FullNodeManager: ObservableObject {
 public enum FullNodeError: Error, LocalizedError {
     case daemonNotInstalled
     case daemonNotRunning
+    case daemonNotBundled
     case startupTimeout
     case configError(String)
+    case installError(String)
 
     public var errorDescription: String? {
         switch self {
@@ -413,10 +469,14 @@ public enum FullNodeError: Error, LocalizedError {
             return "Zclassic daemon is not installed. Please install zclassicd and zclassic-cli to /usr/local/bin from https://github.com/ZclassicCommunity/zclassic"
         case .daemonNotRunning:
             return "Daemon is not running"
+        case .daemonNotBundled:
+            return "Daemon binaries are not bundled with this version of ZipherX"
         case .startupTimeout:
             return "Daemon failed to start within timeout"
         case .configError(let msg):
             return "Configuration error: \(msg)"
+        case .installError(let msg):
+            return "Installation error: \(msg)"
         }
     }
 }
