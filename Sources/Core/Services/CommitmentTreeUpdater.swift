@@ -7,22 +7,21 @@ actor CommitmentTreeUpdater {
 
     // MARK: - Configuration
 
-    /// GitHub raw URL for the manifest file (PUBLIC repo - no auth needed)
-    private static let manifestURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree_manifest.json"
+    /// GitHub API URL to get latest tree release
+    private static let latestReleaseURL = "https://api.github.com/repos/VictorLux/ZipherX_Boost/releases"
 
-    /// GitHub raw URL for the serialized tree file (tiny ~500 bytes, instant load)
-    private static let serializedTreeURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree_serialized.bin"
+    /// Base URL for GitHub raw files (manifest only - other files from releases)
+    private static let rawBaseURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main"
 
-    /// GitHub raw URL for the compressed tree file (fallback if serialized not available)
-    private static let compressedTreeURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree.bin.zst"
-
-    /// GitHub raw URL for the uncompressed CMU file (needed for imported wallets - position lookups)
-    /// This is a large file (~33MB) but required for nullifier computation on imported wallets
-    private static let cmuFileURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/commitment_tree.bin"
+    /// GitHub raw URL for the manifest file (always from main branch for latest info)
+    private static let manifestURL = "\(rawBaseURL)/commitment_tree_manifest.json"
 
     /// Whether tree updates from GitHub are enabled
     /// Set to false to disable remote tree updates (use bundled only)
     private static let enableRemoteUpdates = true
+
+    /// Cached release tag for downloads
+    private var cachedReleaseTag: String?
 
 
     /// Local directory for downloaded trees
@@ -77,6 +76,34 @@ actor CommitmentTreeUpdater {
     private init() {
         // Ensure cache directory exists
         try? FileManager.default.createDirectory(at: treeCacheDirectory, withIntermediateDirectories: true)
+    }
+
+    /// Fetch tree info from GitHub manifest and update ZipherXConstants
+    /// Should be called on app startup BEFORE any tree operations
+    /// This ensures we always have the latest tree height/count/root from GitHub
+    func fetchAndUpdateTreeInfo() async {
+        guard Self.enableRemoteUpdates else {
+            print("🌲 Remote updates disabled, using cached tree info")
+            return
+        }
+
+        do {
+            print("🌲 Fetching tree manifest from GitHub...")
+            let manifest = try await fetchRemoteManifest()
+
+            await MainActor.run {
+                ZipherXConstants.updateTreeInfo(
+                    height: manifest.height,
+                    cmuCount: manifest.cmu_count,
+                    root: manifest.tree_root
+                )
+            }
+
+            print("🌲 Tree info updated from GitHub: height=\(manifest.height), CMUs=\(manifest.cmu_count)")
+        } catch {
+            print("⚠️ Could not fetch tree manifest from GitHub: \(error.localizedDescription)")
+            // App will use cached values from UserDefaults or fallback to Sapling activation
+        }
     }
 
     /// Check if a newer tree is available and download it if so
@@ -143,6 +170,14 @@ actor CommitmentTreeUpdater {
 
                         if verifySHA256(file: cachedSerializedTreePath, expected: serializedInfo.sha256) {
                             try saveManifest(remoteManifest)
+                            // Update ZipherXConstants with downloaded tree info
+                            await MainActor.run {
+                                ZipherXConstants.updateTreeInfo(
+                                    height: remoteManifest.height,
+                                    cmuCount: remoteManifest.cmu_count,
+                                    root: remoteManifest.tree_root
+                                )
+                            }
                             print("🌲 Successfully downloaded serialized tree at height \(remoteManifest.height)")
                             onProgress?(1.0, "Tree updated!")
                             return (cachedSerializedTreePath, remoteManifest.height, remoteManifest.cmu_count)
@@ -167,6 +202,14 @@ actor CommitmentTreeUpdater {
                 }
 
                 try saveManifest(remoteManifest)
+                // Update ZipherXConstants with downloaded tree info
+                await MainActor.run {
+                    ZipherXConstants.updateTreeInfo(
+                        height: remoteManifest.height,
+                        cmuCount: remoteManifest.cmu_count,
+                        root: remoteManifest.tree_root
+                    )
+                }
                 print("🌲 Successfully downloaded tree at height \(remoteManifest.height)")
                 onProgress?(1.0, "Tree updated!")
                 return (cachedTreePath, remoteManifest.height, remoteManifest.cmu_count)
@@ -185,10 +228,13 @@ actor CommitmentTreeUpdater {
 
     /// Download the serialized tree (tiny ~500 bytes, instant)
     private func downloadSerializedTree(manifest: TreeManifest) async throws {
-        guard let url = URL(string: Self.serializedTreeURL) else {
+        // Get URL from GitHub Releases
+        let urlString = getReleaseDownloadURL(for: "commitment_tree_serialized.bin", height: manifest.height)
+        guard let url = URL(string: urlString) else {
             throw TreeUpdaterError.invalidURL
         }
 
+        print("🌲 Downloading serialized tree from: \(urlString)")
         let (data, response) = try await URLSession.shared.data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse,
@@ -196,7 +242,19 @@ actor CommitmentTreeUpdater {
             throw TreeUpdaterError.networkError("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
 
-        // Write directly to cache
+        // Verify checksum BEFORE writing
+        if let serializedInfo = manifest.files.serialized {
+            let computedHash = sha256(data: data)
+            guard computedHash.lowercased() == serializedInfo.sha256.lowercased() else {
+                print("🚨 SECURITY: Serialized tree checksum mismatch!")
+                print("   Expected: \(serializedInfo.sha256)")
+                print("   Got:      \(computedHash)")
+                throw TreeUpdaterError.checksumMismatch
+            }
+            print("✅ Serialized tree checksum verified")
+        }
+
+        // Write to cache
         try data.write(to: cachedSerializedTreePath)
         print("🌲 Downloaded serialized tree: \(data.count) bytes")
     }
@@ -252,18 +310,23 @@ actor CommitmentTreeUpdater {
             return nil  // Use bundled
         }
 
-        // Download the uncompressed CMU file (33MB) directly
-        // Note: We download uncompressed because iOS cannot decompress zstd
-        print("🌲 Downloading CMU file (\(remoteManifest.files.uncompressed.size / 1024 / 1024) MB)...")
+        // Download the COMPRESSED CMU file from GitHub Releases and decompress
+        // This saves bandwidth (compressed is ~10MB vs uncompressed ~33MB)
+        let compressedSize = remoteManifest.files.compressed.size
+        print("🌲 Downloading compressed CMU file (\(compressedSize / 1024 / 1024) MB)...")
         onProgress?(0.1, "Downloading CMU data...")
 
-        guard let url = URL(string: Self.cmuFileURL) else {
+        // Get URL from GitHub Releases
+        let urlString = getReleaseDownloadURL(for: "commitment_tree.bin.zst", height: remoteManifest.height)
+        guard let url = URL(string: urlString) else {
             throw TreeUpdaterError.invalidURL
         }
 
+        print("🌲 Downloading from: \(urlString)")
+
         // Create a download delegate to track progress
         let delegate = DownloadProgressDelegate { progress in
-            onProgress?(0.1 + progress * 0.8, "Downloading... \(Int(progress * 100))%")
+            onProgress?(0.1 + progress * 0.5, "Downloading... \(Int(progress * 100))%")
         }
 
         let (tempURL, response) = try await URLSession.shared.download(from: url, delegate: delegate)
@@ -273,27 +336,53 @@ actor CommitmentTreeUpdater {
             throw TreeUpdaterError.networkError("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
 
-        // Move to cache
-        if FileManager.default.fileExists(atPath: cachedTreePath.path) {
-            try FileManager.default.removeItem(at: cachedTreePath)
+        // Move compressed file to cache
+        let compressedPath = treeCacheDirectory.appendingPathComponent("commitment_tree.bin.zst")
+        if FileManager.default.fileExists(atPath: compressedPath.path) {
+            try FileManager.default.removeItem(at: compressedPath)
         }
-        try FileManager.default.moveItem(at: tempURL, to: cachedTreePath)
+        try FileManager.default.moveItem(at: tempURL, to: compressedPath)
 
-        onProgress?(0.9, "Verifying checksum...")
+        onProgress?(0.65, "Verifying compressed checksum...")
 
-        // Verify checksum
+        // Verify compressed checksum
+        print("🔐 Verifying compressed file checksum...")
+        guard verifySHA256(file: compressedPath, expected: remoteManifest.files.compressed.sha256) else {
+            print("🚨 SECURITY: Compressed CMU checksum mismatch!")
+            try? FileManager.default.removeItem(at: compressedPath)
+            throw TreeUpdaterError.checksumMismatch
+        }
+        print("✅ Compressed CMU checksum verified")
+
+        onProgress?(0.7, "Decompressing...")
+
+        // Decompress
+        try decompressZstd(from: compressedPath, to: cachedTreePath)
+
+        // Clean up compressed file
+        try? FileManager.default.removeItem(at: compressedPath)
+
+        onProgress?(0.9, "Verifying decompressed checksum...")
+
+        // Verify decompressed checksum
+        print("🔐 Verifying decompressed CMU checksum...")
         guard verifySHA256(file: cachedTreePath, expected: remoteManifest.files.uncompressed.sha256) else {
+            print("🚨 SECURITY: Decompressed CMU checksum mismatch!")
             try? FileManager.default.removeItem(at: cachedTreePath)
             throw TreeUpdaterError.checksumMismatch
         }
+        print("✅ Decompressed CMU checksum verified")
 
         // Save manifest
         try saveManifest(remoteManifest)
 
-        // Update UserDefaults for effective tree height (used by ZipherXConstants)
+        // Update ZipherXConstants with downloaded tree info
         await MainActor.run {
-            UserDefaults.standard.set(Int(remoteManifest.height), forKey: "effectiveTreeHeight")
-            UserDefaults.standard.set(Int(remoteManifest.cmu_count), forKey: "effectiveTreeCMUCount")
+            ZipherXConstants.updateTreeInfo(
+                height: remoteManifest.height,
+                cmuCount: remoteManifest.cmu_count,
+                root: remoteManifest.tree_root
+            )
         }
 
         print("🌲 Downloaded CMU file at height \(remoteManifest.height) with \(remoteManifest.cmu_count) CMUs")
@@ -327,6 +416,13 @@ actor CommitmentTreeUpdater {
     }
 
     // MARK: - Private Methods
+
+    /// Get the GitHub Releases download URL for a specific file
+    /// Files are hosted in releases tagged as "v{height}-tree"
+    private func getReleaseDownloadURL(for filename: String, height: UInt64) -> String {
+        // GitHub Releases URL format: https://github.com/{owner}/{repo}/releases/download/{tag}/{filename}
+        return "https://github.com/VictorLux/ZipherX_Boost/releases/download/v\(height)-tree/\(filename)"
+    }
 
     private func fetchRemoteManifest() async throws -> TreeManifest {
         guard let url = URL(string: Self.manifestURL) else {
@@ -364,9 +460,13 @@ actor CommitmentTreeUpdater {
     }
 
     private func downloadAndDecompressTree(manifest: TreeManifest, onProgress: ((Double) -> Void)?) async throws {
-        guard let url = URL(string: Self.compressedTreeURL) else {
+        // Get URL from GitHub Releases (compressed file only)
+        let urlString = getReleaseDownloadURL(for: "commitment_tree.bin.zst", height: manifest.height)
+        guard let url = URL(string: urlString) else {
             throw TreeUpdaterError.invalidURL
         }
+
+        print("🌲 Downloading compressed tree from: \(urlString)")
 
         // Download compressed file
         let compressedPath = treeCacheDirectory.appendingPathComponent("commitment_tree.bin.zst")
@@ -387,16 +487,31 @@ actor CommitmentTreeUpdater {
 
         onProgress?(0.5)
 
-        // Verify compressed file checksum
+        // Verify compressed file checksum BEFORE decompressing
+        print("🔐 Verifying compressed file checksum...")
         guard verifySHA256(file: compressedPath, expected: manifest.files.compressed.sha256) else {
+            print("🚨 SECURITY: Compressed tree checksum mismatch!")
             try? FileManager.default.removeItem(at: compressedPath)
             throw TreeUpdaterError.checksumMismatch
         }
+        print("✅ Compressed tree checksum verified")
 
         onProgress?(0.6)
 
         // Decompress using zstd
         try decompressZstd(from: compressedPath, to: cachedTreePath)
+
+        onProgress?(0.9)
+
+        // Verify decompressed file checksum
+        print("🔐 Verifying decompressed file checksum...")
+        guard verifySHA256(file: cachedTreePath, expected: manifest.files.uncompressed.sha256) else {
+            print("🚨 SECURITY: Decompressed tree checksum mismatch!")
+            try? FileManager.default.removeItem(at: cachedTreePath)
+            try? FileManager.default.removeItem(at: compressedPath)
+            throw TreeUpdaterError.checksumMismatch
+        }
+        print("✅ Decompressed tree checksum verified")
 
         onProgress?(1.0)
 

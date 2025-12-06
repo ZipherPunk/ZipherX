@@ -29,6 +29,12 @@ struct ZipherXApp: App {
         // Request notification permission on launch
         NotificationManager.shared.requestPermission()
         print("🚀 App init at \(Date()) - startup time was \(appStartupTime)")
+
+        // Fetch tree info from GitHub on first launch or to check for updates
+        // This runs async and updates ZipherXConstants with latest values
+        Task {
+            await CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()
+        }
     }
 
     var body: some Scene {
