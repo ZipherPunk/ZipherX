@@ -340,6 +340,7 @@ struct SettingsView: View {
     @State private var showDaemonInstallChoice = false
     @State private var showDaemonInstallProgress = false
     @State private var daemonInstallError: String?
+    @State private var showNodeManagement = false
 
     private var walletModeSection: some View {
         let modeManager = WalletModeManager.shared
@@ -576,6 +577,24 @@ Both binaries must be installed to /usr/local/bin:
                     .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
             )
 
+            // Node Management button
+            Button(action: {
+                showNodeManagement = true
+            }) {
+                HStack {
+                    Image(systemName: "gearshape.2.fill")
+                    Text("Node Management")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(theme.bodyFont)
+                .foregroundColor(.white)
+                .padding(12)
+                .background(theme.primaryColor)
+                .cornerRadius(theme.cornerRadius)
+            }
+            .buttonStyle(PlainButtonStyle())
+
             // Switch to Light mode button
             Button(action: {
                 modeManager.setMode(.light)
@@ -596,6 +615,10 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
             .buttonStyle(PlainButtonStyle())
+        }
+        .sheet(isPresented: $showNodeManagement) {
+            NodeManagementView()
+                .environmentObject(themeManager)
         }
     }
     #endif
