@@ -1797,14 +1797,21 @@ final class WalletManager: ObservableObject {
         updateTaskWithProgress(taskId, detail: detail, progress: progress)
     }
 
-    /// Estimate date for a given block height
-    /// Uses reference point: block 2931180 = Dec 3, 2025 18:09 UTC
-    /// Zclassic block time: 2.5 minutes
+    /// Get the real date for a given block height
+    /// Uses BlockTimestampManager for actual blockchain timestamps (downloaded from GitHub)
+    /// Falls back to estimate only if no real timestamp available
     private func estimateDateForBlock(height: UInt64) -> String {
         guard height > 0 else { return "" }
 
+        // FIRST: Try to get real timestamp from BlockTimestampManager
+        if let realDate = BlockTimestampManager.shared.getFormattedDate(at: height) {
+            return realDate
+        }
+
+        // FALLBACK: Estimate only if real timestamp not available
+        // This should be rare since we download timestamps from GitHub
         let referenceHeight: UInt64 = 2932265
-        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (CORRECT 2025 timestamp)
+        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC
         let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
 
         let heightDiff = Int64(height) - Int64(referenceHeight)
@@ -2433,9 +2440,45 @@ final class WalletManager: ObservableObject {
         _ = ZipherXFFI.treeInit()
         print("🗑️ Reset FFI tree state")
 
+        // 8. Delete cache files (TreeCache, block_hashes, block_timestamps)
+        let fileManager = FileManager.default
+        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
+
+        // Delete TreeCache folder
+        let treeCacheURL = documentsURL.appendingPathComponent("TreeCache")
+        if fileManager.fileExists(atPath: treeCacheURL.path) {
+            try? fileManager.removeItem(at: treeCacheURL)
+            print("🗑️ Deleted TreeCache folder")
+        }
+
+        // Delete block_hashes.bin
+        let blockHashesURL = documentsURL.appendingPathComponent("block_hashes.bin")
+        if fileManager.fileExists(atPath: blockHashesURL.path) {
+            try? fileManager.removeItem(at: blockHashesURL)
+            print("🗑️ Deleted block_hashes.bin")
+        }
+
+        // Delete block_timestamps_cache.bin
+        let timestampsURL = documentsURL.appendingPathComponent("block_timestamps_cache.bin")
+        if fileManager.fileExists(atPath: timestampsURL.path) {
+            try? fileManager.removeItem(at: timestampsURL)
+            print("🗑️ Deleted block_timestamps_cache.bin")
+        }
+
+        #if os(macOS)
+        // Delete macOS encrypted key file
+        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let zipherxFolder = appSupportURL.appendingPathComponent("ZipherX")
+        let encKeyFile = zipherxFolder.appendingPathComponent("com_zipherx_spendingkey.enc")
+        if fileManager.fileExists(atPath: encKeyFile.path) {
+            try? fileManager.removeItem(at: encKeyFile)
+            print("🗑️ Deleted macOS encrypted key file")
+        }
+        #endif
+
         print("✅ DELETE WALLET: Complete! App should be restarted.")
 
-        // 8. Force quit the app after a short delay
+        // 9. Force quit the app after a short delay
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             print("🛑 Terminating app...")
             #if os(iOS)

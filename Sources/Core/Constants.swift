@@ -11,11 +11,12 @@ enum ZipherXConstants {
     private static let treeCMUCountKey = "effectiveTreeCMUCount"
     private static let treeRootKey = "effectiveTreeRoot"
 
-    /// Fallback values ONLY used if GitHub manifest hasn't been downloaded yet
-    /// These should match the MINIMUM supported tree (Sapling activation)
-    private static let fallbackTreeHeight: UInt64 = 476_969  // Sapling activation
-    private static let fallbackTreeCMUCount: UInt64 = 0
-    private static let fallbackTreeRoot = ""
+    /// Fallback values used if GitHub manifest hasn't been downloaded yet
+    /// These should match the BUNDLED tree in Resources/ (last known good values)
+    /// Update these when publishing new bundled tree to app
+    private static let fallbackTreeHeight: UInt64 = 2_926_122
+    private static let fallbackTreeCMUCount: UInt64 = 1_041_891
+    private static let fallbackTreeRoot = "5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945"
 
     /// Get the tree height (from GitHub manifest stored in UserDefaults)
     /// Returns Sapling activation height if not yet downloaded

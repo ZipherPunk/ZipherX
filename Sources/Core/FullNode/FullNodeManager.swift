@@ -4,7 +4,19 @@ import Combine
 #if os(macOS)
 
 /// Manages Full Node mode for ZipherX (macOS only)
-/// Handles daemon detection, startup, and wallet.dat management
+///
+/// IMPORTANT SECURITY DESIGN:
+/// - ZipherX ALWAYS uses its own wallet (SecureKeyStorage + WalletDatabase)
+/// - The local zclassicd wallet.dat is NEVER used for private keys
+/// - Full Node mode only provides:
+///   1. Daemon status monitoring (running/syncing)
+///   2. Block height from trusted local source
+///   3. Transaction verification against full blockchain
+///
+/// This ensures:
+/// - User's private keys remain in ZipherX's encrypted storage
+/// - No risk of wallet.dat exposure
+/// - Consistent wallet experience across Light and Full Node modes
 public class FullNodeManager: ObservableObject {
     public static let shared = FullNodeManager()
 
@@ -14,10 +26,8 @@ public class FullNodeManager: ObservableObject {
     @Published public private(set) var isNodeInstalled: Bool = false
     @Published public private(set) var hasBlockchain: Bool = false
     @Published public private(set) var blockchainSize: String = ""
-    @Published public private(set) var walletAddresses: [WalletAddress] = []
-    @Published public private(set) var totalBalance: Double = 0
-    @Published public private(set) var shieldedBalance: Double = 0
-    @Published public private(set) var transparentBalance: Double = 0
+    @Published public private(set) var daemonBlockHeight: UInt64 = 0
+    @Published public private(set) var daemonSyncProgress: Double = 0.0
 
     // MARK: - Daemon Status
 
@@ -49,24 +59,6 @@ public class FullNodeManager: ObservableObject {
             case .running, .syncing: return true
             default: return false
             }
-        }
-    }
-
-    // MARK: - Wallet Address
-
-    public struct WalletAddress: Identifiable {
-        public let id = UUID()
-        public let address: String
-        public let type: AddressType
-        public let balance: Double
-
-        public enum AddressType: String {
-            case shielded = "Shielded (z)"
-            case transparent = "Transparent (t)"
-        }
-
-        public var isShielded: Bool {
-            type == .shielded
         }
     }
 
@@ -170,11 +162,8 @@ public class FullNodeManager: ObservableObject {
                 isNodeInstalled = true  // Daemon is running, so it's "installed" somewhere
                 print("✅ Full Node: daemon is RUNNING (detected via RPC)")
 
-                // Check sync status
+                // Check sync status and block height
                 await checkSyncStatus()
-
-                // Load wallet addresses
-                await loadWalletAddresses()
                 return
             }
         } catch {
@@ -193,7 +182,7 @@ public class FullNodeManager: ObservableObject {
         daemonStatus = hasBlockchain ? .installed : .notInstalled
     }
 
-    /// Check blockchain sync status
+    /// Check blockchain sync status and get block height
     @MainActor
     private func checkSyncStatus() async {
         guard daemonStatus.isRunning else { return }
@@ -201,13 +190,51 @@ public class FullNodeManager: ObservableObject {
         do {
             let info = try await RPCClient.shared.getInfoDict()
 
-            if let progress = info["verificationprogress"] as? Double, progress < 0.9999 {
-                daemonStatus = .syncing(progress: progress)
+            // Get block height
+            if let blocks = info["blocks"] as? Int {
+                daemonBlockHeight = UInt64(blocks)
+            }
+
+            // Get sync progress
+            if let progress = info["verificationprogress"] as? Double {
+                daemonSyncProgress = progress
+                if progress < 0.9999 {
+                    daemonStatus = .syncing(progress: progress)
+                } else {
+                    daemonStatus = .running
+                }
             } else {
                 daemonStatus = .running
             }
         } catch {
             // Keep running status, just couldn't get sync progress
+        }
+    }
+
+    /// Get the current block height from daemon (for use as trusted source)
+    public func getBlockHeight() async -> UInt64? {
+        guard daemonStatus.isRunning else { return nil }
+
+        do {
+            let info = try await RPCClient.shared.getInfoDict()
+            if let blocks = info["blocks"] as? Int {
+                return UInt64(blocks)
+            }
+        } catch {
+            print("⚠️ FullNodeManager: Failed to get block height: \(error)")
+        }
+        return nil
+    }
+
+    /// Verify a transaction exists in the blockchain
+    public func verifyTransaction(txid: String) async -> Bool {
+        guard daemonStatus.isRunning else { return false }
+
+        do {
+            _ = try await RPCClient.shared.getTransaction(txid: txid)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -305,77 +332,6 @@ public class FullNodeManager: ObservableObject {
 
         try config.write(to: Self.configPath, atomically: true, encoding: .utf8)
         print("✅ Created zclassic.conf")
-    }
-
-    // MARK: - Wallet Operations
-
-    /// Load addresses from wallet.dat via RPC
-    @MainActor
-    private func loadWalletAddresses() async {
-        guard daemonStatus.isRunning else { return }
-
-        do {
-            // Get z-addresses
-            let zAddresses = try await RPCClient.shared.getZAddresses()
-            var addresses: [WalletAddress] = []
-
-            for addr in zAddresses {
-                let balance = try await RPCClient.shared.getZBalance(address: addr)
-                addresses.append(WalletAddress(
-                    address: addr,
-                    type: .shielded,
-                    balance: balance
-                ))
-            }
-
-            // Get t-addresses
-            let tAddresses = try await RPCClient.shared.getTAddresses()
-            for addr in tAddresses {
-                let balance = try await RPCClient.shared.getTBalance(address: addr)
-                addresses.append(WalletAddress(
-                    address: addr,
-                    type: .transparent,
-                    balance: balance
-                ))
-            }
-
-            walletAddresses = addresses
-
-            // Calculate totals
-            shieldedBalance = addresses.filter { $0.isShielded }.reduce(0) { $0 + $1.balance }
-            transparentBalance = addresses.filter { !$0.isShielded }.reduce(0) { $0 + $1.balance }
-            totalBalance = shieldedBalance + transparentBalance
-
-        } catch {
-            print("⚠️ Failed to load wallet addresses: \(error)")
-        }
-    }
-
-    /// Create a new z-address in wallet.dat
-    public func createZAddress() async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.createZAddress()
-    }
-
-    /// Create a new t-address in wallet.dat
-    public func createTAddress() async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.createTAddress()
-    }
-
-    /// Send ZCL using the full node's wallet.dat
-    public func sendZCL(from: String, to: String, amount: Double, memo: String? = nil) async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.sendTransaction(from: from, to: to, amount: amount, memo: memo)
     }
 
     // MARK: - Helpers

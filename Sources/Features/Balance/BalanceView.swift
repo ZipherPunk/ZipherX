@@ -837,6 +837,13 @@ struct BalanceView: View {
 
     private var networkStatus: some View {
         VStack(spacing: 0) {
+            // Mode indicator (macOS only)
+            #if os(macOS)
+            modeIndicator
+            Divider()
+                .background(theme.borderColor)
+            #endif
+
             // Connection status with more details
             HStack(spacing: 8) {
                 // Animated connection indicator
@@ -1120,6 +1127,50 @@ struct BalanceView: View {
             }
         }
     }
+
+    // MARK: - Mode Indicator (macOS only)
+
+    #if os(macOS)
+    private var modeIndicator: some View {
+        HStack(spacing: 6) {
+            // Mode icon
+            Image(systemName: WalletModeManager.shared.currentMode == .fullNode ? "server.rack" : "bolt.fill")
+                .foregroundColor(modeIndicatorColor)
+                .font(.system(size: 10))
+
+            // Mode text
+            Text(WalletModeManager.shared.currentMode == .fullNode ? "FULL NODE" : "LIGHT MODE")
+                .font(theme.captionFont)
+                .fontWeight(.medium)
+                .foregroundColor(modeIndicatorColor)
+
+            Spacer()
+
+            // Full Node: show daemon block height
+            if WalletModeManager.shared.currentMode == .fullNode {
+                if FullNodeManager.shared.daemonStatus.isRunning {
+                    Text("Block \(FullNodeManager.shared.daemonBlockHeight)")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                } else {
+                    Text(FullNodeManager.shared.daemonStatus.displayText)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.warningColor)
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(modeIndicatorColor.opacity(0.1))
+    }
+
+    private var modeIndicatorColor: Color {
+        if WalletModeManager.shared.currentMode == .fullNode {
+            return FullNodeManager.shared.daemonStatus.isRunning ? .green : .orange
+        }
+        return .blue
+    }
+    #endif
 
     // MARK: - Computed Properties
 
