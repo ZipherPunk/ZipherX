@@ -153,7 +153,9 @@ struct WalletSetupView: View {
             importWarningView
                 .environmentObject(themeManager)
                 #if os(macOS)
-                .frame(minWidth: 550, idealWidth: 600, minHeight: 750, idealHeight: 850)
+                .frame(minWidth: 550, idealWidth: 600, minHeight: 850, idealHeight: 950)
+                #else
+                .presentationDetents([.large])
                 #endif
         }
         .sheet(isPresented: $showImportKey) {

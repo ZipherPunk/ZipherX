@@ -1321,9 +1321,9 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
+                // Block transactions are already confirmed so they don't need pending tracking.
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1491,10 +1491,8 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                // Track as incoming
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: info.txid, amount: note.value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
                 let memoText = String(data: note.memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1663,9 +1661,8 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,

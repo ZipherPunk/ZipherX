@@ -44,6 +44,106 @@ final class WalletManager: ObservableObject {
     @Published private(set) var syncTasks: [SyncTask] = []
     @Published private(set) var syncCurrentHeight: UInt64 = 0
     @Published private(set) var syncMaxHeight: UInt64 = 0
+
+    // MARK: - Monotonic Progress (never goes backward!)
+
+    /// Overall progress that ONLY increases (0.0 → 1.0)
+    /// This is what the UI should display for a smooth experience
+    @Published private(set) var overallProgress: Double = 0.0
+
+    /// Current phase for progress tracking
+    private var currentProgressPhase: ProgressPhase = .idle
+
+    /// Progress phase definitions with weight allocations (must sum to 1.0)
+    enum ProgressPhase: Int, Comparable {
+        case idle = 0
+        case downloadingTree = 1      // 0-15% - Downloading CMU file from GitHub
+        case loadingTree = 2          // 15-35% - Loading/parsing CMU data
+        case connecting = 3           // 35-40% - Connecting to P2P network
+        case syncingHeaders = 4       // 40-50% - Header sync
+        case phase1Scanning = 5       // 50-70% - Parallel note decryption (Rayon)
+        case phase15Witnesses = 6     // 70-80% - Computing Merkle witnesses
+        case phase16SpentCheck = 7    // 80-85% - Spent note detection
+        case phase2Sequential = 8     // 85-95% - Sequential tree building
+        case finalizingBalance = 9    // 95-100% - Final balance calculation
+        case complete = 10
+
+        static func < (lhs: ProgressPhase, rhs: ProgressPhase) -> Bool {
+            return lhs.rawValue < rhs.rawValue
+        }
+
+        /// Base progress (start of this phase)
+        var baseProgress: Double {
+            switch self {
+            case .idle: return 0.0
+            case .downloadingTree: return 0.0
+            case .loadingTree: return 0.15
+            case .connecting: return 0.35
+            case .syncingHeaders: return 0.40
+            case .phase1Scanning: return 0.50
+            case .phase15Witnesses: return 0.70
+            case .phase16SpentCheck: return 0.80
+            case .phase2Sequential: return 0.85
+            case .finalizingBalance: return 0.95
+            case .complete: return 1.0
+            }
+        }
+
+        /// Weight (size) of this phase
+        var weight: Double {
+            switch self {
+            case .idle: return 0.0
+            case .downloadingTree: return 0.15
+            case .loadingTree: return 0.20
+            case .connecting: return 0.05
+            case .syncingHeaders: return 0.10
+            case .phase1Scanning: return 0.20
+            case .phase15Witnesses: return 0.10
+            case .phase16SpentCheck: return 0.05
+            case .phase2Sequential: return 0.10
+            case .finalizingBalance: return 0.05
+            case .complete: return 0.0
+            }
+        }
+    }
+
+    /// Update progress - ONLY allows forward movement
+    /// - Parameters:
+    ///   - phase: Current phase
+    ///   - phaseProgress: Progress within this phase (0.0 to 1.0)
+    @MainActor
+    func updateOverallProgress(phase: ProgressPhase, phaseProgress: Double) {
+        // Only allow moving to same or later phase
+        guard phase >= currentProgressPhase else {
+            print("⚠️ Progress: Ignoring backward phase change \(phase) < \(currentProgressPhase)")
+            return
+        }
+
+        // Calculate new overall progress
+        let clampedPhaseProgress = max(0.0, min(1.0, phaseProgress))
+        let newProgress = phase.baseProgress + (phase.weight * clampedPhaseProgress)
+
+        // ONLY update if progress increased
+        if newProgress > overallProgress {
+            currentProgressPhase = phase
+            overallProgress = newProgress
+            // print("📊 Progress: \(Int(newProgress * 100))% (phase: \(phase), sub: \(Int(clampedPhaseProgress * 100))%)")
+        }
+    }
+
+    /// Reset progress for new sync (call at start of sync only)
+    @MainActor
+    func resetProgress() {
+        overallProgress = 0.0
+        currentProgressPhase = .idle
+    }
+
+    /// Complete progress (jump to 100%)
+    @MainActor
+    func completeProgress() {
+        overallProgress = 1.0
+        currentProgressPhase = .complete
+    }
     @Published private(set) var transactionHistoryVersion: Int = 0  // Increments when tx history changes
 
     /// Timestamp of last sent transaction - used to suppress fireworks for change outputs
@@ -155,10 +255,10 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
-    // Expected values for bundled tree validation
-    private let bundledTreeCMUCount: UInt64 = 1_041_891
-    private let bundledTreeHeight: UInt64 = 2_926_122
-    // Expected root (display format): 5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945
+    // Expected values for bundled tree validation - use ZipherXConstants for dynamic values from GitHub
+    private var bundledTreeCMUCount: UInt64 { ZipherXConstants.bundledTreeCMUCount }
+    private var bundledTreeHeight: UInt64 { ZipherXConstants.bundledTreeHeight }
+    // Expected root from ZipherXConstants.bundledTreeRoot
 
     // Lock to prevent concurrent tree loading
     private var isTreeLoading = false
@@ -201,6 +301,8 @@ final class WalletManager: ObservableObject {
         print("🌳 Preloading commitment tree...")
 
         await MainActor.run {
+            // Reset monotonic progress at the start of sync
+            self.resetProgress()
             self.treeLoadStatus = "Initializing secure vault..."
         }
 
@@ -274,6 +376,7 @@ final class WalletManager: ObservableObject {
             await MainActor.run {
                 self.treeLoadStatus = "Checking for tree updates..."
                 self.treeLoadProgress = 0.1
+                self.updateOverallProgress(phase: .downloadingTree, phaseProgress: 0.1)
             }
 
             do {
@@ -281,6 +384,7 @@ final class WalletManager: ObservableObject {
                     Task { @MainActor in
                         self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for update check/download
                         self.treeLoadStatus = status
+                        self.updateOverallProgress(phase: .downloadingTree, phaseProgress: 0.1 + progress * 0.9)
                     }
                 }
 
@@ -307,6 +411,7 @@ final class WalletManager: ObservableObject {
         await MainActor.run {
             self.treeLoadStatus = "Restoring privacy infrastructure..."
             self.treeLoadProgress = 0.3
+            self.updateOverallProgress(phase: .loadingTree, phaseProgress: 0.1)
         }
 
         // Try GitHub downloaded tree first
@@ -330,6 +435,7 @@ final class WalletManager: ObservableObject {
                     self.isTreeLoaded = true
                     self.treeLoadProgress = 1.0
                     self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                    self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
                 }
                 return
             } else {
@@ -362,6 +468,7 @@ final class WalletManager: ObservableObject {
                         self.isTreeLoaded = true
                         self.treeLoadProgress = 1.0
                         self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                        self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
                     }
                     return
                 } else {
@@ -423,6 +530,7 @@ final class WalletManager: ObservableObject {
                     DispatchQueue.main.async {
                         self?.treeLoadProgress = progress
                         self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
+                        self?.updateOverallProgress(phase: .loadingTree, phaseProgress: progress)
                     }
                 }
                 continuation.resume(returning: result)
@@ -443,6 +551,7 @@ final class WalletManager: ObservableObject {
                 self.isTreeLoaded = true
                 self.treeLoadProgress = 1.0
                 self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
             }
         } else {
             print("❌ Failed to load commitment tree")
@@ -763,6 +872,8 @@ final class WalletManager: ObservableObject {
             self.isSyncing = true
             self.syncProgress = 0.0
             self.syncStatus = "Initializing privacy shield..."
+            // Move to connecting phase (tree loading should already be done)
+            self.updateOverallProgress(phase: .connecting, phaseProgress: 0.0)
             self.syncTasks = [
                 SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
                 SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
@@ -910,6 +1021,21 @@ final class WalletManager: ObservableObject {
                     print("✅ Corrupted headers cleared")
                 }
 
+                // CRITICAL: Ensure block hashes are loaded BEFORE header sync
+                // Without block hashes, P2P getheaders will use zero locator hash,
+                // causing peers to return genesis headers with wrong Equihash params (200,9 instead of 192,7)
+                print("📦 Ensuring block hashes are loaded for header sync locator...")
+                if !BundledBlockHashes.shared.isLoaded {
+                    do {
+                        try await BundledBlockHashes.shared.loadBundledHashes()
+                        print("✅ Block hashes ready for header sync")
+                    } catch {
+                        print("⚠️ Block hashes failed to load: \(error) - header sync may get wrong Equihash params")
+                    }
+                } else {
+                    print("✅ Block hashes already loaded")
+                }
+
                 print("🔄 Starting header sync...")
                 let headerSync = HeaderSyncManager(
                     headerStore: HeaderStore.shared,
@@ -926,6 +1052,9 @@ final class WalletManager: ObservableObject {
                                 ? Double(progress.currentHeight) / Double(progress.totalHeight)
                                 : 0.0
                             self?.syncTasks[index].progress = progressPercentage
+
+                            // Update monotonic progress for header sync phase
+                            self?.updateOverallProgress(phase: .syncingHeaders, phaseProgress: progressPercentage)
                         }
                     }
                 }
@@ -992,17 +1121,21 @@ final class WalletManager: ObservableObject {
                 self?.syncPhase = phase
                 self?.syncStatus = status
 
-                // Update task detail based on phase
+                // Update task detail and monotonic progress based on phase
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     switch phase {
                     case "phase1":
                         self?.syncTasks[index].detail = "Parallel note decryption"
+                        self?.updateOverallProgress(phase: .phase1Scanning, phaseProgress: 0.0)
                     case "phase1.5":
                         self?.syncTasks[index].detail = "Computing Merkle witnesses"
+                        self?.updateOverallProgress(phase: .phase15Witnesses, phaseProgress: 0.0)
                     case "phase1.6":
                         self?.syncTasks[index].detail = "Detecting spent notes"
+                        self?.updateOverallProgress(phase: .phase16SpentCheck, phaseProgress: 0.0)
                     case "phase2":
                         self?.syncTasks[index].detail = "Sequential tree building"
+                        self?.updateOverallProgress(phase: .phase2Sequential, phaseProgress: 0.0)
                     default:
                         break
                     }
@@ -1015,6 +1148,23 @@ final class WalletManager: ObservableObject {
                 self?.syncProgress = progress
                 self?.syncCurrentHeight = currentHeight
                 self?.syncMaxHeight = maxHeight
+
+                // Update monotonic progress based on current phase
+                let phase = self?.syncPhase ?? ""
+                switch phase {
+                case "phase1":
+                    self?.updateOverallProgress(phase: .phase1Scanning, phaseProgress: progress)
+                case "phase1.5":
+                    self?.updateOverallProgress(phase: .phase15Witnesses, phaseProgress: progress)
+                case "phase1.6":
+                    self?.updateOverallProgress(phase: .phase16SpentCheck, phaseProgress: progress)
+                case "phase2":
+                    self?.updateOverallProgress(phase: .phase2Sequential, phaseProgress: progress)
+                default:
+                    // For early sync phases, use syncingHeaders
+                    self?.updateOverallProgress(phase: .syncingHeaders, phaseProgress: progress)
+                }
+
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     // Show context: scanning from checkpoint to current with estimated date
                     let blocksToScan = maxHeight > bundledTreeHeight ? maxHeight - bundledTreeHeight : 0
@@ -1162,6 +1312,11 @@ final class WalletManager: ObservableObject {
         // Final verification step
         await updateTaskWithProgress("balance", detail: "Finalizing balance...", progress: 0.95)
 
+        // Update monotonic progress - entering finalization phase
+        await MainActor.run {
+            self.updateOverallProgress(phase: .finalizingBalance, phaseProgress: 0.5)
+        }
+
         // Update transaction confirmations based on current chain height
         if chainHeight > 0 {
             try? database.updateAllConfirmations(chainHeight: chainHeight)
@@ -1195,6 +1350,11 @@ final class WalletManager: ObservableObject {
                 UserDefaults.standard.set(false, forKey: "wallet_imported")
                 UserDefaults.standard.synchronize()
             }
+        }
+
+        // Complete monotonic progress - we're done!
+        await MainActor.run {
+            self.completeProgress()
         }
 
         print("✅ Sync complete: balance task finished")

@@ -39,17 +39,18 @@ fn main() {
     let input = &header[0..108];  // Version through bits
     let nonce = &header[108..140]; // 32-byte nonce
     
-    // Test with (192, 7) parameters - should PASS for post-Bubbles blocks
-    println!("\n--- Testing Equihash(192, 7) ---");
+    // Zclassic uses Equihash(192, 7) since Bubbles upgrade at height 585,318
+    // Source: /Users/chris/zclassic/zclassic/src/consensus/upgrades.cpp lines 78-82
+    println!("\n--- Testing Equihash(192, 7) [CORRECT for Zclassic post-Bubbles] ---");
     match equihash::is_valid_solution(192, 7, input, nonce, solution) {
         Ok(()) => println!("✅ Equihash(192, 7) verification PASSED!"),
         Err(e) => println!("❌ Equihash(192, 7) verification FAILED: {:?}", e),
     }
-    
-    // Also test with (200, 9) for comparison - should FAIL
-    println!("\n--- Testing Equihash(200, 9) ---");
+
+    // Also test with (200, 9) for comparison - should FAIL for post-Bubbles blocks
+    println!("\n--- Testing Equihash(200, 9) [pre-Bubbles / Zcash params - should fail] ---");
     match equihash::is_valid_solution(200, 9, input, nonce, solution) {
-        Ok(()) => println!("✅ Equihash(200, 9) verification PASSED!"),
-        Err(e) => println!("❌ Equihash(200, 9) verification FAILED: {:?}", e),
+        Ok(()) => println!("⚠️ Equihash(200, 9) verification PASSED (unexpected!)"),
+        Err(e) => println!("✅ Equihash(200, 9) correctly FAILED: {:?}", e),
     }
 }

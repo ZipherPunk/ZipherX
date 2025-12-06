@@ -301,7 +301,7 @@ struct SettingsView: View {
                 startRepairNotes()
             }
         } message: {
-            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height 2926122.\n\nDo you want to continue?")
+            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height \(ZipherXConstants.bundledTreeHeight).\n\nDo you want to continue?")
         }
         .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
             Button("Cancel - Keep Wallet", role: .cancel) {}

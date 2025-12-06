@@ -982,12 +982,9 @@ final class NetworkManager: ObservableObject {
 
     /// Fetch network statistics (P2P-first, InsightAPI fallback)
     func fetchNetworkStats() async {
-        print("📊 Fetching network stats...")
-
-        // Get peer version from first connected peer
+        // Get peer version from first connected peer (silently)
         if let peer = peers.first {
             let version = peer.peerUserAgent.isEmpty ? "Unknown" : peer.peerUserAgent
-            print("📊 [P2P] Peer version: \(version)")
             await MainActor.run {
                 self.peerVersion = version
             }
@@ -996,11 +993,11 @@ final class NetworkManager: ObservableObject {
         // Get authoritative chain height from InsightAPI
         // This is the source of truth for display - don't trust stale local headers
         var currentChainHeight: UInt64 = 0
+        let previousHeight = await MainActor.run { self.chainHeight }
 
         // 1. First try InsightAPI (authoritative network source)
         if let status = try? await InsightAPI.shared.getStatus() {
             currentChainHeight = status.height
-            print("📊 [API] Network height: \(currentChainHeight)")
             await MainActor.run {
                 self.networkDifficulty = status.difficulty
             }
@@ -1010,7 +1007,6 @@ final class NetworkManager: ObservableObject {
         if currentChainHeight == 0 {
             if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
                 currentChainHeight = headerHeight
-                print("📊 [P2P] HeaderStore height: \(headerHeight)")
             }
         }
 
@@ -1022,16 +1018,15 @@ final class NetworkManager: ObservableObject {
                     currentChainHeight = h
                 }
             }
-            if currentChainHeight > 0 {
-                print("📊 [P2P] Peer height: \(currentChainHeight)")
-            }
         }
 
-        // Update chain height
+        // Update chain height (only log if changed)
         if currentChainHeight > 0 {
             await MainActor.run {
+                if self.chainHeight != currentChainHeight {
+                    print("📊 Chain height: \(currentChainHeight)")
+                }
                 self.chainHeight = currentChainHeight
-                print("📊 Updated chainHeight to: \(self.chainHeight)")
             }
         }
 
@@ -1050,14 +1045,12 @@ final class NetworkManager: ObservableObject {
         // to avoid race conditions with MainActor updates
         // SKIP during initial sync to avoid race conditions with startup header sync
         if suppressBackgroundSync {
-            print("📊 Background sync suppressed (initial sync in progress)")
+            // Silently skip during initial sync
         } else if currentChainHeight > dbHeight && dbHeight > 0 {
-            print("🔄 Background sync needed: chain=\(currentChainHeight) wallet=\(dbHeight) (+\(currentChainHeight - dbHeight) blocks)")
+            print("🔄 Background sync: +\(currentChainHeight - dbHeight) blocks")
             Task {
                 await WalletManager.shared.backgroundSyncToHeight(currentChainHeight)
             }
-        } else if currentChainHeight > 0 && dbHeight > 0 {
-            print("📊 Sync check: chain=\(currentChainHeight) wallet=\(dbHeight) - no sync needed")
         }
 
         // MEMPOOL SCAN: Check for incoming unconfirmed transactions
@@ -1271,7 +1264,6 @@ final class NetworkManager: ObservableObject {
     /// Called when an incoming transaction is confirmed (found in a mined block)
     /// Removes from pending tracking and publishes confirmation for UI celebration
     func confirmIncomingTx(txid: String, amount: UInt64) async {
-        print("📥 confirmIncomingTx called for: \(txid.prefix(16))... amount=\(amount)")
 
         // Check if this was a tracked mempool incoming tx
         let trackedAmount = await txTrackingState.confirmIncoming(txid: txid)
@@ -1318,7 +1310,7 @@ final class NetworkManager: ObservableObject {
             // Receiver doesn't have send click time, so clearingTime/settlementTime are nil
             self.justConfirmedTx = (txid: txid, amount: finalAmount, isOutgoing: false, clearingTime: nil, settlementTime: nil)
             self.settlementCelebrationTrigger += 1  // Increment to trigger onChange
-            print("⛏️ SETTLEMENT! Incoming tx confirmed: \(txid.prefix(12))... +\(Double(finalAmount) / 100_000_000.0) ZCL (trigger=\(self.settlementCelebrationTrigger))")
+            print("⛏️ Confirmed: +\(Double(finalAmount) / 100_000_000.0) ZCL")
 
             // Also send system notification
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
@@ -1330,8 +1322,10 @@ final class NetworkManager: ObservableObject {
     func checkPendingOutgoingConfirmations() async {
         let pendingTxids = await txTrackingState.getPendingTxids()
 
-        // Always log current state for debugging
-        print("📤 checkPendingOutgoingConfirmations: pendingTxids.count=\(pendingTxids.count), mempoolOutgoing=\(mempoolOutgoing)")
+        // Only log when there's something to check
+        if !pendingTxids.isEmpty || mempoolOutgoing > 0 {
+            print("📤 checkPendingOutgoingConfirmations: pendingTxids=\(pendingTxids.count), mempoolOutgoing=\(mempoolOutgoing)")
+        }
 
         guard !pendingTxids.isEmpty else {
             // If we have mempoolOutgoing > 0 but no pending txids, something is out of sync
@@ -1411,8 +1405,10 @@ final class NetworkManager: ObservableObject {
     func checkPendingIncomingConfirmations() async {
         let pendingIncoming = await txTrackingState.getPendingIncomingTxids()
 
-        // Always log current state for debugging
-        print("📥 checkPendingIncomingConfirmations: pendingIncoming.count=\(pendingIncoming.count), mempoolIncoming=\(mempoolIncoming)")
+        // Only log when there's something to check
+        if !pendingIncoming.isEmpty || mempoolIncoming > 0 {
+            print("📥 checkPendingIncomingConfirmations: pendingIncoming=\(pendingIncoming.count), mempoolIncoming=\(mempoolIncoming)")
+        }
 
         guard !pendingIncoming.isEmpty else {
             // If we have mempoolIncoming > 0 but no pending txids, something is out of sync
@@ -1427,8 +1423,7 @@ final class NetworkManager: ObservableObject {
             return
         }
 
-        print("📥 Checking \(pendingIncoming.count) pending incoming transactions for confirmations...")
-        print("📥 Pending txids: \(pendingIncoming.map { $0.txid.prefix(16) + "..." })")
+        // Check pending incoming transactions silently
 
         var confirmedCount = 0
 
@@ -1436,14 +1431,12 @@ final class NetworkManager: ObservableObject {
             // Check if transaction has confirmations via InsightAPI
             do {
                 let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
-                print("📥 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
                 if txInfo.confirmations >= 1 {
-                    print("📥 Tx \(txid.prefix(16))... CONFIRMED (1+ conf)! Calling confirmIncomingTx...")
                     await confirmIncomingTx(txid: txid, amount: amount)
                     confirmedCount += 1
                 }
             } catch {
-                print("📥 Failed to check tx \(txid.prefix(16))...: \(error)")
+                // Silently skip failed checks
             }
         }
 

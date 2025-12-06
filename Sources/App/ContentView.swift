@@ -445,58 +445,12 @@ struct ContentView: View {
         }
     }
 
-    /// Combined progress for all sync phases
+    /// Combined progress for all sync phases - MONOTONIC (never decreases!)
+    /// Uses WalletManager.overallProgress which only ever increases
     private var currentSyncProgress: Double {
-        // Tree loading phase (0-40%) - FIRST priority
-        // Tree loads before network connection starts
-        if !walletManager.isTreeLoaded {
-            // Show 5% immediately, then scale progress from 5-40%
-            let baseProgress = 0.05
-            let treePhaseSize = 0.35
-            return baseProgress + (walletManager.treeLoadProgress * treePhaseSize)
-        }
-
-        // Connecting phase (40-50%) - after tree is loaded
-        if !networkManager.isConnected {
-            return walletManager.isConnecting ? 0.45 : 0.40
-        }
-
-        // Check if all tasks are completed
-        let allTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
-            if case .completed = $0.status { return true }
-            if case .failed = $0.status { return true }
-            return false
-        }
-
-        // Check if balance task is completed (strong completion signal)
-        let balanceCompleted = walletManager.syncTasks.contains {
-            $0.id == "balance" && $0.status == .completed
-        }
-
-        // PRIORITY: If all tasks completed OR balance completed, show 98%
-        // This takes precedence over catch-up phase to avoid stuck at 96%
-        if allTasksCompleted || balanceCompleted {
-            return 0.98
-        }
-
-        // Sync phase (50-95%)
-        if walletManager.isSyncing || !walletManager.syncTasks.isEmpty {
-            return 0.50 + (walletManager.syncProgress * 0.45)
-        }
-
-        // Catch-up phase (95-98%) - when isConnecting is set but not syncing
-        // This happens BEFORE sync tasks are created
-        if walletManager.isConnecting && !walletManager.isSyncing {
-            return 0.96
-        }
-
-        // Finalizing phase (100%) - only if we're truly done
-        if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
-            return 1.0
-        }
-
-        // Still waiting for sync to start
-        return 0.50
+        // Use the monotonic progress from WalletManager
+        // This never goes backward, providing smooth UX
+        return walletManager.overallProgress
     }
 
     /// Combined status for all sync phases

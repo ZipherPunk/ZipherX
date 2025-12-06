@@ -2998,10 +2998,23 @@ pub unsafe extern "C" fn zipherx_verify_equihash(
     solution: *const u8,
     solution_len: usize,
 ) -> bool {
-    // Zclassic Equihash parameters (post-Bubbles upgrade at height 585,318)
-    // Changed from Zcash's (200, 9) to (192, 7) for ASIC resistance
+    // Zclassic Equihash parameters - changed at Bubbles upgrade (height 585,318)
+    // Source: /Users/chris/zclassic/zclassic/src/consensus/upgrades.cpp lines 78-82
+    // Pre-Bubbles (< 585,318): Equihash(200, 9) - same as Zcash
+    // Post-Bubbles (>= 585,318): Equihash(192, 7) - ASIC resistant
+    // ZipherX only syncs from Sapling activation (476,969), which is before Bubbles,
+    // but all current blocks use (192, 7) since we're well past height 585,318
     const N: u32 = 192;
     const K: u32 = 7;
+
+    // Expected solution size: (2^K) * (N/(K+1) + 1) / 8 = 128 * 25 / 8 = 400 bytes
+    const EXPECTED_SOLUTION_LEN: usize = 400;
+
+    // Debug: log solution length mismatch
+    if solution_len != EXPECTED_SOLUTION_LEN {
+        eprintln!("❌ Equihash solution length mismatch: got {} bytes, expected {} bytes for (192,7)",
+                  solution_len, EXPECTED_SOLUTION_LEN);
+    }
 
     // Header is 140 bytes total:
     // - First 108 bytes: header data (input for Equihash)
@@ -3021,7 +3034,7 @@ pub unsafe extern "C" fn zipherx_verify_equihash(
             true
         }
         Err(e) => {
-            eprintln!("❌ Equihash verification failed: {:?}", e);
+            eprintln!("❌ Equihash verification failed (solution_len={}): {:?}", solution_len, e);
             false
         }
     }

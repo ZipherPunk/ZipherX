@@ -410,11 +410,20 @@ final class HeaderSyncManager {
             }
         }
 
-        // Fallback: Use zero hash (will return headers from genesis)
+        // Third try: Get from BundledBlockHashes (downloaded from GitHub)
+        if locatorHash == nil {
+            let bundledHashes = BundledBlockHashes.shared
+            if bundledHashes.isLoaded, let hash = bundledHashes.getBlockHash(at: locatorHeight) {
+                locatorHash = hash  // Already in wire format
+                print("📋 Using BundledBlockHashes hash for locator at height \(locatorHeight)")
+            }
+        }
+
+        // Fallback: Use zero hash (will return headers from genesis) - SECURITY WARNING: may get old headers!
         if let hash = locatorHash {
             payload.append(hash)
         } else {
-            print("⚠️ No locator hash available for height \(locatorHeight), using zero hash")
+            print("🚨 No locator hash available for height \(locatorHeight), using zero hash (may get wrong Equihash params!)")
             payload.append(Data(count: 32))
         }
 

@@ -80,6 +80,7 @@ bool zipherx_build_transaction_multi(
 // Commitment tree functions
 bool zipherx_tree_init(void);
 uint64_t zipherx_tree_append(const uint8_t *cmu);
+uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);  // Batch append (faster)
 uint64_t zipherx_tree_witness_current(void);
 bool zipherx_tree_root(uint8_t *root_out);
 bool zipherx_tree_get_witness(uint64_t witness_index, uint8_t *witness_out);
