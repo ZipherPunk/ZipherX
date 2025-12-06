@@ -460,8 +460,15 @@ Your private keys remain SECURE in ZipherX's encrypted storage.
 
 The daemon's wallet is NEVER accessed for signing.
 
-⚠️ Requires ~5GB storage for blockchain data.
-You can switch back to Light mode anytime.
+⚠️ REQUIREMENTS:
+• ~5 GB disk space for blockchain data
+• ~2-4 hours for initial blockchain sync
+• Stable internet connection during sync
+• zclassicd daemon must be installed
+
+"By running a full node, you become part of the network's backbone. You verify every transaction independently, trusting no one. This is the cypherpunk way."
+
+Thank you for strengthening the network! 🛡️
 """)
         }
         .sheet(isPresented: $showBootstrapSheet) {
