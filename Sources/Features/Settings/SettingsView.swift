@@ -461,10 +461,18 @@ Your private keys remain SECURE in ZipherX's encrypted storage.
 The daemon's wallet is NEVER accessed for signing.
 
 ⚠️ REQUIREMENTS:
-• ~5 GB disk space for blockchain data
-• ~2-4 hours for initial blockchain sync
+• ~10 GB disk space for blockchain data
+• ~10 minutes with bootstrap (or 2-4 hours without)
 • Stable internet connection during sync
-• zclassicd daemon must be installed
+• zclassicd + zclassic-cli must be installed
+
+📦 DAEMON INSTALLATION:
+ZipherX can install the daemon binaries for you, or you can verify and compile yourself from the official source:
+https://github.com/ZclassicCommunity/zclassic
+
+🚀 BOOTSTRAP:
+ZipherX downloads the latest blockchain bootstrap for fast sync:
+https://github.com/VictorLux/zclassic-bootstrap
 
 "By running a full node, you become part of the network's backbone. You verify every transaction independently, trusting no one. This is the cypherpunk way."
 

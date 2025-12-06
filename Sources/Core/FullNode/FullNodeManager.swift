@@ -334,6 +334,48 @@ public class FullNodeManager: ObservableObject {
         print("✅ Created zclassic.conf")
     }
 
+    // MARK: - Daemon Installation Info
+
+    /// Official source URL for building from source
+    public static let officialSourceURL = "https://github.com/ZclassicCommunity/zclassic"
+
+    /// Bootstrap download URL for fast sync
+    public static let bootstrapURL = "https://github.com/VictorLux/zclassic-bootstrap"
+
+    /// Check if daemon is installed at /usr/local/bin
+    public var isDaemonInstalledAtPath: Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: Self.daemonPath.path) &&
+               fm.fileExists(atPath: Self.cliPath.path)
+    }
+
+    /// Get daemon version if installed
+    public func getDaemonVersion() async -> String? {
+        guard isDaemonInstalledAtPath else { return nil }
+
+        let process = Process()
+        process.executableURL = Self.daemonPath
+        process.arguments = ["--version"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                // Extract version from output (e.g., "Zclassic Daemon version v2.1.2-1")
+                return output.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        } catch {
+            print("⚠️ Could not get daemon version: \(error)")
+        }
+        return nil
+    }
+
     // MARK: - Helpers
 
     private func getDirectorySize(_ url: URL) -> UInt64? {
@@ -364,20 +406,17 @@ public enum FullNodeError: Error, LocalizedError {
     case daemonNotRunning
     case startupTimeout
     case configError(String)
-    case walletError(String)
 
     public var errorDescription: String? {
         switch self {
         case .daemonNotInstalled:
-            return "Zclassic daemon is not installed"
+            return "Zclassic daemon is not installed. Please install zclassicd and zclassic-cli to /usr/local/bin from https://github.com/ZclassicCommunity/zclassic"
         case .daemonNotRunning:
             return "Daemon is not running"
         case .startupTimeout:
             return "Daemon failed to start within timeout"
         case .configError(let msg):
             return "Configuration error: \(msg)"
-        case .walletError(let msg):
-            return "Wallet error: \(msg)"
         }
     }
 }
