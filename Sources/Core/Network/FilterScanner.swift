@@ -1321,9 +1321,9 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
+                // Block transactions are already confirmed so they don't need pending tracking.
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1397,11 +1397,14 @@ final class FilterScanner {
         }
 
         guard !batchOutputs.isEmpty else {
-            debugLog(.sync, "⚡ Batch \(heightRange.lowerBound)-\(heightRange.upperBound): 0 outputs, \(totalSpends) spends collected")
+            // Empty batch - no debug logging (too spammy for 2.4M blocks)
             return
         }
 
-        debugLog(.sync, "🚀 Parallel decrypting \(batchOutputs.count) outputs from \(heightRange.count) blocks...")
+        // Only log every 10th batch with outputs to reduce spam
+        if heightRange.lowerBound % 5000 == 0 {
+            debugLog(.sync, "🚀 Parallel decrypting \(batchOutputs.count) outputs...")
+        }
 
         // Step 2: Convert to FFI format (handles byte order conversion)
         let ffiOutputs = batchOutputs.map { info -> ZipherXFFI.FFIShieldedOutput in
@@ -1488,10 +1491,8 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                // Track as incoming
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: info.txid, amount: note.value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
                 let memoText = String(data: note.memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,
@@ -1660,9 +1661,8 @@ final class FilterScanner {
             }
 
             if !isChangeOutput {
-                Task { @MainActor in
-                    await NetworkManager.shared.trackPendingIncoming(txid: txid, amount: value)
-                }
+                // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
+                // trackPendingIncoming should only be called for mempool (0-confirmation) transactions.
                 let memoText = String(data: memo.prefix(while: { $0 != 0 }), encoding: .utf8)
                 try database.recordReceivedTransaction(
                     txid: txidData,

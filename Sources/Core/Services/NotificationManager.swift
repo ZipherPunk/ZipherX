@@ -11,6 +11,20 @@ import AppKit
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
+    /// Flag to suppress notifications during initial sync for imported wallets
+    /// (avoids notification spam when scanning through historical transactions)
+    var isInitialSyncInProgress: Bool = false
+
+    /// Helper to check if we should suppress notifications
+    /// Suppresses during: initial sync flag OR wallet manager syncing
+    private var shouldSuppressNotifications: Bool {
+        if isInitialSyncInProgress {
+            return true
+        }
+        // Also suppress during any wallet sync operation
+        return WalletManager.shared.isSyncing
+    }
+
     private override init() {
         super.init()
         // Set self as delegate to show notifications in foreground
@@ -72,12 +86,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is received (pending in mempool)
     func notifyReceived(amount: UInt64, txid: String, memo: String? = nil) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !shouldSuppressNotifications else { return }
+
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 NOTIFICATION: notifyReceived called")
-        print("   amount=\(amount) (\(zcl) ZCL)")
-        print("   txid=\(txid.prefix(16))...")
-        print("   memo=\(memo ?? "nil")")
-        print("   >>> Sending MEMPOOL INCOMING notification")
+        print("🔔 Notification: +\(zcl) ZCL incoming (mempool)")
 
         let content = UNMutableNotificationContent()
         content.title = "Incoming ZCL"
@@ -108,17 +121,15 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is received AND confirmed (mined in block)
     func notifyReceivedConfirmed(amount: UInt64, txid: String, memo: String? = nil) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !shouldSuppressNotifications else { return }
+
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 NOTIFICATION: notifyReceivedConfirmed called")
-        print("   amount=\(amount) (\(zcl) ZCL)")
-        print("   txid=\(txid.prefix(16))...")
-        print("   memo=\(memo ?? "nil")")
-        print("   >>> Sending MINED INCOMING notification")
+        print("🔔 Notification: +\(zcl) ZCL confirmed")
 
         // Remove the pending "Incoming" notification for this txid
         // This replaces the "Awaiting confirmation" message with "Received"
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["received-\(txid)"])
-        print("   Removed pending notification: received-\(txid)")
 
         let content = UNMutableNotificationContent()
         content.title = "⛏️ ZCL Received"
@@ -150,11 +161,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when transaction is confirmed (for outgoing txs)
     func notifyConfirmed(amount: UInt64, txid: String) {
+        // Suppress notifications during initial wallet sync (historical txs)
+        guard !shouldSuppressNotifications else { return }
+
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 NOTIFICATION: notifyConfirmed called")
-        print("   amount=\(amount) (\(zcl) ZCL)")
-        print("   txid=\(txid.prefix(16))...")
-        print("   >>> Sending OUTGOING TX MINED notification")
+        print("🔔 Notification: -\(zcl) ZCL confirmed")
 
         let content = UNMutableNotificationContent()
         content.title = "⛏️ Transaction Mined"
@@ -178,6 +189,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// Notify when ZCL is sent
     func notifySent(amount: UInt64, txid: String, memo: String? = nil) {
+        // Note: notifySent is NOT suppressed during sync because user explicitly initiates sends
+        // This is intentional - user should always see confirmation of their own actions
+
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifySent called")
         print("   amount=\(amount) (\(zcl) ZCL)")

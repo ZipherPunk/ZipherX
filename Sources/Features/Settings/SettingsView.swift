@@ -121,6 +121,7 @@ struct SettingsView: View {
     @State private var showPINSetup = false
     @State private var pinCode = ""
     @State private var confirmPIN = ""
+    @State private var showPINText = false  // Toggle to show/hide PIN text
     @State private var biometricAvailable = false
     @State private var showRescanWarning = false
     @State private var showRescanProgress = false
@@ -300,7 +301,7 @@ struct SettingsView: View {
                 startRepairNotes()
             }
         } message: {
-            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height 2926122.\n\nDo you want to continue?")
+            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height \(ZipherXConstants.bundledTreeHeight).\n\nDo you want to continue?")
         }
         .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
             Button("Cancel - Keep Wallet", role: .cancel) {}
@@ -336,10 +337,15 @@ struct SettingsView: View {
     #if os(macOS)
     @State private var showBootstrapSheet = false
     @State private var showModeChangeAlert = false
+    @State private var showDaemonInstallChoice = false
+    @State private var showDaemonInstallProgress = false
+    @State private var daemonInstallError: String?
+    @State private var showNodeManagement = false
 
     private var walletModeSection: some View {
         let modeManager = WalletModeManager.shared
         let bootstrapManager = BootstrapManager.shared
+        let fullNodeManager = FullNodeManager.shared
 
         return VStack(spacing: 12) {
             // Section header
@@ -440,14 +446,100 @@ struct SettingsView: View {
         )
         .alert("Switch to Full Node Mode?", isPresented: $showModeChangeAlert) {
             Button("Cancel", role: .cancel) {}
-            Button("Switch") {
-                modeManager.setMode(.fullNode)
-                if bootstrapManager.needsBootstrap {
-                    showBootstrapSheet = true
+            Button("I Understand, Continue") {
+                // Check if daemon is already installed
+                if fullNodeManager.isDaemonInstalledAtPath {
+                    // Daemon already installed, proceed directly
+                    modeManager.setMode(.fullNode)
+                    if bootstrapManager.needsBootstrap {
+                        showBootstrapSheet = true
+                    }
+                } else {
+                    // Show daemon installation choice
+                    showDaemonInstallChoice = true
                 }
             }
         } message: {
-            Text("Full Node mode requires ~5GB of storage and will download the Zclassic blockchain.\n\nThis provides complete verification and explorer features.\n\nYou can switch back to Light mode anytime.")
+            Text("""
+🔐 SECURITY NOTICE
+
+Your private keys remain SECURE in ZipherX's encrypted storage.
+
+• ZipherX will NOT use the daemon's wallet.dat
+• Your spending key stays in Secure Enclave / encrypted keychain
+• Send/receive continues through ZipherX wallet
+• Full Node only provides trusted block height & verification
+
+The daemon's wallet is NEVER accessed for signing.
+
+⚠️ REQUIREMENTS:
+• ~10 GB disk space for blockchain data
+• ~10 minutes with bootstrap (or 2-4 hours without)
+• Stable internet connection during sync
+• zclassicd + zclassic-cli must be installed
+
+🚀 BOOTSTRAP:
+ZipherX downloads the latest blockchain bootstrap for fast sync:
+https://github.com/VictorLux/zclassic-bootstrap
+
+"By running a full node, you become part of the network's backbone. You verify every transaction independently, trusting no one. This is the cypherpunk way."
+
+Thank you for strengthening the network! 🛡️
+""")
+        }
+        // Daemon installation choice alert
+        .alert("Install Daemon Binaries?", isPresented: $showDaemonInstallChoice) {
+            Button("Cancel", role: .cancel) {}
+            Button("I'll Install Myself") {
+                // User will handle installation, show info
+                if let url = URL(string: FullNodeManager.officialSourceURL) {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            if fullNodeManager.hasBundledDaemon {
+                Button("Install from ZipherX") {
+                    // Install bundled binaries
+                    Task {
+                        do {
+                            try await fullNodeManager.installDaemonFromBundle()
+                            await MainActor.run {
+                                modeManager.setMode(.fullNode)
+                                if bootstrapManager.needsBootstrap {
+                                    showBootstrapSheet = true
+                                }
+                            }
+                        } catch {
+                            await MainActor.run {
+                                daemonInstallError = error.localizedDescription
+                            }
+                        }
+                    }
+                }
+            }
+        } message: {
+            Text("""
+zclassicd and zclassic-cli are required for Full Node mode.
+
+📦 INSTALL FROM ZIPHERX:
+ZipherX includes pre-built binaries that will be installed to /usr/local/bin
+
+🔧 INSTALL YOURSELF:
+Download and compile from the official source. This allows you to verify the code yourself (recommended for maximum security):
+https://github.com/ZclassicCommunity/zclassic
+
+Both binaries must be installed to /usr/local/bin:
+• /usr/local/bin/zclassicd
+• /usr/local/bin/zclassic-cli
+""")
+        }
+        // Installation error alert
+        .alert("Installation Failed", isPresented: .init(
+            get: { daemonInstallError != nil },
+            set: { if !$0 { daemonInstallError = nil } }
+        )) {
+            Button("OK") { daemonInstallError = nil }
+        } message: {
+            Text(daemonInstallError ?? "Unknown error")
         }
         .sheet(isPresented: $showBootstrapSheet) {
             BootstrapProgressView()
@@ -485,6 +577,24 @@ struct SettingsView: View {
                     .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
             )
 
+            // Node Management button
+            Button(action: {
+                showNodeManagement = true
+            }) {
+                HStack {
+                    Image(systemName: "gearshape.2.fill")
+                    Text("Node Management")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(theme.bodyFont)
+                .foregroundColor(.white)
+                .padding(12)
+                .background(theme.primaryColor)
+                .cornerRadius(theme.cornerRadius)
+            }
+            .buttonStyle(PlainButtonStyle())
+
             // Switch to Light mode button
             Button(action: {
                 modeManager.setMode(.light)
@@ -505,6 +615,10 @@ struct SettingsView: View {
                 )
             }
             .buttonStyle(PlainButtonStyle())
+        }
+        .sheet(isPresented: $showNodeManagement) {
+            NodeManagementView()
+                .environmentObject(themeManager)
         }
     }
     #endif
@@ -813,58 +927,60 @@ struct SettingsView: View {
             }
             .foregroundColor(theme.textPrimary)
 
-            // P2P Only toggle
-            HStack {
-                Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.system(size: 14))
-                    .foregroundColor(theme.textPrimary)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("P2P Only Mode")
-                        .font(theme.bodyFont)
+            // P2P Only toggle - DEACTIVATED (feature not ready for release)
+            if false {
+                HStack {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 14))
                         .foregroundColor(theme.textPrimary)
-                    Text("No centralized API fallback")
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("P2P Only Mode")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textPrimary)
+                        Text("No centralized API fallback")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    Spacer()
+
+                    Toggle("", isOn: $useP2POnly)
+                        .labelsHidden()
+                        .onChange(of: useP2POnly) { newValue in
+                            UserDefaults.standard.set(newValue, forKey: "useP2POnly")
+                            // FilterScanner reads from UserDefaults on init
+                            print("🌐 P2P Only Mode: \(newValue ? "ENABLED" : "disabled")")
+                        }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+
+                // Info text
+                HStack(spacing: 8) {
+                    Image(systemName: useP2POnly ? "checkmark.shield.fill" : "info.circle")
+                        .foregroundColor(useP2POnly ? .green : .blue)
+                        .font(.system(size: 12))
+
+                    Text(useP2POnly ?
+                        "Maximum security: All data verified via decentralized P2P network with multi-peer consensus." :
+                        "P2P first with InsightAPI fallback. Enable P2P-only for trustless operation.")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Spacer()
-
-                Toggle("", isOn: $useP2POnly)
-                    .labelsHidden()
-                    .onChange(of: useP2POnly) { newValue in
-                        UserDefaults.standard.set(newValue, forKey: "useP2POnly")
-                        // FilterScanner reads from UserDefaults on init
-                        print("🌐 P2P Only Mode: \(newValue ? "ENABLED" : "disabled")")
-                    }
+                .padding(8)
+                .background(useP2POnly ? Color.green.opacity(0.1) : theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(useP2POnly ? Color.green.opacity(0.5) : theme.textPrimary.opacity(0.3), lineWidth: 1)
+                )
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(theme.surfaceColor)
-            .overlay(
-                Rectangle()
-                    .stroke(theme.textPrimary, lineWidth: 1)
-            )
-
-            // Info text
-            HStack(spacing: 8) {
-                Image(systemName: useP2POnly ? "checkmark.shield.fill" : "info.circle")
-                    .foregroundColor(useP2POnly ? .green : .blue)
-                    .font(.system(size: 12))
-
-                Text(useP2POnly ?
-                    "Maximum security: All data verified via decentralized P2P network with multi-peer consensus." :
-                    "P2P first with InsightAPI fallback. Enable P2P-only for trustless operation.")
-                    .font(theme.captionFont)
-                    .foregroundColor(theme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(8)
-            .background(useP2POnly ? Color.green.opacity(0.1) : theme.surfaceColor)
-            .overlay(
-                Rectangle()
-                    .stroke(useP2POnly ? Color.green.opacity(0.5) : theme.textPrimary.opacity(0.3), lineWidth: 1)
-            )
 
             // Banned Peers button
             Button(action: {
@@ -899,51 +1015,53 @@ struct SettingsView: View {
                 )
             }
 
-            // Export Reliable Peers button (for bundling in future releases)
-            Button(action: {
-                exportReliablePeers()
-            }) {
-                HStack {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 14))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Export Reliable Peers")
-                            .font(theme.bodyFont)
-                        Text("\(networkManager.reliablePeerCount) peers with >50% success")
-                            .font(theme.captionFont)
+            // Export Reliable Peers button - DEACTIVATED (developer feature)
+            if false {
+                Button(action: {
+                    exportReliablePeers()
+                }) {
+                    HStack {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 14))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Export Reliable Peers")
+                                .font(theme.bodyFont)
+                            Text("\(networkManager.reliablePeerCount) peers with >50% success")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10))
                             .foregroundColor(theme.textSecondary)
                     }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10))
-                        .foregroundColor(theme.textSecondary)
+                    .foregroundColor(theme.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(networkManager.reliablePeerCount >= 100 ? Color.green.opacity(0.1) : theme.surfaceColor)
+                    .overlay(
+                        Rectangle()
+                            .stroke(networkManager.reliablePeerCount >= 100 ? Color.green : theme.textPrimary, lineWidth: 1)
+                    )
                 }
-                .foregroundColor(theme.textPrimary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(networkManager.reliablePeerCount >= 100 ? Color.green.opacity(0.1) : theme.surfaceColor)
-                .overlay(
-                    Rectangle()
-                        .stroke(networkManager.reliablePeerCount >= 100 ? Color.green : theme.textPrimary, lineWidth: 1)
-                )
-            }
 
-            // Info text about peer export
-            if networkManager.reliablePeerCount >= 100 {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                        .font(.system(size: 12))
-                    Text("100+ reliable peers ready for bundling!")
-                        .font(theme.captionFont)
-                        .foregroundColor(.green)
+                // Info text about peer export
+                if networkManager.reliablePeerCount >= 100 {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 12))
+                        Text("100+ reliable peers ready for bundling!")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    }
+                    .padding(8)
+                    .background(Color.green.opacity(0.1))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.green.opacity(0.5), lineWidth: 1)
+                    )
                 }
-                .padding(8)
-                .background(Color.green.opacity(0.1))
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.green.opacity(0.5), lineWidth: 1)
-                )
             }
         }
         .padding(12)
@@ -1023,8 +1141,8 @@ struct SettingsView: View {
                     .stroke(Color.orange.opacity(0.3), lineWidth: 1)
             )
 
-            // Reveal Seed Phrase (if not imported wallet)
-            if !walletManager.isImportedWallet {
+            // Reveal Seed Phrase - DEACTIVATED (seed not stored for privacy)
+            if false && !walletManager.isImportedWallet {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Image(systemName: "list.number")
@@ -1575,25 +1693,65 @@ struct SettingsView: View {
                 .foregroundColor(theme.textPrimary)
 
             VStack(spacing: 12) {
-                SecureField("Enter 4-6 digit PIN", text: $pinCode)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    #if os(iOS)
-                    .keyboardType(.numberPad)
-                    #endif
-                    .frame(maxWidth: 200)
+                // PIN entry with show/hide toggle
+                HStack {
+                    if showPINText {
+                        TextField("Enter 4-6 digit PIN", text: $pinCode)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                    } else {
+                        SecureField("Enter 4-6 digit PIN", text: $pinCode)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                    }
 
-                SecureField("Confirm PIN", text: $confirmPIN)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    #if os(iOS)
-                    .keyboardType(.numberPad)
-                    #endif
-                    .frame(maxWidth: 200)
+                    Button(action: { showPINText.toggle() }) {
+                        Image(systemName: showPINText ? "eye.slash.fill" : "eye.fill")
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .frame(maxWidth: 250)
+
+                // Confirm PIN with same visibility
+                HStack {
+                    if showPINText {
+                        TextField("Confirm PIN", text: $confirmPIN)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                    } else {
+                        SecureField("Confirm PIN", text: $confirmPIN)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                    }
+
+                    // Spacer to align with first field's button
+                    Image(systemName: "eye.fill")
+                        .foregroundColor(.clear)
+                }
+                .frame(maxWidth: 250)
+            }
+
+            // Show PIN mismatch warning
+            if !pinCode.isEmpty && !confirmPIN.isEmpty && pinCode != confirmPIN {
+                Text("PINs do not match")
+                    .font(theme.captionFont)
+                    .foregroundColor(.red)
             }
 
             HStack(spacing: 12) {
                 Button("Cancel") {
                     pinCode = ""
                     confirmPIN = ""
+                    showPINText = false
                     usePINCode = false
                     showPINSetup = false
                 }
@@ -1601,6 +1759,7 @@ struct SettingsView: View {
 
                 Button("Save") {
                     savePIN()
+                    showPINText = false
                 }
                 .disabled(pinCode.count < 4 || pinCode != confirmPIN)
             }

@@ -10,6 +10,7 @@
 // - hashes: 32 bytes each (wire format, little-endian)
 
 import Foundation
+import CommonCrypto
 
 /// Manager for bundled block hashes - enables fast P2P block fetching
 /// without needing to sync headers from the network first.
@@ -92,15 +93,78 @@ final class BundledBlockHashes {
         print("✅ Downloaded and loaded \(count) block hashes in \(String(format: "%.1f", elapsed))s")
     }
 
-    /// Download block hashes from GitHub (fallback if not bundled/cached)
+    /// Download block hashes from GitHub Releases (fallback if not bundled/cached)
+    /// First fetches manifest to get checksum, then downloads and verifies
     private func downloadFromGitHub(onProgress: ((UInt64, UInt64) -> Void)? = nil) async throws {
-        let urlString = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/block_hashes.bin"
+        print("📥 Fetching block hashes manifest from GitHub...")
 
+        // 1. Fetch manifest to get checksum and latest height
+        let manifestURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/manifest.json"
+        guard let manifestUrl = URL(string: manifestURL) else {
+            throw BundledHashesError.invalidURL
+        }
+
+        let (manifestData, manifestResponse) = try await URLSession.shared.data(from: manifestUrl)
+        guard let httpResponse = manifestResponse as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw BundledHashesError.downloadFailed
+        }
+
+        // Parse manifest to get checksum
+        guard let manifest = try? JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+              let blockHashes = manifest["block_hashes"] as? [String: Any],
+              let expectedSHA256 = blockHashes["sha256"] as? String,
+              let endHeight = blockHashes["end_height"] as? Int else {
+            print("⚠️ Could not parse manifest, downloading without checksum verification")
+            try await downloadWithoutChecksum(onProgress: onProgress)
+            return
+        }
+
+        print("📥 Manifest shows block hashes to height \(endHeight), checksum: \(expectedSHA256.prefix(16))...")
+
+        // 2. Download from GitHub Releases
+        let urlString = "https://github.com/VictorLux/ZipherX_Boost/releases/download/v\(endHeight)-hashes/block_hashes.bin"
         guard let url = URL(string: urlString) else {
             throw BundledHashesError.invalidURL
         }
 
-        print("📥 Downloading block hashes from GitHub...")
+        print("📥 Downloading block hashes from: \(urlString)")
+
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        guard let httpResp = response as? HTTPURLResponse,
+              httpResp.statusCode == 200 else {
+            throw BundledHashesError.downloadFailed
+        }
+
+        // 3. Verify SHA256 checksum BEFORE using
+        print("🔐 Verifying block hashes checksum...")
+        let computedHash = sha256(data: data)
+        guard computedHash.lowercased() == expectedSHA256.lowercased() else {
+            print("🚨 SECURITY: Block hashes checksum mismatch!")
+            print("   Expected: \(expectedSHA256)")
+            print("   Got:      \(computedHash)")
+            throw BundledHashesError.checksumMismatch
+        }
+        print("✅ Block hashes checksum verified")
+
+        try loadFromData(data, onProgress: onProgress)
+
+        // Save to Documents for future use
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let savedURL = documentsURL.appendingPathComponent("block_hashes.bin")
+        try data.write(to: savedURL)
+        print("💾 Saved block hashes to Documents for future use")
+    }
+
+    /// Fallback download without checksum (if manifest parsing fails)
+    private func downloadWithoutChecksum(onProgress: ((UInt64, UInt64) -> Void)? = nil) async throws {
+        let urlString = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/block_hashes.bin"
+        guard let url = URL(string: urlString) else {
+            throw BundledHashesError.invalidURL
+        }
+
+        print("⚠️ Downloading block hashes without checksum verification (fallback)...")
 
         let (data, response) = try await URLSession.shared.data(from: url)
 
@@ -116,6 +180,15 @@ final class BundledBlockHashes {
         let savedURL = documentsURL.appendingPathComponent("block_hashes.bin")
         try data.write(to: savedURL)
         print("💾 Saved block hashes to Documents for future use")
+    }
+
+    /// Calculate SHA256 hash of data
+    private func sha256(data: Data) -> String {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return hash.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Load hashes from data
@@ -220,6 +293,7 @@ enum BundledHashesError: Error, LocalizedError {
     case invalidURL
     case downloadFailed
     case invalidFormat
+    case checksumMismatch
 
     var errorDescription: String? {
         switch self {
@@ -229,6 +303,8 @@ enum BundledHashesError: Error, LocalizedError {
             return "Failed to download block hashes"
         case .invalidFormat:
             return "Invalid block hashes file format"
+        case .checksumMismatch:
+            return "Block hashes checksum verification failed - file may be corrupted or tampered"
         }
     }
 }

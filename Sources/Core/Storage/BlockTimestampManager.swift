@@ -15,8 +15,9 @@ final class BlockTimestampManager {
     static let shared = BlockTimestampManager()
 
     // GitHub URLs (from ZipherX_Boost repo)
+    // Manifest is always from main branch (contains latest height info)
     private static let MANIFEST_URL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/block_timestamps_manifest.json"
-    private static let TIMESTAMPS_URL = "https://github.com/VictorLux/ZipherX_Boost/releases/download/v1.0.0-timestamps/block_timestamps.bin"
+    // Timestamps file URL is built dynamically based on manifest height
 
     /// Local cache filename
     private static let CACHE_FILENAME = "block_timestamps_cache.bin"
@@ -103,9 +104,13 @@ final class BlockTimestampManager {
         print("⬇️ Downloading newer timestamps (remote: \(remoteManifest.maxHeight) > local: \(localMaxHeight))...")
         onProgress?(0.1, "Downloading timestamps...")
 
+        // Build dynamic release URL based on manifest height
+        let timestampsURL = "https://github.com/VictorLux/ZipherX_Boost/releases/download/v\(remoteManifest.maxHeight)-timestamps/block_timestamps.bin"
+        print("📥 Downloading from: \(timestampsURL)")
+
         // Download the file
         guard let downloadedURL = await downloadFile(
-            from: Self.TIMESTAMPS_URL,
+            from: timestampsURL,
             expectedSize: remoteManifest.fileSize,
             onProgress: { progress in
                 onProgress?(0.1 + progress * 0.8, "Downloading: \(Int(progress * 100))%")

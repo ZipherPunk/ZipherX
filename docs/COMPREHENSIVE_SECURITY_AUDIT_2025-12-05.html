@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZipherX Comprehensive Security Audit - December 2025</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a24;
+            --text-primary: #00ff41;
+            --text-secondary: #00cc33;
+            --text-muted: #888;
+            --accent: #00ff41;
+            --warning: #ffaa00;
+            --error: #ff4444;
+            --success: #00ff41;
+            --border: #333;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            padding: 40px 0;
+            border-bottom: 2px solid var(--accent);
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            text-shadow: 0 0 20px var(--accent);
+            margin-bottom: 20px;
+        }
+
+        .meta {
+            color: var(--text-muted);
+            font-size: 0.9em;
+        }
+
+        .meta span {
+            margin: 0 15px;
+        }
+
+        h2 {
+            color: var(--accent);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 10px;
+            margin: 40px 0 20px 0;
+            font-size: 1.5em;
+        }
+
+        h3 {
+            color: var(--text-secondary);
+            margin: 25px 0 15px 0;
+            font-size: 1.2em;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        .score-card {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+
+        .score-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .score-item .label {
+            color: var(--text-muted);
+            font-size: 0.9em;
+            margin-bottom: 10px;
+        }
+
+        .score-item .value {
+            font-size: 2em;
+            font-weight: bold;
+        }
+
+        .score-item.good .value { color: var(--success); }
+        .score-item.warning .value { color: var(--warning); }
+        .score-item.critical .value { color: var(--error); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 0.9em;
+        }
+
+        th, td {
+            border: 1px solid var(--border);
+            padding: 12px;
+            text-align: left;
+        }
+
+        th {
+            background: var(--bg-secondary);
+            color: var(--accent);
+        }
+
+        tr:nth-child(even) {
+            background: var(--bg-secondary);
+        }
+
+        .status-fixed { color: var(--success); }
+        .status-needs-fix { color: var(--warning); }
+        .status-critical { color: var(--error); }
+
+        pre {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 15px;
+            overflow-x: auto;
+            font-size: 0.85em;
+            margin: 15px 0;
+        }
+
+        code {
+            background: var(--bg-secondary);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+
+        .finding {
+            border-left: 4px solid var(--warning);
+            padding-left: 15px;
+            margin: 20px 0;
+        }
+
+        .finding.critical { border-color: var(--error); }
+        .finding.high { border-color: var(--warning); }
+        .finding.fixed { border-color: var(--success); }
+
+        .checklist {
+            list-style: none;
+            padding: 0;
+        }
+
+        .checklist li {
+            padding: 8px 0;
+            padding-left: 30px;
+            position: relative;
+        }
+
+        .checklist li::before {
+            position: absolute;
+            left: 0;
+            font-size: 1.2em;
+        }
+
+        .checklist li.done::before { content: '✅'; }
+        .checklist li.pending::before { content: '⚠️'; }
+
+        .architecture-diagram {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            font-family: monospace;
+            white-space: pre;
+            overflow-x: auto;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .metric {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 15px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .metric .label { color: var(--text-muted); }
+        .metric .value { color: var(--accent); font-weight: bold; }
+
+        footer {
+            margin-top: 60px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-muted);
+        }
+
+        .quote {
+            font-style: italic;
+            color: var(--text-muted);
+            border-left: 2px solid var(--accent);
+            padding-left: 15px;
+            margin: 30px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔒 ZipherX Security Audit</h1>
+            <p class="meta">
+                <span>Version 1.1</span>
+                <span>|</span>
+                <span>December 5-6, 2025</span>
+                <span>|</span>
+                <span>Auditor: Claude (Anthropic)</span>
+            </p>
+        </header>
+
+        <section>
+            <h2>Executive Summary</h2>
+
+            <div class="score-card">
+                <div class="score-item good">
+                    <div class="label">FFI/Rust Security</div>
+                    <div class="value">80/100</div>
+                </div>
+                <div class="score-item warning">
+                    <div class="label">Swift Core Security</div>
+                    <div class="value">72/100</div>
+                </div>
+                <div class="score-item good">
+                    <div class="label">Architecture</div>
+                    <div class="value">8/10</div>
+                </div>
+                <div class="score-item good">
+                    <div class="label">Performance</div>
+                    <div class="value">8/10</div>
+                </div>
+                <div class="score-item warning">
+                    <div class="label">Overall Score</div>
+                    <div class="value">76/100</div>
+                </div>
+            </div>
+
+            <h3>Critical Findings Summary</h3>
+            <table>
+                <tr>
+                    <th>ID</th>
+                    <th>Severity</th>
+                    <th>Component</th>
+                    <th>Issue</th>
+                    <th>Status</th>
+                </tr>
+                <tr>
+                    <td>VUL-002</td>
+                    <td class="status-critical">CRITICAL</td>
+                    <td>FFI</td>
+                    <td>Memory protection for spending keys</td>
+                    <td class="status-fixed">✅ FIXED</td>
+                </tr>
+                <tr>
+                    <td>CRIT-001</td>
+                    <td class="status-critical">CRITICAL</td>
+                    <td>Database</td>
+                    <td>Encryption key derivation weakness</td>
+                    <td class="status-needs-fix">⚠️ NEEDS FIX</td>
+                </tr>
+                <tr>
+                    <td>CRIT-002</td>
+                    <td class="status-critical">CRITICAL</td>
+                    <td>Storage</td>
+                    <td>Spending key in Swift memory</td>
+                    <td class="status-needs-fix">⚠️ PARTIAL</td>
+                </tr>
+                <tr>
+                    <td>CRIT-003</td>
+                    <td class="status-critical">CRITICAL</td>
+                    <td>Network</td>
+                    <td>No TLS certificate pinning</td>
+                    <td class="status-needs-fix">⚠️ NEEDS FIX</td>
+                </tr>
+                <tr>
+                    <td>HIGH-001</td>
+                    <td class="status-needs-fix">HIGH</td>
+                    <td>Network</td>
+                    <td>Weak consensus threshold</td>
+                    <td class="status-fixed">✅ FIXED</td>
+                </tr>
+                <tr>
+                    <td>HIGH-002</td>
+                    <td class="status-needs-fix">HIGH</td>
+                    <td>Network</td>
+                    <td>Race condition in tx tracking</td>
+                    <td class="status-needs-fix">⚠️ NEEDS FIX</td>
+                </tr>
+                <tr>
+                    <td>NEW-001</td>
+                    <td class="status-needs-fix">HIGH</td>
+                    <td>FFI</td>
+                    <td>Integer overflow in tree loading</td>
+                    <td class="status-needs-fix">⚠️ NEEDS FIX</td>
+                </tr>
+                <tr>
+                    <td>NEW-002</td>
+                    <td class="status-needs-fix">HIGH</td>
+                    <td>FFI</td>
+                    <td>Unwrap() usage in FFI (67 instances)</td>
+                    <td class="status-needs-fix">⚠️ IMPROVED</td>
+                </tr>
+            </table>
+        </section>
+
+        <section>
+            <h2>1. FFI/Rust Library Security Audit</h2>
+
+            <div class="card">
+                <h3>1.1 Overview</h3>
+                <div class="metrics-grid">
+                    <div class="metric">
+                        <span class="label">File</span>
+                        <span class="value">lib.rs</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Lines of Code</span>
+                        <span class="value">3,834</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Extern "C" Functions</span>
+                        <span class="value">54</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Unwrap() Instances</span>
+                        <span class="value">67 (↓13%)</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Score</span>
+                        <span class="value">80/100</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="finding fixed">
+                <h3>1.2 VUL-002 Fix Verification ✅ EXCELLENT</h3>
+                <p>The VUL-002 fix (encrypted key handling) is <strong>properly implemented</strong>:</p>
+                <pre>// Line 3337-3346: Secure zeroing implementation
+#[inline(never)]
+fn secure_zero(data: &amp;mut [u8]) {
+    for byte in data.iter_mut() {
+        unsafe { ptr::write_volatile(byte, 0); }
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}</pre>
+                <ul>
+                    <li>✅ Volatile writes prevent compiler optimization</li>
+                    <li>✅ Compiler fence prevents reordering</li>
+                    <li>✅ All 16+ error paths call secure_zero()</li>
+                    <li>✅ Keys decrypted only in Rust, never leave FFI boundary</li>
+                    <li>✅ AES-GCM-256 authenticated encryption (197-byte format)</li>
+                </ul>
+            </div>
+
+            <div class="finding high">
+                <h3>1.3 Integer Overflow Vulnerability ⚠️ HIGH</h3>
+                <p><strong>Location:</strong> Line 2182-2187</p>
+                <pre>let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+let expected_len = 8 + (count as usize * 32);  // Could overflow!</pre>
+                <p><strong>Attack:</strong> Malicious input with count = 2^62 causes memory corruption or DoS.</p>
+                <p><strong>Recommended Fix:</strong></p>
+                <pre>if count > (usize::MAX / 32).saturating_sub(8) as u64 {
+    return false;
+}</pre>
+            </div>
+
+            <div class="finding fixed">
+                <h3>1.5 Equihash Parameters ✅ VERIFIED CORRECT</h3>
+                <p><strong>Location:</strong> Line 3007-3008</p>
+                <pre>const N: u32 = 192;  // Zclassic post-Bubbles (height >= 585,318)
+const K: u32 = 7;    // ASIC-resistant variant</pre>
+                <table>
+                    <tr>
+                        <th>Era</th>
+                        <th>Height Range</th>
+                        <th>Parameters</th>
+                        <th>Solution Size</th>
+                    </tr>
+                    <tr>
+                        <td>Pre-Bubbles</td>
+                        <td>&lt; 585,318</td>
+                        <td>Equihash(200, 9)</td>
+                        <td>1344 bytes</td>
+                    </tr>
+                    <tr>
+                        <td>Post-Bubbles</td>
+                        <td>≥ 585,318</td>
+                        <td>Equihash(192, 7)</td>
+                        <td>400 bytes</td>
+                    </tr>
+                </table>
+                <p><strong>Status:</strong> ✅ Current parameters (192, 7) are correct for chain height ~2.93M</p>
+            </div>
+        </section>
+
+        <section>
+            <h2>2. Swift Core Security Audit</h2>
+
+            <div class="card">
+                <h3>2.1 Overview</h3>
+                <div class="metrics-grid">
+                    <div class="metric">
+                        <span class="label">Swift Files</span>
+                        <span class="value">56 (↑5)</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Lines of Code</span>
+                        <span class="value">41,328 (↑8.7%)</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">@Published Properties</span>
+                        <span class="value">97 (↑27)</span>
+                    </div>
+                    <div class="metric">
+                        <span class="label">Score</span>
+                        <span class="value">72/100</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="finding critical">
+                <h3>2.2 CRIT-001: Database Encryption Key Weakness</h3>
+                <p><strong>File:</strong> SQLCipherManager.swift:86-105</p>
+                <pre>let deviceId = getDeviceIdentifier()  // Predictable!
+let salt = try getOrCreateSalt()
+let derivedKey = HKDF&lt;SHA256&gt;.deriveKey(...)</pre>
+                <p><strong>Vulnerabilities:</strong></p>
+                <ul>
+                    <li>Device ID is predictable (vendor ID, UUID, hardware UUID)</li>
+                    <li>Salt stored in keychain without biometric gate</li>
+                    <li>Attacker with keychain access can derive database key</li>
+                </ul>
+                <p><strong>Recommendation:</strong> Add biometric gate + user password entropy to key derivation.</p>
+            </div>
+
+            <div class="finding critical">
+                <h3>2.4 CRIT-003: No TLS Certificate Pinning</h3>
+                <p><strong>File:</strong> InsightAPI.swift:8</p>
+                <pre>private let baseURL = "https://explorer.zcl.zelcore.io"</pre>
+                <p><strong>Vulnerabilities:</strong></p>
+                <ul>
+                    <li>No certificate pinning - MITM attacks possible</li>
+                    <li>Single point of failure</li>
+                    <li>Transaction broadcast can be intercepted</li>
+                </ul>
+                <p><strong>Recommendation:</strong> Implement URLSessionDelegate with certificate pinning.</p>
+            </div>
+
+            <div class="card">
+                <h3>2.6 Positive Findings ✅</h3>
+                <ul class="checklist">
+                    <li class="done">VUL-001 FIXED: Consensus threshold increased to 5</li>
+                    <li class="done">VUL-007 FIXED: SQLCipher required for wallet creation</li>
+                    <li class="done">VUL-008 FIXED: SecureData.zero() uses memset_s</li>
+                    <li class="done">VUL-009 IMPLEMENTED: Nullifier hashing for privacy</li>
+                    <li class="done">VUL-020 FIXED: Memo validation (length + UTF-8)</li>
+                    <li class="done">VUL-024 FIXED: Dust output detection</li>
+                </ul>
+            </div>
+        </section>
+
+        <section>
+            <h2>4. Architecture Audit</h2>
+
+            <div class="architecture-diagram">
+UI Layer (SwiftUI)
+       ↓
+Coordinator Layer (Singletons: WalletManager, NetworkManager)
+       ↓
+Service Layer (TransactionBuilder, BiometricAuthManager)
+       ↓
+Data Layer (WalletDatabase, HeaderStore, SecureKeyStorage)
+       ↓
+FFI Boundary (ZipherXFFI → librustzcash)
+            </div>
+        </section>
+
+        <section>
+            <h2>5. Performance Audit</h2>
+
+            <table>
+                <tr>
+                    <th>Operation</th>
+                    <th>Current</th>
+                    <th>Bottleneck</th>
+                    <th>Potential</th>
+                </tr>
+                <tr>
+                    <td>Tree loading (cold)</td>
+                    <td>54s</td>
+                    <td>Sequential CMU append</td>
+                    <td class="status-fixed">&lt;1s (serialized) ✅</td>
+                </tr>
+                <tr>
+                    <td>Tree loading (warm)</td>
+                    <td>&lt;1s</td>
+                    <td>Database cache</td>
+                    <td class="status-fixed">Optimal ✅</td>
+                </tr>
+                <tr>
+                    <td>Note decryption</td>
+                    <td>112ms/10k</td>
+                    <td>CPU-bound</td>
+                    <td class="status-fixed">6.7x speedup ✅</td>
+                </tr>
+                <tr>
+                    <td>Witness rebuild</td>
+                    <td>2+ min</td>
+                    <td>Network + tree</td>
+                    <td>Background update</td>
+                </tr>
+                <tr>
+                    <td>Initial sync</td>
+                    <td>2m 50s</td>
+                    <td>Sequential building</td>
+                    <td class="status-fixed">Parallel phase 1 ✅</td>
+                </tr>
+            </table>
+        </section>
+
+        <section>
+            <h2>7. Security Checklist</h2>
+
+            <div class="card">
+                <h3>Implemented ✅</h3>
+                <ul class="checklist">
+                    <li class="done">VUL-002: Encrypted key FFI</li>
+                    <li class="done">VUL-001: Consensus threshold = 5</li>
+                    <li class="done">VUL-007: SQLCipher required</li>
+                    <li class="done">VUL-008: Secure memory zeroing (memset_s)</li>
+                    <li class="done">VUL-009: Nullifier hashing</li>
+                    <li class="done">VUL-011: P2P rate limiting</li>
+                    <li class="done">VUL-020: Memo validation</li>
+                    <li class="done">VUL-024: Dust output detection</li>
+                    <li class="done">Secure Enclave for iOS spending keys</li>
+                    <li class="done">Face ID/Touch ID authentication</li>
+                    <li class="done">AES-GCM-256 field encryption</li>
+                    <li class="done">Sapling proof verification</li>
+                    <li class="done">Multi-peer consensus</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h3>Needs Attention ⚠️</h3>
+                <ul class="checklist">
+                    <li class="pending">TLS certificate pinning</li>
+                    <li class="pending">Database key with biometric gate</li>
+                    <li class="pending">FFI panic safety (unwraps)</li>
+                    <li class="pending">Integer overflow protection</li>
+                    <li class="pending">Transaction tracking race condition</li>
+                    <li class="pending">Header storage unbounded growth</li>
+                </ul>
+            </div>
+        </section>
+
+        <section>
+            <h2>Appendix A: Key Metrics</h2>
+
+            <div class="metrics-grid">
+                <div class="metric">
+                    <span class="label">Swift Files</span>
+                    <span class="value">56 (↑5)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Swift LOC</span>
+                    <span class="value">41,328</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Rust LOC</span>
+                    <span class="value">3,834</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Unwrap() Instances</span>
+                    <span class="value">67 (↓10)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Extern "C" Functions</span>
+                    <span class="value">54 (↑8)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">@Published Properties</span>
+                    <span class="value">97 (↑27)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Async Call Sites</span>
+                    <span class="value">262</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Task Spawns</span>
+                    <span class="value">104 (↑10)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Singleton Usage</span>
+                    <span class="value">390</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Actor Usage</span>
+                    <span class="value">13 (↑10)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">NSLock Usage</span>
+                    <span class="value">10 files (↓10)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Startup Memory</span>
+                    <span class="value">~80 MB</span>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <h2>8. Conclusion</h2>
+
+            <div class="card">
+                <p>ZipherX demonstrates <strong>strong security architecture</strong> with proper cryptographic implementation and the VUL-002 fix being <strong>textbook perfect</strong>. The main concerns are:</p>
+                <ol>
+                    <li><strong>Critical:</strong> Database encryption key derivation needs biometric gate</li>
+                    <li><strong>Critical:</strong> No TLS certificate pinning on InsightAPI</li>
+                    <li><strong>High:</strong> FFI panic safety (67 unwraps) could cause undefined behavior</li>
+                    <li><strong>High:</strong> Integer overflow in tree loading could cause memory corruption</li>
+                </ol>
+                <p><strong>Recommendation:</strong> Address all P0 (Critical) issues before production release. The application is suitable for beta testing in current state.</p>
+            </div>
+
+            <div class="quote">
+                "Privacy is necessary for an open society in the electronic age."
+                <br>— A Cypherpunk's Manifesto
+            </div>
+        </section>
+
+        <footer>
+            <p>Report Generated: December 5, 2025 | Updated: December 6, 2025</p>
+            <p>Auditor: Claude (Anthropic) | Report Version: 1.1</p>
+        </footer>
+    </div>
+</body>
+</html>

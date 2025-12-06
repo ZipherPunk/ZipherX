@@ -4,7 +4,19 @@ import Combine
 #if os(macOS)
 
 /// Manages Full Node mode for ZipherX (macOS only)
-/// Handles daemon detection, startup, and wallet.dat management
+///
+/// IMPORTANT SECURITY DESIGN:
+/// - ZipherX ALWAYS uses its own wallet (SecureKeyStorage + WalletDatabase)
+/// - The local zclassicd wallet.dat is NEVER used for private keys
+/// - Full Node mode only provides:
+///   1. Daemon status monitoring (running/syncing)
+///   2. Block height from trusted local source
+///   3. Transaction verification against full blockchain
+///
+/// This ensures:
+/// - User's private keys remain in ZipherX's encrypted storage
+/// - No risk of wallet.dat exposure
+/// - Consistent wallet experience across Light and Full Node modes
 public class FullNodeManager: ObservableObject {
     public static let shared = FullNodeManager()
 
@@ -14,10 +26,8 @@ public class FullNodeManager: ObservableObject {
     @Published public private(set) var isNodeInstalled: Bool = false
     @Published public private(set) var hasBlockchain: Bool = false
     @Published public private(set) var blockchainSize: String = ""
-    @Published public private(set) var walletAddresses: [WalletAddress] = []
-    @Published public private(set) var totalBalance: Double = 0
-    @Published public private(set) var shieldedBalance: Double = 0
-    @Published public private(set) var transparentBalance: Double = 0
+    @Published public private(set) var daemonBlockHeight: UInt64 = 0
+    @Published public private(set) var daemonSyncProgress: Double = 0.0
 
     // MARK: - Daemon Status
 
@@ -49,24 +59,6 @@ public class FullNodeManager: ObservableObject {
             case .running, .syncing: return true
             default: return false
             }
-        }
-    }
-
-    // MARK: - Wallet Address
-
-    public struct WalletAddress: Identifiable {
-        public let id = UUID()
-        public let address: String
-        public let type: AddressType
-        public let balance: Double
-
-        public enum AddressType: String {
-            case shielded = "Shielded (z)"
-            case transparent = "Transparent (t)"
-        }
-
-        public var isShielded: Bool {
-            type == .shielded
         }
     }
 
@@ -152,44 +144,45 @@ public class FullNodeManager: ObservableObject {
     }
 
     /// Check if daemon is currently running
+    /// Detection priority: RPC connection (most reliable) > binary path check
     @MainActor
     private func checkDaemonRunning() async {
-        guard isNodeInstalled else {
-            print("🔴 Full Node: daemon not installed")
+        // FIRST: Try to connect via RPC - this detects ANY running zclassicd
+        // regardless of where the binary is installed (Zipher.app, /usr/local/bin, etc.)
+        do {
+            try RPCClient.shared.loadConfig()
+            print("✅ Full Node: config loaded successfully")
+
+            // Try to connect to running daemon
+            let connected = await RPCClient.shared.checkConnection()
+            print("🔄 Full Node: RPC connection result = \(connected)")
+
+            if connected {
+                daemonStatus = .running
+                isNodeInstalled = true  // Daemon is running, so it's "installed" somewhere
+                print("✅ Full Node: daemon is RUNNING (detected via RPC)")
+
+                // Check sync status and block height
+                await checkSyncStatus()
+                return
+            }
+        } catch {
+            print("⚠️ Full Node: config/RPC check failed - \(error.localizedDescription)")
+        }
+
+        // FALLBACK: Check if binary exists at standard path
+        if !isNodeInstalled {
+            print("🔴 Full Node: daemon not installed at standard path")
             daemonStatus = .notInstalled
             return
         }
 
-        // Try to connect via RPC
-        do {
-            try RPCClient.shared.loadConfig()
-            print("✅ Full Node: config loaded successfully")
-        } catch {
-            print("⚠️ Full Node: config load failed - \(error.localizedDescription)")
-            daemonStatus = hasBlockchain ? .installed : .notInstalled
-            return
-        }
-
-        // Now try to connect
-        let connected = await RPCClient.shared.checkConnection()
-        print("🔄 Full Node: connection check result = \(connected)")
-
-        if connected {
-            daemonStatus = .running
-            print("✅ Full Node: daemon is RUNNING")
-
-            // Check sync status
-            await checkSyncStatus()
-
-            // Load wallet addresses
-            await loadWalletAddresses()
-        } else {
-            print("🔴 Full Node: daemon connection FAILED, marking as \(hasBlockchain ? "installed" : "not installed")")
-            daemonStatus = hasBlockchain ? .installed : .notInstalled
-        }
+        // Binary exists but daemon not running
+        print("🔴 Full Node: daemon installed but not running")
+        daemonStatus = hasBlockchain ? .installed : .notInstalled
     }
 
-    /// Check blockchain sync status
+    /// Check blockchain sync status and get block height
     @MainActor
     private func checkSyncStatus() async {
         guard daemonStatus.isRunning else { return }
@@ -197,13 +190,51 @@ public class FullNodeManager: ObservableObject {
         do {
             let info = try await RPCClient.shared.getInfoDict()
 
-            if let progress = info["verificationprogress"] as? Double, progress < 0.9999 {
-                daemonStatus = .syncing(progress: progress)
+            // Get block height
+            if let blocks = info["blocks"] as? Int {
+                daemonBlockHeight = UInt64(blocks)
+            }
+
+            // Get sync progress
+            if let progress = info["verificationprogress"] as? Double {
+                daemonSyncProgress = progress
+                if progress < 0.9999 {
+                    daemonStatus = .syncing(progress: progress)
+                } else {
+                    daemonStatus = .running
+                }
             } else {
                 daemonStatus = .running
             }
         } catch {
             // Keep running status, just couldn't get sync progress
+        }
+    }
+
+    /// Get the current block height from daemon (for use as trusted source)
+    public func getBlockHeight() async -> UInt64? {
+        guard daemonStatus.isRunning else { return nil }
+
+        do {
+            let info = try await RPCClient.shared.getInfoDict()
+            if let blocks = info["blocks"] as? Int {
+                return UInt64(blocks)
+            }
+        } catch {
+            print("⚠️ FullNodeManager: Failed to get block height: \(error)")
+        }
+        return nil
+    }
+
+    /// Verify a transaction exists in the blockchain
+    public func verifyTransaction(txid: String) async -> Bool {
+        guard daemonStatus.isRunning else { return false }
+
+        do {
+            _ = try await RPCClient.shared.getTransaction(txid: txid)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -303,75 +334,100 @@ public class FullNodeManager: ObservableObject {
         print("✅ Created zclassic.conf")
     }
 
-    // MARK: - Wallet Operations
+    // MARK: - Daemon Installation
 
-    /// Load addresses from wallet.dat via RPC
-    @MainActor
-    private func loadWalletAddresses() async {
-        guard daemonStatus.isRunning else { return }
+    /// Official source URL for building from source
+    public static let officialSourceURL = "https://github.com/ZclassicCommunity/zclassic"
+
+    /// Bootstrap download URL for fast sync
+    public static let bootstrapURL = "https://github.com/VictorLux/zclassic-bootstrap"
+
+    /// Path to bundled daemon in app bundle
+    private static var bundledDaemonPath: URL? {
+        Bundle.main.url(forResource: "zclassicd", withExtension: nil, subdirectory: "Binaries")
+    }
+
+    /// Path to bundled CLI in app bundle
+    private static var bundledCliPath: URL? {
+        Bundle.main.url(forResource: "zclassic-cli", withExtension: nil, subdirectory: "Binaries")
+    }
+
+    /// Check if daemon binaries are bundled with the app
+    public var hasBundledDaemon: Bool {
+        Self.bundledDaemonPath != nil && Self.bundledCliPath != nil
+    }
+
+    /// Check if daemon is installed at /usr/local/bin
+    public var isDaemonInstalledAtPath: Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: Self.daemonPath.path) &&
+               fm.fileExists(atPath: Self.cliPath.path)
+    }
+
+    /// Install daemon binaries from app bundle to /usr/local/bin
+    /// Returns true on success
+    public func installDaemonFromBundle() async throws {
+        guard let daemonSource = Self.bundledDaemonPath,
+              let cliSource = Self.bundledCliPath else {
+            throw FullNodeError.daemonNotBundled
+        }
+
+        let fm = FileManager.default
+
+        // Check if /usr/local/bin exists, create if not
+        let binDir = URL(fileURLWithPath: "/usr/local/bin")
+        if !fm.fileExists(atPath: binDir.path) {
+            try fm.createDirectory(at: binDir, withIntermediateDirectories: true)
+        }
+
+        // Copy daemon binary (overwrite if exists)
+        let daemonDest = Self.daemonPath
+        if fm.fileExists(atPath: daemonDest.path) {
+            try fm.removeItem(at: daemonDest)
+        }
+        try fm.copyItem(at: daemonSource, to: daemonDest)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
+        print("✅ Installed zclassicd to \(daemonDest.path)")
+
+        // Copy CLI binary (overwrite if exists)
+        let cliDest = Self.cliPath
+        if fm.fileExists(atPath: cliDest.path) {
+            try fm.removeItem(at: cliDest)
+        }
+        try fm.copyItem(at: cliSource, to: cliDest)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
+        print("✅ Installed zclassic-cli to \(cliDest.path)")
+
+        await MainActor.run {
+            isNodeInstalled = true
+            daemonStatus = .installed
+        }
+    }
+
+    /// Get daemon version if installed
+    public func getDaemonVersion() async -> String? {
+        guard isDaemonInstalledAtPath else { return nil }
+
+        let process = Process()
+        process.executableURL = Self.daemonPath
+        process.arguments = ["--version"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
 
         do {
-            // Get z-addresses
-            let zAddresses = try await RPCClient.shared.getZAddresses()
-            var addresses: [WalletAddress] = []
+            try process.run()
+            process.waitUntilExit()
 
-            for addr in zAddresses {
-                let balance = try await RPCClient.shared.getZBalance(address: addr)
-                addresses.append(WalletAddress(
-                    address: addr,
-                    type: .shielded,
-                    balance: balance
-                ))
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                return output.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-
-            // Get t-addresses
-            let tAddresses = try await RPCClient.shared.getTAddresses()
-            for addr in tAddresses {
-                let balance = try await RPCClient.shared.getTBalance(address: addr)
-                addresses.append(WalletAddress(
-                    address: addr,
-                    type: .transparent,
-                    balance: balance
-                ))
-            }
-
-            walletAddresses = addresses
-
-            // Calculate totals
-            shieldedBalance = addresses.filter { $0.isShielded }.reduce(0) { $0 + $1.balance }
-            transparentBalance = addresses.filter { !$0.isShielded }.reduce(0) { $0 + $1.balance }
-            totalBalance = shieldedBalance + transparentBalance
-
         } catch {
-            print("⚠️ Failed to load wallet addresses: \(error)")
+            print("⚠️ Could not get daemon version: \(error)")
         }
-    }
-
-    /// Create a new z-address in wallet.dat
-    public func createZAddress() async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.createZAddress()
-    }
-
-    /// Create a new t-address in wallet.dat
-    public func createTAddress() async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.createTAddress()
-    }
-
-    /// Send ZCL using the full node's wallet.dat
-    public func sendZCL(from: String, to: String, amount: Double, memo: String? = nil) async throws -> String {
-        guard daemonStatus.isRunning else {
-            throw FullNodeError.daemonNotRunning
-        }
-
-        return try await RPCClient.shared.sendTransaction(from: from, to: to, amount: amount, memo: memo)
+        return nil
     }
 
     // MARK: - Helpers
@@ -402,22 +458,25 @@ public class FullNodeManager: ObservableObject {
 public enum FullNodeError: Error, LocalizedError {
     case daemonNotInstalled
     case daemonNotRunning
+    case daemonNotBundled
     case startupTimeout
     case configError(String)
-    case walletError(String)
+    case installError(String)
 
     public var errorDescription: String? {
         switch self {
         case .daemonNotInstalled:
-            return "Zclassic daemon is not installed"
+            return "Zclassic daemon is not installed. Please install zclassicd and zclassic-cli to /usr/local/bin from https://github.com/ZclassicCommunity/zclassic"
         case .daemonNotRunning:
             return "Daemon is not running"
+        case .daemonNotBundled:
+            return "Daemon binaries are not bundled with this version of ZipherX"
         case .startupTimeout:
             return "Daemon failed to start within timeout"
         case .configError(let msg):
             return "Configuration error: \(msg)"
-        case .walletError(let msg):
-            return "Wallet error: \(msg)"
+        case .installError(let msg):
+            return "Installation error: \(msg)"
         }
     }
 }

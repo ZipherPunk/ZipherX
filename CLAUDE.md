@@ -329,25 +329,45 @@ If tree root doesn't match chain's `finalsaplingroot`:
 
 ### Overview
 
-The app can download updated commitment trees from GitHub to reduce sync time. This allows users to benefit from newer tree data without requiring an app update.
+The app downloads commitment tree info and files from GitHub automatically. **No hardcoded tree values in the app** - all tree height/count/root values are fetched from GitHub manifest on each app launch.
 
 ### Repository Structure
 
-The ZipherX_Boost public repository (`https://github.com/VictorLux/ZipherX_Boost`) contains:
+The ZipherX_Boost public repository (`https://github.com/VictorLux/ZipherX_Boost`) uses **GitHub Releases** for file hosting:
 
-| File | Size | Purpose |
-|------|------|---------|
-| `commitment_tree.bin` | ~33 MB | Full CMU file for position lookups |
-| `commitment_tree.bin.zst` | ~33 MB | Compressed CMU file (zstd) |
-| `commitment_tree_serialized.bin` | ~574 bytes | Serialized tree frontier (instant load) |
-| `commitment_tree_manifest.json` | ~800 bytes | Metadata (height, CMU count, checksums) |
+| Release Tag | Files | Purpose |
+|-------------|-------|---------|
+| `v{height}-tree` | `.zst`, `_serialized.bin`, `_manifest.json` | Commitment tree data |
+| `v{height}-hashes` | `block_hashes.bin`, `manifest.json` | Block hash validation |
+| `v{height}-timestamps` | `block_timestamps.bin`, `_manifest.json` | Transaction date display |
+| `v{height}-peers` | `reliable_peers.json` | Bootstrap peer discovery |
+
+**NOTE**: Only compressed files (`.zst`) are in releases - app downloads and decompresses locally.
+
+### Dynamic Tree Info (No Hardcoded Values!)
+
+**On App Startup** (`ZipherXApp.swift`):
+1. `CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()` is called
+2. Downloads `commitment_tree_manifest.json` from GitHub
+3. Updates `ZipherXConstants` with latest height/cmuCount/root
+4. Values stored in UserDefaults for offline use
+
+**`ZipherXConstants.swift`** (computed properties, not hardcoded):
+```swift
+static var bundledTreeHeight: UInt64 {
+    // Returns value from UserDefaults (downloaded from GitHub)
+    // Falls back to Sapling activation (476,969) if not downloaded
+}
+static var bundledTreeCMUCount: UInt64 { ... }
+static var bundledTreeRoot: String { ... }
+```
 
 ### File Differences
 
-**commitment_tree.bin (CMU file)**:
-- Contains: `[count: UInt64][cmu1: 32 bytes][cmu2: 32 bytes]...`
+**commitment_tree.bin.zst (Compressed CMU file)**:
+- Contains: Zstd-compressed `[count: UInt64][cmu1: 32 bytes][cmu2: 32 bytes]...`
 - Required for: Imported wallets (position lookup for nullifier computation)
-- Size: ~33 MB (32 bytes × 1M+ CMUs + 8 byte header)
+- Size: ~10 MB compressed (decompresses to ~33 MB)
 
 **commitment_tree_serialized.bin (Serialized tree)**:
 - Contains: Merkle frontier only (tree state without individual CMUs)
@@ -359,47 +379,55 @@ The ZipherX_Boost public repository (`https://github.com/VictorLux/ZipherX_Boost
 | Scenario | File Used | Reason |
 |----------|-----------|--------|
 | New wallet (first launch) | Serialized (~574 bytes) | No historical notes to find |
-| Imported wallet (private key) | CMU file (~33 MB) | Need CMU positions for nullifier computation |
+| Imported wallet (private key) | CMU file (~10 MB compressed) | Need CMU positions for nullifier computation |
 | Subsequent launches | Database cache | Tree state saved to SQLite |
 
-### Publishing Updated Tree
+### Publishing Updated Files
 
-Run the publish script after zclassicd syncs new blocks:
+Run the master update script after zclassicd syncs new blocks:
 
 ```bash
 cd /Users/chris/ZipherX/Tools
-python3 publish_commitment_tree.py
+python3 update_zipherx_boost.py
 
 # Options:
-#   --no-push    Don't push to git (local test only)
-#   --full       Export full tree from Sapling activation (slow, ~20 min)
+#   --no-push    Don't push to git or create releases (local test only)
+#   --full       Full tree export from Sapling activation (slow, ~20 min)
+#   --publish    Mark releases as non-draft (latest) - default is draft
 ```
 
 The script:
-1. Reads existing tree from ZipherX_Boost
-2. Fetches new CMUs from local zcashd node
-3. Verifies tree root matches `finalsaplingroot`
-4. Generates all 4 files (CMU, compressed, serialized, manifest)
-5. Commits and pushes to GitHub
+1. Updates commitment tree (incremental or full export)
+2. Updates block hashes
+3. Updates block timestamps
+4. Updates reliable peers list
+5. Creates GitHub Releases (draft mode by default)
+6. Verifies SHA256 checksums for all files
+
+### Security: Checksum Verification
+
+**All downloaded files are verified with SHA256 checksums:**
+- Manifest contains checksums for each file
+- App verifies checksum BEFORE using any downloaded data
+- Checksum mismatch = file rejected, falls back to cached/bundled
 
 ### App Integration
 
 **CommitmentTreeUpdater.swift** handles downloading:
-- Checks manifest for newer tree on GitHub
+- Fetches manifest on every app launch → updates `ZipherXConstants`
+- Downloads from GitHub Releases URLs (format: `v{height}-tree`)
+- Verifies SHA256 checksums for both compressed and decompressed files
 - For new wallets: Downloads serialized tree (~574 bytes, instant)
-- For imported wallets: Downloads CMU file (~33 MB)
-- Verifies SHA256 checksums
-- Saves to `Documents/TreeCache/`
+- For imported wallets: Downloads compressed CMU file (~10 MB), decompresses
 
-**FilterScanner.swift** uses downloaded data:
-- Prefers downloaded CMU file over bundled
-- Falls back to bundled if download unavailable
-- Uses `cmuDataForPositionLookup` for nullifier computation
+**BundledBlockHashes.swift**:
+- Downloads from GitHub Releases (format: `v{height}-hashes`)
+- Verifies SHA256 checksum from manifest
+- Falls back to bundled if checksum verification fails
 
-**ZipherXConstants.swift** tracks effective height:
-- `effectiveTreeHeight` returns downloaded or bundled height
-- `effectiveTreeCMUCount` returns downloaded or bundled count
-- Stored in UserDefaults when downloaded
+**BlockTimestampManager.swift**:
+- Downloads from GitHub Releases (format: `v{height}-timestamps`)
+- Verifies SHA256 checksum from manifest
 
 ### Example Manifest
 

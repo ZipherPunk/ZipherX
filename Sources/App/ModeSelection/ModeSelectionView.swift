@@ -57,9 +57,26 @@ struct ModeSelectionView: View {
                 .font(theme.titleFont)
                 .foregroundColor(theme.textPrimary)
 
-            Text("Choose your wallet mode")
-                .font(theme.bodyFont)
-                .foregroundColor(theme.textSecondary)
+            // Show different message if daemon detected
+            if modeManager.daemonDetected {
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "server.rack")
+                            .foregroundColor(theme.successColor)
+                        Text("Zclassic daemon detected!")
+                            .foregroundColor(theme.successColor)
+                    }
+                    .font(theme.bodyFont)
+
+                    Text("Choose which mode to use")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+            } else {
+                Text("Choose your wallet mode")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textSecondary)
+            }
         }
         .padding(.vertical, 32)
         .frame(maxWidth: .infinity)

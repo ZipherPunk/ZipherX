@@ -80,5 +80,6 @@ Tools/
 # Security audit docs (never commit to public repo)
 docs/
 
-# Claude Code settings (never commit)
+# Claude Code settings and docs (never commit)
 .claude/
+CLAUDE.md
