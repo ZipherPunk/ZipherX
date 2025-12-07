@@ -484,7 +484,42 @@ final class FilterScanner {
             // Format: (height, txid, nullifierHex)
             var collectedSpends: [(UInt64, String, String)] = []
 
-            while currentHeight <= parallelEndHeight && isScanning {
+            // =====================================================================
+            // NEW: Use complete Rust FFI for boost file scanning (migrated from Swift)
+            // This processes the ENTIRE boost file at once, exactly like bench_boost_scan.rs
+            // Key insight: position = enumerate index in outputs array (blockchain order)
+            // =====================================================================
+            var usedRustBoostScan = false
+
+            if await CommitmentTreeUpdater.shared.hasCachedBoostFile() {
+                do {
+                    print("🦀 Starting complete Rust boost file scan...")
+                    let result = try await processBoostFileWithRust(
+                        accountId: accountId,
+                        spendingKey: spendingKey
+                    )
+                    print("🦀 Rust scan complete: \(result.notesFound) notes, \(result.notesSpent) spent, balance: \(Double(result.balance) / 100_000_000) ZCL")
+                    usedRustBoostScan = true
+
+                    // Skip to PHASE 2 since boost file covers everything up to phase1EndHeight
+                    currentHeight = parallelEndHeight + 1
+
+                    // Report progress as 40% complete (PHASE 1 done)
+                    reportPhase1Progress(
+                        scannedBlocks: parallelTotalBlocks,
+                        totalBlocks: parallelTotalBlocks,
+                        maxHeight: targetHeight,
+                        currentHeight: parallelEndHeight
+                    )
+
+                } catch {
+                    print("⚠️ Rust boost scan failed, falling back to batch processing: \(error)")
+                    usedRustBoostScan = false
+                }
+            }
+
+            // Only use batch processing if Rust scan failed or boost file unavailable
+            while !usedRustBoostScan && currentHeight <= parallelEndHeight && isScanning {
                 let remainingBlocks = Int(parallelEndHeight - currentHeight + 1)
                 let thisBatchSize = min(batchSize, remainingBlocks)
                 let endHeight = currentHeight + UInt64(thisBatchSize) - 1
@@ -1601,6 +1636,107 @@ final class FilterScanner {
         }
     }
 
+    /// Process entire boost file using Rust FFI (complete migration from Swift)
+    /// This uses the same approach as bench_boost_scan.rs which correctly finds all notes
+    /// Key insight: position = enumerate index in outputs array (blockchain order)
+    ///
+    /// - Parameters:
+    ///   - accountId: Account to store notes for
+    ///   - spendingKey: Spending key for decryption
+    /// - Returns: Tuple of (notes found, notes spent, unspent balance in zatoshis)
+    private func processBoostFileWithRust(
+        accountId: Int64,
+        spendingKey: Data
+    ) async throws -> (notesFound: Int, notesSpent: Int, balance: UInt64) {
+        // Get section info from boost manifest
+        let treeUpdater = CommitmentTreeUpdater.shared
+
+        guard let cachedInfo = await treeUpdater.getCachedInfo() else {
+            throw ScanError.boostFileMissing
+        }
+
+        let outputCount = Int(cachedInfo.outputCount)
+        let spendCount = Int(cachedInfo.spendCount)
+
+        debugLog(.sync, "🦀 Rust boost scan: \(outputCount) outputs, \(spendCount) spends")
+
+        // Extract raw data from boost file
+        let outputsData = try await treeUpdater.extractShieldedOutputs()
+        let spendsData = try await treeUpdater.extractShieldedSpends()
+
+        debugLog(.sync, "📦 Extracted: outputs=\(outputsData.count) bytes, spends=\(spendsData.count) bytes")
+
+        // Call Rust FFI for complete scanning
+        guard let result = ZipherXFFI.scanBoostOutputs(
+            spendingKey: spendingKey,
+            outputsData: outputsData,
+            outputCount: outputCount,
+            spendsData: spendsData,
+            spendCount: spendCount
+        ) else {
+            throw ScanError.decryptionFailed
+        }
+
+        debugLog(.sync, """
+            🦀 Rust scan result:
+               Notes found: \(result.summary.notesFound)
+               Notes spent: \(result.summary.notesSpent)
+               Unspent balance: \(Double(result.summary.unspentBalance) / 100_000_000) ZCL
+               Total received: \(Double(result.summary.totalReceived) / 100_000_000) ZCL
+            """)
+
+        // Store all notes in database
+        for note in result.notes {
+            // Create a pseudo-txid for bundled outputs (grouped by height)
+            let txidData = "boost_\(note.height)".data(using: .utf8) ?? Data()
+
+            // Add to known nullifiers for future spend detection
+            knownNullifiers.insert(note.nullifier)
+
+            // Insert note into database
+            let noteId = try database.insertNote(
+                accountId: accountId,
+                diversifier: note.diversifier,
+                value: note.value,
+                rcm: note.rcm,
+                memo: Data(count: 512), // Memo not extracted in this path
+                nullifier: note.nullifier,
+                txid: txidData,
+                height: UInt64(note.height),
+                witness: Data(count: 1028), // Witnesses computed in PHASE 1.5
+                cmu: note.cmu
+            )
+
+            // Record in transaction history
+            try? database.recordReceivedTransaction(
+                txid: txidData,
+                height: UInt64(note.height),
+                value: note.value,
+                memo: nil
+            )
+
+            // If Rust already determined this note is spent, mark it
+            if note.isSpent {
+                // Use a pseudo-txid for the spend (we don't have the actual spend txid from boost)
+                let spendTxid = "boost_spent_\(note.height)".data(using: .utf8) ?? Data()
+                try database.markNoteSpent(
+                    nullifier: note.nullifier,
+                    txid: spendTxid,
+                    spentHeight: UInt64(note.height)
+                )
+                debugLog(.wallet, "💸 Note marked spent: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
+            } else {
+                debugLog(.wallet, "💰 Unspent note: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
+            }
+        }
+
+        return (
+            notesFound: Int(result.summary.notesFound),
+            notesSpent: Int(result.summary.notesSpent),
+            balance: result.summary.unspentBalance
+        )
+    }
+
     /// Process shielded outputs for note discovery only (no tree building)
     /// Used by quick scan - much faster as it skips CMU appending
     /// Also checks spends for nullifiers to detect spent notes
@@ -2339,6 +2475,8 @@ enum ScanError: LocalizedError {
     case networkError
     case decodingError
     case databaseError
+    case boostFileMissing
+    case decryptionFailed
 
     var errorDescription: String? {
         switch self {
@@ -2348,6 +2486,10 @@ enum ScanError: LocalizedError {
             return "Failed to decode filter or block"
         case .databaseError:
             return "Database error during scan"
+        case .boostFileMissing:
+            return "Boost file not available"
+        case .decryptionFailed:
+            return "Note decryption failed"
         }
     }
 }

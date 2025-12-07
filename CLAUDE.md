@@ -3588,6 +3588,62 @@ for (position, cmu) in cmu_reader.enumerate() {
 
 ---
 
+### 63. Complete Boost File Scanning Migration to Rust FFI (December 7, 2025)
+
+**Problem**: Previous Swift fixes (#60, #62) still had issues with spent note detection. The Rust benchmark (`bench_boost_scan.rs`) worked perfectly and found all notes with correct balance.
+
+**Solution**: Migrate the entire boost file scanning logic from Swift to Rust FFI, matching the benchmark implementation exactly.
+
+**New Rust FFI Function** (`lib.rs:3845-4124`):
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_scan_boost_outputs(
+    sk: *const u8,              // 169-byte spending key
+    outputs_data: *const u8,    // Outputs section (652 bytes per output)
+    output_count: usize,
+    spends_data: *const u8,     // Spends section (36 bytes per spend)
+    spend_count: usize,
+    notes_out: *mut BoostScanNote,
+    max_notes: usize,
+    result_out: *mut BoostScanResult,
+) -> usize
+```
+
+**What the Rust function does**:
+1. Parses outputs from boost data (652 bytes per output: height + index + cmu + epk + ciphertext)
+2. Parses spends from boost data (36 bytes per spend: height + nullifier)
+3. Builds nullifier set from all spends in boost file
+4. Parallel note decryption using Rayon
+5. For each decrypted note: compute nullifier with `position = enumerate index`
+6. Check if nullifier exists in spends set → mark as spent
+7. Returns all notes with: height, position, value, diversifier, rcm, cmu, nullifier, is_spent
+
+**Key insight**: `position = enumerate index` in outputs array (blockchain order)
+
+**Swift Integration**:
+1. **ZipherXFFI.swift**: Added `scanBoostOutputs()` wrapper with `BoostNote` and `BoostScanSummary` structs
+2. **FilterScanner.swift**: Added `processBoostFileWithRust()` that:
+   - Extracts raw outputs/spends data from boost file
+   - Calls Rust FFI function
+   - Stores all notes in database with correct fields
+   - Marks spent notes based on Rust's `is_spent` flag
+3. **PHASE 1 scanning**: Now calls Rust function once for entire boost file (instead of batch-by-batch Swift processing)
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Added `zipherx_scan_boost_outputs` function
+- `Libraries/zipherx-ffi/include/zipherx_ffi.h` - Added C struct definitions
+- `Sources/ZipherX-Bridging-Header.h` - Added C declarations for Swift
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Added Swift wrapper
+- `Sources/Core/Network/FilterScanner.swift` - Added `processBoostFileWithRust()`, updated PHASE 1 to use it
+
+**Performance**:
+- Rust processes entire boost file (~1M outputs + ~47K spends) in single call
+- Parallel decryption via Rayon (6.7x speedup)
+- Correct nullifier computation with position = index
+- Spent detection done in Rust, no Swift nullifier matching issues
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

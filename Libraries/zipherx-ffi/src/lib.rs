@@ -3841,3 +3841,284 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
 
     true
 }
+
+// =============================================================================
+// Boost File Scanning - Complete wallet scan in Rust (matching benchmark)
+// =============================================================================
+
+/// Boost file output record size: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) = 652
+const BOOST_OUTPUT_SIZE: usize = 652;
+/// Boost file spend record size: height(4) + nullifier(32) = 36
+const BOOST_SPEND_SIZE: usize = 36;
+
+/// Result for a discovered note from boost file scanning
+/// Contains all data needed to store in database and build transactions
+#[repr(C)]
+pub struct BoostScanNote {
+    pub height: u32,
+    pub position: u64,
+    pub value: u64,
+    pub diversifier: [u8; 11],
+    pub rcm: [u8; 32],
+    pub cmu: [u8; 32],
+    pub nullifier: [u8; 32],
+    pub is_spent: u8,  // 1 if spent, 0 if unspent
+    pub _padding: [u8; 4],  // Alignment padding
+}
+
+/// Result structure for boost scan summary
+#[repr(C)]
+pub struct BoostScanResult {
+    pub total_received: u64,     // Total value of all notes found
+    pub total_spent: u64,        // Total value of spent notes
+    pub unspent_balance: u64,    // Final spendable balance
+    pub notes_found: u32,        // Number of notes found
+    pub notes_spent: u32,        // Number of notes that are spent
+    pub spends_checked: u32,     // Number of spends in boost file
+}
+
+/// Scan boost file outputs section and return discovered notes with nullifiers
+///
+/// This function performs the complete PHASE 1 + PHASE 1.6 scanning in Rust:
+/// 1. Parse outputs from boost data (652 bytes per output)
+/// 2. Parse spends from boost data (36 bytes per spend)
+/// 3. Parallel note decryption using Rayon
+/// 4. Compute nullifiers for each discovered note (using enumerate index as position)
+/// 5. Check nullifiers against spends to detect spent notes
+///
+/// The returned data includes everything needed to:
+/// - Store notes in SQLite database
+/// - Build spend transactions (diversifier, value, rcm, nullifier, position)
+///
+/// # Arguments
+/// * `sk` - Extended spending key (169 bytes)
+/// * `outputs_data` - Pointer to outputs section (652 bytes per output)
+/// * `output_count` - Number of outputs
+/// * `spends_data` - Pointer to spends section (36 bytes per spend)
+/// * `spend_count` - Number of spends
+/// * `notes_out` - Output buffer for discovered notes (BoostScanNote array)
+/// * `max_notes` - Maximum notes that can fit in notes_out
+/// * `result_out` - Output for scan summary (BoostScanResult)
+///
+/// # Returns
+/// Number of notes written to notes_out
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_scan_boost_outputs(
+    sk: *const u8,
+    outputs_data: *const u8,
+    output_count: usize,
+    spends_data: *const u8,
+    spend_count: usize,
+    notes_out: *mut BoostScanNote,
+    max_notes: usize,
+    result_out: *mut BoostScanResult,
+) -> usize {
+    use std::collections::HashSet;
+    use zcash_primitives::sapling::{Diversifier, Rseed};
+    use jubjub::Fr;
+    use ff::PrimeField;
+
+    eprintln!("🚀 zipherx_scan_boost_outputs: {} outputs, {} spends", output_count, spend_count);
+
+    if output_count == 0 {
+        if !result_out.is_null() {
+            (*result_out) = BoostScanResult {
+                total_received: 0,
+                total_spent: 0,
+                unspent_balance: 0,
+                notes_found: 0,
+                notes_spent: 0,
+                spends_checked: spend_count as u32,
+            };
+        }
+        return 0;
+    }
+
+    // Parse spending key
+    let sk_slice = slice::from_raw_parts(sk, 169);
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("❌ Failed to parse spending key: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Derive keys for decryption and nullifier computation
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let fvk = dfvk.fvk();
+    let ivk = fvk.vk.ivk();
+    let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
+    let nk = fvk.vk.nk;
+
+    // Parse spends into nullifier set for fast lookup
+    let mut nullifier_set: HashSet<[u8; 32]> = HashSet::with_capacity(spend_count);
+    if spend_count > 0 && !spends_data.is_null() {
+        let spends_slice = slice::from_raw_parts(spends_data, spend_count * BOOST_SPEND_SIZE);
+        for i in 0..spend_count {
+            let offset = i * BOOST_SPEND_SIZE;
+            let mut nullifier = [0u8; 32];
+            // Skip height (4 bytes), read nullifier (32 bytes)
+            nullifier.copy_from_slice(&spends_slice[offset + 4..offset + 36]);
+            nullifier_set.insert(nullifier);
+        }
+    }
+    eprintln!("📊 Indexed {} nullifiers for spend detection", nullifier_set.len());
+
+    // Parse outputs for parallel processing
+    let outputs_slice = slice::from_raw_parts(outputs_data, output_count * BOOST_OUTPUT_SIZE);
+
+    // Parse into vector of (position, height, cmu, epk, ciphertext)
+    // CRITICAL: position = enumerate index (outputs are in blockchain order)
+    let parsed_outputs: Vec<(usize, u32, [u8; 32], [u8; 32], [u8; 580])> = (0..output_count)
+        .map(|i| {
+            let offset = i * BOOST_OUTPUT_SIZE;
+            let height = u32::from_le_bytes([
+                outputs_slice[offset],
+                outputs_slice[offset + 1],
+                outputs_slice[offset + 2],
+                outputs_slice[offset + 3],
+            ]);
+            // Skip index (4 bytes at offset+4)
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(&outputs_slice[offset + 8..offset + 40]);
+            let mut epk = [0u8; 32];
+            epk.copy_from_slice(&outputs_slice[offset + 40..offset + 72]);
+            let mut ciphertext = [0u8; 580];
+            ciphertext.copy_from_slice(&outputs_slice[offset + 72..offset + 652]);
+
+            (i, height, cmu, epk, ciphertext)
+        })
+        .collect();
+
+    // Parallel decryption using Rayon
+    // Collect (position, height, value, diversifier, rcm, cmu) for notes we find
+    let decrypted: Vec<_> = parsed_outputs.par_iter()
+        .filter_map(|(position, height, cmu, epk, ciphertext)| {
+            // Create a ShieldedOutput for decryption
+            let output = BoostOutput {
+                epk: *epk,
+                cmu: *cmu,
+                enc_ciphertext: *ciphertext,
+            };
+
+            let block_height = BlockHeight::from_u32(*height);
+            match try_sapling_note_decryption(&ZclassicNetwork, block_height, &prepared_ivk, &output) {
+                Some((note, address, _memo)) => {
+                    let mut diversifier = [0u8; 11];
+                    diversifier.copy_from_slice(address.diversifier().0.as_ref());
+
+                    let rcm_repr = match note.rseed() {
+                        Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                        Rseed::AfterZip212(rseed) => *rseed,
+                    };
+
+                    Some((*position as u64, *height, note.value().inner(), diversifier, rcm_repr, *cmu))
+                }
+                None => None,
+            }
+        })
+        .collect();
+
+    eprintln!("⚡ Decrypted {} notes from {} outputs", decrypted.len(), output_count);
+
+    // Now compute nullifiers (need extsk, so sequential, but this is fast)
+    let mut notes_written = 0;
+    let mut total_received: u64 = 0;
+    let mut total_spent: u64 = 0;
+    let mut notes_spent: u32 = 0;
+
+    for (position, height, value, diversifier, rcm_repr, cmu) in decrypted {
+        if notes_written >= max_notes {
+            eprintln!("⚠️ Max notes ({}) reached, stopping", max_notes);
+            break;
+        }
+
+        total_received += value;
+
+        // Parse rcm
+        let rcm_scalar: Fr = match Option::<Fr>::from(Fr::from_repr(rcm_repr)) {
+            Some(r) => r,
+            None => {
+                eprintln!("⚠️ Invalid rcm for note at position {}", position);
+                continue;
+            }
+        };
+
+        // Get payment address for nullifier computation
+        let div = Diversifier(diversifier);
+        let payment_address = match fvk.vk.to_payment_address(div) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("⚠️ Invalid diversifier for note at position {}", position);
+                continue;
+            }
+        };
+
+        // Create note and compute nullifier
+        // CRITICAL: position is the enumerate index from boost file (blockchain order)
+        let note = payment_address.create_note(value, Rseed::BeforeZip212(rcm_scalar));
+        let nullifier = note.nf(&nk, position);
+        let nf_bytes = nullifier.0;
+
+        // Check if spent
+        let is_spent = if nullifier_set.contains(&nf_bytes) { 1u8 } else { 0u8 };
+        if is_spent == 1 {
+            total_spent += value;
+            notes_spent += 1;
+            eprintln!("   💸 Spent: {} zatoshis @ height {}", value, height);
+        } else {
+            eprintln!("   💰 Unspent: {} zatoshis @ height {} (pos {})", value, height, position);
+        }
+
+        // Write to output buffer with all data needed for database/transactions
+        let out_note = &mut *notes_out.add(notes_written);
+        out_note.height = height;
+        out_note.position = position;
+        out_note.value = value;
+        out_note.diversifier = diversifier;
+        out_note.rcm = rcm_repr;
+        out_note.cmu = cmu;
+        out_note.nullifier = nf_bytes;
+        out_note.is_spent = is_spent;
+        out_note._padding = [0u8; 4];
+
+        notes_written += 1;
+    }
+
+    // Write summary
+    if !result_out.is_null() {
+        (*result_out) = BoostScanResult {
+            total_received,
+            total_spent,
+            unspent_balance: total_received - total_spent,
+            notes_found: notes_written as u32,
+            notes_spent,
+            spends_checked: spend_count as u32,
+        };
+    }
+
+    eprintln!("✅ Scan complete: {} notes, {} spent, balance: {:.8} ZCL",
+        notes_written, notes_spent, (total_received - total_spent) as f64 / 100_000_000.0);
+
+    notes_written
+}
+
+/// Helper struct for boost output decryption (implements ShieldedOutput trait)
+struct BoostOutput {
+    epk: [u8; 32],
+    cmu: [u8; 32],
+    enc_ciphertext: [u8; 580],
+}
+
+impl ShieldedOutput<SaplingDomain<ZclassicNetwork>, ENC_CIPHERTEXT_SIZE> for BoostOutput {
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        EphemeralKeyBytes(self.epk)
+    }
+    fn cmstar_bytes(&self) -> [u8; 32] {
+        self.cmu
+    }
+    fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
+        &self.enc_ciphertext
+    }
+}

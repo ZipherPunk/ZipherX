@@ -1516,4 +1516,133 @@ enum ZipherXFFI {
 
         return (Data(txOutput.prefix(txLen)), nullifiers)
     }
+
+    // MARK: - Boost File Scanning (Rust-native, matching benchmark)
+
+    /// Result for a discovered note from boost file scanning
+    struct BoostNote {
+        let height: UInt32
+        let position: UInt64
+        let value: UInt64
+        let diversifier: Data  // 11 bytes
+        let rcm: Data          // 32 bytes
+        let cmu: Data          // 32 bytes
+        let nullifier: Data    // 32 bytes
+        let isSpent: Bool
+    }
+
+    /// Summary result from boost scan
+    struct BoostScanSummary {
+        let totalReceived: UInt64
+        let totalSpent: UInt64
+        let unspentBalance: UInt64
+        let notesFound: UInt32
+        let notesSpent: UInt32
+        let spendsChecked: UInt32
+    }
+
+    /// Scan boost file outputs and spends in Rust - complete PHASE 1 + PHASE 1.6
+    /// This matches the benchmark implementation exactly
+    ///
+    /// - Parameters:
+    ///   - spendingKey: 169-byte extended spending key
+    ///   - outputsData: Raw outputs section from boost file (652 bytes per output)
+    ///   - outputCount: Number of outputs
+    ///   - spendsData: Raw spends section from boost file (36 bytes per spend)
+    ///   - spendCount: Number of spends
+    /// - Returns: (notes, summary) or nil on failure
+    static func scanBoostOutputs(
+        spendingKey: Data,
+        outputsData: Data,
+        outputCount: Int,
+        spendsData: Data,
+        spendCount: Int
+    ) -> (notes: [BoostNote], summary: BoostScanSummary)? {
+        guard spendingKey.count == 169,
+              outputsData.count >= outputCount * 652,
+              spendsData.count >= spendCount * 36 else {
+            print("❌ scanBoostOutputs: invalid input sizes")
+            return nil
+        }
+
+        let maxNotes = 1000  // Buffer for up to 1000 notes
+
+        // Allocate output buffers
+        var notesBuffer = [BoostScanNote](repeating: BoostScanNote(
+            height: 0,
+            position: 0,
+            value: 0,
+            diversifier: (0,0,0,0,0,0,0,0,0,0,0),
+            rcm: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+            cmu: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+            nullifier: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+            is_spent: 0,
+            _padding: (0,0,0,0)
+        ), count: maxNotes)
+
+        var resultSummary = BoostScanResult(
+            total_received: 0,
+            total_spent: 0,
+            unspent_balance: 0,
+            notes_found: 0,
+            notes_spent: 0,
+            spends_checked: 0
+        )
+
+        let notesWritten: Int = spendingKey.withUnsafeBytes { skPtr in
+            outputsData.withUnsafeBytes { outputsPtr in
+                spendsData.withUnsafeBytes { spendsPtr in
+                    zipherx_scan_boost_outputs(
+                        skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        outputsPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        outputCount,
+                        spendsPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        spendCount,
+                        &notesBuffer,
+                        maxNotes,
+                        &resultSummary
+                    )
+                }
+            }
+        }
+
+        guard notesWritten > 0 || resultSummary.notes_found == 0 else {
+            return nil
+        }
+
+        // Convert C structs to Swift structs
+        var notes: [BoostNote] = []
+        for i in 0..<notesWritten {
+            let cNote = notesBuffer[i]
+
+            // Convert tuples to Data
+            let divData = withUnsafeBytes(of: cNote.diversifier) { Data($0) }
+            let rcmData = withUnsafeBytes(of: cNote.rcm) { Data($0) }
+            let cmuData = withUnsafeBytes(of: cNote.cmu) { Data($0) }
+            let nfData = withUnsafeBytes(of: cNote.nullifier) { Data($0) }
+
+            let note = BoostNote(
+                height: cNote.height,
+                position: cNote.position,
+                value: cNote.value,
+                diversifier: divData,
+                rcm: rcmData,
+                cmu: cmuData,
+                nullifier: nfData,
+                isSpent: cNote.is_spent != 0
+            )
+            notes.append(note)
+        }
+
+        let summary = BoostScanSummary(
+            totalReceived: resultSummary.total_received,
+            totalSpent: resultSummary.total_spent,
+            unspentBalance: resultSummary.unspent_balance,
+            notesFound: resultSummary.notes_found,
+            notesSpent: resultSummary.notes_spent,
+            spendsChecked: resultSummary.spends_checked
+        )
+
+        return (notes, summary)
+    }
 }
