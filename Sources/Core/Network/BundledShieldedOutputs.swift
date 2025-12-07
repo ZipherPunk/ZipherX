@@ -294,17 +294,85 @@ final class BundledShieldedOutputs {
 
     /// Get outputs for parallel decryption (returns FFI-compatible format)
     /// Also returns metadata for each output to correlate decryption results
-    func getOutputsForParallelDecryption(from: UInt64, to: UInt64) -> [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data)] {
-        let outputs = getOutputsInRange(from: from, to: to)
+    /// Returns: Array of (output, height, cmu, globalPosition) tuples
+    /// globalPosition is the 0-based index in the entire boost file (used for nullifier computation)
+    func getOutputsForParallelDecryption(from: UInt64, to: UInt64) -> [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data, globalPosition: UInt64)] {
+        let (outputs, startIndex) = getOutputsInRangeWithPosition(from: from, to: to)
 
-        return outputs.map { output in
+        return outputs.enumerated().map { (idx, output) in
             let ffiOutput = ZipherXFFI.FFIShieldedOutput(
                 epk: output.epk,
                 cmu: output.cmu,
                 ciphertext: output.encCiphertext
             )
-            return (output: ffiOutput, height: output.height, cmu: output.cmu)
+            let globalPosition = UInt64(startIndex + idx)
+            return (output: ffiOutput, height: output.height, cmu: output.cmu, globalPosition: globalPosition)
         }
+    }
+
+    /// Get outputs in range along with the starting index (for position tracking)
+    /// Returns: (outputs array, starting index in the full boost file)
+    private func getOutputsInRangeWithPosition(from: UInt64, to: UInt64) -> ([ShieldedOutputData], Int) {
+        guard let data = outputsData else {
+            return ([], 0)
+        }
+
+        // Build index if needed
+        if heightIndex == nil {
+            buildHeightIndex()
+        }
+
+        guard let index = heightIndex, !index.isEmpty else {
+            return ([], 0)
+        }
+
+        // Binary search for start position
+        var lo = 0
+        var hi = index.count
+
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if index[mid].height < UInt32(from) {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+
+        // Handle edge case: start height not found
+        if lo >= index.count {
+            return ([], 0)
+        }
+
+        // Check if first matching index is actually in our range
+        if index[lo].height > UInt32(to) {
+            return ([], 0)
+        }
+
+        // Calculate starting output index from offset
+        let startOffset = index[lo].offset
+        let startIndex = startOffset / Self.OUTPUT_SIZE
+
+        // Collect outputs in range
+        var outputs: [ShieldedOutputData] = []
+        var offset = startOffset
+
+        let dataCount = data.count
+        while offset + Self.OUTPUT_SIZE <= dataCount {
+            let output = parseOutput(at: offset, in: data)
+
+            if output.height > UInt32(to) {
+                break
+            }
+
+            if output.height >= UInt32(from) {
+                outputs.append(output)
+            }
+
+            offset += Self.OUTPUT_SIZE
+        }
+
+        return (outputs, startIndex)
     }
 
     /// Get CMU data for tree building (in blockchain order)

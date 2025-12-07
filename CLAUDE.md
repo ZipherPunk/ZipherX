@@ -3546,6 +3546,48 @@ let encCiphertext = data.subdata(in: (offset + 72)..<(offset + 652))
 
 ---
 
+### 62. CRITICAL: Nullifier Computation Using Boost File Global Position (December 7, 2025)
+
+**Problem**: After fixing the byte order bug (#60), balance was still wrong - all 54 notes showed as UNSPENT when many should be spent. Log showed: `✅ PHASE 1 complete: 0 notes, 16 spends` but `knownNullifiers.count = 0`.
+
+**Root Cause**: `processBoostOutputsParallel()` was trying to look up CMU positions from a separate CMU file (`cmuDataForPositionLookup`), but the unified boost file doesn't have a separate CMU section. The lookup always failed, so nullifiers were never computed/added.
+
+**Key Insight**: The boost file outputs ARE in blockchain order. The enumerate index IS the correct position for nullifier computation. This is exactly how the Rust benchmark works.
+
+**Solution**: Use global position from boost file index directly:
+
+1. **BundledShieldedOutputs.swift**:
+   - Added `getOutputsForParallelDecryption()` that returns `globalPosition` (the output's index in the full boost file)
+   - Added helper `getOutputsInRangeWithPosition()` that calculates `startIndex = startOffset / OUTPUT_SIZE`
+   - Each output's position = `startIndex + enumerate index`
+
+2. **FilterScanner.swift**:
+   - Updated `processBoostOutputsParallel()` signature to accept tuples with `globalPosition`
+   - Use `info.globalPosition` directly for `computeNullifier()` - no CMU lookup needed
+   - Nullifiers are now ALWAYS added to `knownNullifiers` (no conditional check)
+
+**Why This Matches Benchmark**:
+```rust
+// Rust benchmark uses enumerate index as position:
+for (position, cmu) in cmu_reader.enumerate() {
+    nullifier = compute_nf(spending_key, &note, position as u64)?;
+}
+```
+
+**Flow After Fix**:
+1. PHASE 1: `processBoostOutputsParallel()` finds 54 notes
+2. For each note: `position = output.globalPosition` (index in boost file)
+3. `nullifier = computeNullifier(position: position)` - correct nullifier
+4. `knownNullifiers.insert(nullifier)` - nullifier tracked
+5. PHASE 1.6: Checks 16 spends against `knownNullifiers` - spent notes detected
+6. Balance shows correct amount (not all notes marked UNSPENT)
+
+**Files Modified**:
+- `Sources/Core/Network/BundledShieldedOutputs.swift` - Added `globalPosition` to output tuple
+- `Sources/Core/Network/FilterScanner.swift` - Uses `globalPosition` directly, removed CMU lookup
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

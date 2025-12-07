@@ -508,7 +508,6 @@ final class FilterScanner {
                                 outputs: boostOutputs,
                                 accountId: accountId,
                                 spendingKey: spendingKey,
-                                cmuDataForPositionLookup: self.cmuDataForPositionLookup,
                                 baseHeight: currentHeight
                             )
                             usedOptimizedPath = true
@@ -1519,15 +1518,14 @@ final class FilterScanner {
     ///
     /// - Parameters:
     ///   - outputs: Pre-processed outputs from BundledShieldedOutputs.getOutputsForParallelDecryption()
+    ///             Each tuple contains (output, height, cmu, globalPosition)
     ///   - accountId: Account to store notes for
     ///   - spendingKey: Spending key for decryption
-    ///   - cmuDataForPositionLookup: Bundled CMU data for position lookup
     ///   - baseHeight: Lowest height in batch (for FFI version byte selection)
     private func processBoostOutputsParallel(
-        outputs: [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data)],
+        outputs: [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data, globalPosition: UInt64)],
         accountId: Int64,
         spendingKey: Data,
-        cmuDataForPositionLookup: Data?,
         baseHeight: UInt64
     ) throws {
         guard !outputs.isEmpty else { return }
@@ -1552,27 +1550,15 @@ final class FilterScanner {
             let info = outputs[idx]
             let cmu = info.cmu  // Already in wire format from boost file
             let height = UInt64(info.height)
+            let position = info.globalPosition  // Position from boost file index (matches benchmark)
 
             debugLog(.wallet, "💰 Note found: \(Double(note.value)/100_000_000) ZCL @ height \(height)")
 
             // Generate a pseudo-txid for bundled outputs (grouped by height)
             let txidData = "boost_\(height)_\(idx)".data(using: .utf8) ?? Data()
 
-            // Look up position from bundled CMU data
-            var position: UInt64 = 0
-            var needsNullifierFix = false
-
-            if let bundledData = cmuDataForPositionLookup {
-                if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
-                    position = realPos
-                } else {
-                    needsNullifierFix = true
-                }
-            } else {
-                needsNullifierFix = true
-            }
-
-            // Compute nullifier
+            // Compute nullifier using globalPosition from boost file index
+            // This matches how the benchmark computes positions: enumerate index = position
             let nullifier = try rustBridge.computeNullifier(
                 spendingKey: spendingKey,
                 diversifier: note.diversifier,
@@ -1581,10 +1567,8 @@ final class FilterScanner {
                 position: position
             )
 
-            // Add to known nullifiers only if position is correct
-            if !needsNullifierFix {
-                knownNullifiers.insert(nullifier)
-            }
+            // Add to known nullifiers - position is always correct from boost file index
+            knownNullifiers.insert(nullifier)
 
             // Store note (noteId unused - witnesses computed in PHASE 1.5)
             _ = try database.insertNote(
