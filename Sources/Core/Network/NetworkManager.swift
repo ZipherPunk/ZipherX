@@ -829,7 +829,7 @@ final class NetworkManager: ObservableObject {
         // This allows reconnecting to previously discovered peers
         addressLock.lock()
         var allCandidates: [PeerAddress] = []
-        for (key, info) in knownAddresses {
+        for (key, _) in knownAddresses {
             let components = key.split(separator: ":")
             guard components.count == 2, let port = UInt16(components[1]) else { continue }
             allCandidates.append(PeerAddress(host: String(components[0]), port: port))
@@ -2186,7 +2186,7 @@ final class NetworkManager: ObservableObject {
 
         // Broadcast to all peers - but check mempool after FIRST success
         // Use short timeout (5s) to avoid waiting for slow/dead peers
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        await withThrowingTaskGroup(of: Void.self) { group in
             // Add broadcast tasks for all peers with fast timeout
             for peer in peers {
                 let peerHost = "\(peer.host):\(peer.port)"

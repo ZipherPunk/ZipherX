@@ -1056,8 +1056,6 @@ final class WalletManager: ObservableObject {
 
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     // Show context: scanning from checkpoint to current with estimated date
-                    let blocksScanned = currentHeight > downloadedTreeHeight ? currentHeight - downloadedTreeHeight : 0
-
                     // Estimate date for current block height
                     let estimatedDate = self?.estimateDateForBlock(height: currentHeight) ?? ""
                     let dateString = estimatedDate.isEmpty ? "" : " (\(estimatedDate))"
