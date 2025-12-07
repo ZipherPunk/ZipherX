@@ -54,8 +54,13 @@ final class TransactionBuilder {
         print("   Spend:  \(spendPath.path)")
         print("   Output: \(outputPath.path)")
 
-        guard let spendData = try? Data(contentsOf: spendPath) else {
-            print("❌ Failed to read spend params file")
+        let spendData: Data
+        do {
+            spendData = try Data(contentsOf: spendPath)
+        } catch {
+            print("❌ Failed to read spend params file: \(error.localizedDescription)")
+            print("   Path: \(spendPath.path)")
+            print("   Exists: \(FileManager.default.fileExists(atPath: spendPath.path))")
             throw TransactionError.proofGenerationFailed
         }
         guard let outputData = try? Data(contentsOf: outputPath) else {
