@@ -505,12 +505,7 @@ final class FilterScanner {
                     currentHeight = parallelEndHeight + 1
 
                     // Report progress as 40% complete (PHASE 1 done)
-                    reportPhase1Progress(
-                        scannedBlocks: parallelTotalBlocks,
-                        totalBlocks: parallelTotalBlocks,
-                        maxHeight: targetHeight,
-                        currentHeight: parallelEndHeight
-                    )
+                    reportPhase1Progress(1.0, height: parallelEndHeight, maxHeight: targetHeight)
 
                 } catch {
                     print("⚠️ Rust boost scan failed, falling back to batch processing: \(error)")
