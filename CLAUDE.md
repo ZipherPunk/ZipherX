@@ -3644,6 +3644,93 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
 
 ---
 
+### 64. CRITICAL: Multi-Input Transaction AnchorMismatch Fix (December 7, 2025)
+
+**Problem**: Multi-input transactions (spending multiple notes) failed with `AnchorMismatch` error:
+```
+✅ Multi-input INSTANT mode: All 2 notes have matching anchors!
+❌ Failed to add spend: AnchorMismatch
+```
+
+**Root Cause**: The Sapling protocol requires ALL spends in a transaction to use the SAME anchor (Merkle tree root). Each note's witness was created at a different tree state (when the note was discovered/synced), so they had different anchors. The stored `anchor` field in the database was unreliable - it tracked when the witness was "saved" but not the actual tree state used to compute the witness.
+
+**Solution**: For multi-input transactions, ALWAYS rebuild ALL witnesses using batch witness creation from the CMU data file. This guarantees all witnesses are computed from the exact same tree state with matching anchors.
+
+**Code Changes** (`TransactionBuilder.swift`):
+```swift
+// For multi-input, ALWAYS use batch witness creation to guarantee same anchor
+if isMultiInput {
+    print("🔧 Multi-input: Rebuilding witnesses for consistent anchors...")
+
+    // Collect all CMUs and create witnesses in batch
+    var allCMUs: [Data] = []
+    for note in selectedNotes {
+        allCMUs.append(note.cmu!)
+    }
+
+    let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: data, targetCMUs: allCMUs)
+    // Use batch-created witnesses which all have same anchor
+}
+```
+
+**Key Insight**: The `treeCreateWitnessesBatch` function builds the tree ONCE and creates witnesses for all target CMUs, updating them all to the END of the CMU data. This ensures all witnesses have the SAME anchor.
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Always use batch witness creation for multi-input
+
+---
+
+### 65. iOS Simulator Secure Enclave Key Retrieval Fix (December 7, 2025)
+
+**Problem**: On iOS Simulator running on Apple Silicon Macs, transaction building failed with "Key not found in storage" error.
+
+**Root Cause**: iOS Simulator on Apple Silicon has access to the REAL Secure Enclave (not emulated). Keys were stored with Secure Enclave encryption (250 bytes) but `retrieveEncryptedSpendingKey()` expected AES-GCM format (197 bytes = 12 nonce + 169 ciphertext + 16 tag).
+
+**Solution**: Modified `retrieveEncryptedSpendingKey()` to detect and handle Secure Enclave encrypted keys:
+```swift
+if encryptedData.count == 197 {
+    return encryptedData  // AES-GCM format - return as-is
+} else if encryptedData.count > 169 {
+    // Secure Enclave format - decrypt and re-encrypt with AES-GCM
+    print("📱 Simulator: Key was stored with Secure Enclave, converting to AES-GCM format")
+    let sePrivateKey = // retrieve SE private key
+    let decrypted = SecKeyCreateDecryptedData(sePrivateKey, ...)
+    let reEncrypted = // encrypt with AES-GCM
+    return reEncrypted
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/SecureKeyStorage.swift` - Handle SE-encrypted keys on Apple Silicon simulators
+
+---
+
+### 66. Post-Sync Verification Progress Improvements (December 7, 2025)
+
+**Problem**: Progress bar showed 100% while "Verifying Height" was still running for 20+ seconds.
+
+**Solution**:
+1. Cap progress at 98% during verification phase
+2. Show remaining blocks and elapsed time during verification
+3. More frequent status updates (every 500ms instead of 2 seconds)
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Progress capping and status improvements
+
+---
+
+### 67. Boost File Cache Version Invalidation (December 7, 2025)
+
+**Problem**: Old cached CMU files with incorrect offsets were being used instead of regenerated.
+
+**Solution**: Added version-based cache invalidation (`legacyCMUCacheVersion = 2`) and automatic cleanup of old cache versions.
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - Version-based cache invalidation
+- `Sources/Core/Wallet/WalletManager.swift` - Delete boost files when wallet is deleted
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

@@ -203,14 +203,39 @@ struct ContentView: View {
 
                         // ALSO wait for wallet height to match chain height
                         // This ensures we're truly synced, not just "not syncing"
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Verifying blockchain height...")
+                        }
                         var syncWaitCount = 0
                         let maxSyncWait = 300 // 30 seconds max wait for height sync
+
+                        // Fetch initial stats to get current heights
+                        await networkManager.fetchNetworkStats()
+                        let targetHeight = networkManager.chainHeight
+
                         while networkManager.chainHeight > 0 &&
                               networkManager.walletHeight < networkManager.chainHeight &&
                               syncWaitCount < maxSyncWait {
                             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                             syncWaitCount += 1
-                            // Re-fetch stats periodically to update heights
+
+                            // Update status more frequently (every 500ms) with detailed progress
+                            if syncWaitCount % 5 == 0 {
+                                let walletH = networkManager.walletHeight
+                                let chainH = networkManager.chainHeight
+                                let blocksRemaining = chainH > walletH ? chainH - walletH : 0
+                                let elapsed = Double(syncWaitCount) / 10.0 // seconds elapsed
+
+                                await MainActor.run {
+                                    if blocksRemaining > 0 {
+                                        walletManager.setConnecting(true, status: "Syncing \(blocksRemaining) remaining blocks... (\(String(format: "%.1f", elapsed))s)")
+                                    } else {
+                                        walletManager.setConnecting(true, status: "Finalizing sync... (\(String(format: "%.1f", elapsed))s)")
+                                    }
+                                }
+                            }
+
+                            // Re-fetch stats every 2 seconds to update heights
                             if syncWaitCount % 20 == 0 {
                                 await networkManager.fetchNetworkStats()
                             }
@@ -218,6 +243,9 @@ struct ContentView: View {
 
                         // CATCH-UP: Check for blocks that arrived during setup
                         // Re-fetch current chain height and sync any new blocks
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Checking for new blocks...")
+                        }
                         await networkManager.fetchNetworkStats()
                         let currentChainHeight = networkManager.chainHeight
                         let currentWalletHeight = networkManager.walletHeight
@@ -450,7 +478,22 @@ struct ContentView: View {
     private var currentSyncProgress: Double {
         // Use the monotonic progress from WalletManager
         // This never goes backward, providing smooth UX
-        return walletManager.overallProgress
+        let baseProgress = walletManager.overallProgress
+
+        // If we're in post-sync verification (isConnecting after tasks complete),
+        // cap progress at 98% so user knows it's not fully done yet
+        let statusAllTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+            if case .completed = $0.status { return true }
+            if case .failed = $0.status { return true }
+            return false
+        }
+
+        if statusAllTasksCompleted && walletManager.isConnecting {
+            // During verification phase, show progress between 98-99%
+            return min(baseProgress, 0.98)
+        }
+
+        return baseProgress
     }
 
     /// Combined status for all sync phases
@@ -471,10 +514,15 @@ struct ContentView: View {
             return false
         }
 
-        // PRIORITY: All tasks completed - show "Almost ready..."
-        // This takes precedence to avoid showing stale status messages
+        // PRIORITY 1: Post-sync verification (isConnecting after sync complete)
+        // This shows status like "Verifying sync completion..." or "Checking for new blocks..."
+        if statusAllTasksCompleted && walletManager.isConnecting && !walletManager.syncStatus.isEmpty {
+            return walletManager.syncStatus
+        }
+
+        // PRIORITY 2: All tasks completed but no specific status - show generic message
         if statusAllTasksCompleted {
-            return "Almost ready..."
+            return "Finalizing..."
         }
 
         // Syncing (includes waiting for sync to start)

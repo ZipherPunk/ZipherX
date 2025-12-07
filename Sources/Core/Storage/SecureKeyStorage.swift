@@ -1055,12 +1055,14 @@ extension SecureKeyStorage {
     // These functions provide encrypted key data that can be passed to Rust for
     // decryption in memory that Rust can explicitly zero.
 
-    /// Retrieve the encrypted spending key data (197 bytes)
-    /// Format: nonce(12) + ciphertext(169) + tag(16)
+    /// Retrieve the encrypted spending key data
+    /// For AES-GCM format (simulator/macOS): 197 bytes = nonce(12) + ciphertext(169) + tag(16)
+    /// For Secure Enclave format (iOS device): variable size (encrypted with SE public key)
     /// This data can be passed to Rust for decryption where memory can be explicitly zeroed
     func retrieveEncryptedSpendingKey() throws -> Data {
         if isSimulator {
-            // Simulator: key is stored encrypted in keychain
+            // Simulator: key might be stored encrypted in keychain (AES-GCM format)
+            // OR it might have used Secure Enclave if available (Apple Silicon Macs)
             print("📱 Simulator: Retrieving encrypted key from keychain")
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
@@ -1076,12 +1078,60 @@ extension SecureKeyStorage {
                 throw SecureStorageError.keyNotFound
             }
 
-            // Verify correct length (should be 197 bytes)
-            guard encryptedData.count == 197 else {
+            // Check if it's AES-GCM format (197 bytes) or Secure Enclave format (>197 bytes)
+            if encryptedData.count == 197 {
+                // AES-GCM format - can be passed directly to Rust
+                return encryptedData
+            } else if encryptedData.count > 169 {
+                // Secure Enclave format - need to decrypt and re-encrypt in AES-GCM format
+                // This happens on Apple Silicon simulators that have access to Secure Enclave
+                print("📱 Simulator: Key was stored with Secure Enclave (\(encryptedData.count) bytes), converting to AES-GCM format")
+
+                // Get the Secure Enclave private key
+                let keyQuery: [String: Any] = [
+                    kSecClass as String: kSecClassKey,
+                    kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
+                    kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                    kSecReturnRef as String: true
+                ]
+
+                var keyRef: AnyObject?
+                let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
+
+                guard keyStatus == errSecSuccess else {
+                    print("⚠️ Simulator: Secure Enclave key not found (status: \(keyStatus))")
+                    throw SecureStorageError.secureEnclaveKeyNotFound
+                }
+
+                // Decrypt with Secure Enclave
+                let privateKey = keyRef as! SecKey
+                var decryptError: Unmanaged<CFError>?
+                guard let decryptedData = SecKeyCreateDecryptedData(
+                    privateKey,
+                    .eciesEncryptionCofactorVariableIVX963SHA256AESGCM,
+                    encryptedData as CFData,
+                    &decryptError
+                ) else {
+                    let errorMsg = decryptError?.takeRetainedValue().localizedDescription ?? "Unknown error"
+                    print("⚠️ Simulator: Secure Enclave decryption failed: \(errorMsg)")
+                    throw SecureStorageError.decryptionFailed(errorMsg)
+                }
+
+                let decryptedKey = decryptedData as Data
+                print("📱 Simulator: Decrypted key (\(decryptedKey.count) bytes), re-encrypting with AES-GCM")
+
+                // Re-encrypt with AES-GCM for Rust FFI
+                let encryptionKey = try getSimulatorEncryptionKey()
+                let sealedBox = try AES.GCM.seal(decryptedKey, using: encryptionKey)
+                guard let reEncrypted = sealedBox.combined else {
+                    throw SecureStorageError.encryptionFailed("Failed to re-encrypt key")
+                }
+                print("📱 Simulator: Re-encrypted to AES-GCM format (\(reEncrypted.count) bytes)")
+                return reEncrypted
+            } else {
+                print("⚠️ Simulator: Unexpected encrypted key size: \(encryptedData.count)")
                 throw SecureStorageError.keyNotFound
             }
-
-            return encryptedData
         }
 
         if isMacOS {

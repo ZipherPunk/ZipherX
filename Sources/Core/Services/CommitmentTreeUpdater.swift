@@ -204,13 +204,14 @@ actor CommitmentTreeUpdater {
         }
 
         // Output record format in boost file (652 bytes each):
-        // - height: 4 bytes (UInt32 LE)
-        // - epk: 32 bytes
-        // - cmu: 32 bytes (at offset 36)
-        // - ciphertext: 580 bytes
-        // - nullifier: 4 bytes (tx index or 0)
+        // - height: 4 bytes (UInt32 LE) - offset 0
+        // - index: 4 bytes (UInt32 LE) - offset 4
+        // - cmu: 32 bytes - offset 8
+        // - epk: 32 bytes - offset 40
+        // - ciphertext: 580 bytes - offset 72
+        // Total: 652 bytes per output
         let recordSize = 652
-        let cmuOffset = 36  // height(4) + epk(32) = 36
+        let cmuOffset = 8  // height(4) + index(4) = 8
 
         let outputCount = outputSection.count
         print("🔄 Extracting \(outputCount) CMUs in legacy format...")
@@ -235,7 +236,7 @@ actor CommitmentTreeUpdater {
                 throw BoostFileError.readError
             }
 
-            // Extract CMU (32 bytes at offset 36)
+            // Extract CMU (32 bytes at offset 8)
             let cmu = recordData.subdata(in: cmuOffset..<(cmuOffset + 32))
 
             // Write CMU to result buffer
@@ -416,13 +417,29 @@ actor CommitmentTreeUpdater {
         return manifest.sections.first(where: { $0.type == type.rawValue })
     }
 
-    /// Clear the boost cache
+    /// Clear the boost cache (resets for fresh download)
     func clearCache() throws {
         if FileManager.default.fileExists(atPath: boostCacheDirectory.path) {
             try FileManager.default.removeItem(at: boostCacheDirectory)
             try FileManager.default.createDirectory(at: boostCacheDirectory, withIntermediateDirectories: true)
         }
-        print("🧹 Boost cache cleared")
+        print("🧹 Boost cache cleared (reset for fresh download)")
+    }
+
+    /// Completely delete the boost cache directory (used when deleting wallet)
+    /// Marked nonisolated since it only uses FileManager which is thread-safe
+    nonisolated func deleteAllBoostFiles() {
+        let fm = FileManager.default
+        let documentsDir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let boostCachePath = documentsDir.appendingPathComponent("BoostCache")
+        if fm.fileExists(atPath: boostCachePath.path) {
+            do {
+                try fm.removeItem(at: boostCachePath)
+                print("🗑️ Deleted BoostCache folder")
+            } catch {
+                print("⚠️ Failed to delete BoostCache: \(error)")
+            }
+        }
     }
 
     // MARK: - Legacy Compatibility (for existing code)
@@ -432,14 +449,35 @@ actor CommitmentTreeUpdater {
         return try await getBestAvailableBoostFile(onProgress: onProgress)
     }
 
+    /// Version for legacy CMU cache format - bump this when format changes
+    /// Version 2: Fixed CMU offset from 36 to 8 (December 2025)
+    private static let legacyCMUCacheVersion = 2
+
     /// Path to cached legacy CMU file (extracted from boost file)
     private var cachedLegacyCMUPath: URL {
-        boostCacheDirectory.appendingPathComponent("legacy_cmus.bin")
+        boostCacheDirectory.appendingPathComponent("legacy_cmus_v\(Self.legacyCMUCacheVersion).bin")
+    }
+
+    /// Clean up old cache versions
+    private func cleanupOldCacheVersions() {
+        let fm = FileManager.default
+        // Delete old version files
+        let oldFiles = ["legacy_cmus.bin", "legacy_cmus_v1.bin"]
+        for filename in oldFiles {
+            let path = boostCacheDirectory.appendingPathComponent(filename)
+            if fm.fileExists(atPath: path.path) {
+                try? fm.removeItem(at: path)
+                print("🗑️ Deleted old cache file: \(filename)")
+            }
+        }
     }
 
     /// Legacy method - get cached CMU data in legacy format
     /// Extracts CMUs from boost file on first call, caches for subsequent calls
     func getCachedCMUFilePath() async -> URL? {
+        // Clean up old cache versions first
+        cleanupOldCacheVersions()
+
         // Check if we have cached legacy CMU file
         if FileManager.default.fileExists(atPath: cachedLegacyCMUPath.path) {
             return cachedLegacyCMUPath
@@ -451,7 +489,7 @@ actor CommitmentTreeUpdater {
         do {
             let cmuData = try await extractCMUsInLegacyFormat()
             try cmuData.write(to: cachedLegacyCMUPath)
-            print("💾 Cached legacy CMU data: \(cmuData.count) bytes")
+            print("💾 Cached legacy CMU data (v\(Self.legacyCMUCacheVersion)): \(cmuData.count) bytes")
             return cachedLegacyCMUPath
         } catch {
             print("❌ Failed to extract legacy CMU data: \(error)")

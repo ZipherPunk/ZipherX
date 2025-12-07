@@ -2511,6 +2511,9 @@ final class WalletManager: ObservableObject {
             print("🗑️ Deleted block_timestamps_cache.bin")
         }
 
+        // 9. Delete boost files (downloaded CMU/commitment tree data)
+        CommitmentTreeUpdater.shared.deleteAllBoostFiles()
+
         #if os(macOS)
         // Delete macOS encrypted key file
         let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!

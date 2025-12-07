@@ -493,11 +493,29 @@ final class FilterScanner {
 
             if await CommitmentTreeUpdater.shared.hasCachedBoostFile() {
                 do {
+                    // Update status BEFORE the long Rust operation
+                    onStatusUpdate?("phase1", "Decrypting historical notes (Rust)...")
+                    reportPhase1Progress(0.05, height: currentHeight, maxHeight: targetHeight)
+
                     print("🦀 Starting complete Rust boost file scan...")
                     let result = try await processBoostFileWithRust(
                         accountId: accountId,
                         spendingKey: spendingKey
-                    )
+                    ) { phase, detail in
+                        // Progress callback from processBoostFileWithRust
+                        self.onStatusUpdate?("phase1", detail)
+                        // Map sub-phases to 5-40% progress
+                        let subProgress: Double
+                        switch phase {
+                        case "extract_outputs": subProgress = 0.10
+                        case "extract_spends": subProgress = 0.15
+                        case "rust_scan": subProgress = 0.20
+                        case "store_notes": subProgress = 0.80
+                        case "complete": subProgress = 1.0
+                        default: subProgress = 0.50
+                        }
+                        self.reportPhase1Progress(subProgress, height: self.currentChainHeight, maxHeight: targetHeight)
+                    }
                     print("🦀 Rust scan complete: \(result.notesFound) notes, \(result.notesSpent) spent, balance: \(Double(result.balance) / 100_000_000) ZCL")
                     usedRustBoostScan = true
 
@@ -1640,7 +1658,8 @@ final class FilterScanner {
     /// - Returns: Tuple of (notes found, notes spent, unspent balance in zatoshis)
     private func processBoostFileWithRust(
         accountId: Int64,
-        spendingKey: Data
+        spendingKey: Data,
+        onProgress: ((String, String) -> Void)? = nil
     ) async throws -> (notesFound: Int, notesSpent: Int, balance: UInt64) {
         // Get section info from boost manifest
         let treeUpdater = CommitmentTreeUpdater.shared
@@ -1653,12 +1672,15 @@ final class FilterScanner {
         let spendCount = Int(cachedInfo.spendCount)
 
         debugLog(.sync, "🦀 Rust boost scan: \(outputCount) outputs, \(spendCount) spends")
+        onProgress?("extract_outputs", "Extracting \(outputCount.formatted()) outputs...")
 
         // Extract raw data from boost file
         let outputsData = try await treeUpdater.extractShieldedOutputs()
+        onProgress?("extract_spends", "Extracting \(spendCount.formatted()) spends...")
         let spendsData = try await treeUpdater.extractShieldedSpends()
 
         debugLog(.sync, "📦 Extracted: outputs=\(outputsData.count) bytes, spends=\(spendsData.count) bytes")
+        onProgress?("rust_scan", "Scanning \(outputCount.formatted()) outputs (Rayon parallel)...")
 
         // Call Rust FFI for complete scanning
         guard let result = ZipherXFFI.scanBoostOutputs(
@@ -1678,6 +1700,13 @@ final class FilterScanner {
                Unspent balance: \(Double(result.summary.unspentBalance) / 100_000_000) ZCL
                Total received: \(Double(result.summary.totalReceived) / 100_000_000) ZCL
             """)
+
+        // Report scan complete, storing notes
+        if result.summary.notesFound > 0 {
+            onProgress?("store_notes", "Storing \(result.summary.notesFound) notes in vault...")
+        } else {
+            onProgress?("store_notes", "No notes found for this wallet")
+        }
 
         // Store all notes in database
         for note in result.notes {
@@ -1723,6 +1752,9 @@ final class FilterScanner {
                 debugLog(.wallet, "💰 Unspent note: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
             }
         }
+
+        // Report completion
+        onProgress?("complete", "Boost scan complete: \(result.summary.notesFound) notes")
 
         return (
             notesFound: Int(result.summary.notesFound),

@@ -1049,6 +1049,7 @@ struct CypherpunkSyncView: View {
     private let completionQuoteSize: CGFloat = 13
     private let completionFooterSize: CGFloat = 12
     #else
+    // iOS font sizes - original values
     private let titleSize: CGFloat = 28
     private let subtitleSize: CGFloat = 10
     private let messageSize: CGFloat = 12
