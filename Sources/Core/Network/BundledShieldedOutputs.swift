@@ -21,10 +21,10 @@ struct ShieldedOutputData {
 /// Loader for shielded outputs from unified boost file
 /// Boost file outputs section format (652 bytes per record):
 ///   - height: UInt32 (4 bytes)
-///   - epk: [UInt8; 32]
+///   - index: UInt32 (4 bytes)
 ///   - cmu: [UInt8; 32]
+///   - epk: [UInt8; 32]
 ///   - ciphertext: [UInt8; 580]
-///   - nullifier_prefix: UInt32 (4 bytes) - unused, for future filtering
 final class BundledShieldedOutputs {
 
     static let shared = BundledShieldedOutputs()
@@ -271,17 +271,18 @@ final class BundledShieldedOutputs {
     /// Parse a single output at the given offset
     /// Boost file format (652 bytes):
     ///   - height: UInt32 (4 bytes)
-    ///   - epk: [UInt8; 32]
+    ///   - index: UInt32 (4 bytes)
     ///   - cmu: [UInt8; 32]
+    ///   - epk: [UInt8; 32]
     ///   - ciphertext: [UInt8; 580]
-    ///   - nullifier_prefix: UInt32 (4 bytes) - unused
     private func parseOutput(at offset: Int, in data: Data) -> ShieldedOutputData {
         let height = readUInt32(from: data, at: offset)
 
-        // Boost format: height(4) + epk(32) + cmu(32) + ciphertext(580) + nullifier_prefix(4)
-        let epk = data.subdata(in: (offset + 4)..<(offset + 36))
-        let cmu = data.subdata(in: (offset + 36)..<(offset + 68))
-        let encCiphertext = data.subdata(in: (offset + 68)..<(offset + 648))
+        // Boost format: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
+        // CRITICAL: Order is CMU first, then EPK (matches Rust benchmark)
+        let cmu = data.subdata(in: (offset + 8)..<(offset + 40))
+        let epk = data.subdata(in: (offset + 40)..<(offset + 72))
+        let encCiphertext = data.subdata(in: (offset + 72)..<(offset + 652))
 
         return ShieldedOutputData(
             height: height,

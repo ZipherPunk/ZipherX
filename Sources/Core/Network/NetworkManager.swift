@@ -993,7 +993,7 @@ final class NetworkManager: ObservableObject {
         // Get authoritative chain height from InsightAPI
         // This is the source of truth for display - don't trust stale local headers
         var currentChainHeight: UInt64 = 0
-        let previousHeight = await MainActor.run { self.chainHeight }
+        _ = await MainActor.run { self.chainHeight }  // Check previous height (used for comparison below)
 
         // 1. First try InsightAPI (authoritative network source)
         if let status = try? await InsightAPI.shared.getStatus() {
@@ -2908,120 +2908,115 @@ final class NetworkManager: ObservableObject {
     /// Uses sequential getdata calls (batch getdata had parsing issues)
     /// PRIORITY: 1) HeaderStore (synced headers), 2) BundledBlockHashes (for historical scan)
     private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
-        do {
-            // Get block hashes - try HeaderStore first, then BundledBlockHashes
-            var blockHashes: [(UInt64, Data)] = []
-            var headerStoreCount = 0
-            var bundledCount = 0
+        // Get block hashes - try HeaderStore first, then BundledBlockHashes
+        var blockHashes: [(UInt64, Data)] = []
+        var headerStoreCount = 0
+        var bundledCount = 0
 
-            for i in 0..<count {
-                let height = startHeight + UInt64(i)
+        for i in 0..<count {
+            let height = startHeight + UInt64(i)
 
-                // First try HeaderStore (synced headers from P2P)
-                if let header = try? HeaderStore.shared.getHeader(at: height) {
-                    blockHashes.append((height, header.blockHash))
-                    headerStoreCount += 1
-                }
-                // Then try BundledBlockHashes (for historical blocks)
-                else if let hash = BundledBlockHashes.shared.getBlockHash(at: height) {
-                    blockHashes.append((height, hash))
-                    bundledCount += 1
-                }
+            // First try HeaderStore (synced headers from P2P)
+            if let header = try? HeaderStore.shared.getHeader(at: height) {
+                blockHashes.append((height, header.blockHash))
+                headerStoreCount += 1
             }
-
-            if headerStoreCount > 0 || bundledCount > 0 {
-                print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
+            // Then try BundledBlockHashes (for historical blocks)
+            else if let hash = BundledBlockHashes.shared.getBlockHash(at: height) {
+                blockHashes.append((height, hash))
+                bundledCount += 1
             }
+        }
 
-            guard !blockHashes.isEmpty else {
-                print("⚠️ [\(peer.host)] No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
-                return nil
-            }
+        if headerStoreCount > 0 || bundledCount > 0 {
+            print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
+        }
 
-            // Check peer connection before attempting fetches
-            guard peer.isConnectionReady else {
-                print("⚠️ [\(peer.host)] Peer not ready, skipping batch of \(count) blocks")
-                return nil
-            }
-
-            // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
-            var blocks: [(UInt64, CompactBlock)] = []
-            var failCount = 0
-            for (height, hash) in blockHashes {
-                do {
-                    let block = try await withTimeout(seconds: 10) {
-                        try await peer.getBlockByHash(hash: hash)
-                    }
-                    blocks.append((height, block))
-                } catch {
-                    failCount += 1
-                    // If too many failures, peer is likely dead
-                    if failCount > 3 {
-                        print("⚠️ [\(peer.host)] Too many failures (\(failCount)), aborting batch")
-                        break
-                    }
-                    continue
-                }
-            }
-
-            if blocks.isEmpty && !blockHashes.isEmpty {
-                print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
-            }
-
-            var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-
-            for (blockHeight, compactBlock) in blocks {
-                let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
-                var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-
-                for tx in compactBlock.transactions {
-                    var shieldedOutputs: [ShieldedOutput] = []
-                    for output in tx.outputs {
-                        let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
-                        let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
-                        let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
-
-                        let shieldedOutput = ShieldedOutput(
-                            cv: String(repeating: "0", count: 64),
-                            cmu: cmuHex,
-                            ephemeralKey: epkHex,
-                            encCiphertext: ciphertextHex,
-                            outCiphertext: String(repeating: "0", count: 160),
-                            proof: String(repeating: "0", count: 384)
-                        )
-                        shieldedOutputs.append(shieldedOutput)
-                    }
-
-                    var shieldedSpends: [ShieldedSpend]? = nil
-                    if !tx.spends.isEmpty {
-                        shieldedSpends = tx.spends.map { spend in
-                            let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
-                            return ShieldedSpend(
-                                cv: String(repeating: "0", count: 64),
-                                anchor: String(repeating: "0", count: 64),
-                                nullifier: nullifierHex,
-                                rk: String(repeating: "0", count: 64),
-                                proof: String(repeating: "0", count: 384),
-                                spendAuthSig: String(repeating: "0", count: 128)
-                            )
-                        }
-                    }
-
-                    let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
-
-                    if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
-                        txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
-                    }
-                }
-
-                results.append((blockHeight, finalBlockHash, txDataList))
-            }
-
-            return results
-        } catch {
-            print("⚠️ P2P batch fetch failed for peer \(peer.host): \(error)")
+        guard !blockHashes.isEmpty else {
+            print("⚠️ [\(peer.host)] No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
             return nil
         }
+
+        // Check peer connection before attempting fetches
+        guard peer.isConnectionReady else {
+            print("⚠️ [\(peer.host)] Peer not ready, skipping batch of \(count) blocks")
+            return nil
+        }
+
+        // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
+        var blocks: [(UInt64, CompactBlock)] = []
+        var failCount = 0
+        for (height, hash) in blockHashes {
+            do {
+                let block = try await withTimeout(seconds: 10) {
+                    try await peer.getBlockByHash(hash: hash)
+                }
+                blocks.append((height, block))
+            } catch {
+                failCount += 1
+                // If too many failures, peer is likely dead
+                if failCount > 3 {
+                    print("⚠️ [\(peer.host)] Too many failures (\(failCount)), aborting batch")
+                    break
+                }
+                continue
+            }
+        }
+
+        if blocks.isEmpty && !blockHashes.isEmpty {
+            print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
+        }
+
+        var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+
+        for (blockHeight, compactBlock) in blocks {
+            let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
+            var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+            for tx in compactBlock.transactions {
+                var shieldedOutputs: [ShieldedOutput] = []
+                for output in tx.outputs {
+                    let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                    let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                    let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+
+                    let shieldedOutput = ShieldedOutput(
+                        cv: String(repeating: "0", count: 64),
+                        cmu: cmuHex,
+                        ephemeralKey: epkHex,
+                        encCiphertext: ciphertextHex,
+                        outCiphertext: String(repeating: "0", count: 160),
+                        proof: String(repeating: "0", count: 384)
+                    )
+                    shieldedOutputs.append(shieldedOutput)
+                }
+
+                var shieldedSpends: [ShieldedSpend]? = nil
+                if !tx.spends.isEmpty {
+                    shieldedSpends = tx.spends.map { spend in
+                        let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                        return ShieldedSpend(
+                            cv: String(repeating: "0", count: 64),
+                            anchor: String(repeating: "0", count: 64),
+                            nullifier: nullifierHex,
+                            rk: String(repeating: "0", count: 64),
+                            proof: String(repeating: "0", count: 384),
+                            spendAuthSig: String(repeating: "0", count: 128)
+                        )
+                    }
+                }
+
+                let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+
+                if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                    txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+                }
+            }
+
+            results.append((blockHeight, finalBlockHash, txDataList))
+        }
+
+        return results
     }
 
     /// Fetch a single block from P2P peers with fallback to InsightAPI

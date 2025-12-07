@@ -3476,6 +3476,76 @@ All 9 notes are at similar positions near the end of the 1M+ CMU tree. Each thre
 
 ---
 
+### 60. CRITICAL: Boost File Byte Order Fix (December 7, 2025)
+
+**Problem**: Imported wallet scan found 0 notes when it should find 9 (0.0015 ZCL). The optimized boost file scanning path was returning no decrypted notes.
+
+**Root Cause**: `BundledShieldedOutputs.swift` had **incorrect byte offsets** when parsing the boost file:
+
+| Field | Wrong Offset | Correct Offset |
+|-------|-------------|----------------|
+| height | 0-3 | 0-3 ✓ |
+| index | (missing) | 4-7 |
+| cmu | 4-35 (wrong!) | 8-39 |
+| epk | 36-67 (wrong!) | 40-71 |
+| ciphertext | 68-647 (wrong!) | 72-651 |
+
+The Swift code was:
+1. **Missing the 4-byte index field** - caused all subsequent offsets to be wrong by 4 bytes
+2. **EPK and CMU were swapped** - the Rust benchmark has CMU before EPK
+
+**Correct Boost File Format (652 bytes per output)**:
+```
+height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) = 652 bytes
+```
+
+**Impact**: The EPK bytes passed to Rust FFI were actually CMU bytes shifted by 4, causing 100% decryption failure.
+
+**Fix Applied** (`BundledShieldedOutputs.swift`):
+```swift
+// OLD (wrong):
+let epk = data.subdata(in: (offset + 4)..<(offset + 36))
+let cmu = data.subdata(in: (offset + 36)..<(offset + 68))
+let encCiphertext = data.subdata(in: (offset + 68)..<(offset + 648))
+
+// NEW (correct - matches Rust benchmark):
+let cmu = data.subdata(in: (offset + 8)..<(offset + 40))
+let epk = data.subdata(in: (offset + 40)..<(offset + 72))
+let encCiphertext = data.subdata(in: (offset + 72)..<(offset + 652))
+```
+
+**Lesson Learned**: Binary format parsing should ideally be done in one place (Rust) to avoid Swift/Rust mismatches. The working Rust benchmark (`bench_boost_scan.rs`) has the correct format - Swift was out of sync.
+
+**Files Modified**:
+- `Sources/Core/Network/BundledShieldedOutputs.swift` - Fixed byte offsets and field order
+
+---
+
+### 61. Optimized Boost File Scanning + Compiler Warnings Fix (December 7, 2025)
+
+**Feature**: Added optimized binary path for boost file scanning that matches benchmark performance.
+
+**New Function**: `processBoostOutputsParallel()` in `FilterScanner.swift`:
+- Uses direct binary Data from `BundledShieldedOutputs.getOutputsForParallelDecryption()`
+- Skips hex string conversion (7x faster than hex path)
+- Processes entire PHASE 1 range in ~14s instead of ~90s for 1M outputs
+
+**PHASE 1 Loop Priority**:
+1. **PRIORITY 1**: Use bundled boost outputs if available (fast binary path)
+2. **PRIORITY 2**: Network fetch (P2P or InsightAPI) as fallback
+
+**Compiler Warnings Fixed**:
+- `FilterScanner.swift`: Unused variables `loadedHeight`, `needsTreeForPositionLookup`, `noteId`
+- `NetworkManager.swift`: Unreachable catch block, unused `previousHeight`
+- `System7Components.swift`: Unused `estimated` variable
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Added `processBoostOutputsParallel()`, fixed warnings
+- `Sources/Core/Network/NetworkManager.swift` - Fixed unreachable catch block
+- `Sources/UI/Components/System7Components.swift` - Fixed unused variable
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

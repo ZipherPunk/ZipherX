@@ -167,7 +167,7 @@ final class FilterScanner {
         // LOAD SHIELDED OUTPUTS FROM BOOST FILE
         await WalletManager.shared.updateDownloadTask("download_outputs", status: .inProgress)
         let bundledOutputs = BundledShieldedOutputs.shared
-        let (loadSuccess, outputCount, loadedHeight) = await bundledOutputs.loadFromBoostFile { progress, status in
+        let (loadSuccess, outputCount, _) = await bundledOutputs.loadFromBoostFile { progress, status in
             self.onStatusUpdate?("download", status)
             Task { @MainActor in
                 WalletManager.shared.updateDownloadTaskProgress("download_outputs", detail: status, progress: progress)
@@ -327,7 +327,7 @@ final class FilterScanner {
         let existingTreeSize = ZipherXFFI.treeSize()
 
         // For imported wallets scanning within downloaded tree range
-        let needsTreeForPositionLookup = scanWithinDownloadedRange
+        _ = scanWithinDownloadedRange  // Used implicitly via effectiveTreeCMUCount
         let requiredTreeSize = effectiveTreeCMUCount
 
         if !needsFreshTree && existingTreeSize > 0 {
@@ -493,35 +493,32 @@ final class FilterScanner {
                 // Use batch P2P fetch - much faster than individual requests!
                 var blockDataMap: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
 
-                // PRIORITY 1: Use bundled shielded outputs file if available
+                // PRIORITY 1: Use bundled shielded outputs file if available (FAST BINARY PATH)
                 let bundledOutputs = BundledShieldedOutputs.shared
-                if bundledOutputs.isAvailable && endHeight <= bundledOutputs.bundledEndHeight {
-                    let outputs = bundledOutputs.getOutputsInRange(from: currentHeight, to: endHeight)
+                var usedOptimizedPath = false
 
-                    // Convert to blockDataMap format grouped by height
-                    // NOTE: Bundled outputs don't have spend data (nullifiers computed later)
-                    var outputCounter = 0
-                    for output in outputs {
-                        let height = UInt64(output.height)
-                        // ShieldedOutput requires all fields but only cmu, ephemeralKey, encCiphertext are needed for note decryption
-                        // cv, outCiphertext, proof are only used for proof verification (not needed here)
-                        let shieldedOutput = ShieldedOutput(
-                            cv: "",  // Not needed for note decryption
-                            cmu: output.cmu.map { String(format: "%02x", $0) }.joined(),
-                            ephemeralKey: output.epk.map { String(format: "%02x", $0) }.joined(),
-                            encCiphertext: output.encCiphertext.map { String(format: "%02x", $0) }.joined(),
-                            outCiphertext: "",  // Not needed for note decryption
-                            proof: ""  // Not needed for note decryption
-                        )
-                        // Use dummy txid since bundled outputs are grouped by height, not tx
-                        let txid = "bundled_\(height)_\(outputCounter)"
-                        if blockDataMap[height] == nil {
-                            blockDataMap[height] = []
+                if bundledOutputs.isAvailable && endHeight <= bundledOutputs.bundledEndHeight {
+                    // OPTIMIZED: Use direct binary path - no hex string conversion!
+                    // This matches the benchmark's performance (~14s instead of ~90s for 1M outputs)
+                    let boostOutputs = bundledOutputs.getOutputsForParallelDecryption(from: currentHeight, to: endHeight)
+
+                    if !boostOutputs.isEmpty {
+                        do {
+                            try processBoostOutputsParallel(
+                                outputs: boostOutputs,
+                                accountId: accountId,
+                                spendingKey: spendingKey,
+                                cmuDataForPositionLookup: self.cmuDataForPositionLookup,
+                                baseHeight: currentHeight
+                            )
+                            usedOptimizedPath = true
+                        } catch {
+                            print("⚠️ Optimized boost path failed, falling back to network: \(error)")
                         }
-                        blockDataMap[height]!.append((txid, [shieldedOutput], nil))
-                        outputCounter += 1
                     }
-                } else {
+                }
+
+                if !usedOptimizedPath {
                     // PRIORITY 2: Network fetch (P2P or InsightAPI)
                     do {
                         // Try P2P batch fetch first
@@ -560,17 +557,20 @@ final class FilterScanner {
 
                 // PARALLEL BATCH PROCESSING (6.7x speedup via Rayon)
                 // Process entire batch at once instead of one-by-one
-                do {
-                    try processBlocksBatchParallel(
-                        blockDataMap: blockDataMap,
-                        heightRange: currentHeight...endHeight,
-                        accountId: accountId,
-                        spendingKey: spendingKey,
-                        collectedSpends: &collectedSpends,
-                        cmuDataForPositionLookup: self.cmuDataForPositionLookup
-                    )
-                } catch {
-                    print("❌ Error in parallel batch processing: \(error)")
+                // Skip if we already used the optimized boost path (processBoostOutputsParallel)
+                if !usedOptimizedPath && !blockDataMap.isEmpty {
+                    do {
+                        try processBlocksBatchParallel(
+                            blockDataMap: blockDataMap,
+                            heightRange: currentHeight...endHeight,
+                            accountId: accountId,
+                            spendingKey: spendingKey,
+                            collectedSpends: &collectedSpends,
+                            cmuDataForPositionLookup: self.cmuDataForPositionLookup
+                        )
+                    } catch {
+                        print("❌ Error in parallel batch processing: \(error)")
+                    }
                 }
 
                 // Update progress (PHASE 1: 0-40%)
@@ -1510,6 +1510,110 @@ final class FilterScanner {
 
         if notesFound > 0 {
             debugLog(.sync, "🚀 Parallel batch: \(notesFound) notes found in \(batchOutputs.count) outputs")
+        }
+    }
+
+    /// OPTIMIZED: Process boost file outputs directly using binary Data (no hex conversion)
+    /// This matches the benchmark's performance by avoiding hex string conversions entirely.
+    /// The boost file stores outputs in wire format (little-endian), ready for direct FFI use.
+    ///
+    /// - Parameters:
+    ///   - outputs: Pre-processed outputs from BundledShieldedOutputs.getOutputsForParallelDecryption()
+    ///   - accountId: Account to store notes for
+    ///   - spendingKey: Spending key for decryption
+    ///   - cmuDataForPositionLookup: Bundled CMU data for position lookup
+    ///   - baseHeight: Lowest height in batch (for FFI version byte selection)
+    private func processBoostOutputsParallel(
+        outputs: [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data)],
+        accountId: Int64,
+        spendingKey: Data,
+        cmuDataForPositionLookup: Data?,
+        baseHeight: UInt64
+    ) throws {
+        guard !outputs.isEmpty else { return }
+
+        // Extract just the FFI outputs for parallel decryption
+        let ffiOutputs = outputs.map { $0.output }
+
+        // Call parallel decryption (6.7x speedup via Rayon)
+        let results = ZipherXFFI.tryDecryptNotesParallel(
+            spendingKey: spendingKey,
+            outputs: ffiOutputs,
+            height: baseHeight
+        )
+
+        // Process decrypted notes
+        var notesFound = 0
+
+        for (idx, maybeNote) in results.enumerated() {
+            guard let note = maybeNote else { continue }
+            notesFound += 1
+
+            let info = outputs[idx]
+            let cmu = info.cmu  // Already in wire format from boost file
+            let height = UInt64(info.height)
+
+            debugLog(.wallet, "💰 Note found: \(Double(note.value)/100_000_000) ZCL @ height \(height)")
+
+            // Generate a pseudo-txid for bundled outputs (grouped by height)
+            let txidData = "boost_\(height)_\(idx)".data(using: .utf8) ?? Data()
+
+            // Look up position from bundled CMU data
+            var position: UInt64 = 0
+            var needsNullifierFix = false
+
+            if let bundledData = cmuDataForPositionLookup {
+                if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
+                    position = realPos
+                } else {
+                    needsNullifierFix = true
+                }
+            } else {
+                needsNullifierFix = true
+            }
+
+            // Compute nullifier
+            let nullifier = try rustBridge.computeNullifier(
+                spendingKey: spendingKey,
+                diversifier: note.diversifier,
+                value: note.value,
+                rcm: note.rcm,
+                position: position
+            )
+
+            // Add to known nullifiers only if position is correct
+            if !needsNullifierFix {
+                knownNullifiers.insert(nullifier)
+            }
+
+            // Store note (noteId unused - witnesses computed in PHASE 1.5)
+            _ = try database.insertNote(
+                accountId: accountId,
+                diversifier: note.diversifier,
+                value: note.value,
+                rcm: note.rcm,
+                memo: note.memo,
+                nullifier: nullifier,
+                txid: txidData,
+                height: height,
+                witness: Data(count: 1028),
+                cmu: cmu
+            )
+
+            // Record in transaction history immediately
+            try? database.recordReceivedTransaction(
+                txid: txidData,
+                height: height,
+                value: note.value,
+                memo: String(data: note.memo.prefix(512).filter { $0 != 0 }, encoding: .utf8)
+            )
+
+            // Note: Witnesses are computed in PHASE 1.5 (computeWitnessesForBundledNotesBatch)
+            // The notes are stored with empty witnesses, and PHASE 1.5 batch-computes them
+        }
+
+        if notesFound > 0 {
+            debugLog(.sync, "⚡ Boost batch: \(notesFound) notes found in \(outputs.count) outputs (binary path)")
         }
     }
 

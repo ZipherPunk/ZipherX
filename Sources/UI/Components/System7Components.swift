@@ -1422,7 +1422,7 @@ struct CypherpunkSyncView: View {
                 .foregroundColor(NeonColors.primaryVeryDim)
 
             // Estimated remaining
-            if let estimated = estimatedDuration, progress > 0.05 {
+            if estimatedDuration != nil, progress > 0.05 {
                 VStack(spacing: 2) {
                     Text("REMAINING")
                         .font(.system(size: 8, design: .monospaced))
