@@ -313,4 +313,52 @@ bool zipherx_build_transaction_multi_encrypted(
     uint8_t *nullifiers_out
 );
 
+// =============================================================================
+// Boost File Scanning - Complete wallet scan in Rust
+// =============================================================================
+
+// Result for a discovered note from boost file scanning
+// Contains all data needed to store in database and build transactions
+typedef struct {
+    uint32_t height;           // Block height where note was received
+    uint64_t position;         // Position in commitment tree (for nullifier)
+    uint64_t value;            // Note value in zatoshis
+    uint8_t diversifier[11];   // Note diversifier
+    uint8_t rcm[32];           // Random commitment
+    uint8_t cmu[32];           // Note commitment
+    uint8_t nullifier[32];     // Computed nullifier
+    uint8_t is_spent;          // 1 if spent, 0 if unspent
+    uint8_t _padding[4];       // Alignment padding
+} BoostScanNote;
+
+// Summary result from boost scan
+typedef struct {
+    uint64_t total_received;   // Total value of all notes found
+    uint64_t total_spent;      // Total value of spent notes
+    uint64_t unspent_balance;  // Final spendable balance
+    uint32_t notes_found;      // Number of notes found
+    uint32_t notes_spent;      // Number of notes that are spent
+    uint32_t spends_checked;   // Number of spends in boost file
+} BoostScanResult;
+
+// Scan boost file outputs section and return discovered notes with nullifiers
+// Performs complete PHASE 1 + PHASE 1.6 scanning:
+// 1. Parse outputs from boost data (652 bytes per output)
+// 2. Parse spends from boost data (36 bytes per spend)
+// 3. Parallel note decryption using Rayon
+// 4. Compute nullifiers for each discovered note
+// 5. Check nullifiers against spends to detect spent notes
+//
+// Returns: Number of notes written to notes_out
+size_t zipherx_scan_boost_outputs(
+    const uint8_t *sk,              // Extended spending key (169 bytes)
+    const uint8_t *outputs_data,    // Outputs section (652 bytes per output)
+    size_t output_count,            // Number of outputs
+    const uint8_t *spends_data,     // Spends section (36 bytes per spend)
+    size_t spend_count,             // Number of spends
+    BoostScanNote *notes_out,       // Output buffer for discovered notes
+    size_t max_notes,               // Maximum notes that can fit
+    BoostScanResult *result_out     // Output for scan summary
+);
+
 #endif // ZIPHERX_FFI_H

@@ -1689,7 +1689,7 @@ final class FilterScanner {
             knownNullifiers.insert(note.nullifier)
 
             // Insert note into database
-            let noteId = try database.insertNote(
+            _ = try database.insertNote(
                 accountId: accountId,
                 diversifier: note.diversifier,
                 value: note.value,
