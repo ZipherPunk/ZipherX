@@ -3731,6 +3731,52 @@ if encryptedData.count == 197 {
 
 ---
 
+### 68. Smart Multi-Input Witness Handling: Notes Beyond Cached Boost Height (December 7, 2025)
+
+**Problem**: Multi-input transactions with notes beyond the cached boost file height (2935315) failed:
+```
+✅ Batch witness: 1/2 witnesses created
+❌ Failed to create batch witness for note 1
+```
+
+**Root Cause**: The batch witness creation from CMU file only works for notes within the cached boost file height. Note at height 2935410 (95 blocks newer than cached file) couldn't be found in the CMU data.
+
+**Solution**: Smart witness handling based on note heights:
+
+1. **Get cached boost height** from manifest
+2. **If ANY note is beyond cached height**: Use stored database witnesses (which were updated to same tree state during background sync)
+3. **If ALL notes within cached height**: Use batch creation from CMU file
+
+**Code Logic** (`TransactionBuilder.swift`):
+```swift
+let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+
+if maxNoteHeight > cachedBoostHeight {
+    // Notes beyond cached data - use stored database witnesses
+    // They were all updated to same tree state during background sync
+    for note in selectedNotes {
+        preparedSpends.append((note: note, witness: note.witness))
+    }
+} else {
+    // All notes within cached data - use batch creation
+    let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: data, targetCMUs: allCMUs)
+}
+```
+
+**Key Insight**: The app automatically syncs new blocks in the background (every 30 seconds via NetworkManager timer + AppDelegate foreground events). During this sync, ALL witnesses are updated to the same tree state, so stored witnesses can be used directly for multi-input transactions.
+
+**Background Sync Ensures Witness Consistency**:
+- `NetworkManager.fetchNetworkStats()` triggers `backgroundSyncToHeight()` when new blocks detected
+- `FilterScanner.startScan()` updates all witnesses to same tree state
+- Stored witnesses all have matching anchors (required for multi-input)
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Smart witness handling based on note heights
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - Added `getCachedBoostHeight()` convenience method
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

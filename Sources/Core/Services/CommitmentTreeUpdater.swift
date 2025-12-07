@@ -411,6 +411,11 @@ actor CommitmentTreeUpdater {
         return (manifest.chain_height, manifest.output_count, manifest.spend_count)
     }
 
+    /// Get cached boost file height (convenience method)
+    func getCachedBoostHeight() -> UInt64? {
+        return loadCachedManifest()?.chain_height
+    }
+
     /// Get section info from manifest
     func getSectionInfo(type: SectionType) -> BoostManifest.SectionInfo? {
         guard let manifest = loadCachedManifest() else { return nil }

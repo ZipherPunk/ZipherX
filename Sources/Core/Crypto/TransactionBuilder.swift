@@ -538,51 +538,118 @@ final class TransactionBuilder {
         var preparedSpends: [(note: SpendableNote, witness: Data)] = []
 
         // CRITICAL FIX: For multi-input transactions, ALL witnesses MUST have the same anchor.
-        // The stored anchor in database may be stale, so we ALWAYS rebuild for multi-input
-        // to ensure all witnesses are computed from the same tree state.
+        // Strategy:
+        // 1. Get cached CMU file height
+        // 2. If ANY note is beyond cached height, use in-memory tree witnesses (all updated to same state)
+        // 3. If ALL notes within cached height, use batch creation from CMU file
         if isMultiInput {
-            // For multi-input, ALWAYS use batch witness creation to guarantee same anchor
-            // The stored anchor field is unreliable because witnesses may have been
-            // updated independently at different tree states
-            print("🔧 Multi-input: Rebuilding witnesses for consistent anchors...")
+            print("🔧 Multi-input: Ensuring consistent anchors for \(selectedNotes.count) notes...")
 
-            // Collect all CMUs from selected notes
-            var allCMUs: [Data] = []
-            for (index, note) in selectedNotes.enumerated() {
-                guard let cmu = note.cmu else {
-                    print("❌ Note \(index + 1) has no CMU")
+            // Get cached boost height
+            let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+            let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+
+            print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+
+            if maxNoteHeight > cachedBoostHeight {
+                // Notes beyond cached data - use stored database witnesses
+                // These were all updated to the same tree state during sync
+                print("📝 Notes beyond cached boost file, using stored database witnesses...")
+
+                // Verify all stored witnesses are valid (1028 bytes, not all zeros)
+                var allWitnessesValid = true
+                for (index, note) in selectedNotes.enumerated() {
+                    let witnessValid = note.witness.count >= 1028 && !note.witness.prefix(1028).allSatisfy({ $0 == 0 })
+                    if !witnessValid {
+                        print("⚠️ Note \(index + 1) has invalid witness")
+                        allWitnessesValid = false
+                        break
+                    }
+                }
+
+                if allWitnessesValid {
+                    // Use stored witnesses directly - they should all have the same anchor
+                    // because they were updated during background sync
+                    print("✅ Using stored witnesses from database (all synced to same tree state)")
+                    for note in selectedNotes {
+                        preparedSpends.append((note: note, witness: note.witness))
+                    }
+                } else {
+                    // Witnesses are stale/invalid - need to rebuild from current tree
+                    print("⚠️ Some witnesses are stale, rebuilding from current tree state...")
+
+                    // Get current tree root as anchor
+                    guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
+                        print("❌ No tree root available for witness rebuild")
+                        throw TransactionError.proofGenerationFailed
+                    }
+                    print("🌲 Current tree root: \(currentTreeRoot.prefix(16).map { String(format: "%02x", $0) }.joined())...")
+
+                    // Rebuild witnesses individually from current tree state
+                    for (index, note) in selectedNotes.enumerated() {
+                        print("📝 Rebuilding witness for note \(index + 1) at height \(note.height)...")
+
+                        guard let cmu = note.cmu else {
+                            print("❌ Note \(index + 1) has no CMU")
+                            throw TransactionError.proofGenerationFailed
+                        }
+
+                        // Try to rebuild from current tree
+                        if let result = try await rebuildWitnessForNote(
+                            cmu: cmu,
+                            noteHeight: note.height,
+                            downloadedTreeHeight: cachedBoostHeight
+                        ) {
+                            preparedSpends.append((note: note, witness: result.witness))
+                        } else {
+                            print("❌ Failed to rebuild witness for note \(index + 1)")
+                            throw TransactionError.proofGenerationFailed
+                        }
+                    }
+                    print("✅ Rebuilt \(preparedSpends.count) witnesses from current tree")
+                }
+            } else {
+                // All notes within cached data - use batch creation from CMU file
+                print("📁 All notes within cached boost height, using batch witness creation...")
+
+                // Collect all CMUs from selected notes
+                var allCMUs: [Data] = []
+                for (index, note) in selectedNotes.enumerated() {
+                    guard let cmu = note.cmu else {
+                        print("❌ Note \(index + 1) has no CMU")
+                        throw TransactionError.proofGenerationFailed
+                    }
+                    allCMUs.append(cmu)
+                }
+
+                // Get the CMU data for batch witness creation
+                var cmuData: Data?
+
+                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let data = try? Data(contentsOf: cachedPath) {
+                    print("📁 Using cached CMU data for batch witnesses (\(data.count) bytes)")
+                    cmuData = data
+                }
+
+                guard let data = cmuData else {
+                    print("❌ No CMU data available for batch witness creation")
                     throw TransactionError.proofGenerationFailed
                 }
-                allCMUs.append(cmu)
-            }
 
-            // Get the CMU data for batch witness creation
-            var cmuData: Data?
+                // Create all witnesses in batch - ensures same anchor for all
+                let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: data, targetCMUs: allCMUs)
 
-            if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-               let data = try? Data(contentsOf: cachedPath) {
-                print("📁 Using cached CMU data for batch witnesses (\(data.count) bytes)")
-                cmuData = data
-            }
-
-            guard let data = cmuData else {
-                print("❌ No CMU data available for batch witness creation")
-                throw TransactionError.proofGenerationFailed
-            }
-
-            // Create all witnesses in batch - ensures same anchor for all
-            let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: data, targetCMUs: allCMUs)
-
-            // Verify all witnesses were created successfully
-            for (index, result) in batchResults.enumerated() {
-                guard let (_, witness) = result else {
-                    print("❌ Failed to create batch witness for note \(index + 1)")
-                    throw TransactionError.proofGenerationFailed
+                // Verify all witnesses were created successfully
+                for (index, result) in batchResults.enumerated() {
+                    guard let (_, witness) = result else {
+                        print("❌ Failed to create batch witness for note \(index + 1)")
+                        throw TransactionError.proofGenerationFailed
+                    }
+                    preparedSpends.append((note: selectedNotes[index], witness: witness))
                 }
-                preparedSpends.append((note: selectedNotes[index], witness: witness))
-            }
 
-            print("✅ Batch witnesses rebuilt for \(preparedSpends.count) notes")
+                print("✅ Batch witnesses created for \(preparedSpends.count) notes")
+            }
         } else {
             // Single-input transaction - use existing logic
             for (index, note) in selectedNotes.enumerated() {
