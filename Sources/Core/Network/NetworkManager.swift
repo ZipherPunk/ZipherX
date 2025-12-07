@@ -1993,28 +1993,31 @@ final class NetworkManager: ObservableObject {
 
     private func resolveDNSSeed(_ hostname: String) async -> [PeerAddress] {
         return await withCheckedContinuation { continuation in
-            let host = CFHostCreateWithName(nil, hostname as CFString).takeRetainedValue()
-            var resolved = DarwinBoolean(false)
+            // Dispatch DNS resolution to background queue to avoid priority inversion
+            DispatchQueue.global(qos: .utility).async {
+                let host = CFHostCreateWithName(nil, hostname as CFString).takeRetainedValue()
+                var resolved = DarwinBoolean(false)
 
-            CFHostStartInfoResolution(host, .addresses, nil)
+                CFHostStartInfoResolution(host, .addresses, nil)
 
-            guard let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data] else {
-                continuation.resume(returning: [])
-                return
-            }
-
-            var peerAddresses: [PeerAddress] = []
-            for addressData in addresses {
-                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                addressData.withUnsafeBytes { ptr in
-                    let sockaddr = ptr.baseAddress!.assumingMemoryBound(to: sockaddr.self)
-                    getnameinfo(sockaddr, socklen_t(addressData.count), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                guard let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data] else {
+                    continuation.resume(returning: [])
+                    return
                 }
-                let host = String(cString: hostname)
-                peerAddresses.append(PeerAddress(host: host, port: defaultPort))
-            }
 
-            continuation.resume(returning: peerAddresses)
+                var peerAddresses: [PeerAddress] = []
+                for addressData in addresses {
+                    var hostnameBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    addressData.withUnsafeBytes { ptr in
+                        let sockaddr = ptr.baseAddress!.assumingMemoryBound(to: sockaddr.self)
+                        getnameinfo(sockaddr, socklen_t(addressData.count), &hostnameBuffer, socklen_t(hostnameBuffer.count), nil, 0, NI_NUMERICHOST)
+                    }
+                    let hostStr = String(cString: hostnameBuffer)
+                    peerAddresses.append(PeerAddress(host: hostStr, port: self.defaultPort))
+                }
+
+                continuation.resume(returning: peerAddresses)
+            }
         }
     }
 
