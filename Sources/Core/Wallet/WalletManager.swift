@@ -250,15 +250,12 @@ final class WalletManager: ObservableObject {
     // MARK: - Tree Preloading
 
     /// Preload commitment tree at startup for faster transactions
-    /// This loads from database (if saved) or bundled CMUs (first time)
+    /// This loads from database (if saved) or downloads from GitHub (first time)
     @Published private(set) var isTreeLoaded: Bool = false
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
-    // Expected values for bundled tree validation - use ZipherXConstants for dynamic values from GitHub
-    private var bundledTreeCMUCount: UInt64 { ZipherXConstants.bundledTreeCMUCount }
-    private var bundledTreeHeight: UInt64 { ZipherXConstants.bundledTreeHeight }
-    // Expected root from ZipherXConstants.bundledTreeRoot
+    // Tree height/count now come from GitHub via ZipherXConstants.effectiveTreeHeight/effectiveTreeCMUCount
 
     // Lock to prevent concurrent tree loading
     private var isTreeLoading = false
@@ -333,7 +330,7 @@ final class WalletManager: ObservableObject {
 
                 // VALIDATION: Check if tree size is reasonable
                 // Use effectiveTreeCMUCount (from UserDefaults) which may be from a downloaded tree
-                // that's newer than the bundled one. This prevents false corruption detection.
+                // that's newer than what we had. This prevents false corruption detection.
                 let effectiveHeight = ZipherXConstants.effectiveTreeHeight
                 let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
 
@@ -343,11 +340,11 @@ final class WalletManager: ObservableObject {
 
                 if treeSize < effectiveCMUCount || treeSize > maxExpectedCMUs {
                     print("⚠️ Tree size \(treeSize) seems invalid (expected \(effectiveCMUCount)-\(maxExpectedCMUs))")
-                    print("🔄 Clearing corrupted tree state, will reload from bundled CMUs...")
+                    print("🔄 Clearing corrupted tree state, will reload from GitHub...")
                     // Clear the corrupted state from database
                     try? WalletDatabase.shared.clearTreeState()
                     try? WalletDatabase.shared.updateLastScannedHeight(effectiveHeight, hash: Data(count: 32))
-                    // Fall through to reload from bundled CMUs
+                    // Fall through to reload from GitHub
                     // (treeLoadFromCMUs will replace the tree in FFI memory)
                 } else {
                     print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
@@ -361,185 +358,63 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // CHECK GITHUB FIRST for newer serialized tree (on first installation)
-        // This allows users to get the latest tree without app update
-        let hasExistingTreeState = (try? WalletDatabase.shared.getTreeState()) != nil
-        let isFirstInstallation = !hasExistingTreeState
-
-        var useGitHubTree = false
-        var gitHubSerializedData: Data?
-        var effectiveTreeHeight = bundledTreeHeight
-        var effectiveCMUCount = bundledTreeCMUCount
-
-        if isFirstInstallation {
-            print("🌲 First installation - checking GitHub for updated tree...")
-            await MainActor.run {
-                self.treeLoadStatus = "Checking for tree updates..."
-                self.treeLoadProgress = 0.1
-                self.updateOverallProgress(phase: .downloadingTree, phaseProgress: 0.1)
-            }
-
-            do {
-                let (bestTreeURL, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableTree { progress, status in
-                    Task { @MainActor in
-                        self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for update check/download
-                        self.treeLoadStatus = status
-                        self.updateOverallProgress(phase: .downloadingTree, phaseProgress: 0.1 + progress * 0.9)
-                    }
-                }
-
-                if height > bundledTreeHeight {
-                    // GitHub has newer tree - try to load the serialized version
-                    if bestTreeURL.lastPathComponent.contains("serialized") {
-                        if let data = try? Data(contentsOf: bestTreeURL) {
-                            print("🌲 Downloaded newer serialized tree from GitHub: height \(height) (\(cmuCount) CMUs)")
-                            gitHubSerializedData = data
-                            useGitHubTree = true
-                            effectiveTreeHeight = height
-                            effectiveCMUCount = cmuCount
-                        }
-                    }
-                }
-            } catch {
-                print("⚠️ GitHub tree check failed: \(error.localizedDescription)")
-                // Continue with bundled tree
-            }
+        // Download boost file from GitHub (required - no bundled fallback)
+        print("🚀 Downloading boost file from GitHub...")
+        await MainActor.run {
+            self.treeLoadStatus = "Downloading boost data..."
+            self.treeLoadProgress = 0.1
         }
 
-        // FAST PATH: Load serialized tree (either from GitHub or bundled)
-        print("🌳 Loading commitment tree...")
+        var downloadedTreeHeight: UInt64 = 0
+        var downloadedCMUCount: UInt64 = 0
+
+        do {
+            // Download the unified boost file (contains tree, outputs, spends, etc.)
+            let (_, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                Task { @MainActor in
+                    self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for download
+                    self.treeLoadStatus = status
+                }
+            }
+            downloadedTreeHeight = height
+            downloadedCMUCount = cmuCount
+            print("🚀 Downloaded boost file from GitHub: height \(height) (\(cmuCount) outputs)")
+        } catch {
+            print("❌ GitHub boost file download failed: \(error.localizedDescription)")
+            await MainActor.run {
+                self.treeLoadStatus = "Failed to download boost data"
+            }
+            return
+        }
+
+        // Extract and load the serialized tree from the boost file
+        print("🌳 Extracting commitment tree...")
         await MainActor.run {
             self.treeLoadStatus = "Restoring privacy infrastructure..."
             self.treeLoadProgress = 0.3
             self.updateOverallProgress(phase: .loadingTree, phaseProgress: 0.1)
         }
 
-        // Try GitHub downloaded tree first
-        if useGitHubTree, let serializedData = gitHubSerializedData {
-            print("🌲 Using GitHub serialized tree...")
-            if ZipherXFFI.treeDeserialize(data: serializedData) {
-                let treeSize = ZipherXFFI.treeSize()
-                print("✅ GitHub commitment tree loaded instantly: \(treeSize) commitments (height \(effectiveTreeHeight))")
-
-                // Store effective height for FilterScanner
-                UserDefaults.standard.set(Int(effectiveTreeHeight), forKey: "effectiveTreeHeight")
-                UserDefaults.standard.set(Int(effectiveCMUCount), forKey: "effectiveTreeCMUCount")
-
-                // Save to database for next time
-                if let serializedTree = ZipherXFFI.treeSerialize() {
-                    try? WalletDatabase.shared.saveTreeState(serializedTree)
-                    print("💾 Tree state saved to database for future use")
-                }
-
-                await MainActor.run {
-                    self.isTreeLoaded = true
-                    self.treeLoadProgress = 1.0
-                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
-                    self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
-                }
-                return
-            } else {
-                print("⚠️ GitHub tree deserialization failed, falling back to bundled...")
-            }
-        }
-
-        // DEBUG: Log bundle path to help diagnose resource loading issues
-        print("📁 Bundle path: \(Bundle.main.bundlePath)")
-        print("📁 Resource path: \(Bundle.main.resourcePath ?? "nil")")
-
-        // Fall back to bundled serialized tree
-        if let serializedTreeURL = Bundle.main.url(forResource: "commitment_tree_serialized", withExtension: "bin") {
-            print("✅ Found serialized tree at: \(serializedTreeURL.path)")
-            if let serializedData = try? Data(contentsOf: serializedTreeURL) {
-                print("✅ Loaded serialized tree data: \(serializedData.count) bytes")
-
-                // This is instant! Just deserialize the Merkle frontier
-                if ZipherXFFI.treeDeserialize(data: serializedData) {
-                    let treeSize = ZipherXFFI.treeSize()
-                    print("✅ Bundled commitment tree loaded instantly: \(treeSize) commitments")
-
-                    // Save to database for next time
-                    if let serializedTree = ZipherXFFI.treeSerialize() {
-                        try? WalletDatabase.shared.saveTreeState(serializedTree)
-                        print("💾 Tree state saved to database for future use")
-                    }
-
-                    await MainActor.run {
-                        self.isTreeLoaded = true
-                        self.treeLoadProgress = 1.0
-                        self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
-                        self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
-                    }
-                    return
-                } else {
-                    print("⚠️ FFI treeDeserialize returned false, falling back to CMU rebuild...")
-                }
-            } else {
-                print("⚠️ Failed to read serialized tree data, falling back to CMU rebuild...")
-            }
-        } else {
-            print("⚠️ commitment_tree_serialized.bin not found in bundle, falling back to CMU rebuild...")
-        }
-
-        // SLOW FALLBACK: Build tree from CMUs (only if serialized files fail/missing)
-        // This takes ~50 seconds but ensures all spending operations are instant
-        print("🌳 Rebuilding commitment tree from CMUs (slow fallback)...")
-        await MainActor.run {
-            self.treeLoadStatus = "Building cryptographic foundation..."
-            self.treeLoadProgress = 0.0
-        }
-
-        // Use bundled tree for CMU rebuild
-        var treeURL: URL? = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin")
-
-        guard let finalTreeURL = treeURL ?? Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-              let bundledData = try? Data(contentsOf: finalTreeURL) else {
-            print("❌ No commitment tree available")
+        let serializedData: Data
+        do {
+            serializedData = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+            print("🌲 Extracted serialized tree: \(serializedData.count) bytes")
+        } catch {
+            print("❌ Failed to extract tree from boost file: \(error.localizedDescription)")
             await MainActor.run {
-                self.treeLoadStatus = "Privacy data not found"
+                self.treeLoadStatus = "Failed to extract commitment tree"
             }
             return
         }
 
-        // Proceed with loading tree from CMUs (slow fallback - only used if serialized fails)
-        // Cypherpunk messages for tree building
-        let treeLoadMessages = [
-            "Constructing zero-knowledge tree...",
-            "Assembling cryptographic proofs...",
-            "Building Merkle commitments...",
-            "Weaving the privacy lattice...",
-            "Forging shielded infrastructure...",
-            "Computing Pedersen hashes...",
-            "Anchoring the privacy chain...",
-            "Establishing trust anchors..."
-        ]
-
-        // Run the heavy FFI call on a background thread so UI updates can process
-        let success = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let result = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { current, total in
-                    let progress = Double(current) / Double(total)
-                    let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
-                    let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
-
-                    // Rotate through cypherpunk messages
-                    let messageIndex = Int(current / 100000) % treeLoadMessages.count
-                    let statusMessage = treeLoadMessages[messageIndex]
-
-                    // Update UI on main thread
-                    DispatchQueue.main.async {
-                        self?.treeLoadProgress = progress
-                        self?.treeLoadStatus = "\(statusMessage)\n\(currentFormatted) / \(totalFormatted) CMUs"
-                        self?.updateOverallProgress(phase: .loadingTree, phaseProgress: progress)
-                    }
-                }
-                continuation.resume(returning: result)
-            }
-        }
-
-        if success {
+        print("🌲 Deserializing commitment tree...")
+        if ZipherXFFI.treeDeserialize(data: serializedData) {
             let treeSize = ZipherXFFI.treeSize()
-            print("✅ Commitment tree loaded: \(treeSize) commitments")
+            print("✅ Commitment tree loaded instantly: \(treeSize) commitments (height \(downloadedTreeHeight))")
+
+            // Store effective height for FilterScanner
+            UserDefaults.standard.set(Int(downloadedTreeHeight), forKey: "effectiveTreeHeight")
+            UserDefaults.standard.set(Int(downloadedCMUCount), forKey: "effectiveTreeCMUCount")
 
             // Save to database for next time
             if let serializedTree = ZipherXFFI.treeSerialize() {
@@ -553,13 +428,26 @@ final class WalletManager: ObservableObject {
                 self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
                 self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
             }
-        } else {
-            print("❌ Failed to load commitment tree")
-            await MainActor.run {
-                self.treeLoadStatus = "Cryptographic tree build failed"
-            }
+            return
         }
+
+        // Deserialization failed - this is unexpected with the new format
+        print("❌ Tree deserialization failed - boost file may be corrupted")
+        await MainActor.run {
+            self.treeLoadStatus = "Failed to load commitment tree"
+            self.treeLoadProgress = 0.0
+        }
+
+        // Clear the corrupted boost file and try again next time
+        try? await CommitmentTreeUpdater.shared.clearCache()
+        return
     }
+
+    // MARK: - Removed CMU Rebuild Logic
+    // The new unified boost file always includes a pre-serialized tree,
+    // so we no longer need to rebuild from individual CMUs.
+    // If the tree section is corrupted, we clear the cache and re-download.
+
 
     // MARK: - Background Tree Sync
 
@@ -592,7 +480,7 @@ final class WalletManager: ObservableObject {
         }
 
         // Get current synced height
-        let currentHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? bundledTreeHeight
+        let currentHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? ZipherXConstants.effectiveTreeHeight
         guard targetHeight > currentHeight else {
             return // Already synced
         }
@@ -703,7 +591,7 @@ final class WalletManager: ObservableObject {
         print("🔐 Address length: \(address.count) characters")
 
         // CRITICAL: Reset database state for new wallet
-        // This ensures we scan from bundledTreeHeight, not from a previous wallet's lastScannedHeight
+        // This ensures we scan from downloadedTreeHeight, not from a previous wallet's lastScannedHeight
         print("🗑️ Resetting database state for new wallet...")
         try? resetDatabaseForNewWallet()
 
@@ -836,7 +724,7 @@ final class WalletManager: ObservableObject {
         // Clear tree state
         try? WalletDatabase.shared.clearTreeState()
 
-        // Reset last scanned height to 0 (will be set to bundledTreeHeight during scan)
+        // Reset last scanned height to 0 (will be set to downloadedTreeHeight during scan)
         try? WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
 
         // Clear notes table
@@ -959,9 +847,10 @@ final class WalletManager: ObservableObject {
 
         // SECURITY CHECK: Validate lastScannedHeight against trusted chain height
         // Malicious P2P peers may have caused fake heights to be stored
+        let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
         do {
             let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
-            if lastScanned > bundledTreeHeight {
+            if lastScanned > effectiveTreeHeight {
                 // Query InsightAPI for trusted chain height
                 let status = try await InsightAPI.shared.getStatus()
                 let trustedHeight = status.height
@@ -970,10 +859,10 @@ final class WalletManager: ObservableObject {
                 if lastScanned > trustedHeight + maxAheadTolerance {
                     print("🚨 [SECURITY] Detected FAKE lastScannedHeight: \(lastScanned)")
                     print("🚨 [SECURITY] Trusted chain height is: \(trustedHeight)")
-                    print("🧹 Resetting to bundled tree height...")
+                    print("🧹 Resetting to downloaded tree height...")
 
                     // Reset to safe state
-                    try WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
+                    try WalletDatabase.shared.updateLastScannedHeight(effectiveTreeHeight, hash: Data(count: 32))
                     try? HeaderStore.shared.open()
                     try? HeaderStore.shared.clearAllHeaders()
 
@@ -1007,13 +896,13 @@ final class WalletManager: ObservableObject {
                 try HeaderStore.shared.open()
 
                 // CRITICAL: Check for corrupted header timestamps
-                // Bug: Headers were being assigned wrong heights (from genesis instead of bundled tree)
+                // Bug: Headers were being assigned wrong heights (from genesis instead of downloaded tree)
                 // This caused timestamps to show 2016 instead of 2025
                 // Detection: If a header at recent height has timestamp < 2024, it's corrupted
                 let corruptedTimestampThreshold: UInt32 = 1704067200 // Jan 1, 2024 UTC
                 if let latestHeight = try? HeaderStore.shared.getLatestHeight(),
-                   latestHeight >= bundledTreeHeight,
-                   let sampleHeader = try? HeaderStore.shared.getHeader(at: bundledTreeHeight + 100),
+                   latestHeight >= effectiveTreeHeight,
+                   let sampleHeader = try? HeaderStore.shared.getHeader(at: effectiveTreeHeight + 100),
                    sampleHeader.time < corruptedTimestampThreshold {
                     print("🚨 [CRITICAL] Detected corrupted header timestamps (showing 2016 dates)")
                     print("🧹 Clearing all headers to trigger fresh sync with correct data...")
@@ -1060,19 +949,19 @@ final class WalletManager: ObservableObject {
                 }
 
                 // Get starting height for sync
-                // We want headers from bundledTreeHeight + 1 onwards (tree includes up to bundledTreeHeight)
+                // We want headers from downloadedTreeHeight + 1 onwards (tree includes up to downloadedTreeHeight)
                 // The getheaders protocol returns headers AFTER the locator hash
-                // VUL-018: Use shared constant for bundled tree height
-                let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+                // VUL-018: Use shared constant for downloaded tree height
+                let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
                 let startHeight: UInt64
-                if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= bundledTreeHeight {
+                if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= downloadedTreeHeight {
                     // Resume from where we left off
                     startHeight = latestHeight + 1
                     print("📊 Resuming header sync from height \(startHeight)")
                 } else {
-                    // Start from bundledTreeHeight + 1 (checkpoint at bundledTreeHeight used as locator)
-                    startHeight = bundledTreeHeight + 1
-                    print("📊 Starting header sync from height \(startHeight) (checkpoint at \(bundledTreeHeight))")
+                    // Start from downloadedTreeHeight + 1 (checkpoint at downloadedTreeHeight used as locator)
+                    startHeight = downloadedTreeHeight + 1
+                    print("📊 Starting header sync from height \(startHeight) (checkpoint at \(downloadedTreeHeight))")
                 }
 
                 try await headerSync.syncHeaders(from: startHeight)
@@ -1112,8 +1001,8 @@ final class WalletManager: ObservableObject {
         let scanner = FilterScanner()
         self.currentScanner = scanner  // Store reference for stopSync()
 
-        // VUL-018: Use shared constant for bundled tree height
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        // VUL-018: Use shared constant for downloaded tree height
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Status update callback - handles phase transitions and messages
         scanner.onStatusUpdate = { [weak self] phase, status in
@@ -1167,8 +1056,8 @@ final class WalletManager: ObservableObject {
 
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     // Show context: scanning from checkpoint to current with estimated date
-                    let blocksToScan = maxHeight > bundledTreeHeight ? maxHeight - bundledTreeHeight : 0
-                    let blocksScanned = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
+                    let blocksToScan = maxHeight > downloadedTreeHeight ? maxHeight - downloadedTreeHeight : 0
+                    let blocksScanned = currentHeight > downloadedTreeHeight ? currentHeight - downloadedTreeHeight : 0
 
                     // Estimate date for current block height
                     let estimatedDate = self?.estimateDateForBlock(height: currentHeight) ?? ""
@@ -1213,8 +1102,8 @@ final class WalletManager: ObservableObject {
                         "Securing new commitments...",
                         "Zero-knowledge sync active..."
                     ]
-                    let blocksAfterBundled = currentHeight > bundledTreeHeight ? currentHeight - bundledTreeHeight : 0
-                    let messageIndex = Int(blocksAfterBundled / 1000) % phase2Messages.count
+                    let blocksAfterDownloaded = currentHeight > downloadedTreeHeight ? currentHeight - downloadedTreeHeight : 0
+                    let messageIndex = Int(blocksAfterDownloaded / 1000) % phase2Messages.count
                     self?.syncStatus = phase2Messages[messageIndex]
                 }
                 // Note: phase1.5 and phase1.6 status is set by onStatusUpdate
@@ -1360,18 +1249,18 @@ final class WalletManager: ObservableObject {
         print("✅ Sync complete: balance task finished")
     }
 
-    /// Sync witnesses for notes beyond bundled tree to match current tree state
+    /// Sync witnesses for notes beyond downloaded tree to match current tree state
     /// This ensures witnesses are ready for spending without rebuild at transaction time
-    private func syncWitnesses(accountId: Int64, bundledTreeHeight: UInt64) async throws {
+    private func syncWitnesses(accountId: Int64, downloadedTreeHeight: UInt64) async throws {
         let database = WalletDatabase.shared
 
         // Get all unspent notes
         let notes = try database.getUnspentNotes(accountId: accountId)
 
-        // Filter notes beyond bundled tree that might need witness update
+        // Filter notes beyond downloaded tree that might need witness update
         let notesNeedingSync = notes.filter { note in
-            // Notes beyond bundled tree need witness sync
-            note.height > bundledTreeHeight &&
+            // Notes beyond downloaded tree need witness sync
+            note.height > downloadedTreeHeight &&
             // Only if they have valid witness that might be stale
             note.witness.count >= 1028 &&
             // Must have CMU for rebuild
@@ -1390,7 +1279,7 @@ final class WalletManager: ObservableObject {
             return
         }
 
-        print("🔄 Syncing \(notesNeedingSync.count) witness(es) beyond bundled tree...")
+        print("🔄 Syncing \(notesNeedingSync.count) witness(es) beyond downloaded tree...")
 
         // Cypherpunk messages for witness sync
         let witnessMessages = [
@@ -1420,7 +1309,7 @@ final class WalletManager: ObservableObject {
             if let result = try await builder.rebuildWitnessForNote(
                 cmu: cmu,
                 noteHeight: note.height,
-                bundledTreeHeight: bundledTreeHeight
+                downloadedTreeHeight: downloadedTreeHeight
             ) {
                 // Save updated witness to database
                 try? database.updateNoteWitness(noteId: note.id, witness: result.witness)
@@ -1463,7 +1352,7 @@ final class WalletManager: ObservableObject {
     /// Perform a full blockchain rescan from a specific height
     /// This rebuilds the commitment tree and finds notes with proper witnesses
     /// - Parameters:
-    ///   - fromHeight: Optional start height (defaults to loading bundled tree height)
+    ///   - fromHeight: Optional start height (defaults to loading downloaded tree height)
     ///   - onProgress: Callback with (progress, currentHeight, maxHeight)
     func performFullRescan(fromHeight startHeight: UInt64? = nil, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
@@ -1498,8 +1387,8 @@ final class WalletManager: ObservableObject {
         }
         print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
 
-        // VUL-018: Use shared constant for bundled tree height
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        // VUL-018: Use shared constant for downloaded tree height
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Wait for any existing scan to complete (with timeout)
         if FilterScanner.isScanInProgress {
@@ -1521,12 +1410,12 @@ final class WalletManager: ObservableObject {
         }
 
         if let startHeight = startHeight {
-            // Check if the requested height is within the bundled tree range
-            if startHeight <= bundledTreeHeight {
-                // For heights within bundled tree: use quick scan (note detection only, no tree changes)
-                // This preserves the correct bundled tree while finding notes
+            // Check if the requested height is within the downloaded tree range
+            if startHeight <= downloadedTreeHeight {
+                // For heights within downloaded tree: use quick scan (note detection only, no tree changes)
+                // This preserves the correct downloaded tree while finding notes
                 // NOTE: We do NOT clear existing notes - just scan for additional ones
-                print("🔍 Quick scan mode: height \(startHeight) is within bundled tree range (ends at \(bundledTreeHeight))")
+                print("🔍 Quick scan mode: height \(startHeight) is within downloaded tree range (ends at \(downloadedTreeHeight))")
                 print("🔍 Will scan for notes WITHOUT modifying the commitment tree or existing notes")
 
                 // Create scanner with progress callback
@@ -1541,9 +1430,9 @@ final class WalletManager: ObservableObject {
                 print("✅ Quick scan complete from height \(startHeight)")
                 return
             } else {
-                // Height is beyond bundled tree - do sequential scan from bundled tree end
-                print("⚠️ Full rescan from height \(startHeight) is beyond bundled tree (\(bundledTreeHeight))")
-                print("🔄 Will continue sequential scan from bundled tree end")
+                // Height is beyond downloaded tree - do sequential scan from downloaded tree end
+                print("⚠️ Full rescan from height \(startHeight) is beyond downloaded tree (\(downloadedTreeHeight))")
+                print("🔄 Will continue sequential scan from downloaded tree end")
                 try WalletDatabase.shared.resetSyncState()
             }
         } else {
@@ -1567,16 +1456,16 @@ final class WalletManager: ObservableObject {
     }
 
     /// Repair notes with corrupted nullifiers
-    /// This deletes notes received after the bundled tree height and rescans to rediscover them
+    /// This deletes notes received after the downloaded tree height and rescans to rediscover them
     /// with correct positions and nullifiers
     /// - Parameter onProgress: Callback with (progress, currentHeight, maxHeight)
-    func repairNotesAfterBundledTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+    func repairNotesAfterDownloadedTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
             throw WalletError.walletNotCreated
         }
 
-        // VUL-018: Use shared constant for bundled tree height
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        // VUL-018: Use shared constant for downloaded tree height
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
@@ -1594,18 +1483,18 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
-        // Delete notes received AFTER bundled tree height
+        // Delete notes received AFTER downloaded tree height
         // These notes may have corrupted nullifiers due to wrong position calculation
-        let deletedCount = try WalletDatabase.shared.deleteNotesAfterHeight(bundledTreeHeight)
-        print("🗑️ Deleted \(deletedCount) notes after height \(bundledTreeHeight)")
+        let deletedCount = try WalletDatabase.shared.deleteNotesAfterHeight(downloadedTreeHeight)
+        print("🗑️ Deleted \(deletedCount) notes after height \(downloadedTreeHeight)")
 
-        // Clear tree state so it gets rebuilt from bundled CMUs
+        // Clear tree state so it gets rebuilt from downloaded CMUs
         try WalletDatabase.shared.clearTreeState()
         print("🌳 Cleared tree state")
 
-        // Update last scanned height to bundled tree height so scan resumes from there
-        try WalletDatabase.shared.updateLastScannedHeight(bundledTreeHeight, hash: Data(count: 32))
-        print("📝 Set last scanned height to \(bundledTreeHeight)")
+        // Update last scanned height to downloaded tree height so scan resumes from there
+        try WalletDatabase.shared.updateLastScannedHeight(downloadedTreeHeight, hash: Data(count: 32))
+        print("📝 Set last scanned height to \(downloadedTreeHeight)")
 
         // Ensure network connection
         print("📡 Ensuring network connection...")
@@ -1625,7 +1514,7 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // Clear the in-memory tree and reload from bundled CMUs
+        // Clear the in-memory tree and reload from downloaded CMUs
         // CRITICAL: Reset isTreeLoaded flag so preloadCommitmentTree() actually reloads
         // Without this, preloadCommitmentTree() returns immediately because isTreeLoaded is true
         await MainActor.run {
@@ -1635,25 +1524,25 @@ final class WalletManager: ObservableObject {
         }
         // Also clear the FFI tree to ensure fresh start
         _ = ZipherXFFI.treeInit()
-        print("🌳 Reloading commitment tree from bundled data...")
+        print("🌳 Reloading commitment tree from downloaded data...")
         await preloadCommitmentTree()
 
-        // Scan from bundledTreeHeight + 1 to current chain tip
+        // Scan from downloadedTreeHeight + 1 to current chain tip
         // This uses sequential mode which properly calculates positions
         let scanner = FilterScanner()
         scanner.onProgress = onProgress
 
-        print("🔄 Starting repair scan from height \(bundledTreeHeight + 1)...")
-        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: bundledTreeHeight + 1)
+        print("🔄 Starting repair scan from height \(downloadedTreeHeight + 1)...")
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: downloadedTreeHeight + 1)
 
         // Refresh balance
         try await refreshBalance()
         print("✅ Note repair complete - nullifiers recalculated with correct positions")
     }
 
-    /// Rebuild witnesses from bundled tree height
+    /// Rebuild witnesses from downloaded tree height
     /// This is needed when witnesses are invalid (e.g., after quick scan)
-    /// Uses bundled CMUs and scans sequentially to build proper witnesses
+    /// Uses downloaded CMUs and scans sequentially to build proper witnesses
     func rebuildWitnessesForSpending(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
             throw WalletError.walletNotCreated
@@ -1675,19 +1564,19 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
-        // FAST PATH: Try to rebuild witnesses using stored CMUs and bundled tree
+        // FAST PATH: Try to rebuild witnesses using stored CMUs and downloaded tree
         let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.id)
         print("📝 Found \(notes.count) notes to rebuild witnesses for")
 
-        // Load bundled CMU data
-        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-              let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-            print("❌ Bundled CMU file not found, falling back to full scan")
+        // Load CMU data from GitHub cache
+        guard let cmuFilePath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+              let downloadedData = try? Data(contentsOf: cmuFilePath) else {
+            print("❌ CMU file not found in GitHub cache, falling back to full scan")
             try await rebuildWitnessesViaFullScan(account: account, spendingKey: spendingKey, onProgress: onProgress)
             return
         }
 
-        print("📦 Loaded bundled CMU data: \(bundledData.count) bytes")
+        print("📦 Loaded CMU data from GitHub cache: \(downloadedData.count) bytes")
 
         // Check if all notes have CMU stored
         var notesWithCMU: [WalletNote] = []
@@ -1704,22 +1593,22 @@ final class WalletManager: ObservableObject {
         print("📝 Notes with CMU: \(notesWithCMU.count), without CMU: \(notesWithoutCMU.count)")
 
         if notesWithoutCMU.isEmpty && !notesWithCMU.isEmpty {
-            // All notes have CMU - check if any are beyond bundled range
+            // All notes have CMU - check if any are beyond downloaded range
             print("🚀 Checking notes for witness rebuild...")
 
-            // VUL-018: Use shared constant for bundled tree height
-            let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+            // VUL-018: Use shared constant for downloaded tree height
+            let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
-            // Check if ANY note is beyond bundled range
-            let notesBeyondBundled = notesWithCMU.filter { $0.height > bundledTreeHeight }
-            if !notesBeyondBundled.isEmpty {
-                print("⚠️ Found \(notesBeyondBundled.count) notes beyond bundled range - need live scan")
-                print("📡 Scanning from bundled height to chain tip...")
+            // Check if ANY note is beyond downloaded range
+            let notesBeyondDownloaded = notesWithCMU.filter { $0.height > downloadedTreeHeight }
+            if !notesBeyondDownloaded.isEmpty {
+                print("⚠️ Found \(notesBeyondDownloaded.count) notes beyond downloaded range - need live scan")
+                print("📡 Scanning from downloaded height to chain tip...")
 
-                // Load bundled tree first
-                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+                // Load downloaded tree first
+                if ZipherXFFI.treeLoadFromCMUs(data: downloadedData) {
                     let treeSize = ZipherXFFI.treeSize()
-                    print("✅ Loaded bundled tree: \(treeSize) commitments")
+                    print("✅ Loaded downloaded tree: \(treeSize) commitments")
                 }
 
                 // Ensure network connection
@@ -1728,10 +1617,10 @@ final class WalletManager: ObservableObject {
                     try await Task.sleep(nanoseconds: 500_000_000)
                 }
 
-                // Scan from bundled tree height to find notes AND detect spent nullifiers
+                // Scan from downloaded tree height to find notes AND detect spent nullifiers
                 let scanner = FilterScanner()
                 scanner.onProgress = onProgress
-                try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: bundledTreeHeight + 1)
+                try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: downloadedTreeHeight + 1)
 
                 // Refresh balance after scan (will detect spent notes)
                 try await refreshBalance()
@@ -1739,8 +1628,8 @@ final class WalletManager: ObservableObject {
                 return
             }
 
-            // All notes within bundled range - use fast path
-            print("🚀 All notes within bundled range - using fast witness rebuild")
+            // All notes within downloaded range - use fast path
+            print("🚀 All notes within downloaded range - using fast witness rebuild")
 
             for (index, note) in notesWithCMU.enumerated() {
                 guard let cmu = note.cmu else { continue }
@@ -1751,22 +1640,22 @@ final class WalletManager: ObservableObject {
                     onProgress(progress, UInt64(index + 1), UInt64(notesWithCMU.count))
                 }
 
-                // Use treeCreateWitnessForCMU for notes within bundled range
-                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                // Use treeCreateWitnessForCMU for notes within downloaded range
+                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: downloadedData, targetCMU: cmu) {
                     let (position, witness) = result
                     print("✅ Created witness for note \(note.id): position=\(position), witness=\(witness.count) bytes")
 
                     // Update witness in database
                     try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
                 } else {
-                    print("⚠️ Failed to create witness for note \(note.id) - CMU not in bundled tree")
+                    print("⚠️ Failed to create witness for note \(note.id) - CMU not in downloaded tree")
                 }
             }
 
-            // Load the bundled tree into memory for spending
-            if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+            // Load the downloaded tree into memory for spending
+            if ZipherXFFI.treeLoadFromCMUs(data: downloadedData) {
                 let treeSize = ZipherXFFI.treeSize()
-                print("✅ Loaded bundled tree for spending: \(treeSize) commitments")
+                print("✅ Loaded downloaded tree for spending: \(treeSize) commitments")
             }
 
             // Refresh balance after rebuild
@@ -1799,7 +1688,7 @@ final class WalletManager: ObservableObject {
         scanner.onProgress = onProgress
 
         // CRITICAL: For rebuild, we need to scan from Sapling activation to find ALL notes
-        // Don't let it use bundled tree height as start - that would skip notes within bundled range
+        // Don't let it use downloaded tree height as start - that would skip notes within downloaded range
         let saplingActivation: UInt64 = 476969
         print("🔄 Starting full rescan from Sapling activation (\(saplingActivation)) to rediscover all notes")
 
@@ -1811,7 +1700,7 @@ final class WalletManager: ObservableObject {
     }
 
     /// Perform a quick scan for notes starting from a specific height
-    /// Uses bundled tree - only scans for notes, doesn't rebuild tree
+    /// Uses downloaded tree - only scans for notes, doesn't rebuild tree
     func performQuickScan(fromHeight startHeight: UInt64, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
             throw WalletError.walletNotCreated
@@ -1853,19 +1742,19 @@ final class WalletManager: ObservableObject {
             _ = ZipherXFFI.treeInit()
             print("🌳 Initialized empty tree for full rescan from \(startHeight)")
         } else if startHeight >= prebuiltTreeHeight {
-            // Recent scan - load pre-built tree
-            if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-               let bundledData = try? Data(contentsOf: bundledTreeURL) {
-                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+            // Recent scan - load pre-built tree from GitHub cache
+            if let cmuFilePath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+               let downloadedData = try? Data(contentsOf: cmuFilePath) {
+                if ZipherXFFI.treeLoadFromCMUs(data: downloadedData) {
                     let treeSize = ZipherXFFI.treeSize()
-                    print("🌳 Loaded bundled commitment tree (CMU format) with \(treeSize) commitments")
+                    print("🌳 Loaded downloaded commitment tree (CMU format) with \(treeSize) commitments")
                 } else {
-                    print("❌ Failed to load bundled tree from CMU format")
+                    print("❌ Failed to load downloaded tree from CMU format")
                     _ = ZipherXFFI.treeInit()
                 }
             } else {
                 _ = ZipherXFFI.treeInit()
-                print("🌳 Initialized empty tree (no bundled tree found)")
+                print("🌳 Initialized empty tree (no downloaded tree found)")
             }
         } else {
             // Partial scan from middle - need empty tree to build correctly

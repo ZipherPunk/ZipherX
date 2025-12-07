@@ -2243,7 +2243,7 @@ Both binaries must be installed to /usr/local/bin:
             do {
                 print("🔧 Starting note repair...")
 
-                try await walletManager.repairNotesAfterBundledTree { progress, currentHeight, maxHeight in
+                try await walletManager.repairNotesAfterDownloadedTree { progress, currentHeight, maxHeight in
                     Task { @MainActor in
                         rescanProgress = progress
                         rescanCurrentHeight = currentHeight

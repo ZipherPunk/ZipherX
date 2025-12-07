@@ -1,25 +1,21 @@
 // Copyright (c) 2025 Zipherpunk.com dev team
-// Block timestamp manager - downloads from GitHub and caches locally
+// Block timestamp manager - extracts from boost file or uses legacy cache
 
 import Foundation
 import CryptoKit
 
 /// Provides block timestamp lookup from multiple sources:
-/// 1. Cached file downloaded from GitHub (stored in Documents)
-/// 2. Runtime cache for newly synced blocks
-/// 3. HeaderStore (synced at runtime from P2P network)
+/// 1. Boost file (extracted from ZipherX_Boost unified file)
+/// 2. Legacy cached file (previously downloaded)
+/// 3. Runtime cache for newly synced blocks
+/// 4. HeaderStore (synced at runtime from P2P network)
 ///
-/// File format: [timestamp: UInt32 LE] × (maxHeight + 1)
-/// Each timestamp is at offset (height × 4)
+/// Boost file format: [timestamp: UInt32 LE] × count (4 bytes each)
+/// Legacy format: [timestamp: UInt32 LE] × (maxHeight + 1) - Each timestamp is at offset (height × 4)
 final class BlockTimestampManager {
     static let shared = BlockTimestampManager()
 
-    // GitHub URLs (from ZipherX_Boost repo)
-    // Manifest is always from main branch (contains latest height info)
-    private static let MANIFEST_URL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/block_timestamps_manifest.json"
-    // Timestamps file URL is built dynamically based on manifest height
-
-    /// Local cache filename
+    /// Local cache filename (legacy format)
     private static let CACHE_FILENAME = "block_timestamps_cache.bin"
 
     /// Maximum height in the loaded file
@@ -68,152 +64,99 @@ final class BlockTimestampManager {
         }
     }
 
-    // MARK: - Download from GitHub
+    // MARK: - Load from Boost File
 
-    /// Download/update timestamps file from GitHub
+    /// Load timestamps from boost file or legacy sources
+    /// Priority: 1) Boost file, 2) Legacy cache, 3) Download boost file
     /// Returns: (success, maxHeight)
     func downloadIfNeeded(onProgress: ((Double, String) -> Void)? = nil) async -> (Bool, UInt64) {
         guard !isDownloading else {
-            print("⚠️ BlockTimestampManager: Download already in progress")
+            print("⚠️ BlockTimestampManager: Load already in progress")
             return (false, maxHeight)
         }
 
         isDownloading = true
         defer { isDownloading = false }
 
-        onProgress?(0.0, "Checking for timestamp updates...")
-
-        // Fetch manifest from GitHub
-        let manifest = await fetchManifest()
-
-        if let manifest = manifest {
-            print("📡 Timestamp manifest: max height \(manifest.maxHeight), sha256: \(manifest.sha256.prefix(16))...")
-        } else {
-            print("⚠️ Could not fetch timestamp manifest, using local file only")
-            return (timestampData != nil, maxHeight)
-        }
-
-        // Check if we need to download (newer data available)
-        let localMaxHeight = maxHeight
-        guard let remoteManifest = manifest, UInt64(remoteManifest.maxHeight) > localMaxHeight else {
-            print("✅ Local timestamps are up to date (max height \(localMaxHeight))")
-            onProgress?(1.0, "Timestamps up to date")
+        // Already loaded?
+        if timestampData != nil && maxHeight > 0 {
+            print("✅ BlockTimestampManager: Timestamps already loaded (max height \(maxHeight))")
+            onProgress?(1.0, "Timestamps ready")
             return (true, maxHeight)
         }
 
-        print("⬇️ Downloading newer timestamps (remote: \(remoteManifest.maxHeight) > local: \(localMaxHeight))...")
-        onProgress?(0.1, "Downloading timestamps...")
+        onProgress?(0.0, "Loading timestamps...")
 
-        // Build dynamic release URL based on manifest height
-        let timestampsURL = "https://github.com/VictorLux/ZipherX_Boost/releases/download/v\(remoteManifest.maxHeight)-timestamps/block_timestamps.bin"
-        print("📥 Downloading from: \(timestampsURL)")
-
-        // Download the file
-        guard let downloadedURL = await downloadFile(
-            from: timestampsURL,
-            expectedSize: remoteManifest.fileSize,
-            onProgress: { progress in
-                onProgress?(0.1 + progress * 0.8, "Downloading: \(Int(progress * 100))%")
+        // 1) Try to extract from boost file
+        if await CommitmentTreeUpdater.shared.hasCachedBoostFile(),
+           let sectionInfo = await CommitmentTreeUpdater.shared.getSectionInfo(type: .timestamps) {
+            do {
+                let data = try await CommitmentTreeUpdater.shared.extractBlockTimestamps()
+                try loadFromBoostSection(data, startHeight: sectionInfo.start_height, count: sectionInfo.count)
+                print("✅ BlockTimestampManager: Loaded \(sectionInfo.count) timestamps from boost file")
+                onProgress?(1.0, "Timestamps ready")
+                return (true, maxHeight)
+            } catch {
+                print("⚠️ BlockTimestampManager: Failed to extract from boost: \(error)")
             }
-        ) else {
-            print("❌ Download failed, using local file")
-            return (timestampData != nil, maxHeight)
         }
 
-        // Verify checksum
-        onProgress?(0.92, "Verifying checksum...")
-        if !verifySHA256(fileURL: downloadedURL, expectedHash: remoteManifest.sha256) {
-            print("🚨 SECURITY: Downloaded timestamps failed checksum verification!")
-            try? FileManager.default.removeItem(at: downloadedURL)
-            return (timestampData != nil, maxHeight)
-        }
-
-        // Move to cache location
-        do {
-            if FileManager.default.fileExists(atPath: cacheFilePath.path) {
-                try FileManager.default.removeItem(at: cacheFilePath)
+        // 2) Try legacy cache
+        if FileManager.default.fileExists(atPath: cacheFilePath.path) {
+            do {
+                let data = try Data(contentsOf: cacheFilePath, options: .mappedIfSafe)
+                timestampData = data
+                maxHeight = UInt64(data.count / 4) - 1
+                print("✅ BlockTimestampManager: Loaded legacy cache (max height \(maxHeight))")
+                onProgress?(1.0, "Timestamps ready")
+                return (true, maxHeight)
+            } catch {
+                print("⚠️ BlockTimestampManager: Failed to load legacy cache: \(error)")
             }
-            try FileManager.default.moveItem(at: downloadedURL, to: cacheFilePath)
-            print("✅ Downloaded, verified, and saved timestamps to cache")
-
-            // Reload the file
-            timestampData = nil
-            loadCachedTimestamps()
-            onProgress?(1.0, "Ready: timestamps to height \(maxHeight)")
-            return (true, maxHeight)
-        } catch {
-            print("❌ Failed to save downloaded timestamps: \(error)")
-            return (timestampData != nil, maxHeight)
         }
-    }
 
-    /// Fetch manifest from GitHub
-    private func fetchManifest() async -> TimestampManifest? {
-        guard let url = URL(string: Self.MANIFEST_URL) else { return nil }
+        // 3) Download boost file from GitHub if nothing available
+        print("⬇️ BlockTimestampManager: Downloading boost file for timestamps...")
+        onProgress?(0.1, "Downloading boost file...")
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                return nil
+            _ = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                onProgress?(0.1 + progress * 0.8, status)
             }
-            return parseManifest(data)
-        } catch {
-            print("⚠️ BlockTimestampManager: Manifest fetch error: \(error)")
-            return nil
-        }
-    }
 
-    /// Parse manifest JSON
-    private func parseManifest(_ data: Data) -> TimestampManifest? {
-        do {
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let maxHeight = json["max_height"] as? Int,
-                  let fileSize = json["file_size"] as? Int,
-                  let sha256 = json["sha256"] as? String else {
-                return nil
+            if let sectionInfo = await CommitmentTreeUpdater.shared.getSectionInfo(type: .timestamps) {
+                let data = try await CommitmentTreeUpdater.shared.extractBlockTimestamps()
+                try loadFromBoostSection(data, startHeight: sectionInfo.start_height, count: sectionInfo.count)
+                print("✅ BlockTimestampManager: Loaded \(sectionInfo.count) timestamps from downloaded boost file")
+                onProgress?(1.0, "Timestamps ready")
+                return (true, maxHeight)
             }
-            return TimestampManifest(maxHeight: maxHeight, fileSize: fileSize, sha256: sha256)
         } catch {
-            return nil
+            print("❌ BlockTimestampManager: Failed to download boost file: \(error)")
         }
+
+        return (timestampData != nil, maxHeight)
     }
 
-    /// Verify SHA256 checksum
-    private func verifySHA256(fileURL: URL, expectedHash: String) -> Bool {
-        do {
-            let data = try Data(contentsOf: fileURL)
-            let hash = SHA256.hash(data: data)
-            let computedHash = hash.compactMap { String(format: "%02x", $0) }.joined()
-            let matches = computedHash.lowercased() == expectedHash.lowercased()
-            if matches {
-                print("✅ SHA256 checksum verified: \(computedHash.prefix(16))...")
-            } else {
-                print("❌ SHA256 mismatch! Expected: \(expectedHash.prefix(16))..., Got: \(computedHash.prefix(16))...")
-            }
-            return matches
-        } catch {
-            print("❌ Failed to read file for checksum: \(error)")
-            return false
+    /// Load timestamps from boost section (4 bytes per timestamp)
+    private func loadFromBoostSection(_ data: Data, startHeight: UInt64, count: UInt64) throws {
+        guard data.count >= Int(count) * 4 else {
+            throw NSError(domain: "BlockTimestampManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid boost section size"])
         }
+
+        // Store data and metadata
+        timestampData = data
+        maxHeight = startHeight + count - 1
+        boostStartHeight = startHeight
+        isBoostFormat = true
+
+        print("⏰ BlockTimestampManager: Loaded timestamps from boost (heights \(startHeight) to \(maxHeight))")
     }
 
-    /// Download file with progress
-    private func downloadFile(from urlString: String, expectedSize: Int, onProgress: @escaping (Double) -> Void) async -> URL? {
-        guard let url = URL(string: urlString) else { return nil }
-
-        return await withCheckedContinuation { continuation in
-            let session = URLSession(
-                configuration: .default,
-                delegate: DownloadProgressDelegate(expectedSize: expectedSize, onProgress: onProgress) { tempURL in
-                    continuation.resume(returning: tempURL)
-                },
-                delegateQueue: nil
-            )
-
-            let task = session.downloadTask(with: url)
-            task.resume()
-        }
-    }
+    /// Start height for boost format (Sapling activation)
+    private var boostStartHeight: UInt64 = 0
+    /// Whether loaded from boost format (vs legacy)
+    private var isBoostFormat: Bool = false
 
     // MARK: - Public API
 
@@ -250,7 +193,17 @@ final class BlockTimestampManager {
         guard let data = timestampData else { return nil }
         guard height <= maxHeight else { return nil }
 
-        let offset = Int(height) * 4
+        // Calculate offset based on format
+        let offset: Int
+        if isBoostFormat {
+            // Boost format: timestamps start at boostStartHeight
+            guard height >= boostStartHeight else { return nil }
+            offset = Int(height - boostStartHeight) * 4
+        } else {
+            // Legacy format: timestamps start at height 0
+            offset = Int(height) * 4
+        }
+
         guard offset + 4 <= data.count else { return nil }
 
         // Read UInt32 little-endian
@@ -327,51 +280,6 @@ final class BlockTimestampManager {
         for height in heights {
             guard getTimestamp(at: height) == nil else { continue }
             _ = await fetchTimestamp(at: height)
-        }
-    }
-}
-
-// MARK: - Manifest Structure
-
-private struct TimestampManifest {
-    let maxHeight: Int
-    let fileSize: Int
-    let sha256: String
-}
-
-// MARK: - Download Delegate
-
-private class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
-    let expectedSize: Int
-    let onProgress: (Double) -> Void
-    let onComplete: (URL?) -> Void
-
-    init(expectedSize: Int, onProgress: @escaping (Double) -> Void, onComplete: @escaping (URL?) -> Void) {
-        self.expectedSize = expectedSize
-        self.onProgress = onProgress
-        self.onComplete = onComplete
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".bin")
-        do {
-            try FileManager.default.copyItem(at: location, to: tempURL)
-            onComplete(tempURL)
-        } catch {
-            print("❌ DownloadProgressDelegate: Failed to copy file: \(error)")
-            onComplete(nil)
-        }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : Int64(expectedSize)
-        let progress = Double(totalBytesWritten) / Double(total)
-        onProgress(min(progress, 1.0))
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if error != nil {
-            onComplete(nil)
         }
     }
 }

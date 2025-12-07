@@ -53,7 +53,6 @@
 		462B43AF87D801C815856A0F /* ZipherXFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */; };
 		46D80759524E31A7309DEA25 /* BIP39Wordlist.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */; };
 		49B27A56BC94675D1B18506B /* BlockTimestampManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04DC847050BBC7E852DE4F5F /* BlockTimestampManager.swift */; };
-		49CF4027769B3712F2ADB331 /* commitment_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */; };
 		4A972E24FC0F1401E59C1C39 /* BundledBlockHashes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6626F058762A0D0666024868 /* BundledBlockHashes.swift */; };
 		517AE371E83D67E5C53DF758 /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8734EC25838585488804B01 /* HistoryView.swift */; };
 		52BC66B9631F78F1CFF46212 /* WalletMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D769A0AE4089D10446BFBBCE /* WalletMode.swift */; };
@@ -77,15 +76,12 @@
 		76CAA651280ABA8925035994 /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */; };
 		76E34B0E07EC1B8587C2BE12 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		772BD4E27BC23CDF88246433 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */; };
-		78385A3DC527E6AB96E59DB5 /* commitment_tree_serialized.bin in Resources */ = {isa = PBXBuildFile; fileRef = 8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */; };
 		79B002B28B3284D1D6AEEA57 /* Mac7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7173E7574C060D4285B73B46 /* Mac7Theme.swift */; };
 		7A96BC266309441F5614C1C7 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
-		7C38AF6C374A0F3FC5A6B5AA /* commitment_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */; };
 		7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
 		7EC2BE84340E3513C2F738E6 /* ZipherXFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 068F236B88339FCE75878F8B /* ZipherXFFI.swift */; };
 		838503AC50687F8879C1AAC1 /* DatabaseEncryption.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */; };
 		87821B0808BF2BB65B8DC3A7 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
-		895A047D03F848A37AED509B /* sapling_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 716A65BFF58BBC7334E13C13 /* sapling_tree.bin */; };
 		8A38BF03B3A4BB357D8C2904 /* ExplorerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7F6B7B7115F3075801EC5C5 /* ExplorerView.swift */; };
 		8A5068238F935B6E199FCABD /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD23F43B8205785891BF585 /* BlockHeader.swift */; };
 		8B6D4C9B2735242DFEC82611 /* RustBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD65941062D3050BEA2765F9 /* RustBridge.swift */; };
@@ -98,14 +94,12 @@
 		95B02CA9CFC2FF60EC40B1D4 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		A2ADB56D4E059E232CD01868 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
-		A4C736922B9D119338E16056 /* commitment_tree_serialized.bin in Resources */ = {isa = PBXBuildFile; fileRef = 8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */; };
 		A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */; };
 		AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
 		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
 		B5432C123C1ECD9D24CA0466 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
-		B90AF5F7E75CE549DE7C5122 /* shielded_outputs.bin in Resources */ = {isa = PBXBuildFile; fileRef = 9E3DB5B554E39CA5FFE2896D /* shielded_outputs.bin */; };
 		B999C8F0D77345F8DF9D5479 /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD23F43B8205785891BF585 /* BlockHeader.swift */; };
 		BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6C673DA8922F1FE8EAAB2C04 /* Assets.xcassets */; };
 		BE9229075EDEE71F40F43823 /* ModernTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */; };
@@ -125,10 +119,8 @@
 		E4979D57487D8A0547221B53 /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1AF6B2117E203E51A3F91E /* ThemeManager.swift */; };
 		E844AE91EBA8D86DC8441EC4 /* ExplorerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7F6B7B7115F3075801EC5C5 /* ExplorerView.swift */; };
 		E8AE0DF3E6B2CAF78CD6BF8C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6537E08D964E75E72B38163 /* SettingsView.swift */; };
-		EB7C49BF1EFB6609E615262C /* shielded_outputs.bin in Resources */ = {isa = PBXBuildFile; fileRef = 9E3DB5B554E39CA5FFE2896D /* shielded_outputs.bin */; };
 		ECE7A8EBCC60183A2F686044 /* Checkpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */; };
 		ED160AAE5D5BE3EE9480FEF2 /* WalletSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */; };
-		EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */ = {isa = PBXBuildFile; fileRef = 716A65BFF58BBC7334E13C13 /* sapling_tree.bin */; };
 		F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 630CFD90F45505D02500501A /* ContentView.swift */; };
 		F49F08F7B04F1E25AB55812B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
 		F6048AFB789DE06F4F2D7066 /* BundledBlockHashes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6626F058762A0D0666024868 /* BundledBlockHashes.swift */; };
@@ -177,22 +169,18 @@
 		6DD6AFDCA26B490632B50E6D /* BiometricAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiometricAuthManager.swift; sourceTree = "<group>"; };
 		6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemedComponents.swift; sourceTree = "<group>"; };
 		710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InsightAPI.swift; sourceTree = "<group>"; };
-		716A65BFF58BBC7334E13C13 /* sapling_tree.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = sapling_tree.bin; sourceTree = "<group>"; };
 		7173E7574C060D4285B73B46 /* Mac7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mac7Theme.swift; sourceTree = "<group>"; };
 		77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeManagementView.swift; sourceTree = "<group>"; };
 		79B539975C988B8093FB4106 /* System7Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Components.swift; sourceTree = "<group>"; };
 		7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletDatabase.swift; sourceTree = "<group>"; };
-		81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = commitment_tree.bin; sourceTree = "<group>"; };
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
-		8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = commitment_tree_serialized.bin; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseEncryption.swift; sourceTree = "<group>"; };
-		9E3DB5B554E39CA5FFE2896D /* shielded_outputs.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = shielded_outputs.bin; sourceTree = "<group>"; };
 		A9C06A2912C98B98AD2E5D87 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
@@ -549,10 +537,6 @@
 		D17373C50F6A9058CFF47A8D /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				8986B70E2DEF3D712682C49F /* commitment_tree_serialized.bin */,
-				81089A1A3BB227ED6B86CC68 /* commitment_tree.bin */,
-				716A65BFF58BBC7334E13C13 /* sapling_tree.bin */,
-				9E3DB5B554E39CA5FFE2896D /* shielded_outputs.bin */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -683,10 +667,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */,
-				49CF4027769B3712F2ADB331 /* commitment_tree.bin in Resources */,
-				A4C736922B9D119338E16056 /* commitment_tree_serialized.bin in Resources */,
-				895A047D03F848A37AED509B /* sapling_tree.bin in Resources */,
-				EB7C49BF1EFB6609E615262C /* shielded_outputs.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -695,10 +675,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				54413ED9395E4CB73E09FE15 /* Assets.xcassets in Resources */,
-				7C38AF6C374A0F3FC5A6B5AA /* commitment_tree.bin in Resources */,
-				78385A3DC527E6AB96E59DB5 /* commitment_tree_serialized.bin in Resources */,
-				EF5720B348F486E4DDFF5FB1 /* sapling_tree.bin in Resources */,
-				B90AF5F7E75CE549DE7C5122 /* shielded_outputs.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

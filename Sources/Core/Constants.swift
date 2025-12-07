@@ -4,39 +4,38 @@ import Foundation
 /// Centralizes hardcoded values to prevent inconsistencies across the codebase
 enum ZipherXConstants {
 
-    // MARK: - Commitment Tree (Dynamic from GitHub)
+    // MARK: - Commitment Tree (GitHub Boost File)
 
-    /// UserDefaults keys for tree info downloaded from GitHub
+    /// UserDefaults keys for tree info downloaded from GitHub boost file
     private static let treeHeightKey = "effectiveTreeHeight"
     private static let treeCMUCountKey = "effectiveTreeCMUCount"
     private static let treeRootKey = "effectiveTreeRoot"
 
-    /// Fallback values used if GitHub manifest hasn't been downloaded yet
-    /// These should match the BUNDLED tree in Resources/ (last known good values)
-    /// Update these when publishing new bundled tree to app
-    private static let fallbackTreeHeight: UInt64 = 2_926_122
-    private static let fallbackTreeCMUCount: UInt64 = 1_041_891
-    private static let fallbackTreeRoot = "5cc45e5ed5008b68e0098fdc7ea52cc25caa4400b3bc62c6701bbfc581990945"
-
-    /// Get the tree height (from GitHub manifest stored in UserDefaults)
-    /// Returns Sapling activation height if not yet downloaded
-    static var bundledTreeHeight: UInt64 {
+    /// Get the effective tree height (from downloaded boost file)
+    /// Returns 0 if no boost file has been downloaded yet (forces download)
+    static var effectiveTreeHeight: UInt64 {
         let downloaded = UserDefaults.standard.integer(forKey: treeHeightKey)
-        return downloaded > 0 ? UInt64(downloaded) : fallbackTreeHeight
+        return downloaded > 0 ? UInt64(downloaded) : 0
     }
 
-    /// Get the CMU count (from GitHub manifest stored in UserDefaults)
-    static var bundledTreeCMUCount: UInt64 {
+    /// Get the effective CMU count (from downloaded boost file)
+    /// Returns 0 if no boost file has been downloaded yet
+    static var effectiveTreeCMUCount: UInt64 {
         let downloaded = UserDefaults.standard.integer(forKey: treeCMUCountKey)
-        return downloaded > 0 ? UInt64(downloaded) : fallbackTreeCMUCount
+        return downloaded > 0 ? UInt64(downloaded) : 0
     }
 
-    /// Get the tree root (from GitHub manifest stored in UserDefaults)
-    static var bundledTreeRoot: String {
-        return UserDefaults.standard.string(forKey: treeRootKey) ?? fallbackTreeRoot
+    /// Check if tree data has been downloaded from GitHub boost file
+    static var hasDownloadedTree: Bool {
+        return effectiveTreeHeight > 0
     }
 
-    /// Update tree info from downloaded GitHub manifest
+    /// Get the tree root (from downloaded boost file)
+    static var effectiveTreeRoot: String {
+        return UserDefaults.standard.string(forKey: treeRootKey) ?? ""
+    }
+
+    /// Update tree info from downloaded GitHub boost file
     /// Called by CommitmentTreeUpdater after successful download
     static func updateTreeInfo(height: UInt64, cmuCount: UInt64, root: String) {
         UserDefaults.standard.set(Int(height), forKey: treeHeightKey)
@@ -60,9 +59,10 @@ enum ZipherXConstants {
         print("📊 Cleared tree info from UserDefaults")
     }
 
-    /// Alias for backwards compatibility
-    static var effectiveTreeHeight: UInt64 { bundledTreeHeight }
-    static var effectiveTreeCMUCount: UInt64 { bundledTreeCMUCount }
+    /// Aliases for backwards compatibility with code using "bundled" naming
+    static var bundledTreeHeight: UInt64 { effectiveTreeHeight }
+    static var bundledTreeCMUCount: UInt64 { effectiveTreeCMUCount }
+    static var bundledTreeRoot: String { effectiveTreeRoot }
 
     // MARK: - Network
 

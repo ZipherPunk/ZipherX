@@ -148,8 +148,8 @@ final class TransactionBuilder {
 
         print("📝 Found \(dbNotes.count) notes with valid witnesses")
 
-        // VUL-018: Use shared constant for bundled tree height
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        // Use downloaded tree height from GitHub
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -160,26 +160,33 @@ final class TransactionBuilder {
             _ = ZipherXFFI.treeDeserialize(data: treeData)
             print("✅ Commitment tree loaded from database")
         } else {
-            // Load bundled tree from app resources (slow, first time only)
-            print("🌳 Loading bundled commitment tree...")
-            if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-               let bundledData = try? Data(contentsOf: bundledTreeURL) {
-                if ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
+            // Load tree from GitHub boost file cache
+            print("🌳 Loading commitment tree from boost file...")
+
+            // First ensure boost file is downloaded
+            if await !CommitmentTreeUpdater.shared.hasCachedBoostFile() {
+                print("🌳 Downloading boost file from GitHub...")
+                _ = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile()
+            }
+
+            // Extract and deserialize the tree
+            do {
+                let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                if ZipherXFFI.treeDeserialize(data: serializedTree) {
                     let treeSize = ZipherXFFI.treeSize()
-                    print("✅ Loaded bundled commitment tree with \(treeSize) commitments")
+                    print("✅ Loaded commitment tree with \(treeSize) commitments")
 
                     // CRITICAL: Save to database so we don't need to reload next time
-                    // This saves ~50 seconds on subsequent transactions
-                    if let serializedTree = ZipherXFFI.treeSerialize() {
-                        try? database.saveTreeState(serializedTree)
+                    if let serializedTreeData = ZipherXFFI.treeSerialize() {
+                        try? database.saveTreeState(serializedTreeData)
                         print("💾 Tree state saved to database for future use")
                     }
                 } else {
-                    print("❌ Failed to load bundled tree")
+                    print("❌ Failed to deserialize tree from boost file")
                     throw TransactionError.proofGenerationFailed
                 }
-            } else {
-                print("❌ Bundled tree file not found")
+            } catch {
+                print("❌ Failed to extract tree from boost file: \(error)")
                 throw TransactionError.proofGenerationFailed
             }
         }
@@ -279,21 +286,21 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // For notes beyond bundled tree height, rebuild witness if needed
+        // For notes beyond downloaded tree height, rebuild witness if needed
         // OPTIMIZATION: Skip if witness is already current (background sync)
-        if noteHeight > bundledTreeHeight && needsRebuild {
-            print("📝 Note is beyond bundled tree height (\(bundledTreeHeight)), rebuilding witness...")
+        if noteHeight > downloadedTreeHeight && needsRebuild {
+            print("📝 Note is beyond downloaded tree height (\(downloadedTreeHeight)), rebuilding witness...")
 
             guard let cmu = noteCMU else {
                 print("❌ Cannot rebuild witness without CMU")
                 throw TransactionError.proofGenerationFailed
             }
 
-            // Rebuild witness using bundled tree + fetched CMUs
+            // Rebuild witness using downloaded tree + fetched CMUs
             if let result = try await rebuildWitnessForNote(
                 cmu: cmu,
                 noteHeight: noteHeight,
-                bundledTreeHeight: bundledTreeHeight
+                downloadedTreeHeight: downloadedTreeHeight
             ) {
                 print("✅ Successfully rebuilt witness for note at height \(noteHeight)")
                 witnessToUse = result.witness
@@ -308,21 +315,21 @@ final class TransactionBuilder {
                 print("❌ Failed to rebuild witness")
                 throw TransactionError.proofGenerationFailed
             }
-        } else if noteHeight <= bundledTreeHeight && needsRebuild, let cmu = noteCMU {
-            // Note is within bundled tree range - use treeCreateWitnessForCMU
-            print("📝 Note is within bundled tree range, creating witness from bundled CMUs...")
+        } else if noteHeight <= downloadedTreeHeight && needsRebuild, let cmu = noteCMU {
+            // Note is within downloaded tree range - use treeCreateWitnessForCMU
+            print("📝 Note is within downloaded tree range, creating witness from downloaded CMUs...")
 
-            guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                  let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-                print("❌ Failed to load bundled commitment tree")
+            guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                  let cachedData = try? Data(contentsOf: cachedPath) else {
+                print("❌ Failed to load commitment tree from GitHub cache")
                 throw TransactionError.proofGenerationFailed
             }
 
-            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+            if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
                 print("✅ Created witness at position \(result.position)")
                 witnessToUse = result.witness
             } else {
-                print("❌ Failed to find note CMU in bundled tree")
+                print("❌ Failed to find note CMU in downloaded tree")
                 throw TransactionError.proofGenerationFailed
             }
         }
@@ -417,8 +424,8 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // VUL-018: Use shared constant for bundled tree height
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        // Use downloaded tree height from GitHub
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
@@ -429,18 +436,17 @@ final class TransactionBuilder {
             _ = ZipherXFFI.treeDeserialize(data: treeData)
             onProgress("tree", "Tree loaded from cache", 1.0)
         } else {
-            onProgress("tree", "Loading bundled tree...", 0.0)
+            onProgress("tree", "Loading tree from GitHub cache...", 0.0)
 
-            if let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-               let bundledData = try? Data(contentsOf: bundledTreeURL) {
+            if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+               let cachedData = try? Data(contentsOf: cachedPath) {
 
                 // Count CMUs for progress display
-                let cmuCount = bundledData.count >= 8 ?
-                    bundledData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) } : 0
-                let totalCMUs = Int(cmuCount)
+                let cmuCount = cachedData.count >= 8 ?
+                    cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) } : 0
 
                 // Use the new FFI function with real progress callback
-                let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: bundledData) { current, total in
+                let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: cachedData) { current, total in
                     let progress = Double(current) / Double(total)
                     let currentFormatted = NumberFormatter.localizedString(from: NSNumber(value: current), number: .decimal)
                     let totalFormatted = NumberFormatter.localizedString(from: NSNumber(value: total), number: .decimal)
@@ -457,9 +463,25 @@ final class TransactionBuilder {
                     print("💾 Tree state saved to database for future use")
                 }
 
-                onProgress("tree", "\(totalCMUs.formatted()) CMUs loaded", 1.0)
+                onProgress("tree", "\(cmuCount.formatted()) CMUs loaded", 1.0)
             } else {
-                throw TransactionError.proofGenerationFailed
+                // Download boost file from GitHub if not cached
+                onProgress("tree", "Downloading boost file...", 0.1)
+                _ = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                    onProgress("tree", status, progress * 0.8)
+                }
+
+                // Extract and deserialize the tree
+                onProgress("tree", "Extracting tree...", 0.85)
+                let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                    if let serializedTreeData = ZipherXFFI.treeSerialize() {
+                        try? database.saveTreeState(serializedTreeData)
+                    }
+                    onProgress("tree", "Tree ready", 1.0)
+                } else {
+                    throw TransactionError.proofGenerationFailed
+                }
             }
         }
 
@@ -531,7 +553,7 @@ final class TransactionBuilder {
             }
 
             // Only rebuild witness if needed
-            if needsRebuild && noteHeight > bundledTreeHeight {
+            if needsRebuild && noteHeight > downloadedTreeHeight {
                 guard let cmu = noteCMU else {
                     print("❌ Note \(index + 1) has no CMU for witness rebuild")
                     throw TransactionError.proofGenerationFailed
@@ -541,19 +563,19 @@ final class TransactionBuilder {
                 if let result = try await rebuildWitnessForNote(
                     cmu: cmu,
                     noteHeight: noteHeight,
-                    bundledTreeHeight: bundledTreeHeight
+                    downloadedTreeHeight: downloadedTreeHeight
                 ) {
                     witnessToUse = result.witness
                 } else {
                     throw TransactionError.proofGenerationFailed
                 }
             } else if needsRebuild, let cmu = noteCMU {
-                guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                      let bundledData = try? Data(contentsOf: bundledTreeURL) else {
+                guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                      let cachedData = try? Data(contentsOf: cachedPath) else {
                     throw TransactionError.proofGenerationFailed
                 }
 
-                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
+                if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
                     witnessToUse = result.witness
                 } else {
                     print("❌ Failed to create witness for note \(index + 1)")
@@ -840,22 +862,22 @@ final class TransactionBuilder {
     func rebuildWitnessForNote(
         cmu: Data,
         noteHeight: UInt64,
-        bundledTreeHeight: UInt64
+        downloadedTreeHeight: UInt64
     ) async throws -> (witness: Data, anchor: Data)? {
         print("🔄 Rebuilding witness for note at height \(noteHeight)...")
         print("📝 Note CMU: \(cmu.map { String(format: "%02x", $0) }.joined().prefix(16))...")
 
-        // 1. Load bundled CMU file
-        guard let bundledTreeURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-              let bundledData = try? Data(contentsOf: bundledTreeURL) else {
-            print("❌ Failed to load bundled commitment tree")
+        // 1. Load CMU file from GitHub cache
+        guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+              let cachedData = try? Data(contentsOf: cachedPath) else {
+            print("❌ Failed to load commitment tree from GitHub cache")
             return nil
         }
 
-        // Parse bundled CMU count
-        guard bundledData.count >= 8 else { return nil }
-        let bundledCount = bundledData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-        print("📊 Bundled tree has \(bundledCount) CMUs ending at height \(bundledTreeHeight)")
+        // Parse CMU count
+        guard cachedData.count >= 8 else { return nil }
+        let cachedCount = cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        print("📊 Downloaded tree has \(cachedCount) CMUs ending at height \(downloadedTreeHeight)")
 
         // 2. Initialize fresh tree
         guard ZipherXFFI.treeInit() else {
@@ -863,18 +885,18 @@ final class TransactionBuilder {
             return nil
         }
 
-        // 3. Load bundled CMUs into tree
-        print("🌳 Loading bundled CMUs into tree...")
-        if !ZipherXFFI.treeLoadFromCMUs(data: bundledData) {
-            print("❌ Failed to load bundled CMUs")
+        // 3. Load downloaded CMUs into tree
+        print("🌳 Loading downloaded CMUs into tree...")
+        if !ZipherXFFI.treeLoadFromCMUs(data: cachedData) {
+            print("❌ Failed to load downloaded CMUs")
             return nil
         }
 
         let treeSize = ZipherXFFI.treeSize()
         print("✅ Tree now has \(treeSize) commitments")
 
-        // 4. Fetch additional CMUs from blocks between bundledTreeHeight+1 and noteHeight
-        let startHeight = bundledTreeHeight + 1
+        // 4. Fetch additional CMUs from blocks between downloadedTreeHeight+1 and noteHeight
+        let startHeight = downloadedTreeHeight + 1
         print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight)...")
 
         var additionalCMUs: [Data] = []

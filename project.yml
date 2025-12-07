@@ -32,8 +32,8 @@ targets:
         buildPhase: resources
       - path: Resources/sapling-output.params
         buildPhase: resources
-      # block_timestamps.bin is NOT bundled (~12 MB) - downloaded from GitHub on first sync
-      # shielded_outputs.bin is NOT bundled (585 MB) - downloaded from GitHub on first sync
+      # All sync data (outputs, timestamps, tree, block hashes) is downloaded from GitHub
+      # as a unified boost file (zipherx_boost_v1.bin, ~520 MB) on first sync
     info:
       path: Info.plist
       properties:
@@ -93,8 +93,8 @@ targets:
         buildPhase: resources
       - path: Resources/sapling-output.params
         buildPhase: resources
-      # block_timestamps.bin is NOT bundled (~12 MB) - downloaded from GitHub on first sync
-      # shielded_outputs.bin is NOT bundled (585 MB) - downloaded from GitHub on first sync
+      # All sync data (outputs, timestamps, tree, block hashes) is downloaded from GitHub
+      # as a unified boost file (zipherx_boost_v1.bin, ~520 MB) on first sync
       # macOS only: Bundled zclassicd and zclassic-cli for Full Node mode
       - path: Resources/Binaries
         buildPhase: resources

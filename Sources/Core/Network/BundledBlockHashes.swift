@@ -1,18 +1,14 @@
 // BundledBlockHashes.swift
 // ZipherX
 //
-// Loads and provides fast lookup of block hashes from bundled file.
+// Loads and provides fast lookup of block hashes from boost file.
 // Enables P2P block fetching without syncing headers from network.
 //
-// File format:
-// - count: UInt64 LE (number of hashes)
-// - start_height: UInt64 LE (first block height, e.g., Sapling activation)
-// - hashes: 32 bytes each (wire format, little-endian)
+// Boost file format: raw hashes, 32 bytes each (wire format, little-endian)
 
 import Foundation
-import CommonCrypto
 
-/// Manager for bundled block hashes - enables fast P2P block fetching
+/// Manager for block hashes - enables fast P2P block fetching
 /// without needing to sync headers from the network first.
 final class BundledBlockHashes {
 
@@ -27,7 +23,7 @@ final class BundledBlockHashes {
     /// Start height of bundled data (Sapling activation)
     private(set) var startHeight: UInt64 = 0
 
-    /// End height of bundled data (bundledTreeHeight)
+    /// End height of bundled data
     private(set) var endHeight: UInt64 = 0
 
     /// Number of hashes loaded
@@ -36,8 +32,7 @@ final class BundledBlockHashes {
     /// Whether hashes are loaded
     private(set) var isLoaded: Bool = false
 
-    /// Loading lock to prevent concurrent loads
-    private let loadLock = NSLock()
+    /// Loading state
     private var isLoading = false
 
     // MARK: - Initialization
@@ -46,153 +41,110 @@ final class BundledBlockHashes {
 
     // MARK: - Public Methods
 
-    /// Load bundled block hashes from Resources
-    /// Priority: 1) Bundle, 2) Documents (cached download), 3) GitHub download
+    /// Load block hashes from boost file
+    /// Priority: 1) Boost file (extracted from GitHub boost), 2) Legacy bundle, 3) Legacy cache, 4) Download
     /// - Parameter onProgress: Optional progress callback (current, total)
     func loadBundledHashes(onProgress: ((UInt64, UInt64) -> Void)? = nil) async throws {
-        loadLock.lock()
+        // Check loading state
         if isLoaded || isLoading {
-            loadLock.unlock()
             return
         }
         isLoading = true
-        loadLock.unlock()
 
         defer {
-            loadLock.lock()
             isLoading = false
-            loadLock.unlock()
         }
 
-        print("📦 Loading bundled block hashes...")
+        print("📦 Loading block hashes...")
         let startTime = Date()
 
-        // 1) Try to load from bundle first (fastest)
+        // 1) Try to extract from boost file (new format)
+        if await CommitmentTreeUpdater.shared.hasCachedBoostFile(),
+           let sectionInfo = await CommitmentTreeUpdater.shared.getSectionInfo(type: .blockHashes) {
+            do {
+                let hashData = try await CommitmentTreeUpdater.shared.extractBlockHashes()
+                try loadFromBoostSection(hashData, startHeight: sectionInfo.start_height, count: sectionInfo.count, onProgress: onProgress)
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("✅ Loaded \(count) block hashes from boost file in \(String(format: "%.1f", elapsed))s")
+                return
+            } catch {
+                print("⚠️ Failed to extract block hashes from boost file: \(error)")
+            }
+        }
+
+        // 2) Try to load from legacy bundle (old format - will be removed in future)
         if let url = Bundle.main.url(forResource: "block_hashes", withExtension: "bin") {
             let data = try Data(contentsOf: url)
-            try loadFromData(data, onProgress: onProgress)
+            try loadFromLegacyData(data, onProgress: onProgress)
             let elapsed = Date().timeIntervalSince(startTime)
-            print("✅ Loaded \(count) block hashes from bundle in \(String(format: "%.1f", elapsed))s")
+            print("✅ Loaded \(count) block hashes from legacy bundle in \(String(format: "%.1f", elapsed))s")
             return
         }
 
-        // 2) Try Documents cache (previously downloaded)
+        // 3) Try Documents cache (previously downloaded legacy format)
         let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let cachedURL = documentsURL.appendingPathComponent("block_hashes.bin")
         if FileManager.default.fileExists(atPath: cachedURL.path) {
             let data = try Data(contentsOf: cachedURL)
-            try loadFromData(data, onProgress: onProgress)
+            try loadFromLegacyData(data, onProgress: onProgress)
             let elapsed = Date().timeIntervalSince(startTime)
-            print("✅ Loaded \(count) block hashes from cache in \(String(format: "%.1f", elapsed))s")
+            print("✅ Loaded \(count) block hashes from legacy cache in \(String(format: "%.1f", elapsed))s")
             return
         }
 
-        // 3) Download from GitHub as fallback
-        try await downloadFromGitHub(onProgress: onProgress)
-        let elapsed = Date().timeIntervalSince(startTime)
-        print("✅ Downloaded and loaded \(count) block hashes in \(String(format: "%.1f", elapsed))s")
+        // 4) Download boost file from GitHub if nothing available
+        print("📥 No block hashes available, downloading boost file...")
+        _ = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile(onProgress: nil)
+
+        if let sectionInfo = await CommitmentTreeUpdater.shared.getSectionInfo(type: .blockHashes) {
+            let hashData = try await CommitmentTreeUpdater.shared.extractBlockHashes()
+            try loadFromBoostSection(hashData, startHeight: sectionInfo.start_height, count: sectionInfo.count, onProgress: onProgress)
+            let elapsed = Date().timeIntervalSince(startTime)
+            print("✅ Downloaded and loaded \(count) block hashes in \(String(format: "%.1f", elapsed))s")
+        }
     }
 
-    /// Download block hashes from GitHub Releases (fallback if not bundled/cached)
-    /// First fetches manifest to get checksum, then downloads and verifies
-    private func downloadFromGitHub(onProgress: ((UInt64, UInt64) -> Void)? = nil) async throws {
-        print("📥 Fetching block hashes manifest from GitHub...")
-
-        // 1. Fetch manifest to get checksum and latest height
-        let manifestURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/manifest.json"
-        guard let manifestUrl = URL(string: manifestURL) else {
-            throw BundledHashesError.invalidURL
+    /// Load hashes from boost file section (raw hashes, 32 bytes each)
+    private func loadFromBoostSection(_ data: Data, startHeight: UInt64, count: UInt64, onProgress: ((UInt64, UInt64) -> Void)? = nil) throws {
+        // Validate data size (32 bytes per hash)
+        let expectedSize = Int(count) * 32
+        guard data.count >= expectedSize else {
+            throw BundledHashesError.invalidFormat
         }
 
-        let (manifestData, manifestResponse) = try await URLSession.shared.data(from: manifestUrl)
-        guard let httpResponse = manifestResponse as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw BundledHashesError.downloadFailed
+        print("📦 Block hashes: \(count) hashes from height \(startHeight)")
+
+        // Build hash table
+        var table: [UInt64: Data] = [:]
+        table.reserveCapacity(Int(count))
+
+        let progressInterval = count / 100  // Update progress every 1%
+        var offset = 0
+
+        for i in 0..<count {
+            let height = startHeight + i
+            let hash = data.subdata(in: offset..<(offset + 32))
+            table[height] = hash
+            offset += 32
+
+            // Progress callback
+            if progressInterval > 0 && i % progressInterval == 0 {
+                onProgress?(i, count)
+            }
         }
 
-        // Parse manifest to get checksum
-        guard let manifest = try? JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
-              let blockHashes = manifest["block_hashes"] as? [String: Any],
-              let expectedSHA256 = blockHashes["sha256"] as? String,
-              let endHeight = blockHashes["end_height"] as? Int else {
-            print("⚠️ Could not parse manifest, downloading without checksum verification")
-            try await downloadWithoutChecksum(onProgress: onProgress)
-            return
-        }
+        // Update state
+        self.hashTable = table
+        self.startHeight = startHeight
+        self.endHeight = startHeight + count - 1
+        self.count = count
+        self.isLoaded = true
 
-        print("📥 Manifest shows block hashes to height \(endHeight), checksum: \(expectedSHA256.prefix(16))...")
-
-        // 2. Download from GitHub Releases
-        let urlString = "https://github.com/VictorLux/ZipherX_Boost/releases/download/v\(endHeight)-hashes/block_hashes.bin"
-        guard let url = URL(string: urlString) else {
-            throw BundledHashesError.invalidURL
-        }
-
-        print("📥 Downloading block hashes from: \(urlString)")
-
-        let (data, response) = try await URLSession.shared.data(from: url)
-
-        guard let httpResp = response as? HTTPURLResponse,
-              httpResp.statusCode == 200 else {
-            throw BundledHashesError.downloadFailed
-        }
-
-        // 3. Verify SHA256 checksum BEFORE using
-        print("🔐 Verifying block hashes checksum...")
-        let computedHash = sha256(data: data)
-        guard computedHash.lowercased() == expectedSHA256.lowercased() else {
-            print("🚨 SECURITY: Block hashes checksum mismatch!")
-            print("   Expected: \(expectedSHA256)")
-            print("   Got:      \(computedHash)")
-            throw BundledHashesError.checksumMismatch
-        }
-        print("✅ Block hashes checksum verified")
-
-        try loadFromData(data, onProgress: onProgress)
-
-        // Save to Documents for future use
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let savedURL = documentsURL.appendingPathComponent("block_hashes.bin")
-        try data.write(to: savedURL)
-        print("💾 Saved block hashes to Documents for future use")
+        onProgress?(count, count)
     }
 
-    /// Fallback download without checksum (if manifest parsing fails)
-    private func downloadWithoutChecksum(onProgress: ((UInt64, UInt64) -> Void)? = nil) async throws {
-        let urlString = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/block_hashes.bin"
-        guard let url = URL(string: urlString) else {
-            throw BundledHashesError.invalidURL
-        }
-
-        print("⚠️ Downloading block hashes without checksum verification (fallback)...")
-
-        let (data, response) = try await URLSession.shared.data(from: url)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw BundledHashesError.downloadFailed
-        }
-
-        try loadFromData(data, onProgress: onProgress)
-
-        // Save to Documents for future use
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let savedURL = documentsURL.appendingPathComponent("block_hashes.bin")
-        try data.write(to: savedURL)
-        print("💾 Saved block hashes to Documents for future use")
-    }
-
-    /// Calculate SHA256 hash of data
-    private func sha256(data: Data) -> String {
-        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes { buffer in
-            _ = CC_SHA256(buffer.baseAddress, CC_LONG(data.count), &hash)
-        }
-        return hash.map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// Load hashes from data
-    private func loadFromData(_ data: Data, onProgress: ((UInt64, UInt64) -> Void)? = nil) throws {
+    /// Load hashes from legacy data format (with count + start_height header)
+    private func loadFromLegacyData(_ data: Data, onProgress: ((UInt64, UInt64) -> Void)? = nil) throws {
         guard data.count >= 16 else {
             throw BundledHashesError.invalidFormat
         }
@@ -212,7 +164,7 @@ final class BundledBlockHashes {
             throw BundledHashesError.invalidFormat
         }
 
-        print("📦 Block hashes: \(count) hashes from height \(startHeight)")
+        print("📦 Block hashes (legacy): \(count) hashes from height \(startHeight)")
 
         // Build hash table
         var table: [UInt64: Data] = [:]
@@ -274,11 +226,8 @@ final class BundledBlockHashes {
         return result
     }
 
-    /// Clear loaded hashes (for testing or memory management)
+    /// Clear loaded hashes (for memory management)
     func clear() {
-        loadLock.lock()
-        defer { loadLock.unlock() }
-
         hashTable.removeAll()
         startHeight = 0
         endHeight = 0
@@ -290,21 +239,15 @@ final class BundledBlockHashes {
 // MARK: - Errors
 
 enum BundledHashesError: Error, LocalizedError {
-    case invalidURL
-    case downloadFailed
     case invalidFormat
-    case checksumMismatch
+    case downloadFailed
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL:
-            return "Invalid block hashes URL"
-        case .downloadFailed:
-            return "Failed to download block hashes"
         case .invalidFormat:
             return "Invalid block hashes file format"
-        case .checksumMismatch:
-            return "Block hashes checksum verification failed - file may be corrupted or tampered"
+        case .downloadFailed:
+            return "Failed to download block hashes"
         }
     }
 }

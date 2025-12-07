@@ -28,7 +28,7 @@ enum ZclassicCheckpoints {
 
         // Sapling activation height for Zclassic
         // This is where shielded (z-addr) transactions become available
-        558000: "000000000saplingactivationhashplaceholder0123456789abcdef01234",
+        476969: "0000000048245efbc142c0f0f0f64e8c9dcc7b2938ba544667c803568a2b53d3",
 
         // Recent checkpoints for faster sync
         // Real checkpoint at 2900000 for imported wallets starting around this height
@@ -39,7 +39,7 @@ enum ZclassicCheckpoints {
     ]
 
     /// Sapling activation height on Zclassic mainnet
-    static let saplingActivationHeight: UInt64 = 558000
+    static let saplingActivationHeight: UInt64 = 476969
 
     /// Recent checkpoint for faster initial sync (from bundled tree)
     /// New wallets will start scanning from here instead of Sapling activation

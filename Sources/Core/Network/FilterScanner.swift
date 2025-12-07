@@ -70,8 +70,8 @@ final class FilterScanner {
     private var cmuDataHeight: UInt64 = 0  // Height of the CMU data source
     private var cmuDataCount: UInt64 = 0   // Number of CMUs in the data
 
-    // Notes discovered AFTER bundledTreeHeight that need nullifier recomputation
-    // These notes have position=0 (wrong) because they weren't in bundled tree
+    // Notes discovered AFTER downloadedTreeHeight that need nullifier recomputation
+    // These notes have position=0 (wrong) because they weren't in downloaded tree
     // After PHASE 2, we recompute their nullifiers using correct tree positions
     // Format: (noteId, cmu, diversifier, value, rcm, height)
     private var notesNeedingNullifierFix: [(noteId: Int64, cmu: Data, diversifier: Data, value: UInt64, rcm: Data, height: UInt64)] = []
@@ -164,17 +164,17 @@ final class FilterScanner {
         }
         currentChainHeight = latestHeight
 
-        // DOWNLOAD/UPDATE SHIELDED OUTPUTS FROM GITHUB (if newer version available)
+        // LOAD SHIELDED OUTPUTS FROM BOOST FILE
         await WalletManager.shared.updateDownloadTask("download_outputs", status: .inProgress)
         let bundledOutputs = BundledShieldedOutputs.shared
-        let (downloadSuccess, outputCount, downloadedHeight) = await bundledOutputs.downloadForSync { progress, status in
+        let (loadSuccess, outputCount, loadedHeight) = await bundledOutputs.loadFromBoostFile { progress, status in
             self.onStatusUpdate?("download", status)
             Task { @MainActor in
                 WalletManager.shared.updateDownloadTaskProgress("download_outputs", detail: status, progress: progress)
             }
             self.onProgress?(progress * 0.05, 0, UInt64(latestHeight))
         }
-        await WalletManager.shared.updateDownloadTask("download_outputs", status: .completed, detail: downloadSuccess ? "\(outputCount) outputs" : "Using P2P")
+        await WalletManager.shared.updateDownloadTask("download_outputs", status: .completed, detail: loadSuccess ? "\(outputCount) outputs" : "Using P2P")
 
         // DOWNLOAD/UPDATE BLOCK TIMESTAMPS FROM GITHUB
         await WalletManager.shared.updateDownloadTask("download_timestamps", status: .inProgress)
@@ -200,26 +200,25 @@ final class FilterScanner {
         // Determine start height
         var startHeight: UInt64
 
-        // VUL-018: Use shared constants for bundled tree
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
-        let bundledTreeCMUCount = ZipherXConstants.bundledTreeCMUCount
-        // Use effectiveTreeHeight which may be higher if a newer tree was downloaded from GitHub
+        // VUL-018: Use shared constants - all tree data comes from GitHub
+        // effectiveTreeHeight is the downloaded tree height (0 if not downloaded yet)
         let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
+        let effectiveTreeCMUCount = ZipherXConstants.effectiveTreeCMUCount
 
-        // Track if we're scanning within bundled tree range (notes only, no tree building)
-        var scanWithinBundledRange = false
+        // Track if we're scanning within downloaded tree range (notes only, no tree building)
+        var scanWithinDownloadedRange = false
 
         // If custom start height provided (quick scan), use it
         if let customStart = customStartHeight {
             startHeight = customStart
             if startHeight <= effectiveTreeHeight {
-                scanWithinBundledRange = true
+                scanWithinDownloadedRange = true
             }
         } else {
             // Normal scan - determine start height automatically
             let lastScanned = try database.getLastScannedHeight()
             let treeExists = (try? database.getTreeState()) != nil
-            let bundledTreeAvailable = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") != nil
+            let hasDownloadedTree = ZipherXConstants.hasDownloadedTree
             let isImportedWallet = WalletManager.shared.isImportedWallet
             let customScanHeight = WalletManager.shared.importScanStartHeight
 
@@ -231,27 +230,29 @@ final class FilterScanner {
                 } else {
                     startHeight = ZclassicCheckpoints.saplingActivationHeight
                 }
-                scanWithinBundledRange = true
+                scanWithinDownloadedRange = true
 
-                // DOWNLOAD CMU FILE FROM GITHUB if newer than bundled
-                if let (cmuPath, cmuHeight, cmuCount) = try? await CommitmentTreeUpdater.shared.getCMUFileForImportedWallet(onProgress: { progress, status in
-                    self.onProgress?(progress * 0.1, startHeight, latestHeight)
-                }) {
-                    if let downloadedData = try? Data(contentsOf: cmuPath) {
-                        self.cmuDataForPositionLookup = downloadedData
-                        self.cmuDataHeight = cmuHeight
-                        self.cmuDataCount = cmuCount
-                    }
+                // DOWNLOAD BOOST FILE FROM GITHUB (required for imported wallets)
+                let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile(onProgress: { progress, status in
+                    self.onProgress?(progress * 0.05, startHeight, latestHeight)
+                })
+                // Extract CMUs in legacy format for position lookup
+                if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let cmuData = try? Data(contentsOf: cmuPath) {
+                    self.cmuDataForPositionLookup = cmuData
+                    self.cmuDataHeight = boostHeight
+                    self.cmuDataCount = boostOutputCount
                 }
 
                 // LOAD BLOCK HASHES for fast P2P block fetching
                 if !BundledBlockHashes.shared.isLoaded {
                     try? await BundledBlockHashes.shared.loadBundledHashes { _, _ in }
                 }
-            } else if treeExists || bundledTreeAvailable {
+            } else if treeExists || hasDownloadedTree {
                 startHeight = effectiveTreeHeight + 1
                 isNewWalletInitialSync = true
             } else {
+                // No tree downloaded yet - must download first
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
             }
         }
@@ -301,18 +302,17 @@ final class FilterScanner {
         // Background sync passes heights > effectiveTreeHeight and should APPEND
         // A rescan specifically starts at effectiveTreeHeight + 1 to rebuild from current tree state
         let initialTreeSize = ZipherXFFI.treeSize()
-        let effectiveTreeCMUCount = ZipherXConstants.effectiveTreeCMUCount
         let treeHasProgress = initialTreeSize > effectiveTreeCMUCount
 
         // Only force fresh tree if:
         // 1. Custom height provided AND starting exactly from effective+1 (rescan scenario)
         // 2. AND tree doesn't already have progress (hasn't appended CMUs beyond effective)
-        let needsFreshBundledTree = customStartHeight != nil
+        let needsFreshTree = customStartHeight != nil
             && customStartHeight! == effectiveTreeHeight + 1
             && !treeHasProgress
 
         // Wait for WalletManager to finish loading tree before proceeding
-        if !needsFreshBundledTree {
+        if !needsFreshTree {
             let walletManager = WalletManager.shared
             var waitAttempts = 0
             let maxWaitAttempts = 1200 // 120 seconds max wait
@@ -326,31 +326,20 @@ final class FilterScanner {
         // This prevents race condition where FilterScanner loads again while WalletManager is loading
         let existingTreeSize = ZipherXFFI.treeSize()
 
-        // CRITICAL FIX: For imported wallets scanning within bundled range, we MUST use the bundled tree
-        // because that's what cmuDataForPositionLookup contains for position lookup.
-        // GitHub serialized tree has DIFFERENT CMU positions than bundled CMU file!
-        let needsBundledTreeForPositionLookup = scanWithinBundledRange
-        let requiredTreeSize = needsBundledTreeForPositionLookup ? bundledTreeCMUCount : effectiveTreeCMUCount
+        // For imported wallets scanning within downloaded tree range
+        let needsTreeForPositionLookup = scanWithinDownloadedRange
+        let requiredTreeSize = effectiveTreeCMUCount
 
-        if !needsFreshBundledTree && existingTreeSize > 0 {
+        if !needsFreshTree && existingTreeSize > 0 {
             if existingTreeSize >= requiredTreeSize {
-                if needsBundledTreeForPositionLookup && existingTreeSize > bundledTreeCMUCount {
-                    treeInitialized = false
-                } else {
-                    treeInitialized = true
-                    // Load CMU data for position lookup
-                    if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                       let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo(),
-                       let cachedData = try? Data(contentsOf: cachedPath) {
-                        self.cmuDataForPositionLookup = cachedData
-                        self.cmuDataHeight = cachedInfo.height
-                        self.cmuDataCount = cachedInfo.cmuCount
-                    } else if let bundledCMUsURL = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin"),
-                              let bundledData = try? Data(contentsOf: bundledCMUsURL) {
-                        self.cmuDataForPositionLookup = bundledData
-                        self.cmuDataHeight = ZipherXConstants.bundledTreeHeight
-                        self.cmuDataCount = ZipherXConstants.bundledTreeCMUCount
-                    }
+                treeInitialized = true
+                // Load CMU data for position lookup from GitHub cache
+                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo(),
+                   let cachedData = try? Data(contentsOf: cachedPath) {
+                    self.cmuDataForPositionLookup = cachedData
+                    self.cmuDataHeight = cachedInfo.height
+                    self.cmuDataCount = cachedInfo.cmuCount
                 }
             } else {
                 try? database.clearTreeState()
@@ -359,16 +348,11 @@ final class FilterScanner {
         }
 
         // Initialize from database state
-        if !treeInitialized && !needsFreshBundledTree, let treeData = try? database.getTreeState() {
+        if !treeInitialized && !needsFreshTree, let treeData = try? database.getTreeState() {
             if ZipherXFFI.treeDeserialize(data: treeData) {
                 let treeSize = ZipherXFFI.treeSize()
                 if treeSize >= requiredTreeSize {
-                    if needsBundledTreeForPositionLookup && treeSize > bundledTreeCMUCount {
-                        try? database.clearTreeState()
-                        treeInitialized = false
-                    } else {
-                        treeInitialized = true
-                    }
+                    treeInitialized = true
                 } else {
                     try? database.clearTreeState()
                     treeInitialized = false
@@ -378,64 +362,72 @@ final class FilterScanner {
             }
         }
 
-        // Force load bundled tree for rescans
-        if needsFreshBundledTree {
+        // Force reload tree for rescans
+        if needsFreshTree {
             treeInitialized = false
         }
 
-        // Load CMUs for tree building
+        // Load tree from boost file - MUST download from GitHub
         if !treeInitialized {
-            var cmuDataURL: URL?
-
-            if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+            // Try to extract serialized tree from cached boost file
+            if await CommitmentTreeUpdater.shared.hasCachedBoostFile(),
                let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo() {
-                cmuDataURL = cachedPath
-                self.cmuDataHeight = cachedInfo.height
-                self.cmuDataCount = cachedInfo.cmuCount
-            }
 
-            if cmuDataURL == nil, let bundledPath = Bundle.main.url(forResource: "commitment_tree", withExtension: "bin") {
-                cmuDataURL = bundledPath
-                self.cmuDataHeight = ZipherXConstants.bundledTreeHeight
-                self.cmuDataCount = ZipherXConstants.bundledTreeCMUCount
-            }
+                do {
+                    // Extract serialized tree (fast - just the frontier)
+                    let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                    if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                        let treeSize = ZipherXFFI.treeSize()
+                        print("🌳 Tree deserialized: \(treeSize) commitments from boost file")
+                        treeInitialized = true
+                        self.cmuDataHeight = cachedInfo.height
+                        self.cmuDataCount = cachedInfo.cmuCount
 
-            if let cmuURL = cmuDataURL, let cmuData = try? Data(contentsOf: cmuURL) {
-                self.cmuDataForPositionLookup = cmuData
-                _ = ZipherXFFI.treeInit()
+                        // Also load CMU data for position lookup (needed for nullifier computation)
+                        if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                           let cmuData = try? Data(contentsOf: cmuPath) {
+                            self.cmuDataForPositionLookup = cmuData
+                        }
 
-                guard cmuData.count >= 8 else {
-                    print("❌ Invalid CMUs file")
-                    treeInitialized = false
-                    return
-                }
-
-                let count = cmuData.withUnsafeBytes { ptr -> UInt64 in
-                    ptr.load(as: UInt64.self)
-                }
-
-                let buildStart = Date()
-                cmuData.withUnsafeBytes { ptr in
-                    let basePtr = ptr.baseAddress!.advanced(by: 8)
-                    for i in 0..<Int(count) {
-                        let cmuPtr = basePtr.advanced(by: i * 32)
-                        _ = ZipherXFFI.treeAppendRaw(cmu: cmuPtr.assumingMemoryBound(to: UInt8.self))
+                        if let treeData = ZipherXFFI.treeSerialize() {
+                            try? database.saveTreeState(treeData)
+                        }
                     }
+                } catch {
+                    print("⚠️ Failed to extract serialized tree: \(error)")
+                }
+            }
+
+            // If still not initialized, download boost file from GitHub
+            if !treeInitialized {
+                print("⚠️ No commitment tree available - downloading from GitHub...")
+                let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                    self.onProgress?(progress * 0.2, startHeight, targetHeight)
                 }
 
-                let buildTime = Date().timeIntervalSince(buildStart)
-                let treeSize = ZipherXFFI.treeSize()
-                print("🌳 Tree: \(treeSize) CMUs in \(String(format: "%.1f", buildTime))s")
-                treeInitialized = true
+                // Extract and deserialize tree
+                do {
+                    let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                    if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                        let treeSize = ZipherXFFI.treeSize()
+                        print("🌳 Tree deserialized: \(treeSize) commitments from GitHub boost file")
+                        treeInitialized = true
+                        self.cmuDataHeight = boostHeight
+                        self.cmuDataCount = boostOutputCount
 
-                if let treeData = ZipherXFFI.treeSerialize() {
-                    try? database.saveTreeState(treeData)
-                }
-            } else if let bundledTreeURL = Bundle.main.url(forResource: "sapling_tree", withExtension: "bin"),
-               let bundledData = try? Data(contentsOf: bundledTreeURL) {
-                if ZipherXFFI.treeDeserialize(data: bundledData) {
-                    treeInitialized = true
-                    try? database.saveTreeState(bundledData)
+                        // Load CMU data for position lookup
+                        if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                           let cmuData = try? Data(contentsOf: cmuPath) {
+                            self.cmuDataForPositionLookup = cmuData
+                        }
+
+                        if let treeData = ZipherXFFI.treeSerialize() {
+                            try? database.saveTreeState(treeData)
+                        }
+                    }
+                } catch {
+                    print("❌ Failed to extract tree from boost file: \(error)")
+                    treeInitialized = false
                 }
             }
         }
@@ -471,18 +463,17 @@ final class FilterScanner {
         onProgress?(0.01, startHeight, targetHeight)
 
         // Determine scanning strategy:
-        // - If scanning within bundled tree range: use PARALLEL mode (note discovery only)
-        // - If scanning after bundled tree: use SEQUENTIAL mode (tree building + note discovery)
+        // - If scanning within downloaded tree range: use PARALLEL mode (note discovery only)
+        // - If scanning after downloaded tree: use SEQUENTIAL mode (tree building + note discovery)
         var currentHeight = startHeight
 
         // PHASE 1: If we're scanning within CMU data range, scan those blocks first (batch/fast)
-        // CRITICAL: PHASE 1 must only go up to cmuDataHeight (bundled OR downloaded from GitHub)
+        // CRITICAL: PHASE 1 must only go up to cmuDataHeight (downloaded from GitHub)
         // because that's where we have CMU data for position lookup. Beyond cmuDataHeight, notes
         // MUST be scanned in PHASE 2 sequential mode where positions are computed as CMUs are appended.
-        // Use downloaded CMU height if available, otherwise fall back to bundled height
-        let phase1EndHeight = cmuDataHeight > 0 ? cmuDataHeight : bundledTreeHeight
+        let phase1EndHeight = cmuDataHeight > 0 ? cmuDataHeight : effectiveTreeHeight
 
-        if scanWithinBundledRange && startHeight <= phase1EndHeight {
+        if scanWithinDownloadedRange && startHeight <= phase1EndHeight {
             let parallelEndHeight = min(phase1EndHeight, targetHeight)
             print("⚡ PHASE 1: \(startHeight) → \(parallelEndHeight) (\(parallelEndHeight - startHeight + 1) blocks)")
             let parallelTotalBlocks = parallelEndHeight - startHeight + 1
@@ -509,6 +500,7 @@ final class FilterScanner {
 
                     // Convert to blockDataMap format grouped by height
                     // NOTE: Bundled outputs don't have spend data (nullifiers computed later)
+                    var outputCounter = 0
                     for output in outputs {
                         let height = UInt64(output.height)
                         // ShieldedOutput requires all fields but only cmu, ephemeralKey, encCiphertext are needed for note decryption
@@ -522,11 +514,12 @@ final class FilterScanner {
                             proof: ""  // Not needed for note decryption
                         )
                         // Use dummy txid since bundled outputs are grouped by height, not tx
-                        let txid = "bundled_\(height)_\(output.txIndex)_\(output.outputIndex)"
+                        let txid = "bundled_\(height)_\(outputCounter)"
                         if blockDataMap[height] == nil {
                             blockDataMap[height] = []
                         }
                         blockDataMap[height]!.append((txid, [shieldedOutput], nil))
+                        outputCounter += 1
                     }
                 } else {
                     // PRIORITY 2: Network fetch (P2P or InsightAPI)
@@ -638,11 +631,11 @@ final class FilterScanner {
         // - We did PHASE 1 and there are more blocks after phase1EndHeight
         // - OR no custom start height was provided (normal auto-scan)
         // - OR custom start height is AFTER CMU data height (must use sequential for correct positions)
-        let continueAfterBundledRange = scanWithinBundledRange && currentHeight <= targetHeight
+        let continueAfterBundledRange = scanWithinDownloadedRange && currentHeight <= targetHeight
 
         // Quick scan is ONLY safe when scanning WITHIN CMU data range where positions are known
         // If starting AFTER CMU data, we MUST use sequential mode for correct nullifier computation
-        let isQuickScanOnly = customStartHeight != nil && !scanWithinBundledRange && customStartHeight! <= phase1EndHeight
+        let isQuickScanOnly = customStartHeight != nil && !scanWithinDownloadedRange && customStartHeight! <= phase1EndHeight
 
         // If custom start is AFTER CMU data height, force sequential mode
         let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > phase1EndHeight
@@ -1424,7 +1417,7 @@ final class FilterScanner {
         )
 
         // Step 4: Process decrypted notes
-        let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
         var notesFound = 0
 
         for (idx, maybeNote) in results.enumerated() {
@@ -1604,13 +1597,13 @@ final class FilterScanner {
 
             let txidData = Data(hexString: txid) ?? Data()
 
-            // Try to find real position from bundled CMU data
+            // Try to find real position from downloaded CMU data
             var position: UInt64 = 0
             var needsNullifierFix = false
-            let bundledTreeHeight = ZipherXConstants.bundledTreeHeight
+            let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
-            if let bundledData = cmuDataForPositionLookup {
-                if let realPos = ZipherXFFI.findCMUPosition(cmuData: bundledData, targetCMU: cmu) {
+            if let downloadedData = cmuDataForPositionLookup {
+                if let realPos = ZipherXFFI.findCMUPosition(cmuData: downloadedData, targetCMU: cmu) {
                     position = realPos
                 } else {
                     needsNullifierFix = true
