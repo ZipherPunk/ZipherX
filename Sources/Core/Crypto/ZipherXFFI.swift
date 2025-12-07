@@ -1464,55 +1464,72 @@ enum ZipherXFFI {
         let memoData = memo ?? Data(repeating: 0, count: 512)
         guard memoData.count == 512 else { return nil }
 
-        // Create C-compatible SpendInfo structs
-        var spendInfos: [SpendInfo] = []
-        var witnessBuffers: [[UInt8]] = []
-        var rcmBuffers: [[UInt8]] = []
-        var divBuffers: [[UInt8]] = []
+        // Flatten all spend data into single contiguous arrays for safe FFI
+        var allWitnesses = Data()
+        var allRcms = Data()
+        var allDiversifiers = Data()
+        var witnessOffsets: [Int] = []
+        var witnessLens: [Int] = []
 
         for spend in spends {
-            witnessBuffers.append(Array(spend.witness))
-            rcmBuffers.append(Array(spend.rcm))
-            divBuffers.append(Array(spend.diversifier))
+            witnessOffsets.append(allWitnesses.count)
+            witnessLens.append(spend.witness.count)
+            allWitnesses.append(spend.witness)
+            allRcms.append(spend.rcm)
+            allDiversifiers.append(spend.diversifier)
         }
 
-        // Create SpendInfo structs pointing to our buffers
-        for i in 0..<spends.count {
-            let info = SpendInfo(
-                witness_data: UnsafePointer(witnessBuffers[i]),
-                witness_len: witnessBuffers[i].count,
-                note_value: spends[i].value,
-                note_rcm: UnsafePointer(rcmBuffers[i]),
-                note_diversifier: UnsafePointer(divBuffers[i])
-            )
-            spendInfos.append(info)
-        }
-
-        // Create array of pointers to SpendInfo
-        var spendPtrs: [UnsafePointer<SpendInfo>?] = []
-        for i in 0..<spendInfos.count {
-            spendPtrs.append(withUnsafePointer(to: &spendInfos[i]) { $0 })
-        }
-
+        // Build transaction with all data kept alive in withUnsafeBytes closures
         let success = encryptedSpendingKey.withUnsafeBytes { encSkPtr in
             encryptionKey.withUnsafeBytes { encKeyPtr in
                 toAddress.withUnsafeBytes { toPtr in
                     memoData.withUnsafeBytes { memoPtr in
-                        spendPtrs.withUnsafeBufferPointer { spendsPtr in
-                            zipherx_build_transaction_multi_encrypted(
-                                encSkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                                encryptedSpendingKey.count,
-                                encKeyPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                                toPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                                amount,
-                                memoPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                                spendsPtr.baseAddress,
-                                spends.count,
-                                chainHeight,
-                                &txOutput,
-                                &txLen,
-                                &nullifiersOutput
-                            )
+                        allWitnesses.withUnsafeBytes { witnessPtr in
+                            allRcms.withUnsafeBytes { rcmPtr in
+                                allDiversifiers.withUnsafeBytes { divPtr in
+                                    // Create SpendInfo structs with valid pointers
+                                    var spendInfos: [SpendInfo] = []
+                                    let witnessBase = witnessPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                                    let rcmBase = rcmPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                                    let divBase = divPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+
+                                    for i in 0..<spends.count {
+                                        let info = SpendInfo(
+                                            witness_data: witnessBase.advanced(by: witnessOffsets[i]),
+                                            witness_len: witnessLens[i],
+                                            note_value: spends[i].value,
+                                            note_rcm: rcmBase.advanced(by: i * 32),
+                                            note_diversifier: divBase.advanced(by: i * 11)
+                                        )
+                                        spendInfos.append(info)
+                                    }
+
+                                    // Create array of pointers and call FFI
+                                    return spendInfos.withUnsafeMutableBufferPointer { infoBuf in
+                                        guard let base = infoBuf.baseAddress else { return false }
+                                        var spendPtrs: [UnsafePointer<SpendInfo>?] = []
+                                        for i in 0..<infoBuf.count {
+                                            spendPtrs.append(UnsafePointer(base.advanced(by: i)))
+                                        }
+                                        return spendPtrs.withUnsafeBufferPointer { spendsPtr in
+                                            zipherx_build_transaction_multi_encrypted(
+                                                encSkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                                encryptedSpendingKey.count,
+                                                encKeyPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                                toPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                                amount,
+                                                memoPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                                spendsPtr.baseAddress,
+                                                spends.count,
+                                                chainHeight,
+                                                &txOutput,
+                                                &txLen,
+                                                &nullifiersOutput
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

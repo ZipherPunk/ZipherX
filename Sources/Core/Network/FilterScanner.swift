@@ -945,7 +945,7 @@ final class FilterScanner {
         let time = data.loadUInt32(at: offset)
         offset += 4
 
-        let bits = data.loadUInt32(at: offset)
+        _ = data.loadUInt32(at: offset) // bits - not used
         offset += 4
 
         _ = Data(data[offset..<offset+32]) // nonce - not used
@@ -1446,7 +1446,6 @@ final class FilterScanner {
         )
 
         // Step 4: Process decrypted notes
-        let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
         var notesFound = 0
 
         for (idx, maybeNote) in results.enumerated() {
