@@ -519,14 +519,19 @@ final class NetworkManager: ObservableObject {
         // Count .onion peers actually connected
         let onionConnected = peers.filter { $0.isOnion && $0.isConnectionReady }.count
 
+        // Debug: Log Tor peer status
+        if torCount > 0 || onionConnected > 0 {
+            print("🧅 Tor peers: \(torCount) via SOCKS5, \(onionConnected) .onion connected, \(onionCount) .onion discovered")
+        }
+
         await MainActor.run {
             self.onionPeersCount = onionCount
             self.torConnectedPeersCount = torCount
             self.onionConnectedPeersCount = onionConnected
         }
 
-        if _torIsAvailable {
-            print("🧅 Tor available - \(onionCount) .onion peers in address book")
+        if _torIsAvailable && (torCount == 0 && onionCount == 0) {
+            print("🧅 Tor available - 0 .onion peers in address book")
         }
     }
 
@@ -2118,6 +2123,16 @@ final class NetworkManager: ObservableObject {
         for seed in dnsSeedsZCL {
             let resolved = await resolveDNSSeed(seed)
             addresses.append(contentsOf: resolved)
+        }
+
+        // Add .onion seed nodes if Tor is available
+        let torMode = await TorManager.shared.mode
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torMode == .enabled && torConnected {
+            for onionSeed in ZclassicCheckpoints.onionSeedNodes {
+                addresses.append(PeerAddress(host: onionSeed, port: defaultPort))
+                print("🧅 Added .onion seed: \(onionSeed)")
+            }
         }
 
         return addresses

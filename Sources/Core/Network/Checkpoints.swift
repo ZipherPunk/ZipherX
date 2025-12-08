@@ -124,6 +124,11 @@ enum ZclassicCheckpoints {
         "45.32.165.178",
         "104.238.159.229"
     ]
+
+    /// Hardcoded .onion seed nodes (Tor hidden services)
+    static let onionSeedNodes = [
+        "akf2fbsxuz7nuz5hx7qifsv63lbbfxu3ncpvmmg42uvt65644lbha2ad.onion"
+    ]
 }
 
 // MARK: - Equihash Parameters
