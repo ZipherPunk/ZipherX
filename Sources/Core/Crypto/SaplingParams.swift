@@ -53,11 +53,8 @@ final class SaplingParams {
     var onProgress: ((String, Double) -> Void)?
 
     private init() {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        paramsDirectory = documents.appendingPathComponent("sapling-params")
-
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: paramsDirectory, withIntermediateDirectories: true)
+        // Use AppDirectories for platform-appropriate path (Application Support on macOS, Documents on iOS)
+        paramsDirectory = AppDirectories.saplingParams
     }
 
     // MARK: - Public Methods

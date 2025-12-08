@@ -63,8 +63,7 @@ final class DebugLogger {
     }
 
     private init() {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        logFileURL = documents.appendingPathComponent(logFileName)
+        logFileURL = AppDirectories.logs.appendingPathComponent(logFileName)
 
         dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"

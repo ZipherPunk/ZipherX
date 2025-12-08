@@ -42,6 +42,11 @@ private actor TransactionTrackingState {
         Set(pendingOutgoingTxs.keys)
     }
 
+    /// Clear all pending outgoing transactions (called when broadcast fails)
+    func clearAllOutgoing() {
+        pendingOutgoingTxs.removeAll()
+    }
+
     // MARK: - Incoming Mempool Notification Tracking
 
     func checkAndMarkNotified(txid: String) -> Bool {
@@ -1160,13 +1165,24 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Clear pending broadcast state (called when tx is confirmed/mined)
+    /// Clear pending broadcast state (called when tx is confirmed/mined OR when broadcast fails)
     @MainActor
     func clearPendingBroadcast() {
         pendingBroadcastTxid = nil
         pendingBroadcastAmount = 0
         isMempoolVerified = false
-        print("🧹 Pending broadcast cleared")
+        // Also clear mempoolOutgoing so "awaiting confirmation" message disappears
+        mempoolOutgoing = 0
+        mempoolOutgoingTxCount = 0
+        // Clear the sync-accessible pending set
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.removeAll()
+        pendingOutgoingLock.unlock()
+        // Clear the actor state in background
+        Task {
+            await txTrackingState.clearAllOutgoing()
+        }
+        print("🧹 Pending broadcast cleared (all pending state reset)")
     }
 
     /// Called after successfully broadcasting a transaction
@@ -2245,8 +2261,10 @@ final class NetworkManager: ObservableObject {
 
                 onProgress?("verify", "Verifying mempool acceptance...", 0.5)
 
-                // Check mempool - just 3 quick attempts
-                for attempt in 1...3 {
+                // Check mempool - 5 attempts with 1 second between each (5 seconds total)
+                // This gives time for transaction to propagate and be validated by the network
+                for attempt in 1...5 {
+                    onProgress?("verify", "Verifying mempool (attempt \(attempt)/5)...", 0.5 + Double(attempt) * 0.08)
                     if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
                         print("✅ Transaction VERIFIED in mempool: \(txId)")
                         onProgress?("verify", "In mempool - awaiting miners", 1.0)
@@ -2257,19 +2275,22 @@ final class NetworkManager: ObservableObject {
                         }
                         return // Exit immediately!
                     }
-                    if attempt < 3 {
-                        try await Task.sleep(nanoseconds: 500_000_000) // 500ms between checks
+                    print("⏳ Mempool check attempt \(attempt)/5: not yet visible")
+                    if attempt < 5 {
+                        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second between checks
                     }
                 }
+                print("❌ Transaction NOT found in mempool after 5 attempts")
             }
 
             // The mempool verification task will set isVerified() and return
             // The broadcast tasks will complete (success or fail)
             // We just need to wait for all tasks to finish, but with a timeout
 
-            // Add a timeout task that cancels everything after 10 seconds
+            // Add a timeout task that cancels everything after 15 seconds
+            // (5 second broadcast + 5 second mempool verification + buffer)
             group.addTask {
-                try await Task.sleep(nanoseconds: 10_000_000_000) // 10 second max
+                try await Task.sleep(nanoseconds: 15_000_000_000) // 15 second max
                 print("⏱️ Broadcast timeout reached")
             }
 
@@ -2327,9 +2348,19 @@ final class NetworkManager: ObservableObject {
         print("📡 Transaction broadcast to \(successCount)/\(peerCount) peers: \(txId)")
 
         if !verified {
-            // P2P broadcast succeeded, tx is propagating even if mempool check timed out
-            print("⚠️ Mempool not yet visible (tx is propagating): \(txId)")
-            onProgress?("verify", "Propagating to miners...", 1.0)
+            // CRITICAL FIX: Mempool verification failed - the transaction was likely REJECTED!
+            // P2P peers may "accept" into their local mempool but then reject during validation.
+            // If we can't see it in the explorer mempool, it's NOT a valid transaction.
+            print("❌ BROADCAST FAILED: Transaction not visible in mempool after 3 attempts")
+            print("❌ The transaction was likely rejected by the network (invalid proof)")
+            onProgress?("error", "Transaction rejected by network", 0.0)
+
+            // Clear any pending broadcast state since the tx is invalid
+            await MainActor.run {
+                self.clearPendingBroadcast()
+            }
+
+            throw NetworkError.broadcastFailed
         }
 
         return txId
@@ -2813,7 +2844,8 @@ final class NetworkManager: ObservableObject {
     /// Get multiple blocks' data for P2P scanning
     /// Distributes block ranges across peers - each peer fetches its range SEQUENTIALLY
     /// All peers work in PARALLEL for maximum throughput
-    func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+    /// Returns: [(height, blockHash, timestamp, txData)]
+    func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
         // Ensure at least some peers are connected before checking
         // This prevents race condition where peers are reconnecting
         var availablePeers = peers.filter { $0.isConnectionReady }
@@ -2866,8 +2898,8 @@ final class NetworkManager: ObservableObject {
         // Peer 0: [height, height + blocksPerPeer)
         // Peer 1: [height + blocksPerPeer, height + 2*blocksPerPeer)
         // etc.
-        let results = await withTaskGroup(of: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
-            var collected: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+        let results = await withTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
+            var collected: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
             for (peerIndex, peer) in availablePeers.enumerated() {
                 let rangeStart = height + UInt64(peerIndex * blocksPerPeer)
@@ -2910,7 +2942,8 @@ final class NetworkManager: ObservableObject {
     /// Fetch a batch of blocks from a single peer using HeaderStore or BundledBlockHashes
     /// Uses sequential getdata calls (batch getdata had parsing issues)
     /// PRIORITY: 1) HeaderStore (synced headers), 2) BundledBlockHashes (for historical scan)
-    private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
+    /// Returns: [(height, blockHash, timestamp, txData)]
+    private func fetchBlockBatchP2P(peer: Peer, startHeight: UInt64, count: Int) async -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? {
         // Get block hashes - try HeaderStore first, then BundledBlockHashes
         var blockHashes: [(UInt64, Data)] = []
         var headerStoreCount = 0
@@ -2970,10 +3003,11 @@ final class NetworkManager: ObservableObject {
             print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
         }
 
-        var results: [(UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+        var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
         for (blockHeight, compactBlock) in blocks {
             let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
+            let blockTimestamp = compactBlock.time  // Block timestamp from P2P header
             var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
 
             for tx in compactBlock.transactions {
@@ -3016,14 +3050,15 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
-            results.append((blockHeight, finalBlockHash, txDataList))
+            results.append((blockHeight, finalBlockHash, blockTimestamp, txDataList))
         }
 
         return results
     }
 
     /// Fetch a single block from P2P peers with fallback to InsightAPI
-    private func fetchSingleBlockP2P(height: UInt64, peers: [Peer]) async -> (UInt64, String, [(String, [ShieldedOutput], [ShieldedSpend]?)])? {
+    /// Returns: (height, blockHash, timestamp, txData)
+    private func fetchSingleBlockP2P(height: UInt64, peers: [Peer]) async -> (UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])? {
         var block: CompactBlock?
         var blockHash: Data?
 
@@ -3064,7 +3099,7 @@ final class NetworkManager: ObservableObject {
                         txDataList.append((txid, outputs, spends))
                     }
                 }
-                return (height, hashFromAPI, txDataList)
+                return (height, hashFromAPI, UInt32(insightBlock.time), txDataList)
             } catch {
                 return nil
             }
@@ -3116,7 +3151,7 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        return (height, finalBlockHash, txDataList)
+        return (height, finalBlockHash, block.time, txDataList)
     }
 
     // MARK: - Peer Rotation

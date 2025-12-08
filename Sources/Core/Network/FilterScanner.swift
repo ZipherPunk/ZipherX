@@ -571,8 +571,10 @@ final class FilterScanner {
                         // Try P2P batch fetch first
                         if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected {
                             let results = try await networkManager.getBlocksDataP2P(from: currentHeight, count: thisBatchSize)
-                            for (height, _, txData) in results {
+                            for (height, _, timestamp, txData) in results {
                                 blockDataMap[height] = txData
+                                // Cache real block timestamps for transaction history
+                                BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: timestamp)
                             }
                             FilterScanner.p2pBlockFetchingWorks = true
                         } else {
@@ -635,6 +637,36 @@ final class FilterScanner {
             // This computes all witnesses in ~78 seconds using all CPU cores
             if let bundledData = cmuDataForPositionLookup {
                 await computeWitnessesForBundledNotesBatch(bundledData: bundledData)
+
+                // CRITICAL: After PHASE 1.5, load the computed witnesses into FFI global tree
+                // so they get auto-updated during PHASE 2 CMU appends.
+                // This ensures all notes end up with the SAME anchor (enabling INSTANT mode).
+                do {
+                    guard let account = try database.getAccount(index: 0) else { throw ScanError.databaseError }
+                    let phase1Notes = try database.getAllUnspentNotes(accountId: account.id)
+                    var loadedCount = 0
+                    for note in phase1Notes {
+                        // Only load valid witnesses (1028 bytes, not all zeros)
+                        if note.witness.count >= 1028 && !note.witness.allSatisfy({ $0 == 0 }) {
+                            let witnessIndex = note.witness.withUnsafeBytes { ptr in
+                                ZipherXFFI.treeLoadWitness(
+                                    witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                    witnessLen: note.witness.count
+                                )
+                            }
+                            if witnessIndex != UInt64.max {
+                                // Track for later update at end of PHASE 2
+                                existingWitnessIndices.append((noteId: note.id, witnessIndex: witnessIndex))
+                                loadedCount += 1
+                            }
+                        }
+                    }
+                    if loadedCount > 0 {
+                        print("🔧 Loaded \(loadedCount) PHASE 1 witnesses into FFI for PHASE 2 updates")
+                    }
+                } catch {
+                    debugLog(.error, "Failed to load PHASE 1.5 witnesses into FFI: \(error)")
+                }
             }
 
             // PHASE 1.6: SPEND DETECTION PASS
@@ -2271,8 +2303,10 @@ final class FilterScanner {
 
                 var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
                 var hasAnyShieldedData = false
-                for (h, _, txData) in results {
+                for (h, _, timestamp, txData) in results {
                     blockData.append((h, txData))
+                    // Cache real block timestamps for transaction history
+                    BlockTimestampManager.shared.cacheTimestamp(height: h, timestamp: timestamp)
                     // Check if any transaction has actual shielded data
                     for (_, outputs, spends) in txData {
                         if !outputs.isEmpty || spends?.isEmpty == false {
@@ -2381,6 +2415,10 @@ final class FilterScanner {
 
                 if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
                     try database.updateNoteWitness(noteId: note.id, witness: result.witness)
+                    // Extract anchor from witness and save it - enables INSTANT mode!
+                    if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                        try database.updateNoteAnchor(noteId: note.id, anchor: anchor)
+                    }
                 }
 
                 let progress = 0.1 + 0.85 * (Double(index + 1) / Double(notesNeedingWitness.count))
@@ -2442,12 +2480,19 @@ final class FilterScanner {
             let elapsed = Date().timeIntervalSince(startTime)
             reportPhase15Progress(0.9, current: targetCMUs.count, total: targetCMUs.count)
 
-            // Update database with computed witnesses
+            // Update database with computed witnesses AND anchors
+            // CRITICAL: treeCreateWitnessesBatch builds its OWN tree, not the global COMMITMENT_TREE.
+            // The anchor must be extracted FROM the witness using witnessGetRoot().
+            // This ensures INSTANT mode works - the stored anchor matches the witness.
             var successCount = 0
             for (index, result) in results.enumerated() {
                 guard let noteId = noteIdMap[index] else { continue }
                 if let (_, witness) = result {
                     try database.updateNoteWitness(noteId: noteId, witness: witness)
+                    // Extract anchor from witness and save it - enables INSTANT mode!
+                    if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                        try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                    }
                     successCount += 1
                 }
             }

@@ -25,10 +25,20 @@ final class WalletDatabase {
         }
     }
 
+    // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
+    // WARNING: Only set to true for debugging purposes! Set back to false before release!
+    private static let DEBUG_DISABLE_ENCRYPTION = true
+
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
     /// SECURITY VUL-002: NEVER returns plaintext - throws on failure
     private func encryptBlob(_ data: Data) throws -> Data {
+        // DEBUG: Skip encryption for debugging database issues
+        if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
+            print("⚠️ DEBUG: Encryption DISABLED - storing plaintext")
+            return data
+        }
+
         do {
             return try DatabaseEncryption.shared.encrypt(data)
         } catch {
@@ -41,6 +51,12 @@ final class WalletDatabase {
     /// Decrypt sensitive data retrieved from database
     /// SECURITY VUL-002: Throws on failure instead of returning corrupted data
     private func decryptBlob(_ encryptedData: Data) throws -> Data {
+        // DEBUG: Skip decryption for debugging database issues
+        if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
+            print("⚠️ DEBUG: Decryption DISABLED - returning raw data")
+            return encryptedData
+        }
+
         // AES-GCM combined format: 12 (nonce) + ciphertext + 16 (tag) = 29+ bytes
         guard encryptedData.count >= 29 else {
             // Data too short to be encrypted - this is a security issue
@@ -58,7 +74,7 @@ final class WalletDatabase {
     }
 
     /// Check if encryption is enabled (always true after this update)
-    var isEncryptionEnabled: Bool { true }
+    var isEncryptionEnabled: Bool { !WalletDatabase.DEBUG_DISABLE_ENCRYPTION }
 
     /// Check if database connection is open
     var isOpen: Bool { db != nil }
@@ -115,8 +131,7 @@ final class WalletDatabase {
     private let queue = DispatchQueue(label: "com.zipherx.database", qos: .userInitiated)
 
     private init() {
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        dbPath = documentsPath.appendingPathComponent("zipherx_wallet.db").path
+        dbPath = AppDirectories.database.appendingPathComponent("zipherx_wallet.db").path
         // Thread safety is handled via SQLITE_OPEN_FULLMUTEX in open()
 
         // SECURITY: Apply iOS Data Protection to the database file

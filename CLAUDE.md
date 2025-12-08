@@ -3777,6 +3777,109 @@ if maxNoteHeight > cachedBoostHeight {
 
 ---
 
+### 69. UI Improvements: Centered ZipherX Title + Rotating Zipherpunk Logo (December 8, 2025)
+
+**Features**:
+1. **Centered ZipherX Title** - Title now centered in menu bar with increased font size (22pt)
+2. **3D Rotating Zipherpunk Logo** - Replaces the old Apple icon, continuously rotates with 3D Y-axis effect
+3. **Variable Rotation Speed** - Logo spins faster (3x) during:
+   - Syncing operations
+   - Incoming/outgoing transactions in mempool
+   - Returns to normal speed when transaction confirmed
+4. **ZipherX Title on Sync Page** - Shows "ZipherX" header with rotating logo during initial sync
+
+**Implementation**:
+- `System7MenuBar` - Centered title with rotating logo using `rotation3DEffect(.degrees(logoRotation), axis: (x: 0, y: 1, z: 0), perspective: 0.5)`
+- `CypherpunkSyncView` - Added ZipherX header with logo, faster rotation during sync (6°/tick)
+- Timer-based animation: 30ms refresh rate for smooth rotation
+
+**Files Modified**:
+- `Sources/UI/Components/System7Components.swift` - System7MenuBar, CypherpunkSyncView
+- `Assets.xcassets/ZipherpunkLogo.imageset/` - Added Zipherpunk logo (1024x1024 PNG)
+
+---
+
+### 70. Instant Transaction Build/Send with Block Height Verification (December 8, 2025)
+
+**Feature**: Pre-build transactions in background to enable instant sending after FaceID authentication.
+
+**Problem**: Transaction building (zk-SNARK proof generation) takes 30-60 seconds, making sends feel slow after FaceID approval.
+
+**Solution: Pre-Build Architecture**
+
+1. **Background Preparation**: When user enters valid recipient + amount, transaction is pre-built in background
+2. **Block Height Recording**: Chain height is captured at preparation time
+3. **FaceID Authentication**: User authenticates with Face ID / Touch ID
+4. **Height Verification**: After FaceID, check if block height changed:
+   - **Same height**: Broadcast immediately (INSTANT!)
+   - **Different height**: Still try broadcast (network rejects if anchor invalid) → auto-fallback to rebuild
+
+**Data Flow**:
+```
+User enters recipient/amount
+         ↓
+[Background] prepareTransaction()
+  → Get chain height (e.g., 2935500)
+  → Build zk-SNARK proof (30-60s)
+  → Store PreparedTransaction
+         ↓
+[UI shows] "Transaction ready - instant send enabled" ⚡
+         ↓
+User clicks Send → FaceID → Success
+         ↓
+[Instant] performInstantSend()
+  → Check current height (2935500 vs 2935500)
+  → If same: broadcast immediately
+  → If changed: try broadcast, fallback to rebuild
+```
+
+**PreparedTransaction Structure**:
+```swift
+struct PreparedTransaction {
+    let rawTx: Data              // Built transaction bytes
+    let spentNullifier: Data     // For marking note spent
+    let toAddress: String        // Recipient z-address
+    let amount: UInt64           // Amount in zatoshis
+    let memo: String?            // Optional encrypted memo
+    let preparedAtHeight: UInt64 // Chain height at preparation
+    let preparedAt: Date         // Timestamp (2-minute validity)
+}
+```
+
+**UI Indicators** (in SendView):
+- 🔄 "Preparing transaction..." - Building in progress
+- ⚡ "Transaction ready - instant send enabled" - Ready for instant send
+- "Height verified: 2935500" - After FaceID, confirms height matches
+- "Height changed: 2935499→2935500" - Warning if height changed (still attempts broadcast)
+
+**Files Modified**:
+- `Sources/Features/Send/SendView.swift` - PreparedTransaction struct, instant send flow, UI indicators
+
+---
+
+### 71. DEBUG_DISABLE_ENCRYPTION Flag for Development (December 8, 2025)
+
+**Feature**: Debug flag to temporarily disable database field-level encryption for debugging.
+
+**Usage**:
+```swift
+// In WalletDatabase.swift
+private static let DEBUG_DISABLE_ENCRYPTION = true  // Set to true for debugging
+```
+
+**When Enabled**:
+- `encryptBlob()` returns raw data without encryption
+- `decryptBlob()` returns raw data without decryption
+- Prints "⚠️ DEBUG: Encryption DISABLED" warning
+- `isEncryptionEnabled` property returns `false`
+
+**WARNING**: This flag should ONLY be set to `true` for debugging. Set back to `false` before any release!
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - DEBUG_DISABLE_ENCRYPTION flag
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

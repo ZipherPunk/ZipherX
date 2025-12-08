@@ -39,14 +39,24 @@ targets:
       properties:
         CFBundleDisplayName: ZipherX
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "1"
+        CFBundleVersion: "2"
         UILaunchScreen:
           UIColorName: LaunchScreenColor
         NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
+        NSCameraUsageDescription: ZipherX uses the camera to scan QR codes for receiving payments.
         UIBackgroundModes:
           - fetch
         ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx

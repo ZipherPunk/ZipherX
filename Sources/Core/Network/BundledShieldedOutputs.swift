@@ -385,9 +385,9 @@ final class BundledShieldedOutputs {
 
     /// Get available disk space in bytes
     static func getAvailableDiskSpace() -> Int64 {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let appDataURL = AppDirectories.appData
         do {
-            let values = try documentsURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            let values = try appDataURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             if let capacity = values.volumeAvailableCapacityForImportantUsage {
                 return capacity
             }

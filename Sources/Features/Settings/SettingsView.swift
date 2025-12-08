@@ -189,6 +189,9 @@ struct SettingsView: View {
                 // Export section
                 exportSection
 
+                // Repair Database button (standalone)
+                repairDatabaseSection
+
                 /* DISABLED: Debug logging section - hide for now
                 // Debug section
                 debugLoggingSection
@@ -295,13 +298,13 @@ struct SettingsView: View {
         } message: {
             Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
         }
-        .alert("Repair Notes (Fix Nullifiers)", isPresented: $showRepairNotesWarning) {
+        .alert("Repair Database", isPresented: $showRepairNotesWarning) {
             Button("Cancel", role: .cancel) {}
             Button("Repair", role: .destructive) {
                 startRepairNotes()
             }
         } message: {
-            Text("This fixes incorrect balance by recalculating nullifiers for notes received after the bundled tree.\n\nUse this if:\n• Balance shows wrong amount\n• Spent notes still show as unspent\n• Notes discovered during quick scan have wrong nullifiers\n\nThis deletes and re-scans notes after height \(ZipherXConstants.bundledTreeHeight).\n\nDo you want to continue?")
+            Text("This repairs database corruption by:\n\n• Clearing invalid transaction history\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Re-scanning from boost file height\n\nUse this if:\n• Balance shows wrong amount\n• Sent transactions show as failed\n• Tree root doesn't match blockchain\n\nThis will take 5-15 minutes.\n\nDo you want to continue?")
         }
         .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
             Button("Cancel - Keep Wallet", role: .cancel) {}
@@ -1362,6 +1365,54 @@ Both binaries must be installed to /usr/local/bin:
         }
     }
 
+    // MARK: - Repair Database Section (Standalone)
+
+    private var repairDatabaseSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.system(size: 12))
+                Text("Database Repair")
+                    .font(theme.titleFont)
+                Spacer()
+            }
+            .foregroundColor(theme.textPrimary)
+
+            // Info box
+            Text("Use this to fix corrupted database, wrong balance, or failed transactions that show as successful.")
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Repair Database button - PURPLE
+            Button(action: {
+                showRepairNotesWarning = true
+            }) {
+                HStack {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .font(.system(size: 12))
+                    Text("Repair Database")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.purple)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.purple.opacity(0.8), lineWidth: 2)
+                )
+            }
+        }
+        .padding()
+        .background(theme.surfaceColor)
+        .overlay(
+            Rectangle()
+                .stroke(theme.textSecondary.opacity(0.3), lineWidth: 1)
+        )
+    }
+
     // MARK: - Rescan Section
 
     private var rescanSection: some View {
@@ -1442,14 +1493,14 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
-            // Repair Notes button - PURPLE (fix nullifier issues)
+            // Repair Database button - PURPLE (fix nullifier issues and tree corruption)
             Button(action: {
                 showRepairNotesWarning = true
             }) {
                 HStack {
                     Image(systemName: "wrench.and.screwdriver")
                         .font(.system(size: 12))
-                    Text("Repair Notes (fix balance)")
+                    Text("Repair Database")
                         .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)

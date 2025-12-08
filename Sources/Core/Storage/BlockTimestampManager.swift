@@ -31,10 +31,9 @@ final class BlockTimestampManager {
     /// Download state
     private var isDownloading = false
 
-    /// Path to cached file in Documents directory
+    /// Path to cached file in app data directory
     private var cacheFilePath: URL {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return documentsURL.appendingPathComponent(Self.CACHE_FILENAME)
+        return AppDirectories.appData.appendingPathComponent(Self.CACHE_FILENAME)
     }
 
     private init() {

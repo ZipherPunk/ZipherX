@@ -154,6 +154,17 @@ size_t zipherx_tree_create_witnesses_parallel(
     uint8_t *witnesses_out
 );
 
+// Extract the Merkle root (anchor) from a serialized witness
+// witness_data: serialized witness (1028 bytes from treeCreateWitnessesBatch)
+// witness_len: length of witness data
+// root_out: 32-byte output buffer for the root
+// Returns: true if successful
+bool zipherx_witness_get_root(
+    const uint8_t *witness_data,
+    size_t witness_len,
+    uint8_t *root_out
+);
+
 // Compute nullifier for a note
 bool zipherx_compute_nullifier(
     const uint8_t *spending_key,

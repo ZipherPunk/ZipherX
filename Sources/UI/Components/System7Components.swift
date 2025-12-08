@@ -135,60 +135,83 @@ struct System7Window<Content: View>: View {
 // MARK: - Menu Bar
 struct System7MenuBar: View {
     @EnvironmentObject var themeManager: ThemeManager
+    @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var networkManager: NetworkManager
     @State private var showQuote = false
     @State private var currentQuote: (quote: String, author: String) = ("", "")
-    @State private var appleGlow: Bool = false
+    @State private var logoRotation: Double = 0
+    @State private var logoRotationSpeed: Double = 1.0  // Normal speed
 
     private var theme: AppTheme { themeManager.currentTheme }
 
+    // Logo rotation speed: 1.0 = normal, 3.0 = fast (during tx/sync)
+    private var currentRotationSpeed: Double {
+        // Check if syncing
+        if walletManager.isSyncing {
+            return 3.0  // Fast rotation during sync
+        }
+        // Check for pending transactions
+        if networkManager.mempoolOutgoing > 0 || networkManager.justDetectedIncomingMempool != nil {
+            return 3.0  // Fast rotation during pending transaction
+        }
+        return 1.0  // Normal speed
+    }
+
+    // Timer for logo rotation
+    private let rotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
+
     var body: some View {
         HStack {
-            // Apple menu - tap for privacy quote
-            // Larger tap area with proper safe area padding
-            Button(action: {
-                currentQuote = PrivacyQuotes.randomQuote()
-                showQuote = true
-            }) {
-                ZStack {
-                    // Glow effect (always use accent color for glow)
-                    if appleGlow {
-                        Image(systemName: "apple.logo")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(theme.primaryColor)
-                            .blur(radius: 4)
-                            .opacity(0.6)
-                    }
-
-                    // Main icon
-                    Image(systemName: "apple.logo")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(appleGlow ? theme.primaryColor : theme.primaryColor.opacity(0.7))
-                        .shadow(color: theme.primaryColor.opacity(appleGlow ? 0.8 : 0.3), radius: appleGlow ? 6 : 2)
-                }
-                .frame(width: 44, height: 44) // Larger tap target
-                .contentShape(Rectangle())
-            }
-            .padding(.leading, 8) // Extra left padding for edge accessibility
-
-            Text("File")
-                .font(theme.titleFont)
-                .foregroundColor(theme.textPrimary)
-                .padding(.horizontal, 8)
-
-            Text("Edit")
-                .font(theme.titleFont)
-                .foregroundColor(theme.textPrimary)
-                .padding(.horizontal, 8)
-
             Spacer()
 
-            // Network status
-            Image(systemName: "network")
-                .font(.system(size: 12))
-                .foregroundColor(theme.textPrimary)
-                .padding(.horizontal, 8)
+            // Centered ZipherX title with rotating logo
+            HStack(spacing: 8) {
+                // ZipherX title - centered and larger
+                Text("ZipherX")
+                    .font(.system(size: 22, weight: .bold, design: .default))
+                    .foregroundColor(theme.textPrimary)
+                    .shadow(color: theme.primaryColor.opacity(0.3), radius: 2)
+
+                // Rotating Zipherpunk logo with 3D effect - tap for privacy quote
+                Button(action: {
+                    currentQuote = PrivacyQuotes.randomQuote()
+                    showQuote = true
+                }) {
+                    ZStack {
+                        // Glow effect behind logo
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [theme.primaryColor.opacity(0.4), Color.clear],
+                                    center: .center,
+                                    startRadius: 5,
+                                    endRadius: 20
+                                )
+                            )
+                            .frame(width: 40, height: 40)
+                            .blur(radius: 3)
+
+                        // Logo with 3D rotation
+                        Image("ZipherpunkLogo")
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 28, height: 28)
+                            .rotation3DEffect(
+                                .degrees(logoRotation),
+                                axis: (x: 0, y: 1, z: 0),  // Y-axis rotation for 3D spin
+                                perspective: 0.5
+                            )
+                            .shadow(color: theme.primaryColor.opacity(0.5), radius: 3)
+                    }
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+
+            Spacer()
         }
-        .frame(height: 28) // Slightly taller for better tap area
+        .frame(height: 36)
         .background(theme.surfaceColor)
         .overlay(
             Rectangle()
@@ -196,15 +219,18 @@ struct System7MenuBar: View {
                 .foregroundColor(theme.borderColor),
             alignment: .bottom
         )
-        .alert("Privacy Quote", isPresented: $showQuote) {
+        .alert("Cypherpunk Wisdom", isPresented: $showQuote) {
             Button("OK", role: .cancel) {}
         } message: {
             Text("\"\(currentQuote.quote)\"\n\n- \(currentQuote.author)")
         }
-        .onAppear {
-            // Start pulsing animation
-            withAnimation(Animation.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
-                appleGlow = true
+        .onReceive(rotationTimer) { _ in
+            // Continuously rotate the logo
+            withAnimation(.linear(duration: 0.03)) {
+                logoRotation += currentRotationSpeed * 2.0  // 2 degrees per tick at normal speed
+                if logoRotation >= 360 {
+                    logoRotation -= 360
+                }
             }
         }
     }
@@ -907,6 +933,10 @@ struct CypherpunkSyncView: View {
     @State private var showCompletionAnimation: Bool = false
     @State private var showStopConfirmation: Bool = false
     @State private var showDeleteConfirmation: Bool = false
+    @State private var logoRotation: Double = 0  // Logo rotation for syncing view
+
+    // Timer for logo rotation (fast during sync)
+    private let logoRotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
 
     // MARK: - ZClassic History Story (shown during sync)
     // A cypherpunk tale of freedom, forks, and fighting the 20% tax
@@ -1023,6 +1053,13 @@ struct CypherpunkSyncView: View {
                 }
             }
         }
+        .onReceive(logoRotationTimer) { _ in
+            // Fast rotation during sync (6 degrees per tick = ~200 degrees/second)
+            logoRotation += 6.0
+            if logoRotation >= 360 {
+                logoRotation -= 360
+            }
+        }
     }
 
     // MARK: - Platform-specific font sizes
@@ -1076,6 +1113,41 @@ struct CypherpunkSyncView: View {
     // MARK: - Syncing View
     private var syncingView: some View {
         VStack(spacing: 16) {
+            // ZipherX header with rotating logo at top
+            HStack(spacing: 10) {
+                Text("ZipherX")
+                    .font(.system(size: titleSize, weight: .bold, design: .default))
+                    .foregroundColor(NeonColors.primary)
+                    .shadow(color: NeonColors.primary.opacity(0.5), radius: 4)
+
+                // Rotating Zipherpunk logo (fast during sync)
+                ZStack {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [NeonColors.primary.opacity(0.4), Color.clear],
+                                center: .center,
+                                startRadius: 5,
+                                endRadius: 25
+                            )
+                        )
+                        .frame(width: 50, height: 50)
+                        .blur(radius: 4)
+
+                    Image("ZipherpunkLogo")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 36, height: 36)
+                        .rotation3DEffect(
+                            .degrees(logoRotation),
+                            axis: (x: 0, y: 1, z: 0),
+                            perspective: 0.5
+                        )
+                        .shadow(color: NeonColors.primary.opacity(0.6), radius: 4)
+                }
+            }
+            .padding(.top, 40)
+
             Spacer()
 
             // Matrix-style title with glitch effect

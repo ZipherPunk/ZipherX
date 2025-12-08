@@ -81,9 +81,8 @@ final class BundledBlockHashes {
             return
         }
 
-        // 3) Try Documents cache (previously downloaded legacy format)
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let cachedURL = documentsURL.appendingPathComponent("block_hashes.bin")
+        // 3) Try app data cache (previously downloaded legacy format)
+        let cachedURL = AppDirectories.blockHashes
         if FileManager.default.fileExists(atPath: cachedURL.path) {
             let data = try Data(contentsOf: cachedURL)
             try loadFromLegacyData(data, onProgress: onProgress)

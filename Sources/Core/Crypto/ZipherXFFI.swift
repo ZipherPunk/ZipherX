@@ -1128,6 +1128,36 @@ enum ZipherXFFI {
         return results
     }
 
+    /// Extract the Merkle root (anchor) from a serialized witness
+    /// The anchor is the root of the Merkle tree that the witness is proving membership in.
+    /// For multi-input transactions, all witnesses MUST have the SAME anchor.
+    ///
+    /// - Parameter witness: Serialized witness data (1028 bytes)
+    /// - Returns: 32-byte anchor (Merkle root) or nil if extraction fails
+    static func witnessGetRoot(_ witness: Data) -> Data? {
+        guard witness.count >= 100 else {
+            print("❌ witnessGetRoot: witness too short (\(witness.count) bytes)")
+            return nil
+        }
+
+        var root = [UInt8](repeating: 0, count: 32)
+
+        let success = witness.withUnsafeBytes { witnessPtr in
+            zipherx_witness_get_root(
+                witnessPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                witness.count,
+                &root
+            )
+        }
+
+        if success {
+            return Data(root)
+        } else {
+            print("❌ witnessGetRoot: failed to extract root")
+            return nil
+        }
+    }
+
     // MARK: - OVK Output Recovery (Transaction History)
 
     /// Derive outgoing viewing key from spending key

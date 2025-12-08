@@ -24,6 +24,23 @@ enum SendProgressStatus: Equatable {
     case failed(String)
 }
 
+/// Pre-built transaction data for instant send
+struct PreparedTransaction {
+    let rawTx: Data
+    let spentNullifier: Data
+    let toAddress: String
+    let amount: UInt64
+    let memo: String?
+    let preparedAtHeight: UInt64
+    let preparedAt: Date
+
+    /// Check if transaction is still valid (not stale)
+    /// Transaction is valid if prepared within last 2 minutes
+    var isValid: Bool {
+        Date().timeIntervalSince(preparedAt) < 120.0
+    }
+}
+
 /// Send View - Send shielded ZCL transactions (z-to-z only!)
 /// Themed design
 struct SendView: View {
@@ -63,6 +80,12 @@ struct SendView: View {
     @State private var showSettlementCelebration = false
     @State private var settlementTime: TimeInterval = 0
 
+    // INSTANT SEND: Pre-built transaction state
+    @State private var preparedTransaction: PreparedTransaction? = nil
+    @State private var isPreparingTransaction = false
+    @State private var preparationTask: Task<Void, Never>? = nil
+    @State private var preparationProgress: String = ""
+
     var body: some View {
         ZStack {
             ScrollView {
@@ -89,6 +112,27 @@ struct SendView: View {
                                 .foregroundColor(theme.warningColor)
                         }
                         .padding(.vertical, 8)
+                    }
+
+                    // INSTANT SEND: Preparation status indicator
+                    if isPreparingTransaction {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                            Text(preparationProgress.isEmpty ? "Preparing transaction..." : preparationProgress)
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.primaryColor)
+                        }
+                        .padding(.vertical, 4)
+                    } else if preparedTransaction != nil && isValidInput {
+                        HStack(spacing: 8) {
+                            Image(systemName: "bolt.fill")
+                                .foregroundColor(theme.successColor)
+                            Text("Transaction ready - instant send enabled")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.successColor)
+                        }
+                        .padding(.vertical, 4)
                     }
 
                     // Send button
@@ -293,6 +337,25 @@ struct SendView: View {
                     networkManager.justConfirmedTx = nil
                 }
             }
+        }
+        // INSTANT SEND: Trigger transaction preparation when input becomes valid
+        .onChange(of: recipientAddress) { _ in
+            triggerPreparationIfNeeded()
+        }
+        .onChange(of: amount) { _ in
+            triggerPreparationIfNeeded()
+        }
+        .onChange(of: memo) { _ in
+            // Only re-prepare if we already have a prepared tx
+            if preparedTransaction != nil {
+                invalidatePreparedTransaction()
+                triggerPreparationIfNeeded()
+            }
+        }
+        .onDisappear {
+            // Cancel any ongoing preparation when view disappears
+            preparationTask?.cancel()
+            preparationTask = nil
         }
     }
 
@@ -624,10 +687,164 @@ struct SendView: View {
 
         BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { [self] success, error in
             if success {
-                performSendTransaction()
+                // INSTANT SEND: Check if we have a valid prepared transaction
+                if let prepared = preparedTransaction,
+                   prepared.isValid,
+                   prepared.toAddress == recipientAddress,
+                   prepared.amount == zatoshis,
+                   prepared.memo == (memo.isEmpty ? nil : memo) {
+                    // Use prepared transaction with block height check
+                    performInstantSend(prepared: prepared)
+                } else {
+                    // Fall back to normal send (no prepared tx available)
+                    performSendTransaction()
+                }
             } else {
                 errorMessage = "Authentication required to send transaction"
                 showError = true
+            }
+        }
+    }
+
+    /// Instant send using pre-built transaction (with block height verification)
+    private func performInstantSend(prepared: PreparedTransaction) {
+        isSending = true
+
+        // Show minimal progress (only broadcast step since tx is already built)
+        sendProgress = [
+            SendProgressStep(id: "validate", title: "Verifying block height", status: .inProgress),
+            SendProgressStep(id: "broadcast", title: "Broadcasting & verifying", status: .pending)
+        ]
+
+        Task {
+            do {
+                // CRITICAL: Check if block height changed since preparation
+                let currentHeight: UInt64
+                do {
+                    currentHeight = try await networkManager.getChainHeight()
+                } catch {
+                    currentHeight = networkManager.chainHeight
+                }
+
+                if currentHeight != prepared.preparedAtHeight {
+                    // Block height changed! Transaction might be stale
+                    // The witness/anchor could be invalid for the new chain state
+                    await MainActor.run {
+                        print("⚠️ Block height changed: \(prepared.preparedAtHeight) → \(currentHeight)")
+                        // Show warning but still try to broadcast
+                        // The network will reject if the anchor is invalid
+                        sendProgress[0].status = .completed
+                        sendProgress[0].detail = "Height changed: \(prepared.preparedAtHeight)→\(currentHeight)"
+                    }
+                } else {
+                    await MainActor.run {
+                        sendProgress[0].status = .completed
+                        sendProgress[0].detail = "Height verified: \(currentHeight)"
+                    }
+                }
+
+                await MainActor.run {
+                    sendProgress[1].status = .inProgress
+                }
+
+                // Record last send timestamp
+                await MainActor.run {
+                    walletManager.lastSendTimestamp = Date()
+                }
+
+                // Broadcast the prepared transaction
+                let networkMgr = NetworkManager.shared
+                let broadcastedTxId = try await networkMgr.broadcastTransactionWithProgress(prepared.rawTx, amount: prepared.amount) { phase, detail, progress in
+                    Task { @MainActor in
+                        self.handleProgressUpdate(step: phase, detail: detail, progress: progress)
+                    }
+                }
+
+                // Track as pending outgoing
+                let pendingFee: UInt64 = 10_000
+                await networkMgr.trackPendingOutgoing(txid: broadcastedTxId, amount: prepared.amount + pendingFee)
+
+                // Record transaction in database
+                guard let txidData = Data(hexString: broadcastedTxId) else {
+                    throw WalletError.transactionFailed("Invalid transaction ID format")
+                }
+
+                // Mark spent note
+                try WalletDatabase.shared.markNoteSpentByHashedNullifier(
+                    hashedNullifier: prepared.spentNullifier,
+                    txid: txidData,
+                    spentHeight: currentHeight
+                )
+
+                // Record in history
+                _ = try WalletDatabase.shared.insertTransactionHistory(
+                    txid: txidData,
+                    height: currentHeight,
+                    blockTime: UInt64(Date().timeIntervalSince1970),
+                    type: .sent,
+                    value: prepared.amount,
+                    fee: 10_000,
+                    toAddress: prepared.toAddress,
+                    fromDiversifier: nil,
+                    memo: prepared.memo
+                )
+
+                // Verify saved
+                let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
+                guard txWasSaved else {
+                    throw WalletError.transactionFailed("Failed to save transaction to database")
+                }
+
+                // Notify UI
+                await MainActor.run {
+                    walletManager.transactionHistoryVersion += 1
+                }
+
+                // Send notification
+                NotificationManager.shared.notifySent(amount: prepared.amount, txid: broadcastedTxId, memo: prepared.memo)
+
+                await MainActor.run {
+                    self.txId = broadcastedTxId
+                    showSuccess = true
+                    isSending = false
+                    sendProgress = []
+                    // Clear prepared transaction after successful send
+                    invalidatePreparedTransaction()
+                }
+
+                print("⚡ INSTANT SEND complete! Txid: \(broadcastedTxId)")
+
+                // Refresh balance in background
+                Task {
+                    try? await walletManager.refreshBalance()
+                }
+            } catch {
+                // If broadcast fails (e.g., stale anchor), fall back to normal send
+                await MainActor.run {
+                    print("⚠️ Instant send failed: \(error.localizedDescription)")
+                    // Clear prepared transaction
+                    invalidatePreparedTransaction()
+                }
+
+                // Check if it's likely an anchor mismatch (transaction rejected)
+                let errorStr = error.localizedDescription.lowercased()
+                if errorStr.contains("rejected") || errorStr.contains("invalid") || errorStr.contains("anchor") {
+                    // Rebuild and retry
+                    await MainActor.run {
+                        sendProgress = []
+                        isSending = false
+                    }
+                    // Start normal send flow (will rebuild transaction)
+                    await MainActor.run {
+                        performSendTransaction()
+                    }
+                } else {
+                    await MainActor.run {
+                        errorMessage = error.localizedDescription
+                        showError = true
+                        isSending = false
+                    }
+                }
             }
         }
     }
@@ -727,24 +944,30 @@ struct SendView: View {
             updateStepSync("proof", status: .completed)
             updateStepSync("broadcast", status: .inProgress)
         case "peers":
-            // IMMEDIATE TXID DISPLAY: Show success screen as soon as first peer accepts!
-            // Extract txid from detail string: "Accepted by X/Y nodes [txid:abc123...]"
+            // CRITICAL FIX: Do NOT show success immediately on peer accept!
+            // Peers may accept into local mempool but reject during validation.
+            // Wait for mempool verification (sendShieldedWithProgress returns) before showing success.
+            // Just extract and store txid for later use, but DON'T show success yet.
             if let detail = detail, let txidRange = detail.range(of: "[txid:") {
                 let afterTxid = detail[txidRange.upperBound...]
                 if let endBracket = afterTxid.firstIndex(of: "]") {
                     let extractedTxid = String(afterTxid[..<endBracket])
-                    // Show success screen IMMEDIATELY with txid
-                    if !showSuccess && !extractedTxid.isEmpty {
+                    // Store txid for later (will be used when send completes successfully)
+                    if txId.isEmpty && !extractedTxid.isEmpty {
                         txId = extractedTxid
-                        showSuccess = true
-                        isSending = false
-                        sendProgress = []
-                        print("🚀 INSTANT SUCCESS: Showing txid immediately after peer accept: \(extractedTxid.prefix(16))...")
+                        print("📋 Txid received from peer accept: \(extractedTxid.prefix(16))... (waiting for mempool verification)")
                     }
                 }
             }
-            // Also update broadcast step progress
+            // Update broadcast step progress (but don't show success yet!)
             updateStepSync("broadcast", status: .inProgress, detail: detail?.replacingOccurrences(of: #"\s*\[txid:[^\]]+\]"#, with: "", options: .regularExpression), progress: progress)
+        case "error":
+            // CRITICAL: Handle broadcast error - transaction was rejected!
+            let errorDetail = detail ?? "Transaction rejected by network"
+            updateStepSync("broadcast", status: .failed(errorDetail), detail: errorDetail)
+            errorMessage = errorDetail
+            showError = true
+            isSending = false
         case "broadcast":
             // Broadcast step has sub-progress for peer propagation and verification
             if let p = progress, p < 1.0 {
@@ -792,6 +1015,157 @@ struct SendView: View {
         recipientAddress = ""
         amount = ""
         memo = ""
+        invalidatePreparedTransaction()
+    }
+
+    // MARK: - Instant Send Preparation Functions
+
+    /// Invalidate any prepared transaction
+    private func invalidatePreparedTransaction() {
+        preparationTask?.cancel()
+        preparationTask = nil
+        preparedTransaction = nil
+        isPreparingTransaction = false
+        preparationProgress = ""
+    }
+
+    /// Check if we should trigger transaction preparation
+    private func triggerPreparationIfNeeded() {
+        // Only prepare if input is valid
+        guard isValidInput && !isSending && !hasPendingTransaction else {
+            // If input became invalid, cancel preparation
+            if !isValidInput && isPreparingTransaction {
+                invalidatePreparedTransaction()
+            }
+            return
+        }
+
+        // Check if we already have a valid prepared transaction for this input
+        if let prepared = preparedTransaction,
+           prepared.isValid,
+           prepared.toAddress == recipientAddress,
+           prepared.amount == currentZatoshis,
+           prepared.memo == (memo.isEmpty ? nil : memo) {
+            // Already prepared and valid
+            return
+        }
+
+        // Cancel any existing preparation
+        preparationTask?.cancel()
+
+        // Start new preparation
+        isPreparingTransaction = true
+        preparationProgress = "Initializing..."
+
+        preparationTask = Task {
+            await prepareTransaction()
+        }
+    }
+
+    /// Current amount in zatoshis
+    private var currentZatoshis: UInt64 {
+        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
+        guard let amountValue = Double(normalizedAmount) else { return 0 }
+        return UInt64(round(amountValue * 100_000_000))
+    }
+
+    /// Prepare transaction in background (build zk-SNARK proof)
+    private func prepareTransaction() async {
+        do {
+            // Get current chain height BEFORE building
+            let heightBeforePrep: UInt64
+            do {
+                heightBeforePrep = try await networkManager.getChainHeight()
+            } catch {
+                heightBeforePrep = networkManager.chainHeight
+            }
+
+            await MainActor.run {
+                preparationProgress = "Connecting to network..."
+            }
+
+            // Ensure network connection
+            if !networkManager.isConnected {
+                try await networkManager.connect()
+            }
+
+            // Check for cancellation
+            try Task.checkCancellation()
+
+            await MainActor.run {
+                preparationProgress = "Loading prover..."
+            }
+
+            // Get the values we need for preparation
+            let toAddress = recipientAddress
+            let zatoshis = currentZatoshis
+            let memoText = memo.isEmpty ? nil : memo
+
+            // Get spending key
+            let secureStorage = SecureKeyStorage()
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+
+            await MainActor.run {
+                preparationProgress = "Building transaction..."
+            }
+
+            // Build the transaction
+            let txBuilder = TransactionBuilder()
+            let (rawTx, spentNullifier) = try await txBuilder.buildShieldedTransactionWithProgress(
+                from: walletManager.zAddress,
+                to: toAddress,
+                amount: zatoshis,
+                memo: memoText,
+                spendingKey: secureKey.data,
+                onProgress: { step, detail, _ in
+                    Task { @MainActor in
+                        switch step {
+                        case "prover": self.preparationProgress = "Prover ready"
+                        case "notes": self.preparationProgress = "Notes selected"
+                        case "tree": self.preparationProgress = detail ?? "Loading tree..."
+                        case "witness": self.preparationProgress = "Building witness..."
+                        case "proof": self.preparationProgress = "Generating zk-SNARK..."
+                        default: break
+                        }
+                    }
+                }
+            )
+
+            // Zero spending key immediately
+            secureKey.zero()
+
+            // Check for cancellation
+            try Task.checkCancellation()
+
+            // Store prepared transaction
+            await MainActor.run {
+                self.preparedTransaction = PreparedTransaction(
+                    rawTx: rawTx,
+                    spentNullifier: spentNullifier,
+                    toAddress: toAddress,
+                    amount: zatoshis,
+                    memo: memoText,
+                    preparedAtHeight: heightBeforePrep,
+                    preparedAt: Date()
+                )
+                self.isPreparingTransaction = false
+                self.preparationProgress = ""
+                print("⚡ Transaction prepared at height \(heightBeforePrep) - ready for instant send!")
+            }
+        } catch is CancellationError {
+            await MainActor.run {
+                isPreparingTransaction = false
+                preparationProgress = ""
+            }
+        } catch {
+            await MainActor.run {
+                isPreparingTransaction = false
+                preparationProgress = ""
+                // Don't show error - just silently fail preparation
+                // User can still send normally
+                print("⚠️ Transaction preparation failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func copyToClipboard(_ string: String) {

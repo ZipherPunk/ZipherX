@@ -2643,6 +2643,42 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
     success_count
 }
 
+/// Extract the root (anchor) from serialized witness data
+/// This is needed when using treeCreateWitnessesBatch which builds its own tree
+/// rather than using the global COMMITMENT_TREE
+///
+/// witness_data: Serialized witness (1028 bytes)
+/// root_out: 32-byte output buffer for the root
+/// Returns: true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_get_root(
+    witness_data: *const u8,
+    witness_len: usize,
+    root_out: *mut u8,
+) -> bool {
+    if witness_len < 100 {
+        return false;
+    }
+
+    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+    let mut reader = std::io::Cursor::new(witness_slice);
+
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+
+    let root = witness.root();
+    let mut root_bytes = Vec::new();
+    if root.write(&mut root_bytes).is_err() {
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
+    true
+}
+
 /// Create witnesses for multiple CMUs using BATCH processing (OPTIMIZED)
 ///
 /// PERFORMANCE: Builds tree ONCE and captures witnesses incrementally as we pass each target.

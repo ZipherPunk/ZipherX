@@ -543,77 +543,91 @@ final class TransactionBuilder {
         var preparedSpends: [(note: SpendableNote, witness: Data)] = []
 
         // CRITICAL FIX: For multi-input transactions, ALL witnesses MUST have the same anchor.
-        // Strategy:
-        // 1. Get cached CMU file height
-        // 2. If ANY note is beyond cached height, use in-memory tree witnesses (all updated to same state)
-        // 3. If ALL notes within cached height, use batch creation from CMU file
         if isMultiInput {
-            print("🔧 Multi-input: Ensuring consistent anchors for \(selectedNotes.count) notes...")
+            print("🔧 Multi-input: Checking if database witnesses can be used directly...")
 
-            // Get cached boost height
-            let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
-            let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+            // OPTIMIZATION: First check if ALL notes have valid witnesses with MATCHING anchors
+            // This is the INSTANT path - no network or file I/O needed!
+            var allValid = true
+            var commonAnchor: Data?
 
-            print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+            for note in selectedNotes {
+                // Check if witness is valid
+                let witnessValid = note.witness.count >= 1028 && !note.witness.allSatisfy { $0 == 0 }
+                if !witnessValid {
+                    print("   Note at height \(note.height): invalid witness (\(note.witness.count) bytes)")
+                    allValid = false
+                    break
+                }
 
-            if maxNoteHeight > cachedBoostHeight {
-                // Notes beyond cached data - MUST rebuild ALL witnesses in SINGLE PASS
-                // to ensure they all have the SAME anchor. This builds the tree once
-                // and creates witnesses for all notes as their CMUs are encountered.
-                print("📝 Notes beyond cached boost file, rebuilding ALL witnesses in single pass...")
+                // Extract anchor from witness to verify all match
+                guard let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) else {
+                    print("   Note at height \(note.height): failed to extract anchor from witness")
+                    allValid = false
+                    break
+                }
 
-                // Use the new batch function that ensures same anchor for all
+                if let expected = commonAnchor {
+                    if witnessAnchor != expected {
+                        let expectedHex = expected.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let actualHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("   Note at height \(note.height): anchor mismatch! Expected \(expectedHex)..., got \(actualHex)...")
+                        allValid = false
+                        break
+                    }
+                } else {
+                    commonAnchor = witnessAnchor
+                }
+            }
+
+            // VALIDATION: The common anchor must match the current tree root!
+            // The witnesses must reflect the CURRENT tree state, not an old one.
+            let currentTreeRoot = ZipherXFFI.treeRoot()
+            let anchorMatchesTree = allValid && commonAnchor != nil && commonAnchor == currentTreeRoot
+
+            if allValid && anchorMatchesTree {
+                // INSTANT MODE: All witnesses are valid with matching anchors that match current tree!
+                print("✅ Multi-input INSTANT mode: All \(selectedNotes.count) notes have valid witnesses with matching anchors!")
+                for note in selectedNotes {
+                    preparedSpends.append((note: note, witness: note.witness))
+                }
+            } else if allValid && commonAnchor != nil && currentTreeRoot != nil {
+                // Anchors match each other but are STALE (tree has moved on)
+                let commonHex = commonAnchor!.prefix(8).map { String(format: "%02x", $0) }.joined()
+                let treeHex = currentTreeRoot!.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("⚠️ Witness anchors (\(commonHex)...) don't match current tree (\(treeHex)...) - STALE!")
+                print("⚠️ Database witnesses are stale, rebuilding from boost + delta...")
+
+                let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+                let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+                print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+
                 let results = try await rebuildWitnessesForNotes(
                     notes: selectedNotes,
                     downloadedTreeHeight: cachedBoostHeight
                 )
 
-                // Convert results to preparedSpends
                 for result in results {
                     preparedSpends.append((note: result.note, witness: result.witness))
                 }
-                print("✅ Rebuilt \(preparedSpends.count) witnesses with SAME anchor")
+                print("✅ Created \(preparedSpends.count) witnesses with SAME anchor")
             } else {
-                // All notes within cached data - use batch creation from CMU file
-                print("📁 All notes within cached boost height, using batch witness creation...")
+                // FALLBACK: Rebuild witnesses using boost + delta
+                print("⚠️ Database witnesses not usable, rebuilding from boost + delta...")
 
-                // Collect all CMUs from selected notes
-                var allCMUs: [Data] = []
-                for (index, note) in selectedNotes.enumerated() {
-                    guard let cmu = note.cmu else {
-                        print("❌ Note \(index + 1) has no CMU")
-                        throw TransactionError.proofGenerationFailed
-                    }
-                    allCMUs.append(cmu)
+                let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+                let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+                print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+
+                let results = try await rebuildWitnessesForNotes(
+                    notes: selectedNotes,
+                    downloadedTreeHeight: cachedBoostHeight
+                )
+
+                for result in results {
+                    preparedSpends.append((note: result.note, witness: result.witness))
                 }
-
-                // Get the CMU data for batch witness creation
-                var cmuData: Data?
-
-                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                   let data = try? Data(contentsOf: cachedPath) {
-                    print("📁 Using cached CMU data for batch witnesses (\(data.count) bytes)")
-                    cmuData = data
-                }
-
-                guard let data = cmuData else {
-                    print("❌ No CMU data available for batch witness creation")
-                    throw TransactionError.proofGenerationFailed
-                }
-
-                // Create all witnesses in batch - ensures same anchor for all
-                let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: data, targetCMUs: allCMUs)
-
-                // Verify all witnesses were created successfully
-                for (index, result) in batchResults.enumerated() {
-                    guard let (_, witness) = result else {
-                        print("❌ Failed to create batch witness for note \(index + 1)")
-                        throw TransactionError.proofGenerationFailed
-                    }
-                    preparedSpends.append((note: selectedNotes[index], witness: witness))
-                }
-
-                print("✅ Batch witnesses created for \(preparedSpends.count) notes")
+                print("✅ Created \(preparedSpends.count) witnesses with SAME anchor")
             }
         } else {
             // Single-input transaction - use existing logic
@@ -1067,131 +1081,113 @@ final class TransactionBuilder {
 
     /// Rebuild witnesses for MULTIPLE notes in a single tree-building pass
     /// This ensures all witnesses have the SAME anchor (required for multi-input transactions)
+    /// Handles notes both within AND beyond the downloaded CMU range
     func rebuildWitnessesForNotes(
         notes: [SpendableNote],
         downloadedTreeHeight: UInt64
     ) async throws -> [(note: SpendableNote, witness: Data, anchor: Data)] {
-        print("🔄 Rebuilding witnesses for \(notes.count) notes in single pass...")
+        print("🔄 Rebuilding witnesses for \(notes.count) notes using boost + delta sync...")
 
         // Sort notes by height to process them in order
         let sortedNotes = notes.sorted { $0.height < $1.height }
         let maxNoteHeight = sortedNotes.last?.height ?? 0
 
-        // 1. Load CMU file from GitHub cache
-        guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-              let cachedData = try? Data(contentsOf: cachedPath) else {
-            print("❌ Failed to load commitment tree from GitHub cache")
-            throw TransactionError.proofGenerationFailed
-        }
-
-        // Parse CMU count
-        guard cachedData.count >= 8 else { throw TransactionError.proofGenerationFailed }
-        let cachedCount = cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-        print("📊 Downloaded tree has \(cachedCount) CMUs ending at height \(downloadedTreeHeight)")
-
-        // 2. Initialize fresh tree
-        guard ZipherXFFI.treeInit() else {
-            print("❌ Failed to initialize tree")
-            throw TransactionError.proofGenerationFailed
-        }
-
-        // 3. Load downloaded CMUs into tree
-        print("🌳 Loading downloaded CMUs into tree...")
-        if !ZipherXFFI.treeLoadFromCMUs(data: cachedData) {
-            print("❌ Failed to load downloaded CMUs")
-            throw TransactionError.proofGenerationFailed
-        }
-
-        print("✅ Tree now has \(ZipherXFFI.treeSize()) commitments")
-
-        // 4. Create a Set of CMUs we're looking for (for fast lookup)
-        var targetCMUs: Set<Data> = []
+        // 1. Collect all note CMUs from database (they're already stored there!)
+        var allNoteCMUs: [Data] = []
         var cmuToNote: [Data: SpendableNote] = [:]
         for note in sortedNotes {
             guard let cmu = note.cmu else {
                 print("❌ Note at height \(note.height) has no CMU")
                 throw TransactionError.proofGenerationFailed
             }
-            targetCMUs.insert(cmu)
+            allNoteCMUs.append(cmu)
             cmuToNote[cmu] = note
-            print("   Looking for CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())... at height \(note.height)")
+            let status = note.height <= downloadedTreeHeight ? "(in boost)" : "(in delta)"
+            print("   CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())... at height \(note.height) \(status)")
         }
 
-        // 5. Fetch CMUs from blocks and build tree, creating witnesses when we find target notes
-        // Track: (note, witnessIndex) - we'll get actual witness data after tree is complete
-        var noteWitnessIndices: [(note: SpendableNote, witnessIndex: UInt64)] = []
-        var foundCMUs: Set<Data> = []
+        // 2. Extract CMUs from boost file in legacy format (fast bulk read)
+        print("📦 Extracting CMUs from boost file...")
+        let boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
+            if Int(progress * 100) % 10 == 0 {
+                print("   Extracting boost CMUs: \(Int(progress * 100))%")
+            }
+        }
 
-        let startHeight = downloadedTreeHeight + 1
-        print("📡 Fetching CMUs from blocks \(startHeight) to \(maxNoteHeight)...")
+        // Parse CMU count from boost data
+        guard boostCMUData.count >= 8 else { throw TransactionError.proofGenerationFailed }
+        let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        print("📊 Boost file has \(boostCMUCount) CMUs up to height \(downloadedTreeHeight)")
 
-        for height in startHeight...maxNoteHeight {
-            do {
-                let blockCMUs = try await fetchCMUsViaInsight(height: height)
-                for blockCMU in blockCMUs {
-                    // Check if this is one of our target CMUs
-                    if targetCMUs.contains(blockCMU) && !foundCMUs.contains(blockCMU) {
-                        // Found a target note! Append it and create witness
-                        let position = ZipherXFFI.treeAppend(cmu: blockCMU)
-                        if position == UInt64.max {
-                            print("❌ Failed to append note CMU at height \(height)")
-                            throw TransactionError.proofGenerationFailed
-                        }
+        // 3. Fetch delta CMUs from chain (only blocks beyond boost file)
+        var deltaCMUs: [Data] = []
+        if maxNoteHeight > downloadedTreeHeight {
+            let startHeight = downloadedTreeHeight + 1
+            print("📡 Fetching delta CMUs from blocks \(startHeight) to \(maxNoteHeight)...")
 
-                        // Create witness immediately after appending
-                        let witnessIndex = ZipherXFFI.treeWitnessCurrent()
-                        if witnessIndex == UInt64.max {
-                            print("❌ Failed to create witness for note at height \(height)")
-                            throw TransactionError.proofGenerationFailed
-                        }
-
-                        if let note = cmuToNote[blockCMU] {
-                            noteWitnessIndices.append((note: note, witnessIndex: witnessIndex))
-                            foundCMUs.insert(blockCMU)
-                            print("✅ Found note at position \(position), height \(height), witnessIndex \(witnessIndex)")
-                        }
-                    } else {
-                        // Not a target CMU (or already found) - just append to update existing witnesses
-                        let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
-                        if pos == UInt64.max {
-                            print("⚠️ Failed to append CMU at height \(height)")
-                        }
-                    }
+            for height in startHeight...maxNoteHeight {
+                do {
+                    let blockCMUs = try await fetchCMUsViaInsight(height: height)
+                    deltaCMUs.append(contentsOf: blockCMUs)
+                    print("   Block \(height): \(blockCMUs.count) CMUs")
+                } catch {
+                    print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
                 }
-            } catch {
-                print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
             }
+            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain")
         }
 
-        // Verify we found all target notes
-        if foundCMUs.count != targetCMUs.count {
-            let missing = targetCMUs.subtracting(foundCMUs)
-            print("❌ Failed to find \(missing.count) CMU(s) in chain")
-            for cmu in missing {
-                print("   Missing: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-            }
+        // 4. Build combined CMU data: boost + delta
+        // Format: [count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+        let totalCMUCount = boostCMUCount + UInt64(deltaCMUs.count)
+        var combinedCMUData = Data(capacity: 8 + Int(totalCMUCount) * 32)
+
+        // Write new count
+        var count = totalCMUCount
+        withUnsafeBytes(of: &count) { bytes in
+            combinedCMUData.append(contentsOf: bytes)
+        }
+
+        // Append boost CMUs (skip the 8-byte header from boost data)
+        combinedCMUData.append(boostCMUData.suffix(from: 8))
+
+        // Append delta CMUs
+        for cmu in deltaCMUs {
+            combinedCMUData.append(cmu)
+        }
+
+        print("📊 Combined CMU data: \(totalCMUCount) CMUs (\(combinedCMUData.count) bytes)")
+
+        // 5. Use batch witness creation (Rust parallel processing)
+        print("🌳 Creating witnesses using batch processing...")
+        let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: allNoteCMUs)
+
+        // 6. Get anchor FROM THE FIRST WITNESS (NOT from global tree!)
+        // CRITICAL: treeCreateWitnessesBatch builds its OWN local tree, NOT the global COMMITMENT_TREE.
+        // So ZipherXFFI.treeRoot() returns the WRONG anchor - it returns the global tree's root.
+        // We must extract the anchor from the witness data itself using witnessGetRoot().
+        guard let firstResult = batchResults.first, let (_, firstWitness) = firstResult else {
+            print("❌ Failed to create first witness")
             throw TransactionError.proofGenerationFailed
         }
 
-        print("📊 Final tree size: \(ZipherXFFI.treeSize())")
-
-        // 6. Get the tree root - this is the SAME anchor for ALL witnesses
-        guard let anchor = ZipherXFFI.treeRoot() else {
-            print("❌ Failed to get tree root")
+        guard let anchor = ZipherXFFI.witnessGetRoot(firstWitness) else {
+            print("❌ Failed to extract anchor from witness")
             throw TransactionError.proofGenerationFailed
         }
         let rootHex = anchor.map { String(format: "%02x", $0) }.joined()
-        print("📝 Computed anchor (same for all witnesses): \(rootHex.prefix(16))...")
+        print("📝 Extracted anchor from witness (same for all): \(rootHex.prefix(16))...")
 
-        // 7. Retrieve all witnesses with the SAME anchor
+        // 7. Build results with same anchor for all (all witnesses from same batch have same root)
         var results: [(note: SpendableNote, witness: Data, anchor: Data)] = []
-        for (note, witnessIndex) in noteWitnessIndices {
-            guard let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) else {
-                print("❌ Failed to get witness at index \(witnessIndex)")
+        for (index, result) in batchResults.enumerated() {
+            guard let (position, witness) = result else {
+                print("❌ Failed to create witness for note \(index + 1) at height \(sortedNotes[index].height)")
                 throw TransactionError.proofGenerationFailed
             }
+            let note = sortedNotes[index]
             results.append((note: note, witness: witness, anchor: anchor))
-            print("   ✅ Retrieved witness \(witnessIndex): \(witness.count) bytes")
+            print("   ✅ Note \(index + 1): position \(position), witness \(witness.count) bytes")
         }
 
         // 8. Save updated tree state to database
@@ -1200,7 +1196,7 @@ final class TransactionBuilder {
             print("💾 Updated tree state saved to database")
         }
 
-        print("✅ Rebuilt \(results.count) witnesses with SAME anchor")
+        print("✅ Rebuilt \(results.count) witnesses with SAME anchor using boost + delta")
         return results
     }
 

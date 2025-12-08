@@ -829,8 +829,11 @@ final class Peer {
                     throw NetworkError.transactionRejected
                 }
             }
+        } catch NetworkError.transactionRejected {
+            // Transaction was explicitly rejected by the peer - this is a REAL failure!
+            throw NetworkError.transactionRejected
         } catch {
-            // Ignore timeout errors - they mean success (no reject received)
+            // Ignore timeout/cancellation errors - they mean success (no reject received)
             if !(error is CancellationError) {
                 print("⚠️ Broadcast check error: \(error)")
             }

@@ -1310,6 +1310,10 @@ final class WalletManager: ObservableObject {
             ) {
                 // Save updated witness to database
                 try? database.updateNoteWitness(noteId: note.id, witness: result.witness)
+                // Extract anchor from witness and save it - ensures INSTANT mode works
+                if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                    try? database.updateNoteAnchor(noteId: note.id, anchor: anchor)
+                }
                 print("✅ Synced witness for note \(note.id) at height \(note.height)")
             } else {
                 print("⚠️ Could not sync witness for note \(note.id)")
@@ -1452,9 +1456,9 @@ final class WalletManager: ObservableObject {
         print("✅ Full rescan complete")
     }
 
-    /// Repair notes with corrupted nullifiers
-    /// This deletes notes received after the downloaded tree height and rescans to rediscover them
-    /// with correct positions and nullifiers
+    /// Repair database with full resync
+    /// This deletes ALL notes and transaction history, then does a complete rescan
+    /// to rebuild everything with correct nullifiers and positions
     /// - Parameter onProgress: Callback with (progress, currentHeight, maxHeight)
     func repairNotesAfterDownloadedTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
@@ -1480,18 +1484,32 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
-        // Delete notes received AFTER downloaded tree height
-        // These notes may have corrupted nullifiers due to wrong position calculation
-        let deletedCount = try WalletDatabase.shared.deleteNotesAfterHeight(downloadedTreeHeight)
-        print("🗑️ Deleted \(deletedCount) notes after height \(downloadedTreeHeight)")
+        // FULL RESYNC: Delete ALL notes (not just after tree height)
+        // This ensures all corrupted data is removed
+        print("🗑️ Deleting ALL notes for full resync...")
+        try WalletDatabase.shared.deleteAllNotes()
+        print("🗑️ All notes deleted")
+
+        // Clear ALL transaction history
+        try WalletDatabase.shared.clearTransactionHistory()
+        print("🗑️ Cleared transaction history")
 
         // Clear tree state so it gets rebuilt from downloaded CMUs
         try WalletDatabase.shared.clearTreeState()
         print("🌳 Cleared tree state")
 
-        // Update last scanned height to downloaded tree height so scan resumes from there
-        try WalletDatabase.shared.updateLastScannedHeight(downloadedTreeHeight, hash: Data(count: 32))
-        print("📝 Set last scanned height to \(downloadedTreeHeight)")
+        // Also delete cached boost file to force re-download from GitHub
+        let boostCacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("ZipherX")
+            .appendingPathComponent("BoostCache")
+        if FileManager.default.fileExists(atPath: boostCacheDir.path) {
+            try? FileManager.default.removeItem(at: boostCacheDir)
+            print("🗑️ Cleared boost cache (will re-download from GitHub)")
+        }
+
+        // Reset last scanned height to 0 for full rescan
+        try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
+        print("📝 Reset last scanned height to 0")
 
         // Ensure network connection
         print("📡 Ensuring network connection...")
@@ -1521,20 +1539,24 @@ final class WalletManager: ObservableObject {
         }
         // Also clear the FFI tree to ensure fresh start
         _ = ZipherXFFI.treeInit()
-        print("🌳 Reloading commitment tree from downloaded data...")
+        print("🌳 Reloading commitment tree from GitHub...")
         await preloadCommitmentTree()
 
-        // Scan from downloadedTreeHeight + 1 to current chain tip
+        // Get the new downloaded tree height (from GitHub)
+        let newTreeHeight = ZipherXConstants.effectiveTreeHeight
+        print("📦 GitHub boost file height: \(newTreeHeight)")
+
+        // Scan from boost height + 1 to current chain tip
         // This uses sequential mode which properly calculates positions
         let scanner = FilterScanner()
         scanner.onProgress = onProgress
 
-        print("🔄 Starting repair scan from height \(downloadedTreeHeight + 1)...")
-        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: downloadedTreeHeight + 1)
+        print("🔄 Starting full rescan from height \(newTreeHeight + 1)...")
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: newTreeHeight + 1)
 
         // Refresh balance
         try await refreshBalance()
-        print("✅ Note repair complete - nullifiers recalculated with correct positions")
+        print("✅ Database repair complete - full resync finished")
     }
 
     /// Rebuild witnesses from downloaded tree height
@@ -1644,6 +1666,10 @@ final class WalletManager: ObservableObject {
 
                     // Update witness in database
                     try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                    // Extract anchor from witness and save it - ensures INSTANT mode works
+                    if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                        try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: anchor)
+                    }
                 } else {
                     print("⚠️ Failed to create witness for note \(note.id) - CMU not in downloaded tree")
                 }
@@ -2488,24 +2514,23 @@ final class WalletManager: ObservableObject {
 
         // 8. Delete cache files (TreeCache, block_hashes, block_timestamps)
         let fileManager = FileManager.default
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
 
         // Delete TreeCache folder
-        let treeCacheURL = documentsURL.appendingPathComponent("TreeCache")
+        let treeCacheURL = AppDirectories.treeCache
         if fileManager.fileExists(atPath: treeCacheURL.path) {
             try? fileManager.removeItem(at: treeCacheURL)
             print("🗑️ Deleted TreeCache folder")
         }
 
         // Delete block_hashes.bin
-        let blockHashesURL = documentsURL.appendingPathComponent("block_hashes.bin")
+        let blockHashesURL = AppDirectories.blockHashes
         if fileManager.fileExists(atPath: blockHashesURL.path) {
             try? fileManager.removeItem(at: blockHashesURL)
             print("🗑️ Deleted block_hashes.bin")
         }
 
         // Delete block_timestamps_cache.bin
-        let timestampsURL = documentsURL.appendingPathComponent("block_timestamps_cache.bin")
+        let timestampsURL = AppDirectories.blockTimestamps
         if fileManager.fileExists(atPath: timestampsURL.path) {
             try? fileManager.removeItem(at: timestampsURL)
             print("🗑️ Deleted block_timestamps_cache.bin")

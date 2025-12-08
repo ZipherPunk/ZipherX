@@ -15,8 +15,7 @@ final class HeaderStore {
     private let queue = DispatchQueue(label: "com.zipherx.headerstore", qos: .userInitiated)
 
     private init() {
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        dbPath = documentsPath.appendingPathComponent("zipherx_headers.db").path
+        dbPath = AppDirectories.database.appendingPathComponent("zipherx_headers.db").path
     }
 
     // MARK: - Database Connection

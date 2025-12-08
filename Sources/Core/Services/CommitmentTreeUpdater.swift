@@ -39,8 +39,7 @@ actor CommitmentTreeUpdater {
 
     /// Local directory for downloaded boost file
     private var boostCacheDirectory: URL {
-        let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsDir.appendingPathComponent("BoostCache")
+        return AppDirectories.boostCache
     }
 
     /// Path to cached manifest
@@ -435,8 +434,7 @@ actor CommitmentTreeUpdater {
     /// Marked nonisolated since it only uses FileManager which is thread-safe
     nonisolated func deleteAllBoostFiles() {
         let fm = FileManager.default
-        let documentsDir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let boostCachePath = documentsDir.appendingPathComponent("BoostCache")
+        let boostCachePath = AppDirectories.boostCache
         if fm.fileExists(atPath: boostCachePath.path) {
             do {
                 try fm.removeItem(at: boostCachePath)
