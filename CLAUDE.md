@@ -3890,6 +3890,118 @@ private static let DEBUG_DISABLE_ENCRYPTION = true  // Set to true for debugging
 
 ---
 
+### 72. Embedded Tor via Arti + Auto-Start (December 8, 2025)
+
+**Feature**: Automatic Tor startup on app launch for maximum privacy.
+
+**Implementation**:
+- `TorManager.shared.start()` called in `ZipherXApp.init()`
+- Tor bootstraps in background while app loads
+- When connected, updates `zclassic.conf` with proxy settings
+
+**Files Modified**:
+- `Sources/App/ZipherXApp.swift` - Added Tor auto-start in init()
+
+---
+
+### 73. Mode & Privacy Indicators on Balance Screen (December 8, 2025)
+
+**Feature**: Visual indicators showing operating mode and privacy level.
+
+**macOS 2-Row Display**:
+```
+Row 1: [📡 FULL NODE] or [📱 LIGHT MODE]
+Row 2: [🧅 FULL PRIVACY (Tor/Onion)] or [🌐 PARTIAL PRIVACY (P2P)]
+        + [⚠️ Restart daemon] if Tor connected but daemon needs restart
+```
+
+**iOS Single Row**:
+```
+[🧅 Tor] (green when connected) or [⏳] (connecting) or [🌐 P2P] (direct)
+```
+
+**needsTorRestart Flag**:
+- Set when Tor connects after daemon is already running
+- Shows warning to user that daemon restart is needed
+- Cleared when daemon is restarted
+
+**Files Modified**:
+- `Sources/Features/Balance/BalanceView.swift` - Mode/privacy indicators
+- `Sources/Core/FullNode/FullNodeManager.swift` - `needsTorRestart` flag
+
+---
+
+### 74. CRITICAL: Tor SOCKS5 Proxy Readiness Verification (December 8, 2025)
+
+**Problem**: P2P connections failed with "Connection refused" even though Arti reported "Tor connected! SOCKS port: 19050". App stuck with 0 peers.
+
+**Root Cause**: Arti reports state 3 ("connected") before the SOCKS5 listener is actually accepting connections. P2P code immediately tried to use the proxy, but it wasn't ready yet.
+
+**Evidence from log**:
+```
+🧅 Tor connected! SOCKS port: 19050
+🧅 [157.90.223.151] Connecting via SOCKS5 proxy (port 19050)...
+Socket SO_ERROR [61: Connection refused]
+```
+
+**Solution: Two-Stage Verification**
+
+1. **TorManager SOCKS Proxy Verification** (`TorManager.swift`):
+   - Added `isSocksProxyReady()` - Tests TCP connection to SOCKS port
+   - Added `waitForSocksProxyReady(maxWait:)` - Retries up to 30 seconds
+   - Modified `updateStatus()` to verify proxy before setting `.connected`
+   - Shows "Bootstrapping 99%" until proxy is verified ready
+
+   ```swift
+   case 3:  // Connected (Arti reports connected)
+       socksPort = port
+       print("🧅 Arti reports connected, SOCKS port: \(port)")
+
+       // Verify SOCKS proxy is actually accepting connections
+       if !connectionState.isConnected {
+           connectionState = .bootstrapping(progress: 99)
+           Task {
+               let proxyReady = await self.waitForSocksProxyReady(maxWait: 30)
+               if proxyReady {
+                   self.connectionState = .connected
+                   print("🧅 Tor fully connected! SOCKS proxy verified on port \(port)")
+               } else {
+                   self.connectionState = .error("SOCKS proxy not responding")
+               }
+           }
+       }
+   ```
+
+2. **Peer.swift SOCKS5 Connection Retry** (`Peer.swift`):
+   - Wait for SOCKS proxy if not ready yet
+   - Verify proxy is accepting connections before attempting peer connection
+   - Graceful error messages instead of cryptic "Connection refused"
+
+   ```swift
+   private func connectViaSocks5() async throws {
+       // If Tor isn't connected yet, wait for it (up to 30 seconds)
+       if !torConnected || socksPort == 0 {
+           print("🧅 [\(host)] Waiting for Tor SOCKS proxy to be ready...")
+           let proxyReady = await TorManager.shared.waitForSocksProxyReady(maxWait: 30)
+           // ... update socksPort and torConnected
+       }
+
+       // Verify SOCKS proxy is actually ready before attempting connection
+       let proxyReady = await TorManager.shared.isSocksProxyReady()
+       guard proxyReady else {
+           throw NetworkError.connectionFailed("SOCKS5 proxy not accepting connections")
+       }
+   }
+   ```
+
+**Result**: P2P connections now wait for SOCKS proxy to be fully ready before attempting connections. No more "Connection refused" errors.
+
+**Files Modified**:
+- `Sources/Core/Network/TorManager.swift` - `isSocksProxyReady()`, `waitForSocksProxyReady()`, proxy verification in `updateStatus()`
+- `Sources/Core/Network/Peer.swift` - Wait for SOCKS proxy in `connectViaSocks5()`
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

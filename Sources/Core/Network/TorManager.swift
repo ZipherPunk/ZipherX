@@ -384,18 +384,34 @@ public final class TorManager: ObservableObject {
                 connectionState = .connecting
             case 2:  // Bootstrapping
                 connectionState = .bootstrapping(progress: Int(progress))
-            case 3:  // Connected
-                connectionState = .connected
+            case 3:  // Connected (Arti reports connected)
                 socksPort = port
-                print("🧅 Tor connected! SOCKS port: \(port)")
+                print("🧅 Arti reports connected, SOCKS port: \(port)")
 
-                // Notify FullNodeManager to update zclassic.conf with Tor proxy
-                #if os(macOS)
-                FullNodeManager.shared.updateTorProxy(host: proxyHost, port: port)
-                Task {
-                    await FullNodeManager.shared.refreshDaemonNetwork()
+                // Verify SOCKS proxy is actually accepting connections
+                // This is done in a separate task to not block status updates
+                if !connectionState.isConnected {
+                    connectionState = .bootstrapping(progress: 99)
+                    Task {
+                        let proxyReady = await self.waitForSocksProxyReady(maxWait: 30)
+                        await MainActor.run {
+                            if proxyReady {
+                                self.connectionState = .connected
+                                print("🧅 Tor fully connected! SOCKS proxy verified on port \(port)")
+
+                                // Notify FullNodeManager to update zclassic.conf with Tor proxy
+                                #if os(macOS)
+                                FullNodeManager.shared.updateTorProxy(host: self.proxyHost, port: port)
+                                Task {
+                                    await FullNodeManager.shared.refreshDaemonNetwork()
+                                }
+                                #endif
+                            } else {
+                                self.connectionState = .error("SOCKS proxy not responding on port \(port)")
+                            }
+                        }
+                    }
                 }
-                #endif
             case 4:  // Error
                 if let errorPtr = zipherx_tor_get_error() {
                     let errorMsg = String(cString: errorPtr)
@@ -469,6 +485,69 @@ public final class TorManager: ObservableObject {
     public func verifyTorWorking() -> Bool {
         guard let real = realIP, let tor = torIP else { return false }
         return real != tor
+    }
+
+    /// Test if the SOCKS5 proxy is actually accepting connections
+    /// Returns true if we can establish a TCP connection to the proxy port
+    public func isSocksProxyReady() async -> Bool {
+        guard socksPort > 0 else { return false }
+
+        return await withCheckedContinuation { continuation in
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: NWEndpoint.Port(integerLiteral: socksPort)
+            )
+            let connection = NWConnection(to: endpoint, using: .tcp)
+
+            var hasResumed = false
+            let queue = DispatchQueue(label: "socks-test")
+
+            connection.stateUpdateHandler = { state in
+                guard !hasResumed else { return }
+                switch state {
+                case .ready:
+                    hasResumed = true
+                    connection.cancel()
+                    continuation.resume(returning: true)
+                case .failed, .cancelled:
+                    hasResumed = true
+                    continuation.resume(returning: false)
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: queue)
+
+            // Timeout after 2 seconds
+            queue.asyncAfter(deadline: .now() + 2) {
+                guard !hasResumed else { return }
+                hasResumed = true
+                connection.cancel()
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    /// Wait for SOCKS proxy to become ready (up to maxWait seconds)
+    /// Returns true if proxy became ready within the timeout
+    public func waitForSocksProxyReady(maxWait: TimeInterval = 30) async -> Bool {
+        let startTime = Date()
+        var attempts = 0
+
+        while Date().timeIntervalSince(startTime) < maxWait {
+            attempts += 1
+            if await isSocksProxyReady() {
+                print("🧅 SOCKS proxy ready after \(attempts) attempt(s)")
+                return true
+            }
+
+            // Wait 500ms before next check
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+
+        print("🧅 SOCKS proxy NOT ready after \(maxWait) seconds (\(attempts) attempts)")
+        return false
     }
 }
 

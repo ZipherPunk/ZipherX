@@ -336,14 +336,30 @@ final class Peer {
     /// Connect to peer via Tor SOCKS5 proxy
     /// Used for .onion addresses and when Tor mode is enabled for privacy
     private func connectViaSocks5() async throws {
-        let socksPort = await TorManager.shared.socksPort
-        let torConnected = await TorManager.shared.connectionState.isConnected
+        var socksPort = await TorManager.shared.socksPort
+        var torConnected = await TorManager.shared.connectionState.isConnected
+
+        // If Tor isn't connected yet, wait for it (up to 30 seconds)
+        if !torConnected || socksPort == 0 {
+            print("🧅 [\(host)] Waiting for Tor SOCKS proxy to be ready...")
+            let proxyReady = await TorManager.shared.waitForSocksProxyReady(maxWait: 30)
+            if proxyReady {
+                socksPort = await TorManager.shared.socksPort
+                torConnected = await TorManager.shared.connectionState.isConnected
+            }
+        }
 
         guard torConnected && socksPort > 0 else {
             if isOnion {
                 throw NetworkError.connectionFailed(".onion addresses require Tor to be connected")
             }
             throw NetworkError.connectionFailed("Tor not connected")
+        }
+
+        // Verify SOCKS proxy is actually ready before attempting connection
+        let proxyReady = await TorManager.shared.isSocksProxyReady()
+        guard proxyReady else {
+            throw NetworkError.connectionFailed("SOCKS5 proxy not accepting connections on port \(socksPort)")
         }
 
         print("🧅 [\(host)] Connecting via SOCKS5 proxy (port \(socksPort))...")
