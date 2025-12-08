@@ -127,7 +127,8 @@ enum ZclassicCheckpoints {
 
     /// Hardcoded .onion seed nodes (Tor hidden services)
     static let onionSeedNodes = [
-        "akf2fbsxuz7nuz5hx7qifsv63lbbfxu3ncpvmmg42uvt65644lbha2ad.onion"
+        "akf2fbsxuz7nuz5hx7qifsv63lbbfxu3ncpvmmg42uvt65644lbha2ad.onion",
+        "cwmmtcsevvzjurzftl3wvlzpwxwe4fnsu2yl7bfkvirkdxc5idpariqd.onion"
     ]
 }
 
