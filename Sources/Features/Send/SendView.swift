@@ -749,7 +749,7 @@ struct SendView: View {
 
                 // Record last send timestamp
                 await MainActor.run {
-                    walletManager.lastSendTimestamp = Date()
+                    walletManager.recordSendTimestamp()
                 }
 
                 // Broadcast the prepared transaction

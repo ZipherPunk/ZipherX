@@ -166,6 +166,13 @@ final class WalletManager: ObservableObject {
         // lastSendTimestamp will naturally expire after 120 seconds
     }
 
+    /// Record the timestamp when a send transaction is initiated
+    /// Used for change output detection and clearing time calculation
+    @MainActor
+    func recordSendTimestamp() {
+        lastSendTimestamp = Date()
+    }
+
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
     private let mnemonicGenerator: MnemonicGenerator
