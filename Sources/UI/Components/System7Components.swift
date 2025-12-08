@@ -934,6 +934,8 @@ struct CypherpunkSyncView: View {
     @State private var showStopConfirmation: Bool = false
     @State private var showDeleteConfirmation: Bool = false
     @State private var logoRotation: Double = 0  // Logo rotation for syncing view
+    @State private var completionMessage: String = ""  // Store completion message to prevent re-randomization
+    @State private var enterButtonMessage: String = ""  // Store button message to prevent re-randomization
 
     // Timer for logo rotation (fast during sync)
     private let logoRotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
@@ -1394,8 +1396,8 @@ struct CypherpunkSyncView: View {
                     .scaleEffect(showCompletionAnimation ? 1.0 : 0.0)
             }
 
-            // Completion message
-            Text(completionMessages.randomElement() ?? "SOVEREIGNTY UNLOCKED")
+            // Completion message (stored in @State to prevent rapid re-randomization)
+            Text(completionMessage)
                 .font(.system(size: completionTitleSize, weight: .bold, design: .monospaced))
                 .foregroundColor(NeonColors.primary)
                 .scaleEffect(showCompletionAnimation ? 1.0 : 0.8)
@@ -1418,11 +1420,11 @@ struct CypherpunkSyncView: View {
 
             Spacer()
 
-            // Enter button with cypherpunk message
+            // Enter button with cypherpunk message (stored in @State to prevent rapid re-randomization)
             if let action = onEnterWallet {
                 Button(action: action) {
                     HStack(spacing: 12) {
-                        Text(enterButtonMessages.randomElement() ?? "[ ENTER THE VOID ]")
+                        Text(enterButtonMessage)
                             .font(.system(size: completionButtonTextSize, weight: .bold, design: .monospaced))
                         Image(systemName: "arrow.right")
                             .font(.system(size: completionButtonIconSize, weight: .bold))
@@ -1458,6 +1460,13 @@ struct CypherpunkSyncView: View {
             .padding(.bottom, 40)
         }
         .onAppear {
+            // Initialize completion messages ONCE on appear to prevent re-randomization
+            if completionMessage.isEmpty {
+                completionMessage = completionMessages.randomElement() ?? "SOVEREIGNTY UNLOCKED"
+            }
+            if enterButtonMessage.isEmpty {
+                enterButtonMessage = enterButtonMessages.randomElement() ?? "[ ENTER THE VOID ]"
+            }
             withAnimation(.spring(response: 0.6, dampingFraction: 0.7)) {
                 showCompletionAnimation = true
             }
@@ -1647,6 +1656,9 @@ struct CypherpunkMainView: View {
     @State private var previousBalance: UInt64 = 0
     @State private var showFireworks = false
     @State private var fireworksAmount: Double = 0
+    @State private var logoRotation: Double = 0
+    @State private var showQuote = false
+    @State private var currentQuote: (quote: String, author: String) = ("", "")
 
     // Matrix green colors (primary = orange on macOS, green on iOS)
     private let matrixGreen = NeonColors.primary
@@ -1658,6 +1670,15 @@ struct CypherpunkMainView: View {
     private let glitchTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
     // Periodic mempool check for incoming transactions (every 15 seconds)
     private let mempoolCheckTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    // Logo rotation timer
+    private let logoRotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
+
+    // Logo rotation speed: 1.0 = normal, 3.0 = fast (during tx/sync)
+    private var currentRotationSpeed: Double {
+        if walletManager.isSyncing { return 3.0 }
+        if networkManager.mempoolOutgoing > 0 || networkManager.justDetectedIncomingMempool != nil { return 3.0 }
+        return 1.0
+    }
 
     var body: some View {
         ZStack {
@@ -1670,10 +1691,14 @@ struct CypherpunkMainView: View {
                 .opacity(0.15)
 
             VStack(spacing: 0) {
-                // Top bar with settings gear
+                // Top bar with settings gear - more padding from top on iOS
                 topBar
                     .padding(.horizontal, 16)
+                    #if os(iOS)
+                    .padding(.top, 16)  // More space from top on iOS
+                    #else
                     .padding(.top, 8)
+                    #endif
 
                 Spacer()
                     .frame(height: 20)
@@ -1814,11 +1839,31 @@ struct CypherpunkMainView: View {
 
             Spacer()
 
-            // App title
-            Text("ZIPHERX")
-                .font(.system(size: 14, weight: .bold, design: .monospaced))
-                .foregroundColor(matrixGreen)
-                .tracking(2)
+            // App title with rotating logo - tap for cypherpunk quote
+            Button(action: {
+                currentQuote = PrivacyQuotes.randomQuote()
+                showQuote = true
+            }) {
+                HStack(spacing: 10) {
+                    Text("ZipherX")
+                        .font(.system(size: 20, weight: .bold, design: .default))
+                        .foregroundColor(matrixGreen)
+                        .shadow(color: matrixGreen.opacity(0.5), radius: 3)
+
+                    // Rotating Zipherpunk logo with 3D effect - no background
+                    Image("ZipherpunkLogo")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 36, height: 36)
+                        .rotation3DEffect(
+                            .degrees(logoRotation),
+                            axis: (x: 0, y: 1, z: 0),
+                            perspective: 0.5
+                        )
+                        .shadow(color: matrixGreen.opacity(0.6), radius: 4)
+                }
+            }
+            .buttonStyle(PlainButtonStyle())
 
             Spacer()
 
@@ -1830,6 +1875,19 @@ struct CypherpunkMainView: View {
                     .shadow(color: matrixGreen.opacity(0.5), radius: 4)
             }
             .buttonStyle(PlainButtonStyle())
+        }
+        .alert("Cypherpunk Wisdom", isPresented: $showQuote) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("\"\(currentQuote.quote)\"\n\n- \(currentQuote.author)")
+        }
+        .onReceive(logoRotationTimer) { _ in
+            withAnimation(.linear(duration: 0.03)) {
+                logoRotation += currentRotationSpeed * 2.0
+                if logoRotation >= 360 {
+                    logoRotation -= 360
+                }
+            }
         }
     }
 

@@ -27,6 +27,7 @@ final class WalletDatabase {
 
     // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
     // WARNING: Only set to true for debugging purposes! Set back to false before release!
+    // TODO: Re-enable (set to false) after all tests pass: send/receive/history
     private static let DEBUG_DISABLE_ENCRYPTION = true
 
     /// Encrypt sensitive data before storing in database

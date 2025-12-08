@@ -193,6 +193,24 @@ public class RPCClient: ObservableObject {
         return dict
     }
 
+    /// Get blockchain info (newer RPC method with more details)
+    public func getBlockchainInfo() async throws -> [String: Any] {
+        let result = try await call(method: "getblockchaininfo", params: [])
+        guard let dict = result as? [String: Any] else {
+            throw RPCError.invalidResponse
+        }
+        return dict
+    }
+
+    /// Get network info (connections, version, etc.)
+    public func getNetworkInfo() async throws -> [String: Any] {
+        let result = try await call(method: "getnetworkinfo", params: [])
+        guard let dict = result as? [String: Any] else {
+            throw RPCError.invalidResponse
+        }
+        return dict
+    }
+
     /// Get balance for a specific z-address
     public func getZBalance(address: String) async throws -> Double {
         let result = try await call(method: "z_getbalance", params: [address])

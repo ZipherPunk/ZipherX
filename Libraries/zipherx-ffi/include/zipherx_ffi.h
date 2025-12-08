@@ -372,4 +372,45 @@ size_t zipherx_scan_boost_outputs(
     BoostScanResult *result_out     // Output for scan summary
 );
 
+// =============================================================================
+// Tor (Arti) Integration
+// =============================================================================
+
+// Start the embedded Tor client
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_start(void);
+
+// Stop the Tor client
+// Returns 0 on success
+int32_t zipherx_tor_stop(void);
+
+// Get current Tor state
+// 0 = Disconnected, 1 = Connecting, 2 = Bootstrapping, 3 = Connected, 4 = Error
+uint8_t zipherx_tor_get_state(void);
+
+// Get bootstrap progress (0-100)
+uint8_t zipherx_tor_get_progress(void);
+
+// Get SOCKS proxy port (0 if not connected)
+uint16_t zipherx_tor_get_socks_port(void);
+
+// Get last error message
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+char* zipherx_tor_get_error(void);
+
+// Request new Tor identity (new circuit)
+// Returns 0 on success
+int32_t zipherx_tor_new_identity(void);
+
+// Make an HTTP GET request through Tor
+// Returns response body as null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL on error
+char* zipherx_tor_http_get(const char *url);
+
+// Free a string allocated by Tor functions
+void zipherx_tor_free_string(char *ptr);
+
+// Check if Tor is available (compiled in)
+bool zipherx_tor_is_available(void);
+
 #endif // ZIPHERX_FFI_H

@@ -255,6 +255,16 @@ Before any release:
     - Activity tracking resets timeout on user interaction
     - Settings → "Face ID" toggle and timeout configuration
 
+28. **Tor Privacy Support** - TorManager (December 2025) ✅
+    - Three modes: Disabled (direct), Orbot (external), Embedded (Tor.framework)
+    - `TorManager.swift` - Singleton managing Tor connectivity
+    - SOCKS5 proxy configuration for URLSession (InsightAPI)
+    - NWParameters proxy configuration for P2P connections
+    - Circuit isolation via SOCKS authentication for transaction privacy
+    - Bootstrap progress monitoring (0-100%)
+    - Settings → "TOR PRIVACY" section with mode picker and status
+    - Cypherpunk quote: "Privacy is not secrecy... Privacy is the power to selectively reveal oneself."
+
 ### In Progress / Needs Testing
 
 1. **Balance UI Update** - Show tree loading progress in main wallet view

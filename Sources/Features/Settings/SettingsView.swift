@@ -713,6 +713,31 @@ Both binaries must be installed to /usr/local/bin:
             }
             .foregroundColor(theme.textPrimary)
 
+            // Security Warning - show when neither Face ID nor PIN is enabled
+            if !useFaceID && !usePINCode {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 16))
+                        .foregroundColor(.orange)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SECURITY RECOMMENDED")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.orange)
+                        Text("Enable \(biometricAvailable ? getBiometricName() + " or " : "")PIN Code to protect your wallet from unauthorized access.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.1))
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.orange, lineWidth: 1)
+                )
+            }
+
             // Face ID / Touch ID toggle
             if biometricAvailable {
                 HStack {
@@ -831,19 +856,27 @@ Both binaries must be installed to /usr/local/bin:
                     Spacer()
 
                     HStack(spacing: 4) {
-                        Image(systemName: SQLCipherManager.shared.isSQLCipherAvailable ? "checkmark.shield.fill" : "shield")
-                            .font(.system(size: 12))
-                            .foregroundColor(SQLCipherManager.shared.isSQLCipherAvailable ? .green : .orange)
+                        // Check if database is ACTUALLY encrypted, not just if SQLCipher is available
+                        let isEncrypted = SQLCipherManager.shared.isWalletDatabaseEncrypted
+                        let hasFieldLevel = !SQLCipherManager.shared.isSQLCipherAvailable
 
-                        Text(SQLCipherManager.shared.isSQLCipherAvailable ? "Full" : "Field-level")
+                        Image(systemName: isEncrypted ? "checkmark.shield.fill" : (hasFieldLevel ? "shield" : "xmark.shield"))
+                            .font(.system(size: 12))
+                            .foregroundColor(isEncrypted ? .green : (hasFieldLevel ? .orange : .red))
+
+                        Text(isEncrypted ? "Full" : (hasFieldLevel ? "Field-level" : "Not Encrypted"))
                             .font(theme.captionFont)
-                            .foregroundColor(SQLCipherManager.shared.isSQLCipherAvailable ? .green : .orange)
+                            .foregroundColor(isEncrypted ? .green : (hasFieldLevel ? .orange : .red))
                     }
                 }
 
-                Text(SQLCipherManager.shared.isSQLCipherAvailable
+                // Show appropriate description based on actual state
+                let isEncrypted = SQLCipherManager.shared.isWalletDatabaseEncrypted
+                Text(isEncrypted
                     ? "SQLCipher: AES-256 full database encryption"
-                    : "iOS Data Protection + AES-GCM field encryption")
+                    : (SQLCipherManager.shared.isSQLCipherAvailable
+                        ? "SQLCipher available but database not encrypted (legacy database)"
+                        : "iOS Data Protection + AES-GCM field encryption"))
                     .font(theme.captionFont)
                     .foregroundColor(theme.textSecondary)
             }
@@ -1018,6 +1051,9 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
+            // Tor Privacy Mode
+            torPrivacySection
+
             // Export Reliable Peers button - DEACTIVATED (developer feature)
             if false {
                 Button(action: {
@@ -1088,6 +1124,215 @@ Both binaries must be installed to /usr/local/bin:
             #else
             Text("Exported \(peerExportCount) reliable peers to Documents/bundled_peers.json\n\nAccess via Files app → On My iPhone → ZipherX")
             #endif
+        }
+    }
+
+    // MARK: - Tor Privacy Section
+
+    private var torPrivacySection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "network.badge.shield.half.filled")
+                    .font(.system(size: 14))
+                Text("TOR PRIVACY")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                Spacer()
+
+                // Connection status indicator
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(torStatusColor)
+                        .frame(width: 8, height: 8)
+                    Text(TorManager.shared.connectionState.displayText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                }
+            }
+            .foregroundColor(theme.accentColor)
+
+            // Tor enable toggle
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { TorManager.shared.mode == .enabled },
+                    set: { TorManager.shared.mode = $0 ? .enabled : .disabled }
+                )) {
+                    HStack {
+                        Text("Route through Tor")
+                            .font(theme.bodyFont)
+                        Spacer()
+                    }
+                }
+                .toggleStyle(SwitchToggleStyle(tint: theme.accentColor))
+
+                // Mode description
+                Text(TorManager.shared.mode.description)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // macOS requirement note
+                #if os(macOS)
+                if TorManager.shared.mode == .enabled {
+                    HStack(spacing: 4) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 10))
+                        Text("Requires: brew install tor")
+                            .font(.system(size: 10, design: .monospaced))
+                    }
+                    .foregroundColor(.orange)
+                }
+                #endif
+            }
+            .padding(12)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary, lineWidth: 1)
+            )
+
+            // Start/Stop button (only for non-disabled modes)
+            if TorManager.shared.mode != .disabled {
+                Button(action: {
+                    Task {
+                        if TorManager.shared.connectionState.isConnected {
+                            await TorManager.shared.stop()
+                        } else {
+                            // Fetch real IP BEFORE connecting to Tor
+                            await TorManager.shared.fetchRealIP()
+                            await TorManager.shared.start()
+                            // Wait for connection then fetch Tor IP
+                            // This is done via onChange below
+                        }
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: TorManager.shared.connectionState.isConnected ? "stop.circle" : "play.circle")
+                            .font(.system(size: 14))
+                        Text(TorManager.shared.connectionState.isConnected ? "Disconnect Tor" : "Connect Tor")
+                            .font(theme.bodyFont)
+                        Spacer()
+                        if case .bootstrapping(let progress) = TorManager.shared.connectionState {
+                            Text("\(progress)%")
+                                .font(theme.monoFont)
+                                .foregroundColor(theme.accentColor)
+                        }
+                    }
+                    .foregroundColor(TorManager.shared.connectionState.isConnected ? .red : theme.accentColor)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(theme.surfaceColor)
+                    .overlay(
+                        Rectangle()
+                            .stroke(TorManager.shared.connectionState.isConnected ? Color.red : theme.accentColor, lineWidth: 1)
+                    )
+                }
+                .onChange(of: TorManager.shared.connectionState) { newState in
+                    // When Tor connects, fetch the exit IP to verify it's working
+                    if case .connected = newState {
+                        Task {
+                            await TorManager.shared.fetchTorIP()
+                        }
+                    }
+                }
+            }
+
+            // IP Address Verification (shows when connected)
+            if TorManager.shared.connectionState.isConnected {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("IP VERIFICATION")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.accentColor)
+
+                    HStack {
+                        Text("Your IP:")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+                        Text(TorManager.shared.realIP ?? "Unknown")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.red)
+                        Text("→")
+                            .foregroundColor(theme.textSecondary)
+                        Text(TorManager.shared.torIP ?? "Fetching...")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.green)
+                    }
+                    .onAppear {
+                        // Fetch IPs when verification section appears (in case Tor was already connected)
+                        Task {
+                            if TorManager.shared.realIP == nil {
+                                await TorManager.shared.fetchRealIP()
+                            }
+                            if TorManager.shared.torIP == nil {
+                                await TorManager.shared.fetchTorIP()
+                            }
+                        }
+                    }
+
+                    // Verification status
+                    if let realIP = TorManager.shared.realIP, let torIP = TorManager.shared.torIP {
+                        HStack(spacing: 4) {
+                            if realIP != torIP {
+                                Image(systemName: "checkmark.shield.fill")
+                                    .foregroundColor(.green)
+                                    .font(.system(size: 12))
+                                Text("Tor is working! Your IP is hidden.")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.green)
+                            } else {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.system(size: 12))
+                                Text("Warning: IP unchanged. Tor may not be routing traffic.")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(TorManager.shared.verifyTorWorking() ? Color.green : theme.textPrimary, lineWidth: 1)
+                )
+            }
+
+            // Cypherpunk quote
+            HStack(spacing: 8) {
+                Text("🧅")
+                    .font(.system(size: 12))
+                Text("\"Privacy is not secrecy... Privacy is the power to selectively reveal oneself.\"")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .italic()
+            }
+            .padding(8)
+            .background(theme.accentColor.opacity(0.1))
+            .overlay(
+                Rectangle()
+                    .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .padding(12)
+        .background(theme.backgroundColor)
+        .overlay(
+            Rectangle()
+                .stroke(theme.textPrimary, lineWidth: 1)
+        )
+    }
+
+    /// Color for Tor connection status indicator
+    private var torStatusColor: Color {
+        switch TorManager.shared.connectionState {
+        case .disconnected:
+            return .gray
+        case .connecting, .bootstrapping:
+            return .orange
+        case .connected:
+            return .green
+        case .error:
+            return .red
         }
     }
 

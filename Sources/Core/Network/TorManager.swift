@@ -1,0 +1,493 @@
+//
+//  TorManager.swift
+//  ZipherX
+//
+//  Created by ZipherX Team on 2025-12-08.
+//  Embedded Tor support via Arti (Rust) for maximum privacy
+//
+//  "Privacy is necessary for an open society in the electronic age."
+//  - A Cypherpunk's Manifesto
+//
+
+import Foundation
+import Network
+
+// MARK: - Tor Mode Enum
+
+/// Tor operating modes for ZipherX
+public enum TorMode: String, CaseIterable {
+    case disabled = "disabled"      // Direct connections (fastest)
+    case enabled = "enabled"        // Embedded Tor via Arti (maximum privacy)
+
+    var displayName: String {
+        switch self {
+        case .disabled: return "Direct"
+        case .enabled: return "Tor Enabled"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .disabled:
+            return "Connect directly to peers. Fastest but your IP is visible to nodes."
+        case .enabled:
+            return "Route all traffic through Tor. Maximum privacy, slower startup."
+        }
+    }
+}
+
+// MARK: - Tor Connection State
+
+public enum TorConnectionState: Equatable {
+    case disconnected
+    case connecting
+    case bootstrapping(progress: Int)  // 0-100%
+    case connected
+    case error(String)
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    var displayText: String {
+        switch self {
+        case .disconnected: return "Disconnected"
+        case .connecting: return "Connecting..."
+        case .bootstrapping(let progress): return "Bootstrapping \(progress)%"
+        case .connected: return "Connected"
+        case .error(let msg): return "Error: \(msg)"
+        }
+    }
+
+    /// Initialize from Arti FFI state code
+    init(artiState: UInt8) {
+        switch artiState {
+        case 0: self = .disconnected
+        case 1: self = .connecting
+        case 2: self = .bootstrapping(progress: 50)  // Will be updated by progress
+        case 3: self = .connected
+        case 4: self = .error("Unknown error")
+        default: self = .disconnected
+        }
+    }
+}
+
+// MARK: - Tor Manager
+
+/// Manages embedded Tor connectivity for ZipherX via Arti (Rust)
+/// Routes all network traffic through Tor for maximum privacy
+@MainActor
+public final class TorManager: ObservableObject {
+
+    // MARK: - Singleton
+
+    public static let shared = TorManager()
+
+    // MARK: - Published Properties
+
+    @Published public private(set) var connectionState: TorConnectionState = .disconnected
+    @Published public private(set) var currentCircuitId: String?
+    @Published public private(set) var exitNodeCountry: String?
+
+    /// IP addresses for verification - shows user their IP before and after Tor
+    @Published public private(set) var realIP: String?       // User's real IP (before Tor)
+    @Published public private(set) var torIP: String?        // Exit node IP (after Tor connected)
+
+    /// Current Tor mode (persisted)
+    @Published public var mode: TorMode {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "torMode")
+            Task {
+                await handleModeChange(from: oldValue, to: mode)
+            }
+        }
+    }
+
+    // MARK: - Configuration
+
+    /// SOCKS5 proxy port (from Arti)
+    public private(set) var socksPort: UInt16 = 0
+
+    /// Proxy host (always localhost)
+    public let proxyHost: String = "127.0.0.1"
+
+    // MARK: - Internal State
+
+    private var isStartingTor = false
+    private var statusPollingTask: Task<Void, Never>?
+
+    /// Circuit isolation counter (different value = different circuit via SOCKS auth)
+    private var circuitIsolationCounter: UInt64 = 0
+
+    // MARK: - Initialization
+
+    private init() {
+        // Load persisted mode
+        if let savedMode = UserDefaults.standard.string(forKey: "torMode"),
+           let torMode = TorMode(rawValue: savedMode) {
+            self.mode = torMode
+        } else {
+            self.mode = .disabled
+        }
+
+        // Check if Arti is available
+        let isAvailable = zipherx_tor_is_available()
+        print("🧅 TorManager initialized, mode: \(mode.displayName), Arti available: \(isAvailable)")
+    }
+
+    // MARK: - Public API
+
+    /// Start Tor connection (if mode requires it)
+    public func start() async {
+        guard mode == .enabled else {
+            print("🧅 Tor disabled, skipping start")
+            return
+        }
+
+        await startArti()
+    }
+
+    /// Stop Tor connection
+    public func stop() async {
+        print("🧅 Stopping Tor...")
+        await stopArti()
+    }
+
+    /// Request new identity (new circuit)
+    /// Use before broadcasting transactions for maximum privacy
+    public func requestNewIdentity() async -> Bool {
+        guard mode == .enabled else { return false }
+
+        // Use SOCKS auth isolation for new circuit
+        circuitIsolationCounter += 1
+        print("🧅 New circuit isolation ID: \(circuitIsolationCounter)")
+
+        // Request new identity from Arti
+        if connectionState.isConnected {
+            let result = zipherx_tor_new_identity()
+            return result == 0
+        }
+
+        return true
+    }
+
+    /// Get URLSession configured for Tor proxy
+    public func getTorURLSession(isolate: Bool = false) -> URLSession {
+        guard mode == .enabled, connectionState.isConnected, socksPort > 0 else {
+            return URLSession.shared
+        }
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60  // Tor is slower
+        config.timeoutIntervalForResource = 120
+
+        // SOCKS5 proxy configuration
+        var proxyDict: [AnyHashable: Any] = [
+            kCFStreamPropertySOCKSProxyHost as String: proxyHost,
+            kCFStreamPropertySOCKSProxyPort as String: socksPort,
+            kCFStreamPropertySOCKSVersion as String: kCFStreamSocketSOCKSVersion5
+        ]
+
+        // Circuit isolation via SOCKS authentication
+        if isolate {
+            circuitIsolationCounter += 1
+            let username = "zipherx-\(circuitIsolationCounter)"
+            let password = "isolate-\(UUID().uuidString.prefix(8))"
+            proxyDict[kCFStreamPropertySOCKSUser as String] = username
+            proxyDict[kCFStreamPropertySOCKSPassword as String] = password
+            print("🧅 Isolated circuit: \(username)")
+        }
+
+        config.connectionProxyDictionary = proxyDict
+
+        return URLSession(configuration: config)
+    }
+
+    /// Get NWParameters configured for Tor SOCKS5 proxy
+    /// Note: Full SOCKS5 proxy support requires iOS 17+ / macOS 14+
+    /// For older versions, P2P connections go direct (Tor only for HTTP)
+    public func getTorConnectionParameters(isolate: Bool = false) -> NWParameters {
+        guard mode == .enabled, connectionState.isConnected else {
+            return NWParameters.tcp
+        }
+
+        // If isolating, increment counter for different SOCKS auth
+        if isolate {
+            circuitIsolationCounter += 1
+        }
+
+        // Note: Full NWConnection SOCKS5 proxy requires iOS 17+ / macOS 14+
+        // For now, return TCP parameters - P2P will connect directly
+        // This is a limitation of Network.framework on older OS versions
+        // HTTP traffic (InsightAPI) still goes through Tor via URLSession
+        print("🧅 Note: P2P connections are direct. HTTP traffic routes through Tor.")
+        return NWParameters.tcp
+    }
+
+    /// Make HTTP GET request through Tor (uses Arti directly)
+    /// Returns response body as string, or nil on error
+    public func httpGet(url: String) async -> String? {
+        guard mode == .enabled, connectionState.isConnected else {
+            print("🧅 httpGet: Tor not connected")
+            return nil
+        }
+
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = url.withCString { urlPtr -> String? in
+                    guard let responsePtr = zipherx_tor_http_get(urlPtr) else {
+                        return nil
+                    }
+                    let response = String(cString: responsePtr)
+                    zipherx_tor_free_string(responsePtr)
+                    return response
+                }
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    /// Check if Tor is available and connected
+    public var isAvailable: Bool {
+        mode == .enabled && connectionState.isConnected
+    }
+
+    /// Check if Arti (Rust Tor) is compiled in
+    public var isArtiAvailable: Bool {
+        zipherx_tor_is_available()
+    }
+
+    // MARK: - Mode Change Handling
+
+    private func handleModeChange(from oldMode: TorMode, to newMode: TorMode) async {
+        print("🧅 Mode change: \(oldMode.displayName) → \(newMode.displayName)")
+
+        // Stop old connection
+        if oldMode == .enabled {
+            await stopArti()
+        }
+
+        // Start new mode
+        if newMode == .enabled {
+            await start()
+        } else {
+            connectionState = .disconnected
+
+            // Remove Tor proxy from zclassic.conf when Tor is disabled
+            #if os(macOS)
+            FullNodeManager.shared.removeTorProxy()
+            Task {
+                await FullNodeManager.shared.refreshDaemonNetwork()
+            }
+            #endif
+        }
+    }
+
+    // MARK: - Arti (Rust Tor) Integration
+
+    private func startArti() async {
+        guard !isStartingTor else {
+            print("🧅 Tor already starting...")
+            return
+        }
+
+        // Check if Arti is available
+        guard zipherx_tor_is_available() else {
+            connectionState = .error("Arti not available in this build")
+            return
+        }
+
+        isStartingTor = true
+        connectionState = .connecting
+
+        print("🧅 Starting Arti (embedded Tor)...")
+
+        // Start Arti in background thread
+        let result = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = zipherx_tor_start()
+                continuation.resume(returning: result)
+            }
+        }
+
+        if result != 0 {
+            // Get error message
+            if let errorPtr = zipherx_tor_get_error() {
+                let errorMsg = String(cString: errorPtr)
+                zipherx_tor_free_string(errorPtr)
+                connectionState = .error(errorMsg)
+            } else {
+                connectionState = .error("Failed to start Tor")
+            }
+            isStartingTor = false
+            return
+        }
+
+        // Start polling for status updates
+        startStatusPolling()
+    }
+
+    private func stopArti() async {
+        print("🧅 Stopping Arti...")
+
+        // Stop status polling
+        statusPollingTask?.cancel()
+        statusPollingTask = nil
+
+        // Stop Arti
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = zipherx_tor_stop()
+                continuation.resume()
+            }
+        }
+
+        connectionState = .disconnected
+        socksPort = 0
+        isStartingTor = false
+    }
+
+    private func startStatusPolling() {
+        statusPollingTask?.cancel()
+
+        statusPollingTask = Task {
+            while !Task.isCancelled {
+                await updateStatus()
+
+                // Stop polling if connected or error
+                if case .connected = connectionState {
+                    isStartingTor = false
+                    break
+                }
+                if case .error = connectionState {
+                    isStartingTor = false
+                    break
+                }
+
+                try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms
+            }
+        }
+    }
+
+    private func updateStatus() async {
+        let state = zipherx_tor_get_state()
+        let progress = zipherx_tor_get_progress()
+        let port = zipherx_tor_get_socks_port()
+
+        await MainActor.run {
+            // Update connection state based on Arti state
+            switch state {
+            case 0:  // Disconnected
+                connectionState = .disconnected
+            case 1:  // Connecting
+                connectionState = .connecting
+            case 2:  // Bootstrapping
+                connectionState = .bootstrapping(progress: Int(progress))
+            case 3:  // Connected
+                connectionState = .connected
+                socksPort = port
+                print("🧅 Tor connected! SOCKS port: \(port)")
+
+                // Notify FullNodeManager to update zclassic.conf with Tor proxy
+                #if os(macOS)
+                FullNodeManager.shared.updateTorProxy(host: proxyHost, port: port)
+                Task {
+                    await FullNodeManager.shared.refreshDaemonNetwork()
+                }
+                #endif
+            case 4:  // Error
+                if let errorPtr = zipherx_tor_get_error() {
+                    let errorMsg = String(cString: errorPtr)
+                    zipherx_tor_free_string(errorPtr)
+                    connectionState = .error(errorMsg)
+                } else {
+                    connectionState = .error("Unknown error")
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    // MARK: - Helper Functions
+
+    private func getTorDataDirectory() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("ZipherX/Tor", isDirectory: true)
+    }
+
+    // MARK: - IP Address Verification
+
+    /// Fetch public IP address using direct connection (bypassing Tor)
+    /// Call this BEFORE enabling Tor to show user their real IP
+    public func fetchRealIP() async {
+        // Use a simple IP check service - direct connection
+        let session = URLSession.shared
+        guard let url = URL(string: "https://api.ipify.org") else { return }
+
+        do {
+            let (data, _) = try await session.data(from: url)
+            if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                await MainActor.run {
+                    self.realIP = ip
+                    print("🧅 Real IP (before Tor): \(ip)")
+                }
+            }
+        } catch {
+            print("🧅 Failed to fetch real IP: \(error.localizedDescription)")
+        }
+    }
+
+    /// Fetch public IP address through Tor
+    /// Call this AFTER Tor is connected to verify exit node IP
+    public func fetchTorIP() async {
+        guard connectionState.isConnected else {
+            print("🧅 Cannot fetch Tor IP - not connected")
+            return
+        }
+
+        // Use Tor-configured URLSession
+        let session = getTorURLSession(isolate: false)
+        guard let url = URL(string: "https://api.ipify.org") else { return }
+
+        do {
+            let (data, _) = try await session.data(from: url)
+            if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                await MainActor.run {
+                    self.torIP = ip
+                    print("🧅 Tor exit IP (after Tor): \(ip)")
+                }
+            }
+        } catch {
+            print("🧅 Failed to fetch Tor IP: \(error.localizedDescription)")
+        }
+    }
+
+    /// Verify Tor is working by comparing IPs
+    /// Returns true if IPs are different (Tor is hiding your real IP)
+    public func verifyTorWorking() -> Bool {
+        guard let real = realIP, let tor = torIP else { return false }
+        return real != tor
+    }
+}
+
+// MARK: - Debug Extensions
+
+extension TorManager {
+
+    /// Get debug info about Tor status
+    public var debugInfo: String {
+        """
+        🧅 Tor Status (Arti)
+        ─────────────────────────
+        Mode: \(mode.displayName)
+        State: \(connectionState.displayText)
+        Arti Available: \(isArtiAvailable)
+        SOCKS: \(proxyHost):\(socksPort)
+        Circuit ID: \(currentCircuitId ?? "N/A")
+        Exit Country: \(exitNodeCountry ?? "N/A")
+        Isolation Counter: \(circuitIsolationCounter)
+        """
+    }
+}

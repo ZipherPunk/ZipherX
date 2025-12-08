@@ -3,17 +3,19 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 63;
+	objectVersion = 77;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
+		06809D718F601662F7E64D8B /* TorManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE0707D0A98DFEF7F487D9B /* TorManager.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		06B12D7857EFEC8AC250FC21 /* Win95Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA9A163DB79D1C4871FD5D /* Win95Theme.swift */; };
 		06EFE4825D0A38F6B1659224 /* DatabaseEncryption.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */; };
 		081187F2F7A558ACD51FDC40 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
+		099D7898F55101699514DC81 /* TorManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE0707D0A98DFEF7F487D9B /* TorManager.swift */; };
 		0E9CC1442507E8DA6B137645 /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8734EC25838585488804B01 /* HistoryView.swift */; };
 		0EC0AE8AA031C37EA515AF19 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D114627F3AC22A9229292187 /* HeaderSyncManager.swift */; };
 		166B61D02B2AEB89D06A158A /* BundledShieldedOutputs.swift in Sources */ = {isa = PBXBuildFile; fileRef = F745C75EE82A4C61B3D8050B /* BundledShieldedOutputs.swift */; };
@@ -181,6 +183,7 @@
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
+		9CE0707D0A98DFEF7F487D9B /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseEncryption.swift; sourceTree = "<group>"; };
 		A9C06A2912C98B98AD2E5D87 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
@@ -423,6 +426,7 @@
 				710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */,
 				18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */,
 				48D92FD9B357E6379040DA58 /* Peer.swift */,
+				9CE0707D0A98DFEF7F487D9B /* TorManager.swift */,
 			);
 			path = Network;
 			sourceTree = "<group>";
@@ -630,6 +634,7 @@
 			);
 			mainGroup = 1E0AB0F916282FFBD8E5F74E;
 			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -713,6 +718,7 @@
 				87821B0808BF2BB65B8DC3A7 /* System7Theme.swift in Sources */,
 				E4979D57487D8A0547221B53 /* ThemeManager.swift in Sources */,
 				988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */,
+				06809D718F601662F7E64D8B /* TorManager.swift in Sources */,
 				BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */,
 				90604ADFA09E5EB4C3ED5245 /* WalletDatabase.swift in Sources */,
 				DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */,
@@ -777,6 +783,7 @@
 				C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */,
 				2181FB4B936836564DCC5956 /* ThemeManager.swift in Sources */,
 				C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */,
+				099D7898F55101699514DC81 /* TorManager.swift in Sources */,
 				745902783803843898150674 /* TransactionBuilder.swift in Sources */,
 				416268C8206067F62AE5C1B4 /* WalletDatabase.swift in Sources */,
 				7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */,
@@ -849,14 +856,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -883,7 +894,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -911,7 +924,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -929,14 +944,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";

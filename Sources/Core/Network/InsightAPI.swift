@@ -35,6 +35,9 @@ final class InsightAPI: NSObject {
     /// URLSession with certificate pinning delegate
     private var session: URLSession!
 
+    /// Tor-enabled URLSession (when Tor mode active)
+    private var torSession: URLSession?
+
     /// Certificate pinning delegate
     private let pinningDelegate = CertificatePinningDelegate()
 
@@ -47,6 +50,9 @@ final class InsightAPI: NSObject {
 
         // SECURITY: Use delegate for certificate pinning
         self.session = URLSession(configuration: config, delegate: pinningDelegate, delegateQueue: nil)
+
+        // Setup Tor session observer
+        setupTorObserver()
 
         // Populate pins on first launch (development mode)
         Task {
@@ -78,12 +84,70 @@ final class InsightAPI: NSObject {
         #endif
     }
 
+    // MARK: - Tor Integration
+
+    /// Setup observer to update Tor session when mode changes
+    private func setupTorObserver() {
+        // Observe TorManager state changes
+        Task { @MainActor in
+            // Initial setup
+            updateTorSession()
+        }
+    }
+
+    /// Update the Tor session based on TorManager state
+    @MainActor
+    private func updateTorSession() {
+        let torManager = TorManager.shared
+
+        if torManager.mode != .disabled && torManager.connectionState.isConnected {
+            // Create Tor-enabled session with SOCKS5 proxy
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 60  // Tor is slower
+            config.timeoutIntervalForResource = 120
+
+            // SOCKS5 proxy configuration
+            config.connectionProxyDictionary = [
+                kCFStreamPropertySOCKSProxyHost as String: torManager.proxyHost,
+                kCFStreamPropertySOCKSProxyPort as String: torManager.socksPort,
+                kCFStreamPropertySOCKSVersion as String: kCFStreamSocketSOCKSVersion5
+            ]
+
+            // Note: Certificate pinning still applies through delegate
+            torSession = URLSession(configuration: config, delegate: pinningDelegate, delegateQueue: nil)
+            print("🧅 InsightAPI: Tor session configured (SOCKS5 \(torManager.proxyHost):\(torManager.socksPort))")
+        } else {
+            torSession = nil
+        }
+    }
+
+    /// Get the appropriate session (Tor if available, otherwise direct)
+    private func getActiveSession() -> URLSession {
+        // Check if Tor should be used
+        Task { @MainActor in
+            updateTorSession()
+        }
+
+        // Use Tor session if available
+        if let torSession = torSession {
+            return torSession
+        }
+        return session
+    }
+
+    /// Check if currently using Tor
+    @MainActor
+    public var isUsingTor: Bool {
+        TorManager.shared.mode != .disabled && TorManager.shared.connectionState.isConnected
+    }
+
     // MARK: - Status
 
     /// Get blockchain status
     func getStatus() async throws -> BlockchainStatus {
         let url = URL(string: "\(baseURL)/api/status")!
-        let (data, _) = try await session.data(from: url)
+        let activeSession = getActiveSession()
+        let (data, _) = try await activeSession.data(from: url)
 
         let response = try JSONDecoder().decode(StatusResponse.self, from: data)
         return BlockchainStatus(

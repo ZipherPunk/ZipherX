@@ -3,6 +3,9 @@
 //! This crate provides C-compatible functions for iOS integration
 //! Using real librustzcash for proper Sapling operations
 
+// Tor module (Arti integration)
+pub mod tor;
+
 // Set to true for verbose debug output, false for production
 const DEBUG_LOGGING: bool = false;
 

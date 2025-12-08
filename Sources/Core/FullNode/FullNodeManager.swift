@@ -29,6 +29,11 @@ public class FullNodeManager: ObservableObject {
     @Published public private(set) var daemonBlockHeight: UInt64 = 0
     @Published public private(set) var daemonSyncProgress: Double = 0.0
 
+    /// Tracks whether daemon needs restart to use Tor proxy
+    /// Set to true when Tor connects and proxy is written to config
+    /// Set to false when daemon is restarted (in startDaemon)
+    @Published public private(set) var needsTorRestart: Bool = false
+
     // MARK: - Daemon Status
 
     public enum DaemonStatus: Equatable {
@@ -97,10 +102,34 @@ public class FullNodeManager: ObservableObject {
         dataDir.appendingPathComponent("zclassic.conf")
     }
 
+    // MARK: - Auto-Refresh Timer
+
+    private var statusRefreshTimer: Timer?
+    private static let STATUS_REFRESH_INTERVAL: TimeInterval = 5.0  // Refresh every 5 seconds
+
     // MARK: - Initialization
 
     private init() {
         checkNodeStatus()
+        startAutoRefresh()
+    }
+
+    deinit {
+        stopAutoRefresh()
+    }
+
+    /// Start automatic status refresh timer
+    public func startAutoRefresh() {
+        stopAutoRefresh()
+        statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: Self.STATUS_REFRESH_INTERVAL, repeats: true) { [weak self] _ in
+            self?.checkNodeStatus()
+        }
+    }
+
+    /// Stop automatic status refresh
+    public func stopAutoRefresh() {
+        statusRefreshTimer?.invalidate()
+        statusRefreshTimer = nil
     }
 
     // MARK: - Status Checking
@@ -275,6 +304,8 @@ public class FullNodeManager: ObservableObject {
                 if await RPCClient.shared.checkConnection() {
                     await MainActor.run {
                         daemonStatus = .running
+                        // Clear the Tor restart flag - daemon just started with latest config
+                        needsTorRestart = false
                     }
                     print("✅ Daemon started successfully after \(i) seconds")
                     return
@@ -428,6 +459,121 @@ public class FullNodeManager: ObservableObject {
             print("⚠️ Could not get daemon version: \(error)")
         }
         return nil
+    }
+
+    // MARK: - Tor Integration
+
+    /// Update zclassic.conf with Tor proxy settings
+    /// Called by TorManager when Arti connects with a SOCKS port
+    public func updateTorProxy(host: String, port: UInt16) {
+        let configPath = Self.configPath
+
+        guard FileManager.default.fileExists(atPath: configPath.path) else {
+            print("⚠️ FullNodeManager: zclassic.conf not found, cannot update Tor proxy")
+            return
+        }
+
+        do {
+            var config = try String(contentsOf: configPath, encoding: .utf8)
+            var lines = config.components(separatedBy: "\n")
+            var proxyFound = false
+            var onlynetFound = false
+
+            // Update or add proxy line
+            for i in 0..<lines.count {
+                if lines[i].hasPrefix("proxy=") {
+                    lines[i] = "proxy=\(host):\(port)"
+                    proxyFound = true
+                    print("🧅 FullNodeManager: Updated proxy to \(host):\(port)")
+                }
+                if lines[i].hasPrefix("onlynet=") {
+                    onlynetFound = true
+                }
+            }
+
+            if !proxyFound {
+                // Add proxy setting before first blank line or at end
+                let proxyLine = "proxy=\(host):\(port)"
+                if let firstEmpty = lines.firstIndex(where: { $0.isEmpty }) {
+                    lines.insert(proxyLine, at: firstEmpty)
+                } else {
+                    lines.append(proxyLine)
+                }
+                print("🧅 FullNodeManager: Added proxy=\(host):\(port)")
+            }
+
+            // Optionally add onlynet=onion for maximum privacy
+            // (commented out - user may want clearnet fallback)
+            // if !onlynetFound {
+            //     lines.append("onlynet=onion")
+            // }
+
+            config = lines.joined(separator: "\n")
+            try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+            print("✅ FullNodeManager: zclassic.conf updated with Tor proxy")
+
+            // Note: Daemon needs restart to pick up new proxy
+            // Mark that daemon needs restart to use Tor
+            if daemonStatus.isRunning {
+                DispatchQueue.main.async {
+                    self.needsTorRestart = true
+                    print("⚠️ FullNodeManager: Daemon needs restart to use Tor proxy")
+                }
+            }
+
+        } catch {
+            print("❌ FullNodeManager: Failed to update zclassic.conf: \(error)")
+        }
+    }
+
+    /// Remove Tor proxy setting from zclassic.conf
+    /// Called when Tor is disabled
+    public func removeTorProxy() {
+        let configPath = Self.configPath
+
+        guard FileManager.default.fileExists(atPath: configPath.path) else { return }
+
+        do {
+            var config = try String(contentsOf: configPath, encoding: .utf8)
+            var lines = config.components(separatedBy: "\n")
+
+            // Remove proxy and onlynet lines
+            lines.removeAll { line in
+                line.hasPrefix("proxy=") || line.hasPrefix("onlynet=onion")
+            }
+
+            config = lines.joined(separator: "\n")
+            try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+            print("🧅 FullNodeManager: Removed Tor proxy from zclassic.conf")
+
+        } catch {
+            print("❌ FullNodeManager: Failed to remove proxy from zclassic.conf: \(error)")
+        }
+    }
+
+    /// Restart daemon's network to apply new proxy settings
+    /// Note: Most settings require daemon restart to take effect
+    /// This method logs that a restart is needed
+    public func refreshDaemonNetwork() async {
+        guard daemonStatus.isRunning else { return }
+
+        // Most network settings (including proxy) require a full daemon restart
+        // Just log a message - the daemon will pick up new proxy on next restart
+        print("🧅 FullNodeManager: Proxy config updated. Daemon restart required to apply.")
+
+        // Try to add some peer connections using onetry (doesn't require restart)
+        // This won't change the proxy but may help get some connections going
+        let peers = ["162.55.92.62:8033", "157.90.223.151:8033", "37.187.76.79:8033"]
+        for peer in peers {
+            let process = Process()
+            process.executableURL = Self.cliPath
+            process.arguments = ["addnode", peer, "onetry"]
+            try? process.run()
+            process.waitUntilExit()
+        }
+        print("✅ FullNodeManager: Attempted peer connections via addnode onetry")
     }
 
     // MARK: - Helpers

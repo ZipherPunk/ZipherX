@@ -12,6 +12,10 @@ struct BalanceView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
+    @ObservedObject private var torManager = TorManager.shared
+    #if os(macOS)
+    @ObservedObject private var fullNodeManager = FullNodeManager.shared
+    #endif
     @State private var isRefreshing = false
     @State private var showError = false
     @State private var errorMessage = ""
@@ -837,9 +841,14 @@ struct BalanceView: View {
 
     private var networkStatus: some View {
         VStack(spacing: 0) {
-            // Mode indicator (macOS only)
+            // Mode indicator (macOS only - includes privacy level)
             #if os(macOS)
             modeIndicator
+            Divider()
+                .background(theme.borderColor)
+            #else
+            // iOS: Privacy level indicator (always Light mode, but can use Tor)
+            privacyIndicator
             Divider()
                 .background(theme.borderColor)
             #endif
@@ -855,6 +864,17 @@ struct BalanceView: View {
                     Text(connectionStatusText)
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
+
+                    // Show .onion peers count when discovered
+                    if networkManager.onionPeersCount > 0 {
+                        HStack(spacing: 4) {
+                            Text("🧅")
+                                .font(.system(size: 10))
+                            Text("\(networkManager.onionPeersCount) .onion peers discovered")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.secondaryColor)
+                        }
+                    }
                 }
 
                 Spacer()
@@ -1131,44 +1151,252 @@ struct BalanceView: View {
     // MARK: - Mode Indicator (macOS only)
 
     #if os(macOS)
+    // Animated heart state for healthy daemon
+    @State private var heartScale: CGFloat = 1.0
+    @State private var heartTimer: Timer?
     private var modeIndicator: some View {
-        HStack(spacing: 6) {
-            // Mode icon
-            Image(systemName: WalletModeManager.shared.currentMode == .fullNode ? "server.rack" : "bolt.fill")
-                .foregroundColor(modeIndicatorColor)
-                .font(.system(size: 10))
+        VStack(spacing: 2) {
+            // Row 1: Mode indicator (Full Node vs Light)
+            HStack(spacing: 6) {
+                // Mode icon - animated heart when daemon is healthy
+                if WalletModeManager.shared.currentMode == .fullNode && isDaemonHealthy {
+                    // Animated beating heart for healthy Full Node
+                    Image(systemName: "heart.fill")
+                        .foregroundColor(Color(red: 0, green: 1, blue: 0.25))  // Neon green
+                        .font(.system(size: 12))
+                        .scaleEffect(heartScale)
+                        .animation(.easeInOut(duration: 0.5), value: heartScale)
+                        .onAppear {
+                            startHeartbeat()
+                        }
+                        .onDisappear {
+                            stopHeartbeat()
+                        }
+                } else {
+                    Image(systemName: WalletModeManager.shared.currentMode == .fullNode ? "server.rack" : "bolt.fill")
+                        .foregroundColor(modeIndicatorColor)
+                        .font(.system(size: 10))
+                }
 
-            // Mode text
-            Text(WalletModeManager.shared.currentMode == .fullNode ? "FULL NODE" : "LIGHT MODE")
-                .font(theme.captionFont)
-                .fontWeight(.medium)
-                .foregroundColor(modeIndicatorColor)
+                // Mode text
+                Text(WalletModeManager.shared.currentMode == .fullNode ? "FULL NODE" : "LIGHT MODE")
+                    .font(theme.captionFont)
+                    .fontWeight(.medium)
+                    .foregroundColor(modeIndicatorColor)
 
-            Spacer()
+                Spacer()
 
-            // Full Node: show daemon block height
-            if WalletModeManager.shared.currentMode == .fullNode {
-                if FullNodeManager.shared.daemonStatus.isRunning {
-                    Text("Block \(FullNodeManager.shared.daemonBlockHeight)")
+                // Full Node: show daemon block height
+                if WalletModeManager.shared.currentMode == .fullNode {
+                    if fullNodeManager.daemonStatus.isRunning {
+                        Text("Block \(fullNodeManager.daemonBlockHeight)")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    } else {
+                        Text(fullNodeManager.daemonStatus.displayText)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.warningColor)
+                    }
+                }
+            }
+
+            // Row 2: Privacy level indicator (Tor/Onion vs P2P)
+            HStack(spacing: 6) {
+                // Privacy icon
+                if torManager.connectionState.isConnected {
+                    Text("🧅")
+                        .font(.system(size: 10))
+                } else if torManager.mode == .enabled {
+                    // Tor enabled but not connected yet
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: "network")
+                        .foregroundColor(privacyIndicatorColor)
+                        .font(.system(size: 10))
+                }
+
+                // Privacy text
+                Text(privacyLevelText)
+                    .font(theme.captionFont)
+                    .fontWeight(.medium)
+                    .foregroundColor(privacyIndicatorColor)
+
+                Spacer()
+
+                // Show restart warning when Tor connected but daemon needs restart
+                if torManager.connectionState.isConnected &&
+                   WalletModeManager.shared.currentMode == .fullNode &&
+                   fullNodeManager.daemonStatus.isRunning &&
+                   daemonNeedsTorRestart {
+                    Text("⚠️ Restart daemon")
+                        .font(theme.captionFont)
+                        .foregroundColor(.orange)
+                } else if torManager.connectionState.isConnected && torManager.socksPort > 0 {
+                    // Show Tor SOCKS port when connected
+                    Text("SOCKS:\(torManager.socksPort)")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
-                } else {
-                    Text(FullNodeManager.shared.daemonStatus.displayText)
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.warningColor)
                 }
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(modeIndicatorColor.opacity(0.1))
+        .background(
+            LinearGradient(
+                colors: [modeIndicatorColor.opacity(0.1), privacyIndicatorColor.opacity(0.1)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    /// Privacy level display text
+    private var privacyLevelText: String {
+        if torManager.connectionState.isConnected {
+            return "FULL PRIVACY (Tor/Onion)"
+        } else if torManager.mode == .enabled {
+            return "Connecting to Tor..."
+        } else {
+            return "PARTIAL PRIVACY (P2P)"
+        }
+    }
+
+    /// Privacy indicator color
+    private var privacyIndicatorColor: Color {
+        if torManager.connectionState.isConnected {
+            // Purple/violet for Tor connected (onion color)
+            return Color(red: 0.6, green: 0.3, blue: 0.9)
+        } else if torManager.mode == .enabled {
+            // Orange when connecting
+            return .orange
+        } else {
+            // Yellow/amber for partial privacy (P2P exposes IP)
+            return .yellow
+        }
+    }
+
+    /// Whether the Full Node daemon is healthy (running with peers)
+    private var isDaemonHealthy: Bool {
+        WalletModeManager.shared.currentMode == .fullNode &&
+        fullNodeManager.daemonStatus.isRunning &&
+        RPCClient.shared.peerCount > 0
+    }
+
+    /// Whether daemon needs restart to use Tor
+    /// Uses FullNodeManager.needsTorRestart which tracks Tor proxy config changes
+    private var daemonNeedsTorRestart: Bool {
+        fullNodeManager.needsTorRestart
+    }
+
+    /// Start the heartbeat animation
+    private func startHeartbeat() {
+        heartTimer?.invalidate()
+        heartTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { _ in
+            withAnimation(.easeInOut(duration: 0.3)) {
+                heartScale = 1.2
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    heartScale = 1.0
+                }
+            }
+        }
+    }
+
+    /// Stop the heartbeat animation
+    private func stopHeartbeat() {
+        heartTimer?.invalidate()
+        heartTimer = nil
     }
 
     private var modeIndicatorColor: Color {
         if WalletModeManager.shared.currentMode == .fullNode {
-            return FullNodeManager.shared.daemonStatus.isRunning ? .green : .orange
+            // Neon green when daemon is running and has peers (fully connected)
+            // Bright fluorescent green (#00FF40) for visibility
+            if fullNodeManager.daemonStatus.isRunning {
+                // Check if connected to network (has connections)
+                let peerCount = RPCClient.shared.peerCount
+                if peerCount > 0 {
+                    // Full Node running + connected = neon/fluo green
+                    return Color(red: 0, green: 1, blue: 0.25)  // Bright neon green like iOS sync view
+                } else {
+                    // Running but not connected to peers yet
+                    return .orange
+                }
+            } else {
+                return .orange
+            }
         }
         return .blue
+    }
+    #endif
+
+    // MARK: - iOS Privacy Indicator
+
+    #if os(iOS)
+    /// iOS privacy indicator - shows privacy level (Tor/Onion vs P2P)
+    private var privacyIndicator: some View {
+        HStack(spacing: 6) {
+            // Mode icon (always Light on iOS)
+            Image(systemName: "bolt.fill")
+                .foregroundColor(.blue)
+                .font(.system(size: 10))
+
+            Text("LIGHT MODE")
+                .font(theme.captionFont)
+                .fontWeight(.medium)
+                .foregroundColor(.blue)
+
+            Text("•")
+                .foregroundColor(theme.textSecondary)
+
+            // Privacy icon
+            if torManager.connectionState.isConnected {
+                Text("🧅")
+                    .font(.system(size: 10))
+            } else if torManager.mode == .enabled {
+                ProgressView()
+                    .scaleEffect(0.5)
+                    .frame(width: 12, height: 12)
+            } else {
+                Image(systemName: "network")
+                    .foregroundColor(iOSPrivacyColor)
+                    .font(.system(size: 10))
+            }
+
+            // Privacy text
+            Text(iOSPrivacyText)
+                .font(theme.captionFont)
+                .fontWeight(.medium)
+                .foregroundColor(iOSPrivacyColor)
+
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(iOSPrivacyColor.opacity(0.1))
+    }
+
+    private var iOSPrivacyText: String {
+        if torManager.connectionState.isConnected {
+            return "FULL PRIVACY"
+        } else if torManager.mode == .enabled {
+            return "Connecting..."
+        } else {
+            return "PARTIAL PRIVACY"
+        }
+    }
+
+    private var iOSPrivacyColor: Color {
+        if torManager.connectionState.isConnected {
+            return Color(red: 0.6, green: 0.3, blue: 0.9)  // Purple for Tor
+        } else if torManager.mode == .enabled {
+            return .orange
+        } else {
+            return .yellow
+        }
     }
     #endif
 
@@ -1178,7 +1406,7 @@ struct BalanceView: View {
         #if os(macOS)
         // Full Node mode - use daemon status for color
         if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = FullNodeManager.shared.daemonStatus
+            let daemonStatus = fullNodeManager.daemonStatus
             switch daemonStatus {
             case .running:
                 return .green
@@ -1208,7 +1436,7 @@ struct BalanceView: View {
         #if os(macOS)
         // Full Node mode - text color based on daemon status
         if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = FullNodeManager.shared.daemonStatus
+            let daemonStatus = fullNodeManager.daemonStatus
             return daemonStatus.isRunning ? theme.textPrimary : theme.errorColor
         }
         #endif
@@ -1224,13 +1452,13 @@ struct BalanceView: View {
         #if os(macOS)
         // Show Full Node status if in Full Node mode
         if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = FullNodeManager.shared.daemonStatus
+            let daemonStatus = fullNodeManager.daemonStatus
             let rpcClient = RPCClient.shared
             switch daemonStatus {
             case .running:
                 // Show block height and data size
                 let height = rpcClient.blockHeight
-                let size = FullNodeManager.shared.blockchainSize
+                let size = fullNodeManager.blockchainSize
                 if height > 0 {
                     return "🖥️ Full Node · Block \(height) · \(size)"
                 } else {

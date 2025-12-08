@@ -44,7 +44,7 @@ harness = false
 version = "0.8"
 
 [dependencies.bip0039]
-version = "0.10"
+version = "0.12"
 features = [
     "std",
     "all-languages",

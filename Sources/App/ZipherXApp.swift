@@ -35,6 +35,12 @@ struct ZipherXApp: App {
         Task {
             await CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()
         }
+
+        // Auto-start Tor if mode is enabled (for maximum privacy)
+        // This ensures daemon routes through Tor from first connection
+        Task {
+            await TorManager.shared.start()
+        }
     }
 
     var body: some Scene {

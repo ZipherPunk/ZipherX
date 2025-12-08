@@ -144,6 +144,7 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var lastBlockTxCount: Int = 0
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
+    @Published private(set) var onionPeersCount: Int = 0
 
     /// Warning: P2P connection issues prevent mempool scanning
     /// UI should show warning when this is true (incoming tx detection disabled)
@@ -226,6 +227,14 @@ final class NetworkManager: ObservableObject {
         "116.202.13.16:8033",
         "188.165.24.209:8033",
         "198.50.168.213:8033"
+    ]
+
+    // .onion peers for Tor users (requires Tor to be enabled)
+    // These are hidden service addresses that can only be reached via Tor
+    // Note: .onion peers are also discovered dynamically via P2P addr/addrv2 messages
+    private let onionPeersZCL: [String] = [
+        // Add known Zclassic .onion seed nodes here
+        // Format: "abcdefghijk234567.onion:8033"
     ]
 
     // Zclassic network parameters
@@ -417,13 +426,38 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Select best peer to connect to based on scoring
+    /// Filters .onion addresses based on Tor availability
     private func selectBestAddress() -> PeerAddress? {
         addressLock.lock()
         defer { addressLock.unlock() }
 
+        // Check if Tor is available for .onion connections
+        let torAvailable = torIsAvailable
+
+        // Helper to check if address is .onion
+        func isOnion(_ host: String) -> Bool {
+            return host.hasSuffix(".onion")
+        }
+
+        // Helper to filter address based on Tor availability
+        func isAddressUsable(_ address: PeerAddress) -> Bool {
+            if isOnion(address.host) {
+                return torAvailable // Only use .onion if Tor is available
+            }
+            return true // Regular addresses always usable
+        }
+
         // Prefer new addresses first
-        if let newKey = newAddresses.randomElement(),
+        let usableNewAddresses = newAddresses.filter { key in
+            guard let info = knownAddresses[key] else { return false }
+            return isAddressUsable(info.address)
+        }
+
+        if let newKey = usableNewAddresses.randomElement(),
            let info = knownAddresses[newKey] {
+            if isOnion(info.address.host) {
+                print("🧅 Selected new .onion peer: \(info.address.host)")
+            }
             return info.address
         }
 
@@ -431,6 +465,7 @@ final class NetworkManager: ObservableObject {
         var candidates: [(String, Double)] = []
         for key in triedAddresses {
             if let info = knownAddresses[key] {
+                guard isAddressUsable(info.address) else { continue }
                 let chance = info.getChance()
                 if chance > 0 {
                     candidates.append((key, chance))
@@ -445,7 +480,12 @@ final class NetworkManager: ObservableObject {
             for (key, chance) in candidates {
                 random -= chance
                 if random <= 0 {
-                    return knownAddresses[key]?.address
+                    if let address = knownAddresses[key]?.address {
+                        if isOnion(address.host) {
+                            print("🧅 Selected tried .onion peer: \(address.host)")
+                        }
+                        return address
+                    }
                 }
             }
         }
@@ -453,15 +493,47 @@ final class NetworkManager: ObservableObject {
         return nil
     }
 
+    /// Check if Tor is available for connections (cached for performance in sync operations)
+    private var torIsAvailable: Bool {
+        // This is called synchronously, so we can't await TorManager
+        // Use a cached value that's updated periodically
+        return _torIsAvailable
+    }
+    private var _torIsAvailable: Bool = false
+
+    /// Update Tor availability status (call periodically or when Tor state changes)
+    func updateTorAvailability() async {
+        let mode = await TorManager.shared.mode
+        let connected = await TorManager.shared.connectionState.isConnected
+        _torIsAvailable = (mode == .enabled && connected)
+
+        // Count .onion peers in address book
+        addressLock.lock()
+        let onionCount = knownAddresses.values.filter { $0.address.host.hasSuffix(".onion") }.count
+        addressLock.unlock()
+
+        await MainActor.run {
+            self.onionPeersCount = onionCount
+        }
+
+        if _torIsAvailable {
+            print("🧅 Tor available - \(onionCount) .onion peers in address book")
+        }
+    }
+
     /// Request addresses from all connected peers
     private func discoverMoreAddresses() async {
         var discoveredCount = 0
+        var onionDiscoveredCount = 0
         for peer in peers {
             do {
                 let addresses = try await peer.getAddresses()
                 for addr in addresses {
                     addAddress(addr, source: peer.host)
                     discoveredCount += 1
+                    if addr.host.hasSuffix(".onion") {
+                        onionDiscoveredCount += 1
+                    }
                 }
                 peer.recordSuccess()
             } catch {
@@ -469,9 +541,17 @@ final class NetworkManager: ObservableObject {
             }
         }
 
+        // Log .onion discoveries
+        if onionDiscoveredCount > 0 {
+            print("🧅 Discovered \(onionDiscoveredCount) .onion peers via P2P addr messages")
+        }
+
         // Persist addresses if we discovered new ones
         if discoveredCount > 0 {
             persistAddresses()
+
+            // Update onion peer count
+            await updateTorAvailability()
         }
     }
 
@@ -806,6 +886,9 @@ final class NetworkManager: ObservableObject {
         isConnecting = true
         defer { isConnecting = false }
 
+        // Update Tor availability status for .onion peer selection
+        await updateTorAvailability()
+
         print("🔌 Starting network connection...")
 
         // Discover peers via DNS seeds
@@ -818,6 +901,19 @@ final class NetworkManager: ObservableObject {
             if components.count == 2,
                let port = UInt16(components[1]) {
                 discoveredPeers.append(PeerAddress(host: String(components[0]), port: port))
+            }
+        }
+
+        // Add .onion peers if Tor is enabled and connected
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torConnected && !onionPeersZCL.isEmpty {
+            print("🧅 Tor connected - adding \(onionPeersZCL.count) .onion peers")
+            for peer in onionPeersZCL {
+                let components = peer.split(separator: ":")
+                if components.count == 2,
+                   let port = UInt16(components[1]) {
+                    discoveredPeers.append(PeerAddress(host: String(components[0]), port: port))
+                }
             }
         }
 
@@ -1691,17 +1787,28 @@ final class NetworkManager: ObservableObject {
                         // Change outputs are NOT counted in mempoolIncoming
                         print("🔔 MEMPOOL: Excluding change output \(txIncomingAmount) zatoshis from tx \(txHashHex.prefix(12))...")
                     } else {
-                        // Real incoming - count it and prepare for notification
-                        incomingAmount += txIncomingAmount
-                        incomingCount += 1
+                        // CRITICAL: Check if this tx has already been confirmed
+                        // This prevents the race condition where mempool scan runs
+                        // after confirmation clears mempoolIncoming, but the tx
+                        // is still in some peers' mempool (brief lag before removal)
+                        let txidDataForCheck = txidData.isEmpty ? (Data(hexString: txHashHex) ?? Data()) : txidData
+                        let alreadyConfirmed = (try? WalletDatabase.shared.transactionExists(txid: txidDataForCheck, type: .received)) ?? false
 
-                        // Check if this is a NEW incoming tx we haven't notified about
-                        let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
-                        print("🔮 MEMPOOL: tx \(txHashHex.prefix(12))... isNewTx=\(isNewTx)")
-                        if isNewTx {
-                            newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
+                        if alreadyConfirmed {
+                            print("🔮 MEMPOOL: Skipping already-confirmed tx \(txHashHex.prefix(12))...")
                         } else {
-                            print("🔮 MEMPOOL: Skipping already-notified tx \(txHashHex.prefix(12))...")
+                            // Real incoming - count it and prepare for notification
+                            incomingAmount += txIncomingAmount
+                            incomingCount += 1
+
+                            // Check if this is a NEW incoming tx we haven't notified about
+                            let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txHashHex)
+                            print("🔮 MEMPOOL: tx \(txHashHex.prefix(12))... isNewTx=\(isNewTx)")
+                            if isNewTx {
+                                newIncomingTxs.append((txid: txHashHex, amount: txIncomingAmount))
+                            } else {
+                                print("🔮 MEMPOOL: Skipping already-notified tx \(txHashHex.prefix(12))...")
+                            }
                         }
                     }
                 }

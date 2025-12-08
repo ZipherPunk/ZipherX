@@ -30,6 +30,12 @@ struct NodeManagementView: View {
                 // Backup Management
                 backupSection
 
+                // Configuration Editor
+                configurationSection
+
+                // Wallet Security Check
+                walletSecuritySection
+
                 // Privacy Settings
                 privacySection
 
@@ -131,15 +137,52 @@ struct NodeManagementView: View {
             .background(theme.surfaceColor)
             .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
 
-            // Operation status
+            // Operation status with progress bar
             if viewModel.isOperationInProgress {
-                HStack {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                    Text(viewModel.operationStatus)
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
+                VStack(spacing: 8) {
+                    HStack {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        Text(viewModel.operationStatus)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer()
+                        Text("\(Int(viewModel.operationProgress * 100))%")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                    }
+
+                    // Progress bar
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            // Background
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(theme.surfaceColor)
+                                .frame(height: 8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
+                                )
+
+                            // Progress fill
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [theme.accentColor, theme.accentColor.opacity(0.7)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: geometry.size.width * viewModel.operationProgress, height: 8)
+                                .animation(.easeInOut(duration: 0.3), value: viewModel.operationProgress)
+                        }
+                    }
+                    .frame(height: 8)
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(theme.backgroundColor.opacity(0.5))
+                .overlay(Rectangle().stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
             }
         }
     }
@@ -464,6 +507,358 @@ Continue?
         }
     }
 
+    // MARK: - Configuration Section
+
+    private var configurationSection: some View {
+        VStack(spacing: 12) {
+            sectionHeader(icon: "doc.text", title: "CONFIGURATION EDITOR")
+
+            VStack(spacing: 12) {
+                // Warning banner
+                if viewModel.configHasUnsavedChanges {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text("Unsaved changes - restart daemon to apply")
+                            .font(theme.captionFont)
+                            .foregroundColor(.orange)
+                        Spacer()
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(4)
+                }
+
+                // Network Settings Group
+                configGroupHeader(title: "Network")
+                configRow(key: "port", label: "P2P Port", value: $viewModel.configPort, description: "Port for P2P connections")
+                configRow(key: "maxconnections", label: "Max Connections", value: $viewModel.configMaxConnections, description: "Maximum peer connections")
+                configToggleRow(key: "listen", label: "Accept Connections", isOn: $viewModel.configListen, description: "Allow incoming P2P connections")
+
+                Divider()
+
+                // RPC Settings Group
+                configGroupHeader(title: "RPC Server")
+                configToggleRow(key: "server", label: "Enable RPC", isOn: $viewModel.configServer, description: "Enable JSON-RPC server")
+                configRow(key: "rpcport", label: "RPC Port", value: $viewModel.configRpcPort, description: "Port for RPC connections")
+                configRow(key: "rpcthreads", label: "RPC Threads", value: $viewModel.configRpcThreads, description: "Number of RPC worker threads")
+
+                Divider()
+
+                // Performance Settings Group
+                configGroupHeader(title: "Performance")
+                configRow(key: "dbcache", label: "DB Cache (MB)", value: $viewModel.configDbCache, description: "Database cache size in megabytes")
+                configRow(key: "par", label: "Script Threads", value: $viewModel.configPar, description: "Parallel script verification threads")
+                configToggleRow(key: "txindex", label: "Transaction Index", isOn: $viewModel.configTxIndex, description: "Maintain full tx index (required for address lookup)")
+
+                Divider()
+
+                // Privacy Settings Group
+                configGroupHeader(title: "Privacy & Security")
+                configToggleRow(key: "listenonion", label: "Listen on Tor", isOn: $viewModel.configListenOnion, description: "Accept connections via Tor network")
+                configToggleRow(key: "gen", label: "Mining Enabled", isOn: $viewModel.configGen, description: "Enable CPU mining (not recommended)")
+
+                Divider()
+
+                // Debug Settings Group
+                configGroupHeader(title: "Debugging")
+                configToggleRow(key: "debug", label: "Debug Logging", isOn: $viewModel.configDebug, description: "Enable verbose debug.log output")
+
+                Divider()
+
+                // Action buttons
+                HStack(spacing: 12) {
+                    Button(action: { viewModel.reloadConfig() }) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Reload")
+                        }
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .overlay(Rectangle().stroke(theme.textSecondary.opacity(0.5), lineWidth: 1))
+                    }
+                    .buttonStyle(PlainButtonStyle())
+
+                    Button(action: { viewModel.saveConfig() }) {
+                        HStack {
+                            Image(systemName: "checkmark.circle")
+                            Text("Save Changes")
+                        }
+                        .font(theme.captionFont)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(viewModel.configHasUnsavedChanges ? theme.primaryColor : theme.textSecondary.opacity(0.5))
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(!viewModel.configHasUnsavedChanges)
+
+                    Spacer()
+
+                    Button(action: { viewModel.openConfigInEditor() }) {
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                            Text("Open in Editor")
+                        }
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.primaryColor)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+
+                // Config file location
+                HStack(spacing: 4) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 10))
+                    Text(FullNodeManager.configPath.path)
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .foregroundColor(theme.textSecondary)
+            }
+            .padding(12)
+            .background(theme.surfaceColor)
+            .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
+        }
+    }
+
+    private func configGroupHeader(title: String) -> some View {
+        HStack {
+            Text(title.uppercased())
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(theme.primaryColor)
+            Spacer()
+        }
+        .padding(.top, 4)
+    }
+
+    private func configRow(key: String, label: String, value: Binding<String>, description: String) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+                Text(description)
+                    .font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary)
+            }
+
+            Spacer()
+
+            TextField("", text: value)
+                .textFieldStyle(PlainTextFieldStyle())
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(theme.textPrimary)
+                .frame(width: 100)
+                .padding(6)
+                .background(theme.backgroundColor)
+                .overlay(Rectangle().stroke(theme.textSecondary.opacity(0.3), lineWidth: 1))
+                .onChange(of: value.wrappedValue) { _ in
+                    viewModel.markConfigChanged()
+                }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func configToggleRow(key: String, label: String, isOn: Binding<Bool>, description: String) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+                Text(description)
+                    .font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: isOn)
+                .toggleStyle(SwitchToggleStyle(tint: theme.primaryColor))
+                .onChange(of: isOn.wrappedValue) { _ in
+                    viewModel.markConfigChanged()
+                }
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Wallet Security Section
+
+    private var walletSecuritySection: some View {
+        VStack(spacing: 12) {
+            sectionHeader(icon: "lock.shield.fill", title: "WALLET SECURITY")
+
+            VStack(spacing: 12) {
+                // wallet.dat status
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Image(systemName: viewModel.walletDatExists ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(viewModel.walletDatExists ? .green : .red)
+                            Text("wallet.dat")
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.textPrimary)
+                        }
+
+                        if viewModel.walletDatExists {
+                            Text("Size: \(viewModel.walletDatSize) • Modified: \(viewModel.walletDatAge)")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        } else {
+                            Text("No wallet file found")
+                                .font(theme.captionFont)
+                                .foregroundColor(.orange)
+                        }
+                    }
+
+                    Spacer()
+
+                    if viewModel.walletDatExists {
+                        // Encryption status badge
+                        HStack(spacing: 4) {
+                            Image(systemName: viewModel.isWalletEncrypted ? "lock.fill" : "lock.open.fill")
+                            Text(viewModel.isWalletEncrypted ? "ENCRYPTED" : "UNENCRYPTED")
+                        }
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(viewModel.isWalletEncrypted ? .green : .red)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(viewModel.isWalletEncrypted ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
+                        .cornerRadius(4)
+                    }
+                }
+
+                // Security warnings
+                if !viewModel.walletSecurityWarnings.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(viewModel.walletSecurityWarnings, id: \.self) { warning in
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.system(size: 12))
+                                Text(warning)
+                                    .font(theme.captionFont)
+                                    .foregroundColor(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.1))
+                    .overlay(Rectangle().stroke(Color.orange.opacity(0.3), lineWidth: 1))
+                }
+
+                // Security recommendations
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Security Checklist:")
+                        .font(theme.captionFont)
+                        .fontWeight(.bold)
+                        .foregroundColor(theme.textPrimary)
+
+                    securityCheckItem(
+                        passed: viewModel.walletDatExists,
+                        text: "wallet.dat exists"
+                    )
+                    securityCheckItem(
+                        passed: viewModel.isWalletEncrypted,
+                        text: "Wallet is encrypted"
+                    )
+                    securityCheckItem(
+                        passed: viewModel.hasRecentBackup,
+                        text: "Recent backup (< 7 days)"
+                    )
+                    securityCheckItem(
+                        passed: viewModel.walletDatAgeDays < 365,
+                        text: "Wallet file not too old"
+                    )
+                }
+                .padding(8)
+                .background(theme.backgroundColor)
+                .cornerRadius(4)
+
+                Divider()
+
+                // Actions
+                HStack(spacing: 12) {
+                    if viewModel.walletDatExists && !viewModel.isWalletEncrypted {
+                        Button(action: { viewModel.showEncryptWalletAlert = true }) {
+                            HStack {
+                                Image(systemName: "lock.fill")
+                                Text("Encrypt Wallet")
+                            }
+                            .font(theme.captionFont)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.red)
+                            .cornerRadius(theme.cornerRadius)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+
+                    Button(action: { viewModel.backupWalletDat() }) {
+                        HStack {
+                            Image(systemName: "square.and.arrow.down")
+                            Text("Backup Now")
+                        }
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.primaryColor)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .overlay(Rectangle().stroke(theme.primaryColor, lineWidth: 1))
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .disabled(!viewModel.walletDatExists)
+
+                    Spacer()
+
+                    Button(action: { viewModel.refreshWalletSecurity() }) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Refresh")
+                        }
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+            .padding(12)
+            .background(theme.surfaceColor)
+            .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
+        }
+        .alert("Encrypt Wallet", isPresented: $viewModel.showEncryptWalletAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Open Daemon") {
+                viewModel.showEncryptInstructions()
+            }
+        } message: {
+            Text("""
+            Wallet encryption must be done via zclassic-cli.
+
+            Run: zclassic-cli encryptwallet "your-passphrase"
+
+            ⚠️ WARNING: Make a backup BEFORE encrypting!
+            The daemon will shut down after encryption.
+            """)
+        }
+    }
+
+    private func securityCheckItem(passed: Bool, text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: passed ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundColor(passed ? .green : .red)
+                .font(.system(size: 12))
+            Text(text)
+                .font(theme.captionFont)
+                .foregroundColor(passed ? theme.textSecondary : .orange)
+        }
+    }
+
     // MARK: - Error Log Section
 
     private var errorLogSection: some View {
@@ -566,8 +961,34 @@ class NodeManagementViewModel: ObservableObject {
     @Published var recentErrors: [String] = []
     @Published var isOperationInProgress = false
     @Published var operationStatus = ""
+    @Published var operationProgress: Double = 0.0  // 0.0 to 1.0
     @Published var showBootstrapConfirm = false
 
+    // Configuration Editor properties
+    @Published var configHasUnsavedChanges = false
+    @Published var configPort = "8033"
+    @Published var configMaxConnections = "125"
+    @Published var configListen = true
+    @Published var configServer = true
+    @Published var configRpcPort = "8023"
+    @Published var configRpcThreads = "48"
+    @Published var configDbCache = "4096"
+    @Published var configPar = "8"
+    @Published var configTxIndex = true
+    @Published var configListenOnion = true
+    @Published var configGen = false
+    @Published var configDebug = false
+
+    // Wallet Security properties
+    @Published var walletDatSize = "Unknown"
+    @Published var walletDatAge = "Unknown"
+    @Published var walletDatAgeDays: Int = 0
+    @Published var isWalletEncrypted = false
+    @Published var hasRecentBackup = false
+    @Published var walletSecurityWarnings: [String] = []
+    @Published var showEncryptWalletAlert = false
+
+    private var originalConfig: [String: String] = [:]
     private let fullNodeManager = FullNodeManager.shared
 
     var privacyScore: Int {
@@ -581,6 +1002,8 @@ class NodeManagementViewModel: ObservableObject {
 
     init() {
         loadSettings()
+        loadConfig()
+        refreshWalletSecurity()
     }
 
     func refresh() {
@@ -590,28 +1013,106 @@ class NodeManagementViewModel: ObservableObject {
     }
 
     private func refreshAsync() async {
-        // Check daemon status
-        isDaemonRunning = fullNodeManager.daemonStatus.isRunning
-        blockHeight = fullNodeManager.daemonBlockHeight
-        syncProgress = fullNodeManager.daemonSyncProgress
+        // First, tell FullNodeManager to refresh its status
+        fullNodeManager.checkNodeStatus()
 
-        // Get version
-        daemonVersion = await fullNodeManager.getDaemonVersion()
+        // Wait briefly for the status check to complete
+        try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
 
-        // Get blockchain size
+        // Get blockchain size from FullNodeManager
         blockchainSize = fullNodeManager.blockchainSize
 
         // Check wallet.dat
         walletDatExists = FileManager.default.fileExists(atPath: FullNodeManager.walletPath.path)
 
-        // Get connection count from RPC
-        if isDaemonRunning {
-            do {
-                let info = try await RPCClient.shared.getInfoDict()
-                connectionCount = info["connections"] as? Int ?? 0
-            } catch {
+        // Try to load RPC config and check connection directly
+        do {
+            try RPCClient.shared.loadConfig()
+            let connected = await RPCClient.shared.checkConnection()
+            isDaemonRunning = connected
+            print("🔄 NodeManagement: RPC connection = \(connected)")
+
+            if connected {
+                // Get blockchain info (has verificationprogress)
+                do {
+                    let blockchainInfo = try await RPCClient.shared.getBlockchainInfo()
+
+                    // Block height from getblockchaininfo
+                    if let blocks = blockchainInfo["blocks"] as? Int {
+                        blockHeight = UInt64(blocks)
+                        print("🔄 NodeManagement: blockHeight = \(blocks)")
+                    }
+
+                    // Sync progress from getblockchaininfo
+                    // verificationprogress can be < 1.0 during initial block download (IBD)
+                    // but for a fully synced node with all blocks, we check if it's close to 1.0
+                    // Also check if headers == blocks (fully synced)
+                    let headers = blockchainInfo["headers"] as? Int ?? 0
+                    let blocks = blockchainInfo["blocks"] as? Int ?? 0
+
+                    if headers > 0 && blocks > 0 && headers == blocks {
+                        // All blocks downloaded - fully synced
+                        syncProgress = 1.0
+                        print("🔄 NodeManagement: syncProgress = 1.0 (headers == blocks == \(blocks))")
+                    } else if let progress = blockchainInfo["verificationprogress"] as? Double {
+                        // Still syncing/verifying - use verification progress
+                        syncProgress = progress
+                        print("🔄 NodeManagement: syncProgress = \(progress) (headers=\(headers), blocks=\(blocks))")
+                    } else {
+                        syncProgress = 1.0 // Assume fully synced if no progress reported
+                    }
+                } catch {
+                    print("⚠️ NodeManagement: getblockchaininfo failed, trying getinfo - \(error.localizedDescription)")
+                    // Fallback to getinfo
+                    let info = try await RPCClient.shared.getInfoDict()
+                    if let blocks = info["blocks"] as? Int {
+                        blockHeight = UInt64(blocks)
+                    }
+                    syncProgress = 1.0
+                }
+
+                // Get network info (has connections)
+                do {
+                    let networkInfo = try await RPCClient.shared.getNetworkInfo()
+
+                    // Connection count from getnetworkinfo
+                    if let connections = networkInfo["connections"] as? Int {
+                        connectionCount = connections
+                        print("🔄 NodeManagement: connections = \(connections)")
+                    } else {
+                        connectionCount = 0
+                    }
+                } catch {
+                    print("⚠️ NodeManagement: getnetworkinfo failed, trying getinfo - \(error.localizedDescription)")
+                    // Fallback to getinfo for connections
+                    do {
+                        let info = try await RPCClient.shared.getInfoDict()
+                        if let connections = info["connections"] as? Int {
+                            connectionCount = connections
+                        }
+                    } catch {
+                        connectionCount = 0
+                    }
+                }
+            } else {
+                // Daemon not running
+                blockHeight = 0
+                syncProgress = 0
                 connectionCount = 0
             }
+        } catch {
+            print("⚠️ NodeManagement: RPC error - \(error.localizedDescription)")
+            isDaemonRunning = false
+            blockHeight = 0
+            syncProgress = 0
+            connectionCount = 0
+        }
+
+        // Get version (if installed)
+        if fullNodeManager.isDaemonInstalledAtPath {
+            daemonVersion = await fullNodeManager.getDaemonVersion()
+        } else {
+            daemonVersion = nil
         }
 
         // Load recent errors from debug.log
@@ -620,21 +1121,84 @@ class NodeManagementViewModel: ObservableObject {
 
     func startDaemon() {
         isOperationInProgress = true
-        operationStatus = "Starting daemon..."
+        operationProgress = 0.0
+        operationStatus = "Initializing..."
 
         Task {
             do {
-                try await fullNodeManager.startDaemon()
+                // Step 1: Check prerequisites
                 await MainActor.run {
+                    operationProgress = 0.1
+                    operationStatus = "Checking configuration..."
+                }
+                try await Task.sleep(nanoseconds: 300_000_000)
+
+                // Step 2: Start daemon process
+                await MainActor.run {
+                    operationProgress = 0.2
+                    operationStatus = "Launching zclassicd..."
+                }
+
+                // Launch daemon
+                let process = Process()
+                process.executableURL = FullNodeManager.daemonPath
+                process.arguments = ["-daemon"]
+                try process.run()
+
+                // Step 3: Wait for RPC to become available
+                await MainActor.run {
+                    operationProgress = 0.3
+                    operationStatus = "Waiting for RPC interface..."
+                }
+
+                var connected = false
+                for i in 1...30 {
+                    try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+
+                    // Update progress (0.3 to 0.9 over 30 seconds)
+                    let progress = 0.3 + (Double(i) / 30.0) * 0.6
+                    await MainActor.run {
+                        operationProgress = min(progress, 0.9)
+                        operationStatus = "Connecting to daemon... (\(i)s)"
+                    }
+
+                    if await RPCClient.shared.checkConnection() {
+                        connected = true
+                        break
+                    }
+                }
+
+                if !connected {
+                    throw FullNodeError.startupTimeout
+                }
+
+                // Step 4: Verify daemon is running
+                await MainActor.run {
+                    operationProgress = 0.95
+                    operationStatus = "Verifying daemon status..."
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+
+                // Step 5: Complete
+                await MainActor.run {
+                    operationProgress = 1.0
+                    operationStatus = "Daemon started successfully!"
                     isDaemonRunning = true
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+
+                await MainActor.run {
                     isOperationInProgress = false
                     operationStatus = ""
+                    operationProgress = 0.0
                 }
                 refresh()
+
             } catch {
                 await MainActor.run {
                     isOperationInProgress = false
                     operationStatus = ""
+                    operationProgress = 0.0
                     recentErrors.insert("Failed to start daemon: \(error.localizedDescription)", at: 0)
                 }
             }
@@ -643,10 +1207,17 @@ class NodeManagementViewModel: ObservableObject {
 
     func stopDaemon() {
         isOperationInProgress = true
-        operationStatus = "Stopping daemon..."
+        operationProgress = 0.0
+        operationStatus = "Initiating shutdown..."
 
         Task {
             do {
+                // Step 1: Send stop command
+                await MainActor.run {
+                    operationProgress = 0.1
+                    operationStatus = "Sending stop signal..."
+                }
+
                 // Use zclassic-cli stop
                 let process = Process()
                 process.executableURL = FullNodeManager.cliPath
@@ -654,23 +1225,55 @@ class NodeManagementViewModel: ObservableObject {
                 try process.run()
                 process.waitUntilExit()
 
-                // Wait for daemon to stop
-                for _ in 1...30 {
+                await MainActor.run {
+                    operationProgress = 0.2
+                    operationStatus = "Waiting for daemon to shutdown..."
+                }
+
+                // Step 2: Wait for daemon to stop (with progress)
+                var stopped = false
+                for i in 1...30 {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
+
+                    // Update progress (0.2 to 0.9 over 30 seconds)
+                    let progress = 0.2 + (Double(i) / 30.0) * 0.7
+                    await MainActor.run {
+                        operationProgress = min(progress, 0.9)
+                        operationStatus = "Shutting down... (\(i)s)"
+                    }
+
                     if !(await RPCClient.shared.checkConnection()) {
+                        stopped = true
                         break
                     }
                 }
 
+                // Step 3: Verify shutdown
                 await MainActor.run {
+                    operationProgress = 0.95
+                    operationStatus = "Verifying shutdown..."
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+
+                // Step 4: Complete
+                await MainActor.run {
+                    operationProgress = 1.0
+                    operationStatus = stopped ? "Daemon stopped successfully!" : "Shutdown complete"
                     isDaemonRunning = false
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+
+                await MainActor.run {
                     isOperationInProgress = false
                     operationStatus = ""
+                    operationProgress = 0.0
                 }
+
             } catch {
                 await MainActor.run {
                     isOperationInProgress = false
                     operationStatus = ""
+                    operationProgress = 0.0
                     recentErrors.insert("Failed to stop daemon: \(error.localizedDescription)", at: 0)
                 }
             }
@@ -870,6 +1473,356 @@ class NodeManagementViewModel: ObservableObject {
 
     func clearErrors() {
         recentErrors.removeAll()
+    }
+
+    // MARK: - Configuration Management
+
+    func loadConfig() {
+        let configPath = FullNodeManager.configPath
+        guard FileManager.default.fileExists(atPath: configPath.path) else { return }
+
+        do {
+            let config = try String(contentsOf: configPath, encoding: .utf8)
+            var configDict: [String: String] = [:]
+
+            for line in config.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+
+                if let equalIndex = trimmed.firstIndex(of: "=") {
+                    let key = String(trimmed[..<equalIndex]).trimmingCharacters(in: .whitespaces)
+                    let value = String(trimmed[trimmed.index(after: equalIndex)...]).trimmingCharacters(in: .whitespaces)
+                    configDict[key] = value
+                }
+            }
+
+            // Store original for change detection
+            originalConfig = configDict
+
+            // Load into UI properties
+            configPort = configDict["port"] ?? "8033"
+            configMaxConnections = configDict["maxconnections"] ?? "125"
+            configListen = configDict["listen"] != "0"
+            configServer = configDict["server"] != "0"
+            configRpcPort = configDict["rpcport"] ?? "8023"
+            configRpcThreads = configDict["rpcthreads"] ?? "4"
+            configDbCache = configDict["dbcache"] ?? "450"
+            configPar = configDict["par"] ?? "-1"
+            configTxIndex = configDict["txindex"] == "1"
+            configListenOnion = configDict["listenonion"] != "0"
+            configGen = configDict["gen"] == "1"
+            configDebug = configDict["debug"] == "1"
+
+            configHasUnsavedChanges = false
+        } catch {
+            print("⚠️ Failed to load config: \(error)")
+        }
+    }
+
+    func reloadConfig() {
+        loadConfig()
+    }
+
+    func markConfigChanged() {
+        // Check if any values differ from original
+        let currentValues: [String: String] = [
+            "port": configPort,
+            "maxconnections": configMaxConnections,
+            "listen": configListen ? "1" : "0",
+            "server": configServer ? "1" : "0",
+            "rpcport": configRpcPort,
+            "rpcthreads": configRpcThreads,
+            "dbcache": configDbCache,
+            "par": configPar,
+            "txindex": configTxIndex ? "1" : "0",
+            "listenonion": configListenOnion ? "1" : "0",
+            "gen": configGen ? "1" : "0",
+            "debug": configDebug ? "1" : "0"
+        ]
+
+        configHasUnsavedChanges = currentValues.contains { key, value in
+            originalConfig[key] != value
+        }
+    }
+
+    func saveConfig() {
+        let configPath = FullNodeManager.configPath
+        guard FileManager.default.fileExists(atPath: configPath.path) else { return }
+
+        do {
+            // Create backup before saving
+            let backupDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("ZipherX_Backups")
+                .appendingPathComponent("configs")
+
+            try FileManager.default.createDirectory(at: backupDir, withIntermediateDirectories: true)
+
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
+            let timestamp = dateFormatter.string(from: Date())
+
+            let backupPath = backupDir.appendingPathComponent("zclassic_\(timestamp).conf")
+            try FileManager.default.copyItem(at: configPath, to: backupPath)
+            print("✅ Config backup saved to \(backupPath.path)")
+
+            // Read existing config
+            var config = try String(contentsOf: configPath, encoding: .utf8)
+            var lines = config.components(separatedBy: "\n")
+
+            // Helper to update or add a setting
+            func updateSetting(_ key: String, _ value: String) {
+                var found = false
+                for i in 0..<lines.count {
+                    let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                    if trimmed.hasPrefix("\(key)=") || trimmed.hasPrefix("# \(key)=") {
+                        lines[i] = "\(key)=\(value)"
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    // Add at the end before any addnode entries
+                    var insertIndex = lines.count
+                    for i in 0..<lines.count {
+                        if lines[i].hasPrefix("addnode=") {
+                            insertIndex = i
+                            break
+                        }
+                    }
+                    lines.insert("\(key)=\(value)", at: insertIndex)
+                }
+            }
+
+            // Update all settings
+            updateSetting("port", configPort)
+            updateSetting("maxconnections", configMaxConnections)
+            updateSetting("listen", configListen ? "1" : "0")
+            updateSetting("server", configServer ? "1" : "0")
+            updateSetting("rpcport", configRpcPort)
+            updateSetting("rpcthreads", configRpcThreads)
+            updateSetting("dbcache", configDbCache)
+            updateSetting("par", configPar)
+            updateSetting("txindex", configTxIndex ? "1" : "0")
+            updateSetting("listenonion", configListenOnion ? "1" : "0")
+            updateSetting("gen", configGen ? "1" : "0")
+            updateSetting("debug", configDebug ? "1" : "0")
+            // IMPORTANT: Zclassic requires debuglogfile=1 to actually write to debug.log
+            // (disabled by default for privacy in Zclassic source)
+            updateSetting("debuglogfile", configDebug ? "1" : "0")
+
+            config = lines.joined(separator: "\n")
+            try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+            // Update original values
+            loadConfig()
+            configHasUnsavedChanges = false
+
+            // Show restart notification if daemon is running
+            if isDaemonRunning {
+                let alert = NSAlert()
+                alert.messageText = "Configuration Saved"
+                alert.informativeText = """
+                Configuration changes have been saved.
+
+                ⚠️ Restart the daemon for changes to take effect.
+
+                Backup saved to:
+                \(backupPath.path)
+                """
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+
+        } catch {
+            recentErrors.insert("Failed to save config: \(error.localizedDescription)", at: 0)
+        }
+    }
+
+    func openConfigInEditor() {
+        NSWorkspace.shared.open(FullNodeManager.configPath)
+    }
+
+    // MARK: - Wallet Security
+
+    func refreshWalletSecurity() {
+        let walletPath = FullNodeManager.walletPath
+
+        // Check if wallet.dat exists
+        walletDatExists = FileManager.default.fileExists(atPath: walletPath.path)
+
+        if walletDatExists {
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: walletPath.path)
+
+                // Get file size
+                if let size = attributes[.size] as? UInt64 {
+                    walletDatSize = formatBytes(size)
+                }
+
+                // Get modification date
+                if let modDate = attributes[.modificationDate] as? Date {
+                    let formatter = RelativeDateTimeFormatter()
+                    formatter.unitsStyle = .full
+                    walletDatAge = formatter.localizedString(for: modDate, relativeTo: Date())
+
+                    // Calculate days since modification
+                    walletDatAgeDays = Calendar.current.dateComponents([.day], from: modDate, to: Date()).day ?? 0
+                }
+
+                // Check encryption status by looking for specific patterns in file header
+                // Note: This is a heuristic - encrypted wallet.dat files have different structure
+                checkWalletEncryption()
+
+                // Check for recent backups
+                checkForRecentBackups()
+
+                // Generate security warnings
+                generateSecurityWarnings()
+
+            } catch {
+                print("⚠️ Failed to get wallet.dat attributes: \(error)")
+            }
+        } else {
+            walletDatSize = "N/A"
+            walletDatAge = "N/A"
+            walletDatAgeDays = 0
+            isWalletEncrypted = false
+            hasRecentBackup = false
+            walletSecurityWarnings = ["No wallet.dat found - create or restore a wallet"]
+        }
+    }
+
+    private func checkWalletEncryption() {
+        // Query RPC if daemon is running
+        if isDaemonRunning {
+            Task {
+                do {
+                    let info = try await RPCClient.shared.getInfoDict()
+                    // If "unlocked_until" key exists, wallet is encrypted
+                    if info["unlocked_until"] != nil {
+                        await MainActor.run {
+                            isWalletEncrypted = true
+                        }
+                    } else {
+                        // getInfoDict doesn't have wallet info, so just check if we got a response
+                        // If daemon responds, assume wallet exists but encryption status unknown
+                        // Use file-based heuristic as fallback
+                        await MainActor.run {
+                            checkWalletEncryptionFromFile()
+                        }
+                    }
+                } catch {
+                    // If RPC fails, try to detect from file
+                    await MainActor.run {
+                        checkWalletEncryptionFromFile()
+                    }
+                }
+            }
+        } else {
+            checkWalletEncryptionFromFile()
+        }
+    }
+
+    private func checkWalletEncryptionFromFile() {
+        // When daemon is not running, check file header
+        // BDB files have specific magic bytes, encrypted ones have different structure
+        let walletPath = FullNodeManager.walletPath
+        if let data = FileManager.default.contents(atPath: walletPath.path),
+           data.count > 16 {
+            // Check for encryption marker in Berkeley DB file
+            // This is a heuristic - encrypted wallets typically have "encrypted" string
+            let headerData = data.prefix(1024)
+            if let headerString = String(data: headerData, encoding: .utf8),
+               headerString.contains("encrypted") || headerString.contains("crypt") {
+                isWalletEncrypted = true
+            } else {
+                isWalletEncrypted = false
+            }
+        } else {
+            isWalletEncrypted = false
+        }
+    }
+
+    private func checkForRecentBackups() {
+        let backupDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("ZipherX_Backups")
+
+        guard FileManager.default.fileExists(atPath: backupDir.path) else {
+            hasRecentBackup = false
+            return
+        }
+
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(at: backupDir, includingPropertiesForKeys: [URLResourceKey.contentModificationDateKey])
+            let walletBackups = contents.filter { $0.lastPathComponent.hasPrefix("wallet_") && $0.pathExtension == "dat" }
+
+            // Check if any backup is less than 7 days old
+            let sevenDaysAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+
+            for backup in walletBackups {
+                let resourceValues = try backup.resourceValues(forKeys: [URLResourceKey.contentModificationDateKey])
+                if let modDate = resourceValues.contentModificationDate,
+                   modDate > sevenDaysAgo {
+                    hasRecentBackup = true
+                    return
+                }
+            }
+            hasRecentBackup = false
+        } catch {
+            hasRecentBackup = false
+        }
+    }
+
+    private func generateSecurityWarnings() {
+        walletSecurityWarnings.removeAll()
+
+        if !walletDatExists {
+            walletSecurityWarnings.append("No wallet.dat found")
+            return
+        }
+
+        if !isWalletEncrypted {
+            walletSecurityWarnings.append("⚠️ CRITICAL: Your wallet is NOT encrypted! Anyone with access to this computer can steal your funds.")
+        }
+
+        if !hasRecentBackup {
+            walletSecurityWarnings.append("No recent backup found. Consider backing up your wallet.dat regularly.")
+        }
+
+        if walletDatAgeDays > 365 {
+            walletSecurityWarnings.append("Wallet file is over 1 year old. Consider creating a new wallet and transferring funds.")
+        }
+
+        if walletDatAgeDays > 30 && !hasRecentBackup {
+            walletSecurityWarnings.append("Wallet has changed in the last month but no backup exists. Create a backup now!")
+        }
+    }
+
+    func showEncryptInstructions() {
+        // Copy command to clipboard
+        let command = "zclassic-cli encryptwallet \"YOUR_PASSPHRASE_HERE\""
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+
+        // Show terminal with instructions
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "echo '=== WALLET ENCRYPTION ===' && echo '' && echo 'IMPORTANT: Make a backup of wallet.dat BEFORE encrypting!' && echo '' && echo 'Run this command (replace YOUR_PASSPHRASE_HERE with a strong passphrase):' && echo '' && echo 'zclassic-cli encryptwallet \"YOUR_PASSPHRASE_HERE\"' && echo '' && echo 'The command has been copied to your clipboard.' && echo 'The daemon will shut down after encryption.'"
+        end tell
+        """
+
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            scriptObject.executeAndReturnError(&error)
+        }
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useAll]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: Int64(bytes))
     }
 }
 

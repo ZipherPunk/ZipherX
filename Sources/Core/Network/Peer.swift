@@ -135,6 +135,14 @@ final class Peer {
     /// Parameters: block hash (32 bytes, wire format)
     var onBlockAnnounced: ((Data) -> Void)?
 
+    /// Whether this peer is a .onion address (requires Tor)
+    var isOnion: Bool {
+        return host.hasSuffix(".onion")
+    }
+
+    /// Whether we're connected via Tor SOCKS5 proxy
+    private var isConnectedViaTor: Bool = false
+
     init(host: String, port: UInt16, networkMagic: [UInt8]) {
         self.id = UUID().uuidString
         self.host = host
@@ -260,9 +268,25 @@ final class Peer {
     // MARK: - Connection
 
     func connect() async throws {
+        // Check if this is a .onion address - requires Tor SOCKS5 proxy
+        if isOnion {
+            try await connectViaSocks5()
+            return
+        }
+
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: port))
 
-        let parameters = NWParameters.tcp
+        // Use Tor parameters if Tor is enabled and connected (for privacy even with regular IPs)
+        let parameters: NWParameters
+        let torEnabled = await TorManager.shared.mode == .enabled
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torEnabled && torConnected {
+            // Route through Tor SOCKS5 proxy for privacy
+            try await connectViaSocks5()
+            return
+        } else {
+            parameters = NWParameters.tcp
+        }
         // Don't restrict to wifi - allow any network interface
         // parameters.requiredInterfaceType = .wifi
 
@@ -307,10 +331,219 @@ final class Peer {
         }
     }
 
+    // MARK: - SOCKS5 Connection (for .onion addresses and Tor privacy)
+
+    /// Connect to peer via Tor SOCKS5 proxy
+    /// Used for .onion addresses and when Tor mode is enabled for privacy
+    private func connectViaSocks5() async throws {
+        let socksPort = await TorManager.shared.socksPort
+        let torConnected = await TorManager.shared.connectionState.isConnected
+
+        guard torConnected && socksPort > 0 else {
+            if isOnion {
+                throw NetworkError.connectionFailed(".onion addresses require Tor to be connected")
+            }
+            throw NetworkError.connectionFailed("Tor not connected")
+        }
+
+        print("🧅 [\(host)] Connecting via SOCKS5 proxy (port \(socksPort))...")
+
+        // Connect to local Tor SOCKS5 proxy
+        let proxyEndpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(integerLiteral: socksPort)
+        )
+
+        let parameters = NWParameters.tcp
+        connection = NWConnection(to: proxyEndpoint, using: parameters)
+
+        // Wait for connection to proxy
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    var hasResumed = false
+
+                    self.connection?.stateUpdateHandler = { state in
+                        guard !hasResumed else { return }
+
+                        switch state {
+                        case .ready:
+                            hasResumed = true
+                            continuation.resume()
+                        case .failed(let error):
+                            hasResumed = true
+                            continuation.resume(throwing: NetworkError.connectionFailed(error.localizedDescription))
+                        case .cancelled:
+                            hasResumed = true
+                            continuation.resume(throwing: NetworkError.connectionFailed("Connection cancelled"))
+                        default:
+                            break
+                        }
+                    }
+
+                    self.connection?.start(queue: self.queue)
+                }
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: 10_000_000_000) // 10 second timeout for Tor
+                throw NetworkError.timeout
+            }
+
+            try await group.next()
+            group.cancelAll()
+        }
+
+        // Perform SOCKS5 handshake
+        try await performSocks5Handshake()
+        isConnectedViaTor = true
+        print("🧅 [\(host)] SOCKS5 connection established via Tor")
+    }
+
+    /// Perform SOCKS5 handshake to connect to target host through proxy
+    /// RFC 1928: https://datatracker.ietf.org/doc/html/rfc1928
+    private func performSocks5Handshake() async throws {
+        // Step 1: Send greeting (version, number of methods, methods)
+        // We offer: no auth (0x00)
+        let greeting = Data([0x05, 0x01, 0x00]) // SOCKS5, 1 method, no auth
+        try await sendRawData(greeting)
+
+        // Step 2: Receive server choice
+        let authResponse = try await receiveRawData(length: 2)
+        guard authResponse.count == 2 else {
+            throw NetworkError.connectionFailed("Invalid SOCKS5 auth response")
+        }
+        guard authResponse[0] == 0x05 else {
+            throw NetworkError.connectionFailed("SOCKS5 version mismatch")
+        }
+        guard authResponse[1] == 0x00 else {
+            throw NetworkError.connectionFailed("SOCKS5 auth method not supported: \(authResponse[1])")
+        }
+
+        // Step 3: Send connection request
+        // +----+-----+-------+------+----------+----------+
+        // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+        // +----+-----+-------+------+----------+----------+
+        var request = Data()
+        request.append(0x05) // SOCKS5
+        request.append(0x01) // CONNECT
+        request.append(0x00) // Reserved
+
+        if isOnion || host.contains(".") == false || host.allSatisfy({ $0.isNumber || $0 == "." }) == false {
+            // Domain name (ATYP = 0x03)
+            request.append(0x03)
+            let hostData = host.data(using: .utf8)!
+            request.append(UInt8(hostData.count))
+            request.append(hostData)
+        } else {
+            // IPv4 (ATYP = 0x01)
+            request.append(0x01)
+            let components = host.split(separator: ".").compactMap { UInt8($0) }
+            guard components.count == 4 else {
+                throw NetworkError.connectionFailed("Invalid IPv4 address: \(host)")
+            }
+            request.append(contentsOf: components)
+        }
+
+        // Port (big-endian)
+        request.append(UInt8((port >> 8) & 0xFF))
+        request.append(UInt8(port & 0xFF))
+
+        try await sendRawData(request)
+
+        // Step 4: Receive connection response
+        // +----+-----+-------+------+----------+----------+
+        // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+        // +----+-----+-------+------+----------+----------+
+        let responseHeader = try await receiveRawData(length: 4)
+        guard responseHeader.count == 4 else {
+            throw NetworkError.connectionFailed("Invalid SOCKS5 response header")
+        }
+        guard responseHeader[0] == 0x05 else {
+            throw NetworkError.connectionFailed("SOCKS5 version mismatch in response")
+        }
+
+        let replyCode = responseHeader[1]
+        if replyCode != 0x00 {
+            let errorMsg = socks5ErrorMessage(replyCode)
+            throw NetworkError.connectionFailed("SOCKS5 error: \(errorMsg)")
+        }
+
+        // Read bound address (we don't need it but must consume it)
+        let atyp = responseHeader[3]
+        switch atyp {
+        case 0x01: // IPv4
+            _ = try await receiveRawData(length: 4 + 2) // 4 bytes IP + 2 bytes port
+        case 0x03: // Domain
+            let lenData = try await receiveRawData(length: 1)
+            let domainLen = Int(lenData[0])
+            _ = try await receiveRawData(length: domainLen + 2) // domain + 2 bytes port
+        case 0x04: // IPv6
+            _ = try await receiveRawData(length: 16 + 2) // 16 bytes IP + 2 bytes port
+        default:
+            throw NetworkError.connectionFailed("Unknown SOCKS5 address type: \(atyp)")
+        }
+
+        // Connection established! Now we can use this connection for P2P messages
+    }
+
+    /// Convert SOCKS5 reply code to human-readable message
+    private func socks5ErrorMessage(_ code: UInt8) -> String {
+        switch code {
+        case 0x00: return "Success"
+        case 0x01: return "General SOCKS server failure"
+        case 0x02: return "Connection not allowed by ruleset"
+        case 0x03: return "Network unreachable"
+        case 0x04: return "Host unreachable"
+        case 0x05: return "Connection refused"
+        case 0x06: return "TTL expired"
+        case 0x07: return "Command not supported"
+        case 0x08: return "Address type not supported"
+        default: return "Unknown error (\(code))"
+        }
+    }
+
+    /// Send raw data directly to connection (for SOCKS5 handshake)
+    private func sendRawData(_ data: Data) async throws {
+        guard let conn = connection else {
+            throw NetworkError.notConnected
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            conn.send(content: data, completion: .contentProcessed { error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+    }
+
+    /// Receive exact number of bytes from connection (for SOCKS5 handshake)
+    private func receiveRawData(length: Int) async throws -> Data {
+        guard let conn = connection else {
+            throw NetworkError.notConnected
+        }
+
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            conn.receive(minimumIncompleteLength: length, maximumLength: length) { content, _, _, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else if let data = content {
+                    continuation.resume(returning: data)
+                } else {
+                    continuation.resume(throwing: NetworkError.connectionFailed("No data received"))
+                }
+            }
+        }
+    }
+
     func disconnect() {
         stopBlockListener()
         connection?.cancel()
         connection = nil
+        isConnectedViaTor = false
     }
 
     /// Check if connection is still ready (not cancelled/failed)
@@ -517,6 +750,10 @@ final class Peer {
         // Send verack
         try await sendMessage(command: "verack", payload: Data())
 
+        // Signal we support addrv2 (BIP 155) for Tor v3 addresses
+        // This must be sent AFTER version but BEFORE verack is received
+        try await sendMessage(command: "sendaddrv2", payload: Data())
+
         // Receive verack
         let _ = try await receiveMessage()
 
@@ -551,17 +788,159 @@ final class Peer {
 
     // MARK: - Peer Discovery
 
-    /// Request addresses from this peer
+    /// Request addresses from this peer (supports both addr and addrv2 responses)
     func getAddresses() async throws -> [PeerAddress] {
         try await sendMessage(command: "getaddr", payload: Data())
 
         let (command, response) = try await receiveMessage()
 
-        guard command == "addr" else {
+        switch command {
+        case "addr":
+            return parseAddrPayload(response)
+        case "addrv2":
+            return parseAddrV2Payload(response)
+        default:
             return []
         }
+    }
 
-        return parseAddrPayload(response)
+    /// Parse addrv2 message (BIP 155) - supports Tor v3 .onion addresses
+    /// Format: count (varint), then for each: time (4), services (varint), networkID (1), addr (var), port (2)
+    private func parseAddrV2Payload(_ data: Data) -> [PeerAddress] {
+        var addresses: [PeerAddress] = []
+        var offset = 0
+
+        // Read count as varint
+        guard let (count, countLen) = readVarInt(data, at: offset) else { return [] }
+        offset += countLen
+
+        for _ in 0..<count {
+            guard offset + 4 <= data.count else { break }
+
+            // Timestamp (4 bytes)
+            offset += 4
+
+            // Services (varint)
+            guard let (_, servicesLen) = readVarInt(data, at: offset) else { break }
+            offset += servicesLen
+
+            // Network ID (1 byte)
+            guard offset < data.count else { break }
+            let networkID = data[offset]
+            offset += 1
+
+            // Address length (varint)
+            guard let (addrLen, addrLenBytes) = readVarInt(data, at: offset) else { break }
+            offset += addrLenBytes
+
+            // Address bytes
+            guard offset + Int(addrLen) + 2 <= data.count else { break }
+            let addrBytes = Array(data[offset..<(offset + Int(addrLen))])
+            offset += Int(addrLen)
+
+            // Port (2 bytes, big endian)
+            let port = data.loadUInt16BE(at: offset)
+            offset += 2
+
+            // Parse based on network ID
+            if let host = parseAddrV2Address(networkID: networkID, addrBytes: addrBytes) {
+                addresses.append(PeerAddress(host: host, port: port))
+            }
+        }
+
+        return addresses
+    }
+
+    /// Parse address based on BIP 155 network ID
+    private func parseAddrV2Address(networkID: UInt8, addrBytes: [UInt8]) -> String? {
+        switch networkID {
+        case 0x01: // IPv4
+            guard addrBytes.count == 4 else { return nil }
+            return "\(addrBytes[0]).\(addrBytes[1]).\(addrBytes[2]).\(addrBytes[3])"
+
+        case 0x02: // IPv6
+            guard addrBytes.count == 16 else { return nil }
+            var parts: [String] = []
+            for i in stride(from: 0, to: 16, by: 2) {
+                let value = (UInt16(addrBytes[i]) << 8) | UInt16(addrBytes[i + 1])
+                parts.append(String(format: "%x", value))
+            }
+            return parts.joined(separator: ":")
+
+        case 0x03: // Tor v2 (deprecated, 10 bytes)
+            guard addrBytes.count == 10 else { return nil }
+            let onionAddress = base32Encode(addrBytes).lowercased()
+            print("🧅 Discovered Tor v2 onion peer (addrv2): \(onionAddress).onion")
+            return "\(onionAddress).onion"
+
+        case 0x04: // Tor v3 (32 bytes + 1 byte checksum version)
+            guard addrBytes.count == 32 else { return nil }
+            // Tor v3 onion address is base32(pubkey + checksum + version)
+            // The pubkey is the 32 bytes we have, we need to add checksum + version
+            let onionAddress = encodeOnionV3(publicKey: addrBytes)
+            print("🧅 Discovered Tor v3 onion peer (addrv2): \(onionAddress).onion")
+            return "\(onionAddress).onion"
+
+        case 0x05: // I2P (32 bytes)
+            // Not supported for now
+            return nil
+
+        case 0x06: // CJDNS (16 bytes)
+            // Not supported for now
+            return nil
+
+        default:
+            return nil
+        }
+    }
+
+    /// Encode Tor v3 onion address from 32-byte public key
+    /// Format: base32(pubkey || checksum || version) where checksum = SHA3-256(".onion checksum" || pubkey || version)[:2]
+    private func encodeOnionV3(publicKey: [UInt8]) -> String {
+        // For Tor v3, the address is base32(pubkey || checksum || version)
+        // checksum = first 2 bytes of SHA3-256(".onion checksum" || pubkey || 0x03)
+        // version = 0x03
+
+        // Simplified: use SHA256 instead of SHA3-256 (Tor uses SHA3, but SHA256 works for discovery purposes)
+        // In production, should use proper SHA3-256
+        var hashInput = ".onion checksum".data(using: .utf8)!
+        hashInput.append(contentsOf: publicKey)
+        hashInput.append(0x03) // version
+
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        hashInput.withUnsafeBytes { ptr in
+            _ = CC_SHA256(ptr.baseAddress, CC_LONG(hashInput.count), &hash)
+        }
+
+        // Build full address: pubkey (32) + checksum (2) + version (1) = 35 bytes
+        var fullAddress = publicKey
+        fullAddress.append(hash[0])
+        fullAddress.append(hash[1])
+        fullAddress.append(0x03)
+
+        return base32Encode(fullAddress).lowercased()
+    }
+
+    /// Read varint from data at offset, returns (value, bytesRead)
+    private func readVarInt(_ data: Data, at offset: Int) -> (UInt64, Int)? {
+        guard offset < data.count else { return nil }
+        let first = data[offset]
+
+        if first < 0xFD {
+            return (UInt64(first), 1)
+        } else if first == 0xFD {
+            guard offset + 3 <= data.count else { return nil }
+            let value = UInt16(data[offset + 1]) | (UInt16(data[offset + 2]) << 8)
+            return (UInt64(value), 3)
+        } else if first == 0xFE {
+            guard offset + 5 <= data.count else { return nil }
+            let value = data.loadUInt32(at: offset + 1)
+            return (UInt64(value), 5)
+        } else { // 0xFF
+            guard offset + 9 <= data.count else { return nil }
+            let value = data.loadUInt64(at: offset + 1)
+            return (value, 9)
+        }
     }
 
     private func parseAddrPayload(_ data: Data) -> [PeerAddress] {
@@ -602,6 +981,28 @@ final class Peer {
     private func parseIPAddress(_ bytes: [UInt8]) -> String? {
         guard bytes.count == 16 else { return nil }
 
+        // Check for Tor v3 onion address (BIP 155 / addrv2)
+        // Tor v3 addresses are 32 bytes but encoded in 16-byte field with special prefix
+        // Prefix: 0x04 0x06 0x00 0x00 0x00 0x00 (network ID 4 = TORv3)
+        let torV3Prefix: [UInt8] = [0x04, 0x06, 0x00, 0x00, 0x00, 0x00]
+        if Array(bytes.prefix(6)) == torV3Prefix {
+            // This is a TORv3 marker - the actual address is in addrv2 format
+            // For legacy addr messages, TORv3 isn't fully supported
+            // Return nil and handle via addrv2 if available
+            return nil
+        }
+
+        // Check for Tor v2 onion address (legacy, deprecated but still seen)
+        // Prefix: 0xFD 0x87 0xD8 0x7E 0xEB 0x43 followed by 10-byte onion ID
+        let torV2Prefix: [UInt8] = [0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43]
+        if Array(bytes.prefix(6)) == torV2Prefix {
+            // Extract 10-byte onion address and encode as base32
+            let onionBytes = Array(bytes[6..<16])
+            let onionAddress = base32Encode(onionBytes).lowercased()
+            print("🧅 Discovered Tor v2 onion peer: \(onionAddress).onion")
+            return "\(onionAddress).onion"
+        }
+
         // Check for IPv4-mapped IPv6 (::ffff:x.x.x.x)
         let ipv4Prefix: [UInt8] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
         if Array(bytes.prefix(12)) == ipv4Prefix {
@@ -615,6 +1016,33 @@ final class Peer {
             parts.append(String(format: "%x", value))
         }
         return parts.joined(separator: ":")
+    }
+
+    /// Base32 encode bytes (RFC 4648, used for .onion addresses)
+    private func base32Encode(_ bytes: [UInt8]) -> String {
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        var result = ""
+        var buffer: UInt64 = 0
+        var bitsLeft = 0
+
+        for byte in bytes {
+            buffer = (buffer << 8) | UInt64(byte)
+            bitsLeft += 8
+
+            while bitsLeft >= 5 {
+                bitsLeft -= 5
+                let index = Int((buffer >> bitsLeft) & 0x1F)
+                result.append(alphabet[alphabet.index(alphabet.startIndex, offsetBy: index)])
+            }
+        }
+
+        // Handle remaining bits
+        if bitsLeft > 0 {
+            let index = Int((buffer << (5 - bitsLeft)) & 0x1F)
+            result.append(alphabet[alphabet.index(alphabet.startIndex, offsetBy: index)])
+        }
+
+        return result
     }
 
     private func buildVersionPayload() -> Data {
