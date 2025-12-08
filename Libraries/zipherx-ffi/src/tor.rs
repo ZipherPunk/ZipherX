@@ -27,7 +27,11 @@ static TOR_STATE: AtomicU8 = AtomicU8::new(0);
 /// Bootstrap progress (0-100)
 static TOR_BOOTSTRAP_PROGRESS: AtomicU8 = AtomicU8::new(0);
 
-/// SOCKS proxy port (assigned dynamically)
+/// SOCKS proxy port - fixed at 9150 for compatibility with zclassicd
+/// (9150 is the standard Tor Browser SOCKS port, 9050 is system Tor)
+const FIXED_SOCKS_PORT: u16 = 9150;
+
+/// SOCKS proxy port (stored after binding)
 static TOR_SOCKS_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Last error message
@@ -137,11 +141,21 @@ async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Syn
         *guard = Some((*client_arc).clone());
     }
 
-    // Start SOCKS5 proxy server on a dynamic port
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    // Start SOCKS5 proxy server on fixed port 9150 (for zclassicd compatibility)
+    // Try the fixed port first, fallback to dynamic if in use
+    let listener = match TcpListener::bind(format!("127.0.0.1:{}", FIXED_SOCKS_PORT)).await {
+        Ok(l) => {
+            eprintln!("🧅 SOCKS5 proxy listening on 127.0.0.1:{} (fixed port)", FIXED_SOCKS_PORT);
+            l
+        }
+        Err(e) => {
+            eprintln!("🧅 Fixed port {} in use ({}), trying dynamic port...", FIXED_SOCKS_PORT, e);
+            let l = TcpListener::bind("127.0.0.1:0").await?;
+            eprintln!("🧅 SOCKS5 proxy listening on 127.0.0.1:{} (dynamic fallback)", l.local_addr()?.port());
+            l
+        }
+    };
     let socks_port = listener.local_addr()?.port();
-
-    eprintln!("🧅 SOCKS5 proxy listening on 127.0.0.1:{}", socks_port);
     TOR_SOCKS_PORT.store(socks_port, Ordering::SeqCst);
     TOR_BOOTSTRAP_PROGRESS.store(95, Ordering::SeqCst);
 
@@ -166,9 +180,8 @@ async fn run_socks5_proxy(listener: TcpListener, client: Arc<TorClient<Preferred
             Ok((stream, addr)) => {
                 let client_clone = client.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_socks5_connection(stream, addr, client_clone).await {
-                        eprintln!("🧅 SOCKS5 connection error from {}: {}", addr, e);
-                    }
+                    // Silently handle connection errors (too verbose otherwise)
+                    let _ = handle_socks5_connection(stream, addr, client_clone).await;
                 });
             }
             Err(e) => {
@@ -252,32 +265,22 @@ async fn handle_socks5_connection(
         }
     };
 
-    eprintln!("🧅 SOCKS5 CONNECT {}:{} from {}", host, port, addr);
-
-    // Connect through Tor
+    // Connect through Tor (minimal logging - only errors)
     let prefs = StreamPrefs::new();
     match client.connect_with_prefs((host.as_str(), port), &prefs).await {
         Ok(mut tor_stream) => {
             // Send success response
-            // +----+-----+-------+------+----------+----------+
-            // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-            // +----+-----+-------+------+----------+----------+
             stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]).await?;
 
             // Bidirectional copy between client and Tor stream
-            // Use copy_bidirectional for efficiency
-            match tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await {
-                Ok((client_to_tor, tor_to_client)) => {
-                    eprintln!("🧅 SOCKS5 connection to {}:{} closed (sent={}, received={})",
-                             host, port, client_to_tor, tor_to_client);
-                }
-                Err(e) => {
-                    eprintln!("🧅 SOCKS5 relay error for {}:{}: {}", host, port, e);
-                }
-            }
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await;
         }
         Err(e) => {
-            eprintln!("🧅 Tor connection to {}:{} failed: {}", host, port, e);
+            // Only log connection failures (not every attempt)
+            let err_msg = format!("{}", e);
+            if !err_msg.contains("timed out") && !err_msg.contains("Protocol error") {
+                eprintln!("🧅 Tor connection to {}:{} failed: {}", host, port, e);
+            }
             // Send connection failed response
             stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             return Err(format!("Tor connection failed: {}", e).into());

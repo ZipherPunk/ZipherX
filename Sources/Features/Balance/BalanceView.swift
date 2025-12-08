@@ -865,12 +865,23 @@ struct BalanceView: View {
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
 
+                    // Show Tor connection status
+                    if networkManager.torConnectedPeersCount > 0 {
+                        HStack(spacing: 4) {
+                            Text("🧅")
+                                .font(.system(size: 10))
+                            Text("\(networkManager.torConnectedPeersCount) peers via Tor")
+                                .font(theme.captionFont)
+                                .foregroundColor(.green)
+                        }
+                    }
+
                     // Show .onion peers count when discovered
                     if networkManager.onionPeersCount > 0 {
                         HStack(spacing: 4) {
                             Text("🧅")
                                 .font(.system(size: 10))
-                            Text("\(networkManager.onionPeersCount) .onion peers discovered")
+                            Text("\(networkManager.onionPeersCount) .onion discovered")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.secondaryColor)
                         }

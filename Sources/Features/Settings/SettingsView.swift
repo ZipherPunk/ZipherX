@@ -1215,18 +1215,16 @@ Both binaries must be installed to /usr/local/bin:
                     .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                // macOS requirement note
-                #if os(macOS)
+                // Embedded Arti info
                 if TorManager.shared.mode == .enabled {
                     HStack(spacing: 4) {
-                        Image(systemName: "info.circle")
+                        Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 10))
-                        Text("Requires: brew install tor")
+                        Text("Embedded Tor (Arti) - SOCKS5 port 9150")
                             .font(.system(size: 10, design: .monospaced))
                     }
-                    .foregroundColor(.orange)
+                    .foregroundColor(.green)
                 }
-                #endif
             }
             .padding(12)
             .background(theme.surfaceColor)

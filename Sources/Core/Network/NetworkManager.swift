@@ -145,6 +145,7 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
     @Published private(set) var onionPeersCount: Int = 0
+    @Published private(set) var torConnectedPeersCount: Int = 0
 
     /// Warning: P2P connection issues prevent mempool scanning
     /// UI should show warning when this is true (incoming tx detection disabled)
@@ -512,8 +513,12 @@ final class NetworkManager: ObservableObject {
         let onionCount = knownAddresses.values.filter { $0.address.host.hasSuffix(".onion") }.count
         addressLock.unlock()
 
+        // Count peers connected via Tor SOCKS5
+        let torCount = peers.filter { $0.isConnectedViaTor }.count
+
         await MainActor.run {
             self.onionPeersCount = onionCount
+            self.torConnectedPeersCount = torCount
         }
 
         if _torIsAvailable {

@@ -140,8 +140,8 @@ final class Peer {
         return host.hasSuffix(".onion")
     }
 
-    /// Whether we're connected via Tor SOCKS5 proxy
-    private var isConnectedViaTor: Bool = false
+    /// Whether we're connected via Tor SOCKS5 proxy (public for UI display)
+    private(set) var isConnectedViaTor: Bool = false
 
     init(host: String, port: UInt16, networkMagic: [UInt8]) {
         self.id = UUID().uuidString
