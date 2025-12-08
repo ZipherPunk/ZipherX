@@ -876,12 +876,23 @@ struct BalanceView: View {
                         }
                     }
 
-                    // Show .onion peers count when discovered
-                    if networkManager.onionPeersCount > 0 {
+                    // Show .onion peers actually connected (more important - bright green)
+                    if networkManager.onionConnectedPeersCount > 0 {
                         HStack(spacing: 4) {
                             Text("🧅")
                                 .font(.system(size: 10))
-                            Text("\(networkManager.onionPeersCount) .onion discovered")
+                            Text("\(networkManager.onionConnectedPeersCount) .onion connected")
+                                .font(theme.captionFont)
+                                .foregroundColor(.green)
+                        }
+                    }
+
+                    // Show .onion peers discovered but not connected (secondary)
+                    if networkManager.onionPeersCount > 0 && networkManager.onionConnectedPeersCount < networkManager.onionPeersCount {
+                        HStack(spacing: 4) {
+                            Text("🧅")
+                                .font(.system(size: 10))
+                            Text("\(networkManager.onionPeersCount - networkManager.onionConnectedPeersCount) .onion discovered")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.secondaryColor)
                         }

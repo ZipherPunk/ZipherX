@@ -144,8 +144,9 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var lastBlockTxCount: Int = 0
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
-    @Published private(set) var onionPeersCount: Int = 0
-    @Published private(set) var torConnectedPeersCount: Int = 0
+    @Published private(set) var onionPeersCount: Int = 0  // .onion addresses discovered
+    @Published private(set) var torConnectedPeersCount: Int = 0  // peers connected via Tor SOCKS5
+    @Published private(set) var onionConnectedPeersCount: Int = 0  // .onion peers actually connected
 
     /// Warning: P2P connection issues prevent mempool scanning
     /// UI should show warning when this is true (incoming tx detection disabled)
@@ -515,10 +516,13 @@ final class NetworkManager: ObservableObject {
 
         // Count peers connected via Tor SOCKS5
         let torCount = peers.filter { $0.isConnectedViaTor }.count
+        // Count .onion peers actually connected
+        let onionConnected = peers.filter { $0.isOnion && $0.isConnectionReady }.count
 
         await MainActor.run {
             self.onionPeersCount = onionCount
             self.torConnectedPeersCount = torCount
+            self.onionConnectedPeersCount = onionConnected
         }
 
         if _torIsAvailable {
