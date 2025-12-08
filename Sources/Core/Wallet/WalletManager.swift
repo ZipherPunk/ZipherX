@@ -173,6 +173,12 @@ final class WalletManager: ObservableObject {
         lastSendTimestamp = Date()
     }
 
+    /// Increment the transaction history version to trigger UI updates
+    @MainActor
+    func incrementHistoryVersion() {
+        transactionHistoryVersion += 1
+    }
+
     // MARK: - Private Properties
     private let secureStorage: SecureKeyStorage
     private let mnemonicGenerator: MnemonicGenerator

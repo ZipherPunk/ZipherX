@@ -797,7 +797,7 @@ struct SendView: View {
 
                 // Notify UI
                 await MainActor.run {
-                    walletManager.transactionHistoryVersion += 1
+                    walletManager.incrementHistoryVersion()
                 }
 
                 // Send notification
