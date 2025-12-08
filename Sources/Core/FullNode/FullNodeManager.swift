@@ -110,6 +110,10 @@ public class FullNodeManager: ObservableObject {
     // MARK: - Initialization
 
     private init() {
+        // Load saved debug level from UserDefaults
+        self.daemonDebugLevel = .none
+        self.daemonDebugLevel = loadDebugLevel()
+
         checkNodeStatus()
         startAutoRefresh()
     }
@@ -574,6 +578,133 @@ public class FullNodeManager: ObservableObject {
             process.waitUntilExit()
         }
         print("✅ FullNodeManager: Attempted peer connections via addnode onetry")
+    }
+
+    // MARK: - Debug Level Settings
+
+    /// Debug level options for zclassicd daemon
+    public enum DaemonDebugLevel: String, CaseIterable {
+        case none = "none"           // No debug logging (minimal logs)
+        case network = "net"         // Network-related debug only
+        case full = "1"              // Full debug (all categories)
+
+        public var displayName: String {
+            switch self {
+            case .none: return "None"
+            case .network: return "Network"
+            case .full: return "Full"
+            }
+        }
+
+        public var description: String {
+            switch self {
+            case .none:
+                return "Minimal logging - only errors and warnings"
+            case .network:
+                return "Network events - peer connections, traffic"
+            case .full:
+                return "Full debug - all categories (very verbose)"
+            }
+        }
+    }
+
+    /// Current daemon debug level (persisted in UserDefaults)
+    @Published public var daemonDebugLevel: DaemonDebugLevel {
+        didSet {
+            UserDefaults.standard.set(daemonDebugLevel.rawValue, forKey: "daemonDebugLevel")
+            updateDebugLevel(daemonDebugLevel)
+        }
+    }
+
+    /// Load saved debug level from UserDefaults
+    private func loadDebugLevel() -> DaemonDebugLevel {
+        if let saved = UserDefaults.standard.string(forKey: "daemonDebugLevel"),
+           let level = DaemonDebugLevel(rawValue: saved) {
+            return level
+        }
+        return .none  // Default to no debug
+    }
+
+    /// Update zclassic.conf with new debug level
+    /// Daemon restart required to apply changes
+    public func updateDebugLevel(_ level: DaemonDebugLevel) {
+        let configPath = Self.configPath
+
+        guard FileManager.default.fileExists(atPath: configPath.path) else {
+            print("⚠️ FullNodeManager: zclassic.conf not found")
+            return
+        }
+
+        do {
+            var config = try String(contentsOf: configPath, encoding: .utf8)
+            var lines = config.components(separatedBy: "\n")
+
+            // Remove all existing debug= lines (including commented ones)
+            lines.removeAll { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return trimmed.hasPrefix("debug=") || trimmed.hasPrefix("# debug=")
+            }
+
+            // Add new debug setting based on level
+            switch level {
+            case .none:
+                // No debug line needed (defaults to minimal logging)
+                print("🔧 FullNodeManager: Debug level set to NONE")
+            case .network:
+                // Insert debug=net before first blank line or at a sensible location
+                if let insertIndex = lines.firstIndex(where: { $0.contains("rpcthreads") }) {
+                    lines.insert("debug=net", at: insertIndex + 1)
+                } else {
+                    lines.append("debug=net")
+                }
+                print("🔧 FullNodeManager: Debug level set to NETWORK")
+            case .full:
+                // Insert debug=1 for full debug
+                if let insertIndex = lines.firstIndex(where: { $0.contains("rpcthreads") }) {
+                    lines.insert("debug=1", at: insertIndex + 1)
+                } else {
+                    lines.append("debug=1")
+                }
+                print("🔧 FullNodeManager: Debug level set to FULL")
+            }
+
+            config = lines.joined(separator: "\n")
+            try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+            print("✅ FullNodeManager: zclassic.conf updated with debug level")
+
+            // Note: Daemon needs restart to pick up new debug level
+            if daemonStatus.isRunning {
+                print("⚠️ FullNodeManager: Daemon restart required to apply debug level")
+            }
+
+        } catch {
+            print("❌ FullNodeManager: Failed to update debug level: \(error)")
+        }
+    }
+
+    /// Get current debug level from zclassic.conf
+    public func getCurrentDebugLevel() -> DaemonDebugLevel {
+        let configPath = Self.configPath
+
+        guard FileManager.default.fileExists(atPath: configPath.path),
+              let config = try? String(contentsOf: configPath, encoding: .utf8) else {
+            return .none
+        }
+
+        let lines = config.components(separatedBy: "\n")
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("debug=") && !trimmed.hasPrefix("# ") {
+                let value = trimmed.replacingOccurrences(of: "debug=", with: "")
+                if value == "1" {
+                    return .full
+                } else if value == "net" {
+                    return .network
+                }
+            }
+        }
+        return .none
     }
 
     // MARK: - Helpers

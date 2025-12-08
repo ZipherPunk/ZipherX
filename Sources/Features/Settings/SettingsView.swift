@@ -111,6 +111,9 @@ enum PINSecurity {
 struct SettingsView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
+    #if os(macOS)
+    @ObservedObject private var fullNodeManager = FullNodeManager.shared
+    #endif
     @State private var showExportAlert = false
     @State private var exportedKey = ""
     @State private var showError = false
@@ -578,6 +581,47 @@ Both binaries must be installed to /usr/local/bin:
             .overlay(
                 Rectangle()
                     .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
+            )
+
+            // Debug level picker
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: "ant.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                    Text("Daemon Debug Level")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                Picker("Debug Level", selection: $fullNodeManager.daemonDebugLevel) {
+                    ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
+                        Text(level.displayName).tag(level)
+                    }
+                }
+                .pickerStyle(SegmentedPickerStyle())
+
+                Text(fullNodeManager.daemonDebugLevel.description)
+                    .font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if fullNodeManager.needsTorRestart {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .font(.system(size: 10))
+                        Text("Restart daemon to apply changes")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                    }
+                }
+            }
+            .padding(10)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
             )
 
             // Node Management button

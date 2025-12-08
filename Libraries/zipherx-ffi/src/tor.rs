@@ -2,13 +2,17 @@
 //!
 //! Provides embedded Tor support for both iOS and macOS
 //! Uses Arti - the Tor Project's official Rust implementation
+//! Includes SOCKS5 proxy server for P2P connections
 
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{TorClient, TorClientConfig, StreamPrefs};
 use tor_rtcompat::PreferredRuntime;
 use tokio::runtime::Runtime;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::OnceCell;
-use std::sync::{Mutex, atomic::{AtomicU8, AtomicU16, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU8, AtomicU16, AtomicBool, Ordering}};
 use std::path::PathBuf;
+use std::net::SocketAddr;
 
 /// Global Tor client instance
 static TOR_CLIENT: OnceCell<Mutex<Option<TorClient<PreferredRuntime>>>> = OnceCell::new();
@@ -28,6 +32,9 @@ static TOR_SOCKS_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Last error message
 static TOR_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Flag to stop the SOCKS proxy server
+static SOCKS_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Get or create the Tokio runtime
 fn get_runtime() -> &'static Runtime {
@@ -96,7 +103,7 @@ pub extern "C" fn zipherx_tor_start() -> i32 {
     0
 }
 
-/// Async function to start Tor
+/// Async function to start Tor and SOCKS5 proxy server
 async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = get_tor_data_dir();
 
@@ -120,21 +127,164 @@ async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Syn
     // Create and bootstrap the client
     let client = TorClient::create_bootstrapped(config).await?;
 
-    TOR_BOOTSTRAP_PROGRESS.store(90, Ordering::SeqCst);
+    TOR_BOOTSTRAP_PROGRESS.store(80, Ordering::SeqCst);
+    eprintln!("🧅 Arti client bootstrapped, starting SOCKS5 proxy...");
 
     // Store the client
+    let client_arc = Arc::new(client);
     let client_storage = TOR_CLIENT.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = client_storage.lock() {
-        *guard = Some(client);
+        *guard = Some((*client_arc).clone());
     }
 
-    // Find an available port for SOCKS proxy
-    // Note: Arti doesn't expose a built-in SOCKS listener like C Tor
-    // Instead, we'll use the client directly for connections
-    // For now, return a placeholder port - actual proxying happens via FFI
-    let socks_port: u16 = 19050;
+    // Start SOCKS5 proxy server on a dynamic port
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let socks_port = listener.local_addr()?.port();
 
+    eprintln!("🧅 SOCKS5 proxy listening on 127.0.0.1:{}", socks_port);
+    TOR_SOCKS_PORT.store(socks_port, Ordering::SeqCst);
+    TOR_BOOTSTRAP_PROGRESS.store(95, Ordering::SeqCst);
+
+    // Spawn the SOCKS5 proxy server
+    SOCKS_SERVER_RUNNING.store(true, Ordering::SeqCst);
+    let client_for_proxy = client_arc.clone();
+
+    tokio::spawn(async move {
+        run_socks5_proxy(listener, client_for_proxy).await;
+    });
+
+    TOR_BOOTSTRAP_PROGRESS.store(100, Ordering::SeqCst);
     Ok(socks_port)
+}
+
+/// Run the SOCKS5 proxy server
+async fn run_socks5_proxy(listener: TcpListener, client: Arc<TorClient<PreferredRuntime>>) {
+    eprintln!("🧅 SOCKS5 proxy server started");
+
+    while SOCKS_SERVER_RUNNING.load(Ordering::SeqCst) {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                let client_clone = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_socks5_connection(stream, addr, client_clone).await {
+                        eprintln!("🧅 SOCKS5 connection error from {}: {}", addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                if SOCKS_SERVER_RUNNING.load(Ordering::SeqCst) {
+                    eprintln!("🧅 SOCKS5 accept error: {}", e);
+                }
+            }
+        }
+    }
+
+    eprintln!("🧅 SOCKS5 proxy server stopped");
+}
+
+/// Handle a single SOCKS5 client connection
+async fn handle_socks5_connection(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // SOCKS5 greeting: client sends version + auth methods
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+
+    if greeting[0] != 0x05 {
+        return Err("Not SOCKS5".into());
+    }
+
+    let num_methods = greeting[1] as usize;
+    let mut methods = vec![0u8; num_methods];
+    stream.read_exact(&mut methods).await?;
+
+    // Reply: accept no auth (0x00)
+    stream.write_all(&[0x05, 0x00]).await?;
+
+    // Read connection request
+    let mut request = [0u8; 4];
+    stream.read_exact(&mut request).await?;
+
+    if request[0] != 0x05 || request[1] != 0x01 {
+        // Only support CONNECT (0x01)
+        stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        return Err("Unsupported SOCKS5 command".into());
+    }
+
+    // Parse destination address
+    let (host, port) = match request[3] {
+        0x01 => {
+            // IPv4
+            let mut ip = [0u8; 4];
+            stream.read_exact(&mut ip).await?;
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).await?;
+            let port = u16::from_be_bytes(port_bytes);
+            (format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port)
+        }
+        0x03 => {
+            // Domain name
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut domain).await?;
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).await?;
+            let port = u16::from_be_bytes(port_bytes);
+            (String::from_utf8_lossy(&domain).to_string(), port)
+        }
+        0x04 => {
+            // IPv6
+            let mut ip = [0u8; 16];
+            stream.read_exact(&mut ip).await?;
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).await?;
+            let port = u16::from_be_bytes(port_bytes);
+            // Format IPv6 address
+            let addr: std::net::Ipv6Addr = ip.into();
+            (addr.to_string(), port)
+        }
+        _ => {
+            stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            return Err("Unsupported address type".into());
+        }
+    };
+
+    eprintln!("🧅 SOCKS5 CONNECT {}:{} from {}", host, port, addr);
+
+    // Connect through Tor
+    let prefs = StreamPrefs::new();
+    match client.connect_with_prefs((host.as_str(), port), &prefs).await {
+        Ok(mut tor_stream) => {
+            // Send success response
+            // +----+-----+-------+------+----------+----------+
+            // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+            // +----+-----+-------+------+----------+----------+
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]).await?;
+
+            // Bidirectional copy between client and Tor stream
+            // Use copy_bidirectional for efficiency
+            match tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await {
+                Ok((client_to_tor, tor_to_client)) => {
+                    eprintln!("🧅 SOCKS5 connection to {}:{} closed (sent={}, received={})",
+                             host, port, client_to_tor, tor_to_client);
+                }
+                Err(e) => {
+                    eprintln!("🧅 SOCKS5 relay error for {}:{}: {}", host, port, e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("🧅 Tor connection to {}:{} failed: {}", host, port, e);
+            // Send connection failed response
+            stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            return Err(format!("Tor connection failed: {}", e).into());
+        }
+    }
+
+    Ok(())
 }
 
 /// Stop the Tor client
@@ -142,6 +292,9 @@ async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Syn
 #[no_mangle]
 pub extern "C" fn zipherx_tor_stop() -> i32 {
     eprintln!("🧅 Stopping Tor...");
+
+    // Stop SOCKS proxy server
+    SOCKS_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
     // Clear the client
     if let Some(client_storage) = TOR_CLIENT.get() {
