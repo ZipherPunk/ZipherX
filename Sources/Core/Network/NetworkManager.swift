@@ -145,6 +145,13 @@ final class NetworkManager: ObservableObject {
     @Published private(set) var networkDifficulty: Double = 0.0
     @Published private(set) var bannedPeersCount: Int = 0
     @Published private(set) var onionPeersCount: Int = 0  // .onion addresses discovered
+
+    /// Public accessor for known addresses count (for privacy report)
+    var knownAddressesCount: Int {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+        return knownAddresses.count
+    }
     @Published private(set) var torConnectedPeersCount: Int = 0  // peers connected via Tor SOCKS5
     @Published private(set) var onionConnectedPeersCount: Int = 0  // .onion peers actually connected
 
@@ -255,10 +262,16 @@ final class NetworkManager: ObservableObject {
 
     /// Add a new address to our known addresses
     private func addAddress(_ address: PeerAddress, source: String) {
-        let key = "\(address.host):\(address.port)"
+        // Normalize IPv6-mapped addresses to IPv4
+        guard let normalizedHost = normalizeIPv6MappedAddress(address.host) else {
+            // Skip pure IPv6 addresses
+            return
+        }
+        let normalizedAddress = PeerAddress(host: normalizedHost, port: address.port)
+        let key = "\(normalizedHost):\(address.port)"
 
         // Skip if banned
-        if isBanned(address.host) {
+        if isBanned(normalizedHost) {
             return
         }
 
@@ -275,7 +288,7 @@ final class NetworkManager: ObservableObject {
         // Add to new addresses
         if knownAddresses.count < MAX_KNOWN_ADDRESSES {
             knownAddresses[key] = AddressInfo(
-                address: address,
+                address: normalizedAddress,
                 source: source,
                 firstSeen: Date(),
                 lastSeen: Date(),
@@ -653,6 +666,43 @@ final class NetworkManager: ObservableObject {
     private let persistedAddressesKey = "ZipherX.KnownPeerAddresses"
     private let maxPersistedAddresses = 100
 
+    /// Convert IPv6-mapped IPv4 addresses to pure IPv4 format
+    /// e.g., "0:0:0:0:0:0:ffff:9de93c4e" -> "157.233.60.78"
+    private func normalizeIPv6MappedAddress(_ host: String) -> String? {
+        // Skip .onion addresses
+        if host.hasSuffix(".onion") {
+            return host
+        }
+
+        // Already IPv4
+        if host.split(separator: ".").count == 4 && !host.contains(":") {
+            return host
+        }
+
+        // Check for IPv6-mapped IPv4: 0:0:0:0:0:0:ffff:XXXX
+        if host.contains(":") && host.lowercased().contains("ffff:") {
+            let parts = host.split(separator: ":")
+            if parts.count >= 2, let lastPart = parts.last {
+                // Convert hex to IPv4 bytes
+                let hexStr = String(lastPart)
+                if hexStr.count == 8, let hexVal = UInt32(hexStr, radix: 16) {
+                    let b1 = (hexVal >> 24) & 0xFF
+                    let b2 = (hexVal >> 16) & 0xFF
+                    let b3 = (hexVal >> 8) & 0xFF
+                    let b4 = hexVal & 0xFF
+                    return "\(b1).\(b2).\(b3).\(b4)"
+                }
+            }
+        }
+
+        // Pure IPv6 - not supported via Tor SOCKS5
+        if host.contains(":") {
+            return nil
+        }
+
+        return host
+    }
+
     private func loadPersistedAddresses() {
         guard let data = UserDefaults.standard.data(forKey: persistedAddressesKey),
               let savedAddresses = try? JSONDecoder().decode([PersistedAddress].self, from: data) else {
@@ -664,12 +714,18 @@ final class NetworkManager: ObservableObject {
         defer { addressLock.unlock() }
 
         var loadedCount = 0
+        var skippedIPv6 = 0
         for saved in savedAddresses {
-            let address = PeerAddress(host: saved.host, port: saved.port)
-            let key = "\(saved.host):\(saved.port)"
+            // Normalize IPv6-mapped addresses to IPv4
+            guard let normalizedHost = normalizeIPv6MappedAddress(saved.host) else {
+                skippedIPv6 += 1
+                continue
+            }
+            let address = PeerAddress(host: normalizedHost, port: saved.port)
+            let key = "\(normalizedHost):\(saved.port)"
 
             // Skip if banned or already known
-            if isBanned(saved.host) || knownAddresses[key] != nil {
+            if isBanned(normalizedHost) || knownAddresses[key] != nil {
                 continue
             }
 
@@ -696,7 +752,11 @@ final class NetworkManager: ObservableObject {
             self.knownAddressCount = count
         }
 
-        print("📡 Loaded \(loadedCount) persisted peer addresses")
+        if skippedIPv6 > 0 {
+            print("📡 Loaded \(loadedCount) persisted peer addresses (skipped \(skippedIPv6) pure IPv6)")
+        } else {
+            print("📡 Loaded \(loadedCount) persisted peer addresses")
+        }
     }
 
     private func persistAddresses() {
@@ -1080,6 +1140,40 @@ final class NetworkManager: ObservableObject {
 
         // Persist good addresses for next launch
         persistAddresses()
+
+        // Advertise our .onion address to peers (if hidden service is running)
+        await advertiseOnionAddressToPeers()
+    }
+
+    // MARK: - Onion Address Advertisement
+
+    /// Advertise our .onion address to all connected peers
+    /// This makes ZipherX visible on the network while remaining anonymous
+    func advertiseOnionAddressToPeers() async {
+        // Check if hidden service is running
+        guard await HiddenServiceManager.shared.state == .running,
+              let onionAddress = await HiddenServiceManager.shared.onionAddress else {
+            return
+        }
+
+        let port = await HiddenServiceManager.shared.p2pPort
+
+        print("🧅 Advertising our .onion address to \(peers.count) peers...")
+
+        // Advertise to all connected peers in parallel
+        await withTaskGroup(of: Void.self) { group in
+            for peer in peers {
+                group.addTask {
+                    do {
+                        try await peer.advertiseOnionAddress(onionAddress: onionAddress, port: port)
+                    } catch {
+                        print("🧅 Failed to advertise to \(peer.host): \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+
+        print("🧅 Finished advertising our .onion address to network")
     }
 
     /// Disconnect from all peers

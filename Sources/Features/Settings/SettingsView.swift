@@ -165,6 +165,9 @@ struct SettingsView: View {
     // Seed phrase info
     @State private var showSeedPhraseInfo = false
 
+    // Privacy Report
+    @State private var showPrivacyReport = false
+
     @EnvironmentObject var themeManager: ThemeManager
 
     // Theme shortcut
@@ -185,6 +188,9 @@ struct SettingsView: View {
 
                 // Security section
                 securitySection
+
+                // Privacy Report section
+                privacyReportSection
 
                 // Network section
                 networkSection
@@ -743,6 +749,57 @@ Both binaries must be installed to /usr/local/bin:
         }
     }
 
+    // MARK: - Privacy Report Section
+
+    private var privacyReportSection: some View {
+        VStack(spacing: 12) {
+            // Section header
+            HStack {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 12))
+                Text("Privacy Audit")
+                    .font(theme.titleFont)
+                Spacer()
+            }
+            .foregroundColor(theme.textPrimary)
+
+            // Privacy Report Button
+            Button(action: {
+                showPrivacyReport = true
+            }) {
+                HStack {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 14))
+                    Text("Generate Privacy Report")
+                        .font(theme.bodyFont)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.accentColor)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(theme.surfaceColor)
+                .cornerRadius(8)
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            // Description
+            Text("Analyze your wallet's privacy posture with cypherpunk-grade security checks")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
+                .padding(.horizontal, 4)
+        }
+        .padding()
+        .background(theme.surfaceColor.opacity(0.5))
+        .cornerRadius(12)
+        .sheet(isPresented: $showPrivacyReport) {
+            PrivacyReportView()
+                .environmentObject(themeManager)
+        }
+    }
+
     // MARK: - Security Section
 
     private var securitySection: some View {
@@ -1274,6 +1331,13 @@ Both binaries must be installed to /usr/local/bin:
                     if case .connected = newState {
                         Task {
                             await TorManager.shared.fetchTorIP()
+                            // Notify hidden service manager of Tor connection state change
+                            await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: true)
+                        }
+                    } else if case .disconnected = newState {
+                        Task {
+                            // Notify hidden service manager when Tor disconnects
+                            await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: false)
                         }
                     }
                 }
@@ -1355,6 +1419,139 @@ Both binaries must be installed to /usr/local/bin:
                 Rectangle()
                     .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
             )
+
+            // MARK: - Hidden Service (Onion Hosting) Section
+            if TorManager.shared.mode == .enabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    // Section header
+                    HStack {
+                        Text("🧅 HIDDEN SERVICE")
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        Spacer()
+                        // Status indicator
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(hiddenServiceStatusColor)
+                                .frame(width: 8, height: 8)
+                            Text(HiddenServiceManager.shared.state.displayText)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                        }
+                    }
+                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4)) // Fluorescent green
+
+                    Text("Make your wallet discoverable as a .onion peer")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+
+                    // Enable toggle
+                    Toggle(isOn: Binding(
+                        get: { HiddenServiceManager.shared.isEnabled },
+                        set: { HiddenServiceManager.shared.isEnabled = $0 }
+                    )) {
+                        HStack {
+                            Text("Enable Hidden Service")
+                                .font(theme.bodyFont)
+                            Spacer()
+                        }
+                    }
+                    .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.2, green: 1.0, blue: 0.4)))
+
+                    // Description
+                    Text("When enabled, other peers can connect to you via your unique .onion address. You remain anonymous while being discoverable.")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // Show .onion address when running
+                    if HiddenServiceManager.shared.state == .running,
+                       let onionAddress = HiddenServiceManager.shared.onionAddress,
+                       let fullOnionAddress = HiddenServiceManager.shared.p2pOnionAddress {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("YOUR .ONION ADDRESS")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
+
+                            // Show full address without truncation
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(onionAddress)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
+                                    .textSelection(.enabled)
+                                Text(":\(HiddenServiceManager.shared.p2pPort)")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.7))
+                            }
+
+                            HStack {
+                                // Copy full address with port
+                                Button(action: {
+                                    #if os(iOS)
+                                    UIPasteboard.general.string = fullOnionAddress
+                                    #elseif os(macOS)
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(fullOnionAddress, forType: .string)
+                                    #endif
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.system(size: 11))
+                                        Text("COPY FULL ADDRESS")
+                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                    }
+                                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.2))
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer()
+                            }
+
+                            // Connection info
+                            HStack(spacing: 4) {
+                                Image(systemName: "antenna.radiowaves.left.and.right")
+                                    .font(.system(size: 10))
+                                Text("P2P Port: \(HiddenServiceManager.shared.p2pPort)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                Text("•")
+                                Text("Active: \(HiddenServiceManager.shared.activeConnectionsCount)")
+                                    .font(.system(size: 10, design: .monospaced))
+                            }
+                            .foregroundColor(theme.textSecondary)
+                        }
+                        .padding(10)
+                        .background(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.1))
+                        .overlay(
+                            Rectangle()
+                                .stroke(Color(red: 0.2, green: 1.0, blue: 0.4), lineWidth: 1)
+                        )
+                    }
+
+                    // Cypherpunk message
+                    HStack(spacing: 8) {
+                        Text("🚀")
+                            .font(.system(size: 12))
+                        Text("\"Become a node in the network of freedom.\"")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+                            .italic()
+                    }
+                    .padding(8)
+                    .background(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.1))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.3), lineWidth: 1)
+                    )
+                }
+                .padding(12)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
         }
         .padding(12)
         .background(theme.backgroundColor)
@@ -1362,6 +1559,20 @@ Both binaries must be installed to /usr/local/bin:
             Rectangle()
                 .stroke(theme.textPrimary, lineWidth: 1)
         )
+    }
+
+    /// Color for Hidden Service status indicator
+    private var hiddenServiceStatusColor: Color {
+        switch HiddenServiceManager.shared.state {
+        case .stopped:
+            return .gray
+        case .starting:
+            return .orange
+        case .running:
+            return Color(red: 0.2, green: 1.0, blue: 0.4)  // Fluorescent green
+        case .error:
+            return .red
+        }
     }
 
     /// Color for Tor connection status indicator

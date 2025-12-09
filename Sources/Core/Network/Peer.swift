@@ -413,27 +413,61 @@ final class Peer {
         // Perform SOCKS5 handshake
         try await performSocks5Handshake()
         isConnectedViaTor = true
-        print("🧅 [\(host)] SOCKS5 connection established via Tor")
+        print("🧅 [\(host)] Connected via Tor (SOCKS5 handshake complete)")
     }
 
     /// Perform SOCKS5 handshake to connect to target host through proxy
     /// RFC 1928: https://datatracker.ietf.org/doc/html/rfc1928
+    /// Updated for Arti compatibility - supports both no-auth (0x00) and username/password (0x02)
     private func performSocks5Handshake() async throws {
         // Step 1: Send greeting (version, number of methods, methods)
-        // We offer: no auth (0x00)
-        let greeting = Data([0x05, 0x01, 0x00]) // SOCKS5, 1 method, no auth
+        // Offer both no-auth (0x00) and username/password (0x02) for Arti compatibility
+        // Arti uses username/password auth for circuit isolation
+        let greeting = Data([0x05, 0x02, 0x00, 0x02]) // SOCKS5, 2 methods: no auth + username/password
         try await sendRawData(greeting)
 
-        // Step 2: Receive server choice
-        let authResponse = try await receiveRawData(length: 2)
+        // Step 2: Receive server choice (with timeout and retry)
+        var authResponse: Data
+        do {
+            authResponse = try await receiveRawDataWithTimeout(length: 2, timeout: 5.0)
+        } catch {
+            print("🧅 [\(host)] SOCKS5 auth response failed: \(error)")
+            throw NetworkError.connectionFailed("SOCKS5 proxy not responding")
+        }
+
         guard authResponse.count == 2 else {
-            throw NetworkError.connectionFailed("Invalid SOCKS5 auth response")
+            print("🧅 [\(host)] SOCKS5 invalid auth response length: \(authResponse.count)")
+            throw NetworkError.connectionFailed("Invalid SOCKS5 auth response (got \(authResponse.count) bytes)")
         }
-        guard authResponse[0] == 0x05 else {
-            throw NetworkError.connectionFailed("SOCKS5 version mismatch")
+
+        // Debug log the raw bytes for troubleshooting
+        let byte0 = authResponse[0]
+        let byte1 = authResponse[1]
+
+        guard byte0 == 0x05 else {
+            print("🧅 [\(host)] SOCKS5 version mismatch: expected 0x05, got 0x\(String(format: "%02X", byte0))")
+            print("🧅 [\(host)] Full response bytes: \(authResponse.hexString)")
+            throw NetworkError.connectionFailed("SOCKS5 version mismatch (got 0x\(String(format: "%02X", byte0)), expected 0x05)")
         }
-        guard authResponse[1] == 0x00 else {
-            throw NetworkError.connectionFailed("SOCKS5 auth method not supported: \(authResponse[1])")
+
+        // Handle authentication method
+        switch byte1 {
+        case 0x00:
+            // No authentication required - continue to connection request
+            print("🧅 [\(host)] SOCKS5 using no authentication")
+
+        case 0x02:
+            // Username/password authentication required
+            // Arti uses this for circuit isolation - any username/password works
+            print("🧅 [\(host)] SOCKS5 using username/password auth (circuit isolation)")
+            try await performSocks5UsernameAuth()
+
+        case 0xFF:
+            throw NetworkError.connectionFailed("SOCKS5 proxy: no acceptable auth methods")
+
+        default:
+            print("🧅 [\(host)] SOCKS5 unsupported auth method: 0x\(String(format: "%02X", byte1))")
+            throw NetworkError.connectionFailed("SOCKS5 auth method not supported: \(byte1)")
         }
 
         // Step 3: Send connection request
@@ -555,6 +589,69 @@ final class Peer {
         }
     }
 
+    /// Receive data with timeout (for SOCKS5 handshake reliability)
+    private func receiveRawDataWithTimeout(length: Int, timeout: TimeInterval) async throws -> Data {
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                try await self.receiveRawData(length: length)
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw NetworkError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Perform SOCKS5 username/password authentication (RFC 1929)
+    /// Arti uses this for circuit isolation - any username/password is accepted
+    private func performSocks5UsernameAuth() async throws {
+        // Generate unique credentials for circuit isolation
+        let username = "zipherx-\(UUID().uuidString.prefix(8))"
+        let password = "tor-\(Int.random(in: 1000...9999))"
+
+        // Build authentication request
+        // +----+------+----------+------+----------+
+        // |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+        // +----+------+----------+------+----------+
+        // | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+        // +----+------+----------+------+----------+
+        var authRequest = Data()
+        authRequest.append(0x01)  // Auth version (always 0x01)
+        authRequest.append(UInt8(username.count))
+        authRequest.append(contentsOf: username.utf8)
+        authRequest.append(UInt8(password.count))
+        authRequest.append(contentsOf: password.utf8)
+
+        try await sendRawData(authRequest)
+
+        // Receive authentication response
+        // +----+--------+
+        // |VER | STATUS |
+        // +----+--------+
+        // | 1  |   1    |
+        // +----+--------+
+        let authResponse = try await receiveRawDataWithTimeout(length: 2, timeout: 5.0)
+
+        guard authResponse.count == 2 else {
+            throw NetworkError.connectionFailed("Invalid SOCKS5 auth response")
+        }
+
+        guard authResponse[0] == 0x01 else {
+            throw NetworkError.connectionFailed("SOCKS5 auth version mismatch")
+        }
+
+        guard authResponse[1] == 0x00 else {
+            throw NetworkError.connectionFailed("SOCKS5 authentication failed (status: \(authResponse[1]))")
+        }
+
+        print("🧅 [\(host)] SOCKS5 authentication successful")
+    }
+
     func disconnect() {
         stopBlockListener()
         connection?.cancel()
@@ -601,6 +698,9 @@ final class Peer {
         // Disconnect old connection if exists
         if connection != nil {
             disconnect()
+            // Small delay to ensure old connection is fully torn down
+            // This prevents race conditions with SOCKS5 proxy
+            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
         // Reconnect with fresh handshake
@@ -1025,13 +1125,22 @@ final class Peer {
             return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
         }
 
-        // Pure IPv6 - format as hex
-        var parts: [String] = []
-        for i in stride(from: 0, to: 16, by: 2) {
-            let value = (UInt16(bytes[i]) << 8) | UInt16(bytes[i + 1])
-            parts.append(String(format: "%x", value))
+        // Check for all-zeros prefix (alternative IPv4-mapped format)
+        // Some implementations use 0:0:0:0:0:0:ffff:xxxx where ffff is in the 7th position
+        if bytes[0...9].allSatisfy({ $0 == 0 }) && bytes[10] == 0xff && bytes[11] == 0xff {
+            return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
         }
-        return parts.joined(separator: ":")
+
+        // Skip pure IPv6 addresses - SOCKS5 to Tor doesn't support them well
+        // Only allow .onion and IPv4 addresses
+        let isAllZeros = bytes.prefix(10).allSatisfy { $0 == 0 }
+        if isAllZeros && (bytes[10] == 0xff || bytes[10] == 0) {
+            // This might be an IPv4-mapped we couldn't parse - extract last 4 bytes as IPv4
+            return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+        }
+
+        // Pure IPv6 address - skip it (not supported via Tor SOCKS5)
+        return nil
     }
 
     /// Base32 encode bytes (RFC 4648, used for .onion addresses)
@@ -2236,6 +2345,93 @@ final class Peer {
             }
             return (value, 9)
         }
+    }
+
+    // MARK: - Onion Address Advertisement (Cypherpunk Visibility!)
+
+    /// Advertise our .onion address to this peer via addrv2 message
+    /// This makes ZipherX discoverable as a peer on the network while remaining anonymous
+    /// Format: BIP 155 addrv2 with network ID 0x04 (Tor v3)
+    func advertiseOnionAddress(onionAddress: String, port: UInt16) async throws {
+        // Parse onion address - extract the 56-character base32 part
+        guard onionAddress.hasSuffix(".onion") else {
+            print("🧅 Invalid onion address format: \(onionAddress)")
+            return
+        }
+
+        let addressPart = String(onionAddress.dropLast(6)) // Remove ".onion"
+        guard addressPart.count == 56 else {
+            print("🧅 Invalid Tor v3 address length: \(addressPart.count) (expected 56)")
+            return
+        }
+
+        // Decode base32 to get pubkey + checksum + version (35 bytes)
+        guard let decoded = decodeOnionV3(addressPart) else {
+            print("🧅 Failed to decode onion address")
+            return
+        }
+
+        // The first 32 bytes are the public key (what goes in addrv2)
+        let publicKey = Array(decoded.prefix(32))
+
+        // Build addrv2 payload
+        var payload = Data()
+
+        // Count: 1 address (varint)
+        payload.append(1)
+
+        // Time: current timestamp (4 bytes, little endian)
+        let timestamp = UInt32(Date().timeIntervalSince1970)
+        payload.append(contentsOf: withUnsafeBytes(of: timestamp.littleEndian) { Array($0) })
+
+        // Services: NODE_NETWORK (1) as varint
+        payload.append(1)
+
+        // Network ID: 0x04 = Tor v3
+        payload.append(0x04)
+
+        // Address length: 32 bytes (varint)
+        payload.append(32)
+
+        // Address: 32-byte public key
+        payload.append(contentsOf: publicKey)
+
+        // Port: 2 bytes, big endian
+        payload.append(UInt8((port >> 8) & 0xFF))
+        payload.append(UInt8(port & 0xFF))
+
+        // Send addrv2 message
+        try await sendMessage(command: "addrv2", payload: payload)
+        print("🧅 Advertised our .onion address to peer \(host): \(onionAddress):\(port)")
+    }
+
+    /// Decode Tor v3 onion address from base32 to bytes
+    /// Returns 35 bytes: 32-byte pubkey + 2-byte checksum + 1-byte version
+    private func decodeOnionV3(_ address: String) -> Data? {
+        // Tor v3 addresses use RFC 4648 base32 (no padding)
+        let alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+        let lookup: [Character: UInt8] = Dictionary(uniqueKeysWithValues: alphabet.enumerated().map { (alphabet[alphabet.index(alphabet.startIndex, offsetBy: $0.offset)], UInt8($0.offset)) })
+
+        var bits: [UInt8] = []
+        for char in address.lowercased() {
+            guard let value = lookup[char] else { return nil }
+            // Each base32 character represents 5 bits
+            for i in (0..<5).reversed() {
+                bits.append((value >> i) & 1)
+            }
+        }
+
+        // Convert bits to bytes (280 bits = 35 bytes)
+        var bytes: [UInt8] = []
+        for i in stride(from: 0, to: bits.count - 7, by: 8) {
+            var byte: UInt8 = 0
+            for j in 0..<8 {
+                byte = (byte << 1) | bits[i + j]
+            }
+            bytes.append(byte)
+        }
+
+        return Data(bytes)
     }
 }
 

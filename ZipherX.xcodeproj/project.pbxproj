@@ -23,6 +23,7 @@
 		19D558691C9ED092DBA470FB /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
 		1A94928949C49A5977D23471 /* NodeManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */; };
 		1B2C46C9C59FD9C9A20EA667 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
+		1B44F7C3066ACAB0BE47817A /* HiddenServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */; };
 		1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */; };
 		1CE0234F6BC8E68B8D707AE2 /* BlockTimestampManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04DC847050BBC7E852DE4F5F /* BlockTimestampManager.swift */; };
 		2181FB4B936836564DCC5956 /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1AF6B2117E203E51A3F91E /* ThemeManager.swift */; };
@@ -30,6 +31,7 @@
 		21E26CDC970AD9BF5E8EF5C1 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		259A2EDB88C817E0EC89AA3D /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
 		275398B0CEA6FA763AA1372F /* PrivacyScoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F8F776C5143A67A1A923FF1 /* PrivacyScoreView.swift */; };
+		27A383A84436B64371D21909 /* PrivacyReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */; };
 		27CCF442814D053CBF8F12A9 /* RustBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD65941062D3050BEA2765F9 /* RustBridge.swift */; };
 		28DAAC08B988CB003CA4C56E /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */; };
 		299321BCE07B29EBC52BA294 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
@@ -94,6 +96,7 @@
 		90604ADFA09E5EB4C3ED5245 /* WalletDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */; };
 		913E7649F61DB6E86FEAC26A /* ExplorerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 426F735D18C658425E86F4D4 /* ExplorerViewModel.swift */; };
 		92A36FAFBBE9E6E5CE516875 /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD6AFDCA26B490632B50E6D /* BiometricAuthManager.swift */; };
+		958D0FA84BF6E75FFBB20282 /* PrivacyReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */; };
 		95B02CA9CFC2FF60EC40B1D4 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		A2ADB56D4E059E232CD01868 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
@@ -107,6 +110,7 @@
 		BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6C673DA8922F1FE8EAAB2C04 /* Assets.xcassets */; };
 		BE9229075EDEE71F40F43823 /* ModernTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */; };
 		BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */; };
+		C055B8D18EA58A8EB0AC75BD /* HiddenServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */; };
 		C0B80B951C400D297715A372 /* SQLCipher.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */; };
 		C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */; };
@@ -174,6 +178,7 @@
 		6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemedComponents.swift; sourceTree = "<group>"; };
 		710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InsightAPI.swift; sourceTree = "<group>"; };
 		7173E7574C060D4285B73B46 /* Mac7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mac7Theme.swift; sourceTree = "<group>"; };
+		74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyReportView.swift; sourceTree = "<group>"; };
 		77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeManagementView.swift; sourceTree = "<group>"; };
 		79B539975C988B8093FB4106 /* System7Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Components.swift; sourceTree = "<group>"; };
 		7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletDatabase.swift; sourceTree = "<group>"; };
@@ -182,6 +187,7 @@
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
+		98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiddenServiceManager.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE0707D0A98DFEF7F487D9B /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
@@ -423,6 +429,7 @@
 				682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */,
 				5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */,
 				D114627F3AC22A9229292187 /* HeaderSyncManager.swift */,
+				98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */,
 				710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */,
 				18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */,
 				48D92FD9B357E6379040DA58 /* Peer.swift */,
@@ -468,6 +475,7 @@
 		A3BC2619F100119963425C5B /* Privacy */ = {
 			isa = PBXGroup;
 			children = (
+				74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */,
 				2F8F776C5143A67A1A923FF1 /* PrivacyScoreView.swift */,
 			);
 			path = Privacy;
@@ -693,6 +701,7 @@
 				95B02CA9CFC2FF60EC40B1D4 /* FullNodeManager.swift in Sources */,
 				3D14CF0D99CE3A8E4ECA634C /* HeaderStore.swift in Sources */,
 				2B5B01C47D7F28B032E54857 /* HeaderSyncManager.swift in Sources */,
+				C055B8D18EA58A8EB0AC75BD /* HiddenServiceManager.swift in Sources */,
 				0E9CC1442507E8DA6B137645 /* HistoryView.swift in Sources */,
 				00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */,
 				3EC81DFEA121068B44540EE6 /* Mac7Theme.swift in Sources */,
@@ -704,6 +713,7 @@
 				55B0CB3E3A91EF351BAC5427 /* NotificationManager.swift in Sources */,
 				DCB48F14E31DBA6705F0BC79 /* Peer.swift in Sources */,
 				34481E26708F49AD37EB6C93 /* PrivacyQuotes.swift in Sources */,
+				27A383A84436B64371D21909 /* PrivacyReportView.swift in Sources */,
 				E482EBBAC733177124411B8C /* PrivacyScore.swift in Sources */,
 				275398B0CEA6FA763AA1372F /* PrivacyScoreView.swift in Sources */,
 				3D08C9F31B8F9C6F1837B406 /* RPCClient.swift in Sources */,
@@ -758,6 +768,7 @@
 				B5432C123C1ECD9D24CA0466 /* FullNodeManager.swift in Sources */,
 				772BD4E27BC23CDF88246433 /* HeaderStore.swift in Sources */,
 				0EC0AE8AA031C37EA515AF19 /* HeaderSyncManager.swift in Sources */,
+				1B44F7C3066ACAB0BE47817A /* HiddenServiceManager.swift in Sources */,
 				517AE371E83D67E5C53DF758 /* HistoryView.swift in Sources */,
 				76E34B0E07EC1B8587C2BE12 /* InsightAPI.swift in Sources */,
 				79B002B28B3284D1D6AEEA57 /* Mac7Theme.swift in Sources */,
@@ -769,6 +780,7 @@
 				DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */,
 				3742555859851725FDC9B9DE /* Peer.swift in Sources */,
 				173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */,
+				958D0FA84BF6E75FFBB20282 /* PrivacyReportView.swift in Sources */,
 				577B429477EFC01E98AF29CC /* PrivacyScore.swift in Sources */,
 				420BEAAB450770163D0F5E4F /* PrivacyScoreView.swift in Sources */,
 				71011647034F4C4BEBD2C1CF /* RPCClient.swift in Sources */,

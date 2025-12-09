@@ -461,3 +461,263 @@ pub unsafe extern "C" fn zipherx_tor_free_string(ptr: *mut libc::c_char) {
 pub extern "C" fn zipherx_tor_is_available() -> bool {
     true
 }
+
+// =============================================================================
+// HIDDEN SERVICE (ONION SERVICE) HOSTING
+// =============================================================================
+
+use tor_hsservice::config::{OnionServiceConfig, OnionServiceConfigBuilder};
+use std::sync::atomic::AtomicPtr;
+
+/// Hidden service state
+/// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
+static HIDDEN_SERVICE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Hidden service .onion address (56 characters for v3)
+static HIDDEN_SERVICE_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
+
+/// P2P port for incoming connections (default 8033 = Zclassic mainnet)
+const HIDDEN_SERVICE_P2P_PORT: u16 = 8033;
+
+/// Callback type for incoming connections (connection_id, peer_host, peer_port)
+static INCOMING_CONNECTION_CALLBACK: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Type alias for the callback function
+type IncomingConnectionFn = unsafe extern "C" fn(connection_id: u64, host_ptr: *const libc::c_char, port: u16);
+
+/// Start the hidden service
+/// This makes ZipherX discoverable as a .onion peer
+/// Returns 0 on success, 1 on error
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_start() -> i32 {
+    let tor_state = TOR_STATE.load(Ordering::SeqCst);
+    if tor_state != 3 {
+        eprintln!("🧅 Cannot start hidden service - Tor not connected");
+        return 1;
+    }
+
+    let hs_state = HIDDEN_SERVICE_STATE.load(Ordering::SeqCst);
+    if hs_state == 1 || hs_state == 2 {
+        eprintln!("🧅 Hidden service already running or starting");
+        return 0;
+    }
+
+    HIDDEN_SERVICE_STATE.store(1, Ordering::SeqCst); // Starting
+
+    let runtime = get_runtime();
+
+    runtime.spawn(async {
+        match start_hidden_service_async().await {
+            Ok(onion_addr) => {
+                eprintln!("🧅 Hidden service started!");
+                eprintln!("🧅 Your .onion address: {}", onion_addr);
+                if let Ok(mut addr) = HIDDEN_SERVICE_ADDRESS.lock() {
+                    *addr = Some(onion_addr);
+                }
+                HIDDEN_SERVICE_STATE.store(2, Ordering::SeqCst); // Running
+            }
+            Err(e) => {
+                eprintln!("🧅 Hidden service error: {}", e);
+                HIDDEN_SERVICE_STATE.store(3, Ordering::SeqCst); // Error
+            }
+        }
+    });
+
+    0
+}
+
+/// Async function to start the hidden service
+async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client_storage = TOR_CLIENT.get()
+        .ok_or("Tor client not initialized")?;
+
+    let client = client_storage.lock()
+        .map_err(|_| "Failed to lock Tor client")?;
+
+    let client = client.as_ref()
+        .ok_or("Tor client not available")?
+        .clone();
+
+    drop(client_storage); // Release the lock before async operations
+
+    // Build hidden service configuration
+    // The service will listen for rendezvous requests
+    let mut config_builder = OnionServiceConfigBuilder::default();
+    config_builder.nickname("zipherx".parse().unwrap());
+
+    let config: OnionServiceConfig = config_builder.build()?;
+
+    eprintln!("🧅 Launching hidden service...");
+
+    // Launch the onion service
+    let (service, rend_requests) = client.launch_onion_service(config)?
+        .ok_or("Hidden service returned None")?;
+
+    // Get the .onion address using the new API
+    let onion_addr = service.onion_address()
+        .ok_or("No onion address available")?;
+    // HsId doesn't implement Display, use Debug format and clean up
+    let onion_addr_str = format!("{:?}", onion_addr).replace('"', "");
+
+    eprintln!("🧅 Hidden service published: {}", onion_addr_str);
+
+    // Spawn task to handle incoming rendezvous requests
+    let onion_addr_for_handler = onion_addr_str.clone();
+    tokio::spawn(async move {
+        handle_hidden_service_connections(rend_requests, onion_addr_for_handler).await;
+    });
+
+    Ok(onion_addr_str)
+}
+
+/// Handle incoming connections to our hidden service
+/// NOTE: Full connection handling requires version-specific Arti API
+/// For now, we just log incoming rendezvous requests
+async fn handle_hidden_service_connections<S>(
+    mut rend_requests: S,
+    onion_addr: String,
+) where
+    S: futures::Stream + Unpin,
+{
+    use futures::StreamExt;
+
+    eprintln!("🧅 Hidden service connection handler started for {}", onion_addr);
+
+    let mut connection_counter: u64 = 0;
+
+    // Process incoming stream requests
+    while let Some(_request) = rend_requests.next().await {
+        connection_counter += 1;
+        let conn_id = connection_counter;
+
+        eprintln!("🧅 Incoming rendezvous request #{}", conn_id);
+
+        // Notify Swift about incoming connection attempt
+        let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
+        if !callback_ptr.is_null() {
+            // SAFETY: callback_ptr is set by Swift and points to a valid function
+            unsafe {
+                let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
+                let host = std::ffi::CString::new("tor-hidden-service").unwrap();
+                callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
+            }
+        }
+
+        // TODO: Full P2P protocol handling would go here
+        // For now, we just notify Swift and let the application layer handle it
+    }
+
+    eprintln!("🧅 Hidden service connection handler ended");
+}
+
+/// Placeholder for incoming P2P connection handling
+/// Full implementation requires bi-directional stream handling between Rust and Swift
+#[allow(dead_code)]
+async fn handle_p2p_incoming_placeholder(
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    eprintln!("🧅 P2P connection #{} - would handle protocol here", conn_id);
+
+    // In a full implementation:
+    // 1. Accept the rendezvous stream
+    // 2. Handle P2P protocol messages (version, verack, getdata, etc.)
+    // 3. Forward relevant data to Swift via callbacks
+
+    Ok(())
+}
+
+/// Dummy function to avoid dead_code warning for buffer reading pattern
+#[allow(dead_code)]
+async fn read_from_stream<S>(
+    mut stream: S,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = vec![0u8; 65536];
+
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => {
+                eprintln!("🧅 P2P connection #{} closed by peer", conn_id);
+                break;
+            }
+            Ok(n) => {
+                eprintln!("🧅 P2P #{} received {} bytes", conn_id, n);
+                // Echo back (for testing - real impl would process P2P messages)
+                if let Err(e) = stream.write_all(&buffer[..n]).await {
+                    eprintln!("🧅 P2P #{} write error: {}", conn_id, e);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("🧅 P2P #{} read error: {}", conn_id, e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Stop the hidden service
+/// Returns 0 on success
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_stop() -> i32 {
+    eprintln!("🧅 Stopping hidden service...");
+
+    // Clear the address
+    if let Ok(mut addr) = HIDDEN_SERVICE_ADDRESS.lock() {
+        *addr = None;
+    }
+
+    HIDDEN_SERVICE_STATE.store(0, Ordering::SeqCst); // Not running
+
+    eprintln!("🧅 Hidden service stopped");
+    0
+}
+
+/// Get hidden service state
+/// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_get_state() -> u8 {
+    HIDDEN_SERVICE_STATE.load(Ordering::SeqCst)
+}
+
+/// Get the .onion address of our hidden service
+/// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+/// Returns null if hidden service is not running
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_get_address() -> *mut libc::c_char {
+    if let Ok(guard) = HIDDEN_SERVICE_ADDRESS.lock() {
+        if let Some(ref addr) = *guard {
+            let c_str = std::ffi::CString::new(addr.as_str()).unwrap_or_default();
+            return c_str.into_raw();
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// Set callback for incoming P2P connections
+/// The callback will be called with (connection_id, host, port) for each new connection
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_set_callback(
+    callback: Option<unsafe extern "C" fn(connection_id: u64, host_ptr: *const libc::c_char, port: u16)>
+) {
+    let ptr = match callback {
+        Some(f) => f as *mut libc::c_void,
+        None => std::ptr::null_mut(),
+    };
+    INCOMING_CONNECTION_CALLBACK.store(ptr, Ordering::SeqCst);
+    eprintln!("🧅 Hidden service callback set");
+}
+
+/// Check if hidden service feature is available (compiled in)
+#[no_mangle]
+pub extern "C" fn zipherx_tor_hidden_service_is_available() -> bool {
+    true
+}

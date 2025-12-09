@@ -865,36 +865,21 @@ struct BalanceView: View {
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
 
-                    // Show Tor connection status
-                    if networkManager.torConnectedPeersCount > 0 {
-                        HStack(spacing: 4) {
-                            Text("🧅")
-                                .font(.system(size: 10))
-                            Text("\(networkManager.torConnectedPeersCount) peers via Tor")
+                    // ALWAYS show Tor/Onion peer counts (fluorescent green)
+                    HStack(spacing: 4) {
+                        Text("🧅")
+                            .font(.system(size: 10))
+                        // Show: X via Tor + Y .onion
+                        let torCount = networkManager.torConnectedPeersCount
+                        let onionCount = networkManager.onionConnectedPeersCount
+                        if torCount > 0 || onionCount > 0 {
+                            Text("\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
                                 .font(theme.captionFont)
-                                .foregroundColor(.green)
-                        }
-                    }
-
-                    // Show .onion peers actually connected (more important - bright green)
-                    if networkManager.onionConnectedPeersCount > 0 {
-                        HStack(spacing: 4) {
-                            Text("🧅")
-                                .font(.system(size: 10))
-                            Text("\(networkManager.onionConnectedPeersCount) .onion connected")
+                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4)) // Fluorescent green
+                        } else {
+                            Text("0 Tor peers")
                                 .font(theme.captionFont)
-                                .foregroundColor(.green)
-                        }
-                    }
-
-                    // Show .onion peers discovered but not connected (secondary)
-                    if networkManager.onionPeersCount > 0 && networkManager.onionConnectedPeersCount < networkManager.onionPeersCount {
-                        HStack(spacing: 4) {
-                            Text("🧅")
-                                .font(.system(size: 10))
-                            Text("\(networkManager.onionPeersCount - networkManager.onionConnectedPeersCount) .onion discovered")
-                                .font(theme.captionFont)
-                                .foregroundColor(theme.secondaryColor)
+                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.5))
                         }
                     }
                 }
@@ -1403,7 +1388,14 @@ struct BalanceView: View {
 
     private var iOSPrivacyText: String {
         if torManager.connectionState.isConnected {
-            return "FULL PRIVACY"
+            // Show Tor peer counts like macOS version
+            let torCount = networkManager.torConnectedPeersCount
+            let onionCount = networkManager.onionConnectedPeersCount
+            if torCount > 0 || onionCount > 0 {
+                return "\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : "")
+            } else {
+                return "FULL PRIVACY"
+            }
         } else if torManager.mode == .enabled {
             return "Connecting..."
         } else {

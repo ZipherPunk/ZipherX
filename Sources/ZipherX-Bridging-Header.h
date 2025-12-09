@@ -766,4 +766,44 @@ void zipherx_tor_free_string(char *ptr);
 /// Check if Tor is available (compiled in)
 bool zipherx_tor_is_available(void);
 
+// =============================================================================
+// Hidden Service (Onion Hosting) - Make ZipherX discoverable as .onion peer
+// =============================================================================
+
+/// Hidden service state codes
+/// 0 = Stopped, 1 = Starting, 2 = Running, 3 = Error
+typedef uint8_t HiddenServiceState;
+
+/// Callback type for incoming connections
+/// Receives: client_id (unique), remote_addr (onion or IP)
+typedef void (*HiddenServiceConnectionCallback)(uint64_t client_id, const char *remote_addr);
+
+/// Start the hidden service (Tor onion service)
+/// This makes ZipherX discoverable as a .onion address
+/// Returns 0 on success, 1 on error, 2 if already running
+int32_t zipherx_tor_hidden_service_start(void);
+
+/// Stop the hidden service
+/// Returns 0 on success
+int32_t zipherx_tor_hidden_service_stop(void);
+
+/// Get hidden service state
+/// 0 = Stopped, 1 = Starting, 2 = Running, 3 = Error
+HiddenServiceState zipherx_tor_hidden_service_get_state(void);
+
+/// Get the .onion address for this hidden service
+/// Returns NULL if not running
+/// Caller must free with zipherx_tor_free_string
+char* zipherx_tor_hidden_service_get_address(void);
+
+/// Set callback for incoming connections
+/// Callback receives client_id and remote_addr
+void zipherx_tor_hidden_service_set_callback(HiddenServiceConnectionCallback callback);
+
+/// Check if hidden service feature is available
+bool zipherx_tor_hidden_service_is_available(void);
+
+/// Get hidden service port (typically 8033 for Zclassic P2P)
+uint16_t zipherx_tor_hidden_service_get_port(void);
+
 #endif /* ZipherX_Bridging_Header_h */

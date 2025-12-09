@@ -144,11 +144,49 @@ final class InsightAPI: NSObject {
     // MARK: - Status
 
     /// Get blockchain status
+    /// SECURITY: When Tor mode is enabled, NEVER fallback to clearnet (would leak IP)
     func getStatus() async throws -> BlockchainStatus {
         let url = URL(string: "\(baseURL)/api/status")!
-        let activeSession = getActiveSession()
-        let (data, _) = try await activeSession.data(from: url)
 
+        // Check if Tor mode is enabled - if so, ONLY use Tor (no clearnet fallback!)
+        let torModeEnabled = await MainActor.run { TorManager.shared.mode == .enabled }
+
+        // Try Tor session first if available
+        if let torSession = torSession {
+            do {
+                let (data, _) = try await torSession.data(from: url)
+                // Check if response is valid JSON (not HTML error page)
+                if data.first == UInt8(ascii: "{") {
+                    let response = try JSONDecoder().decode(StatusResponse.self, from: data)
+                    return BlockchainStatus(
+                        height: UInt64(response.info.blocks),
+                        difficulty: response.info.difficulty,
+                        connections: response.info.connections
+                    )
+                } else {
+                    // Got HTML (likely Cloudflare block)
+                    debugLog(.network, "⚠️ InsightAPI via Tor returned HTML (blocked by Cloudflare?)")
+                    if torModeEnabled {
+                        // SECURITY: Do NOT fallback to clearnet when Tor-only mode is set
+                        throw NSError(domain: "InsightAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "InsightAPI blocked via Tor (Cloudflare). Cannot fallback - Tor-only mode enabled."])
+                    }
+                }
+            } catch {
+                debugLog(.network, "⚠️ InsightAPI via Tor failed: \(error.localizedDescription)")
+                if torModeEnabled {
+                    // SECURITY: Do NOT fallback to clearnet when Tor-only mode is set
+                    throw error
+                }
+            }
+        }
+
+        // SECURITY CHECK: If Tor mode is enabled but no Tor session, do NOT use clearnet
+        if torModeEnabled {
+            throw NSError(domain: "InsightAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "Tor mode enabled but Tor not connected. Refusing clearnet connection."])
+        }
+
+        // Direct connection (ONLY when Tor mode is disabled)
+        let (data, _) = try await session.data(from: url)
         let response = try JSONDecoder().decode(StatusResponse.self, from: data)
         return BlockchainStatus(
             height: UInt64(response.info.blocks),
