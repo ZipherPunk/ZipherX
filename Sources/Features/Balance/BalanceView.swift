@@ -856,41 +856,6 @@ struct BalanceView: View {
                 .background(theme.borderColor)
             #endif
 
-            // Connection status with more details
-            HStack(spacing: 8) {
-                // Animated connection indicator
-                Circle()
-                    .fill(connectionColor)
-                    .frame(width: 8, height: 8)
-
-                // Connection status with onion count inline
-                Text(connectionStatusText)
-                    .font(theme.bodyFont)
-                    .foregroundColor(connectionTextColor)
-
-                Spacer()
-
-                // Retry button when disconnected
-                if !networkManager.isConnected && !isRefreshing {
-                    Button(action: { retryConnection() }) {
-                        Text("Retry")
-                            .font(theme.captionFont)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(theme.buttonBackground)
-                            .foregroundColor(theme.buttonText)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: theme.cornerRadius)
-                                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
-                            )
-                            .cornerRadius(theme.cornerRadius)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-
             // Network stats
             if networkManager.isConnected {
                 Divider()
@@ -1141,7 +1106,7 @@ struct BalanceView: View {
 
     // MARK: - Top Left Tor Indicator
 
-    /// Compact Tor/Privacy status indicator at top left corner
+    /// Compact Tor/Privacy status indicator at top left corner - includes peer count
     private var topLeftTorIndicator: some View {
         HStack(spacing: 8) {
             // Privacy/Tor status with colored pill
@@ -1153,14 +1118,6 @@ struct BalanceView: View {
                     Text("TOR")
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
-                    // Show onion count if any - bright fluorescent green for visibility
-                    let onionCount = networkManager.onionConnectedPeersCount
-                    if onionCount > 0 {
-                        Text("+\(onionCount)🧅")
-                            .font(.system(size: 12, weight: .black, design: .monospaced))
-                            .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.2))  // Bright fluorescent green
-                            .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.0).opacity(0.8), radius: 4, x: 0, y: 0)  // Neon glow
-                    }
                 } else if torManager.mode == .enabled {
                     // Tor enabled but connecting
                     ProgressView()
@@ -1178,6 +1135,44 @@ struct BalanceView: View {
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundColor(.yellow)
                 }
+
+                // Separator
+                Text("·")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+
+                // Peer count with onion peers
+                if networkManager.isConnected {
+                    let peerCount = networkManager.connectedPeers
+                    let onionCount = networkManager.onionConnectedPeersCount
+                    let peerWord = peerCount == 1 ? "peer" : "peers"
+                    let warning = peerCount < 3 ? " ⚠️" : ""
+
+                    Text("\(peerCount) \(peerWord)")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(peerCount < 3 ? .red : theme.textPrimary)
+
+                    // Show onion count if any
+                    if onionCount > 0 {
+                        Text("+\(onionCount)🧅")
+                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                            .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.2))
+                            .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.0).opacity(0.8), radius: 4, x: 0, y: 0)
+                    }
+
+                    if !warning.isEmpty {
+                        Text(warning)
+                            .font(.system(size: 10))
+                    }
+                } else if isRefreshing {
+                    Text("Connecting...")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange)
+                } else {
+                    Text("Disconnected")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(.red)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
@@ -1194,6 +1189,26 @@ struct BalanceView: View {
                             )
                     )
             )
+
+            // Retry button when disconnected
+            if !networkManager.isConnected && !isRefreshing {
+                Button(action: { retryConnection() }) {
+                    Text("Retry")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.red.opacity(0.2))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.red.opacity(0.5), lineWidth: 1)
+                                )
+                        )
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
+            }
 
             Spacer()
         }
@@ -1457,105 +1472,6 @@ struct BalanceView: View {
         }
     }
     #endif
-
-    // MARK: - Computed Properties
-
-    private var connectionColor: Color {
-        #if os(macOS)
-        // Full Node mode - use daemon status for color
-        if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = fullNodeManager.daemonStatus
-            switch daemonStatus {
-            case .running:
-                return .green
-            case .syncing:
-                return .orange
-            case .starting:
-                return .yellow
-            default:
-                return .red
-            }
-        }
-        #endif
-
-        // Light mode - P2P connection status
-        if networkManager.isConnected {
-            // RED if less than 3 peers (insufficient for trustless operation)
-            return networkManager.connectedPeers >= 3 ? .green : .red
-        } else if isRefreshing {
-            return .orange
-        } else {
-            return .red
-        }
-    }
-
-    /// Text color for connection status - RED when peers < 3
-    private var connectionTextColor: Color {
-        #if os(macOS)
-        // Full Node mode - text color based on daemon status
-        if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = fullNodeManager.daemonStatus
-            return daemonStatus.isRunning ? theme.textPrimary : theme.errorColor
-        }
-        #endif
-
-        // Light mode - text color based on peer count
-        if networkManager.isConnected && networkManager.connectedPeers < 3 {
-            return theme.errorColor
-        }
-        return theme.textPrimary
-    }
-
-    private var connectionStatusText: String {
-        #if os(macOS)
-        // Show Full Node status if in Full Node mode
-        if WalletModeManager.shared.currentMode == .fullNode {
-            let daemonStatus = fullNodeManager.daemonStatus
-            let rpcClient = RPCClient.shared
-            switch daemonStatus {
-            case .running:
-                // Show block height and data size
-                let height = rpcClient.blockHeight
-                let size = fullNodeManager.blockchainSize
-                if height > 0 {
-                    return "🖥️ Full Node · Block \(height) · \(size)"
-                } else {
-                    return "🖥️ Full Node · \(size)"
-                }
-            case .syncing(let progress):
-                return "🖥️ Full Node (Syncing \(Int(progress * 100))%)"
-            case .starting:
-                return "🖥️ Full Node (Starting...)"
-            case .installed, .stopped:
-                return "🖥️ Full Node (Daemon Offline)"
-            case .notInstalled:
-                return "🖥️ Full Node (Not Installed)"
-            case .error(let msg):
-                return "🖥️ Full Node (Error: \(msg))"
-            case .unknown:
-                return "🖥️ Full Node (Checking...)"
-            }
-        }
-        #endif
-
-        // Light mode - show P2P peer count with onion peers inline
-        if isRefreshing && !networkManager.isConnected {
-            return "Connecting..."
-        } else if networkManager.isConnected {
-            let peerWord = networkManager.connectedPeers == 1 ? "peer" : "peers"
-            var warning = networkManager.connectedPeers < 3 ? " ⚠️" : ""
-            // Add mempool warning if P2P mempool scanning is unavailable
-            if networkManager.p2pMempoolWarning {
-                warning = " ⚠️ (mempool disabled)"
-            }
-            // Add onion count inline if connected via hidden service
-            let onionCount = networkManager.onionConnectedPeersCount
-            let onionSuffix = onionCount > 0 ? " (+\(onionCount)🧅)" : ""
-            return "\(networkManager.connectedPeers) \(peerWord)\(onionSuffix)\(warning)"
-        } else {
-            return "Disconnected"
-        }
-    }
 
     // MARK: - Actions
 
