@@ -947,16 +947,16 @@ final class Peer {
         let (_, versionResponse) = try await receiveMessage()
         parseVersionPayload(versionResponse)
 
-        // Send verack
-        try await sendMessage(command: "verack", payload: Data())
-
         // Signal we support addrv2 (BIP 155) for Tor v3 addresses
-        // Only send to peers that support BIP155 (version >= 170012)
-        // Per BIP155: sendaddrv2 must be sent AFTER version exchange but BEFORE verack is received
+        // Per BIP155: sendaddrv2 MUST be sent AFTER version exchange but BEFORE verack is sent
+        // Order: VERSION <-> VERSION -> SENDADDRV2 -> VERACK <-> VERACK
         if peerVersion >= 170012 {
             try await sendMessage(command: "sendaddrv2", payload: Data())
             print("📡 [\(host)] Sent sendaddrv2 to BIP155 peer (version \(peerVersion))")
         }
+
+        // Send verack (after sendaddrv2 if BIP155)
+        try await sendMessage(command: "verack", payload: Data())
 
         // Receive verack
         let _ = try await receiveMessage()
