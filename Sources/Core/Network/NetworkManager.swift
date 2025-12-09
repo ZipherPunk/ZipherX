@@ -275,6 +275,25 @@ final class NetworkManager: ObservableObject {
             return
         }
 
+        // Skip our own onion address (prevent self-connection)
+        if normalizedHost.hasSuffix(".onion") {
+            Task {
+                if let ownOnion = await HiddenServiceManager.shared.onionAddress {
+                    // Extract just the address part (without .onion suffix)
+                    let ownOnionBase = ownOnion.replacingOccurrences(of: ".onion", with: "")
+                    let addrOnionBase = normalizedHost.replacingOccurrences(of: ".onion", with: "")
+                    if ownOnionBase == addrOnionBase {
+                        print("🧅 Skipping our own onion address: \(normalizedHost.prefix(16))...")
+                    }
+                }
+            }
+            // Synchronous check using stored value
+            if let ownOnion = HiddenServiceManager.cachedOnionAddress,
+               normalizedHost == ownOnion || normalizedHost == "\(ownOnion).onion" {
+                return
+            }
+        }
+
         addressLock.lock()
         defer { addressLock.unlock() }
 

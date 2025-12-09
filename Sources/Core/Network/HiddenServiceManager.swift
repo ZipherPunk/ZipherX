@@ -66,6 +66,10 @@ public final class HiddenServiceManager: ObservableObject {
 
     public static let shared = HiddenServiceManager()
 
+    /// Cached onion address for synchronous access (prevents self-connection)
+    /// Updated when hidden service starts/stops
+    public static var cachedOnionAddress: String?
+
     // MARK: - Published Properties
 
     /// Current state of the hidden service
@@ -293,11 +297,13 @@ public final class HiddenServiceManager: ObservableObject {
 
                     if self.onionAddress != address {
                         self.onionAddress = address
+                        HiddenServiceManager.cachedOnionAddress = address
                         print("🧅 Hidden service running at: \(address)")
                     }
                 }
             } else if newState == .stopped {
                 self.onionAddress = nil
+                HiddenServiceManager.cachedOnionAddress = nil
             }
         }
     }

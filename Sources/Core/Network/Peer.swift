@@ -108,7 +108,9 @@ final class Peer {
     private let rateLimiter = PeerRateLimiter(maxTokens: 100, refillRate: 10)
 
     // Protocol version
-    private let protocolVersion: Int32 = 170011 // Latest Sapling support
+    // 170012 = BIP155 (addrv2) support for Tor v3 addresses
+    // 170011 = Sapling support (backward compatible)
+    private let protocolVersion: Int32 = 170012
     private let services: UInt64 = 1 // NODE_NETWORK
     private let userAgent = "/ZipherX:1.0.0/"
 
@@ -186,8 +188,10 @@ final class Peer {
         }
 
         // Boost for higher protocol version
-        if peerVersion >= 170011 {
-            chance *= 1.2
+        if peerVersion >= 170012 {
+            chance *= 1.3 // BIP155 peers preferred
+        } else if peerVersion >= 170011 {
+            chance *= 1.1 // Sapling peers still good
         }
 
         return chance
@@ -947,8 +951,12 @@ final class Peer {
         try await sendMessage(command: "verack", payload: Data())
 
         // Signal we support addrv2 (BIP 155) for Tor v3 addresses
-        // This must be sent AFTER version but BEFORE verack is received
-        try await sendMessage(command: "sendaddrv2", payload: Data())
+        // Only send to peers that support BIP155 (version >= 170012)
+        // Per BIP155: sendaddrv2 must be sent AFTER version exchange but BEFORE verack is received
+        if peerVersion >= 170012 {
+            try await sendMessage(command: "sendaddrv2", payload: Data())
+            print("📡 [\(host)] Sent sendaddrv2 to BIP155 peer (version \(peerVersion))")
+        }
 
         // Receive verack
         let _ = try await receiveMessage()
@@ -1504,8 +1512,8 @@ final class Peer {
         // Build getheaders message with block locator
         var payload = Data()
 
-        // Protocol version
-        payload.append(contentsOf: withUnsafeBytes(of: UInt32(170011).littleEndian) { Array($0) })
+        // Protocol version (BIP155 support)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(170012).littleEndian) { Array($0) })
 
         // Hash count = 1 (we'll use genesis or a known hash)
         payload.append(UInt8(1))

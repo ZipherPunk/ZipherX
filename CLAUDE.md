@@ -4387,6 +4387,31 @@ zclassicd log:
 
 ---
 
+### 85. Onion Peer Count UI - Inline Cypherpunk Display (December 9, 2025)
+
+**Problem**: The Tor peer count was displayed on a separate line below the main peer count and was too dark to read.
+
+**Solution**:
+1. Removed the separate Tor peer line
+2. Added onion count INLINE with peer count: `8 peers (+2🧅)`
+3. Used bright fluorescent green with neon glow effect for visibility
+
+**Changes**:
+- `connectionStatusText` now includes onion suffix: `"\(peers) peers (+\(onion)🧅)"`
+- Top-left TOR indicator shows `+2🧅` in bright green with shadow glow
+- Removed the entire VStack with "X via Tor + Y .onion" display
+
+**Visual Result**:
+```
+🧅 TOR +2🧅     (top-left corner - bright green with glow)
+8 peers (+2🧅)  (connection status - inline)
+```
+
+**Files Modified**:
+- `Sources/Features/Balance/BalanceView.swift` - lines 1182-1189, 866-869, 1577-1580
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

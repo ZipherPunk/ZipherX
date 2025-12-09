@@ -395,8 +395,8 @@ final class HeaderSyncManager {
     private func buildGetHeadersPayload(startHeight: UInt64) -> Data {
         var payload = Data()
 
-        // Protocol version
-        let version: UInt32 = 170011
+        // Protocol version (BIP155 support)
+        let version: UInt32 = 170012
         payload.append(contentsOf: withUnsafeBytes(of: version.littleEndian) { Array($0) })
 
         // Number of block locator hashes (varint - use 1 for simplicity)
