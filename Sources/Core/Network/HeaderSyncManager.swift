@@ -128,10 +128,21 @@ final class HeaderSyncManager {
     /// SECURITY VUL-006 FIX: Uses locally verified headers as primary source, P2P consensus as secondary
     /// InsightAPI is only used as a last-resort fallback when P2P is unavailable
     func getChainTip() async throws -> UInt64 {
-        // VUL-006: P2P-first chain height determination
+        // VUL-006: Chain height determination priority:
+        // 0. FULL NODE RPC: If running local daemon, use RPC (most trusted!)
         // 1. PRIMARY: Locally verified headers (cryptographically validated with Equihash)
         // 2. SECONDARY: P2P peer consensus (median height from multiple peers)
         // 3. FALLBACK: InsightAPI (only if P2P unavailable)
+
+        // 0. FULL NODE RPC: If local daemon is running, use its height (most trusted source)
+        #if os(macOS)
+        if await WalletModeManager.shared.currentMode == .fullNode {
+            if let rpcHeight = await FullNodeManager.shared.getBlockHeight() {
+                print("📡 [RPC] Full Node daemon height: \(rpcHeight) (TRUSTED)")
+                return rpcHeight
+            }
+        }
+        #endif
 
         // Maximum acceptable height difference between header store and P2P
         let maxHeightDrift: UInt64 = 20
