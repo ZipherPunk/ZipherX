@@ -893,12 +893,16 @@ final class WalletManager: ObservableObject {
         await updateTask("headers", status: .inProgress)
 
         // In Full Node mode, skip P2P header sync - we use RPC for chain data
+        var shouldSkipHeaderSync = false
         #if os(macOS)
         if await WalletModeManager.shared.currentMode == .fullNode {
+            shouldSkipHeaderSync = true
             print("📡 Full Node mode: Skipping P2P header sync (using RPC)")
             await updateTask("headers", status: .completed, detail: "RPC mode")
-        } else {
+        }
         #endif
+
+        if !shouldSkipHeaderSync {
 
         let maxHeaderRetries = 2  // Reduced from 3 to fail faster
         var headerSyncSuccess = false
@@ -1014,9 +1018,7 @@ final class WalletManager: ObservableObject {
             // but user can still see the error and try again
         }
 
-        #if os(macOS)
-        } // End of else block for non-Full-Node mode
-        #endif
+        } // End of if !shouldSkipHeaderSync
 
         // Task 4: Get chain height
         await updateTask("height", status: .inProgress)
