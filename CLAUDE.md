@@ -4173,6 +4173,220 @@ private func autoStartChatIfNeeded() {
 
 ---
 
+### 78. Chat Sheet Close Buttons + Top Left Tor Indicator (December 9, 2025)
+
+**Problem**: Multiple UI issues reported:
+1. Chat Settings and Add Contact sheets had no close button on macOS (toolbar items don't appear in sheets)
+2. Tor/onion status was not visible at top left corner - user wanted prominent placement
+
+**Solutions**:
+
+1. **AddContactSheet Close Button** - Added explicit close button inside VStack for macOS:
+   ```swift
+   #if os(macOS)
+   HStack {
+       Spacer()
+       Button(action: { dismiss() }) {
+           Image(systemName: "xmark.circle.fill")
+               .font(.system(size: 20))
+               .foregroundColor(theme.textPrimary.opacity(0.5))
+       }
+       .buttonStyle(.plain)
+   }
+   .padding(.horizontal, 16)
+   .padding(.top, 8)
+   #endif
+   ```
+
+2. **ChatSettingsSheet Close Button** - Same pattern applied at top of ScrollView VStack
+
+3. **Top Left Tor Indicator** - New `topLeftTorIndicator` view added at very top of BalanceView:
+   - Shows 🧅 **TOR** (neon green) + peer counts when connected
+   - Shows **TOR...** (orange) with spinner when connecting
+   - Shows **P2P** (yellow) when Tor disabled
+   - Compact pill design with colored border matching state
+   - Position: Very first element in main VStack, before balanceCard
+
+**Files Modified**:
+- `Sources/Features/Chat/ChatView.swift` - Close buttons for both AddContactSheet and ChatSettingsSheet
+- `Sources/Features/Balance/BalanceView.swift` - New `topLeftTorIndicator` view at top of body
+
+---
+
+### 79. Boost File Download Progress Bar Fix (December 9, 2025)
+
+**Problem**: Progress bar didn't move during commitment tree download from GitHub. User reported "the progress bar do not progress as long as download is progressing".
+
+**Root Cause**: Download progress was scaled to only 5% of the overall progress bar:
+```swift
+// OLD: Progress barely visible (0-5%)
+self.onProgress?(progress * 0.05, startHeight, latestHeight)
+```
+
+**Solution**: Increased download progress to 30% of overall progress and added status text:
+```swift
+// NEW: Progress visible (0-30%) with status text
+self.onProgress?(progress * 0.30, startHeight, latestHeight)
+self.onStatusUpdate?("download", "📥 \(status)")
+```
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Two locations (lines 237-240 and 407-411)
+
+---
+
+### 80. Chat Sheet UI Improvements (December 9, 2025)
+
+**Problem**: Multiple macOS UI issues with Chat sheets:
+1. Add Contact and Settings windows too small
+2. Content not filling the window
+3. No Cancel/Done/Close buttons visible (toolbar items don't work in macOS sheets)
+
+**Solutions**:
+
+1. **Increased Frame Sizes**:
+   - AddContactSheet: 380×420 → 420-450 × 520-560
+   - ChatSettingsSheet: 400×500 → 450-500 × 550-600
+
+2. **Added Explicit Action Buttons for macOS**:
+   - AddContactSheet: CANCEL button at bottom
+   - ChatSettingsSheet: CLOSE button at bottom
+
+3. **Content Expansion**:
+   - Added `.frame(maxWidth: .infinity, maxHeight: .infinity)` to main VStack
+
+**Files Modified**:
+- `Sources/Features/Chat/ChatView.swift` - Frame sizes, action buttons, content layout
+
+---
+
+### 81. Tor Peer Indicator Visibility Fix (December 9, 2025)
+
+**Problem**: Tor peer count text at top left was too dark/transparent to read.
+
+**Solution**: Changed peer count text styling for better visibility:
+```swift
+// OLD: Low contrast green with opacity
+.font(.system(size: 10, weight: .medium, design: .monospaced))
+.foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.8))
+
+// NEW: Bright white, larger, bolder
+.font(.system(size: 11, weight: .bold, design: .monospaced))
+.foregroundColor(.white)
+```
+
+**Files Modified**:
+- `Sources/Features/Balance/BalanceView.swift` - lines 1186-1188
+
+---
+
+### 82. Chat Sheet Background Mismatch Fix (December 9, 2025)
+
+**Problem**: On macOS, Chat sheets (Add Contact, Settings) had mismatched backgrounds - content with dark background inside grey window.
+
+**Root Cause**: NavigationView on macOS has a default translucent grey background that didn't match the theme's dark background.
+
+**Solution**: Added explicit background to NavigationView for macOS:
+```swift
+// Added to both AddContactSheet and ChatSettingsSheet
+#if os(macOS)
+// Ensure entire sheet has consistent background on macOS
+.background(theme.backgroundColor.ignoresSafeArea())
+#endif
+```
+
+**Files Modified**:
+- `Sources/Features/Chat/ChatView.swift` - AddContactSheet (line 1265-1268), ChatSettingsSheet (line 1459-1462)
+
+---
+
+### 83. Hidden Service RendRequest Logging (December 9, 2025)
+
+**Investigation**: zclassicd connects to ZipherX's onion address but times out after 60 seconds with "socket no message". Arti hidden service not yielding RendRequests.
+
+**Observed Issue**:
+- zmac.log shows "Hidden service published: akf2fbsxuz7nuz5hx7qifsv63lbbfxu3ncpvmmg42uvt65644lbha2ad.onion"
+- BUT no "Hidden service connection handler started" message appears
+- The `tokio::spawn()` for the handler task isn't executing
+
+**New Diagnostic Logging Added** (December 9, 2025):
+```rust
+// In start_hidden_service_async() at line 613:
+eprintln!("🧅 Spawning hidden service connection handler task...");
+tokio::spawn(async move {
+    eprintln!("🧅 [SPAWN] Handler task STARTED - entering connection handler");
+    handle_hidden_service_connections(rend_requests, onion_addr_for_handler).await;
+    eprintln!("🧅 [SPAWN] Handler task EXITED - this should never happen!");
+});
+```
+
+**Expected Log Sequence**:
+```
+🧅 Hidden service published: akf2...onion
+🧅 Spawning hidden service connection handler task...
+🧅 [SPAWN] Handler task STARTED - entering connection handler
+🧅 Hidden service connection handler started for akf2...onion
+🧅 Waiting for rendezvous requests on port 8033...
+```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - lines 611-618, 620-684
+
+**Status**: Investigation in progress. Universal library rebuilt. If "[SPAWN]" messages don't appear, the tokio runtime may be dropping spawned tasks.
+
+---
+
+### 84. Hidden Service Stream Flush Fix (December 9, 2025)
+
+**Problem**: Hidden service received connections and sent responses, but peer never received them. zclassicd log showed "socket no message in first 60 seconds".
+
+**Root Cause**: `stream.write_all()` was buffering data but never flushing. Tor streams require explicit `flush()` to actually send data over the circuit!
+
+**Symptoms**:
+```
+🧅 P2P #1: Received command: 'version'
+🧅 P2P #1: Sent version message
+🧅 P2P #1: Sent verack
+🧅 P2P #1: Timeout waiting for verack  ← Peer never received our messages
+```
+
+**Fix Applied**: Added `stream.flush().await?` after every `write_all()`:
+```rust
+// Before (broken):
+stream.write_all(&our_version).await?;
+eprintln!("Sent version message");
+
+// After (working):
+stream.write_all(&our_version).await?;
+stream.flush().await?;  // CRITICAL: Flush to actually send over Tor
+eprintln!("Sent version message ({} bytes, flushed)", our_version.len());
+```
+
+**Locations Fixed**:
+- `handle_incoming_stream_request()`: version message, verack
+- `handle_p2p_session()`: pong, addr, headers, inv
+
+**Expected Result**: zclassicd should now receive version/verack and complete the P2P handshake.
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - lines 768-776, 863-889
+
+**VERIFIED WORKING** (December 9, 2025):
+```
+zclassicd log:
+09:36:00 SOCKS5 connected xnjpgnerqmpuezkzmwl3ednjcix442x5t3ftjdbdmu2ktjcxpwzy7sad.onion
+09:36:01 received: version (101 bytes) peer=100      ← RECEIVED FROM ZIPHERX!
+09:36:03 receive version message: /ZipherX:1.0.0/
+09:36:03 received: verack (0 bytes) peer=100         ← HANDSHAKE COMPLETE!
+09:36:06 received: pong (8 bytes) peer=100           ← PING/PONG WORKING!
+09:36:06 received: headers (1 bytes) peer=100        ← HEADERS RESPONSE!
+09:36:01 ProcessMessages: advertizing address akf2...onion:8033  ← DISCOVERABLE!
+```
+
+**MILESTONE**: ZipherX hidden service is fully functional! Other Zclassic peers can now discover and connect to ZipherX via Tor.
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

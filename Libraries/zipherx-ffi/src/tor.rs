@@ -610,8 +610,11 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
     // Spawn task to handle incoming rendezvous requests
     let onion_addr_for_handler = onion_addr_str.clone();
+    eprintln!("🧅 Spawning hidden service connection handler task...");
     tokio::spawn(async move {
+        eprintln!("🧅 [SPAWN] Handler task STARTED - entering connection handler");
         handle_hidden_service_connections(rend_requests, onion_addr_for_handler).await;
+        eprintln!("🧅 [SPAWN] Handler task EXITED - this should never happen!");
     });
 
     Ok(onion_addr_str)
@@ -624,42 +627,61 @@ async fn handle_hidden_service_connections(
     onion_addr: String,
 ) {
     use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
     use tor_hsservice::StreamRequest;
 
     eprintln!("🧅 Hidden service connection handler started for {}", onion_addr);
+    eprintln!("🧅 Waiting for rendezvous requests on port 8033...");
 
-    // Convert RendRequest stream to StreamRequest stream using the helper
-    // This accepts all rendezvous requests and yields individual stream requests
-    let mut stream_requests = tor_hsservice::handle_rend_requests(rend_requests);
-
+    // Pin the stream for async iteration
+    let mut rend_requests = Box::pin(rend_requests);
+    let mut rend_counter: u64 = 0;
     let mut connection_counter: u64 = 0;
 
-    // Process incoming stream requests (these come after rendezvous is established)
-    while let Some(stream_request) = stream_requests.next().await {
-        connection_counter += 1;
-        let conn_id = connection_counter;
+    // Process incoming rendezvous requests directly (NOT using handle_rend_requests helper)
+    // This gives us more visibility into what's happening
+    while let Some(rend_request) = rend_requests.next().await {
+        rend_counter += 1;
+        eprintln!("🧅 RendRequest #{} received - accepting rendezvous...", rend_counter);
 
-        eprintln!("🧅 Incoming stream request #{}", conn_id);
+        // Accept the rendezvous request - this connects to the client's rendezvous point
+        match rend_request.accept().await {
+            Ok(stream_requests) => {
+                eprintln!("🧅 RendRequest #{} accepted - now waiting for streams...", rend_counter);
 
-        // Notify Swift about incoming connection attempt
-        let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
-        if !callback_ptr.is_null() {
-            unsafe {
-                let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
-                let host = std::ffi::CString::new("tor-hidden-service").unwrap();
-                callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
+                // Process stream requests from this rendezvous
+                let mut stream_requests = Box::pin(stream_requests);
+                while let Some(stream_request) = stream_requests.next().await {
+                    connection_counter += 1;
+                    let conn_id = connection_counter;
+                    eprintln!("🧅 StreamRequest #{} received from RendRequest #{}", conn_id, rend_counter);
+
+                    // Notify Swift about incoming connection attempt
+                    let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
+                    if !callback_ptr.is_null() {
+                        unsafe {
+                            let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
+                            let host = std::ffi::CString::new("tor-hidden-service").unwrap();
+                            callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
+                        }
+                    }
+
+                    // Accept the stream request and handle P2P protocol
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
+                            eprintln!("🧅 P2P connection #{} error: {}", conn_id, e);
+                        }
+                    });
+                }
+                eprintln!("🧅 RendRequest #{} finished (no more streams)", rend_counter);
+            }
+            Err(e) => {
+                eprintln!("🧅 RendRequest #{} accept FAILED: {}", rend_counter, e);
             }
         }
-
-        // Accept the stream request and handle P2P protocol
-        tokio::spawn(async move {
-            if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
-                eprintln!("🧅 P2P connection #{} error: {}", conn_id, e);
-            }
-        });
     }
 
-    eprintln!("🧅 Hidden service connection handler ended");
+    eprintln!("🧅 Hidden service connection handler ended - rendezvous stream closed");
 }
 
 /// Handle a single incoming stream request from the hidden service
@@ -744,12 +766,14 @@ async fn handle_incoming_stream_request(
             // Send our version message back
             let our_version = build_version_message();
             stream.write_all(&our_version).await?;
-            eprintln!("🧅 P2P #{}: Sent version message", conn_id);
+            stream.flush().await?;  // CRITICAL: Flush to actually send over Tor
+            eprintln!("🧅 P2P #{}: Sent version message ({} bytes, flushed)", conn_id, our_version.len());
 
             // Send verack
             let verack = build_verack_message();
             stream.write_all(&verack).await?;
-            eprintln!("🧅 P2P #{}: Sent verack", conn_id);
+            stream.flush().await?;  // CRITICAL: Flush to actually send over Tor
+            eprintln!("🧅 P2P #{}: Sent verack ({} bytes, flushed)", conn_id, verack.len());
 
             // Now wait for verack from peer
             let mut verack_header = [0u8; 24];
@@ -840,24 +864,28 @@ where
                 // Respond with pong (echo the nonce)
                 let pong = build_pong_message(&payload);
                 stream.write_all(&pong).await?;
+                stream.flush().await?;  // Flush over Tor
                 eprintln!("🧅 P2P #{}: Sent pong", conn_id);
             }
             "getaddr" => {
                 // Respond with addr message (empty for now)
                 let addr = build_addr_message();
                 stream.write_all(&addr).await?;
+                stream.flush().await?;  // Flush over Tor
                 eprintln!("🧅 P2P #{}: Sent addr", conn_id);
             }
             "getheaders" => {
                 // We don't serve headers - send empty response
                 let headers = build_headers_message(&[]);
                 stream.write_all(&headers).await?;
+                stream.flush().await?;  // Flush over Tor
                 eprintln!("🧅 P2P #{}: Sent empty headers", conn_id);
             }
             "mempool" => {
                 // We don't have a mempool - send empty inv
                 let inv = build_inv_message(&[]);
                 stream.write_all(&inv).await?;
+                stream.flush().await?;  // Flush over Tor
                 eprintln!("🧅 P2P #{}: Sent empty inv for mempool", conn_id);
             }
             "pong" => {

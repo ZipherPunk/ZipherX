@@ -52,6 +52,9 @@ struct BalanceView: View {
         let _ = print("📜 BALANCEVIEW: body being rendered")
         ZStack {
             VStack(spacing: 16) {
+                // TOP LEFT: Compact Tor/Privacy status indicator
+                topLeftTorIndicator
+
                 // Balance display
                 balanceCard
 
@@ -860,36 +863,10 @@ struct BalanceView: View {
                     .fill(connectionColor)
                     .frame(width: 8, height: 8)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(connectionStatusText)
-                        .font(theme.bodyFont)
-                        .foregroundColor(connectionTextColor)
-
-                    // CYPHERPUNK: Tor/Onion peer counts - PROMINENT display with background!
-                    let torCount = networkManager.torConnectedPeersCount
-                    let onionCount = networkManager.onionConnectedPeersCount
-                    HStack(alignment: .center, spacing: 6) {
-                        Text("🧅")
-                            .font(.system(size: 14))
-                        if torCount > 0 || onionCount > 0 {
-                            Text("\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
-                        } else {
-                            Text("0 via Tor")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.black.opacity(0.4))
-                    .cornerRadius(6)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.5), lineWidth: 1)
-                    )
-                }
+                // Connection status with onion count inline
+                Text(connectionStatusText)
+                    .font(theme.bodyFont)
+                    .foregroundColor(connectionTextColor)
 
                 Spacer()
 
@@ -1159,6 +1136,66 @@ struct BalanceView: View {
                 .frame(height: 8)
                 .padding(.leading, 24) // Indent to align with title
             }
+        }
+    }
+
+    // MARK: - Top Left Tor Indicator
+
+    /// Compact Tor/Privacy status indicator at top left corner
+    private var topLeftTorIndicator: some View {
+        HStack(spacing: 8) {
+            // Privacy/Tor status with colored pill
+            HStack(spacing: 6) {
+                if torManager.connectionState.isConnected {
+                    // Tor connected - show onion with green neon
+                    Text("🧅")
+                        .font(.system(size: 14))
+                    Text("TOR")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
+                    // Show onion count if any - bright fluorescent green for visibility
+                    let onionCount = networkManager.onionConnectedPeersCount
+                    if onionCount > 0 {
+                        Text("+\(onionCount)🧅")
+                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                            .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.2))  // Bright fluorescent green
+                            .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.0).opacity(0.8), radius: 4, x: 0, y: 0)  // Neon glow
+                    }
+                } else if torManager.mode == .enabled {
+                    // Tor enabled but connecting
+                    ProgressView()
+                        .scaleEffect(0.6)
+                        .frame(width: 14, height: 14)
+                    Text("TOR...")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange)
+                } else {
+                    // P2P mode (no Tor)
+                    Image(systemName: "network")
+                        .font(.system(size: 12))
+                        .foregroundColor(.yellow)
+                    Text("P2P")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.yellow)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.black.opacity(0.3))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(
+                                torManager.connectionState.isConnected
+                                    ? Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.5)
+                                    : (torManager.mode == .enabled ? Color.orange.opacity(0.5) : Color.yellow.opacity(0.5)),
+                                lineWidth: 1
+                            )
+                    )
+            )
+
+            Spacer()
         }
     }
 
@@ -1501,7 +1538,7 @@ struct BalanceView: View {
         }
         #endif
 
-        // Light mode - show P2P peer count
+        // Light mode - show P2P peer count with onion peers inline
         if isRefreshing && !networkManager.isConnected {
             return "Connecting..."
         } else if networkManager.isConnected {
@@ -1511,7 +1548,10 @@ struct BalanceView: View {
             if networkManager.p2pMempoolWarning {
                 warning = " ⚠️ (mempool disabled)"
             }
-            return "Connected to \(networkManager.connectedPeers) \(peerWord)\(warning) (\(networkManager.knownAddressCount) known)"
+            // Add onion count inline if connected via hidden service
+            let onionCount = networkManager.onionConnectedPeersCount
+            let onionSuffix = onionCount > 0 ? " (+\(onionCount)🧅)" : ""
+            return "\(networkManager.connectedPeers) \(peerWord)\(onionSuffix)\(warning)"
         } else {
             return "Disconnected"
         }

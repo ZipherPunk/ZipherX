@@ -59,11 +59,11 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showAddContact) {
             AddContactSheet()
-                .frame(width: 380, height: 420)
+                .frame(minWidth: 420, idealWidth: 450, minHeight: 520, idealHeight: 560)
         }
         .sheet(isPresented: $showSettings) {
             ChatSettingsSheet()
-                .frame(width: 400, height: 500)
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 550, idealHeight: 600)
         }
         .onAppear {
             autoStartChatIfNeeded()
@@ -1096,6 +1096,21 @@ struct AddContactSheet: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 24) {
+                // macOS: Explicit close button (toolbar doesn't work in sheets)
+                #if os(macOS)
+                HStack {
+                    Spacer()
+                    Button(action: { dismiss() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundColor(theme.textPrimary.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                #endif
+
                 // Header icon
                 ZStack {
                     Circle()
@@ -1172,10 +1187,12 @@ struct AddContactSheet: View {
                     .padding(.horizontal, 24)
                 }
 
-                Spacer()
+                Spacer(minLength: 16)
 
-                // Add button
-                Button(action: addContact) {
+                // Action buttons
+                VStack(spacing: 12) {
+                    // Add button
+                    Button(action: addContact) {
                     HStack(spacing: 8) {
                         if isAdding {
                             ProgressView()
@@ -1201,12 +1218,32 @@ struct AddContactSheet: View {
                     .cornerRadius(12)
                     .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
                 }
-                .buttonStyle(.plain)
-                .disabled(onionAddress.isEmpty || isAdding)
-                .opacity(onionAddress.isEmpty ? 0.6 : 1.0)
+                    .buttonStyle(.plain)
+                    .disabled(onionAddress.isEmpty || isAdding)
+                    .opacity(onionAddress.isEmpty ? 0.6 : 1.0)
+
+                    // Cancel button (explicit for macOS since toolbar doesn't work in sheets)
+                    #if os(macOS)
+                    Button(action: { dismiss() }) {
+                        Text("CANCEL")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.7))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.black.opacity(0.2))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(theme.textPrimary.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    #endif
+                }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(theme.backgroundColor)
             .navigationTitle("Add Contact")
             #if os(iOS)
@@ -1225,6 +1262,10 @@ struct AddContactSheet: View {
                 #endif
             }
         }
+        #if os(macOS)
+        // Ensure entire sheet has consistent background on macOS
+        .background(theme.backgroundColor.ignoresSafeArea())
+        #endif
     }
 
     private func addContact() {
@@ -1260,6 +1301,21 @@ struct ChatSettingsSheet: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 24) {
+                    // macOS: Explicit close button (toolbar doesn't work in sheets)
+                    #if os(macOS)
+                    HStack {
+                        Spacer()
+                        Button(action: { dismiss() }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 20))
+                                .foregroundColor(theme.textPrimary.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    #endif
+
                     // Identity Section
                     VStack(alignment: .leading, spacing: 16) {
                         sectionHeader("YOUR IDENTITY")
@@ -1352,9 +1408,30 @@ struct ChatSettingsSheet: View {
                         }
                         .padding(.vertical, 16)
                     }
+
+                    // Close button (explicit for macOS since toolbar doesn't work in sheets)
+                    #if os(macOS)
+                    Spacer(minLength: 16)
+
+                    Button(action: { dismiss() }) {
+                        Text("CLOSE")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.7))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.black.opacity(0.2))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(theme.textPrimary.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    #endif
                 }
                 .padding(24)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(theme.backgroundColor)
             .navigationTitle("Chat Settings")
             .onAppear {
@@ -1379,6 +1456,10 @@ struct ChatSettingsSheet: View {
                 }
             }
         }
+        #if os(macOS)
+        // Ensure entire sheet has consistent background on macOS
+        .background(theme.backgroundColor.ignoresSafeArea())
+        #endif
     }
 
     private func sectionHeader(_ title: String) -> some View {

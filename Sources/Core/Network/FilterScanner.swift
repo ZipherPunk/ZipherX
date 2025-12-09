@@ -234,7 +234,10 @@ final class FilterScanner {
 
                 // DOWNLOAD BOOST FILE FROM GITHUB (required for imported wallets)
                 let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile(onProgress: { progress, status in
-                    self.onProgress?(progress * 0.05, startHeight, latestHeight)
+                    // Show download progress prominently (0-30% of overall progress)
+                    self.onProgress?(progress * 0.30, startHeight, latestHeight)
+                    // Update status text to show download state
+                    self.onStatusUpdate?("download", "📥 \(status)")
                 })
                 // Extract CMUs in legacy format for position lookup
                 if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
@@ -402,7 +405,10 @@ final class FilterScanner {
             if !treeInitialized {
                 print("⚠️ No commitment tree available - downloading from GitHub...")
                 let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
-                    self.onProgress?(progress * 0.2, startHeight, targetHeight)
+                    // Show download progress prominently (0-30% of overall progress)
+                    self.onProgress?(progress * 0.30, startHeight, targetHeight)
+                    // Update status text to show download state
+                    self.onStatusUpdate?("download", "📥 \(status)")
                 }
 
                 // Extract and deserialize tree
