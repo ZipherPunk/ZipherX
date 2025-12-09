@@ -654,7 +654,7 @@ struct ConversationView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(contact.displayName)
                         .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                        .foregroundColor(theme.textPrimary)
+                        .foregroundColor(.white)
 
                     HStack(spacing: 4) {
                         Circle()
@@ -712,6 +712,7 @@ struct ConversationView: View {
                 TextField("Type a message...", text: $messageText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15, design: .monospaced))
+                    .foregroundColor(.white)
                     .focused($isInputFocused)
                     .onChange(of: messageText) { _ in
                         Task {
@@ -1144,6 +1145,7 @@ struct AddContactSheet: View {
                         TextField("xxxxxxxx...xxxxx.onion", text: $onionAddress)
                             .textFieldStyle(.plain)
                             .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white)
                             #if os(iOS)
                             .autocapitalization(.none)
                             #endif
@@ -1165,6 +1167,7 @@ struct AddContactSheet: View {
                         TextField("Enter a friendly name", text: $nickname)
                             .textFieldStyle(.plain)
                             .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white)
                             .padding(14)
                             .background(Color.black.opacity(0.25))
                             .cornerRadius(10)

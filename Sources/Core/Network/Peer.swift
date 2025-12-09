@@ -122,6 +122,8 @@ final class Peer {
     var peerVersion: Int32 = 0
     var peerUserAgent: String = ""
     var peerStartHeight: Int32 = 0
+    /// Whether this peer supports BIP155 addrv2 (received sendaddrv2 from them)
+    private(set) var supportsAddrv2: Bool = false
 
     /// Last time the connection was actively used (for staleness detection)
     private var lastActivity: Date?
@@ -958,8 +960,29 @@ final class Peer {
         // Send verack (after sendaddrv2 if BIP155)
         try await sendMessage(command: "verack", payload: Data())
 
-        // Receive verack
-        let _ = try await receiveMessage()
+        // Receive messages until we get verack
+        // Peer may send sendaddrv2 before verack - we need to handle both
+        var receivedVerack = false
+        var attempts = 0
+        while !receivedVerack && attempts < 5 {
+            let (command, _) = try await receiveMessage()
+            attempts += 1
+
+            if command == "verack" {
+                receivedVerack = true
+            } else if command == "sendaddrv2" {
+                // Peer signals BIP155 support - we can send addrv2 to them
+                supportsAddrv2 = true
+                print("📡 [\(host)] Received sendaddrv2 - peer supports BIP155 addrv2")
+            } else {
+                // Other messages during handshake (ignore but continue)
+                print("📡 [\(host)] Received \(command) during handshake (ignoring)")
+            }
+        }
+
+        if !receivedVerack {
+            throw NetworkError.handshakeFailed
+        }
 
         recordSuccess()
         lastActivity = Date() // Mark connection as active after successful handshake
@@ -2441,6 +2464,12 @@ final class Peer {
     /// This makes ZipherX discoverable as a peer on the network while remaining anonymous
     /// Format: BIP 155 addrv2 with network ID 0x04 (Tor v3)
     func advertiseOnionAddress(onionAddress: String, port: UInt16) async throws {
+        // Per BIP155: Only send addrv2 to peers that have sent us sendaddrv2
+        guard supportsAddrv2 else {
+            print("🧅 [\(host)] Skipping addrv2 - peer doesn't support BIP155")
+            return
+        }
+
         // Parse onion address - extract the 56-character base32 part
         guard onionAddress.hasSuffix(".onion") else {
             print("🧅 Invalid onion address format: \(onionAddress)")
@@ -2487,6 +2516,10 @@ final class Peer {
         // Port: 2 bytes, big endian
         payload.append(UInt8((port >> 8) & 0xFF))
         payload.append(UInt8(port & 0xFF))
+
+        // Debug: print payload hex
+        let payloadHex = payload.map { String(format: "%02x", $0) }.joined()
+        print("🧅 DEBUG addrv2 payload (\(payload.count) bytes): \(payloadHex)")
 
         // Send addrv2 message
         try await sendMessage(command: "addrv2", payload: payload)

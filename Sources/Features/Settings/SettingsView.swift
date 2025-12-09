@@ -1472,31 +1472,27 @@ Both binaries must be installed to /usr/local/bin:
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
 
-                            // Show full address without truncation
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(onionAddress)
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
-                                    .textSelection(.enabled)
-                                Text(":\(HiddenServiceManager.shared.p2pPort)")
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.7))
-                            }
+                            // Show onion address (without port - port is always 8033 for P2P)
+                            let fullOnionWithSuffix = onionAddress.hasSuffix(".onion") ? onionAddress : "\(onionAddress).onion"
+                            Text(fullOnionWithSuffix)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
+                                .textSelection(.enabled)
 
                             HStack {
-                                // Copy full address with port
+                                // Copy onion address (without port)
                                 Button(action: {
                                     #if os(iOS)
-                                    UIPasteboard.general.string = fullOnionAddress
+                                    UIPasteboard.general.string = fullOnionWithSuffix
                                     #elseif os(macOS)
                                     NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(fullOnionAddress, forType: .string)
+                                    NSPasteboard.general.setString(fullOnionWithSuffix, forType: .string)
                                     #endif
                                 }) {
                                     HStack(spacing: 4) {
                                         Image(systemName: "doc.on.doc")
                                             .font(.system(size: 11))
-                                        Text("COPY FULL ADDRESS")
+                                        Text("COPY ADDRESS")
                                             .font(.system(size: 9, weight: .bold, design: .monospaced))
                                     }
                                     .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4))
