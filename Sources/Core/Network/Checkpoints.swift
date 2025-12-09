@@ -126,9 +126,11 @@ enum ZclassicCheckpoints {
     ]
 
     /// Hardcoded .onion seed nodes (Tor hidden services)
-    static let onionSeedNodes = [
-        "akf2fbsxuz7nuz5hx7qifsv63lbbfxu3ncpvmmg42uvt65644lbha2ad.onion",
-        "cwmmtcsevvzjurzftl3wvlzpwxwe4fnsu2yl7bfkvirkdxc5idpariqd.onion"
+    /// Note: With BIP155/addrv2 support, onion addresses are discovered dynamically
+    /// via P2P network gossip. These are fallback seeds for Tor-only bootstrap.
+    static let onionSeedNodes: [String] = [
+        // Onion peers now discovered via addrv2 from the P2P network
+        // Add known reliable .onion nodes here if needed for Tor-only mode
     ]
 }
 
