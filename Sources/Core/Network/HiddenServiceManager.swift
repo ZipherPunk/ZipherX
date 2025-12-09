@@ -68,7 +68,8 @@ public final class HiddenServiceManager: ObservableObject {
 
     /// Cached onion address for synchronous access (prevents self-connection)
     /// Updated when hidden service starts/stops
-    public static var cachedOnionAddress: String?
+    /// nonisolated to allow synchronous access from non-MainActor contexts
+    nonisolated(unsafe) public static var cachedOnionAddress: String?
 
     // MARK: - Published Properties
 
