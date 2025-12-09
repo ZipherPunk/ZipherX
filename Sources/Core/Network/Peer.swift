@@ -726,7 +726,18 @@ final class Peer {
 
         blockListenerTask = Task { [weak self] in
             guard let self = self else { return }
+
+            // For .onion peers, add initial delay to let Tor connection stabilize
+            // This prevents reading garbage bytes immediately after handshake
+            if self.isOnion {
+                print("📡 [\(self.host)] .onion peer - waiting 2s for Tor connection to stabilize...")
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            }
+
             print("📡 [\(self.host)] Block listener started")
+
+            var consecutiveErrors = 0
+            let maxConsecutiveErrors = 5
 
             while self.isListening && self.connection != nil {
                 do {
@@ -740,7 +751,10 @@ final class Peer {
                     }
 
                     // Try to receive a message with a timeout
-                    let (command, payload) = try await self.receiveMessageNonBlocking()
+                    let (command, payload) = try await self.receiveMessageNonBlockingTolerant()
+
+                    // Reset error counter on successful message
+                    consecutiveErrors = 0
 
                     // Handle the received message
                     await self.handleBackgroundMessage(command: command, payload: payload)
@@ -748,6 +762,18 @@ final class Peer {
                 } catch NetworkError.timeout {
                     // Timeout is normal - just continue listening
                     continue
+                } catch NetworkError.invalidMagicBytes {
+                    // For .onion peers, invalid magic bytes might be Tor noise - retry with backoff
+                    consecutiveErrors += 1
+                    if consecutiveErrors < maxConsecutiveErrors {
+                        let backoffMs = min(500 * consecutiveErrors, 2000)
+                        print("📡 [\(self.host)] Invalid magic bytes (attempt \(consecutiveErrors)/\(maxConsecutiveErrors)), retrying in \(backoffMs)ms...")
+                        try? await Task.sleep(nanoseconds: UInt64(backoffMs) * 1_000_000)
+                        continue
+                    } else {
+                        print("📡 [\(self.host)] Too many invalid magic bytes, stopping listener")
+                        break
+                    }
                 } catch {
                     // Connection closed or error - stop listening
                     if self.isListening {
@@ -790,6 +816,60 @@ final class Peer {
             group.cancelAll()
             return result
         }
+    }
+
+    /// Tolerant version for block listener - throws invalidMagicBytes instead of handshakeFailed
+    /// This allows the listener to retry on Tor noise instead of immediately stopping
+    private func receiveMessageNonBlockingTolerant() async throws -> (String, Data) {
+        guard let connection = connection else {
+            throw NetworkError.notConnected
+        }
+
+        // Use a short timeout to periodically check if we should stop
+        return try await withThrowingTaskGroup(of: (String, Data).self) { group in
+            group.addTask {
+                return try await self.receiveMessageTolerant()
+            }
+
+            group.addTask {
+                // 30 second timeout - allows periodic check of isListening
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw NetworkError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Tolerant receive that throws invalidMagicBytes instead of handshakeFailed
+    private func receiveMessageTolerant() async throws -> (String, Data) {
+        // Read header (24 bytes)
+        let header = try await receive(count: 24)
+
+        // Verify magic - use invalidMagicBytes for block listener to retry
+        guard Array(header.prefix(4)) == networkMagic else {
+            let gotMagic = Array(header.prefix(4)).map { String(format: "%02x", $0) }.joined()
+            let expectedMagic = networkMagic.map { String(format: "%02x", $0) }.joined()
+            print("🧅 [\(host)] Invalid magic bytes: got \(gotMagic), expected \(expectedMagic)")
+            throw NetworkError.invalidMagicBytes
+        }
+
+        // Parse command
+        let commandBytes = header[4..<16]
+        let command = String(bytes: commandBytes.prefix(while: { $0 != 0 }), encoding: .utf8) ?? ""
+
+        // Parse length (safe loading)
+        let length = header.loadUInt32(at: 16)
+
+        // Read payload
+        var payload = Data()
+        if length > 0 {
+            payload = try await receive(count: Int(length))
+        }
+
+        return (command, payload)
     }
 
     /// Handle messages received in background listener

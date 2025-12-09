@@ -413,4 +413,56 @@ void zipherx_tor_free_string(char *ptr);
 // Check if Tor is available (compiled in)
 bool zipherx_tor_is_available(void);
 
+// =============================================================================
+// Hidden Service (Onion Hosting)
+// =============================================================================
+
+// Start the hidden service (requires Tor to be connected)
+// Returns 0 on success, 1 on error, 2 if already running
+int32_t zipherx_tor_hidden_service_start(void);
+
+// Stop the hidden service
+// Returns 0 on success
+int32_t zipherx_tor_hidden_service_stop(void);
+
+// Get hidden service state
+// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
+uint8_t zipherx_tor_hidden_service_get_state(void);
+
+// Get the .onion address of our hidden service
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL if hidden service is not running
+char* zipherx_tor_hidden_service_get_address(void);
+
+// Set callback for incoming P2P connections
+// Callback signature: void(connection_id: u64, host_ptr: const char*, port: u16)
+void zipherx_tor_hidden_service_set_callback(
+    void (*callback)(uint64_t connection_id, const char *host_ptr, uint16_t port)
+);
+
+// Check if hidden service feature is available (compiled in)
+bool zipherx_tor_hidden_service_is_available(void);
+
+// =============================================================================
+// Cypherpunk Chat (Encrypted P2P Messaging over Tor)
+// =============================================================================
+
+// Set callback for incoming chat messages
+// Callback signature: void(connection_id: u64, data_ptr: const u8*, data_len: usize)
+void zipherx_tor_chat_set_callback(
+    void (*callback)(uint64_t connection_id, const uint8_t *data_ptr, size_t data_len)
+);
+
+// Get the chat port for ZipherX encrypted messaging (8034)
+uint16_t zipherx_tor_chat_get_port(void);
+
+// Send an encrypted chat message to an .onion address
+// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_chat_send(
+    const char *onion_address,
+    const uint8_t *data,
+    size_t data_len
+);
+
 #endif // ZIPHERX_FFI_H

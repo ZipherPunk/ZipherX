@@ -860,28 +860,29 @@ struct BalanceView: View {
                     .fill(connectionColor)
                     .frame(width: 8, height: 8)
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(connectionStatusText)
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
 
-                    // ALWAYS show Tor/Onion peer counts (fluorescent green)
-                    HStack(spacing: 4) {
+                    // CYPHERPUNK: Tor/Onion peer counts - SAME FONT as peers line, FLUO GREEN!
+                    let torCount = networkManager.torConnectedPeersCount
+                    let onionCount = networkManager.onionConnectedPeersCount
+                    HStack(spacing: 6) {
                         Text("🧅")
-                            .font(.system(size: 10))
-                        // Show: X via Tor + Y .onion
-                        let torCount = networkManager.torConnectedPeersCount
-                        let onionCount = networkManager.onionConnectedPeersCount
+                            .font(.system(size: 14))
                         if torCount > 0 || onionCount > 0 {
                             Text("\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
-                                .font(theme.captionFont)
-                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4)) // Fluorescent green
+                                .font(theme.bodyFont)  // SAME FONT as peers line
+                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))  // FLUO GREEN
+                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3), radius: 6, x: 0, y: 0)  // Glow effect
                         } else {
-                            Text("0 Tor peers")
-                                .font(theme.captionFont)
-                                .foregroundColor(Color(red: 0.2, green: 1.0, blue: 0.4).opacity(0.5))
+                            Text("0 via Tor")
+                                .font(theme.bodyFont)  // SAME FONT as peers line
+                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.7))  // Slightly brighter when 0
                         }
                     }
+                    .padding(.top, 2)  // Add spacing from peers line
                 }
 
                 Spacer()

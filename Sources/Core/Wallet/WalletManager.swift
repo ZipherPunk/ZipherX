@@ -1884,23 +1884,32 @@ final class WalletManager: ObservableObject {
 
     /// Get the real date for a given block height
     /// Uses BlockTimestampManager for actual blockchain timestamps (downloaded from GitHub)
-    /// Falls back to estimate only if no real timestamp available
+    /// Falls back to estimate using HeaderStore or dynamic reference
     private func estimateDateForBlock(height: UInt64) -> String {
         guard height > 0 else { return "" }
 
-        // FIRST: Try to get real timestamp from BlockTimestampManager
+        // 1. Try BlockTimestampManager (boost file or runtime cache)
         if let realDate = BlockTimestampManager.shared.getFormattedDate(at: height) {
             return realDate
         }
 
-        // FALLBACK: Estimate only if real timestamp not available
-        // This should be rare since we download timestamps from GitHub
-        let referenceHeight: UInt64 = 2932265
-        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC
-        let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
+        // 2. Try HeaderStore (P2P synced headers contain timestamps)
+        if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
+            let date = Date(timeIntervalSince1970: TimeInterval(headerTime))
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MMM d, yyyy"
+            return formatter.string(from: date)
+        }
 
-        let heightDiff = Int64(height) - Int64(referenceHeight)
-        let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTimeInterval)
+        // 3. FALLBACK: Dynamic estimate using current chain height and NOW
+        // This avoids hardcoded reference points that become stale
+        let blockTimeInterval: TimeInterval = 150 // 2.5 minutes per block
+        let currentHeight = NetworkManager.shared.chainHeight
+        let currentTime = Date().timeIntervalSince1970
+
+        // Calculate: target height relative to current height
+        let heightDiff = Int64(height) - Int64(currentHeight)
+        let estimatedTimestamp = currentTime + (Double(heightDiff) * blockTimeInterval)
         let date = Date(timeIntervalSince1970: estimatedTimestamp)
 
         let formatter = DateFormatter()
@@ -1909,25 +1918,24 @@ final class WalletManager: ObservableObject {
     }
 
     /// Convert a date to estimated block height
-    /// Uses reference point: block 2932265 = Dec 4, 2025 17:00 UTC
+    /// Uses dynamic reference from current chain height and NOW
     /// Zclassic block time: 2.5 minutes (150 seconds)
     /// - Parameter date: The date to convert
     /// - Returns: Estimated block height (clamped to Sapling activation minimum and current chain height)
     static func blockHeightForDate(_ date: Date) -> UInt64 {
-        let referenceHeight: UInt64 = 2932265
-        let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (correct 2025 timestamp)
         let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
+        let currentHeight = NetworkManager.shared.chainHeight
+        let currentTime = Date().timeIntervalSince1970
 
         let targetTimestamp = date.timeIntervalSince1970
-        let timeDiff = targetTimestamp - referenceTimestamp
+        let timeDiff = targetTimestamp - currentTime
         let blockDiff = Int64(timeDiff / blockTimeInterval)
 
-        let estimatedHeight = Int64(referenceHeight) + blockDiff
+        let estimatedHeight = Int64(currentHeight) + blockDiff
 
         // Clamp to Sapling activation as minimum and current chain height as maximum
         let saplingActivation: UInt64 = 476_969
-        let maxHeight = referenceHeight // Can't scan future blocks
-        let clampedHeight = UInt64(max(Int64(saplingActivation), min(estimatedHeight, Int64(maxHeight))))
+        let clampedHeight = UInt64(max(Int64(saplingActivation), min(estimatedHeight, Int64(currentHeight))))
         return clampedHeight
     }
 

@@ -20,12 +20,15 @@
 		0EC0AE8AA031C37EA515AF19 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D114627F3AC22A9229292187 /* HeaderSyncManager.swift */; };
 		166B61D02B2AEB89D06A158A /* BundledShieldedOutputs.swift in Sources */ = {isa = PBXBuildFile; fileRef = F745C75EE82A4C61B3D8050B /* BundledShieldedOutputs.swift */; };
 		173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */; };
+		189A8CFCC5B8479B29F14DC3 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFCB4EE9BBE481DCD741022B /* ChatView.swift */; };
 		19D558691C9ED092DBA470FB /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
 		1A94928949C49A5977D23471 /* NodeManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */; };
 		1B2C46C9C59FD9C9A20EA667 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
 		1B44F7C3066ACAB0BE47817A /* HiddenServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */; };
 		1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */; };
+		1B81D5D6EABCDBCB92D349D7 /* CypherpunkChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B1E5E415323F1BA44C5E06E /* CypherpunkChat.swift */; };
 		1CE0234F6BC8E68B8D707AE2 /* BlockTimestampManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04DC847050BBC7E852DE4F5F /* BlockTimestampManager.swift */; };
+		1E7AAD1A86D39EAD4E9E8E93 /* ChatManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 981EE3318B95CD2FF12ACE26 /* ChatManager.swift */; };
 		2181FB4B936836564DCC5956 /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1AF6B2117E203E51A3F91E /* ThemeManager.swift */; };
 		21856055B80A98DEA5620668 /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
 		21E26CDC970AD9BF5E8EF5C1 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
@@ -100,6 +103,7 @@
 		95B02CA9CFC2FF60EC40B1D4 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		A2ADB56D4E059E232CD01868 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
+		A55CFCE2DAF3DF2CDB44D929 /* ChatManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 981EE3318B95CD2FF12ACE26 /* ChatManager.swift */; };
 		A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */; };
 		AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
@@ -117,6 +121,7 @@
 		C6307F815EFF9450C89C86CD /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
 		CEA228C1D6634E2A20C27D04 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD9AE42E2111119140BAC99 /* AppDelegate.swift */; };
+		CF30A07128F9B9CDACBE838A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFCB4EE9BBE481DCD741022B /* ChatView.swift */; };
 		D4D092433FE63B1E64252663 /* WalletTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235376F572F89B6D83EDA88C /* WalletTests.swift */; };
 		DCB48F14E31DBA6705F0BC79 /* Peer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D92FD9B357E6379040DA58 /* Peer.swift */; };
 		DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
@@ -134,6 +139,7 @@
 		F6048AFB789DE06F4F2D7066 /* BundledBlockHashes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6626F058762A0D0666024868 /* BundledBlockHashes.swift */; };
 		F81EE61689207BA67EB8D590 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AB898B285954293A4942B3D /* BootstrapManager.swift */; };
 		F89810E6B5612D18E485A0D7 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AB898B285954293A4942B3D /* BootstrapManager.swift */; };
+		FF6C8AE7B3E225E2672D09B2 /* CypherpunkChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B1E5E415323F1BA44C5E06E /* CypherpunkChat.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -181,12 +187,14 @@
 		74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyReportView.swift; sourceTree = "<group>"; };
 		77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeManagementView.swift; sourceTree = "<group>"; };
 		79B539975C988B8093FB4106 /* System7Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Components.swift; sourceTree = "<group>"; };
+		7B1E5E415323F1BA44C5E06E /* CypherpunkChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkChat.swift; sourceTree = "<group>"; };
 		7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletDatabase.swift; sourceTree = "<group>"; };
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
+		981EE3318B95CD2FF12ACE26 /* ChatManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatManager.swift; sourceTree = "<group>"; };
 		98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HiddenServiceManager.swift; sourceTree = "<group>"; };
 		9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletManager.swift; sourceTree = "<group>"; };
 		9CE0707D0A98DFEF7F487D9B /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
@@ -208,6 +216,7 @@
 		D769A0AE4089D10446BFBBCE /* WalletMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletMode.swift; sourceTree = "<group>"; };
 		D8734EC25838585488804B01 /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
 		DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ZipherXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		DFCB4EE9BBE481DCD741022B /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionBuilder.swift; sourceTree = "<group>"; };
 		ECAA8E25D2F1B8508044856E /* WalletSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletSetupView.swift; sourceTree = "<group>"; };
 		ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Theme.swift; sourceTree = "<group>"; };
@@ -265,6 +274,7 @@
 			isa = PBXGroup;
 			children = (
 				A9C06A2912C98B98AD2E5D87 /* Constants.swift */,
+				60239744003850A275DA386B /* Chat */,
 				A57133D73210DCD2789FEF97 /* Crypto */,
 				89B060A782EF443EA7627E21 /* Data */,
 				20F71A132FD8A2BB39D5BE63 /* FullNode */,
@@ -367,6 +377,14 @@
 			path = Components;
 			sourceTree = "<group>";
 		};
+		4E4BE8F13E27DB037E24A00D /* Chat */ = {
+			isa = PBXGroup;
+			children = (
+				DFCB4EE9BBE481DCD741022B /* ChatView.swift */,
+			);
+			path = Chat;
+			sourceTree = "<group>";
+		};
 		581044EF00496E3A2B430848 /* FullNode */ = {
 			isa = PBXGroup;
 			children = (
@@ -381,6 +399,15 @@
 				C6537E08D964E75E72B38163 /* SettingsView.swift */,
 			);
 			path = Settings;
+			sourceTree = "<group>";
+		};
+		60239744003850A275DA386B /* Chat */ = {
+			isa = PBXGroup;
+			children = (
+				981EE3318B95CD2FF12ACE26 /* ChatManager.swift */,
+				7B1E5E415323F1BA44C5E06E /* CypherpunkChat.swift */,
+			);
+			path = Chat;
 			sourceTree = "<group>";
 		};
 		60C3F0DA87160E18F368F2DC /* UnitTests */ = {
@@ -505,6 +532,7 @@
 			isa = PBXGroup;
 			children = (
 				953B086A66376CB050286B36 /* Balance */,
+				4E4BE8F13E27DB037E24A00D /* Chat */,
 				F05F5A5E5EDFB31E0C433EC4 /* Explorer */,
 				581044EF00496E3A2B430848 /* FullNode */,
 				A3C25F15824A4224FE7FEC15 /* History */,
@@ -688,10 +716,13 @@
 				A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */,
 				4A972E24FC0F1401E59C1C39 /* BundledBlockHashes.swift in Sources */,
 				166B61D02B2AEB89D06A158A /* BundledShieldedOutputs.swift in Sources */,
+				A55CFCE2DAF3DF2CDB44D929 /* ChatManager.swift in Sources */,
+				CF30A07128F9B9CDACBE838A /* ChatView.swift in Sources */,
 				ECE7A8EBCC60183A2F686044 /* Checkpoints.swift in Sources */,
 				AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */,
 				060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */,
 				F1E6F1F5FEED9CD9F3E0663E /* ContentView.swift in Sources */,
+				FF6C8AE7B3E225E2672D09B2 /* CypherpunkChat.swift in Sources */,
 				C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */,
 				838503AC50687F8879C1AAC1 /* DatabaseEncryption.swift in Sources */,
 				76CAA651280ABA8925035994 /* DebugLogger.swift in Sources */,
@@ -755,10 +786,13 @@
 				36A75F1FA4D8DFF11BDB6137 /* BootstrapProgressView.swift in Sources */,
 				F6048AFB789DE06F4F2D7066 /* BundledBlockHashes.swift in Sources */,
 				6B215E744E971FF2962066C9 /* BundledShieldedOutputs.swift in Sources */,
+				1E7AAD1A86D39EAD4E9E8E93 /* ChatManager.swift in Sources */,
+				189A8CFCC5B8479B29F14DC3 /* ChatView.swift in Sources */,
 				1B58B6FD46DE8D68D26709C5 /* Checkpoints.swift in Sources */,
 				21E26CDC970AD9BF5E8EF5C1 /* CommitmentTreeUpdater.swift in Sources */,
 				F49F08F7B04F1E25AB55812B /* Constants.swift in Sources */,
 				8F1CF2CA2652DFBB0999A598 /* ContentView.swift in Sources */,
+				1B81D5D6EABCDBCB92D349D7 /* CypherpunkChat.swift in Sources */,
 				4349DCD1E3A8528A99795205 /* CypherpunkTheme.swift in Sources */,
 				06EFE4825D0A38F6B1659224 /* DatabaseEncryption.swift in Sources */,
 				6EE32FD3ED6A227AA235757E /* DebugLogger.swift in Sources */,

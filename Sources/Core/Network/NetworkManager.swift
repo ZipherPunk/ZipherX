@@ -1191,6 +1191,9 @@ final class NetworkManager: ObservableObject {
 
     /// Fetch network statistics (P2P-first, InsightAPI fallback)
     func fetchNetworkStats() async {
+        // Update Tor/Onion peer counts (so UI shows current connected .onion peers)
+        await updateTorAvailability()
+
         // Get peer version from first connected peer (silently)
         if let peer = peers.first {
             let version = peer.peerUserAgent.isEmpty ? "Unknown" : peer.peerUserAgent
@@ -3578,6 +3581,7 @@ enum NetworkError: LocalizedError {
     case transactionNotVerified
     case connectionFailed(String)
     case handshakeFailed
+    case invalidMagicBytes  // For tolerant block listener - can retry
     case timeout
     case connectionTimeout
     case invalidData
@@ -3602,6 +3606,8 @@ enum NetworkError: LocalizedError {
             return "Connection failed: \(message)"
         case .handshakeFailed:
             return "Peer handshake failed"
+        case .invalidMagicBytes:
+            return "Invalid P2P magic bytes (Tor noise or protocol mismatch)"
         case .timeout:
             return "Request timed out"
         case .connectionTimeout:

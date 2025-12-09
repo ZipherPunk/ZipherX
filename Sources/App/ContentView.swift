@@ -30,13 +30,14 @@ struct ContentView: View {
     @State private var showCypherpunkSettings = false
     @State private var showCypherpunkSend = false
     @State private var showCypherpunkReceive = false
+    @State private var showCypherpunkChat = false
 
     // Disk space warning
     @State private var showInsufficientDiskSpaceAlert = false
     @State private var availableDiskSpace: String = ""
 
     enum Tab {
-        case balance, send, receive, settings
+        case balance, send, receive, chat, settings
     }
 
     var body: some View {
@@ -616,7 +617,8 @@ struct ContentView: View {
         CypherpunkMainView(
             showSettings: $showCypherpunkSettings,
             showSend: $showCypherpunkSend,
-            showReceive: $showCypherpunkReceive
+            showReceive: $showCypherpunkReceive,
+            showChat: $showCypherpunkChat
         )
         .sheet(isPresented: $showCypherpunkSettings) {
             VStack(spacing: 0) {
@@ -698,6 +700,30 @@ struct ContentView: View {
             .environmentObject(networkManager)
             .environmentObject(themeManager)
         }
+        .sheet(isPresented: $showCypherpunkChat) {
+            ZStack(alignment: .topTrailing) {
+                ChatView()
+
+                // Close button overlay
+                Button(action: { showCypherpunkChat = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(NeonColors.primary.opacity(0.8))
+                        .background(Color.black.opacity(0.5))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .padding(.top, 8)
+                .padding(.trailing, 8)
+            }
+            .background(Color.black)
+            #if os(macOS)
+            .frame(width: 700, height: 600)
+            #endif
+            .environmentObject(walletManager)
+            .environmentObject(networkManager)
+            .environmentObject(themeManager)
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             recordUserActivity()
@@ -733,6 +759,10 @@ struct ContentView: View {
                             selectedTab = .receive
                             recordUserActivity()
                         }
+                        System7TabButton(title: "Chat", isSelected: selectedTab == .chat) {
+                            selectedTab = .chat
+                            recordUserActivity()
+                        }
                         System7TabButton(title: "Settings", isSelected: selectedTab == .settings) {
                             selectedTab = .settings
                             recordUserActivity()
@@ -751,6 +781,8 @@ struct ContentView: View {
                             })
                         case .receive:
                             ReceiveView()
+                        case .chat:
+                            ChatView()
                         case .settings:
                             SettingsView()
                         }

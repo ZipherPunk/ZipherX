@@ -4002,6 +4002,106 @@ Socket SO_ERROR [61: Connection refused]
 
 ---
 
+### 75. Hidden Service Full P2P Protocol Handler (December 9, 2025)
+
+**Feature**: Complete P2P protocol implementation for incoming hidden service connections.
+
+**Problem**: The previous implementation used wrong Arti API - `RendRequest::accept()` doesn't exist. The correct flow requires using `handle_rend_requests()` to convert rendezvous requests to stream requests.
+
+**Solution**: Implemented correct Arti hidden service API flow:
+
+```rust
+// tor.rs - Correct API usage
+async fn handle_hidden_service_connections(
+    rend_requests: impl futures::Stream<Item = tor_hsservice::RendRequest> + Unpin + Send + 'static,
+    onion_addr: String,
+) {
+    use futures::StreamExt;
+
+    // Convert RendRequest stream to StreamRequest stream
+    let mut stream_requests = tor_hsservice::handle_rend_requests(rend_requests);
+
+    while let Some(stream_request) = stream_requests.next().await {
+        let conn_id = INCOMING_CONNECTION_COUNT.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
+                eprintln!("P2P connection #{} error: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+async fn handle_incoming_stream_request(
+    stream_request: tor_hsservice::StreamRequest,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tor_cell::relaycell::msg::Connected;
+
+    // Accept the stream - this is the correct API
+    let mut stream = stream_request.accept(Connected::new_empty()).await
+        .map_err(|e| format!("Failed to accept stream: {}", e))?;
+
+    // P2P protocol: magic(4) + command(12) + length(4) + checksum(4) + payload
+    // Handle version/verack handshake, ping/pong, etc.
+}
+```
+
+**Added Dependency** (`Cargo.toml`):
+```toml
+tor-cell = "0.37"  # For Connected message type
+```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - Complete P2P protocol handler
+- `Libraries/zipherx-ffi/Cargo.toml` - Added tor-cell dependency
+
+---
+
+### 76. Chat UI Fixes + Auto-Start (December 9, 2025)
+
+**Problem**: Multiple Chat UI issues:
+1. Add Contact sheet had no "Done" button on macOS
+2. Chat Settings sheet had no "Close" button on macOS
+3. Chat status showed "OFFLINE" even when hidden service was running
+
+**Solutions**:
+
+1. **Add Contact Sheet** - Added macOS toolbar with Done button
+2. **Chat Settings Sheet** - Added Close button toolbar
+3. **Auto-Start Chat** - New function that starts chat when hidden service is running:
+
+```swift
+private func autoStartChatIfNeeded() {
+    Task {
+        let hsState = await HiddenServiceManager.shared.state
+        guard hsState == .running else { return }
+        guard !chatManager.isAvailable else { return }
+        try await chatManager.start()
+    }
+}
+// Called in .onAppear for both iOS and macOS
+```
+
+**Files Modified**:
+- `Sources/Features/Chat/ChatView.swift` - Sheet toolbars, auto-start
+
+---
+
+### 77. Tor/Onion Peers Display Improvements (December 9, 2025)
+
+**Problem**: User reported Tor peers display was too dim and small.
+
+**Solution**: Improved visibility in BalanceView:
+- Increased 🧅 emoji font size to 14pt
+- Changed opacity from 0.5 to 0.7 for "0 via Tor" text
+- Added 2pt top padding for visual separation
+
+**Files Modified**:
+- `Sources/Features/Balance/BalanceView.swift` - Tor peers display styling
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

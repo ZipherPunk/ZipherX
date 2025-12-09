@@ -1647,6 +1647,7 @@ struct CypherpunkMainView: View {
     @Binding var showSettings: Bool
     @Binding var showSend: Bool
     @Binding var showReceive: Bool
+    @Binding var showChat: Bool
 
     @State private var transactions: [TransactionHistoryItem] = []
     @State private var isLoadingHistory = true
@@ -1825,16 +1826,32 @@ struct CypherpunkMainView: View {
 
     private var topBar: some View {
         HStack {
-            // Network indicator
+            // Network indicator with Tor/onion breakdown
             HStack(spacing: 6) {
                 Circle()
                     .fill(networkManager.isConnected ? matrixGreen : Color.red)
                     .frame(width: 8, height: 8)
                     .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
 
-                Text("\(networkManager.connectedPeers) PEERS (\(networkManager.knownAddressCount))")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundColor(matrixGreenDark)
+                // Show peer counts with Tor breakdown
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(networkManager.connectedPeers) PEERS")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(matrixGreenDark)
+
+                    // Tor/onion breakdown if connected via Tor
+                    let torCount = networkManager.torConnectedPeersCount
+                    let onionCount = networkManager.onionConnectedPeersCount
+                    if torCount > 0 || onionCount > 0 {
+                        HStack(spacing: 2) {
+                            Text("🧅")
+                                .font(.system(size: 8))
+                            Text("\(torCount) Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
+                                .font(.system(size: 8, weight: .regular, design: .monospaced))
+                                .foregroundColor(matrixGreenDarker)
+                        }
+                    }
+                }
             }
 
             Spacer()
@@ -1985,18 +2002,18 @@ struct CypherpunkMainView: View {
     // MARK: - Action Buttons
 
     private var actionButtons: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             // SEND button
             Button(action: { showSend = true }) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 20))
+                        .font(.system(size: 18))
                     Text("SEND")
-                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
                 }
                 .foregroundColor(.black)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
+                .padding(.vertical, 12)
                 .background(
                     LinearGradient(
                         colors: [matrixGreen, matrixGreenDark],
@@ -2011,15 +2028,35 @@ struct CypherpunkMainView: View {
 
             // RECEIVE button
             Button(action: { showReceive = true }) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Image(systemName: "arrow.down.circle.fill")
-                        .font(.system(size: 20))
+                        .font(.system(size: 18))
                     Text("RECEIVE")
-                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
                 }
                 .foregroundColor(matrixGreen)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
+                .padding(.vertical, 12)
+                .background(Color.black)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(matrixGreen, lineWidth: 2)
+                )
+                .cornerRadius(8)
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            // CHAT button (encrypted messaging)
+            Button(action: { showChat = true }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.system(size: 18))
+                    Text("CHAT")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(matrixGreen)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
                 .background(Color.black)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)

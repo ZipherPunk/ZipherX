@@ -95,34 +95,34 @@ actor ChatPeer {
 /// Main manager for Cypherpunk P2P Chat
 /// Handles connections, encryption, and message routing
 @MainActor
-public final class ChatManager: ObservableObject {
+final class ChatManager: ObservableObject {
 
     // MARK: - Singleton
 
-    public static let shared = ChatManager()
+    static let shared = ChatManager()
 
     // MARK: - Published Properties
 
     /// All contacts
-    @Published public private(set) var contacts: [ChatContact] = []
+    @Published private(set) var contacts: [ChatContact] = []
 
     /// Active conversations
-    @Published public private(set) var conversations: [String: ChatConversation] = [:]
+    @Published private(set) var conversations: [String: ChatConversation] = [:]
 
     /// Currently selected conversation
-    @Published public var selectedConversation: String?
+    @Published var selectedConversation: String?
 
     /// Unread message count (total)
-    @Published public private(set) var totalUnreadCount: Int = 0
+    @Published private(set) var totalUnreadCount: Int = 0
 
     /// Is chat service available (requires Tor + Hidden Service)
-    @Published public private(set) var isAvailable: Bool = false
+    @Published private(set) var isAvailable: Bool = false
 
     /// Our .onion address for chat
-    @Published public private(set) var ourOnionAddress: String?
+    @Published private(set) var ourOnionAddress: String?
 
     /// Our nickname
-    @Published public var ourNickname: String {
+    @Published var ourNickname: String {
         didSet {
             UserDefaults.standard.set(ourNickname, forKey: "chatNickname")
         }
@@ -162,7 +162,7 @@ public final class ChatManager: ObservableObject {
     // MARK: - Public API
 
     /// Start the chat service (requires Hidden Service to be running)
-    public func start() async throws {
+    func start() async throws {
         guard await HiddenServiceManager.shared.state == .running else {
             throw ChatError.hiddenServiceNotRunning
         }
@@ -184,7 +184,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Stop the chat service
-    public func stop() async {
+    func stop() async {
         maintenanceTask?.cancel()
         maintenanceTask = nil
 
@@ -204,7 +204,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Add a new contact by .onion address
-    public func addContact(onionAddress: String, nickname: String) throws {
+    func addContact(onionAddress: String, nickname: String) throws {
         // Validate onion address format
         guard isValidOnionAddress(onionAddress) else {
             throw ChatError.invalidMessage("Invalid .onion address format")
@@ -228,7 +228,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Remove a contact
-    public func removeContact(_ contact: ChatContact) {
+    func removeContact(_ contact: ChatContact) {
         contacts.removeAll { $0.onionAddress == contact.onionAddress }
         conversations.removeValue(forKey: contact.onionAddress)
 
@@ -244,8 +244,17 @@ public final class ChatManager: ObservableObject {
         print("💬 Removed contact: \(contact.displayName)")
     }
 
+    /// Toggle favorite status for a contact
+    func toggleFavorite(_ contact: ChatContact) {
+        if let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) {
+            contacts[index].isFavorite.toggle()
+            database.saveContact(contacts[index])
+            print("💬 \(contacts[index].isFavorite ? "Starred" : "Unstarred") contact: \(contact.displayName)")
+        }
+    }
+
     /// Connect to a contact
-    public func connect(to contact: ChatContact) async throws {
+    func connect(to contact: ChatContact) async throws {
         guard isAvailable else {
             throw ChatError.hiddenServiceNotRunning
         }
@@ -317,7 +326,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Disconnect from a contact
-    public func disconnect(from contact: ChatContact) async {
+    func disconnect(from contact: ChatContact) async {
         guard let peer = peers[contact.onionAddress] else { return }
 
         // Send goodbye message
@@ -339,7 +348,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Send a text message to a contact
-    public func sendTextMessage(_ text: String, to contact: ChatContact, replyTo: String? = nil) async throws {
+    func sendTextMessage(_ text: String, to contact: ChatContact, replyTo: String? = nil) async throws {
         guard !text.isEmpty else { return }
 
         var message = ChatMessage(
@@ -374,7 +383,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Send a payment request
-    public func sendPaymentRequest(
+    func sendPaymentRequest(
         to contact: ChatContact,
         amount: UInt64,
         address: String,
@@ -396,7 +405,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Send typing indicator
-    public func sendTypingIndicator(to contact: ChatContact) async throws {
+    func sendTypingIndicator(to contact: ChatContact) async throws {
         let message = ChatMessage(
             type: .typing,
             fromOnion: ourOnionAddress ?? "",
@@ -408,7 +417,7 @@ public final class ChatManager: ObservableObject {
     }
 
     /// Mark messages as read
-    public func markAsRead(contact: ChatContact) {
+    func markAsRead(contact: ChatContact) {
         guard var conversation = conversations[contact.onionAddress] else { return }
 
         // Update unread count
@@ -738,12 +747,13 @@ public final class ChatManager: ObservableObject {
     }
 
     private func sendMessage(_ message: ChatMessage, to contact: ChatContact) async throws {
-        guard let peer = peers[contact.onionAddress], await peer.state.isConnected else {
-            // Try to connect first
+        // Check if connected, if not, try to connect
+        var isConnected = false
+        if let peer = peers[contact.onionAddress] {
+            isConnected = await peer.state.isConnected
+        }
+        if !isConnected {
             try await connect(to: contact)
-            guard let peer = peers[contact.onionAddress] else {
-                throw ChatError.notConnected
-            }
         }
 
         guard let peer = peers[contact.onionAddress] else {

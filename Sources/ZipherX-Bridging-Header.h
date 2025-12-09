@@ -806,4 +806,25 @@ bool zipherx_tor_hidden_service_is_available(void);
 /// Get hidden service port (typically 8033 for Zclassic P2P)
 uint16_t zipherx_tor_hidden_service_get_port(void);
 
+// =============================================================================
+// MARK: - Cypherpunk Chat (Encrypted P2P Messaging over Tor)
+// =============================================================================
+
+/// Callback type for incoming chat messages
+/// connection_id: unique identifier for the connection
+/// data_ptr: pointer to encrypted message data
+/// data_len: length of message data
+typedef void (*ChatMessageCallback)(uint64_t connection_id, const uint8_t *data_ptr, size_t data_len);
+
+/// Set callback for incoming chat messages
+void zipherx_tor_chat_set_callback(ChatMessageCallback callback);
+
+/// Get the chat port for ZipherX encrypted messaging (8034)
+uint16_t zipherx_tor_chat_get_port(void);
+
+/// Send an encrypted chat message to an .onion address
+/// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
+/// Returns 0 on success, 1 on error
+int32_t zipherx_tor_chat_send(const char *onion_address, const uint8_t *data, size_t data_len);
+
 #endif /* ZipherX_Bridging_Header_h */

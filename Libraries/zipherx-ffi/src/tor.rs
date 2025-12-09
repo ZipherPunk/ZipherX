@@ -467,7 +467,11 @@ pub extern "C" fn zipherx_tor_is_available() -> bool {
 // =============================================================================
 
 use tor_hsservice::config::{OnionServiceConfig, OnionServiceConfigBuilder};
+use tor_hsservice::RunningOnionService;
 use std::sync::atomic::AtomicPtr;
+
+/// Running hidden service handle - MUST be kept alive for the service to accept connections
+static HIDDEN_SERVICE_HANDLE: OnceCell<Mutex<Option<Arc<RunningOnionService>>>> = OnceCell::new();
 
 /// Hidden service state
 /// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
@@ -479,8 +483,17 @@ static HIDDEN_SERVICE_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
 /// P2P port for incoming connections (default 8033 = Zclassic mainnet)
 const HIDDEN_SERVICE_P2P_PORT: u16 = 8033;
 
+/// Chat port for encrypted messaging (8034 = ZipherX chat)
+const HIDDEN_SERVICE_CHAT_PORT: u16 = 8034;
+
 /// Callback type for incoming connections (connection_id, peer_host, peer_port)
 static INCOMING_CONNECTION_CALLBACK: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Callback type for incoming chat connections
+static INCOMING_CHAT_CALLBACK: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Type alias for chat callback function (connection_id, data_ptr, data_len)
+type IncomingChatFn = unsafe extern "C" fn(connection_id: u64, data_ptr: *const u8, data_len: usize);
 
 /// Type alias for the callback function
 type IncomingConnectionFn = unsafe extern "C" fn(connection_id: u64, host_ptr: *const libc::c_char, port: u16);
@@ -553,11 +566,45 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     let (service, rend_requests) = client.launch_onion_service(config)?
         .ok_or("Hidden service returned None")?;
 
+    // CRITICAL: Store the service handle to keep it alive
+    // Without this, the hidden service stops accepting connections immediately!
+    // Note: launch_onion_service already returns Arc<RunningOnionService>
+    let handle_storage = HIDDEN_SERVICE_HANDLE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = handle_storage.lock() {
+        *guard = Some(service.clone());
+        eprintln!("🧅 Hidden service handle stored - service will remain active");
+    }
+
     // Get the .onion address using the new API
-    let onion_addr = service.onion_address()
+    let hs_id = service.onion_address()
         .ok_or("No onion address available")?;
-    // HsId doesn't implement Display, use Debug format and clean up
-    let onion_addr_str = format!("{:?}", onion_addr).replace('"', "");
+
+    // Convert HsId to proper .onion v3 address format
+    // Tor v3 address = base32(pubkey(32) + checksum(2) + version(1)) + ".onion"
+    // HsId contains the 32-byte public key, we need to compute checksum and encode
+    let hs_id_bytes: &[u8] = hs_id.as_ref();
+    let pubkey_bytes: [u8; 32] = hs_id_bytes.try_into()
+        .map_err(|_| "Invalid HsId length")?;
+
+    // Compute checksum: SHA3-256(".onion checksum" + pubkey + version)[0..2]
+    // Tor v3 spec: CHECKSUM = H(".onion checksum" || PUBKEY || VERSION)[:2]
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(&pubkey_bytes);
+    hasher.update(&[0x03u8]); // Version 3
+    let checksum_full = hasher.finalize();
+    let checksum = [checksum_full[0], checksum_full[1]];
+
+    // Combine: pubkey(32) + checksum(2) + version(1) = 35 bytes
+    let mut address_bytes = Vec::with_capacity(35);
+    address_bytes.extend_from_slice(&pubkey_bytes);
+    address_bytes.extend_from_slice(&checksum);
+    address_bytes.push(0x03); // Version 3
+
+    // Base32 encode (lowercase, no padding)
+    let onion_base32 = base32_encode(&address_bytes);
+    let onion_addr_str = format!("{}.onion", onion_base32);
 
     eprintln!("🧅 Hidden service published: {}", onion_addr_str);
 
@@ -571,31 +618,32 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 }
 
 /// Handle incoming connections to our hidden service
-/// NOTE: Full connection handling requires version-specific Arti API
-/// For now, we just log incoming rendezvous requests
-async fn handle_hidden_service_connections<S>(
-    mut rend_requests: S,
+/// FULL IMPLEMENTATION: Accept streams and handle P2P protocol
+async fn handle_hidden_service_connections(
+    rend_requests: impl futures::Stream<Item = tor_hsservice::RendRequest> + Unpin + Send + 'static,
     onion_addr: String,
-) where
-    S: futures::Stream + Unpin,
-{
+) {
     use futures::StreamExt;
+    use tor_hsservice::StreamRequest;
 
     eprintln!("🧅 Hidden service connection handler started for {}", onion_addr);
 
+    // Convert RendRequest stream to StreamRequest stream using the helper
+    // This accepts all rendezvous requests and yields individual stream requests
+    let mut stream_requests = tor_hsservice::handle_rend_requests(rend_requests);
+
     let mut connection_counter: u64 = 0;
 
-    // Process incoming stream requests
-    while let Some(_request) = rend_requests.next().await {
+    // Process incoming stream requests (these come after rendezvous is established)
+    while let Some(stream_request) = stream_requests.next().await {
         connection_counter += 1;
         let conn_id = connection_counter;
 
-        eprintln!("🧅 Incoming rendezvous request #{}", conn_id);
+        eprintln!("🧅 Incoming stream request #{}", conn_id);
 
         // Notify Swift about incoming connection attempt
         let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
         if !callback_ptr.is_null() {
-            // SAFETY: callback_ptr is set by Swift and points to a valid function
             unsafe {
                 let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
                 let host = std::ffi::CString::new("tor-hidden-service").unwrap();
@@ -603,12 +651,355 @@ async fn handle_hidden_service_connections<S>(
             }
         }
 
-        // TODO: Full P2P protocol handling would go here
-        // For now, we just notify Swift and let the application layer handle it
+        // Accept the stream request and handle P2P protocol
+        tokio::spawn(async move {
+            if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
+                eprintln!("🧅 P2P connection #{} error: {}", conn_id, e);
+            }
+        });
     }
 
     eprintln!("🧅 Hidden service connection handler ended");
 }
+
+/// Handle a single incoming stream request from the hidden service
+/// StreamRequest comes from handle_rend_requests() and needs to be accepted to get DataStream
+async fn handle_incoming_stream_request(
+    stream_request: tor_hsservice::StreamRequest,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tor_cell::relaycell::msg::Connected;
+
+    // Check that this is a BEGIN message (standard Tor stream open)
+    let request = stream_request.request();
+    eprintln!("🧅 P2P #{}: Received stream request: {:?}", conn_id, request);
+
+    // Accept the stream request with a CONNECTED response
+    // This gives us a DataStream for bidirectional communication
+    let mut stream = stream_request.accept(Connected::new_empty()).await
+        .map_err(|e| format!("Failed to accept stream: {}", e))?;
+
+    eprintln!("🧅 P2P #{}: Stream accepted, waiting for handshake...", conn_id);
+
+    // Read P2P message header (24 bytes for Zclassic/Bitcoin)
+    // Header: magic(4) + command(12) + length(4) + checksum(4)
+    let mut header = [0u8; 24];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream.read_exact(&mut header)
+    ).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(format!("Failed to read header: {}", e).into()),
+        Err(_) => return Err("Timeout reading header".into()),
+    }
+
+    // Verify magic bytes (Zclassic mainnet: 0x24e92764)
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != 0x24e92764 {
+        eprintln!("🧅 P2P #{}: Invalid magic: {:08x}", conn_id, magic);
+        return Err(format!("Invalid magic bytes: {:08x}", magic).into());
+    }
+
+    // Extract command (12 bytes, null-terminated)
+    let command_bytes = &header[4..16];
+    let command = std::str::from_utf8(command_bytes)
+        .unwrap_or("unknown")
+        .trim_matches('\0');
+
+    eprintln!("🧅 P2P #{}: Received command: '{}'", conn_id, command);
+
+    // Extract payload length
+    let payload_len = u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as usize;
+
+    // Read payload if any
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read_exact(&mut payload)
+        ).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("Failed to read payload: {}", e).into()),
+            Err(_) => return Err("Timeout reading payload".into()),
+        }
+    }
+
+    // Handle "version" command - the first message in P2P handshake
+    if command == "version" {
+        eprintln!("🧅 P2P #{}: Parsing version message ({} bytes)", conn_id, payload_len);
+
+        // Parse version message to get peer info
+        if payload_len >= 85 {
+            let version = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let services = u64::from_le_bytes([payload[4], payload[5], payload[6], payload[7],
+                                               payload[8], payload[9], payload[10], payload[11]]);
+            let timestamp = i64::from_le_bytes([payload[12], payload[13], payload[14], payload[15],
+                                                payload[16], payload[17], payload[18], payload[19]]);
+
+            eprintln!("🧅 P2P #{}: Peer version={}, services={:#x}, timestamp={}",
+                     conn_id, version, services, timestamp);
+
+            // Send our version message back
+            let our_version = build_version_message();
+            stream.write_all(&our_version).await?;
+            eprintln!("🧅 P2P #{}: Sent version message", conn_id);
+
+            // Send verack
+            let verack = build_verack_message();
+            stream.write_all(&verack).await?;
+            eprintln!("🧅 P2P #{}: Sent verack", conn_id);
+
+            // Now wait for verack from peer
+            let mut verack_header = [0u8; 24];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                stream.read_exact(&mut verack_header)
+            ).await {
+                Ok(Ok(_)) => {
+                    let verack_cmd = std::str::from_utf8(&verack_header[4..16])
+                        .unwrap_or("")
+                        .trim_matches('\0');
+                    eprintln!("🧅 P2P #{}: Received '{}' - handshake complete!", conn_id, verack_cmd);
+                }
+                Ok(Err(e)) => eprintln!("🧅 P2P #{}: Error reading verack: {}", conn_id, e),
+                Err(_) => eprintln!("🧅 P2P #{}: Timeout waiting for verack", conn_id),
+            }
+
+            // Keep connection alive and handle further messages
+            handle_p2p_session(&mut stream, conn_id).await?;
+        }
+    } else {
+        eprintln!("🧅 P2P #{}: Unexpected first command: '{}' (expected 'version')", conn_id, command);
+    }
+
+    Ok(())
+}
+
+/// Handle ongoing P2P session after handshake
+async fn handle_p2p_session<S>(
+    stream: &mut S,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    eprintln!("🧅 P2P #{}: Session started, handling messages...", conn_id);
+
+    loop {
+        // Read next message header
+        let mut header = [0u8; 24];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120), // 2 minute timeout for idle
+            stream.read_exact(&mut header)
+        ).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("🧅 P2P #{}: Connection closed: {}", conn_id, e);
+                break;
+            }
+            Err(_) => {
+                eprintln!("🧅 P2P #{}: Connection idle timeout", conn_id);
+                break;
+            }
+        }
+
+        // Verify magic
+        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        if magic != 0x24e92764 {
+            eprintln!("🧅 P2P #{}: Invalid magic in session: {:08x}", conn_id, magic);
+            break;
+        }
+
+        // Extract command
+        let command = std::str::from_utf8(&header[4..16])
+            .unwrap_or("unknown")
+            .trim_matches('\0')
+            .to_string();
+
+        let payload_len = u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as usize;
+
+        // Read payload
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            if let Err(e) = stream.read_exact(&mut payload).await {
+                eprintln!("🧅 P2P #{}: Failed to read payload: {}", conn_id, e);
+                break;
+            }
+        }
+
+        eprintln!("🧅 P2P #{}: Received '{}' ({} bytes)", conn_id, command, payload_len);
+
+        // Handle common P2P commands
+        match command.as_str() {
+            "ping" => {
+                // Respond with pong (echo the nonce)
+                let pong = build_pong_message(&payload);
+                stream.write_all(&pong).await?;
+                eprintln!("🧅 P2P #{}: Sent pong", conn_id);
+            }
+            "getaddr" => {
+                // Respond with addr message (empty for now)
+                let addr = build_addr_message();
+                stream.write_all(&addr).await?;
+                eprintln!("🧅 P2P #{}: Sent addr", conn_id);
+            }
+            "getheaders" => {
+                // We don't serve headers - send empty response
+                let headers = build_headers_message(&[]);
+                stream.write_all(&headers).await?;
+                eprintln!("🧅 P2P #{}: Sent empty headers", conn_id);
+            }
+            "mempool" => {
+                // We don't have a mempool - send empty inv
+                let inv = build_inv_message(&[]);
+                stream.write_all(&inv).await?;
+                eprintln!("🧅 P2P #{}: Sent empty inv for mempool", conn_id);
+            }
+            "pong" => {
+                // Just acknowledge
+                eprintln!("🧅 P2P #{}: Got pong", conn_id);
+            }
+            "addr" | "addrv2" => {
+                // Process address announcement from peer
+                eprintln!("🧅 P2P #{}: Got {} addresses", conn_id, payload_len / 30);
+            }
+            "sendheaders" => {
+                // Peer wants us to send headers via headers msg instead of inv
+                eprintln!("🧅 P2P #{}: Peer requests sendheaders mode", conn_id);
+            }
+            "sendaddrv2" => {
+                // Peer supports BIP-155 addrv2
+                eprintln!("🧅 P2P #{}: Peer supports addrv2", conn_id);
+            }
+            _ => {
+                eprintln!("🧅 P2P #{}: Unhandled command: '{}'", conn_id, command);
+            }
+        }
+    }
+
+    eprintln!("🧅 P2P #{}: Session ended", conn_id);
+    Ok(())
+}
+
+/// Build a version message for P2P handshake
+fn build_version_message() -> Vec<u8> {
+    let mut msg = Vec::new();
+
+    // Version payload
+    let mut payload = Vec::new();
+
+    // Protocol version (170100 = Zclassic 2.1.x)
+    payload.extend_from_slice(&170100i32.to_le_bytes());
+
+    // Services (NODE_NETWORK = 1)
+    payload.extend_from_slice(&1u64.to_le_bytes());
+
+    // Timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    payload.extend_from_slice(&timestamp.to_le_bytes());
+
+    // Addr_recv (26 bytes: services(8) + ip(16) + port(2))
+    payload.extend_from_slice(&1u64.to_le_bytes()); // services
+    payload.extend_from_slice(&[0u8; 10]); // IPv4-mapped prefix
+    payload.extend_from_slice(&[0xff, 0xff]); // IPv4 marker
+    payload.extend_from_slice(&[127, 0, 0, 1]); // 127.0.0.1
+    payload.extend_from_slice(&8033u16.to_be_bytes()); // port
+
+    // Addr_from (26 bytes)
+    payload.extend_from_slice(&1u64.to_le_bytes()); // services
+    payload.extend_from_slice(&[0u8; 10]);
+    payload.extend_from_slice(&[0xff, 0xff]);
+    payload.extend_from_slice(&[0, 0, 0, 0]); // 0.0.0.0
+    payload.extend_from_slice(&8033u16.to_be_bytes());
+
+    // Nonce (8 bytes random)
+    let nonce: u64 = rand::random();
+    payload.extend_from_slice(&nonce.to_le_bytes());
+
+    // User agent (varint length + string)
+    let user_agent = b"/ZipherX:1.0.0/";
+    payload.push(user_agent.len() as u8);
+    payload.extend_from_slice(user_agent);
+
+    // Start height
+    payload.extend_from_slice(&0i32.to_le_bytes());
+
+    // Relay (1 byte)
+    payload.push(1);
+
+    // Build message with header
+    build_p2p_message("version", &payload, &mut msg);
+    msg
+}
+
+/// Build a verack message
+fn build_verack_message() -> Vec<u8> {
+    let mut msg = Vec::new();
+    build_p2p_message("verack", &[], &mut msg);
+    msg
+}
+
+/// Build a pong message (response to ping)
+fn build_pong_message(ping_payload: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::new();
+    build_p2p_message("pong", ping_payload, &mut msg);
+    msg
+}
+
+/// Build an addr message
+fn build_addr_message() -> Vec<u8> {
+    let mut msg = Vec::new();
+    // Empty addr: just varint 0
+    build_p2p_message("addr", &[0], &mut msg);
+    msg
+}
+
+/// Build a headers message
+fn build_headers_message(_headers: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::new();
+    // Empty headers: varint 0
+    build_p2p_message("headers", &[0], &mut msg);
+    msg
+}
+
+/// Build an inv message
+fn build_inv_message(_inventory: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::new();
+    // Empty inv: varint 0
+    build_p2p_message("inv", &[0], &mut msg);
+    msg
+}
+
+/// Build a P2P message with header
+fn build_p2p_message(command: &str, payload: &[u8], out: &mut Vec<u8>) {
+    // Magic (Zclassic mainnet)
+    out.extend_from_slice(&0x24e92764u32.to_le_bytes());
+
+    // Command (12 bytes, null-padded)
+    let mut cmd_bytes = [0u8; 12];
+    let cmd_len = command.len().min(12);
+    cmd_bytes[..cmd_len].copy_from_slice(&command.as_bytes()[..cmd_len]);
+    out.extend_from_slice(&cmd_bytes);
+
+    // Payload length
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+
+    // Checksum (first 4 bytes of double SHA256)
+    let hash1 = sha2::Sha256::digest(payload);
+    let hash2 = sha2::Sha256::digest(&hash1);
+    out.extend_from_slice(&hash2[..4]);
+
+    // Payload
+    out.extend_from_slice(payload);
+}
+
+use sha2::Digest;
 
 /// Placeholder for incoming P2P connection handling
 /// Full implementation requires bi-directional stream handling between Rust and Swift
@@ -670,6 +1061,14 @@ where
 pub extern "C" fn zipherx_tor_hidden_service_stop() -> i32 {
     eprintln!("🧅 Stopping hidden service...");
 
+    // Clear the service handle - this will stop the hidden service
+    if let Some(handle_storage) = HIDDEN_SERVICE_HANDLE.get() {
+        if let Ok(mut guard) = handle_storage.lock() {
+            *guard = None;
+            eprintln!("🧅 Hidden service handle released");
+        }
+    }
+
     // Clear the address
     if let Ok(mut addr) = HIDDEN_SERVICE_ADDRESS.lock() {
         *addr = None;
@@ -720,4 +1119,135 @@ pub extern "C" fn zipherx_tor_hidden_service_set_callback(
 #[no_mangle]
 pub extern "C" fn zipherx_tor_hidden_service_is_available() -> bool {
     true
+}
+
+/// Set callback for incoming chat messages
+/// The callback will be called with (connection_id, data_ptr, data_len) for each incoming message
+#[no_mangle]
+pub extern "C" fn zipherx_tor_chat_set_callback(
+    callback: Option<unsafe extern "C" fn(connection_id: u64, data_ptr: *const u8, data_len: usize)>
+) {
+    let ptr = match callback {
+        Some(f) => f as *mut libc::c_void,
+        None => std::ptr::null_mut(),
+    };
+    INCOMING_CHAT_CALLBACK.store(ptr, Ordering::SeqCst);
+    eprintln!("🧅 Chat callback set");
+}
+
+/// Get the chat port for ZipherX encrypted messaging
+#[no_mangle]
+pub extern "C" fn zipherx_tor_chat_get_port() -> u16 {
+    HIDDEN_SERVICE_CHAT_PORT
+}
+
+/// Send an encrypted chat message to an .onion address
+/// Returns 0 on success, 1 on error
+/// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tor_chat_send(
+    onion_address: *const libc::c_char,
+    data: *const u8,
+    data_len: usize,
+) -> i32 {
+    if onion_address.is_null() || data.is_null() || data_len == 0 {
+        return 1;
+    }
+
+    let address = match std::ffi::CStr::from_ptr(onion_address).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return 1,
+    };
+
+    let message = std::slice::from_raw_parts(data, data_len).to_vec();
+
+    let state = TOR_STATE.load(Ordering::SeqCst);
+    if state != 3 {
+        eprintln!("🧅 Cannot send chat - Tor not connected");
+        return 1;
+    }
+
+    let runtime = get_runtime();
+
+    // Send message asynchronously
+    let result = runtime.block_on(async {
+        send_chat_message_async(&address, &message).await
+    });
+
+    match result {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("🧅 Chat send error: {}", e);
+            1
+        }
+    }
+}
+
+/// Async function to send a chat message through Tor to an .onion address
+async fn send_chat_message_async(
+    onion_address: &str,
+    message: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client_storage = TOR_CLIENT.get()
+        .ok_or("Tor client not initialized")?;
+
+    let client = client_storage.lock()
+        .map_err(|_| "Failed to lock Tor client")?;
+
+    let client = client.as_ref()
+        .ok_or("Tor client not available")?
+        .clone();
+
+    drop(client_storage);
+
+    // Parse the onion address (with or without port)
+    let (host, port) = if onion_address.contains(':') {
+        let parts: Vec<&str> = onion_address.split(':').collect();
+        (parts[0].to_string(), parts[1].parse::<u16>().unwrap_or(HIDDEN_SERVICE_CHAT_PORT))
+    } else {
+        (onion_address.to_string(), HIDDEN_SERVICE_CHAT_PORT)
+    };
+
+    eprintln!("🧅 Connecting to chat peer: {}:{}", host, port);
+
+    // Connect through Tor
+    let mut stream = client.connect((host.as_str(), port)).await?;
+
+    // Send the message length (4 bytes, big-endian) followed by message data
+    let len_bytes = (message.len() as u32).to_be_bytes();
+    stream.write_all(&len_bytes).await?;
+    stream.write_all(message).await?;
+    stream.flush().await?;
+
+    eprintln!("🧅 Chat message sent ({} bytes)", message.len());
+
+    Ok(())
+}
+
+/// RFC 4648 Base32 encoding (lowercase, no padding) for Tor v3 onion addresses
+fn base32_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+    let mut result = String::with_capacity((data.len() * 8 + 4) / 5);
+    let mut buffer: u64 = 0;
+    let mut bits_left = 0;
+
+    for &byte in data {
+        buffer = (buffer << 8) | byte as u64;
+        bits_left += 8;
+
+        while bits_left >= 5 {
+            bits_left -= 5;
+            let index = ((buffer >> bits_left) & 0x1F) as usize;
+            result.push(ALPHABET[index] as char);
+        }
+    }
+
+    // Handle remaining bits (if any)
+    if bits_left > 0 {
+        let index = ((buffer << (5 - bits_left)) & 0x1F) as usize;
+        result.push(ALPHABET[index] as char);
+    }
+
+    result
 }

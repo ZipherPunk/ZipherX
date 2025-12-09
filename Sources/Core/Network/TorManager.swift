@@ -346,6 +346,11 @@ public final class TorManager: ObservableObject {
         connectionState = .disconnected
         socksPort = 0
         isStartingTor = false
+
+        // Notify HiddenServiceManager that Tor is disconnected
+        Task {
+            await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: false)
+        }
     }
 
     private func startStatusPolling() {
@@ -406,6 +411,12 @@ public final class TorManager: ObservableObject {
                                     await FullNodeManager.shared.refreshDaemonNetwork()
                                 }
                                 #endif
+
+                                // Notify HiddenServiceManager that Tor is now connected
+                                // This ensures hidden service starts automatically if enabled
+                                Task {
+                                    await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: true)
+                                }
                             } else {
                                 self.connectionState = .error("SOCKS proxy not responding on port \(port)")
                             }

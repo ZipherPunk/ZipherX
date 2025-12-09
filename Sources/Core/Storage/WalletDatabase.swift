@@ -2737,24 +2737,19 @@ struct TransactionHistoryItem {
             }
         }
 
-        // Final fallback: estimate based on block height
-        // Zclassic has 2.5 minute block time (150 seconds)
-        // Reference: block 2932265 was mined around Dec 4, 2025 17:00 UTC
+        // Final fallback: estimate using dynamic reference (current chain height = NOW)
+        // This avoids hardcoded timestamps that become stale
         if height > 0 {
-            let referenceHeight: UInt64 = 2932265
-            let referenceTimestamp: TimeInterval = 1764867600 // Dec 4, 2025 17:00 UTC (CORRECT 2025 timestamp)
             let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
+            let currentHeight = NetworkManager.shared.chainHeight
+            let currentTime = Date().timeIntervalSince1970
 
-            let heightDiff = Int64(height) - Int64(referenceHeight)
-            let estimatedTimestamp = referenceTimestamp + (Double(heightDiff) * blockTimeInterval)
+            // Calculate: height relative to current chain tip
+            let heightDiff = Int64(height) - Int64(currentHeight)
+            let estimatedTimestamp = currentTime + (Double(heightDiff) * blockTimeInterval)
             let date = Date(timeIntervalSince1970: estimatedTimestamp)
 
-            // Only show "(est)" suffix for older transactions
-            // Recent transactions (within 10 minutes) are likely accurate since
-            // the estimation is based on a recent reference point
-            let now = Date().timeIntervalSince1970
-            let isRecent = abs(estimatedTimestamp - now) < 600 // 10 minutes
-            return formatter.string(from: date) + (isRecent ? "" : " (est)")
+            return formatter.string(from: date) + " (est)"
         }
 
         // No timestamp available
