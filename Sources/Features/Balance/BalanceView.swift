@@ -865,24 +865,24 @@ struct BalanceView: View {
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
 
-                    // CYPHERPUNK: Tor/Onion peer counts - SAME FONT as peers line, FLUO GREEN!
+                    // CYPHERPUNK: Tor/Onion peer counts - PROMINENT display, FLUO GREEN!
                     let torCount = networkManager.torConnectedPeersCount
                     let onionCount = networkManager.onionConnectedPeersCount
-                    HStack(spacing: 6) {
+                    HStack(alignment: .center, spacing: 4) {
                         Text("🧅")
-                            .font(.system(size: 14))
+                            .font(.system(size: 13))
                         if torCount > 0 || onionCount > 0 {
                             Text("\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
-                                .font(theme.bodyFont)  // SAME FONT as peers line
+                                .font(.system(size: 13, weight: .medium))  // PROMINENT font
                                 .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))  // FLUO GREEN
-                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3), radius: 6, x: 0, y: 0)  // Glow effect
+                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3), radius: 4, x: 0, y: 0)
                         } else {
                             Text("0 via Tor")
-                                .font(theme.bodyFont)  // SAME FONT as peers line
-                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.7))  // Slightly brighter when 0
+                                .font(.system(size: 13, weight: .medium))  // PROMINENT font
+                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))  // FULL opacity for visibility
+                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.5), radius: 3, x: 0, y: 0)
                         }
                     }
-                    .padding(.top, 2)  // Add spacing from peers line
                 }
 
                 Spacer()
