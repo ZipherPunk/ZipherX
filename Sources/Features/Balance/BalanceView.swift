@@ -865,24 +865,30 @@ struct BalanceView: View {
                         .font(theme.bodyFont)
                         .foregroundColor(connectionTextColor)
 
-                    // CYPHERPUNK: Tor/Onion peer counts - PROMINENT display, FLUO GREEN!
+                    // CYPHERPUNK: Tor/Onion peer counts - PROMINENT display with background!
                     let torCount = networkManager.torConnectedPeersCount
                     let onionCount = networkManager.onionConnectedPeersCount
-                    HStack(alignment: .center, spacing: 4) {
+                    HStack(alignment: .center, spacing: 6) {
                         Text("🧅")
-                            .font(.system(size: 13))
+                            .font(.system(size: 14))
                         if torCount > 0 || onionCount > 0 {
                             Text("\(torCount) via Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
-                                .font(.system(size: 13, weight: .medium))  // PROMINENT font
-                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))  // FLUO GREEN
-                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3), radius: 4, x: 0, y: 0)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
                         } else {
                             Text("0 via Tor")
-                                .font(.system(size: 13, weight: .medium))  // PROMINENT font
-                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))  // FULL opacity for visibility
-                                .shadow(color: Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.5), radius: 3, x: 0, y: 0)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(Color(red: 0.0, green: 1.0, blue: 0.3))
                         }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.black.opacity(0.4))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(red: 0.0, green: 1.0, blue: 0.3).opacity(0.5), lineWidth: 1)
+                    )
                 }
 
                 Spacer()

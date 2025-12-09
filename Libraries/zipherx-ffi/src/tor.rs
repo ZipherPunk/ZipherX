@@ -695,7 +695,8 @@ async fn handle_incoming_stream_request(
     }
 
     // Verify magic bytes (Zclassic mainnet: 0x24e92764)
-    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    // NOTE: Magic bytes are sent in network byte order (big-endian) in P2P protocol
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if magic != 0x24e92764 {
         eprintln!("🧅 P2P #{}: Invalid magic: {:08x}", conn_id, magic);
         return Err(format!("Invalid magic bytes: {:08x}", magic).into());
@@ -709,8 +710,8 @@ async fn handle_incoming_stream_request(
 
     eprintln!("🧅 P2P #{}: Received command: '{}'", conn_id, command);
 
-    // Extract payload length
-    let payload_len = u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as usize;
+    // Extract payload length (bytes 16-19, NOT 20-23 which is checksum)
+    let payload_len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
 
     // Read payload if any
     let mut payload = vec![0u8; payload_len];
@@ -806,8 +807,8 @@ where
             }
         }
 
-        // Verify magic
-        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        // Verify magic (network byte order = big-endian)
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
         if magic != 0x24e92764 {
             eprintln!("🧅 P2P #{}: Invalid magic in session: {:08x}", conn_id, magic);
             break;
@@ -819,7 +820,8 @@ where
             .trim_matches('\0')
             .to_string();
 
-        let payload_len = u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as usize;
+        // Payload length is at bytes 16-19 (NOT 20-23 which is checksum)
+        let payload_len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
 
         // Read payload
         let mut payload = vec![0u8; payload_len];
@@ -978,8 +980,8 @@ fn build_inv_message(_inventory: &[u8]) -> Vec<u8> {
 
 /// Build a P2P message with header
 fn build_p2p_message(command: &str, payload: &[u8], out: &mut Vec<u8>) {
-    // Magic (Zclassic mainnet)
-    out.extend_from_slice(&0x24e92764u32.to_le_bytes());
+    // Magic (Zclassic mainnet) - network byte order (big-endian)
+    out.extend_from_slice(&0x24e92764u32.to_be_bytes());
 
     // Command (12 bytes, null-padded)
     let mut cmd_bytes = [0u8; 12];

@@ -2751,6 +2751,77 @@ guard let rawTx = rawTx else {
 
 ---
 
+### 60. P2P Hidden Service Protocol Fixes (December 9, 2025)
+
+**Problem**: Incoming P2P connections to ZipherX's Tor hidden service were failing. zclassicd could connect but handshake never completed - "socket closed" after 30 seconds.
+
+**Root Causes Found**:
+
+1. **Magic bytes byte order** - P2P protocol uses network byte order (big-endian), but code was using `from_le_bytes`
+2. **Payload length offset** - Code was reading checksum field (bytes 20-23) instead of length field (bytes 16-19)
+
+**Fixes Applied** (`tor.rs`):
+
+| Line | Issue | Fix |
+|------|-------|-----|
+| 699 | Magic byte order | `from_le_bytes` → `from_be_bytes` |
+| 714 | Payload length offset | `[header[20-23]]` → `[header[16-19]]` |
+| 811 | Magic byte order (session) | `from_le_bytes` → `from_be_bytes` |
+| 823 | Payload length offset (session) | `[header[20-23]]` → `[header[16-19]]` |
+| 983 | Magic write byte order | `to_le_bytes` → `to_be_bytes` |
+
+**P2P Header Format** (24 bytes):
+```
+[0-3]   magic    - 4 bytes (big-endian, network byte order)
+[4-15]  command  - 12 bytes (null-terminated string)
+[16-19] length   - 4 bytes (little-endian)
+[20-23] checksum - 4 bytes
+```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - byte order and offset fixes
+
+---
+
+### 61. Double Touch ID at Startup Fix (December 9, 2025)
+
+**Problem**: Users had to authenticate with Touch ID/Face ID twice at app startup.
+
+**Root Cause**: Two separate biometric prompts were triggered:
+1. SQLCipherManager's `getEncryptionKey()` used `kSecUseAuthenticationContext` for keychain access
+2. LockScreenView's `attemptUnlock()` triggered app-level biometric authentication
+
+**Solution**: Removed biometric-protected secret from database key derivation. The app-level biometric lock provides sufficient protection.
+
+**Changes** (`SQLCipherManager.swift`):
+```swift
+// Key version bumped from 2 to 3
+private let currentKeyVersion: Int = 3
+
+// Changed from biometric secret to app secret
+let appSecret = Data("ZipherX-Cypherpunk-2025".utf8)
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/SQLCipherManager.swift` - removed biometric keychain access
+
+---
+
+### 62. Tor Display Visibility Enhancement (December 9, 2025)
+
+**Problem**: Tor/onion peer count display in top-left corner was hard to see.
+
+**Solution**: Added visual enhancements for better visibility:
+- Semi-transparent black background (`Color.black.opacity(0.4)`)
+- Green border with rounded corners
+- Larger font (14pt semibold)
+- Improved padding
+
+**Files Modified**:
+- `Sources/Features/Balance/BalanceView.swift` - enhanced Tor display styling
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)

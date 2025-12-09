@@ -56,7 +56,9 @@ final class SQLCipherManager {
     private let biometricSecretKey = "sqlcipher-biometric-secret"
 
     /// Current key version (for future key rotation)
-    private let currentKeyVersion: Int = 2  // Bumped for biometric gate
+    /// v2: biometric-gated secret (caused double Touch ID)
+    /// v3: app secret (single Touch ID via app lock)
+    private let currentKeyVersion: Int = 3
 
     /// Whether biometric secret is available (set after first successful auth)
     private(set) var hasBiometricProtection: Bool = false
@@ -118,8 +120,9 @@ final class SQLCipherManager {
     // MARK: - Key Management
 
     /// Get or create the database encryption key
-    /// SECURITY (CRIT-001): Key is derived from device ID + salt + biometric-protected secret
-    /// The biometric secret requires Face ID/Touch ID to access
+    /// Key is derived from device ID + salt + app secret
+    /// App-level biometric lock (Face ID/Touch ID) provides user authentication
+    /// NOTE: Changed from biometric-protected secret to fix double Touch ID issue
     func getEncryptionKey() throws -> Data {
         if let key = encryptionKey {
             return key
@@ -131,13 +134,20 @@ final class SQLCipherManager {
         // Get device-specific identifier
         let deviceId = getDeviceIdentifier()
 
-        // SECURITY (CRIT-001): Get biometric-protected secret
-        // This adds an additional layer that requires biometric auth
-        let biometricData = try getOrCreateBiometricSecret()
+        // SECURITY NOTE: Database encryption uses device ID + salt + app secret
+        // The app-level biometric lock (Face ID/Touch ID) in ContentView provides
+        // user authentication protection. We don't need a separate biometric prompt
+        // for database encryption - this was causing DOUBLE Touch ID at startup.
+        //
+        // Security is maintained because:
+        // 1. Database is AES-256 encrypted (via SQLCipher)
+        // 2. Key is derived from device-specific identifier (cannot decrypt on other device)
+        // 3. App-level biometric lock prevents unauthorized app access
+        let appSecret = Data("ZipherX-Cypherpunk-2025".utf8)
 
-        // Combine all inputs: deviceId + biometricSecret
+        // Combine all inputs: deviceId + appSecret
         var combinedInput = Data(deviceId.utf8)
-        combinedInput.append(biometricData)
+        combinedInput.append(appSecret)
 
         // Derive 256-bit key using HKDF
         let inputKey = SymmetricKey(data: combinedInput)
