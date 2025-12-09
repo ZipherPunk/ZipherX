@@ -59,11 +59,11 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showAddContact) {
             AddContactSheet()
-                .frame(minWidth: 400, minHeight: 450)
+                .frame(width: 380, height: 420)
         }
         .sheet(isPresented: $showSettings) {
             ChatSettingsSheet()
-                .frame(minWidth: 400, minHeight: 400)
+                .frame(width: 400, height: 500)
         }
         .onAppear {
             autoStartChatIfNeeded()
@@ -1225,9 +1225,6 @@ struct AddContactSheet: View {
                 #endif
             }
         }
-        #if os(macOS)
-        .frame(minWidth: 400, minHeight: 500)
-        #endif
     }
 
     private func addContact() {
