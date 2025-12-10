@@ -328,6 +328,22 @@ final class Peer {
             // Connection failed during wait - try again (will acquire lock)
             throw NetworkError.connectionFailed("Connection attempt in progress failed")
         }
+
+        // FIX #107: COOLDOWN CHECK IN connect() - Prevent infinite reconnection loops
+        // Previously cooldown was only in ensureConnected(), but direct connect() calls bypassed it
+        // This caused same peer to reconnect every 100ms when multiple callers retried
+        if let lastAttempt = lastAttempt {
+            let timeSinceLastAttempt = Date().timeIntervalSince(lastAttempt)
+            if timeSinceLastAttempt < Self.minReconnectInterval {
+                connectionLock.unlock()
+                let waitTime = Self.minReconnectInterval - timeSinceLastAttempt
+                print("⏳ [\(host)] Connection cooldown: \(String(format: "%.1f", waitTime))s remaining")
+                throw NetworkError.timeout
+            }
+        }
+        // Record this attempt BEFORE releasing lock to prevent races
+        lastAttempt = Date()
+
         isConnecting = true
         connectionLock.unlock()
 
