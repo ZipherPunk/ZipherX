@@ -8,9 +8,20 @@ import AppKit
 struct NodeManagementView: View {
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var viewModel = NodeManagementViewModel()
+    @ObservedObject private var fullNodeManager = FullNodeManager.shared
     @Environment(\.dismiss) private var dismiss
 
     private var theme: AppTheme { themeManager.currentTheme }
+
+    /// Check if daemon is in a startup/syncing state (prevents duplicate starts)
+    private var isDaemonBusy: Bool {
+        switch fullNodeManager.daemonStatus {
+        case .starting, .syncing:
+            return true
+        default:
+            return viewModel.isOperationInProgress
+        }
+    }
 
     var body: some View {
         ScrollView {
@@ -87,21 +98,21 @@ struct NodeManagementView: View {
             sectionHeader(icon: "power", title: "DAEMON CONTROL")
 
             HStack(spacing: 16) {
-                // Status indicator
+                // Status indicator - uses persistent FullNodeManager status
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(viewModel.isDaemonRunning ? Color.green : Color.red)
+                        .fill(daemonStatusColor)
                         .frame(width: 12, height: 12)
 
-                    Text(viewModel.isDaemonRunning ? "RUNNING" : "STOPPED")
+                    Text(daemonStatusText)
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
-                        .foregroundColor(viewModel.isDaemonRunning ? .green : .red)
+                        .foregroundColor(daemonStatusColor)
                 }
 
                 Spacer()
 
-                // Control buttons
-                if viewModel.isDaemonRunning {
+                // Control buttons - disabled when daemon is busy (starting/syncing)
+                if fullNodeManager.daemonStatus.isRunning {
                     Button(action: { viewModel.stopDaemon() }) {
                         HStack {
                             Image(systemName: "stop.fill")
@@ -115,7 +126,7 @@ struct NodeManagementView: View {
                         .cornerRadius(theme.cornerRadius)
                     }
                     .buttonStyle(PlainButtonStyle())
-                    .disabled(viewModel.isOperationInProgress)
+                    .disabled(isDaemonBusy)
                 } else {
                     Button(action: { viewModel.startDaemon() }) {
                         HStack {
@@ -126,28 +137,28 @@ struct NodeManagementView: View {
                         .foregroundColor(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
-                        .background(Color.green)
+                        .background(isDaemonBusy ? Color.gray : Color.green)
                         .cornerRadius(theme.cornerRadius)
                     }
                     .buttonStyle(PlainButtonStyle())
-                    .disabled(viewModel.isOperationInProgress)
+                    .disabled(isDaemonBusy)
                 }
             }
             .padding(12)
             .background(theme.surfaceColor)
             .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
 
-            // Operation status with progress bar
-            if viewModel.isOperationInProgress {
+            // Operation status with progress bar - shows from ViewModel OR FullNodeManager
+            if viewModel.isOperationInProgress || isSyncingFromManager {
                 VStack(spacing: 8) {
                     HStack {
                         ProgressView()
                             .scaleEffect(0.8)
-                        Text(viewModel.operationStatus)
+                        Text(currentOperationStatus)
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
                         Spacer()
-                        Text("\(Int(viewModel.operationProgress * 100))%")
+                        Text("\(Int(currentOperationProgress * 100))%")
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundColor(theme.accentColor)
                     }
@@ -173,8 +184,8 @@ struct NodeManagementView: View {
                                         endPoint: .trailing
                                     )
                                 )
-                                .frame(width: geometry.size.width * viewModel.operationProgress, height: 8)
-                                .animation(.easeInOut(duration: 0.3), value: viewModel.operationProgress)
+                                .frame(width: geometry.size.width * currentOperationProgress, height: 8)
+                                .animation(.easeInOut(duration: 0.3), value: currentOperationProgress)
                         }
                     }
                     .frame(height: 8)
@@ -184,6 +195,83 @@ struct NodeManagementView: View {
                 .background(theme.backgroundColor.opacity(0.5))
                 .overlay(Rectangle().stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
             }
+        }
+    }
+
+    // MARK: - Daemon Status Helpers
+
+    /// Color for daemon status indicator
+    private var daemonStatusColor: Color {
+        switch fullNodeManager.daemonStatus {
+        case .running:
+            return .green
+        case .syncing:
+            return .orange
+        case .starting:
+            return .yellow
+        case .error:
+            return .red
+        default:
+            return .red
+        }
+    }
+
+    /// Text for daemon status indicator
+    private var daemonStatusText: String {
+        switch fullNodeManager.daemonStatus {
+        case .running:
+            return "RUNNING"
+        case .syncing(let progress):
+            return "SYNCING (\(Int(progress * 100))%)"
+        case .starting:
+            return "STARTING..."
+        case .stopped, .installed:
+            return "STOPPED"
+        case .error(let msg):
+            return "ERROR: \(msg.prefix(20))"
+        default:
+            return "STOPPED"
+        }
+    }
+
+    /// Check if FullNodeManager is syncing (but ViewModel isn't tracking it)
+    private var isSyncingFromManager: Bool {
+        switch fullNodeManager.daemonStatus {
+        case .starting, .syncing:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Current operation status - prefers ViewModel, falls back to FullNodeManager
+    private var currentOperationStatus: String {
+        if viewModel.isOperationInProgress && !viewModel.operationStatus.isEmpty {
+            return viewModel.operationStatus
+        }
+        switch fullNodeManager.daemonStatus {
+        case .starting:
+            return "Starting daemon..."
+        case .syncing(let progress):
+            return "Syncing blockchain... \(Int(progress * 100))% (block \(fullNodeManager.daemonBlockHeight))"
+        default:
+            return viewModel.operationStatus
+        }
+    }
+
+    /// Current operation progress - prefers ViewModel, falls back to FullNodeManager
+    private var currentOperationProgress: Double {
+        if viewModel.isOperationInProgress && viewModel.operationProgress > 0 {
+            return viewModel.operationProgress
+        }
+        switch fullNodeManager.daemonStatus {
+        case .starting:
+            return 0.2
+        case .syncing(let progress):
+            // Map sync progress (0-1) to progress bar (0.3-0.95)
+            return 0.3 + (progress * 0.65)
+        default:
+            return viewModel.operationProgress
         }
     }
 
@@ -1120,6 +1208,27 @@ class NodeManagementViewModel: ObservableObject {
     }
 
     func startDaemon() {
+        // GUARD: Prevent starting if daemon is already starting/syncing/running
+        switch fullNodeManager.daemonStatus {
+        case .starting:
+            print("⚠️ Daemon is already starting, ignoring duplicate start request")
+            return
+        case .syncing(let progress):
+            print("⚠️ Daemon is syncing (\(Int(progress * 100))%), ignoring start request")
+            return
+        case .running:
+            print("⚠️ Daemon is already running, ignoring start request")
+            return
+        default:
+            break
+        }
+
+        // Also check if an operation is already in progress
+        guard !isOperationInProgress else {
+            print("⚠️ Operation already in progress, ignoring start request")
+            return
+        }
+
         isOperationInProgress = true
         operationProgress = 0.0
         operationStatus = "Initializing..."
@@ -1128,14 +1237,14 @@ class NodeManagementViewModel: ObservableObject {
             do {
                 // Step 1: Check prerequisites
                 await MainActor.run {
-                    operationProgress = 0.1
+                    operationProgress = 0.05
                     operationStatus = "Checking configuration..."
                 }
                 try await Task.sleep(nanoseconds: 300_000_000)
 
                 // Step 2: Start daemon process
                 await MainActor.run {
-                    operationProgress = 0.2
+                    operationProgress = 0.1
                     operationStatus = "Launching zclassicd..."
                 }
 
@@ -1147,7 +1256,7 @@ class NodeManagementViewModel: ObservableObject {
 
                 // Step 3: Wait for RPC to become available
                 await MainActor.run {
-                    operationProgress = 0.3
+                    operationProgress = 0.15
                     operationStatus = "Waiting for RPC interface..."
                 }
 
@@ -1155,10 +1264,10 @@ class NodeManagementViewModel: ObservableObject {
                 for i in 1...30 {
                     try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
 
-                    // Update progress (0.3 to 0.9 over 30 seconds)
-                    let progress = 0.3 + (Double(i) / 30.0) * 0.6
+                    // Update progress (0.15 to 0.3 during RPC connection)
+                    let progress = 0.15 + (Double(i) / 30.0) * 0.15
                     await MainActor.run {
-                        operationProgress = min(progress, 0.9)
+                        operationProgress = min(progress, 0.3)
                         operationStatus = "Connecting to daemon... (\(i)s)"
                     }
 
@@ -1172,20 +1281,94 @@ class NodeManagementViewModel: ObservableObject {
                     throw FullNodeError.startupTimeout
                 }
 
-                // Step 4: Verify daemon is running
+                // Step 4: Wait for daemon to be FULLY SYNCED (100%)
                 await MainActor.run {
-                    operationProgress = 0.95
-                    operationStatus = "Verifying daemon status..."
+                    operationProgress = 0.3
+                    operationStatus = "Waiting for blockchain to load..."
                 }
-                try await Task.sleep(nanoseconds: 500_000_000)
 
-                // Step 5: Complete
+                // Poll sync status every 2 seconds, up to 10 minutes
+                for attempt in 1...300 {
+                    do {
+                        let info = try await RPCClient.shared.getBlockchainInfo()
+
+                        // Get sync progress and block info
+                        let headers = info["headers"] as? Int ?? 0
+                        let blocks = info["blocks"] as? Int ?? 0
+
+                        // Note: Zclassic doesn't have initialblockdownload field
+                        // verificationprogress is unreliable (can be 65% even when fully synced)
+                        // The only reliable check is blocks == headers
+
+                        // Calculate true sync progress based on blocks/headers ratio
+                        let trueSyncProgress: Double
+                        if headers > 0 {
+                            trueSyncProgress = Double(blocks) / Double(headers)
+                        } else {
+                            let verificationProgress = info["verificationprogress"] as? Double ?? 0.0
+                            trueSyncProgress = verificationProgress
+                        }
+
+                        // Update UI with sync progress
+                        // Progress bar: 0.3 to 0.95 based on true sync progress
+                        let displayProgress = 0.3 + (trueSyncProgress * 0.65)
+                        let syncPercent = Int(trueSyncProgress * 100)
+
+                        await MainActor.run {
+                            operationProgress = min(displayProgress, 0.95)
+                            blockHeight = UInt64(blocks)
+                            syncProgress = trueSyncProgress
+
+                            if headers == 0 {
+                                // No headers yet - still loading index
+                                operationStatus = "Loading block index..."
+                            } else if blocks < headers {
+                                // Still downloading/verifying blocks
+                                operationStatus = "Syncing blockchain... \(syncPercent)% (block \(blocks)/\(headers))"
+                            } else {
+                                // blocks == headers - synced
+                                operationStatus = "Finalizing..."
+                            }
+                        }
+
+                        // Log progress every 30 seconds (15 attempts × 2s)
+                        if attempt % 15 == 0 {
+                            print("🔄 Daemon sync: \(syncPercent)% (block \(blocks)/\(headers))")
+                        }
+
+                        // Check if fully synced: headers > 0 AND blocks == headers
+                        let isFullySynced = headers > 0 && headers == blocks
+
+                        if isFullySynced {
+                            // FULLY SYNCED!
+                            await MainActor.run {
+                                operationProgress = 0.98
+                                operationStatus = "Blockchain fully synced!"
+                                syncProgress = 1.0
+                            }
+                            try await Task.sleep(nanoseconds: 500_000_000)
+                            break
+                        }
+
+                    } catch {
+                        // Error checking sync - might still be loading block index
+                        print("⚠️ Error checking sync status: \(error.localizedDescription)")
+                        await MainActor.run {
+                            operationStatus = "Loading block index..."
+                        }
+                    }
+
+                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                }
+
+                // Step 5: Complete - daemon is fully synced and ready!
                 await MainActor.run {
                     operationProgress = 1.0
-                    operationStatus = "Daemon started successfully!"
+                    operationStatus = "Daemon fully synced and ready!"
                     isDaemonRunning = true
+                    syncProgress = 1.0
                 }
-                try await Task.sleep(nanoseconds: 500_000_000)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
 
                 await MainActor.run {
                     isOperationInProgress = false

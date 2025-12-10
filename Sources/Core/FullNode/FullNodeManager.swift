@@ -191,11 +191,21 @@ public class FullNodeManager: ObservableObject {
             print("🔄 Full Node: RPC connection result = \(connected)")
 
             if connected {
-                daemonStatus = .running
                 isNodeInstalled = true  // Daemon is running, so it's "installed" somewhere
                 print("✅ Full Node: daemon is RUNNING (detected via RPC)")
 
-                // Check sync status and block height
+                // Set initial status to syncing - checkSyncStatus will update to .running when fully synced
+                // This prevents showing "Running" while daemon is still in "Loading block index" phase
+                if case .running = daemonStatus {
+                    // Keep as .running only if already confirmed running
+                } else if case .syncing = daemonStatus {
+                    // Keep current syncing status
+                } else {
+                    // Initial state - assume syncing until confirmed
+                    daemonStatus = .syncing(progress: 0)
+                }
+
+                // Check sync status and block height - this will update status appropriately
                 await checkSyncStatus()
                 return
             }
@@ -218,29 +228,53 @@ public class FullNodeManager: ObservableObject {
     /// Check blockchain sync status and get block height
     @MainActor
     private func checkSyncStatus() async {
-        guard daemonStatus.isRunning else { return }
+        // Allow checking if running OR syncing
+        switch daemonStatus {
+        case .running, .syncing:
+            break
+        default:
+            return
+        }
 
         do {
-            let info = try await RPCClient.shared.getInfoDict()
+            let info = try await RPCClient.shared.getBlockchainInfo()
 
-            // Get block height
-            if let blocks = info["blocks"] as? Int {
-                daemonBlockHeight = UInt64(blocks)
-            }
+            // Get sync progress and block info
+            let headers = info["headers"] as? Int ?? 0
+            let blocks = info["blocks"] as? Int ?? 0
+            let verificationProgress = info["verificationprogress"] as? Double ?? 0.0
 
-            // Get sync progress
-            if let progress = info["verificationprogress"] as? Double {
-                daemonSyncProgress = progress
-                if progress < 0.9999 {
-                    daemonStatus = .syncing(progress: progress)
-                } else {
-                    daemonStatus = .running
-                }
+            // Note: Zclassic doesn't have initialblockdownload field
+            // verificationprogress is unreliable (can be 65% even when fully synced)
+            // The only reliable check is blocks == headers
+
+            daemonBlockHeight = UInt64(blocks)
+
+            // Calculate true sync progress based on blocks/headers ratio
+            let trueSyncProgress: Double
+            if headers > 0 {
+                trueSyncProgress = Double(blocks) / Double(headers)
             } else {
+                trueSyncProgress = verificationProgress
+            }
+            daemonSyncProgress = trueSyncProgress
+
+            // Check if fully synced: headers > 0 AND blocks == headers
+            let isFullySynced = headers > 0 && headers == blocks
+
+            if isFullySynced {
                 daemonStatus = .running
+            } else {
+                daemonStatus = .syncing(progress: trueSyncProgress)
             }
         } catch {
-            // Keep running status, just couldn't get sync progress
+            // RPC failed - daemon might still be loading
+            print("⚠️ checkSyncStatus: RPC failed - \(error.localizedDescription)")
+
+            // If we thought it was running but RPC failed, it's probably still loading
+            if case .running = daemonStatus {
+                daemonStatus = .syncing(progress: 0)
+            }
         }
     }
 
@@ -301,22 +335,88 @@ public class FullNodeManager: ObservableObject {
         do {
             try process.run()
 
-            // Wait for daemon to start (up to 30 seconds)
+            // Wait for daemon to start (up to 30 seconds for RPC connection)
+            var rpcConnected = false
             for i in 1...30 {
                 try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
 
                 if await RPCClient.shared.checkConnection() {
-                    await MainActor.run {
-                        daemonStatus = .running
-                        // Clear the Tor restart flag - daemon just started with latest config
-                        needsTorRestart = false
-                    }
-                    print("✅ Daemon started successfully after \(i) seconds")
-                    return
+                    rpcConnected = true
+                    print("✅ Daemon RPC connected after \(i) seconds, waiting for full sync...")
+                    break
                 }
             }
 
-            throw FullNodeError.startupTimeout
+            guard rpcConnected else {
+                throw FullNodeError.startupTimeout
+            }
+
+            // Clear the Tor restart flag - daemon just started with latest config
+            await MainActor.run {
+                needsTorRestart = false
+            }
+
+            // Now wait for daemon to be fully synced (up to 10 minutes)
+            // Check every 2 seconds
+            for attempt in 1...300 {
+                do {
+                    let info = try await RPCClient.shared.getBlockchainInfo()
+
+                    // Get sync progress and block info
+                    let headers = info["headers"] as? Int ?? 0
+                    let blocks = info["blocks"] as? Int ?? 0
+
+                    // Note: Zclassic doesn't have initialblockdownload field
+                    // verificationprogress is unreliable (can be 65% even when fully synced)
+                    // The only reliable check is blocks == headers
+
+                    // Calculate true sync progress based on blocks/headers ratio
+                    let trueSyncProgress: Double
+                    if headers > 0 {
+                        trueSyncProgress = Double(blocks) / Double(headers)
+                    } else {
+                        let verificationProgress = info["verificationprogress"] as? Double ?? 0.0
+                        trueSyncProgress = verificationProgress
+                    }
+
+                    await MainActor.run {
+                        self.daemonSyncProgress = trueSyncProgress
+                        self.daemonBlockHeight = UInt64(blocks)
+
+                        // Update status based on sync state
+                        if headers == 0 || blocks < headers {
+                            self.daemonStatus = .syncing(progress: trueSyncProgress)
+                        }
+                    }
+
+                    // Log progress every 10 attempts (20 seconds)
+                    if attempt % 10 == 0 {
+                        print("🔄 Daemon sync: \(Int(trueSyncProgress * 100))% (block \(blocks)/\(headers))")
+                    }
+
+                    // Check if fully synced: headers > 0 AND blocks == headers
+                    let isFullySynced = headers > 0 && headers == blocks
+
+                    if isFullySynced {
+                        await MainActor.run {
+                            self.daemonStatus = .running
+                        }
+                        print("✅ Daemon fully synced and ready! Block height: \(blocks)")
+                        return
+                    }
+
+                } catch {
+                    print("⚠️ Error checking sync status: \(error.localizedDescription)")
+                }
+
+                try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            }
+
+            // If we get here, daemon is still syncing after 10 minutes
+            // Keep status as syncing and let user know daemon is still working
+            print("⚠️ Daemon still syncing after 10 minutes - continuing in background")
+            // Don't throw error - daemon is running, just not fully synced yet
+            return
         } catch {
             await MainActor.run {
                 daemonStatus = .error(error.localizedDescription)

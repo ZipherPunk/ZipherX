@@ -1833,23 +1833,24 @@ struct CypherpunkMainView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
 
-                // Show peer counts with Tor breakdown
-                VStack(alignment: .leading, spacing: 1) {
+                // Show peer counts with Tor breakdown - ALL ON ONE LINE
+                HStack(spacing: 4) {
                     Text("\(networkManager.connectedPeers) PEERS")
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(matrixGreenDark)
 
-                    // Tor/onion breakdown if connected via Tor
+                    // Tor/onion breakdown if connected via Tor - same line
                     let torCount = networkManager.torConnectedPeersCount
                     let onionCount = networkManager.onionConnectedPeersCount
                     if torCount > 0 || onionCount > 0 {
-                        HStack(spacing: 2) {
-                            Text("🧅")
-                                .font(.system(size: 8))
-                            Text("\(torCount) Tor" + (onionCount > 0 ? " + \(onionCount) .onion" : ""))
-                                .font(.system(size: 8, weight: .regular, design: .monospaced))
-                                .foregroundColor(matrixGreenDarker)
-                        }
+                        Text("·")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(matrixGreenDark)
+                        Text("🧅")
+                            .font(.system(size: 9))
+                        Text("\(torCount) Tor" + (onionCount > 0 ? " +\(onionCount) onion" : ""))
+                            .font(.system(size: 9, weight: .regular, design: .monospaced))
+                            .foregroundColor(matrixGreenDark)
                     }
                 }
             }

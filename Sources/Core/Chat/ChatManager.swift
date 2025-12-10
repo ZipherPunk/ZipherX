@@ -253,7 +253,8 @@ final class ChatManager: ObservableObject {
         }
     }
 
-    /// Connect to a contact
+    /// Connect to a contact via Tor SOCKS5 proxy
+    /// .onion addresses require proper SOCKS5 tunneling through Tor
     func connect(to contact: ChatContact) async throws {
         guard isAvailable else {
             throw ChatError.hiddenServiceNotRunning
@@ -264,65 +265,212 @@ final class ChatManager: ObservableObject {
             return
         }
 
-        print("💬 Connecting to \(contact.displayName)...")
+        print("💬 Connecting to \(contact.displayName) via Tor...")
 
-        // Create connection through Tor SOCKS5 proxy
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(contact.onionAddress),
-            port: NWEndpoint.Port(integerLiteral: CYPHERPUNK_CHAT_PORT)
+        // Get Tor SOCKS port
+        let socksPort = await TorManager.shared.socksPort
+        let torConnected = await TorManager.shared.connectionState.isConnected
+
+        guard torConnected && socksPort > 0 else {
+            print("💬 Error: Tor not connected or SOCKS port unavailable")
+            throw ChatError.hiddenServiceNotRunning
+        }
+
+        // Step 1: Connect to SOCKS5 proxy first (not directly to .onion)
+        let proxyEndpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(integerLiteral: socksPort)
         )
 
-        // Use Tor SOCKS5 proxy
-        let proxyConfig = NWProtocolTLS.Options()
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 30
+        let params = NWParameters.tcp
+        let connection = NWConnection(to: proxyEndpoint, using: params)
 
-        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        // Wait for connection to SOCKS proxy
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            var hasResumed = false
 
-        // Configure SOCKS5 proxy for Tor
-        if let proxyEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 9050) as NWEndpoint? {
-            // Note: NWConnection SOCKS5 support requires custom implementation
-            // For now, we'll use the direct connection through arti's SOCKS proxy
+            connection.stateUpdateHandler = { state in
+                guard !hasResumed else { return }
+
+                switch state {
+                case .ready:
+                    hasResumed = true
+                    continuation.resume()
+                case .failed(let error):
+                    hasResumed = true
+                    continuation.resume(throwing: ChatError.connectionFailed(error.localizedDescription))
+                case .cancelled:
+                    hasResumed = true
+                    continuation.resume(throwing: ChatError.connectionFailed("Connection cancelled"))
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: networkQueue)
+
+            // Timeout after 15 seconds
+            Task {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                if !hasResumed {
+                    hasResumed = true
+                    connection.cancel()
+                    continuation.resume(throwing: ChatError.connectionFailed("SOCKS5 proxy connection timeout"))
+                }
+            }
         }
 
-        let connection = NWConnection(to: endpoint, using: params)
-        let peer = ChatPeer(onionAddress: contact.onionAddress, connection: connection)
+        // Step 2: Perform SOCKS5 handshake to tunnel to .onion address
+        try await performSocks5Handshake(connection: connection, targetHost: contact.onionAddress, targetPort: CYPHERPUNK_CHAT_PORT)
 
-        await peer.setState(.connecting)
+        print("💬 SOCKS5 tunnel established to \(contact.onionAddress.prefix(16))...")
+
+        // Now the connection is tunneled to the .onion address
+        let peer = ChatPeer(onionAddress: contact.onionAddress, connection: connection)
+        await peer.setState(.handshaking)
         peers[contact.onionAddress] = peer
 
-        connection.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                await self?.handleConnectionState(state, for: contact.onionAddress)
-            }
-        }
-
-        connection.start(queue: networkQueue)
-
-        // Wait for connection with timeout
-        try await withTimeout(seconds: 30) {
-            while await peer.state == .connecting {
-                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            }
-        }
-
-        guard await peer.state.isConnected else {
-            if case .failed(let reason) = await peer.state {
-                throw ChatError.notConnected
-            }
-            throw ChatError.notConnected
-        }
-
         // Perform key exchange
-        try await performKeyExchange(with: peer)
+        do {
+            try await performKeyExchange(with: peer)
+        } catch {
+            // Key exchange failed - clean up and mark as offline
+            print("💬 Key exchange failed with \(contact.displayName): \(error)")
+            await peer.setState(.failed(error.localizedDescription))
+            connection.cancel()
+            peers.removeValue(forKey: contact.onionAddress)
+            updateContactOnlineStatus(contact.onionAddress, isOnline: false)
+            throw error
+        }
+
+        // Mark as fully connected after successful key exchange
+        await peer.setState(.connected)
 
         // Send our nickname
         if !ourNickname.isEmpty {
-            try await sendNickname(to: contact)
+            try? await sendNickname(to: contact)
         }
 
         updateContactOnlineStatus(contact.onionAddress, isOnline: true)
+        print("💬 Connected to \(contact.displayName)")
+    }
+
+    /// Perform SOCKS5 handshake to connect through proxy to target host
+    /// RFC 1928: https://datatracker.ietf.org/doc/html/rfc1928
+    private func performSocks5Handshake(connection: NWConnection, targetHost: String, targetPort: UInt16) async throws {
+        // Step 1: Send greeting - offer no-auth (0x00) and username/password (0x02)
+        let greeting = Data([0x05, 0x02, 0x00, 0x02])
+        try await sendRawData(connection: connection, data: greeting)
+
+        // Step 2: Receive auth method selection
+        let authResponse = try await receiveRawData(connection: connection, length: 2)
+
+        guard authResponse.count == 2, authResponse[0] == 0x05 else {
+            throw ChatError.connectionFailed("Invalid SOCKS5 response")
+        }
+
+        // Handle authentication
+        switch authResponse[1] {
+        case 0x00:
+            print("💬 SOCKS5: No authentication required")
+        case 0x02:
+            // Username/password auth (for Arti circuit isolation)
+            print("💬 SOCKS5: Using username/password auth")
+            let authRequest = Data([0x01, 0x00, 0x00]) // Version 1, empty username, empty password
+            try await sendRawData(connection: connection, data: authRequest)
+            let authResult = try await receiveRawData(connection: connection, length: 2)
+            guard authResult.count == 2, authResult[1] == 0x00 else {
+                throw ChatError.connectionFailed("SOCKS5 authentication failed")
+            }
+        case 0xFF:
+            throw ChatError.connectionFailed("SOCKS5 proxy: no acceptable auth methods")
+        default:
+            throw ChatError.connectionFailed("SOCKS5 unsupported auth method: \(authResponse[1])")
+        }
+
+        // Step 3: Send connection request
+        // VER(1) + CMD(1) + RSV(1) + ATYP(1) + DST.ADDR(var) + DST.PORT(2)
+        var request = Data()
+        request.append(0x05) // SOCKS5
+        request.append(0x01) // CONNECT
+        request.append(0x00) // Reserved
+        request.append(0x03) // Domain name (ATYP = 0x03)
+
+        // Domain name with length prefix
+        let hostData = targetHost.data(using: .utf8)!
+        request.append(UInt8(hostData.count))
+        request.append(hostData)
+
+        // Port (big-endian)
+        request.append(UInt8((targetPort >> 8) & 0xFF))
+        request.append(UInt8(targetPort & 0xFF))
+
+        try await sendRawData(connection: connection, data: request)
+
+        // Step 4: Receive connection response
+        // VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(var) + BND.PORT(2)
+        let response = try await receiveRawData(connection: connection, length: 10)
+
+        guard response.count >= 4 else {
+            throw ChatError.connectionFailed("Invalid SOCKS5 connect response")
+        }
+
+        guard response[0] == 0x05 else {
+            throw ChatError.connectionFailed("SOCKS5 version mismatch")
+        }
+
+        // Check reply code
+        let replyCode = response[1]
+        switch replyCode {
+        case 0x00:
+            print("💬 SOCKS5: Connection succeeded to \(targetHost.prefix(16))...")
+        case 0x01:
+            throw ChatError.connectionFailed("SOCKS5: General failure")
+        case 0x02:
+            throw ChatError.connectionFailed("SOCKS5: Connection not allowed")
+        case 0x03:
+            throw ChatError.connectionFailed("SOCKS5: Network unreachable")
+        case 0x04:
+            throw ChatError.connectionFailed("SOCKS5: Host unreachable")
+        case 0x05:
+            throw ChatError.connectionFailed("SOCKS5: Connection refused")
+        case 0x06:
+            throw ChatError.connectionFailed("SOCKS5: TTL expired")
+        case 0x07:
+            throw ChatError.connectionFailed("SOCKS5: Command not supported")
+        case 0x08:
+            throw ChatError.connectionFailed("SOCKS5: Address type not supported")
+        default:
+            throw ChatError.connectionFailed("SOCKS5: Unknown error \(replyCode)")
+        }
+    }
+
+    /// Send raw data to connection
+    private func sendRawData(connection: NWConnection, data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error = error {
+                    continuation.resume(throwing: ChatError.connectionFailed(error.localizedDescription))
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+    }
+
+    /// Receive raw data from connection
+    private func receiveRawData(connection: NWConnection, length: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            connection.receive(minimumIncompleteLength: length, maximumLength: length) { data, _, _, error in
+                if let error = error {
+                    continuation.resume(throwing: ChatError.connectionFailed(error.localizedDescription))
+                } else if let data = data {
+                    continuation.resume(returning: data)
+                } else {
+                    continuation.resume(throwing: ChatError.connectionFailed("No data received"))
+                }
+            }
+        }
     }
 
     /// Disconnect from a contact
@@ -402,6 +550,35 @@ final class ChatManager: ObservableObject {
         try await sendMessage(message, to: contact)
         addMessageToConversation(message)
         database.saveMessage(message)
+    }
+
+    /// Send payment confirmation back to the requester after completing a payment
+    /// - Parameters:
+    ///   - contact: The contact who requested payment
+    ///   - amount: Amount paid in zatoshis
+    ///   - txId: Transaction ID of the payment
+    ///   - requestId: ID of the original payment request message (for reference)
+    func sendPaymentConfirmation(
+        to contact: ChatContact,
+        amount: UInt64,
+        txId: String,
+        requestId: String
+    ) async throws {
+        let message = ChatMessage(
+            type: .paymentSent,
+            fromOnion: ourOnionAddress ?? "",
+            toOnion: contact.onionAddress,
+            content: "Payment sent: \(txId)",
+            nickname: ourNickname.isEmpty ? nil : ourNickname,
+            paymentAmount: amount,
+            replyTo: requestId  // Link to the original payment request
+        )
+
+        try await sendMessage(message, to: contact)
+        addMessageToConversation(message)
+        database.saveMessage(message)
+
+        print("💸 Payment confirmation sent to \(contact.displayName) - txId: \(txId.prefix(16))...")
     }
 
     /// Send typing indicator
@@ -606,12 +783,20 @@ final class ChatManager: ObservableObject {
 
     private func receiveMessages(from peer: ChatPeer) {
         Task {
+            let onionAddress = await peer.onionAddress
             while await peer.state.isConnected {
                 do {
                     let data = try await receiveData(from: peer)
                     try await processReceivedData(data, from: peer)
                 } catch {
-                    print("💬 Receive error: \(error)")
+                    print("💬 Receive error from \(onionAddress.prefix(16))...: \(error)")
+                    // CRITICAL FIX: Mark peer as disconnected when receive loop fails
+                    await peer.setState(.disconnected)
+                    await MainActor.run {
+                        // Update contact online status to reflect disconnection
+                        self.updateContactOnlineStatus(onionAddress, isOnline: false)
+                        print("💬 Marked \(onionAddress.prefix(16))... as offline due to receive error")
+                    }
                     break
                 }
             }
@@ -748,11 +933,22 @@ final class ChatManager: ObservableObject {
 
     private func sendMessage(_ message: ChatMessage, to contact: ChatContact) async throws {
         // Check if connected, if not, try to connect
-        var isConnected = false
+        var needsReconnect = true
         if let peer = peers[contact.onionAddress] {
-            isConnected = await peer.state.isConnected
+            let peerState = await peer.state
+            needsReconnect = !peerState.isConnected
+
+            // Also check if connection is stale (no activity for 2+ minutes)
+            let lastActivity = await peer.lastActivity
+            if Date().timeIntervalSince(lastActivity) > 120 {
+                print("💬 Connection to \(contact.displayName) is stale, reconnecting...")
+                await peer.connection.cancel()
+                peers.removeValue(forKey: contact.onionAddress)
+                needsReconnect = true
+            }
         }
-        if !isConnected {
+
+        if needsReconnect {
             try await connect(to: contact)
         }
 
@@ -771,14 +967,29 @@ final class ChatManager: ObservableObject {
         let wireData = ChatProtocol.encode(encryptedPayload: encryptedPayload)
 
         // Send
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            peer.connection.send(content: wireData, completion: .contentProcessed { error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                peer.connection.send(content: wireData, completion: .contentProcessed { error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                })
+            }
+
+            // Message sent successfully - ensure contact is marked online
+            await peer.updateActivity()
+            updateContactOnlineStatus(contact.onionAddress, isOnline: true)
+
+        } catch {
+            // Send failed - mark as offline and clean up connection
+            print("💬 Send failed to \(contact.displayName): \(error)")
+            await peer.setState(.disconnected)
+            await peer.connection.cancel()
+            peers.removeValue(forKey: contact.onionAddress)
+            updateContactOnlineStatus(contact.onionAddress, isOnline: false)
+            throw error
         }
     }
 

@@ -705,6 +705,14 @@ final class FilterScanner {
                 }
             }
 
+            // CHECKPOINT: Save state at PHASE 1 completion
+            // This ensures we don't have to re-scan historical blocks if interrupted
+            try? database.updateLastScannedHeight(phase1EndHeight, hash: Data(count: 32))
+            if let treeData = ZipherXFFI.treeSerialize() {
+                try? database.saveTreeState(treeData)
+            }
+            print("💾 PHASE 1 checkpoint saved at height \(phase1EndHeight)")
+
             // Move to blocks after CMU data height for PHASE 2
             // Use phase1EndHeight (which is cmuDataHeight from GitHub if available)
             // PHASE 2 only needs to scan blocks beyond what we have CMU data for
@@ -876,16 +884,23 @@ final class FilterScanner {
 
                     scannedBlocks += 1
                     // Report PHASE 2 progress (60-100%) every 10 blocks for better UI feedback
+                    // CHECKPOINT: Save every 10 blocks to minimize data loss on crash
                     if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
                         let localProgress = Double(scannedBlocks) / Double(totalBlocks)
                         reportPhase2Progress(localProgress, height: height, maxHeight: targetHeight)
+
+                        // Save checkpoint every 10 blocks
+                        try? database.updateLastScannedHeight(height, hash: Data(count: 32))
+                        if let treeData = ZipherXFFI.treeSerialize() {
+                            try? database.saveTreeState(treeData)
+                        }
                     }
                 }
 
-                // Save progress
+                // Save progress at end of batch (for any remaining blocks not divisible by 10)
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
 
-                // Persist tree state periodically
+                // Persist tree state at end of batch
                 if let treeData = ZipherXFFI.treeSerialize() {
                     try? database.saveTreeState(treeData)
                 }
@@ -966,7 +981,72 @@ final class FilterScanner {
             notesNeedingNullifierFix.removeAll()
         }
 
+        // Save tree checkpoint after scan completes
+        await saveTreeCheckpointAfterSync()
+
         print("✅ Scan complete")
+    }
+
+    /// Save a tree checkpoint after sync completes
+    /// This ensures we have a verified tree state for reliable transaction building
+    private func saveTreeCheckpointAfterSync() async {
+        do {
+            // Get current tree state
+            guard let treeSerialized = ZipherXFFI.treeSerialize() else {
+                print("⚠️ Cannot save checkpoint - tree not serialized")
+                return
+            }
+
+            let treeSize = ZipherXFFI.treeSize()
+            guard treeSize > 0 else {
+                print("⚠️ Cannot save checkpoint - tree is empty")
+                return
+            }
+
+            // Get the tree root
+            guard let treeRoot = ZipherXFFI.treeRoot() else {
+                print("⚠️ Cannot save checkpoint - no tree root")
+                return
+            }
+
+            // Get last scanned height and block hash
+            let lastScanned = try database.getLastScannedHeight()
+            guard lastScanned > 0 else {
+                print("⚠️ Cannot save checkpoint - no scanned height")
+                return
+            }
+
+            // Get block hash from HeaderStore
+            guard let header = try HeaderStore.shared.getHeader(at: lastScanned) else {
+                print("⚠️ Cannot save checkpoint - no header at height \(lastScanned)")
+                return
+            }
+
+            // Validate tree root matches HeaderStore before saving
+            if treeRoot != header.hashFinalSaplingRoot {
+                print("⚠️ Tree root mismatch at height \(lastScanned) - NOT saving checkpoint")
+                print("   Our root:    \(treeRoot.hexString)")
+                print("   Header root: \(header.hashFinalSaplingRoot.hexString)")
+                return
+            }
+
+            // Save the verified checkpoint
+            try database.saveTreeCheckpoint(
+                height: lastScanned,
+                treeRoot: treeRoot,
+                treeSerialized: treeSerialized,
+                cmuCount: UInt64(treeSize),
+                blockHash: header.blockHash
+            )
+
+            // Prune old checkpoints periodically (keep storage manageable)
+            if lastScanned % 100 == 0 {
+                try database.pruneOldCheckpoints()
+            }
+
+        } catch {
+            print("⚠️ Failed to save tree checkpoint: \(error)")
+        }
     }
 
     /// Parse raw block data into CompactBlock format

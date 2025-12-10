@@ -501,29 +501,25 @@ struct TransactionDetailView: View {
 
     /// Format the actual block timestamp for display
     /// Uses the real mined block time stored in the transaction, NOT an estimate
+    /// Unified source: HeaderStore (headers table + block_times table from boost)
     private func blockDateString(for transaction: TransactionHistoryItem) -> String {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
 
-        // Use the real block timestamp if available
+        // Priority 1: Use the real block timestamp if already stored in transaction
         if let blockTime = transaction.blockTime, blockTime > 0 {
             let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
             return formatter.string(from: date)
         }
 
-        // Fallback 1: Try BlockTimestampManager (uses bundled block_timestamps.bin + runtime cache)
+        // Priority 2: Use HeaderStore (UNIFIED SOURCE)
+        // HeaderStore.getBlockTime() checks both:
+        //   - Full headers table (from P2P sync)
+        //   - block_times table (from boost file)
         if transaction.height > 0 {
-            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: transaction.height) {
+            if let timestamp = try? HeaderStore.shared.getBlockTime(at: transaction.height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
-                return formatter.string(from: date)
-            }
-        }
-
-        // Fallback 2: Try HeaderStore directly
-        if transaction.height > 0 {
-            if let header = try? HeaderStore.shared.getHeader(at: transaction.height) {
-                let date = Date(timeIntervalSince1970: TimeInterval(header.time))
                 return formatter.string(from: date)
             }
         }

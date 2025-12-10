@@ -153,6 +153,9 @@ struct SettingsView: View {
     @State private var bannedPeersList: [BannedPeer] = []
     @State private var selectedBannedPeers: Set<String> = []
 
+    // Custom nodes management
+    @State private var showCustomNodes = false
+
     // Delete wallet
     @State private var showDeleteWalletWarning = false
     @State private var showDeleteWalletConfirm = false
@@ -1152,6 +1155,33 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
+            // Custom Nodes button
+            Button(action: {
+                showCustomNodes = true
+            }) {
+                HStack {
+                    Image(systemName: "network.badge.shield.half.filled")
+                        .font(.system(size: 14))
+                    Text("Custom Nodes")
+                        .font(theme.bodyFont)
+                    Spacer()
+                    Text("\(networkManager.customNodes.count)")
+                        .font(theme.monoFont)
+                        .foregroundColor(networkManager.customNodes.isEmpty ? theme.textSecondary : .green)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+
             // Tor Privacy Mode
             torPrivacySection
 
@@ -1215,6 +1245,14 @@ Both binaries must be installed to /usr/local/bin:
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
                        minHeight: 400, idealHeight: 500, maxHeight: 600)
+                #endif
+        }
+        .sheet(isPresented: $showCustomNodes) {
+            CustomNodesView()
+                .environmentObject(themeManager)
+                #if os(macOS)
+                .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
+                       minHeight: 500, idealHeight: 600, maxHeight: 700)
                 #endif
         }
         .alert("Peers Exported!", isPresented: $showPeerExportSuccess) {

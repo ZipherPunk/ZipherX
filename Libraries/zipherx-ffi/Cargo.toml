@@ -47,6 +47,7 @@ tor-rtcompat = { version = "0.37", features = ["tokio", "rustls"] }
 tor-hsservice = "0.37"
 tor-hscrypto = "0.37"
 tor-cell = "0.37"
+tor-proto = "0.37"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net", "macros"] }
 once_cell = "1.19"
 url = "2.5"

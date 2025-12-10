@@ -138,18 +138,36 @@ final class BlockTimestampManager {
     }
 
     /// Load timestamps from boost section (4 bytes per timestamp)
+    /// Also populates HeaderStore.block_times for unified timestamp storage
     private func loadFromBoostSection(_ data: Data, startHeight: UInt64, count: UInt64) throws {
         guard data.count >= Int(count) * 4 else {
             throw NSError(domain: "BlockTimestampManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid boost section size"])
         }
 
-        // Store data and metadata
+        // Store data and metadata in memory
         timestampData = data
         maxHeight = startHeight + count - 1
         boostStartHeight = startHeight
         isBoostFormat = true
 
         print("⏰ BlockTimestampManager: Loaded timestamps from boost (heights \(startHeight) to \(maxHeight))")
+
+        // UNIFIED STORAGE: Also populate HeaderStore.block_times table
+        // This ensures timestamps are available via HeaderStore.getBlockTime()
+        // which is the single source of truth for the wallet
+        do {
+            // Check if HeaderStore already has these timestamps to avoid duplicate work
+            let existingCount = try HeaderStore.shared.getBlockTimesCount()
+            if existingCount < Int(count) {
+                try HeaderStore.shared.insertBlockTimesFromBoostData(data, startHeight: startHeight)
+                print("✅ BlockTimestampManager: Synced \(count) timestamps to HeaderStore.block_times")
+            } else {
+                print("✅ BlockTimestampManager: HeaderStore.block_times already populated (\(existingCount) entries)")
+            }
+        } catch {
+            print("⚠️ BlockTimestampManager: Failed to sync to HeaderStore: \(error.localizedDescription)")
+            // Non-fatal - in-memory cache still works
+        }
     }
 
     /// Start height for boost format (Sapling activation)
@@ -255,6 +273,36 @@ final class BlockTimestampManager {
         cacheLock.lock()
         runtimeCache.removeAll()
         cacheLock.unlock()
+
+        // Also clear in-memory boost data to force re-read from boost file
+        timestampData = nil
+        maxHeight = 0
+        boostStartHeight = 0
+        isBoostFormat = false
+        print("🗑️ BlockTimestampManager: Cleared runtime cache and in-memory data")
+    }
+
+    /// Clear all timestamp data including HeaderStore block_times
+    /// Call this during full repair/reset to force re-sync from boost file
+    func clearAllTimestampData() {
+        // Clear in-memory data
+        cacheLock.lock()
+        runtimeCache.removeAll()
+        cacheLock.unlock()
+        timestampData = nil
+        maxHeight = 0
+        boostStartHeight = 0
+        isBoostFormat = false
+
+        // Clear HeaderStore block_times table
+        do {
+            try HeaderStore.shared.clearBlockTimes()
+            print("🗑️ BlockTimestampManager: Cleared HeaderStore.block_times table")
+        } catch {
+            print("⚠️ BlockTimestampManager: Failed to clear HeaderStore: \(error.localizedDescription)")
+        }
+
+        print("🗑️ BlockTimestampManager: Cleared ALL timestamp data")
     }
 
     // MARK: - Async Fetch for Missing Timestamps

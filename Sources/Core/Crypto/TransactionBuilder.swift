@@ -131,8 +131,11 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // Get current chain height
-        let chainHeight = try await NetworkManager.shared.getChainHeight()
+        // Get current chain height (use cached first to avoid network delay)
+        var chainHeight = NetworkManager.shared.chainHeight
+        if chainHeight == 0 {
+            chainHeight = try await NetworkManager.shared.getChainHeight()
+        }
         print("📊 Current chain height: \(chainHeight)")
 
         // Get notes from database - requires valid witnesses
@@ -418,7 +421,11 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        let chainHeight = try await NetworkManager.shared.getChainHeight()
+        // Use cached chain height first to avoid network delay
+        var chainHeight = NetworkManager.shared.chainHeight
+        if chainHeight == 0 {
+            chainHeight = try await NetworkManager.shared.getChainHeight()
+        }
         var dbNotes = try database.getUnspentNotes(accountId: account.id)
 
         if dbNotes.isEmpty {
@@ -583,7 +590,46 @@ final class TransactionBuilder {
             // VALIDATION: The common anchor must match the current tree root!
             // The witnesses must reflect the CURRENT tree state, not an old one.
             let currentTreeRoot = ZipherXFFI.treeRoot()
-            let anchorMatchesTree = allValid && commonAnchor != nil && commonAnchor == currentTreeRoot
+
+            // CRITICAL SECURITY FIX: Validate tree root against blockchain's finalsaplingroot!
+            // The FFI tree can become corrupted. We MUST verify against trusted chain data.
+            var treeIsValid = true
+            if let currentTreeRoot = currentTreeRoot,
+               let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(),
+               let trustedHeader = try? headerStore.getHeader(at: lastScanned) {
+                let trustedRoot = trustedHeader.hashFinalSaplingRoot
+                let treeRootHex = currentTreeRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+                let trustedRootHex = trustedRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+
+                if currentTreeRoot != trustedRoot {
+                    print("🚨 [SECURITY] Tree root mismatch detected!")
+                    print("   FFI tree root:      \(treeRootHex)...")
+                    print("   Blockchain expects: \(trustedRootHex)... at height \(lastScanned)")
+
+                    // Try checkpoint-based recovery FIRST (faster than full rebuild)
+                    if await tryRestoreFromCheckpoint(targetHeight: lastScanned) {
+                        print("✅ Tree restored from checkpoint - retrying validation...")
+                        // Re-check tree root after restoration
+                        if let newRoot = ZipherXFFI.treeRoot(), newRoot == trustedRoot {
+                            print("✅ Checkpoint restoration successful - tree is now valid!")
+                            treeIsValid = true
+                        } else {
+                            print("⚠️ Checkpoint restoration didn't fix tree - will rebuild witnesses")
+                            treeIsValid = false
+                        }
+                    } else {
+                        print("⚠️ No valid checkpoint available - forcing witness rebuild!")
+                        treeIsValid = false
+                    }
+                } else {
+                    print("✅ Tree root validated against blockchain finalsaplingroot at height \(lastScanned)")
+                }
+            } else {
+                print("⚠️ Could not validate tree root (missing header data)")
+                treeIsValid = false
+            }
+
+            let anchorMatchesTree = allValid && commonAnchor != nil && commonAnchor == currentTreeRoot && treeIsValid
 
             if allValid && anchorMatchesTree {
                 // INSTANT MODE: All witnesses are valid with matching anchors that match current tree!
@@ -596,21 +642,96 @@ final class TransactionBuilder {
                 let commonHex = commonAnchor!.prefix(8).map { String(format: "%02x", $0) }.joined()
                 let treeHex = currentTreeRoot!.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("⚠️ Witness anchors (\(commonHex)...) don't match current tree (\(treeHex)...) - STALE!")
-                print("⚠️ Database witnesses are stale, rebuilding from boost + delta...")
 
-                let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
-                let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
-                print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+                // FAST PATH: Try checkpoint-based delta sync (max ~10 blocks)
+                // This is MUCH faster than rebuilding from boost file
+                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                let chainHeight = try await NetworkManager.shared.getChainHeight()
+                let blocksBehind = chainHeight > lastScanned ? chainHeight - lastScanned : 0
 
-                let results = try await rebuildWitnessesForNotes(
-                    notes: selectedNotes,
-                    downloadedTreeHeight: cachedBoostHeight
-                )
+                print("⚡ FAST PATH: Checkpoint at \(lastScanned), chain at \(chainHeight) (\(blocksBehind) blocks behind)")
 
-                for result in results {
-                    preparedSpends.append((note: result.note, witness: result.witness))
+                if blocksBehind <= 50 && lastScanned > 0 {
+                    // FAST: Delta sync from checkpoint (max 50 blocks)
+                    print("⚡ Using fast delta sync (\(blocksBehind) blocks)...")
+
+                    // 1. Restore tree from checkpoint
+                    if let treeState = try? WalletDatabase.shared.getTreeState() {
+                        if ZipherXFFI.treeDeserialize(data: treeState) {
+                            print("✅ Tree restored from checkpoint")
+
+                            // 2. Load witnesses into FFI for auto-update, track indices
+                            var witnessIndices: [(SpendableNote, UInt64)] = []
+                            for note in selectedNotes {
+                                if note.witness.count >= 1028 {
+                                    let witnessIndex = note.witness.withUnsafeBytes { ptr in
+                                        ZipherXFFI.treeLoadWitness(
+                                            witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                            witnessLen: note.witness.count
+                                        )
+                                    }
+                                    if witnessIndex != UInt64.max {
+                                        witnessIndices.append((note, witnessIndex))
+                                    }
+                                }
+                            }
+
+                            guard witnessIndices.count == selectedNotes.count else {
+                                print("⚠️ Could not load all witnesses into FFI")
+                                throw TransactionError.proofGenerationFailed
+                            }
+
+                            // 3. Fetch and append delta CMUs
+                            let deltaCMUs = try await fetchCMUsForBlockRange(from: lastScanned + 1, to: chainHeight)
+                            print("📡 Fetched \(deltaCMUs.count) CMUs from \(blocksBehind) blocks")
+
+                            for cmu in deltaCMUs {
+                                _ = ZipherXFFI.treeAppend(cmu: cmu)
+                            }
+
+                            // 4. Get updated anchor
+                            guard let newAnchor = ZipherXFFI.treeRoot() else {
+                                throw TransactionError.proofGenerationFailed
+                            }
+                            print("📝 New anchor after delta sync: \(newAnchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+
+                            // 5. Extract updated witnesses using tracked indices
+                            for (note, witnessIndex) in witnessIndices {
+                                if let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) {
+                                    preparedSpends.append((note: note, witness: witness))
+                                } else {
+                                    throw TransactionError.proofGenerationFailed
+                                }
+                            }
+
+                            // 6. Save updated tree state
+                            if let treeData = ZipherXFFI.treeSerialize() {
+                                try? WalletDatabase.shared.saveTreeState(treeData)
+                                try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+                            }
+
+                            print("✅ FAST delta sync complete - \(preparedSpends.count) witnesses updated")
+                        }
+                    }
                 }
-                print("✅ Created \(preparedSpends.count) witnesses with SAME anchor")
+
+                // SLOW PATH: Fall back to boost + delta if fast path didn't work
+                if preparedSpends.isEmpty {
+                    print("⚠️ Fast path failed, falling back to boost + delta...")
+                    let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+                    let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
+                    print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
+
+                    let results = try await rebuildWitnessesForNotes(
+                        notes: selectedNotes,
+                        downloadedTreeHeight: cachedBoostHeight
+                    )
+
+                    for result in results {
+                        preparedSpends.append((note: result.note, witness: result.witness))
+                    }
+                }
+                print("✅ Created \(preparedSpends.count) witnesses")
             } else {
                 // FALLBACK: Rebuild witnesses using boost + delta
                 print("⚠️ Database witnesses not usable, rebuilding from boost + delta...")
@@ -635,14 +756,37 @@ final class TransactionBuilder {
                 print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
 
                 var witnessToUse = note.witness
-                let needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
+                var needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
                 let noteCMU = note.cmu
                 let noteHeight = note.height
 
-                // OPTIMIZATION: If witness is valid AND anchor matches tree root → INSTANT mode!
+                // CRITICAL SECURITY FIX: Validate witness anchor against blockchain's finalsaplingroot!
+                // Even if witness looks valid, it might have a corrupted anchor.
                 if !needsRebuild && note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
-                    if let currentTreeRoot = ZipherXFFI.treeRoot(), note.anchor == currentTreeRoot {
-                        print("✅ Note \(index + 1) witness is current - INSTANT mode!")
+                    // Check if anchor matches a valid blockchain state
+                    if let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(),
+                       let trustedHeader = try? headerStore.getHeader(at: lastScanned) {
+                        let trustedRoot = trustedHeader.hashFinalSaplingRoot
+                        if note.anchor != trustedRoot {
+                            let noteAnchorHex = note.anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
+                            let trustedRootHex = trustedRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+                            print("🚨 [SECURITY] Note \(index + 1) anchor mismatch!")
+                            print("   Stored anchor:      \(noteAnchorHex)...")
+                            print("   Blockchain expects: \(trustedRootHex)... at height \(lastScanned)")
+
+                            // Try checkpoint-based tree restoration first
+                            if await tryRestoreFromCheckpoint(targetHeight: lastScanned) {
+                                print("✅ Tree restored from checkpoint - witness still needs rebuild")
+                            } else {
+                                print("📍 No valid checkpoint - will rebuild from boost + delta")
+                            }
+                            needsRebuild = true
+                        } else {
+                            print("✅ Note \(index + 1) witness validated - INSTANT mode!")
+                        }
+                    } else {
+                        print("⚠️ Could not validate anchor (missing header data) - forcing rebuild")
+                        needsRebuild = true
                     }
                 }
 
@@ -1233,6 +1377,167 @@ final class TransactionBuilder {
         }
 
         return cmus
+    }
+
+    // MARK: - Checkpoint-Based Tree Restoration
+
+    /// Attempt to restore tree from a verified checkpoint
+    /// Returns true if restoration successful, false if no valid checkpoint available
+    private func tryRestoreFromCheckpoint(targetHeight: UInt64) async -> Bool {
+        do {
+            // Try to get a checkpoint at or before the target height
+            guard let checkpoint = try WalletDatabase.shared.getTreeCheckpoint(atOrBefore: targetHeight) else {
+                print("📍 No checkpoint available for height \(targetHeight)")
+                return false
+            }
+
+            // Validate checkpoint against HeaderStore
+            guard WalletDatabase.shared.validateTreeCheckpoint(checkpoint) else {
+                print("⚠️ Checkpoint at height \(checkpoint.height) failed validation - will use fallback")
+                return false
+            }
+
+            print("📍 Found valid checkpoint at height \(checkpoint.height) (target: \(targetHeight))")
+            print("   CMU count: \(checkpoint.cmuCount)")
+            print("   Tree root: \(checkpoint.treeRoot.prefix(8).hexString)...")
+
+            // Restore tree from checkpoint serialized data
+            guard ZipherXFFI.treeDeserialize(data: checkpoint.treeSerialized) else {
+                print("⚠️ Failed to deserialize tree from checkpoint")
+                return false
+            }
+
+            // Verify restored tree has correct root
+            guard let restoredRoot = ZipherXFFI.treeRoot() else {
+                print("⚠️ Restored tree has no root")
+                return false
+            }
+
+            if restoredRoot != checkpoint.treeRoot {
+                print("⚠️ Restored tree root doesn't match checkpoint")
+                print("   Expected: \(checkpoint.treeRoot.hexString)")
+                print("   Got:      \(restoredRoot.hexString)")
+                return false
+            }
+
+            print("✅ Tree restored from checkpoint at height \(checkpoint.height)")
+
+            // If checkpoint is behind target height, we need to sync forward
+            if checkpoint.height < targetHeight {
+                let blocksNeeded = targetHeight - checkpoint.height
+                print("📍 Checkpoint is \(blocksNeeded) blocks behind target, syncing forward...")
+
+                // Fetch and append CMUs for missing blocks
+                let cmus = try await fetchCMUsForBlockRange(from: checkpoint.height + 1, to: targetHeight)
+                if !cmus.isEmpty {
+                    print("📍 Appending \(cmus.count) CMUs for blocks \(checkpoint.height + 1) to \(targetHeight)")
+                    for cmu in cmus {
+                        _ = ZipherXFFI.treeAppend(cmu: cmu)
+                    }
+
+                    // Verify tree root after appending
+                    if let header = try? HeaderStore.shared.getHeader(at: targetHeight),
+                       let newRoot = ZipherXFFI.treeRoot() {
+                        if newRoot == header.hashFinalSaplingRoot {
+                            print("✅ Tree synced forward and validated at height \(targetHeight)")
+                            return true
+                        } else {
+                            print("⚠️ Tree root mismatch after forward sync - checkpoint may be stale")
+                            return false
+                        }
+                    }
+                }
+            }
+
+            return true
+
+        } catch {
+            print("⚠️ Checkpoint restoration failed: \(error)")
+            return false
+        }
+    }
+
+    /// Fetch CMUs for a range of blocks using P2P peers (preferred) or InsightAPI fallback
+    /// Uses on-demand P2P which fetches headers directly via getheaders (no pre-synced HeaderStore required)
+    private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt64) async throws -> [Data] {
+        var allCMUs: [Data] = []
+        let totalBlocks = Int(endHeight - startHeight + 1)
+
+        print("🔗 Fetching CMUs for blocks \(startHeight)-\(endHeight) (\(totalBlocks) blocks)")
+
+        // Use getBlocksOnDemandP2P which:
+        // - Fetches headers on-demand via getheaders (NO pre-synced HeaderStore required!)
+        // - Has multi-peer retry with reconnection logic
+        // - Uses peer.getFullBlocks() which is fully decentralized
+        do {
+            let batchSize = 100  // P2P getheaders returns max 160 headers per request
+            var currentStart = startHeight
+
+            while currentStart <= endHeight {
+                let batchEnd = min(currentStart + UInt64(batchSize) - 1, endHeight)
+                let batchCount = Int(batchEnd - currentStart + 1)
+
+                let blocks = try await NetworkManager.shared.getBlocksOnDemandP2P(from: currentStart, count: batchCount)
+
+                for block in blocks {
+                    for tx in block.transactions {
+                        for output in tx.outputs {
+                            // CMU from CompactBlock.CompactOutput is already in wire format (little-endian)
+                            allCMUs.append(output.cmu)
+                        }
+                    }
+                }
+
+                print("📦 P2P batch: \(currentStart)-\(batchEnd) → \(blocks.count) blocks")
+                currentStart = batchEnd + 1
+            }
+
+            print("✅ P2P on-demand fetch complete: \(allCMUs.count) CMUs from \(totalBlocks) blocks")
+            return allCMUs
+
+        } catch NetworkError.notConnected {
+            print("⚠️ P2P not connected, trying InsightAPI fallback...")
+        } catch NetworkError.p2pFetchFailed {
+            print("⚠️ P2P fetch failed, trying InsightAPI fallback...")
+        } catch {
+            print("⚠️ P2P fetch error: \(error.localizedDescription), trying InsightAPI fallback...")
+        }
+
+        // InsightAPI fallback (may fail if Tor is blocking Cloudflare)
+        print("📡 Attempting InsightAPI fallback for \(totalBlocks) blocks...")
+
+        let batchSize = 50
+        var currentStart = startHeight
+        var insightErrors = 0
+
+        while currentStart <= endHeight {
+            let batchEnd = min(currentStart + UInt64(batchSize) - 1, endHeight)
+
+            for height in currentStart...batchEnd {
+                do {
+                    let cmus = try await fetchCMUsViaInsight(height: height)
+                    allCMUs.append(contentsOf: cmus)
+                } catch {
+                    insightErrors += 1
+                    if insightErrors <= 3 {
+                        print("⚠️ InsightAPI failed for block \(height): \(error.localizedDescription)")
+                    }
+                    // Continue to next block, don't abort entirely
+                }
+            }
+            currentStart = batchEnd + 1
+        }
+
+        if insightErrors > 0 {
+            print("⚠️ InsightAPI had \(insightErrors) errors out of \(totalBlocks) blocks")
+        }
+
+        if allCMUs.isEmpty && totalBlocks > 0 {
+            throw NetworkError.p2pFetchFailed
+        }
+
+        print("✅ InsightAPI fallback complete: \(allCMUs.count) CMUs")
+        return allCMUs
     }
 }
 

@@ -24,6 +24,10 @@ import UIKit
 final class SQLCipherManager {
     static let shared = SQLCipherManager()
 
+    // DEBUG: Set to true to disable SQLCipher encryption for debugging
+    // TODO: Re-enable (set to false) after all tests pass: send/receive/history
+    private static let DEBUG_DISABLE_SQLCIPHER = true
+
     /// Whether SQLCipher is available (compiled with encryption support)
     private(set) var isSQLCipherAvailable: Bool = false
 
@@ -64,12 +68,18 @@ final class SQLCipherManager {
     private(set) var hasBiometricProtection: Bool = false
 
     private init() {
-        // Check if SQLCipher is available by looking for cipher_version
-        isSQLCipherAvailable = checkSQLCipherAvailable()
-        if isSQLCipherAvailable {
-            print("🔐 SQLCipher is available - full database encryption enabled")
+        // DEBUG: Skip SQLCipher for debugging database issues
+        if SQLCipherManager.DEBUG_DISABLE_SQLCIPHER {
+            isSQLCipherAvailable = false
+            print("⚠️ DEBUG: SQLCipher DISABLED - database stored unencrypted")
         } else {
-            print("⚠️ SQLCipher not available - using field-level encryption only")
+            // Check if SQLCipher is available by looking for cipher_version
+            isSQLCipherAvailable = checkSQLCipherAvailable()
+            if isSQLCipherAvailable {
+                print("🔐 SQLCipher is available - full database encryption enabled")
+            } else {
+                print("⚠️ SQLCipher not available - using field-level encryption only")
+            }
         }
 
         // Check if biometric protection is available

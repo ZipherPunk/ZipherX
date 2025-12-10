@@ -654,24 +654,48 @@ async fn handle_hidden_service_connections(
                 while let Some(stream_request) = stream_requests.next().await {
                     connection_counter += 1;
                     let conn_id = connection_counter;
-                    eprintln!("🧅 StreamRequest #{} received from RendRequest #{}", conn_id, rend_counter);
 
-                    // Notify Swift about incoming connection attempt
-                    let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
-                    if !callback_ptr.is_null() {
-                        unsafe {
-                            let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
-                            let host = std::ffi::CString::new("tor-hidden-service").unwrap();
-                            callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
+                    // Extract target port from stream request properly
+                    // The Begin message contains the target port directly
+                    use tor_proto::client::stream::IncomingStreamRequest;
+                    let request = stream_request.request();
+                    let target_port: u16 = match request {
+                        IncomingStreamRequest::Begin(begin) => begin.port(),
+                        IncomingStreamRequest::BeginDir(_) => HIDDEN_SERVICE_P2P_PORT,
+                        IncomingStreamRequest::Resolve(_) => HIDDEN_SERVICE_P2P_PORT,
+                        _ => HIDDEN_SERVICE_P2P_PORT,
+                    };
+                    eprintln!("🧅 StreamRequest #{} received from RendRequest #{} (target port: {})",
+                             conn_id, rend_counter, target_port);
+
+                    // Route based on target port
+                    if target_port == HIDDEN_SERVICE_CHAT_PORT {
+                        // Chat connection (port 8034) - forward to local chat listener
+                        eprintln!("🧅 Chat connection #{} - forwarding to localhost:{}", conn_id, HIDDEN_SERVICE_CHAT_PORT);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_incoming_chat_request(stream_request, conn_id).await {
+                                eprintln!("🧅 Chat connection #{} error: {}", conn_id, e);
+                            }
+                        });
+                    } else {
+                        // P2P connection (port 8033 or default) - handle P2P protocol
+                        // Notify Swift about incoming connection attempt
+                        let callback_ptr = INCOMING_CONNECTION_CALLBACK.load(Ordering::SeqCst);
+                        if !callback_ptr.is_null() {
+                            unsafe {
+                                let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
+                                let host = std::ffi::CString::new("tor-hidden-service").unwrap();
+                                callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
+                            }
                         }
+
+                        // Accept the stream request and handle P2P protocol
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
+                                eprintln!("🧅 P2P connection #{} error: {}", conn_id, e);
+                            }
+                        });
                     }
-
-                    // Accept the stream request and handle P2P protocol
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_incoming_stream_request(stream_request, conn_id).await {
-                            eprintln!("🧅 P2P connection #{} error: {}", conn_id, e);
-                        }
-                    });
                 }
                 eprintln!("🧅 RendRequest #{} finished (no more streams)", rend_counter);
             }
@@ -911,6 +935,83 @@ where
     }
 
     eprintln!("🧅 P2P #{}: Session ended", conn_id);
+    Ok(())
+}
+
+/// Handle incoming chat connection - forward to localhost:8034
+/// Unlike P2P, chat uses raw TCP forwarding (no magic bytes)
+async fn handle_incoming_chat_request(
+    stream_request: tor_hsservice::StreamRequest,
+    conn_id: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tor_cell::relaycell::msg::Connected;
+
+    eprintln!("🧅 Chat #{}: Accepting chat stream request...", conn_id);
+
+    // Accept the stream request to get DataStream
+    let tor_stream = stream_request.accept(Connected::new_empty()).await
+        .map_err(|e| format!("Failed to accept chat stream: {}", e))?;
+
+    eprintln!("🧅 Chat #{}: Stream accepted, connecting to localhost:{}...", conn_id, HIDDEN_SERVICE_CHAT_PORT);
+
+    // Connect to local chat listener
+    let local_stream = match TcpStream::connect(format!("127.0.0.1:{}", HIDDEN_SERVICE_CHAT_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("🧅 Chat #{}: Failed to connect to local chat listener: {}", conn_id, e);
+            return Err(format!("Failed to connect to localhost:{}: {}", HIDDEN_SERVICE_CHAT_PORT, e).into());
+        }
+    };
+
+    eprintln!("🧅 Chat #{}: Connected to local chat listener, starting bidirectional forwarding", conn_id);
+
+    // Split both streams for bidirectional forwarding
+    let (mut tor_read, mut tor_write) = tokio::io::split(tor_stream);
+    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
+
+    // Forward Tor -> Local
+    let tor_to_local = async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match tor_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if local_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = local_write.flush().await;
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    // Forward Local -> Tor
+    let local_to_tor = async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match local_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if tor_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = tor_write.flush().await;
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    // Run both directions concurrently
+    tokio::select! {
+        _ = tor_to_local => eprintln!("🧅 Chat #{}: Tor->Local ended", conn_id),
+        _ = local_to_tor => eprintln!("🧅 Chat #{}: Local->Tor ended", conn_id),
+    }
+
+    eprintln!("🧅 Chat #{}: Connection closed", conn_id);
     Ok(())
 }
 

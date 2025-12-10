@@ -100,6 +100,9 @@ public final class HiddenServiceManager: ObservableObject {
     /// P2P port for the hidden service (Zclassic mainnet)
     public let p2pPort: UInt16 = 8033
 
+    /// Chat port for encrypted messaging (Cypherpunk Chat)
+    public let chatPort: UInt16 = 8034
+
     /// Maximum connection events to keep in history
     private let maxConnectionEvents = 50
 
@@ -223,6 +226,12 @@ public final class HiddenServiceManager: ObservableObject {
     public var p2pOnionAddress: String? {
         guard let address = onionAddress else { return nil }
         return "\(address):\(p2pPort)"
+    }
+
+    /// Get the full .onion address for Chat connections
+    public var chatOnionAddress: String? {
+        guard let address = onionAddress else { return nil }
+        return "\(address):\(chatPort)"
     }
 
     /// Check if hidden service feature is available

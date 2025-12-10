@@ -190,7 +190,8 @@ final class Peer {
         }
 
         // Boost for higher protocol version
-        if peerVersion >= 170012 {
+        // BIP155 (addrv2) support: protocol version > 170011
+        if peerVersion > 170011 {
             chance *= 1.3 // BIP155 peers preferred
         } else if peerVersion >= 170011 {
             chance *= 1.1 // Sapling peers still good
@@ -948,41 +949,62 @@ final class Peer {
         // Receive version and parse peer info
         let (_, versionResponse) = try await receiveMessage()
         parseVersionPayload(versionResponse)
+        print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
 
         // Signal we support addrv2 (BIP 155) for Tor v3 addresses
         // Per BIP155: sendaddrv2 MUST be sent AFTER version exchange but BEFORE verack is sent
         // Order: VERSION <-> VERSION -> SENDADDRV2 -> VERACK <-> VERACK
-        if peerVersion >= 170012 {
+        // BIP155 requires protocol version > 170011 for Zclassic
+        if peerVersion > 170011 {
             try await sendMessage(command: "sendaddrv2", payload: Data())
-            print("📡 [\(host)] Sent sendaddrv2 to BIP155 peer (version \(peerVersion))")
+            print("📡 [\(host)] Sent sendaddrv2 (BIP155 peer v\(peerVersion))")
+        } else {
+            print("📡 [\(host)] No BIP155 - peer version \(peerVersion) <= 170011")
         }
 
         // Send verack (after sendaddrv2 if BIP155)
         try await sendMessage(command: "verack", payload: Data())
 
-        // Receive messages until we get verack
-        // Peer may send sendaddrv2 before verack - we need to handle both
+        // Receive messages until we get verack AND (sendaddrv2 OR timeout)
+        // Per BIP155: sendaddrv2 can come before OR after verack
         var receivedVerack = false
         var attempts = 0
-        while !receivedVerack && attempts < 5 {
+        let maxAttempts = 8  // Increased to allow for sendaddrv2 after verack
+
+        while attempts < maxAttempts {
             let (command, _) = try await receiveMessage()
             attempts += 1
 
             if command == "verack" {
                 receivedVerack = true
+                print("📡 [\(host)] Received verack")
+                // Don't exit yet - continue to check for sendaddrv2
+                // But only check 2 more messages after verack
+                if supportsAddrv2 || attempts >= maxAttempts - 2 {
+                    break  // Already have sendaddrv2 or enough attempts
+                }
             } else if command == "sendaddrv2" {
                 // Peer signals BIP155 support - we can send addrv2 to them
                 supportsAddrv2 = true
-                print("📡 [\(host)] Received sendaddrv2 - peer supports BIP155 addrv2")
+                print("📡 [\(host)] ✅ Received sendaddrv2 - peer supports BIP155 addrv2")
+                if receivedVerack {
+                    break  // Have both verack and sendaddrv2
+                }
             } else {
                 // Other messages during handshake (ignore but continue)
-                print("📡 [\(host)] Received \(command) during handshake (ignoring)")
+                print("📡 [\(host)] Received \(command) during handshake")
+                if receivedVerack {
+                    // Already got verack, don't need to wait for more non-sendaddrv2 messages
+                    break
+                }
             }
         }
 
         if !receivedVerack {
             throw NetworkError.handshakeFailed
         }
+
+        print("📡 [\(host)] Handshake complete - supportsAddrv2: \(supportsAddrv2)")
 
         recordSuccess()
         lastActivity = Date() // Mark connection as active after successful handshake
@@ -1233,24 +1255,25 @@ final class Peer {
         // Check for IPv4-mapped IPv6 (::ffff:x.x.x.x)
         let ipv4Prefix: [UInt8] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
         if Array(bytes.prefix(12)) == ipv4Prefix {
-            return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+            let ip = "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+            // Validate: reject 255.255.x.x (invalid/reserved) and 0.x.x.x
+            if bytes[12] == 255 && bytes[13] == 255 { return nil }
+            if bytes[12] == 0 { return nil }
+            return ip
         }
 
         // Check for all-zeros prefix (alternative IPv4-mapped format)
         // Some implementations use 0:0:0:0:0:0:ffff:xxxx where ffff is in the 7th position
         if bytes[0...9].allSatisfy({ $0 == 0 }) && bytes[10] == 0xff && bytes[11] == 0xff {
-            return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+            let ip = "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+            // Validate: reject 255.255.x.x (invalid/reserved) and 0.x.x.x
+            if bytes[12] == 255 && bytes[13] == 255 { return nil }
+            if bytes[12] == 0 { return nil }
+            return ip
         }
 
-        // Skip pure IPv6 addresses - SOCKS5 to Tor doesn't support them well
-        // Only allow .onion and IPv4 addresses
-        let isAllZeros = bytes.prefix(10).allSatisfy { $0 == 0 }
-        if isAllZeros && (bytes[10] == 0xff || bytes[10] == 0) {
-            // This might be an IPv4-mapped we couldn't parse - extract last 4 bytes as IPv4
-            return "\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
-        }
-
-        // Pure IPv6 address - skip it (not supported via Tor SOCKS5)
+        // Pure IPv6 address or unrecognized format - skip it
+        // REMOVED: Overly permissive fallback that produced 255.255.x.x garbage addresses
         return nil
     }
 
@@ -1309,8 +1332,10 @@ final class Peer {
         payload.append(UInt8(agentData.count))
         payload.append(agentData)
 
-        // Start height
-        let startHeight: Int32 = 0
+        // Start height - report our synced height so peers know what blocks we have
+        // This helps peers decide what data to send us
+        let syncedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        let startHeight: Int32 = Int32(min(syncedHeight, UInt64(Int32.max)))
         payload.append(contentsOf: withUnsafeBytes(of: startHeight.littleEndian) { Array($0) })
 
         return payload

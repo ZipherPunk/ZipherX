@@ -108,6 +108,58 @@ struct ContentView: View {
                         }
                         print("DEBUGZIPHERX: 🚀 Task: Tree is loaded!")
 
+                        // ==========================================================
+                        // FAST START MODE: For consecutive app launches
+                        // If wallet is already synced, show cached balance immediately
+                        // and do background sync later (achieves <5s startup)
+                        // ==========================================================
+                        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                        let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                        let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
+
+                        // Fast start if: already synced (within 50 blocks) AND has cached data
+                        let isFastStart = lastScannedHeight > 0 && cachedChainHeight > 0 && blocksBehind <= 50
+
+                        if isFastStart {
+                            print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(blocksBehind) blocks behind)")
+
+                            // Load cached balance immediately (no network wait!)
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Loading cached balance...")
+                            }
+
+                            // Load balance from database (instant)
+                            walletManager.loadCachedBalance()
+
+                            // Mark initial sync as complete immediately
+                            await MainActor.run {
+                                walletManager.setConnecting(false, status: nil)
+                                isInitialSync = false
+                                hasCompletedInitialSync = true
+                                walletManager.completeProgress()
+                            }
+
+                            // Start background sync for any missed blocks (non-blocking)
+                            networkManager.suppressBackgroundSync = false
+                            Task {
+                                do {
+                                    try await networkManager.connect()
+                                    await networkManager.fetchNetworkStats()
+                                    // Background sync will handle any new blocks automatically
+                                } catch {
+                                    print("⚠️ Background connect error: \(error.localizedDescription)")
+                                }
+                            }
+
+                            print("⚡ FAST START COMPLETE: UI ready in <5s!")
+                            return
+                        }
+
+                        // ==========================================================
+                        // FULL START MODE: First launch or wallet needs full sync
+                        // ==========================================================
+                        print("🚀 FULL START MODE: First launch or needs sync")
+
                         // Show connecting status after tree is loaded
                         print("DEBUGZIPHERX: 📡 Task: Tree loaded, checking network...")
                         await MainActor.run {

@@ -2822,6 +2822,107 @@ let appSecret = Data("ZipherX-Cypherpunk-2025".utf8)
 
 ---
 
+### 63. Fast Start Mode for Consecutive Launches (December 10, 2025)
+
+**Problem**: App took too long to be ready on consecutive launches, even when wallet was already synced.
+
+**Solution**: Implemented "Fast Start Mode" that detects synced wallets and skips network wait:
+
+1. **Detection**: Check if `lastScannedHeight` is within 50 blocks of `cachedChainHeight`
+2. **Fast Path**: If synced, load cached balance from database immediately
+3. **Skip Wait**: No 10-second peer connection wait
+4. **Background Sync**: New blocks synced asynchronously after UI is ready
+
+**Code Flow**:
+```swift
+// ContentView.swift
+let blocksBehind = cachedChainHeight - lastScannedHeight
+if blocksBehind <= 50 && lastScannedHeight > 0 {
+    // FAST START MODE - skip peer wait
+    walletManager.loadCachedBalance()  // Instant!
+    isInitialSync = false
+    // Background sync happens later
+}
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - fast start detection and flow
+- `Sources/Core/Wallet/WalletManager.swift` - `loadCachedBalance()` function
+- `Sources/Core/Network/NetworkManager.swift` - chain height caching to UserDefaults
+
+---
+
+### 64. Unified Timestamp Storage in HeaderStore (December 10, 2025)
+
+**Problem**: Timestamps were stored in multiple places (BlockTimestampManager in-memory, boost file, HeaderStore headers), causing inconsistency after database repair.
+
+**Solution**: Unified timestamp storage using HeaderStore's new `block_times` table:
+
+**Architecture**:
+```
+HeaderStore (zipherx_headers.db)
+├── headers table (full P2P synced headers)
+│   └── Contains: height, hash, prev_hash, merkle_root, sapling_root, TIME, bits, nonce
+└── block_times table (timestamps from boost file)
+    └── Contains: height, timestamp
+
+getBlockTime(height):
+  1. Check headers table → return time
+  2. Check block_times table → return timestamp
+  3. Return nil
+```
+
+**New HeaderStore Functions**:
+- `insertBlockTimesFromBoostData()` - bulk load from boost file
+- `insertBlockTimesBatch()` - efficient batch insert
+- `clearBlockTimes()` - clear for repair
+- `getBlockTimesCount()` - count timestamps
+
+**Integration**:
+- BlockTimestampManager syncs to `block_times` table on boost file load
+- HistoryView uses `HeaderStore.getBlockTime()` as single source
+- Repair function clears all timestamp data for clean re-sync
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` - new `block_times` table and functions
+- `Sources/Core/Storage/BlockTimestampManager.swift` - syncs to HeaderStore
+- `Sources/Core/Wallet/WalletManager.swift` - repair clears all timestamps
+- `Sources/Features/History/HistoryView.swift` - uses unified source
+
+---
+
+### 65. Pre-Witness Rebuild for Instant Payments (December 10, 2025)
+
+**Problem**: Sending transactions required witness rebuild at send time, causing delays.
+
+**Solution**: Pre-rebuild witnesses during background sync so payments are instant:
+
+**New Function**: `preRebuildWitnessesForInstantPayment()`
+```swift
+// Called automatically after every background sync
+// Three optimization levels:
+for note in unspentNotes {
+    if note.anchor == currentTreeRoot {
+        // Already instant-ready - no action needed
+    } else if witnessRoot == currentTreeRoot {
+        // Witness valid, just update anchor in DB (fast)
+    } else {
+        // Full rebuild from current tree state (complete)
+    }
+}
+```
+
+**Workflow**:
+1. Background sync appends new CMUs to tree
+2. FilterScanner updates existing witnesses
+3. `preRebuildWitnessesForInstantPayment()` verifies all notes ready
+4. User can send instantly - no witness rebuild wait
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - `preRebuildWitnessesForInstantPayment()` function
+
+---
+
 ### Known Issues
 
 - Equihash verification temporarily disabled (need implementation)
@@ -4444,6 +4545,82 @@ func saveTreeCheckpoint(...) throws {
 
 **Files Modified**:
 - `Sources/Core/Storage/WalletDatabase.swift` - `saveTreeCheckpoint()` function (lines 1535-1572)
+
+---
+
+### 87. P2P On-Demand CMU Fetching for Transaction Building (December 10, 2025)
+
+**Problem**: Transaction building failed with wrong anchor when:
+1. HeaderStore was not synced (only 39 headers instead of ~3000 needed)
+2. InsightAPI was blocked by Cloudflare via Tor
+3. Delta sync only fetched 76 CMUs instead of ~500+ needed
+
+This caused anchor mismatch → invalid spend proof → transaction rejected by network.
+
+**Root Cause Analysis**:
+- `fetchCMUsForBlockRange()` in TransactionBuilder used `getBlocksDataP2P()`
+- `getBlocksDataP2P()` requires pre-synced headers in HeaderStore (or BundledBlockHashes)
+- For recent blocks beyond bundled range, if HeaderStore is empty → P2P fetch fails
+- Fallback to InsightAPI was blocked by Cloudflare when using Tor
+- Result: Incomplete tree → wrong anchor → invalid proof
+
+**Solution: P2P On-Demand Block Fetching**
+
+Added new function `getBlocksOnDemandP2P()` to NetworkManager that:
+1. Uses `peer.getFullBlocks()` which fetches headers on-demand via P2P `getheaders` message
+2. Does NOT require pre-synced HeaderStore
+3. Has multi-peer retry with reconnection logic
+4. Completely decentralized - works even when InsightAPI is blocked
+
+**How It Works**:
+```
+getBlocksOnDemandP2P(from: height, count: N)
+  → peer.getFullBlocks(from: height, count: N)
+    → peer.getBlockHeaders(from: height, count: N)  // P2P getheaders
+    → peer.getBlockByHash(hash: ...)               // P2P getdata for each block
+  → Returns [CompactBlock] with CMUs in wire format
+```
+
+**Code Flow**:
+```swift
+// TransactionBuilder.fetchCMUsForBlockRange()
+// Now uses getBlocksOnDemandP2P instead of getBlocksDataP2P
+
+let blocks = try await NetworkManager.shared.getBlocksOnDemandP2P(
+    from: currentStart,
+    count: batchCount
+)
+
+for block in blocks {
+    for tx in block.transactions {
+        for output in tx.outputs {
+            // CMU from CompactBlock.CompactOutput is already in wire format
+            allCMUs.append(output.cmu)
+        }
+    }
+}
+```
+
+**Key Differences**:
+
+| Feature | getBlocksDataP2P (old) | getBlocksOnDemandP2P (new) |
+|---------|------------------------|----------------------------|
+| Requires HeaderStore | Yes | No |
+| Requires BundledBlockHashes | Yes (fallback) | No |
+| How it gets block hashes | From pre-synced store | On-demand via getheaders |
+| Works without synced headers | No | Yes |
+| Multi-peer retry | Yes | Yes |
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Added `getBlocksOnDemandP2P()` function (lines 3187-3254)
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Updated `fetchCMUsForBlockRange()` to use new function (lines 1378-1459)
+
+**User Request**: "we have the peers !!!! we must get info from the peers rather than insightapi !!!!"
+
+This fix ensures transaction building works in fully decentralized mode without any dependency on:
+- Pre-synced HeaderStore
+- InsightAPI
+- Centralized services
 
 ---
 

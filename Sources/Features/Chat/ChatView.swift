@@ -28,15 +28,9 @@ struct ChatView: View {
     var body: some View {
         #if os(iOS)
         NavigationView {
-            contactListView
-
-            if let contact = selectedContact {
-                ConversationView(contact: contact)
-            } else {
-                emptyStateView
-            }
+            iOSContactListView
         }
-        .navigationViewStyle(.columns)
+        .navigationViewStyle(.stack)
         .sheet(isPresented: $showAddContact) {
             AddContactSheet()
         }
@@ -165,6 +159,76 @@ struct ChatView: View {
             }
         }
     }
+
+    // MARK: - iOS Contact List (with NavigationLink for proper push navigation)
+
+    #if os(iOS)
+    private var iOSContactListView: some View {
+        VStack(spacing: 0) {
+            // Cypherpunk Header
+            cypherpunkHeader
+
+            // Status bar
+            statusBar
+
+            Divider()
+                .background(theme.accentColor.opacity(0.3))
+
+            // Contact list with NavigationLinks
+            if chatManager.contacts.isEmpty {
+                noContactsView
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(chatManager.contacts) { contact in
+                            NavigationLink(destination: ConversationView(contact: contact)) {
+                                ContactRow(contact: contact, isSelected: false)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(action: { toggleFavorite(contact) }) {
+                                    Label(contact.isFavorite ? "Remove from Favorites" : "Add to Favorites",
+                                          systemImage: contact.isFavorite ? "star.slash" : "star")
+                                }
+                                Button(role: .destructive, action: { deleteContact(contact) }) {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+        .background(
+            LinearGradient(
+                colors: [theme.backgroundColor, theme.backgroundColor.opacity(0.95)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button(action: { showAddContact = true }) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(theme.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 16))
+                        .foregroundColor(theme.textPrimary.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+    #endif
 
     private var cypherpunkHeader: some View {
         VStack(spacing: 6) {
@@ -539,6 +603,8 @@ struct ConversationView: View {
     @State private var messageText = ""
     @State private var isTyping = false
     @State private var showPaymentRequest = false
+    @State private var paymentRequestToPay: ChatMessage? = nil  // Payment request being paid
+    @State private var showPayNowSheet = false
     @FocusState private var isInputFocused: Bool
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -562,7 +628,14 @@ struct ConversationView: View {
                                     DateSeparator(date: message.timestamp)
                                 }
 
-                                MessageBubble(message: message, isFromMe: message.fromOnion == chatManager.ourOnionAddress)
+                                MessageBubble(
+                                    message: message,
+                                    isFromMe: message.fromOnion == chatManager.ourOnionAddress,
+                                    onPayNow: { paymentMsg in
+                                        paymentRequestToPay = paymentMsg
+                                        showPayNowSheet = true
+                                    }
+                                )
                                     .id(message.id)
                                     .transition(.asymmetric(
                                         insertion: .scale(scale: 0.9).combined(with: .opacity),
@@ -620,6 +693,31 @@ struct ConversationView: View {
         }
         .sheet(isPresented: $showPaymentRequest) {
             PaymentRequestSheet(contact: contact)
+        }
+        .sheet(isPresented: $showPayNowSheet) {
+            if let paymentRequest = paymentRequestToPay {
+                PayNowSheet(
+                    contact: contact,
+                    paymentRequest: paymentRequest,
+                    onPaymentComplete: { txId in
+                        // Send payment confirmation back to requester
+                        Task {
+                            try? await chatManager.sendPaymentConfirmation(
+                                to: contact,
+                                amount: paymentRequest.paymentAmount ?? 0,
+                                txId: txId,
+                                requestId: paymentRequest.id
+                            )
+                        }
+                        showPayNowSheet = false
+                        paymentRequestToPay = nil
+                    },
+                    onCancel: {
+                        showPayNowSheet = false
+                        paymentRequestToPay = nil
+                    }
+                )
+            }
         }
     }
 
@@ -824,6 +922,7 @@ struct MessageBubble: View {
     @EnvironmentObject private var themeManager: ThemeManager
     let message: ChatMessage
     let isFromMe: Bool
+    var onPayNow: ((ChatMessage) -> Void)? = nil  // Callback for PAY NOW button
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -925,7 +1024,7 @@ struct MessageBubble: View {
             }
 
             if !isFromMe {
-                Button(action: { /* TODO: Navigate to send */ }) {
+                Button(action: { onPayNow?(message) }) {
                     HStack {
                         Image(systemName: "arrow.right.circle.fill")
                         Text("PAY NOW")
@@ -1484,6 +1583,8 @@ struct PaymentRequestSheet: View {
     @State private var amount = ""
     @State private var memo = ""
     @State private var isSending = false
+    @State private var errorMessage: String?
+    @State private var showSuccess = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1535,6 +1636,32 @@ struct PaymentRequestSheet: View {
                 }
                 .padding(.horizontal, 24)
 
+                // Error message
+                if let error = errorMessage {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                        Text(error)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.red)
+                    }
+                    .padding(.horizontal, 24)
+                    .transition(.opacity)
+                }
+
+                // Success message
+                if showSuccess {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(theme.accentColor)
+                        Text("Payment request sent!")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                    }
+                    .padding(.horizontal, 24)
+                    .transition(.scale.combined(with: .opacity))
+                }
+
                 Spacer()
 
                 Button(action: sendRequest) {
@@ -1584,16 +1711,461 @@ struct PaymentRequestSheet: View {
         let zatoshis = UInt64(amountDouble * 100_000_000)
 
         isSending = true
+        errorMessage = nil
 
         Task {
             do {
                 let zAddress = await WalletManager.shared.zAddress ?? ""
                 try await chatManager.sendPaymentRequest(to: contact, amount: zatoshis, address: zAddress, memo: memo)
-                dismiss()
+
+                // Show success feedback
+                await MainActor.run {
+                    showSuccess = true
+                }
+
+                // Auto-dismiss after success
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await MainActor.run {
+                    dismiss()
+                }
+            } catch let error as ChatError {
+                await MainActor.run {
+                    errorMessage = error.errorDescription ?? error.localizedDescription
+                    isSending = false
+                }
             } catch {
-                print("Failed to send payment request: \(error)")
+                await MainActor.run {
+                    // Make timeout message more user-friendly
+                    if error.localizedDescription.contains("timeout") {
+                        errorMessage = "Connection timeout. \(contact.displayName) may be offline."
+                    } else {
+                        errorMessage = error.localizedDescription
+                    }
+                    isSending = false
+                }
             }
-            isSending = false
+        }
+    }
+}
+
+// MARK: - Pay Now Sheet
+
+/// Sheet displayed when user taps "PAY NOW" on a payment request
+/// Wraps SendView with pre-filled address and amount
+struct PayNowSheet: View {
+    @EnvironmentObject private var themeManager: ThemeManager
+    @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var networkManager: NetworkManager
+    @Environment(\.dismiss) private var dismiss
+
+    let contact: ChatContact
+    let paymentRequest: ChatMessage
+    var onPaymentComplete: ((String) -> Void)?  // Called with txId when payment succeeds
+    var onCancel: (() -> Void)?
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    // Pre-calculated values from payment request
+    private var recipientAddress: String {
+        paymentRequest.paymentAddress ?? ""
+    }
+
+    private var amountZCL: String {
+        guard let zatoshis = paymentRequest.paymentAmount else { return "" }
+        let zcl = Double(zatoshis) / 100_000_000.0
+        return String(format: "%.8f", zcl)
+    }
+
+    private var memo: String {
+        paymentRequest.content.isEmpty ? "Payment for request" : paymentRequest.content
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Header showing payment request details
+                paymentRequestHeader
+
+                Divider()
+                    .background(theme.accentColor.opacity(0.2))
+
+                // Embedded SendView with pre-filled data
+                SendViewForPayment(
+                    prefilledAddress: recipientAddress,
+                    prefilledAmount: amountZCL,
+                    prefilledMemo: memo,
+                    onSuccess: { txId in
+                        onPaymentComplete?(txId)
+                    }
+                )
+            }
+            .background(theme.backgroundColor)
+            .navigationTitle("Pay \(contact.displayName)")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        onCancel?()
+                        dismiss()
+                    }
+                    .foregroundColor(theme.accentColor)
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 500, idealWidth: 600, minHeight: 600, idealHeight: 700)
+        #endif
+    }
+
+    private var paymentRequestHeader: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Image(systemName: "dollarsign.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundColor(theme.accentColor)
+                Text("PAYMENT REQUEST FROM \(contact.displayName.uppercased())")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.accentColor)
+            }
+
+            if let formattedAmount = paymentRequest.formattedAmount {
+                Text(formattedAmount)
+                    .font(.system(size: 24, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+            }
+
+            if !paymentRequest.content.isEmpty {
+                Text("\"\(paymentRequest.content)\"")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.6))
+                    .italic()
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.2))
+    }
+}
+
+// MARK: - Simplified SendView for Payment
+
+/// A simplified version of SendView used within PayNowSheet
+/// Pre-fills address, amount, memo and provides success callback
+struct SendViewForPayment: View {
+    @EnvironmentObject var walletManager: WalletManager
+    @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var themeManager: ThemeManager
+
+    let prefilledAddress: String
+    let prefilledAmount: String
+    let prefilledMemo: String
+    var onSuccess: ((String) -> Void)?
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    @State private var isSending = false
+    @State private var showSuccess = false
+    @State private var showError = false
+    @State private var errorMessage = ""
+    @State private var txId = ""
+
+    // Progress tracking
+    @State private var sendProgress: [SendProgressStep] = []
+    @State private var currentStepIndex: Int = 0
+
+    var body: some View {
+        ZStack {
+            ScrollView {
+                VStack(spacing: 20) {
+                    // Address (read-only)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TO ADDRESS")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+
+                        Text(prefilledAddress)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.black.opacity(0.2))
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
+                            )
+                    }
+
+                    // Amount (read-only)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("AMOUNT")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+
+                        HStack {
+                            Text(prefilledAmount)
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.textPrimary)
+                            Text("ZCL")
+                                .font(.system(size: 16, design: .monospaced))
+                                .foregroundColor(theme.textPrimary.opacity(0.5))
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.2))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
+                        )
+                    }
+
+                    // Memo (read-only)
+                    if !prefilledMemo.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("MEMO")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.accentColor)
+
+                            Text(prefilledMemo)
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundColor(theme.textPrimary.opacity(0.7))
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.black.opacity(0.2))
+                                .cornerRadius(8)
+                        }
+                    }
+
+                    // Available balance
+                    HStack {
+                        Text("Available:")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.5))
+                        Spacer()
+                        Text(String(format: "%.8f ZCL", Double(walletManager.shieldedBalance) / 100_000_000.0))
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                    }
+
+                    // Fee info
+                    HStack {
+                        Text("Network Fee:")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.5))
+                        Spacer()
+                        Text("0.0001 ZCL")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.7))
+                    }
+
+                    Spacer(minLength: 20)
+
+                    // Confirm and Send button
+                    Button(action: sendPayment) {
+                        HStack(spacing: 8) {
+                            if isSending {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .black))
+                                    .scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "paperplane.fill")
+                            }
+                            Text(isSending ? "SENDING..." : "CONFIRM & SEND")
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        }
+                        .foregroundColor(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(
+                            LinearGradient(
+                                colors: [theme.accentColor, theme.accentColor.opacity(0.8)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .cornerRadius(12)
+                        .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSending || !hasEnoughBalance)
+                    .opacity(isSending || !hasEnoughBalance ? 0.6 : 1.0)
+                }
+                .padding(20)
+            }
+
+            // Progress overlay
+            if isSending && !showSuccess {
+                sendProgressOverlay
+            }
+
+            // Success overlay
+            if showSuccess {
+                successOverlay
+            }
+        }
+        .alert("Payment Failed", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+    }
+
+    private var hasEnoughBalance: Bool {
+        guard let amount = Double(prefilledAmount) else { return false }
+        let amountZatoshis = UInt64(amount * 100_000_000)
+        let fee: UInt64 = 10_000
+        return walletManager.shieldedBalance >= amountZatoshis + fee
+    }
+
+    private var sendProgressOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.8)
+
+            VStack(spacing: 20) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: theme.accentColor))
+                    .scaleEffect(1.5)
+
+                Text("Processing Payment...")
+                    .font(.system(size: 16, weight: .medium, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+
+                if !sendProgress.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(sendProgress) { step in
+                            HStack(spacing: 8) {
+                                switch step.status {
+                                case .completed:
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(theme.accentColor)
+                                case .inProgress:
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                case .failed:
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundColor(.red)
+                                default:
+                                    Image(systemName: "circle")
+                                        .foregroundColor(theme.textPrimary.opacity(0.3))
+                                }
+                                Text(step.title)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(theme.textPrimary.opacity(0.7))
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(30)
+        }
+    }
+
+    private var successOverlay: some View {
+        ZStack {
+            Color.black
+
+            VStack(spacing: 20) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 60))
+                    .foregroundColor(theme.accentColor)
+                    .shadow(color: theme.accentColor.opacity(0.8), radius: 20)
+
+                Text("PAYMENT SENT!")
+                    .font(.system(size: 20, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.accentColor)
+
+                Text("Transaction ID:")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.5))
+
+                Text(txId)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(theme.accentColor)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                Button(action: {
+                    onSuccess?(txId)
+                }) {
+                    Text("DONE")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 40)
+                        .padding(.vertical, 12)
+                        .background(theme.accentColor)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 10)
+            }
+        }
+    }
+
+    private func sendPayment() {
+        guard let amount = Double(prefilledAmount) else { return }
+        let amountZatoshis = UInt64(amount * 100_000_000)
+
+        isSending = true
+        sendProgress = [
+            SendProgressStep(id: "build", title: "Building transaction", status: .inProgress),
+            SendProgressStep(id: "sign", title: "Signing with spending key", status: .pending),
+            SendProgressStep(id: "broadcast", title: "Broadcasting to network", status: .pending),
+            SendProgressStep(id: "verify", title: "Verifying in mempool", status: .pending)
+        ]
+
+        Task {
+            do {
+                let result = try await walletManager.sendShieldedWithProgress(
+                    to: prefilledAddress,
+                    amount: amountZatoshis,
+                    memo: prefilledMemo
+                ) { phase, detail, progress in
+                    Task { @MainActor in
+                        updateProgress(phase: phase, detail: detail ?? "", progress: progress ?? 0.0)
+                    }
+                }
+
+                await MainActor.run {
+                    txId = result
+                    showSuccess = true
+                    isSending = false
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showError = true
+                    isSending = false
+                }
+            }
+        }
+    }
+
+    private func updateProgress(phase: String, detail: String, progress: Double) {
+        switch phase {
+        case "build":
+            sendProgress[0].status = progress >= 1.0 ? .completed : .inProgress
+            sendProgress[0].detail = detail
+        case "sign":
+            sendProgress[0].status = .completed
+            sendProgress[1].status = progress >= 1.0 ? .completed : .inProgress
+            sendProgress[1].detail = detail
+        case "broadcast", "peers":
+            sendProgress[0].status = .completed
+            sendProgress[1].status = .completed
+            sendProgress[2].status = progress >= 1.0 ? .completed : .inProgress
+            sendProgress[2].detail = detail
+        case "verify":
+            sendProgress[0].status = .completed
+            sendProgress[1].status = .completed
+            sendProgress[2].status = .completed
+            sendProgress[3].status = progress >= 1.0 ? .completed : .inProgress
+            sendProgress[3].detail = detail
+        default:
+            break
         }
     }
 }

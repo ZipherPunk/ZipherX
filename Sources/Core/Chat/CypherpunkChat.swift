@@ -350,6 +350,7 @@ enum ChatError: Error, LocalizedError {
     case contactNotFound
     case hiddenServiceNotRunning
     case torNotConnected
+    case connectionFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -365,6 +366,8 @@ enum ChatError: Error, LocalizedError {
             return "Hidden service not running. Enable it in Settings."
         case .torNotConnected:
             return "Tor not connected"
+        case .connectionFailed(let reason):
+            return "Connection failed: \(reason)"
         }
     }
 }

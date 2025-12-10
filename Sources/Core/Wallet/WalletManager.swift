@@ -568,8 +568,105 @@ final class WalletManager: ObservableObject {
                 print("⚠️ Background header sync failed: \(error.localizedDescription)")
             }
 
+            // PRE-WITNESS REBUILD: Update witnesses for instant payments
+            // This ensures all unspent notes have witnesses matching current tree root
+            // so the user can send instantly without waiting for witness rebuild
+            await preRebuildWitnessesForInstantPayment(accountId: account.id)
+
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Pre-rebuild witnesses for all unspent notes to enable instant payments
+    /// Called after background sync to ensure witnesses match current tree root
+    /// This eliminates witness rebuild delay at send time
+    private func preRebuildWitnessesForInstantPayment(accountId: Int64) async {
+        do {
+            // Get current tree root (anchor)
+            guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
+                print("⚠️ Pre-witness: No tree root available")
+                return
+            }
+
+            // Get all unspent notes
+            let notes = try WalletDatabase.shared.getUnspentNotes(accountId: accountId)
+            guard !notes.isEmpty else {
+                print("✅ Pre-witness: No unspent notes to update")
+                return
+            }
+
+            var alreadyCurrentCount = 0
+            var rebuiltCount = 0
+            var anchorUpdatedCount = 0
+
+            for note in notes {
+                // Check if witness anchor matches current tree root
+                if let noteAnchor = note.anchor, noteAnchor == currentTreeRoot {
+                    alreadyCurrentCount += 1
+                    continue // Witness is already current - INSTANT payment ready!
+                }
+
+                // Check if witness exists and might just need anchor update
+                if !note.witness.isEmpty {
+                    // Verify witness root matches current tree
+                    // Extract root from witness (last 32 bytes of 1028-byte witness)
+                    if note.witness.count >= 1028 {
+                        let witnessRoot = note.witness.suffix(32)
+                        if witnessRoot == currentTreeRoot {
+                            // Witness is valid, just update anchor in database
+                            try WalletDatabase.shared.updateNoteAnchor(
+                                noteId: note.id,
+                                anchor: currentTreeRoot
+                            )
+                            anchorUpdatedCount += 1
+                            continue
+                        }
+                    }
+                }
+
+                // Need to rebuild witness - it's stale or missing
+                // Get note position from CMU in current tree
+                guard let cmu = note.cmu else {
+                    print("⚠️ Pre-witness: Note has no CMU, skipping")
+                    continue
+                }
+
+                guard let position = ZipherXFFI.findCmuPosition(cmu: cmu), position > 0 else {
+                    print("⚠️ Pre-witness: Note CMU not found in tree, skipping")
+                    continue
+                }
+
+                // Create fresh witness from current tree state
+                guard let newWitness = ZipherXFFI.treeCreateWitness(at: UInt64(position)) else {
+                    print("⚠️ Pre-witness: Failed to create witness at position \(position)")
+                    continue
+                }
+
+                // Save rebuilt witness and current anchor
+                try WalletDatabase.shared.updateNoteWitness(
+                    noteId: note.id,
+                    witness: newWitness
+                )
+                try WalletDatabase.shared.updateNoteAnchor(
+                    noteId: note.id,
+                    anchor: currentTreeRoot
+                )
+                rebuiltCount += 1
+            }
+
+            // Summary
+            if alreadyCurrentCount > 0 {
+                print("✅ Pre-witness: \(alreadyCurrentCount) note(s) already instant-ready")
+            }
+            if anchorUpdatedCount > 0 {
+                print("⚡ Pre-witness: \(anchorUpdatedCount) anchor(s) updated (witness valid)")
+            }
+            if rebuiltCount > 0 {
+                print("🔧 Pre-witness: \(rebuiltCount) witness(es) rebuilt for instant payment")
+            }
+        } catch {
+            print("⚠️ Pre-witness rebuild failed: \(error.localizedDescription)")
         }
     }
 
@@ -1538,6 +1635,17 @@ final class WalletManager: ObservableObject {
         try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
         print("📝 Reset last scanned height to 0")
 
+        // CRITICAL: Clear HeaderStore (headers + block_times) to force full re-sync
+        // Without this, dates show as estimates and checkpoints can't be saved
+        try? HeaderStore.shared.clearAllHeaders()
+        try? HeaderStore.shared.clearBlockTimes()
+        print("🗑️ Cleared HeaderStore (headers + block_times will re-sync)")
+
+        // CRITICAL: Clear ALL timestamp data (in-memory + HeaderStore.block_times)
+        // This forces re-sync from boost file on next load
+        BlockTimestampManager.shared.clearAllTimestampData()
+        print("🗑️ Cleared all timestamp data (unified)")
+
         // Ensure network connection
         print("📡 Ensuring network connection...")
         if !NetworkManager.shared.isConnected {
@@ -1573,13 +1681,20 @@ final class WalletManager: ObservableObject {
         let newTreeHeight = ZipherXConstants.effectiveTreeHeight
         print("📦 GitHub boost file height: \(newTreeHeight)")
 
-        // Scan from boost height + 1 to current chain tip
-        // This uses sequential mode which properly calculates positions
+        // PHASE 1 + PHASE 2 full scan
+        // CRITICAL: Start from Sapling activation (not boost height + 1) to trigger PHASE 1
+        // PHASE 1 uses boost file CMU data to find notes in historical range via parallel decryption
+        // PHASE 2 scans from boost height + 1 to chain tip in sequential mode
+        // If we started from boost height + 1, we would skip PHASE 1 entirely and miss
+        // notes that exist within the boost file range (like the 5 small notes at height ~2931760)
         let scanner = FilterScanner()
         scanner.onProgress = onProgress
 
-        print("🔄 Starting full rescan from height \(newTreeHeight + 1)...")
-        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: newTreeHeight + 1)
+        let saplingActivation = ZclassicCheckpoints.saplingActivationHeight
+        print("🔄 Starting full rescan from Sapling activation (\(saplingActivation)) to trigger PHASE 1+2...")
+        print("📦 PHASE 1 will scan \(saplingActivation) → \(newTreeHeight) using boost file")
+        print("📦 PHASE 2 will scan \(newTreeHeight + 1) → chain tip in sequential mode")
+        try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: saplingActivation)
 
         // Refresh balance
         try await refreshBalance()
@@ -2404,6 +2519,14 @@ final class WalletManager: ObservableObject {
             Task {
                 await loadBalanceFromDatabase()
             }
+        }
+    }
+
+    /// Public wrapper to load cached balance (for fast start mode)
+    /// This is called from ContentView when wallet is already synced
+    func loadCachedBalance() {
+        Task {
+            await loadBalanceFromDatabase()
         }
     }
 

@@ -242,9 +242,162 @@ final class NetworkManager: ObservableObject {
     // These are hidden service addresses that can only be reached via Tor
     // Note: .onion peers are also discovered dynamically via P2P addr/addrv2 messages
     private let onionPeersZCL: [String] = [
-        // Add known Zclassic .onion seed nodes here
-        // Format: "abcdefghijk234567.onion:8033"
+        // .onion peers are discovered dynamically via BIP155 addrv2 messages
+        // from peers that support protocol version > 170011
     ]
+
+    // MARK: - User Custom Nodes
+
+    /// User-added custom nodes (persisted to UserDefaults)
+    @Published private(set) var customNodes: [UserCustomNode] = []
+    private let customNodesKey = "UserCustomNodes"
+
+    /// Load custom nodes from UserDefaults
+    private func loadCustomNodes() {
+        guard let data = UserDefaults.standard.data(forKey: customNodesKey),
+              let nodes = try? JSONDecoder().decode([UserCustomNode].self, from: data) else {
+            customNodes = []
+            return
+        }
+        customNodes = nodes
+        print("📌 Loaded \(nodes.count) custom nodes from storage")
+    }
+
+    /// Save custom nodes to UserDefaults
+    private func saveCustomNodes() {
+        guard let data = try? JSONEncoder().encode(customNodes) else { return }
+        UserDefaults.standard.set(data, forKey: customNodesKey)
+    }
+
+    /// Add a new custom node
+    @MainActor
+    public func addCustomNode(host: String, port: UInt16 = 8033, label: String = "") -> Bool {
+        // Validate format
+        var node = UserCustomNode(host: host, port: port, label: label)
+        guard node.isValid else {
+            print("❌ Invalid node address: \(host)")
+            return false
+        }
+
+        // Check for duplicates
+        if customNodes.contains(where: { $0.host == host && $0.port == port }) {
+            print("⚠️ Node already exists: \(host):\(port)")
+            return false
+        }
+
+        customNodes.append(node)
+        saveCustomNodes()
+        print("✅ Added custom node: \(node.label) (\(node.addressType.rawValue))")
+
+        // Add to known addresses for immediate use
+        let key = "\(host):\(port)"
+        let now = Date()
+        addressLock.lock()
+        knownAddresses[key] = AddressInfo(
+            address: PeerAddress(host: host, port: port),
+            source: "user",
+            firstSeen: now,
+            lastSeen: now,
+            attempts: 0,
+            successes: 0
+        )
+        addressLock.unlock()
+
+        // Trigger immediate connection attempt
+        Task {
+            await connectToNewCustomNode(host: host, port: port)
+        }
+
+        return true
+    }
+
+    /// Attempt to connect to a newly added custom node immediately
+    private func connectToNewCustomNode(host: String, port: UInt16) async {
+        print("🔄 Attempting immediate connection to custom node: \(host):\(port)")
+
+        let peer = Peer(host: host, port: port, networkMagic: networkMagic)
+        do {
+            try await peer.connect()
+            try await peer.performHandshake()
+
+            await MainActor.run {
+                // Add to connected peers if not already there
+                if !self.peers.contains(where: { $0.host == host && $0.port == port }) {
+                    self.peers.append(peer)
+                }
+                self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
+                self.recordCustomNodeConnection(host: host, port: port, success: true)
+                print("✅ Connected to custom node: \(host):\(port)")
+            }
+        } catch {
+            await MainActor.run {
+                self.recordCustomNodeConnection(host: host, port: port, success: false)
+                print("⚠️ Failed to connect to custom node \(host):\(port): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Update an existing custom node
+    @MainActor
+    public func updateCustomNode(_ node: UserCustomNode) -> Bool {
+        guard let index = customNodes.firstIndex(where: { $0.id == node.id }) else {
+            return false
+        }
+        customNodes[index] = node
+        saveCustomNodes()
+        print("✅ Updated custom node: \(node.label)")
+        return true
+    }
+
+    /// Delete a custom node
+    @MainActor
+    public func deleteCustomNode(id: UUID) -> Bool {
+        guard let index = customNodes.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let node = customNodes[index]
+
+        // Remove from known addresses
+        let key = "\(node.host):\(node.port)"
+        addressLock.lock()
+        knownAddresses.removeValue(forKey: key)
+        addressLock.unlock()
+
+        customNodes.remove(at: index)
+        saveCustomNodes()
+        print("🗑️ Deleted custom node: \(node.label)")
+        return true
+    }
+
+    /// Toggle a custom node's enabled state
+    @MainActor
+    public func toggleCustomNode(id: UUID) -> Bool {
+        guard let index = customNodes.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        customNodes[index].isEnabled.toggle()
+        saveCustomNodes()
+        print("🔄 Custom node \(customNodes[index].label) is now \(customNodes[index].isEnabled ? "enabled" : "disabled")")
+        return true
+    }
+
+    /// Record connection result for a custom node
+    private func recordCustomNodeConnection(host: String, port: UInt16, success: Bool) {
+        guard let index = customNodes.firstIndex(where: { $0.host == host && $0.port == port }) else {
+            return
+        }
+        customNodes[index].connectionAttempts += 1
+        if success {
+            customNodes[index].connectionSuccesses += 1
+            customNodes[index].lastConnected = Date()
+        }
+        saveCustomNodes()
+    }
+
+    /// Get enabled custom nodes for connection
+    func getEnabledCustomNodes() -> [UserCustomNode] {
+        return customNodes.filter { $0.isEnabled }
+    }
 
     // Zclassic network parameters
     private let networkMagic: [UInt8] = [0x24, 0xe9, 0x27, 0x64] // ZCL mainnet
@@ -256,6 +409,7 @@ final class NetworkManager: ObservableObject {
         setupStatsRefresh()
         loadBundledPeers()      // Load bundled peers first (for fresh installs)
         loadPersistedAddresses() // Then override with persisted (for returning users)
+        loadCustomNodes()        // Load user-added custom nodes
     }
 
     // MARK: - Address Management
@@ -267,6 +421,12 @@ final class NetworkManager: ObservableObject {
             // Skip pure IPv6 addresses
             return
         }
+
+        // Skip invalid/corrupted addresses (255.255.x.x from bad addr parsing, 0.x.x.x reserved)
+        if normalizedHost.hasPrefix("255.255.") || normalizedHost.hasPrefix("0.") {
+            return
+        }
+
         let normalizedAddress = PeerAddress(host: normalizedHost, port: address.port)
         let key = "\(normalizedHost):\(address.port)"
 
@@ -668,6 +828,8 @@ final class NetworkManager: ObservableObject {
         if newHeight > 0 && newHeight != chainHeight {
             await MainActor.run {
                 self.chainHeight = newHeight
+                // Cache for fast start mode (consecutive app launches)
+                UserDefaults.standard.set(Int(newHeight), forKey: "cachedChainHeight")
                 print("📊 Chain height updated: \(newHeight)")
             }
 
@@ -734,12 +896,20 @@ final class NetworkManager: ObservableObject {
 
         var loadedCount = 0
         var skippedIPv6 = 0
+        var skippedInvalid = 0
         for saved in savedAddresses {
             // Normalize IPv6-mapped addresses to IPv4
             guard let normalizedHost = normalizeIPv6MappedAddress(saved.host) else {
                 skippedIPv6 += 1
                 continue
             }
+
+            // Skip corrupted addresses (255.255.x.x from bad addr message parsing)
+            if normalizedHost.hasPrefix("255.255.") || normalizedHost.hasPrefix("0.") {
+                skippedInvalid += 1
+                continue
+            }
+
             let address = PeerAddress(host: normalizedHost, port: saved.port)
             let key = "\(normalizedHost):\(saved.port)"
 
@@ -771,10 +941,14 @@ final class NetworkManager: ObservableObject {
             self.knownAddressCount = count
         }
 
-        if skippedIPv6 > 0 {
-            print("📡 Loaded \(loadedCount) persisted peer addresses (skipped \(skippedIPv6) pure IPv6)")
-        } else {
+        var skipInfo: [String] = []
+        if skippedIPv6 > 0 { skipInfo.append("\(skippedIPv6) IPv6") }
+        if skippedInvalid > 0 { skipInfo.append("\(skippedInvalid) invalid") }
+
+        if skipInfo.isEmpty {
             print("📡 Loaded \(loadedCount) persisted peer addresses")
+        } else {
+            print("📡 Loaded \(loadedCount) persisted peer addresses (skipped \(skipInfo.joined(separator: ", ")))")
         }
     }
 
@@ -782,6 +956,7 @@ final class NetworkManager: ObservableObject {
         addressLock.lock()
         let addresses = knownAddresses.values
             .filter { $0.successes > 0 || $0.attempts < 3 } // Only save good or untried addresses
+            .filter { !$0.address.host.hasPrefix("255.255.") && !$0.address.host.hasPrefix("0.") } // Filter invalid
             .sorted { $0.successes > $1.successes } // Best first
             .prefix(maxPersistedAddresses)
             .map { info in
@@ -1172,12 +1347,15 @@ final class NetworkManager: ObservableObject {
         // Check if hidden service is running
         guard await HiddenServiceManager.shared.state == .running,
               let onionAddress = await HiddenServiceManager.shared.onionAddress else {
+            print("🧅 advertiseOnionAddressToPeers: Hidden service not running or no address")
             return
         }
 
         let port = await HiddenServiceManager.shared.p2pPort
 
-        print("🧅 Advertising our .onion address to \(peers.count) peers...")
+        // Count BIP155 peers
+        let bip155Peers = peers.filter { $0.supportsAddrv2 }
+        print("🧅 Advertising our .onion address - \(peers.count) total peers, \(bip155Peers.count) support BIP155")
 
         // Advertise to all connected peers in parallel
         await withTaskGroup(of: Void.self) { group in
@@ -1258,6 +1436,8 @@ final class NetworkManager: ObservableObject {
                     print("📊 Chain height: \(currentChainHeight)")
                 }
                 self.chainHeight = currentChainHeight
+                // Cache for fast start mode (consecutive app launches)
+                UserDefaults.standard.set(Int(currentChainHeight), forKey: "cachedChainHeight")
             }
         }
 
@@ -1720,18 +1900,25 @@ final class NetworkManager: ObservableObject {
         // Get all connected peers and try them in order
         var connectedPeers = getAllConnectedPeers()
 
-        // If no ready peers, try to reconnect
+        // If no ready peers, try to reconnect (LIMITED to 3 peers max to prevent DNS exhaustion)
         if connectedPeers.isEmpty {
             print("🔮 scanMempoolForIncoming: no ready peers, attempting reconnection...")
 
-            // Try to reconnect disconnected peers
-            for peer in peers where !peer.isConnectionReady {
+            // Only try to reconnect up to 3 disconnected peers to prevent connection explosion
+            // DNS service has limited slots - creating too many connections causes NoMemory errors
+            let maxReconnectAttempts = 3
+            var reconnectAttempts = 0
+
+            // Try to reconnect disconnected peers (limited)
+            for peer in peers where !peer.isConnectionReady && reconnectAttempts < maxReconnectAttempts {
+                reconnectAttempts += 1
                 do {
                     try await peer.connect()
                     try await peer.performHandshake()
                     print("✅ scanMempoolForIncoming: reconnected to \(peer.host)")
+                    break // Stop after first successful reconnection
                 } catch {
-                    // Silently continue - we'll try other peers
+                    // Silently continue - we'll try other peers (up to limit)
                 }
             }
 
@@ -3001,6 +3188,75 @@ final class NetworkManager: ObservableObject {
         return maxHeight
     }
 
+    // MARK: - P2P Block Data On-Demand (No HeaderStore Required)
+
+    /// Get blocks on-demand via P2P using getheaders + getdata
+    /// This does NOT require pre-synced headers - fetches headers directly from peers
+    /// Tries multiple peers with reconnection logic
+    /// Returns: [(CompactBlock)] with CMUs in wire format (little-endian)
+    func getBlocksOnDemandP2P(from height: UInt64, count: Int) async throws -> [CompactBlock] {
+        print("🔗 P2P on-demand: Fetching \(count) blocks from height \(height)")
+
+        // Ensure at least some peers are connected before checking
+        var availablePeers = peers.filter { $0.isConnectionReady }
+
+        if availablePeers.isEmpty && !peers.isEmpty {
+            // No ready peers but we have peers - try to reconnect them
+            print("⏳ P2P on-demand: No ready peers, attempting reconnection...")
+
+            // Try to reconnect up to 3 peers in parallel
+            let peersToReconnect = Array(peers.prefix(3))
+            await withTaskGroup(of: Void.self) { group in
+                for peer in peersToReconnect {
+                    group.addTask {
+                        do {
+                            try await peer.ensureConnected()
+                        } catch {
+                            print("⚠️ P2P on-demand: Failed to reconnect \(peer.host): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+
+            // Check again after reconnection attempt
+            availablePeers = peers.filter { $0.isConnectionReady }
+
+            if availablePeers.isEmpty {
+                print("⚠️ P2P on-demand: Still no ready peers after reconnection attempt")
+                throw NetworkError.notConnected
+            } else {
+                print("✅ P2P on-demand: Reconnected \(availablePeers.count) peers")
+            }
+        }
+
+        guard !availablePeers.isEmpty else {
+            throw NetworkError.notConnected
+        }
+
+        // Try each peer until one succeeds with the block fetch
+        var lastError: Error = NetworkError.p2pFetchFailed
+        for peer in availablePeers.shuffled() {
+            do {
+                print("📡 P2P on-demand: Trying peer \(peer.host)...")
+                let blocks = try await withTimeout(seconds: 30) {
+                    try await peer.getFullBlocks(from: height, count: count)
+                }
+
+                if !blocks.isEmpty {
+                    print("✅ P2P on-demand: Got \(blocks.count) blocks from \(peer.host)")
+                    return blocks
+                }
+            } catch {
+                print("⚠️ P2P on-demand: Peer \(peer.host) failed: \(error.localizedDescription)")
+                lastError = error
+                continue
+            }
+        }
+
+        print("❌ P2P on-demand: All \(availablePeers.count) peers failed")
+        throw lastError
+    }
+
     // MARK: - P2P Block Data for Scanning (Full P2P Mode)
 
     /// Get block data with shielded outputs in format compatible with FilterScanner
@@ -3557,6 +3813,80 @@ struct PersistedAddress: Codable {
     let lastSeen: Date
     let attempts: Int
     let successes: Int
+}
+
+/// User-added custom node for manual peer management
+/// Supports IPv4, IPv6, and .onion addresses
+public struct UserCustomNode: Codable, Identifiable, Equatable {
+    public let id: UUID
+    public var host: String  // IPv4, IPv6, or .onion address
+    public var port: UInt16
+    public var label: String  // User-friendly name
+    public var isEnabled: Bool
+    public var addedDate: Date
+    public var lastConnected: Date?
+    public var connectionSuccesses: Int
+    public var connectionAttempts: Int
+
+    public init(host: String, port: UInt16 = 8033, label: String = "") {
+        self.id = UUID()
+        self.host = host
+        self.port = port
+        self.label = label.isEmpty ? host : label
+        self.isEnabled = true
+        self.addedDate = Date()
+        self.lastConnected = nil
+        self.connectionSuccesses = 0
+        self.connectionAttempts = 0
+    }
+
+    /// Determine the address type
+    public var addressType: AddressType {
+        if host.hasSuffix(".onion") {
+            return .onion
+        } else if host.contains(":") {
+            return .ipv6
+        } else {
+            return .ipv4
+        }
+    }
+
+    public enum AddressType: String, Codable {
+        case ipv4 = "IPv4"
+        case ipv6 = "IPv6"
+        case onion = "Onion"
+
+        public var icon: String {
+            switch self {
+            case .ipv4: return "network"
+            case .ipv6: return "network.badge.shield.half.filled"
+            case .onion: return "shield.lefthalf.filled"
+            }
+        }
+    }
+
+    /// Validate the address format
+    public var isValid: Bool {
+        switch addressType {
+        case .onion:
+            // Tor v3 onion addresses are 56 characters (without .onion)
+            let onionPart = host.replacingOccurrences(of: ".onion", with: "")
+            return onionPart.count == 56 && onionPart.allSatisfy { $0.isLetter || $0.isNumber }
+        case .ipv4:
+            let components = host.split(separator: ".")
+            if components.count != 4 { return false }
+            return components.allSatisfy { UInt8($0) != nil }
+        case .ipv6:
+            // Basic IPv6 validation
+            return host.contains(":") && !host.contains("..")
+        }
+    }
+
+    /// Success rate as percentage
+    public var successRate: Double {
+        guard connectionAttempts > 0 else { return 0 }
+        return Double(connectionSuccesses) / Double(connectionAttempts) * 100
+    }
 }
 
 /// Peer data for bundling in app resources

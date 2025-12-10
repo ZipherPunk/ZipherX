@@ -50,7 +50,7 @@ final class HeaderStore {
 
     private func createTables() throws {
         let schemas = [
-            // Block headers table
+            // Block headers table (full headers from P2P sync)
             """
             CREATE TABLE IF NOT EXISTS headers (
                 height INTEGER PRIMARY KEY,
@@ -63,6 +63,15 @@ final class HeaderStore {
                 nonce BLOB NOT NULL,
                 version INTEGER NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            """,
+
+            // Block times table (lightweight timestamps from boost file)
+            // This provides continuous timestamp coverage without requiring full headers
+            """
+            CREATE TABLE IF NOT EXISTS block_times (
+                height INTEGER PRIMARY KEY,
+                timestamp INTEGER NOT NULL
             );
             """,
 
@@ -285,9 +294,46 @@ final class HeaderStore {
     }
 
     /// Get block timestamp by height
-    /// Returns the actual Unix timestamp from the block header
+    /// Checks: 1) Full headers table (from P2P sync), 2) block_times table (from boost file)
+    /// Returns the actual Unix timestamp for the block
     func getBlockTime(at height: UInt64) throws -> UInt32? {
-        let sql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
+        // First, check full headers table (P2P synced headers have priority)
+        let headerSql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, headerSql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let timestamp = UInt32(sqlite3_column_int64(stmt, 0))
+            sqlite3_finalize(stmt)
+            return timestamp
+        }
+        sqlite3_finalize(stmt)
+
+        // Second, check block_times table (from boost file)
+        let blockTimeSql = "SELECT timestamp FROM block_times WHERE height = ? LIMIT 1;"
+        var stmt2: OpaquePointer?
+        guard sqlite3_prepare_v2(db, blockTimeSql, -1, &stmt2, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt2) }
+
+        sqlite3_bind_int64(stmt2, 1, Int64(height))
+
+        if sqlite3_step(stmt2) == SQLITE_ROW {
+            return UInt32(sqlite3_column_int64(stmt2, 0))
+        }
+        return nil
+    }
+
+    // MARK: - Block Times (from boost file)
+
+    /// Insert a single block timestamp (from boost file or sync)
+    func insertBlockTime(height: UInt64, timestamp: UInt32) throws {
+        let sql = "INSERT OR REPLACE INTO block_times (height, timestamp) VALUES (?, ?);"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -296,11 +342,101 @@ final class HeaderStore {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int64(stmt, 1, Int64(height))
+        sqlite3_bind_int64(stmt, 2, Int64(timestamp))
 
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            return UInt32(sqlite3_column_int64(stmt, 0))
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
-        return nil
+    }
+
+    /// Batch insert block timestamps from boost file (efficient bulk load)
+    /// timestamps: Array of (height, timestamp) pairs
+    func insertBlockTimesBatch(_ timestamps: [(UInt64, UInt32)]) throws {
+        guard !timestamps.isEmpty else { return }
+
+        guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.insertFailed("Failed to begin transaction")
+        }
+
+        let sql = "INSERT OR REPLACE INTO block_times (height, timestamp) VALUES (?, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        do {
+            for (height, timestamp) in timestamps {
+                sqlite3_reset(stmt)
+                sqlite3_bind_int64(stmt, 1, Int64(height))
+                sqlite3_bind_int64(stmt, 2, Int64(timestamp))
+
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+                }
+            }
+
+            sqlite3_finalize(stmt)
+
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.insertFailed("Failed to commit transaction")
+            }
+        } catch {
+            sqlite3_finalize(stmt)
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Insert block timestamps from boost file data
+    /// data: Raw timestamp data (4 bytes per timestamp, little-endian)
+    /// startHeight: First block height in the data
+    func insertBlockTimesFromBoostData(_ data: Data, startHeight: UInt64) throws {
+        let timestampCount = data.count / 4
+        guard timestampCount > 0 else { return }
+
+        print("⏰ HeaderStore: Loading \(timestampCount) timestamps from boost file (heights \(startHeight) to \(startHeight + UInt64(timestampCount) - 1))")
+
+        var timestamps: [(UInt64, UInt32)] = []
+        timestamps.reserveCapacity(timestampCount)
+
+        data.withUnsafeBytes { ptr in
+            for i in 0..<timestampCount {
+                let timestamp = ptr.load(fromByteOffset: i * 4, as: UInt32.self)
+                timestamps.append((startHeight + UInt64(i), timestamp))
+            }
+        }
+
+        try insertBlockTimesBatch(timestamps)
+        print("✅ HeaderStore: Loaded \(timestampCount) timestamps into block_times table")
+    }
+
+    /// Get count of timestamps in block_times table
+    func getBlockTimesCount() throws -> Int {
+        let sql = "SELECT COUNT(*) FROM block_times;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Clear all block times (for repair/resync)
+    func clearBlockTimes() throws {
+        let sql = "DELETE FROM block_times;"
+
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("🗑️ Cleared all block times")
     }
 
     /// Check if header exists at height
