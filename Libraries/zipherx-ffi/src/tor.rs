@@ -27,10 +27,15 @@ static TOR_STATE: AtomicU8 = AtomicU8::new(0);
 /// Bootstrap progress (0-100)
 static TOR_BOOTSTRAP_PROGRESS: AtomicU8 = AtomicU8::new(0);
 
-/// SOCKS proxy port - fixed at 9250 to avoid conflicts
+/// SOCKS proxy ports - fixed to avoid conflicts
 /// (9050 = homebrew/system Tor, 9150 = Tor Browser)
-/// ZipherX uses 9250 so it can coexist with other Tor instances
+/// ZipherX macOS uses 9250, iOS/Simulator uses 9251
+/// This allows both to run simultaneously on same Mac (development)
+#[cfg(target_os = "macos")]
 const FIXED_SOCKS_PORT: u16 = 9250;
+
+#[cfg(target_os = "ios")]
+const FIXED_SOCKS_PORT: u16 = 9251;
 
 /// SOCKS proxy port (stored after binding)
 static TOR_SOCKS_PORT: AtomicU16 = AtomicU16::new(0);
@@ -277,9 +282,12 @@ async fn handle_socks5_connection(
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await;
         }
         Err(e) => {
-            // Only log connection failures (not every attempt)
+            // Always log .onion failures (important for debugging), reduce noise for clearnet
             let err_msg = format!("{}", e);
-            if !err_msg.contains("timed out") && !err_msg.contains("Protocol error") {
+            let is_onion = host.ends_with(".onion");
+            if is_onion {
+                eprintln!("🧅 [ONION] Failed to connect to {}:{} - {}", host, port, e);
+            } else if !err_msg.contains("timed out") && !err_msg.contains("Protocol error") {
                 eprintln!("🧅 Tor connection to {}:{} failed: {}", host, port, e);
             }
             // Send connection failed response

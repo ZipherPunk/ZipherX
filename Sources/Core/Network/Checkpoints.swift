@@ -36,6 +36,8 @@ enum ZclassicCheckpoints {
         // Bundled tree checkpoint (must match bundledTreeHeight in FilterScanner/WalletManager)
         // IMPORTANT: This hash was corrected on Dec 3, 2025 - previous hash was wrong causing header misalignment
         2926122: "0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd",
+        // Recent checkpoint for header sync (Dec 10, 2025)
+        2938700: "000006ef36df7868360159dd79ce43665569229485abace3864b2bdd98d7202e",
     ]
 
     /// Sapling activation height on Zclassic mainnet

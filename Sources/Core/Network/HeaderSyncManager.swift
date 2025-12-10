@@ -430,7 +430,23 @@ final class HeaderSyncManager {
             }
         }
 
+        // Fourth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
+        // This ensures we always get post-Bubbles headers even if we don't have the exact hash
+        if locatorHash == nil {
+            let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
+            for checkpointHeight in checkpoints {
+                if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+                    if let hashData = Data(hexString: checkpointHex) {
+                        locatorHash = Data(hashData.reversed())  // Convert to wire format
+                        print("📋 Using nearest checkpoint at height \(checkpointHeight) (requested \(locatorHeight))")
+                        break
+                    }
+                }
+            }
+        }
+
         // Fallback: Use zero hash (will return headers from genesis) - SECURITY WARNING: may get old headers!
+        // This should NEVER happen now that we have nearest checkpoint fallback
         if let hash = locatorHash {
             payload.append(hash)
         } else {

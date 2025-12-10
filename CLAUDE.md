@@ -3658,7 +3658,73 @@ All 9 notes are at similar positions near the end of the 1M+ CMU tree. Each thre
 
 ---
 
-### 60. CRITICAL: Boost File Byte Order Fix (December 7, 2025)
+### 60. Header Sync Locator Hash Fallback (December 10, 2025)
+
+**Problem**: Equihash verification failing with "got 1344 bytes, expected 400 bytes" for ALL peers on macOS Tor mode.
+
+**Root Cause**: When requesting headers from height N, the code needs a locator hash at height N-1 to send in the `getheaders` P2P message. If no locator hash is found (not in HeaderStore, Checkpoints, or BundledBlockHashes), it falls back to a **zero hash**. This causes peers to return headers starting from the genesis block, which uses Equihash(200,9) with 1344-byte solutions instead of post-Bubbles Equihash(192,7) with 400-byte solutions.
+
+**Solution**: Added "Fourth try" in `buildGetHeadersPayload()` that finds the nearest checkpoint BELOW the requested height:
+
+```swift
+// Fourth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
+if locatorHash == nil {
+    let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
+    for checkpointHeight in checkpoints {
+        if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+            if let hashData = Data(hexString: checkpointHex) {
+                locatorHash = Data(hashData.reversed())  // Convert to wire format
+                print("📋 Using nearest checkpoint at height \(checkpointHeight) (requested \(locatorHeight))")
+                break
+            }
+        }
+    }
+}
+```
+
+**Also added**: Checkpoint at height 2938700 for recent header sync.
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Added nearest checkpoint fallback
+- `Sources/Core/Network/Checkpoints.swift` - Added checkpoint at 2938700
+
+---
+
+### 61. Dedicated SOCKS Ports for iOS vs macOS (December 10, 2025)
+
+**Problem**: Custom .onion node connects on macOS but fails on iOS Simulator with "SOCKS5 error: Connection refused", even though clearnet peers work fine via SOCKS5.
+
+**Root Cause**: Both macOS app and iOS Simulator run on the same Mac, sharing the network namespace:
+1. macOS app starts first → Arti binds to port 9250 ✅
+2. iOS Simulator starts after → port 9250 in use → falls back to random dynamic port (e.g., 49758)
+3. Dynamic port works for clearnet IPs but fails for .onion address resolution
+
+**Solution**: Platform-specific fixed ports so they don't conflict:
+
+| Platform | SOCKS Port |
+|----------|------------|
+| macOS | 9250 |
+| iOS/Simulator | 9251 |
+
+**Implementation**:
+```rust
+// tor.rs
+#[cfg(target_os = "macos")]
+const FIXED_SOCKS_PORT: u16 = 9250;
+
+#[cfg(target_os = "ios")]
+const FIXED_SOCKS_PORT: u16 = 9251;
+```
+
+**Also added**: Better error logging for .onion connection failures (always logged, not suppressed).
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - Platform-specific ports, better .onion logging
+- `Sources/Features/Settings/SettingsView.swift` - Platform-specific port display
+
+---
+
+### 62. CRITICAL: Boost File Byte Order Fix (December 7, 2025)
 
 **Problem**: Imported wallet scan found 0 notes when it should find 9 (0.0015 ZCL). The optimized boost file scanning path was returning no decrypted notes.
 
@@ -4769,6 +4835,55 @@ final class ResumedFlag: @unchecked Sendable {
 **Files Modified**:
 - `Libraries/zipherx-ffi/src/tor.rs` - `FIXED_SOCKS_PORT = 9250`
 - `Sources/Features/Settings/SettingsView.swift` - UI text updated
+
+---
+
+### 95. Header Sync Equihash Fix - Nearest Checkpoint Fallback (December 10, 2025)
+
+**Problem**: Header sync on macOS (Tor mode) failed with "Equihash got 1344 bytes, expected 400" for ALL peers at height 2938744.
+
+**Root Cause Analysis**:
+1. When syncing from height 2938743, code needed block hash at height 2938742 as P2P locator
+2. **HeaderStore** was empty (fresh start or headers cleared)
+3. **Checkpoints** only had height 2926122 (12,600+ blocks behind requested)
+4. **BundledBlockHashes** wasn't loaded or didn't have that height
+5. Code fell back to **zero hash**, which made peers return headers from GENESIS (block 0)
+6. Genesis headers use pre-Bubbles Equihash(200,9) = 1344-byte solutions
+7. Our code expects post-Bubbles Equihash(192,7) = 400-byte solutions → **MISMATCH**
+
+**Zclassic Equihash Timeline**:
+| Height Range | Equihash | Solution Size |
+|--------------|----------|---------------|
+| 0 - 585,317 | (200, 9) | 1344 bytes |
+| 585,318+ (Bubbles) | (192, 7) | 400 bytes |
+
+**Solution**: Added "nearest checkpoint fallback" in `buildGetHeadersPayload()`:
+- If exact locator hash not found, use the **nearest checkpoint BELOW** the requested height
+- This ensures we always receive post-Bubbles headers (no zero hash fallback to genesis)
+- Pure P2P approach - no InsightAPI dependency (critical for Tor users)
+
+```swift
+// Fourth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
+if locatorHash == nil {
+    let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
+    for checkpointHeight in checkpoints {
+        if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+            if let hashData = Data(hexString: checkpointHex) {
+                locatorHash = Data(hashData.reversed())  // Wire format
+                print("📋 Using nearest checkpoint at height \(checkpointHeight) (requested \(locatorHeight))")
+                break
+            }
+        }
+    }
+}
+```
+
+**Also Added**:
+- New checkpoint at height 2938700: `000006ef36df7868360159dd79ce43665569229485abace3864b2bdd98d7202e`
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Nearest checkpoint fallback logic (lines 433-446)
+- `Sources/Core/Network/Checkpoints.swift` - Added checkpoint at 2938700
 
 ---
 
