@@ -1385,32 +1385,38 @@ final class TransactionBuilder {
         let torEnabled = await TorManager.shared.mode == .enabled
 
         // Try P2P first (especially important for Tor mode)
-        if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
+        // Try multiple peers before giving up
+        let connectedPeers = networkManager.getAllConnectedPeers()
+        if !connectedPeers.isEmpty {
             print("📡 Fetching delta CMUs via P2P (blocks \(startHeight)-\(endHeight))...")
-
             let blockCount = Int(endHeight - startHeight + 1)
-            do {
-                let blocks = try await peer.getFullBlocks(from: startHeight, count: blockCount)
-                for block in blocks {
-                    for tx in block.transactions {
-                        for output in tx.outputs {
-                            // CMU from P2P is already in wire format (little-endian)
-                            allCMUs.append(output.cmu)
+
+            for peer in connectedPeers.prefix(3) {  // Try up to 3 peers
+                do {
+                    let blocks = try await peer.getFullBlocks(from: startHeight, count: blockCount)
+                    for block in blocks {
+                        for tx in block.transactions {
+                            for output in tx.outputs {
+                                // CMU from P2P is already in wire format (little-endian)
+                                allCMUs.append(output.cmu)
+                            }
                         }
                     }
+                    print("📡 P2P: Got \(allCMUs.count) CMUs from \(blocks.count) blocks via \(peer.host)")
+                    return allCMUs
+                } catch {
+                    print("⚠️ P2P fetch from \(peer.host) failed: \(error.localizedDescription)")
+                    // Try next peer
+                    continue
                 }
-                print("📡 P2P: Got \(allCMUs.count) CMUs from \(blocks.count) blocks")
-                return allCMUs
-            } catch {
-                print("⚠️ P2P fetch failed: \(error.localizedDescription)")
-                // Fall through to InsightAPI if not in Tor mode
             }
+            print("⚠️ All P2P peers failed to fetch CMUs")
         }
 
-        // InsightAPI fallback (skip if Tor mode and API blocked)
-        if torEnabled {
-            print("⚠️ Skipping InsightAPI - Tor mode enabled and API likely blocked by Cloudflare")
-            return allCMUs
+        // InsightAPI fallback - try anyway even in Tor mode
+        // (User might have clearnet access, VPN, or Cloudflare might not block)
+        if torEnabled && allCMUs.isEmpty {
+            print("⚠️ P2P failed in Tor mode - trying InsightAPI as last resort...")
         }
 
         // InsightAPI fallback (batch with reduced logging)

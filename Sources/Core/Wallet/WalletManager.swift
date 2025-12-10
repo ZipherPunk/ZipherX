@@ -581,6 +581,7 @@ final class WalletManager: ObservableObject {
     /// Pre-rebuild witnesses for all unspent notes to enable instant payments
     /// Called after background sync to ensure witnesses match current tree root
     /// This eliminates witness rebuild delay at send time
+    /// CRITICAL FIX: Actually rebuilds stale witnesses instead of deferring to send time
     private func preRebuildWitnessesForInstantPayment(accountId: Int64) async {
         do {
             // Get current tree root (anchor)
@@ -598,7 +599,7 @@ final class WalletManager: ObservableObject {
 
             var alreadyCurrentCount = 0
             var anchorUpdatedCount = 0
-            var needsRebuildCount = 0
+            var notesNeedingRebuild: [(note: WalletNote, cmu: Data)] = []
 
             for note in notes {
                 // Check if witness anchor matches current tree root
@@ -625,21 +626,141 @@ final class WalletManager: ObservableObject {
                     }
                 }
 
-                // Witness needs rebuild - will be handled at send time
-                // Pre-rebuild is a lightweight optimization, not a full rebuild
-                // TransactionBuilder.rebuildWitnessForNote() handles full rebuilds
-                needsRebuildCount += 1
+                // Witness needs rebuild - collect for batch rebuild
+                if let cmu = note.cmu, !cmu.isEmpty {
+                    notesNeedingRebuild.append((note: note, cmu: cmu))
+                }
             }
 
-            // Summary
+            // Summary for notes that don't need rebuild
             if alreadyCurrentCount > 0 {
                 print("✅ Pre-witness: \(alreadyCurrentCount) note(s) already instant-ready")
             }
             if anchorUpdatedCount > 0 {
                 print("⚡ Pre-witness: \(anchorUpdatedCount) anchor(s) updated (witness valid)")
             }
-            if needsRebuildCount > 0 {
-                print("ℹ️ Pre-witness: \(needsRebuildCount) note(s) need rebuild at send time")
+
+            // CRITICAL: Actually rebuild stale witnesses (don't defer to send time!)
+            if !notesNeedingRebuild.isEmpty {
+                print("🔄 Pre-witness: Rebuilding \(notesNeedingRebuild.count) stale witness(es)...")
+
+                // Save current tree state before rebuilding
+                let savedTreeState = ZipherXFFI.treeSerialize()
+
+                // Try to get CMU data for witness rebuild
+                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo(),
+                   let cmuData = try? Data(contentsOf: cachedPath) {
+
+                    let boostHeight = cachedInfo.height
+
+                    // Separate notes into those within boost range and those beyond
+                    let notesInBoost = notesNeedingRebuild.filter { $0.note.height <= boostHeight }
+                    let notesAfterBoost = notesNeedingRebuild.filter { $0.note.height > boostHeight }
+
+                    var rebuiltCount = 0
+
+                    // Rebuild witnesses for notes within boost file range
+                    if !notesInBoost.isEmpty {
+                        let targetCMUs = notesInBoost.map { $0.cmu }
+                        let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: cmuData, targetCMUs: targetCMUs)
+
+                        for (index, result) in results.enumerated() {
+                            if let (_, witness) = result {
+                                let note = notesInBoost[index].note
+                                // Extract anchor from the rebuilt witness (last 32 bytes)
+                                let witnessAnchor = witness.suffix(32)
+                                try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                rebuiltCount += 1
+                            }
+                        }
+                    }
+
+                    // For notes beyond boost file, we need delta CMUs from chain
+                    // This is more expensive but necessary for correctness
+                    if !notesAfterBoost.isEmpty {
+                        print("🔄 Pre-witness: \(notesAfterBoost.count) note(s) beyond boost file, fetching delta CMUs...")
+
+                        // Get the max note height to know how far to fetch
+                        let maxNoteHeight = notesAfterBoost.map { $0.note.height }.max() ?? boostHeight
+
+                        // Fetch delta CMUs from chain via P2P
+                        let networkManager = NetworkManager.shared
+                        if networkManager.isConnected {
+                            do {
+                                // Fetch blocks between boostHeight+1 and maxNoteHeight
+                                var deltaCMUs: [Data] = []
+                                let startHeight = boostHeight + 1
+                                let batchSize = 50
+
+                                var currentHeight = startHeight
+                                while currentHeight <= maxNoteHeight {
+                                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
+                                    let blockCount = Int(endHeight - currentHeight + 1)
+
+                                    if let peer = networkManager.getConnectedPeer() {
+                                        let blocks = try await peer.getFullBlocks(from: currentHeight, count: blockCount)
+                                        for block in blocks {
+                                            for tx in block.transactions {
+                                                for output in tx.outputs {
+                                                    deltaCMUs.append(output.cmu)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    currentHeight = endHeight + 1
+                                }
+
+                                // Build combined CMU data: boost + delta
+                                let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+                                let totalCount = boostCount + UInt64(deltaCMUs.count)
+
+                                var combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
+                                var countLE = totalCount
+                                withUnsafeBytes(of: &countLE) { combinedCMUData.append(contentsOf: $0) }
+                                combinedCMUData.append(cmuData.suffix(from: 8))
+                                for cmu in deltaCMUs {
+                                    combinedCMUData.append(cmu)
+                                }
+
+                                // Rebuild witnesses for notes after boost
+                                let afterBoostCMUs = notesAfterBoost.map { $0.cmu }
+                                let afterResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: afterBoostCMUs)
+
+                                for (index, result) in afterResults.enumerated() {
+                                    if let (_, witness) = result {
+                                        let note = notesAfterBoost[index].note
+                                        let witnessAnchor = witness.suffix(32)
+                                        try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                        try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                        rebuiltCount += 1
+                                    }
+                                }
+                            } catch {
+                                print("⚠️ Pre-witness: Failed to fetch delta CMUs: \(error.localizedDescription)")
+                            }
+                        } else {
+                            print("⚠️ Pre-witness: No P2P connection for delta CMU fetch")
+                        }
+                    }
+
+                    if rebuiltCount > 0 {
+                        print("✅ Pre-witness: Rebuilt \(rebuiltCount) witness(es) - INSTANT payments ready!")
+                    }
+                    if rebuiltCount < notesNeedingRebuild.count {
+                        print("⚠️ Pre-witness: \(notesNeedingRebuild.count - rebuiltCount) witness(es) will rebuild at send time")
+                    }
+
+                    // CRITICAL: Restore tree state after witness rebuild
+                    // treeCreateWitnessesBatch modifies the FFI tree, we need to restore it
+                    if let savedState = savedTreeState {
+                        _ = ZipherXFFI.treeInit()
+                        _ = ZipherXFFI.treeDeserialize(data: savedState)
+                    }
+                } else {
+                    print("⚠️ Pre-witness: No CMU data available for rebuild, \(notesNeedingRebuild.count) note(s) will rebuild at send time")
+                }
             }
         } catch {
             print("⚠️ Pre-witness rebuild failed: \(error.localizedDescription)")
