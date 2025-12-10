@@ -77,9 +77,14 @@ final class BlockTimestampManager {
         isDownloading = true
         defer { isDownloading = false }
 
-        // Already loaded?
-        if timestampData != nil && maxHeight > 0 {
+        // Already loaded in memory?
+        if let data = timestampData, maxHeight > 0 {
             print("✅ BlockTimestampManager: Timestamps already loaded (max height \(maxHeight))")
+
+            // CRITICAL: Even if timestamps are in memory, ensure HeaderStore.block_times is populated
+            // This handles the case where timestamps were loaded in a previous session but HeaderStore wasn't synced
+            await ensureHeaderStorePopulated(data: data)
+
             onProgress?(1.0, "Timestamps ready")
             return (true, maxHeight)
         }
@@ -170,6 +175,28 @@ final class BlockTimestampManager {
         } catch {
             print("⚠️ BlockTimestampManager: Failed to sync to HeaderStore: \(error.localizedDescription)")
             // Non-fatal - in-memory cache still works
+        }
+    }
+
+    /// Ensure HeaderStore.block_times is populated from in-memory timestamp data
+    /// Called when timestamps are already in memory but HeaderStore might be empty
+    private func ensureHeaderStorePopulated(data: Data) async {
+        do {
+            // Ensure HeaderStore is opened (creates block_times table if needed)
+            try HeaderStore.shared.open()
+
+            let existingCount = try HeaderStore.shared.getBlockTimesCount()
+            let expectedCount = data.count / 4
+
+            if existingCount < expectedCount {
+                print("⏰ BlockTimestampManager: Syncing \(expectedCount) timestamps to HeaderStore (had \(existingCount))...")
+                try HeaderStore.shared.insertBlockTimesFromBoostData(data, startHeight: boostStartHeight)
+                print("✅ BlockTimestampManager: Synced \(expectedCount) timestamps to HeaderStore.block_times")
+            } else {
+                print("✅ BlockTimestampManager: HeaderStore.block_times already populated (\(existingCount) entries)")
+            }
+        } catch {
+            print("⚠️ BlockTimestampManager: Failed to ensure HeaderStore populated: \(error.localizedDescription)")
         }
     }
 

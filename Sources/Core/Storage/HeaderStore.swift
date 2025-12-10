@@ -23,7 +23,10 @@ final class HeaderStore {
     /// Open database connection
     func open() throws {
         if db != nil {
-            print("📂 HeaderStore already open")
+            // Already open - but still run createTables() to ensure new tables are created
+            // (e.g., block_times table added after initial schema)
+            try createTables()
+            print("📂 HeaderStore already open (schema updated)")
             return
         }
 
