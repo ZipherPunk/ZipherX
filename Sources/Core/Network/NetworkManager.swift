@@ -625,8 +625,12 @@ final class NetworkManager: ObservableObject {
         addressLock.lock()
         defer { addressLock.unlock() }
 
-        // Check if Tor is available for .onion connections
+        // Check if Tor is available for regular SOCKS connections
         let torAvailable = torIsAvailable
+
+        // Check if .onion circuits are ready (requires warmup period)
+        // .onion addresses need rendezvous circuits; regular IPv4 via SOCKS works immediately
+        let onionReady = onionCircuitsReady
 
         // Helper to check if address is .onion
         func isOnion(_ host: String) -> Bool {
@@ -636,7 +640,8 @@ final class NetworkManager: ObservableObject {
         // Helper to filter address based on Tor availability
         func isAddressUsable(_ address: PeerAddress) -> Bool {
             if isOnion(address.host) {
-                return torAvailable // Only use .onion if Tor is available
+                // .onion addresses require both Tor and circuit warmup
+                return onionReady
             }
             return true // Regular addresses always usable
         }
@@ -695,11 +700,32 @@ final class NetworkManager: ObservableObject {
     }
     private var _torIsAvailable: Bool = false
 
+    /// Check if .onion circuits are ready (requires warmup period after SOCKS connection)
+    /// Regular IPv4 via SOCKS works immediately; .onion addresses need ~10s for rendezvous circuits
+    private var onionCircuitsReady: Bool {
+        return _onionCircuitsReady
+    }
+    private var _onionCircuitsReady: Bool = false
+
     /// Update Tor availability status (call periodically or when Tor state changes)
     func updateTorAvailability() async {
         let mode = await TorManager.shared.mode
         let connected = await TorManager.shared.connectionState.isConnected
         _torIsAvailable = (mode == .enabled && connected)
+
+        // Check if .onion circuits are ready (requires warmup period after SOCKS connection)
+        let wasOnionReady = _onionCircuitsReady
+        _onionCircuitsReady = await TorManager.shared.isOnionCircuitsReady
+
+        // Log transition when .onion circuits become ready
+        if !wasOnionReady && _onionCircuitsReady {
+            print("🧅 .onion circuits now ready! Can connect to hidden services.")
+        } else if connected && !_onionCircuitsReady {
+            let remaining = await TorManager.shared.onionCircuitWarmupRemaining
+            if remaining > 0 {
+                print("🧅 .onion circuits warming up... \(Int(remaining))s remaining")
+            }
+        }
 
         // Count .onion peers in address book
         addressLock.lock()

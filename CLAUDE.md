@@ -4962,6 +4962,118 @@ if locatorHash == nil {
 
 ---
 
+### 97. iOS Simulator .onion Circuit Warmup Fix (December 10, 2025)
+
+**Problem**: iOS Simulator could discover .onion peers via addrv2 but failed to connect to them:
+```
+🧅 Tor peers: 12 via SOCKS5, 0 .onion connected, 2 .onion discovered
+Error: tor: tor operation timed out: Failed to obtain hidden service circuit
+```
+Meanwhile, macOS connected to .onion peers successfully (2 connected).
+
+**Root Cause Analysis**:
+Timing analysis showed:
+- **macOS**: Arti connected at 11:47:23 → .onion attempt at 11:47:36 (13 seconds later) → SUCCESS
+- **iOS Sim**: .onion attempt at 11:48:54.397 → Arti connected at 11:48:54.801 (0.4s later) → FAILED
+
+The iOS Simulator was attempting .onion connections BEFORE Arti had fully bootstrapped its rendezvous circuits. The SOCKS5 proxy being "ready" (accepting TCP connections) doesn't mean hidden service circuits are established.
+
+**Solution**: Added .onion circuit warmup delay (10 seconds after SOCKS connection):
+
+1. **TorManager.swift** - Added warmup tracking:
+   ```swift
+   /// Timestamp when SOCKS proxy became connected
+   private var connectedSinceTimestamp: Date?
+
+   /// Warmup period for .onion circuits (rendezvous circuit establishment)
+   private let onionCircuitWarmupSeconds: TimeInterval = 10.0
+
+   /// Check if .onion circuits are ready (requires warmup period)
+   public var isOnionCircuitsReady: Bool {
+       guard connectionState.isConnected, let connectedSince = connectedSinceTimestamp else {
+           return false
+       }
+       let elapsed = Date().timeIntervalSince(connectedSince)
+       return elapsed >= onionCircuitWarmupSeconds
+   }
+   ```
+
+2. **NetworkManager.swift** - Use circuit readiness for .onion peer selection:
+   ```swift
+   private var _onionCircuitsReady: Bool = false
+
+   func updateTorAvailability() async {
+       _onionCircuitsReady = await TorManager.shared.isOnionCircuitsReady
+
+       if !wasOnionReady && _onionCircuitsReady {
+           print("🧅 .onion circuits now ready! Can connect to hidden services.")
+       }
+   }
+
+   // In selectBestAddress():
+   func isAddressUsable(_ address: PeerAddress) -> Bool {
+       if isOnion(address.host) {
+           return onionCircuitsReady  // Not just torIsAvailable
+       }
+       return true
+   }
+   ```
+
+**Behavior After Fix**:
+1. Tor connects → SOCKS proxy ready
+2. App immediately connects to IPv4 peers via SOCKS (works instantly)
+3. App discovers .onion peers via addrv2 gossip
+4. .onion peers are NOT selected for connection yet (circuits warming up)
+5. After 10 seconds: "🧅 .onion circuits now ready!"
+6. App begins connecting to .onion peers → SUCCESS
+
+**Files Modified**:
+- `Sources/Core/Network/TorManager.swift` - Added `connectedSinceTimestamp`, `isOnionCircuitsReady`, `onionCircuitWarmupRemaining`
+- `Sources/Core/Network/NetworkManager.swift` - Added `_onionCircuitsReady`, updated `selectBestAddress()` to use circuit readiness
+
+---
+
+### 98. P2P-First CMU Fetching in Tor Mode (December 10, 2025)
+
+**Problem**: When sending ZCL in Tor mode, TransactionBuilder logged 1000+ "Failed to fetch CMUs" errors because InsightAPI is blocked by Cloudflare when accessed via Tor.
+
+**Root Cause**: `fetchCMUsForBlockRange()` was calling `fetchCMUsViaInsight()` for each individual block, and each call failed with CloudFlare blocking (403 or timeout).
+
+**Solution**: Added P2P-first approach with batch fetching:
+
+1. **Try P2P first** - Use `peer.getFullBlocks()` for batch CMU fetch
+2. **Skip InsightAPI in Tor mode** - CloudFlare blocks Tor exit nodes
+3. **Reduce log spam** - Only log every 10th failure if InsightAPI fallback is used
+
+```swift
+private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt64) async -> [Data] {
+    let torEnabled = await TorManager.shared.mode == .enabled
+
+    // Try P2P first (especially important for Tor mode)
+    if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
+        do {
+            let blocks = try await peer.getFullBlocks(from: startHeight, count: blockCount)
+            // Extract CMUs from blocks...
+            return allCMUs
+        } catch { /* fall through */ }
+    }
+
+    // Skip InsightAPI when Tor mode enabled (blocked by Cloudflare)
+    if torEnabled {
+        print("⚠️ Skipping InsightAPI - Tor mode enabled and API likely blocked")
+        return allCMUs
+    }
+
+    // InsightAPI fallback only when not in Tor mode
+    // ...with reduced logging (every 10th failure)
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - P2P-first batch fetching, skip InsightAPI in Tor mode
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

@@ -127,6 +127,13 @@ public final class TorManager: ObservableObject {
     private var isWaitingForSocksProxy = false
     private let socksProxyLock = NSLock()
 
+    /// Timestamp when SOCKS proxy became connected (for .onion circuit warmup delay)
+    private var connectedSinceTimestamp: Date?
+
+    /// Minimum delay after SOCKS proxy is ready before .onion circuits are likely established
+    /// Hidden services require rendezvous circuits which take additional time to set up
+    private let onionCircuitWarmupSeconds: TimeInterval = 10.0
+
     // MARK: - Initialization
 
     private init() {
@@ -260,6 +267,26 @@ public final class TorManager: ObservableObject {
         mode == .enabled && connectionState.isConnected
     }
 
+    /// Check if .onion circuits are likely ready (connected for warmup period)
+    /// .onion addresses require rendezvous circuits which take time to establish
+    /// Regular IPv4 connections via SOCKS work immediately; .onion needs ~10s warmup
+    public var isOnionCircuitsReady: Bool {
+        guard connectionState.isConnected, let connectedSince = connectedSinceTimestamp else {
+            return false
+        }
+        let elapsed = Date().timeIntervalSince(connectedSince)
+        return elapsed >= onionCircuitWarmupSeconds
+    }
+
+    /// Time remaining until .onion circuits are ready (for UI)
+    public var onionCircuitWarmupRemaining: TimeInterval {
+        guard connectionState.isConnected, let connectedSince = connectedSinceTimestamp else {
+            return onionCircuitWarmupSeconds
+        }
+        let elapsed = Date().timeIntervalSince(connectedSince)
+        return max(0, onionCircuitWarmupSeconds - elapsed)
+    }
+
     /// Check if Arti (Rust Tor) is compiled in
     public var isArtiAvailable: Bool {
         zipherx_tor_is_available()
@@ -353,6 +380,7 @@ public final class TorManager: ObservableObject {
         connectionState = .disconnected
         socksPort = 0
         isStartingTor = false
+        connectedSinceTimestamp = nil  // Reset .onion circuit warmup timer
         resetSocksProxyState()  // Clear cached proxy state
 
         // Notify HiddenServiceManager that Tor is disconnected
@@ -410,7 +438,9 @@ public final class TorManager: ObservableObject {
                         await MainActor.run {
                             if proxyReady {
                                 self.connectionState = .connected
+                                self.connectedSinceTimestamp = Date()
                                 print("🧅 Tor fully connected! SOCKS proxy verified on port \(port)")
+                                print("🧅 .onion circuits will be ready in \(self.onionCircuitWarmupSeconds)s")
 
                                 // Notify FullNodeManager to update zclassic.conf with Tor proxy
                                 #if os(macOS)
@@ -620,11 +650,13 @@ extension TorManager {
 
     /// Get debug info about Tor status
     public var debugInfo: String {
-        """
+        let circuitsStatus = isOnionCircuitsReady ? "Ready" : "Warming (\(Int(onionCircuitWarmupRemaining))s)"
+        return """
         🧅 Tor Status (Arti)
         ─────────────────────────
         Mode: \(mode.displayName)
         State: \(connectionState.displayText)
+        .onion Circuits: \(circuitsStatus)
         Arti Available: \(isArtiAvailable)
         SOCKS: \(proxyHost):\(socksPort)
         Circuit ID: \(currentCircuitId ?? "N/A")
