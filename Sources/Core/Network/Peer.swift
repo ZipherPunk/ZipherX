@@ -283,17 +283,16 @@ final class Peer {
 
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: port))
 
-        // Use Tor parameters if Tor is enabled and connected (for privacy even with regular IPs)
-        let parameters: NWParameters
+        // Use Tor parameters if Tor is enabled (for privacy even with regular IPs)
+        // CRITICAL: If Tor mode is enabled, ALWAYS use SOCKS5 (connectViaSocks5 will wait for Tor)
+        // This prevents direct connections when Tor isn't ready yet
         let torEnabled = await TorManager.shared.mode == .enabled
-        let torConnected = await TorManager.shared.connectionState.isConnected
-        if torEnabled && torConnected {
-            // Route through Tor SOCKS5 proxy for privacy
+        if torEnabled {
+            // Route through Tor SOCKS5 proxy for privacy (will wait for Tor if not ready)
             try await connectViaSocks5()
             return
-        } else {
-            parameters = NWParameters.tcp
         }
+        let parameters = NWParameters.tcp
         // Don't restrict to wifi - allow any network interface
         // parameters.requiredInterfaceType = .wifi
 

@@ -1154,6 +1154,32 @@ final class NetworkManager: ObservableObject {
         isConnecting = true
         defer { isConnecting = false }
 
+        // CRITICAL: If Tor mode is enabled, WAIT for Tor to connect first
+        // Otherwise IPv4 peers will fail and get banned before Tor is ready
+        let torMode = await TorManager.shared.mode
+        if torMode == .enabled {
+            var torConnected = await TorManager.shared.connectionState.isConnected
+            if !torConnected {
+                print("🧅 Tor mode enabled - waiting for Tor to connect (max 30s)...")
+                var waitCount = 0
+                let maxWait = 300 // 30 seconds max
+                while !torConnected && waitCount < maxWait {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    waitCount += 1
+                    torConnected = await TorManager.shared.connectionState.isConnected
+                    if waitCount % 50 == 0 {
+                        let state = await TorManager.shared.connectionState
+                        print("🧅 Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
+                    }
+                }
+                if !torConnected {
+                    print("⚠️ Tor did not connect within 30s, proceeding with .onion peers only")
+                } else {
+                    print("✅ Tor connected, proceeding with P2P connections")
+                }
+            }
+        }
+
         // Update Tor availability status for .onion peer selection
         await updateTorAvailability()
 
