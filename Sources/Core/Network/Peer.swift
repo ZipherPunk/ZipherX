@@ -145,6 +145,7 @@ final class Peer {
     // Block announcement listener
     private var blockListenerTask: Task<Void, Never>?
     private var isListening = false
+    private let listenerLock = NSLock()
 
     /// Callback when a new block is announced via P2P inv message
     /// Parameters: block hash (32 bytes, wire format)
@@ -824,8 +825,19 @@ final class Peer {
     /// Call this after handshake completes
     /// NOTE: The listener only runs when peer is idle (not busy with other operations)
     func startBlockListener() {
-        guard !isListening else { return }
+        // ATOMIC CHECK: Use lock to prevent multiple listeners from starting
+        // Without lock, two concurrent calls could both pass the guard before either sets isListening
+        listenerLock.lock()
+        if isListening {
+            listenerLock.unlock()
+            print("📡 [\(host)] Block listener already running, skipping")
+            return
+        }
+        // Cancel any existing task just to be safe
+        blockListenerTask?.cancel()
+        blockListenerTask = nil
         isListening = true
+        listenerLock.unlock()
 
         blockListenerTask = Task { [weak self] in
             guard let self = self else { return }
@@ -903,15 +915,21 @@ final class Peer {
                 }
             }
 
+            // Reset isListening when task ends (use lock for thread safety)
+            self.listenerLock.lock()
+            self.isListening = false
+            self.listenerLock.unlock()
             print("📡 [\(self.host)] Block listener ended")
         }
     }
 
     /// Stop listening for block announcements
     func stopBlockListener() {
+        listenerLock.lock()
         isListening = false
         blockListenerTask?.cancel()
         blockListenerTask = nil
+        listenerLock.unlock()
     }
 
     /// Receive message without blocking indefinitely (uses short timeout)

@@ -5301,6 +5301,57 @@ func connect() async throws {
 
 ---
 
+### 103. Duplicate Block Listener Prevention (December 10, 2025)
+
+**Problem**: Invalid magic bytes errors still occurring. Two block listeners were running on the same peer simultaneously - both ended at the exact same timestamp:
+```
+[13:50:19.323] 📡 [205.209.104.118] Too many invalid magic bytes, stopping listener
+[13:50:19.323] 📡 [205.209.104.118] Block listener ended
+[13:50:19.323] 📡 [205.209.104.118] Too many invalid magic bytes, stopping listener
+[13:50:19.323] 📡 [205.209.104.118] Block listener ended
+```
+
+**Root Cause**: The `isListening` check in `startBlockListener()` wasn't atomic:
+```swift
+// OLD CODE (race condition):
+guard !isListening else { return }  // Check at time T
+isListening = true                   // Set at time T+1
+// Two concurrent calls could both pass the guard before either sets isListening
+```
+
+**Solution: Atomic Listener Start**
+
+Added `listenerLock` to make the check-and-set atomic (`Peer.swift:148, 827-840`):
+
+```swift
+private let listenerLock = NSLock()
+
+func startBlockListener() {
+    // ATOMIC CHECK: Use lock to prevent multiple listeners
+    listenerLock.lock()
+    if isListening {
+        listenerLock.unlock()
+        print("📡 [\(host)] Block listener already running, skipping")
+        return
+    }
+    // Cancel any existing task just to be safe
+    blockListenerTask?.cancel()
+    blockListenerTask = nil
+    isListening = true
+    listenerLock.unlock()
+    // ... start listener task ...
+}
+```
+
+Also updated:
+- `stopBlockListener()` - Uses lock when resetting `isListening`
+- Task end - Uses lock when resetting `isListening` on natural completion
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Added `listenerLock`, atomic listener start/stop
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
