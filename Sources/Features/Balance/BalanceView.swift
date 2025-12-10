@@ -1562,16 +1562,19 @@ struct BalanceView: View {
     }
 
     private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
+        HStack(spacing: 4) {
             Text(label)
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             Text(value)
                 .font(theme.captionFont)
                 .foregroundColor(theme.textPrimary)
                 .lineLimit(1)
             Spacer()
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
