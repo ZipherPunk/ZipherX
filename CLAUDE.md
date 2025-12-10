@@ -6062,6 +6062,56 @@ This is already partially implemented (see Fix #70) but can be enhanced.
 
 ---
 
+### 114. Infinite SOCKS5 Reconnection Loop Fix (December 10, 2025)
+
+**Problem**: iOS Simulator in Tor mode showed an infinite reconnection loop with the same IPs being attempted every ~300ms:
+```
+[16:35:28.448] 🧅 [67.183.29.123] Connecting via SOCKS5 proxy (port 9251)...
+[16:35:28.668] 🧅 [162.55.92.62] Connecting via SOCKS5 proxy (port 9251)...
+[16:35:28.991] 🧅 [157.90.223.151] Connecting via SOCKS5 proxy (port 9251)...
+[16:35:29.317] 🧅 [67.183.29.123] Connecting via SOCKS5 proxy (port 9251)...  ← Same IP again!
+```
+
+587 SOCKS5 connection attempts with only 61 successful (10% success rate).
+
+**Root Cause**: The cooldown logic in `Peer.swift` was per-Peer-object, but `NetworkManager.connectToPeer()` creates a **NEW Peer object** for each attempt. Each new Peer has `lastAttempt = nil`, so the cooldown was never triggered.
+
+**Solution**: Added connection cooldown at the **NetworkManager level** (tracks by IP address):
+
+```swift
+// MARK: - Connection Cooldown (FIX #114)
+private var connectionAttempts: [String: Date] = [:]
+private let connectionAttemptsLock = NSLock()
+private let CONNECTION_COOLDOWN: TimeInterval = 5.0
+
+private func isOnCooldown(_ host: String, port: UInt16) -> Bool {
+    let key = "\(host):\(port)"
+    connectionAttemptsLock.lock()
+    defer { connectionAttemptsLock.unlock() }
+
+    if let lastAttempt = connectionAttempts[key] {
+        let elapsed = Date().timeIntervalSince(lastAttempt)
+        return elapsed < CONNECTION_COOLDOWN
+    }
+    return false
+}
+```
+
+**Applied in connection loop**:
+```swift
+// FIX #114: Skip addresses on cooldown to prevent infinite reconnection loops
+if self.isOnCooldown(address.host, port: address.port) {
+    continue
+}
+// Record attempt BEFORE trying (cooldown starts now)
+self.recordConnectionAttempt(address.host, port: address.port)
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Added `connectionAttempts` dictionary, `isOnCooldown()`, `recordConnectionAttempt()`, and cooldown check in connection loop
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

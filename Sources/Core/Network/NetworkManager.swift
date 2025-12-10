@@ -180,6 +180,34 @@ final class NetworkManager: ObservableObject {
     /// Set to true during ContentView's initial sync task, false after completion
     var suppressBackgroundSync: Bool = false
 
+    // MARK: - Connection Cooldown (FIX #114)
+    /// Track last connection attempt per address to prevent infinite reconnection loops
+    /// Key: "host:port", Value: timestamp of last attempt
+    private var connectionAttempts: [String: Date] = [:]
+    private let connectionAttemptsLock = NSLock()
+    private let CONNECTION_COOLDOWN: TimeInterval = 5.0  // 5 seconds between attempts to same address
+
+    /// Check if an address is on cooldown (recently attempted)
+    private func isOnCooldown(_ host: String, port: UInt16) -> Bool {
+        let key = "\(host):\(port)"
+        connectionAttemptsLock.lock()
+        defer { connectionAttemptsLock.unlock() }
+
+        if let lastAttempt = connectionAttempts[key] {
+            let elapsed = Date().timeIntervalSince(lastAttempt)
+            return elapsed < CONNECTION_COOLDOWN
+        }
+        return false
+    }
+
+    /// Record a connection attempt for cooldown tracking
+    private func recordConnectionAttempt(_ host: String, port: UInt16) {
+        let key = "\(host):\(port)"
+        connectionAttemptsLock.lock()
+        connectionAttempts[key] = Date()
+        connectionAttemptsLock.unlock()
+    }
+
     // MARK: - Private Properties
     internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
 
@@ -1367,7 +1395,15 @@ final class NetworkManager: ObservableObject {
                     guard !attemptedThisBatch.contains(key) else { continue }
                     attemptedThisBatch.insert(key)
 
+                    // FIX #114: Skip addresses on cooldown to prevent infinite reconnection loops
+                    if self.isOnCooldown(address.host, port: address.port) {
+                        continue
+                    }
+
                     group.addTask {
+                        // Record attempt BEFORE trying (cooldown starts now)
+                        self.recordConnectionAttempt(address.host, port: address.port)
+
                         do {
                             print("🔄 Trying \(address.host):\(address.port)...")
                             let peer = try await self.connectToPeer(address)
