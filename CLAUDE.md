@@ -5406,6 +5406,99 @@ Now the lock is released **synchronously** before the function returns, ensuring
 
 ---
 
+### 105. Missing withExclusiveAccess() Wrappers - Bypassed Lock (December 10, 2025)
+
+**Problem**: Invalid magic bytes errors STILL occurring on ALL peers even after fix #104. All 6 peers showed errors within 100ms:
+```
+[13:56:26.984] 🧅 [185.205.246.161] Invalid magic bytes: got cf68c0d4, expected 24e92764
+[13:56:27.056] 🧅 [37.187.76.79] Invalid magic bytes: got cf68c0d4, expected 24e92764
+[13:56:27.087] 🧅 [80.67.172.162] Invalid magic bytes: got 6ef5b856, expected 24e92764
+[13:56:27.087] 🧅 [80.67.172.162] Invalid magic bytes: got 6e737761, expected 24e92764
+```
+
+All block listeners eventually died: "Too many invalid magic bytes, stopping listener"
+
+**Root Cause**: The `withExclusiveAccess()` fix only protects operations that USE it. Three critical P2P operations were calling `sendMessage()`/`receiveMessage()` DIRECTLY without the lock:
+
+1. **HeaderSyncManager.requestHeaders()** - Used for header sync
+2. **Peer.getBlockByHash()** - Used for single block fetch
+3. **Peer.getBlocksByHashes()** - Used for batch block fetch
+
+When these operations ran while the block listener was active, they read from the same socket simultaneously → stream desync → invalid magic bytes.
+
+**Solution**: Wrapped all three functions in `withExclusiveAccess()`:
+
+**Fix 1 - HeaderSyncManager.swift (lines 357-399)**:
+```swift
+private func requestHeaders(...) async throws -> [ZclassicBlockHeader] {
+    let payload = buildGetHeadersPayload(startHeight: startHeight)
+
+    // CRITICAL FIX: Wrap send+receive in withExclusiveAccess
+    let headers = try await peer.withExclusiveAccess {
+        try await peer.sendMessage(command: "getheaders", payload: payload)
+
+        var receivedHeaders: [ZclassicBlockHeader]?
+        var attempts = 0
+        while receivedHeaders == nil && attempts < 10 {
+            let (command, response) = try await peer.receiveMessage()
+            if command == "headers" {
+                receivedHeaders = try self.parseHeadersPayload(response, startingAt: startHeight)
+            }
+            attempts += 1
+        }
+        guard let headers = receivedHeaders else {
+            throw SyncError.unexpectedMessage(...)
+        }
+        return headers
+    }
+    return headers
+}
+```
+
+**Fix 2 - Peer.swift getBlockByHash() (lines 2349-2417)**:
+```swift
+func getBlockByHash(hash: Data) async throws -> CompactBlock {
+    try await ensureConnected()
+    // Build payload outside lock
+    var payload = Data()
+    // ... build MSG_BLOCK getdata ...
+
+    // CRITICAL FIX: Wrap send+receive in withExclusiveAccess
+    return try await withExclusiveAccess {
+        try await self.sendMessage(command: "getdata", payload: payload)
+        // ... receive loop ...
+    }
+}
+```
+
+**Fix 3 - Peer.swift getBlocksByHashes() (lines 2419-2498)**:
+```swift
+func getBlocksByHashes(hashes: [Data]) async throws -> [CompactBlock] {
+    try await ensureConnected()
+    // Build payload outside lock
+    var payload = Data()
+    // ... build MSG_BLOCK getdata for multiple hashes ...
+
+    // CRITICAL FIX: Wrap send+receive in withExclusiveAccess
+    return try await withExclusiveAccess {
+        try await self.sendMessage(command: "getdata", payload: payload)
+        // ... receive loop ...
+    }
+}
+```
+
+**Why This Completes the Fix**:
+- Fix #104 made `withExclusiveAccess()` actually work (synchronous lock release)
+- Fix #105 ensures ALL P2P operations USE the lock
+- Block listener uses `tryAcquire()` which properly checks the lock
+- Now NO concurrent socket reads are possible
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Wrapped `requestHeaders()` in `withExclusiveAccess()`
+- `Sources/Core/Network/Peer.swift` - Wrapped `getBlockByHash()` and `getBlocksByHashes()` in `withExclusiveAccess()`
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

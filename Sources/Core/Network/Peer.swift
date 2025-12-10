@@ -2348,69 +2348,72 @@ final class Peer {
 
     /// Get a single block by its hash via P2P getdata
     func getBlockByHash(hash: Data) async throws -> CompactBlock {
-        // Ensure connection is fresh before making request
+        // Ensure connection is fresh before making request (outside lock)
         try await ensureConnected()
 
         guard hash.count == 32 else {
             throw PeerError.invalidData
         }
 
-        // Build getdata message for single block
+        // Build getdata message for single block (outside lock - pure computation)
         var payload = Data()
         payload.append(1) // count = 1
         payload.append(contentsOf: withUnsafeBytes(of: UInt32(2).littleEndian) { Array($0) }) // MSG_BLOCK = 2
         payload.append(hash)
 
-        try await sendMessage(command: "getdata", payload: payload)
+        // CRITICAL FIX: Wrap send+receive in withExclusiveAccess to prevent race with block listener
+        return try await withExclusiveAccess {
+            try await self.sendMessage(command: "getdata", payload: payload)
 
-        // Wait for block response with timeout
-        // Peers may send ping, inv, addr messages - we need to handle them
-        var attempts = 0
-        let maxAttempts = 30 // Increased from 10 - blocks can be large and slow
-        while attempts < maxAttempts {
-            attempts += 1
+            // Wait for block response with timeout
+            // Peers may send ping, inv, addr messages - we need to handle them
+            var attempts = 0
+            let maxAttempts = 30 // Increased from 10 - blocks can be large and slow
+            while attempts < maxAttempts {
+                attempts += 1
 
-            // Add timeout for each receive attempt
-            do {
-                let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
-                    group.addTask {
-                        try await self.receiveMessage()
+                // Add timeout for each receive attempt
+                do {
+                    let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
+                        group.addTask {
+                            try await self.receiveMessage()
+                        }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
+                            throw PeerError.timeout
+                        }
+
+                        let result = try await group.next()!
+                        group.cancelAll()
+                        return result
                     }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
-                        throw PeerError.timeout
-                    }
 
-                    let result = try await group.next()!
-                    group.cancelAll()
-                    return result
+                    let (command, response) = result
+
+                    if command == "block" {
+                        if let block = self.parseCompactBlock(response) {
+                            return block
+                        }
+                        throw PeerError.invalidData
+                    } else if command == "notfound" {
+                        // Peer doesn't have this block
+                        throw PeerError.invalidData
+                    } else if command == "ping" {
+                        // Respond to ping with pong
+                        try? await self.sendMessage(command: "pong", payload: response)
+                    }
+                    // Continue waiting for block message
+                } catch is CancellationError {
+                    // Timeout on this attempt, continue to next
+                    continue
+                } catch PeerError.timeout {
+                    // Timeout, continue to next attempt
+                    continue
                 }
-
-                let (command, response) = result
-
-                if command == "block" {
-                    if let block = parseCompactBlock(response) {
-                        return block
-                    }
-                    throw PeerError.invalidData
-                } else if command == "notfound" {
-                    // Peer doesn't have this block
-                    throw PeerError.invalidData
-                } else if command == "ping" {
-                    // Respond to ping with pong
-                    try? await sendMessage(command: "pong", payload: response)
-                }
-                // Continue waiting for block message
-            } catch is CancellationError {
-                // Timeout on this attempt, continue to next
-                continue
-            } catch PeerError.timeout {
-                // Timeout, continue to next attempt
-                continue
             }
-        }
 
-        throw PeerError.timeout
+            throw PeerError.timeout
+        }
     }
 
     /// Get multiple blocks by their hashes via a single P2P getdata message (batch)
@@ -2418,15 +2421,15 @@ final class Peer {
     func getBlocksByHashes(hashes: [Data]) async throws -> [CompactBlock] {
         guard !hashes.isEmpty else { return [] }
 
-        // Ensure connection is fresh before making request
+        // Ensure connection is fresh before making request (outside lock)
         try await ensureConnected()
 
-        // Validate all hashes
+        // Validate all hashes (outside lock - pure computation)
         for hash in hashes {
             guard hash.count == 32 else { throw PeerError.invalidData }
         }
 
-        // Build getdata message for multiple blocks
+        // Build getdata message for multiple blocks (outside lock - pure computation)
         var payload = Data()
         // Encode count as varint (simple case: count < 253)
         if hashes.count < 253 {
@@ -2441,54 +2444,57 @@ final class Peer {
             payload.append(hash)
         }
 
-        try await sendMessage(command: "getdata", payload: payload)
+        // CRITICAL FIX: Wrap send+receive in withExclusiveAccess to prevent race with block listener
+        return try await withExclusiveAccess {
+            try await self.sendMessage(command: "getdata", payload: payload)
 
-        // Wait for all block responses
-        var blocks: [CompactBlock] = []
-        var attempts = 0
-        let maxAttempts = hashes.count * 30 + 30 // Scale with batch size
+            // Wait for all block responses
+            var blocks: [CompactBlock] = []
+            var attempts = 0
+            let maxAttempts = hashes.count * 30 + 30 // Scale with batch size
 
-        while blocks.count < hashes.count && attempts < maxAttempts {
-            attempts += 1
+            while blocks.count < hashes.count && attempts < maxAttempts {
+                attempts += 1
 
-            do {
-                let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
-                    group.addTask {
-                        try await self.receiveMessage()
+                do {
+                    let result = try await withThrowingTaskGroup(of: (String, Data).self) { group in
+                        group.addTask {
+                            try await self.receiveMessage()
+                        }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
+                            throw PeerError.timeout
+                        }
+
+                        let result = try await group.next()!
+                        group.cancelAll()
+                        return result
                     }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout per message
-                        throw PeerError.timeout
+
+                    let (command, response) = result
+
+                    if command == "block" {
+                        if let block = self.parseCompactBlock(response) {
+                            blocks.append(block)
+                        }
+                    } else if command == "notfound" {
+                        // Peer doesn't have one of the blocks - just continue
+                        continue
+                    } else if command == "ping" {
+                        try? await self.sendMessage(command: "pong", payload: response)
                     }
-
-                    let result = try await group.next()!
-                    group.cancelAll()
-                    return result
-                }
-
-                let (command, response) = result
-
-                if command == "block" {
-                    if let block = parseCompactBlock(response) {
-                        blocks.append(block)
-                    }
-                } else if command == "notfound" {
-                    // Peer doesn't have one of the blocks - just continue
+                    // Continue waiting for more block messages
+                } catch is CancellationError {
                     continue
-                } else if command == "ping" {
-                    try? await sendMessage(command: "pong", payload: response)
+                } catch PeerError.timeout {
+                    // If we have some blocks but hit timeout, return what we have
+                    if !blocks.isEmpty { break }
+                    continue
                 }
-                // Continue waiting for more block messages
-            } catch is CancellationError {
-                continue
-            } catch PeerError.timeout {
-                // If we have some blocks but hit timeout, return what we have
-                if !blocks.isEmpty { break }
-                continue
             }
-        }
 
-        return blocks
+            return blocks
+        }
     }
 
     /// Get a transaction by its hash via P2P getdata

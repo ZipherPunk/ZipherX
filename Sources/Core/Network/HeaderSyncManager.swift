@@ -359,32 +359,38 @@ final class HeaderSyncManager {
         startHeight: UInt64,
         endHeight: UInt64
     ) async throws -> [ZclassicBlockHeader] {
-        // Build getheaders payload
+        // Build getheaders payload (can be done outside the lock)
         let payload = buildGetHeadersPayload(startHeight: startHeight)
 
-        // Send getheaders message
-        try await peer.sendMessage(command: "getheaders", payload: payload)
+        // CRITICAL FIX: Wrap entire send+receive sequence in withExclusiveAccess
+        // This prevents block listener from reading our response while we're waiting for it
+        let headers = try await peer.withExclusiveAccess {
+            // Send getheaders message
+            try await peer.sendMessage(command: "getheaders", payload: payload)
 
-        // Loop until we receive headers response (peers may send inv/addr/ping first)
-        var headers: [ZclassicBlockHeader]?
-        let maxAttempts = 10
-        var attempts = 0
+            // Loop until we receive headers response (peers may send inv/addr/ping first)
+            var receivedHeaders: [ZclassicBlockHeader]?
+            let maxAttempts = 10
+            var attempts = 0
 
-        while headers == nil && attempts < maxAttempts {
-            attempts += 1
-            let (command, response) = try await peer.receiveMessage()
+            while receivedHeaders == nil && attempts < maxAttempts {
+                attempts += 1
+                let (command, response) = try await peer.receiveMessage()
 
-            if command == "headers" {
-                // Got the headers we requested!
-                headers = try parseHeadersPayload(response, startingAt: startHeight)
-            } else {
-                // Ignore other messages (inv, addr, ping, etc.)
-                print("📭 Peer sent '\(command)' message, waiting for headers...")
+                if command == "headers" {
+                    // Got the headers we requested!
+                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: startHeight)
+                } else {
+                    // Ignore other messages (inv, addr, ping, etc.)
+                    print("📭 Peer sent '\(command)' message, waiting for headers...")
+                }
             }
-        }
 
-        guard let headers = headers else {
-            throw SyncError.unexpectedMessage(expected: "headers", got: "timeout after \(maxAttempts) messages")
+            guard let headers = receivedHeaders else {
+                throw SyncError.unexpectedMessage(expected: "headers", got: "timeout after \(maxAttempts) messages")
+            }
+
+            return headers
         }
 
         peer.recordSuccess()
