@@ -5891,6 +5891,177 @@ Peer reports: 669,590,754
 
 ---
 
+### 113. Instant Transaction Architecture (December 10, 2025)
+
+**Goal**: Transaction build/broadcast should be INSTANT (~30s for zk-SNARK proof only), not 2-5+ minutes.
+
+#### Current Architecture (SLOW - Why Transactions Take Minutes)
+
+```
+User clicks SEND
+    ↓
+1. Get chain height from peers (~1-2s)
+    ↓
+2. Check if witnesses are stale (anchor ≠ current tree root)
+    ↓
+3. IF STALE: Rebuild witnesses (THIS IS THE BOTTLENECK!)
+   a. Load bundled CMU file (1M+ CMUs) - ~10s
+   b. Fetch delta CMUs via P2P for blocks after bundled height - ~30-180s
+   c. Append all delta CMUs to tree - ~5-10s
+   d. Create witnesses for each note being spent - ~5s per note
+    ↓
+4. Build zk-SNARK proof (~30s) - THIS IS THE ONLY ACCEPTABLE DELAY
+    ↓
+5. Broadcast to peers (~1-2s)
+```
+
+**Problem**: Steps 2-3 happen at SEND TIME, causing 2-5+ minute delays when witnesses are stale.
+
+#### Why Witnesses Become Stale
+
+A witness is a Merkle path from a note's CMU to the tree root (anchor). When new blocks arrive:
+- New CMUs are appended to the commitment tree
+- The tree root (anchor) changes
+- Old witnesses point to the old root → STALE
+
+The Sapling protocol requires: **witness root == transaction anchor**
+
+If they don't match → invalid zk-SNARK proof → transaction rejected by network.
+
+#### Ideal Architecture (INSTANT)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BACKGROUND (while app is running)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Every 30 seconds (or when new block detected):                             │
+│    1. Fetch new block headers from P2P                                      │
+│    2. Fetch CMUs from new blocks                                            │
+│    3. Append CMUs to in-memory tree                                         │
+│    4. UPDATE ALL WITNESSES for unspent notes ← KEY STEP!                    │
+│    5. Save tree checkpoint + witnesses to database                          │
+│                                                                              │
+│  Result: Witnesses ALWAYS match current tree root                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SEND TIME (user clicks SEND)                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Check witness anchor == current tree root                               │
+│     → YES: Use stored witness (INSTANT!)                                    │
+│     → NO: This should NOT happen if background sync is working              │
+│                                                                              │
+│  2. Build zk-SNARK proof (~30s) - ONLY acceptable delay                     │
+│                                                                              │
+│  3. Broadcast to peers (~1-2s)                                              │
+│                                                                              │
+│  Total time: ~30-35 seconds (proof generation only)                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Solution Components
+
+**Component 1: Pre-Rebuild Witnesses During Background Sync** (PRIORITY 1)
+
+Location: `WalletManager.backgroundSyncToHeight()` and `FilterScanner.startScan()`
+
+When new blocks are synced:
+1. CMUs are already appended to tree ✓
+2. **ADD**: Update ALL witnesses for unspent notes
+3. **ADD**: Save updated witnesses with current anchor to database
+
+```swift
+// In FilterScanner after appending CMUs to tree:
+func updateAllWitnessesAfterSync() async throws {
+    let notes = try database.getAllUnspentNotes()
+    let currentAnchor = ZipherXFFI.treeRoot()
+
+    for note in notes {
+        // Skip if witness already matches current anchor
+        if note.anchor == currentAnchor { continue }
+
+        // Update witness to current tree state
+        if let updatedWitness = ZipherXFFI.witnessUpdate(note.witness, toTreeRoot: currentAnchor) {
+            try database.updateNoteWitness(noteId: note.id, witness: updatedWitness, anchor: currentAnchor)
+        }
+    }
+}
+```
+
+**Component 2: Fast-Path at Send Time** (Already Partially Implemented)
+
+Location: `TransactionBuilder.buildShieldedTransactionWithProgress()`
+
+```swift
+// Already in code but needs improvement:
+if note.anchor == currentTreeRoot {
+    print("✅ INSTANT mode - witness already current!")
+    // Use stored witness directly - NO rebuild needed
+} else {
+    // This should NEVER happen if background sync is working
+    print("⚠️ Witness stale - background sync may have failed")
+    // Fall back to rebuild (but log it as a warning)
+}
+```
+
+**Component 3: Pre-Build Transaction** (Optional Enhancement)
+
+Location: `SendView.swift`
+
+When user enters recipient + amount:
+1. Start building transaction in background
+2. Store as `PreparedTransaction` with chain height
+3. On SEND click: verify height, then broadcast immediately
+
+This is already partially implemented (see Fix #70) but can be enhanced.
+
+#### What's Already Persisted vs What Needs Work
+
+| Component | Current Status | Needed |
+|-----------|---------------|--------|
+| Tree state (frontier) | ✅ Saved to `tree_state` table | Working |
+| CMU positions | ✅ Saved with each note | Working |
+| Witnesses | ✅ Saved with each note | Working |
+| Anchors | ✅ Saved with each note | Working |
+| **Witness updates during sync** | ❌ NOT IMPLEMENTED | **NEEDS WORK** |
+
+#### Implementation Plan
+
+1. **Add `preRebuildWitnessesForInstantPayment()` to WalletManager** ← FIX #113
+   - Called at end of every background sync
+   - Updates all unspent note witnesses to current tree state
+   - Saves updated witnesses + anchors to database
+
+2. **Modify FilterScanner to call witness update** ← Part of FIX #113
+   - After CMU append phase completes
+   - Before marking sync as complete
+
+3. **Add logging to track witness freshness**
+   - Log when witness is current (INSTANT mode)
+   - Log when witness is stale (REBUILD mode) - this should become rare
+
+#### Expected Results After Implementation
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| Send after fresh sync | ~30s (proof only) | ~30s (proof only) |
+| Send 10 minutes after sync | 2-5 minutes (rebuild) | ~30s (proof only) |
+| Send 1 hour after sync | 2-5 minutes (rebuild) | ~30s (proof only) |
+| Send after app restart | 2-5 minutes (rebuild) | ~30s (proof only) |
+
+**Key Insight**: By updating witnesses during BACKGROUND SYNC instead of at SEND TIME, we eliminate the bottleneck. The ~30s zk-SNARK proof generation is irreducible (cryptographic operation), but everything else should be instant.
+
+**Files to Modify**:
+- `Sources/Core/Wallet/WalletManager.swift` - Add `preRebuildWitnessesForInstantPayment()`
+- `Sources/Core/Network/FilterScanner.swift` - Call witness update after CMU append
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Add better logging for instant vs rebuild mode
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
