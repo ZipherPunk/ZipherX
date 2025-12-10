@@ -280,13 +280,10 @@ final class HeaderSyncManager {
                             peer.markActive()
                             return (peer.host, result)
                         } catch NetworkError.handshakeFailed {
-                            // Try reconnect once
-                            print("🔄 [\(peer.host)] Handshake failed, reconnecting...")
-                            peer.disconnect()
-                            try? await Task.sleep(nanoseconds: 50_000_000)
+                            // Try reconnect once using ensureConnected (has 5s cooldown)
+                            print("🔄 [\(peer.host)] Handshake failed, trying ensureConnected...")
                             do {
-                                try await peer.connect()
-                                try await peer.performHandshake()
+                                try await peer.ensureConnected()
                                 let result = try await self.requestHeaders(
                                     from: peer,
                                     startHeight: startHeight,
@@ -294,6 +291,11 @@ final class HeaderSyncManager {
                                 )
                                 peer.markActive()
                                 return (peer.host, result)
+                            } catch NetworkError.timeout {
+                                // Cooldown period - peer was recently reconnected
+                                print("⏳ [\(peer.host)] In reconnect cooldown, skipping...")
+                                peer.recordFailure()
+                                return (peer.host, nil)
                             } catch {
                                 peer.recordFailure()
                                 return (peer.host, nil)

@@ -2046,13 +2046,16 @@ final class NetworkManager: ObservableObject {
             var reconnectAttempts = 0
 
             // Try to reconnect disconnected peers (limited)
+            // Use ensureConnected() which has built-in 5-second cooldown to prevent infinite loops
             for peer in peers where !peer.isConnectionReady && reconnectAttempts < maxReconnectAttempts {
                 reconnectAttempts += 1
                 do {
-                    try await peer.connect()
-                    try await peer.performHandshake()
+                    try await peer.ensureConnected()
                     print("✅ scanMempoolForIncoming: reconnected to \(peer.host)")
                     break // Stop after first successful reconnection
+                } catch NetworkError.timeout {
+                    // Cooldown period - peer was recently reconnected, skip
+                    continue
                 } catch {
                     // Silently continue - we'll try other peers (up to limit)
                 }
@@ -2095,20 +2098,11 @@ final class NetworkManager: ObservableObject {
                 print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host)")
                 break
             } catch NetworkError.handshakeFailed {
-                // Connection is stale - try to reconnect
-                print("🔮 scanMempoolForIncoming: peer \(peer.host) stale, reconnecting...")
-                peer.disconnect()
-                do {
-                    try await peer.connect()
-                    try await peer.performHandshake()
-                    mempoolTxs = try await peer.getMempoolTransactions()
-                    successfulPeer = peer
-                    print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host) after reconnect")
-                    break
-                } catch {
-                    print("⚠️ scanMempoolForIncoming: peer \(peer.host) reconnect failed: \(error.localizedDescription)")
-                    continue
-                }
+                // Connection is stale - try to reconnect using ensureConnected (has 5s cooldown)
+                print("🔮 scanMempoolForIncoming: peer \(peer.host) stale, will try next peer...")
+                // Don't attempt immediate reconnect - let ensureConnected handle it on next iteration
+                // This prevents infinite reconnection loops
+                continue
             } catch {
                 print("⚠️ scanMempoolForIncoming: peer \(peer.host) failed: \(error.localizedDescription)")
                 continue

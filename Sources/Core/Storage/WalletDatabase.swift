@@ -1376,6 +1376,7 @@ final class WalletDatabase {
     // MARK: - Sync State
 
     /// Get last scanned height
+    /// FIX: Added validation to detect and auto-correct corrupted values
     func getLastScannedHeight() throws -> UInt64 {
         let sql = "SELECT last_scanned_height FROM sync_state WHERE id = 1;"
 
@@ -1389,11 +1390,42 @@ final class WalletDatabase {
             return 0
         }
 
-        return UInt64(sqlite3_column_int64(stmt, 0))
+        let rawHeight = UInt64(sqlite3_column_int64(stmt, 0))
+
+        // FIX: Validate lastScannedHeight - detect corruption
+        // Zclassic chain height is currently ~3 million
+        // Any value > 10 million is definitely corrupted
+        let maxReasonableHeight: UInt64 = 10_000_000
+
+        if rawHeight > maxReasonableHeight {
+            print("🚨 [DATABASE] Corrupted lastScannedHeight detected: \(rawHeight)")
+            print("   Resetting to bundled tree height...")
+
+            // Reset to bundled tree height (safe fallback)
+            let bundledHeight: UInt64 = 2_926_122  // From Constants
+            do {
+                try updateLastScannedHeight(bundledHeight, hash: Data(repeating: 0, count: 32))
+                print("   ✅ Reset to \(bundledHeight)")
+            } catch {
+                print("   ⚠️ Failed to reset: \(error)")
+            }
+
+            return bundledHeight
+        }
+
+        return rawHeight
     }
 
     /// Update last scanned height
+    /// FIX: Added validation to prevent writing corrupted values
     func updateLastScannedHeight(_ height: UInt64, hash: Data) throws {
+        // FIX: Validate height before writing to prevent corruption
+        let maxReasonableHeight: UInt64 = 10_000_000
+        guard height <= maxReasonableHeight else {
+            print("🚨 [DATABASE] Refusing to write invalid lastScannedHeight: \(height)")
+            return  // Silently ignore invalid updates
+        }
+
         let sql = "UPDATE sync_state SET last_scanned_height = ?, last_scanned_hash = ? WHERE id = 1;"
 
         var stmt: OpaquePointer?

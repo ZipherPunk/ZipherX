@@ -31,6 +31,17 @@ actor PeerMessageLock {
     var isBusy: Bool {
         return isLocked
     }
+
+    /// Try to acquire lock without waiting
+    /// Returns true if lock was acquired, false if already locked by another operation
+    /// Used by block listener to avoid blocking other P2P operations
+    func tryAcquire() -> Bool {
+        if isLocked {
+            return false
+        }
+        isLocked = true
+        return true
+    }
 }
 
 // MARK: - VUL-011: Token Bucket Rate Limiter
@@ -146,6 +157,11 @@ final class Peer {
 
     /// Whether we're connected via Tor SOCKS5 proxy (public for UI display)
     private(set) var isConnectedViaTor: Bool = false
+
+    /// Connection lock to prevent concurrent connection attempts
+    /// Multiple code paths calling connect() simultaneously can overwhelm the SOCKS5 proxy
+    private var isConnecting = false
+    private let connectionLock = NSLock()
 
     init(host: String, port: UInt16, networkMagic: [UInt8]) {
         self.id = UUID().uuidString
@@ -282,6 +298,37 @@ final class Peer {
     // MARK: - Connection
 
     func connect() async throws {
+        // CONCURRENT CONNECTION FIX: Prevent multiple code paths from connecting simultaneously
+        // The crash logs showed same peer logging "Connecting via SOCKS5" 3x at same timestamp
+        // This overwhelms the SOCKS5 proxy and causes all connections to fail
+        connectionLock.lock()
+        if isConnecting {
+            connectionLock.unlock()
+            // Another connection attempt is in progress - wait for it
+            print("⏳ [\(host)] Connection already in progress, waiting...")
+            var waited = 0
+            while isConnecting && waited < 100 { // Max 10 seconds (100 * 100ms)
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                waited += 1
+            }
+            // After waiting, check if connection succeeded
+            if isConnectionReady {
+                print("✅ [\(host)] Reusing existing connection")
+                return
+            }
+            // Connection failed during wait - try again (will acquire lock)
+            throw NetworkError.connectionFailed("Connection attempt in progress failed")
+        }
+        isConnecting = true
+        connectionLock.unlock()
+
+        // Ensure we reset isConnecting when done (success or failure)
+        defer {
+            connectionLock.lock()
+            isConnecting = false
+            connectionLock.unlock()
+        }
+
         // Check if this is a .onion address - requires Tor SOCKS5 proxy
         if isOnion {
             try await connectViaSocks5()
@@ -783,11 +830,15 @@ final class Peer {
         blockListenerTask = Task { [weak self] in
             guard let self = self else { return }
 
-            // For .onion peers, add initial delay to let Tor connection stabilize
-            // This prevents reading garbage bytes immediately after handshake
+            // Add initial delay to let connection stabilize after handshake
+            // This prevents reading garbage bytes that may be buffered
+            // Longer delay for .onion peers (Tor), shorter for regular peers
             if self.isOnion {
                 print("📡 [\(self.host)] .onion peer - waiting 2s for Tor connection to stabilize...")
                 try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            } else {
+                // Short delay for regular peers to let any pending handshake data clear
+                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
             }
 
             print("📡 [\(self.host)] Block listener started")
@@ -797,17 +848,30 @@ final class Peer {
 
             while self.isListening && self.connection != nil {
                 do {
-                    // Only listen when peer is not busy with other operations
-                    // This prevents interference with request-response patterns
-                    let isBusy = await self.messageLock.isBusy
-                    if isBusy {
-                        // Peer is busy, wait and retry
+                    // RACE CONDITION FIX: Acquire lock before receiving to prevent
+                    // concurrent socket reads with other P2P operations.
+                    // Uses tryAcquire() which returns immediately if lock is held,
+                    // avoiding blocking other operations.
+                    let acquired = await self.messageLock.tryAcquire()
+                    if !acquired {
+                        // Peer is busy with another operation, wait and retry
                         try await Task.sleep(nanoseconds: 500_000_000) // 500ms
                         continue
                     }
 
                     // Try to receive a message with a timeout
-                    let (command, payload) = try await self.receiveMessageNonBlockingTolerant()
+                    // Lock is held during receive to prevent concurrent reads
+                    let (command, payload): (String, Data)
+                    do {
+                        (command, payload) = try await self.receiveMessageNonBlockingTolerant()
+                    } catch {
+                        // Release lock before rethrowing
+                        await self.messageLock.release()
+                        throw error
+                    }
+
+                    // Release lock after receiving (before processing)
+                    await self.messageLock.release()
 
                     // Reset error counter on successful message
                     consecutiveErrors = 0
@@ -1821,21 +1885,29 @@ final class Peer {
         try await sendMessage(command: "getdata", payload: getdataPayload)
 
         // Receive block messages
+        // FIX: Use while loop to handle unexpected messages (like leftover 'headers') without advancing block index
         var blocks: [CompactBlock] = []
+        var blockIndex = 0
+        var unexpectedMessages = 0
+        let maxUnexpectedMessages = 10  // Prevent infinite loop if peer keeps sending wrong messages
 
-        for (index, hash) in blockHashes.enumerated() {
+        while blockIndex < blockHashes.count && unexpectedMessages < maxUnexpectedMessages {
             let (command, response) = try await receiveMessage()
 
+            // If we receive a non-block message, drain it and retry (don't advance blockIndex)
             guard command == "block" else {
-                print("⚠️ Expected block, got \(command)")
-                continue
+                print("⚠️ Expected block, got \(command) - draining and retrying")
+                unexpectedMessages += 1
+                continue  // Keep waiting for the actual block
             }
+
+            let hash = blockHashes[blockIndex]
 
             // Parse the full block
             if var block = parseCompactBlock(response) {
                 // Set correct height and preserve finalSaplingRoot
                 block = CompactBlock(
-                    blockHeight: height + UInt64(index),
+                    blockHeight: height + UInt64(blockIndex),
                     blockHash: hash,
                     prevHash: block.prevHash,
                     finalSaplingRoot: block.finalSaplingRoot,
@@ -1843,8 +1915,13 @@ final class Peer {
                     transactions: block.transactions
                 )
                 blocks.append(block)
-                print("📦 Got block \(height + UInt64(index))")
+                print("📦 Got block \(height + UInt64(blockIndex))")
             }
+            blockIndex += 1
+        }
+
+        if unexpectedMessages > 0 {
+            print("⚠️ Drained \(unexpectedMessages) unexpected messages during block fetch")
         }
 
         return blocks

@@ -5156,6 +5156,151 @@ private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt
 
 ---
 
+### 101. CRITICAL: Block Listener Race Condition Fix (December 10, 2025)
+
+**Problem**: "Invalid magic bytes" errors appearing on P2P peers, causing block listeners to die and mempool scanning to report all peers as "stale".
+
+**Symptoms in Log**:
+```
+[13:35:51.412] Invalid magic bytes: got fd0e0268, expected 24e92764
+[13:35:55.953] Invalid magic bytes: got fd110208, expected 24e92764
+```
+
+**Root Cause**: Race condition between block listener's `isBusy` check and receive operation:
+
+```swift
+// OLD CODE (race condition):
+let isBusy = await self.messageLock.isBusy  // Check at time T
+if isBusy { continue }
+// <-- RACE WINDOW: Another operation can acquire lock here at time T+1 -->
+let (command, payload) = try await self.receiveMessageNonBlockingTolerant()  // Read at time T+2
+```
+
+Between the check (line 802) and receive (line 810), another P2P operation (e.g., `getaddr` during network stats fetch) could acquire the lock and start receiving. Both operations then read from the same socket concurrently, causing stream desync and garbage magic bytes.
+
+**Evidence**: Invalid bytes like `fd0e0268`, `fd110208` are mid-message data (the `fd` prefix is a compact size varint), not the start of a new message.
+
+**Solution: Atomic Lock Acquisition**
+
+1. **Added `tryAcquire()` to PeerMessageLock** (`Peer.swift:35-44`):
+   ```swift
+   /// Try to acquire lock without waiting
+   /// Returns true if acquired, false if already locked
+   func tryAcquire() -> Bool {
+       if isLocked { return false }
+       isLocked = true
+       return true
+   }
+   ```
+
+2. **Block listener now acquires lock atomically** (`Peer.swift:811-834`):
+   ```swift
+   let acquired = await self.messageLock.tryAcquire()
+   if !acquired {
+       try await Task.sleep(nanoseconds: 500_000_000)
+       continue
+   }
+
+   let (command, payload): (String, Data)
+   do {
+       (command, payload) = try await self.receiveMessageNonBlockingTolerant()
+   } catch {
+       await self.messageLock.release()  // Release on error
+       throw error
+   }
+   await self.messageLock.release()  // Release after receive
+   ```
+
+3. **Added 200ms stabilization delay for ALL peers** (`Peer.swift:803-806`):
+   ```swift
+   // Short delay for regular peers to let any pending handshake data clear
+   try? await Task.sleep(nanoseconds: 200_000_000)
+   ```
+
+**How It Works**:
+- Block listener uses `tryAcquire()` which atomically checks AND acquires the lock
+- If lock already held (returns `false`), waits 500ms and retries
+- If lock acquired (returns `true`), holds it during receive to prevent concurrent reads
+- Other operations using `withExclusiveAccess()` wait for block listener to release
+- No more race condition between check and receive
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Added `tryAcquire()`, atomic block listener locking, stabilization delay
+
+---
+
+### 102. CRITICAL: Concurrent Connection Attempts Fix (December 10, 2025)
+
+**Problem**: macOS app crashing with all P2P peers failing. Console showed `Swift.CancellationError error 1` on all 5 peers, and SOCKS5 proxy connections to 127.0.0.1:9250 failing.
+
+**Key Evidence**:
+```
+[13:41:30.454] DEBUGZIPHERX: 🧅 [74.50.74.102] Connecting via SOCKS5 proxy (port 9250)...
+[13:41:30.454] DEBUGZIPHERX: 🧅 [74.50.74.102] Connecting via SOCKS5 proxy (port 9250)...
+[13:41:30.454] DEBUGZIPHERX: 🧅 [74.50.74.102] Connecting via SOCKS5 proxy (port 9250)...
+```
+
+The same peer logged "Connecting via SOCKS5" THREE times at the exact same timestamp (454ms). This indicates multiple code paths were calling `connect()` concurrently on the same peer.
+
+**Root Cause**: No protection against concurrent connection attempts:
+1. `connect()` is called from multiple code paths (initial connect, reconnect, ensureConnected)
+2. When Tor is enabled, all go through `connectViaSocks5()`
+3. Multiple concurrent SOCKS5 connections overwhelm the Arti proxy
+4. All connections fail with CancellationError
+
+**Solution: Connection Lock**
+
+Added `isConnecting` flag and `connectionLock` to prevent concurrent connection attempts (`Peer.swift:161-164, 301-330`):
+
+```swift
+/// Connection lock to prevent concurrent connection attempts
+private var isConnecting = false
+private let connectionLock = NSLock()
+
+func connect() async throws {
+    // CONCURRENT CONNECTION FIX
+    connectionLock.lock()
+    if isConnecting {
+        connectionLock.unlock()
+        // Another connection attempt is in progress - wait for it
+        debugLog("⏳ [\(host)] Connection already in progress, waiting...", category: .net)
+        var waited = 0
+        while isConnecting && waited < 100 { // Max 10 seconds
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            waited += 1
+        }
+        // After waiting, check if connection succeeded
+        if isConnectionReady {
+            debugLog("✅ [\(host)] Reusing existing connection", category: .net)
+            return
+        }
+        throw NetworkError.connectionFailed("Connection attempt in progress failed")
+    }
+    isConnecting = true
+    connectionLock.unlock()
+
+    defer {
+        connectionLock.lock()
+        isConnecting = false
+        connectionLock.unlock()
+    }
+
+    // ... rest of connect() ...
+}
+```
+
+**How It Works**:
+1. First caller acquires lock, sets `isConnecting = true`, proceeds with connection
+2. Subsequent callers see `isConnecting = true`, wait in loop checking every 100ms
+3. After first caller completes (success or failure), `defer` block sets `isConnecting = false`
+4. Waiting callers either reuse the successful connection or retry on failure
+5. Only ONE connection attempt per peer at a time, preventing SOCKS5 proxy overload
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Added connection lock to prevent concurrent attempts
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
