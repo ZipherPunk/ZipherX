@@ -51,11 +51,11 @@ echo "════════════════════════�
 lipo -create \
     target/release/libzipherx_ffi.a \
     target/x86_64-apple-darwin/release/libzipherx_ffi.a \
-    -output "$PROJECT_DIR/Libraries/libzipherx_ffi_macos.a"
+    -output "$PROJECT_DIR/Libraries/libzipherx_ffi.a"
 
 # Verify universal library
 echo "✅ Universal macOS library:"
-lipo -info "$PROJECT_DIR/Libraries/libzipherx_ffi_macos.a"
+lipo -info "$PROJECT_DIR/Libraries/libzipherx_ffi.a"
 
 # Copy to xcframework
 echo ""
@@ -63,10 +63,14 @@ echo "════════════════════════�
 echo "📦 Updating XCFramework..."
 echo "═══════════════════════════════════════════════════════════════"
 
-# macOS
-echo "  → macOS (arm64 + x86_64)..."
-cp "$PROJECT_DIR/Libraries/libzipherx_ffi_macos.a" \
-   "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos_universal.a"
+# macOS (copy to xcframework if the directory exists)
+if [ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64" ]; then
+    echo "  → macOS XCFramework (arm64 + x86_64)..."
+    cp "$PROJECT_DIR/Libraries/libzipherx_ffi.a" \
+       "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi.a"
+else
+    echo "  → macOS: Using standalone library (no XCFramework)"
+fi
 
 # iOS Device
 echo "  → iOS Device (arm64)..."
@@ -85,19 +89,17 @@ echo "🔍 Verifying updated libraries..."
 echo "═══════════════════════════════════════════════════════════════"
 
 echo ""
-echo "macOS ($(ls -lh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos_universal.a" | awk '{print $5}')):"
-ls -la "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos_universal.a"
-strings "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos_universal.a" 2>/dev/null | grep -i "fixed port" | head -1 || echo "  ⚠️ 'fixed port' string not found"
+echo "macOS standalone library:"
+ls -la "$PROJECT_DIR/Libraries/libzipherx_ffi.a"
+lipo -info "$PROJECT_DIR/Libraries/libzipherx_ffi.a"
 
 echo ""
-echo "iOS Device ($(ls -lh "$XCFRAMEWORK_DIR/ios-arm64/libzipherx_ffi.a" | awk '{print $5}')):"
+echo "iOS Device:"
 ls -la "$XCFRAMEWORK_DIR/ios-arm64/libzipherx_ffi.a"
-strings "$XCFRAMEWORK_DIR/ios-arm64/libzipherx_ffi.a" 2>/dev/null | grep -i "fixed port" | head -1 || echo "  ⚠️ 'fixed port' string not found"
 
 echo ""
-echo "iOS Simulator ($(ls -lh "$XCFRAMEWORK_DIR/ios-arm64-simulator/libzipherx_ffi.a" | awk '{print $5}')):"
+echo "iOS Simulator:"
 ls -la "$XCFRAMEWORK_DIR/ios-arm64-simulator/libzipherx_ffi.a"
-strings "$XCFRAMEWORK_DIR/ios-arm64-simulator/libzipherx_ffi.a" 2>/dev/null | grep -i "fixed port" | head -1 || echo "  ⚠️ 'fixed port' string not found"
 
 # Clean Xcode DerivedData
 echo ""

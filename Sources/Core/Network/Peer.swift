@@ -707,11 +707,24 @@ final class Peer {
     }
 
     /// Reconnect if connection is not ready or stale
+    /// Minimum time between reconnection attempts (seconds)
+    private static let minReconnectInterval: TimeInterval = 5.0
+
     func ensureConnected() async throws {
         let needsReconnect = !isConnectionReady || isConnectionStale
 
         if !needsReconnect {
             return // Connection is ready and fresh
+        }
+
+        // COOLDOWN: Prevent rapid reconnection attempts (prevents infinite loop)
+        if let lastAttempt = lastAttempt {
+            let timeSinceLastAttempt = Date().timeIntervalSince(lastAttempt)
+            if timeSinceLastAttempt < Self.minReconnectInterval {
+                let waitTime = Self.minReconnectInterval - timeSinceLastAttempt
+                print("⏳ [\(host)] Reconnect cooldown: waiting \(String(format: "%.1f", waitTime))s...")
+                throw NetworkError.timeout // Don't wait, just fail this attempt
+            }
         }
 
         // Log why we're reconnecting
@@ -966,10 +979,37 @@ final class Peer {
         let versionPayload = buildVersionPayload()
         try await sendMessage(command: "version", payload: versionPayload)
 
-        // Receive version and parse peer info
-        let (_, versionResponse) = try await receiveMessage()
-        parseVersionPayload(versionResponse)
-        print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
+        // Wait for version message from peer (with retry for non-version messages)
+        // Bitcoin P2P can send other messages before version in some edge cases
+        var receivedVersion = false
+        var versionAttempts = 0
+        let maxVersionAttempts = 5  // Max messages to check before giving up on version
+
+        while !receivedVersion && versionAttempts < maxVersionAttempts {
+            let (command, payload) = try await receiveMessage()
+            versionAttempts += 1
+
+            if command == "version" {
+                parseVersionPayload(payload)
+                // Validate version - Zclassic peers should be at least version 70002
+                if peerVersion >= 70002 {
+                    receivedVersion = true
+                    print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
+                } else {
+                    // Version 0 or very old version - likely parsing issue
+                    print("⚠️ [\(host)] Invalid peer version \(peerVersion) (payload: \(payload.count) bytes)")
+                    // Continue waiting for valid version
+                }
+            } else {
+                // Got non-version message first - log and continue waiting
+                print("📡 [\(host)] Got '\(command)' (\(payload.count) bytes) before version, waiting for version...")
+            }
+        }
+
+        if !receivedVersion {
+            print("❌ [\(host)] Never received version message after \(versionAttempts) attempts")
+            throw NetworkError.handshakeFailed
+        }
 
         // Signal we support addrv2 (BIP 155) for Tor v3 addresses
         // Per BIP155: sendaddrv2 MUST be sent AFTER version exchange but BEFORE verack is sent
@@ -1031,7 +1071,10 @@ final class Peer {
     }
 
     private func parseVersionPayload(_ data: Data) {
-        guard data.count >= 80 else { return }
+        guard data.count >= 80 else {
+            print("⚠️ [\(host)] Version payload too short: \(data.count) bytes (need 80+)")
+            return
+        }
 
         // Protocol version (bytes 0-3) - use safe loading
         peerVersion = data.loadInt32(at: 0)

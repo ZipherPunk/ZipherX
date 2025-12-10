@@ -4887,6 +4887,81 @@ if locatorHash == nil {
 
 ---
 
+### 96. P2P Handshake Infinite Loop Fix (December 10, 2025)
+
+**Problem**: After enabling Tor mode, zmac.log showed an infinite reconnection loop:
+```
+📡 [149.154.176.6] Peer version: 0, user-agent:
+📡 [149.154.176.6] No BIP155 - peer version 0 <= 170011
+📡 [149.154.176.6] Received ping during handshake
+📡 [149.154.176.6] Received getheaders during handshake
+🧅 [149.154.176.6] Connecting via SOCKS5 proxy...  (repeat)
+```
+
+**Root Cause Analysis**:
+1. In `performHandshake()`, code assumed first message received is always "version":
+   ```swift
+   let (_, versionResponse) = try await receiveMessage()  // Ignores command!
+   parseVersionPayload(versionResponse)
+   ```
+2. Over Tor, messages can be delayed/reordered - first message might NOT be "version"
+3. `parseVersionPayload()` silently returns if `data.count < 80` (guard clause)
+4. This left `peerVersion = 0` (default value)
+5. Handshake "completes" but peer disconnects because we never properly acknowledged their version
+6. Connection resets → immediate reconnection → repeat infinitely
+
+**Solution**: Three-part fix in `Peer.swift`:
+
+1. **Wait for actual version message** (with retry):
+   ```swift
+   var receivedVersion = false
+   var versionAttempts = 0
+   let maxVersionAttempts = 5
+
+   while !receivedVersion && versionAttempts < maxVersionAttempts {
+       let (command, payload) = try await receiveMessage()
+       versionAttempts += 1
+
+       if command == "version" {
+           parseVersionPayload(payload)
+           if peerVersion >= 70002 {  // Validate version
+               receivedVersion = true
+           }
+       } else {
+           print("📡 [\(host)] Got '\(command)' before version, waiting...")
+       }
+   }
+   ```
+
+2. **Version validation** - Reject peerVersion < 70002 (likely parsing failure)
+
+3. **Reconnection cooldown** - 5 second minimum between reconnection attempts:
+   ```swift
+   private static let minReconnectInterval: TimeInterval = 5.0
+
+   func ensureConnected() async throws {
+       if let lastAttempt = lastAttempt {
+           let timeSinceLastAttempt = Date().timeIntervalSince(lastAttempt)
+           if timeSinceLastAttempt < Self.minReconnectInterval {
+               throw NetworkError.timeout  // Don't wait, just fail this attempt
+           }
+       }
+       // ... rest of reconnection logic
+   }
+   ```
+
+**Debug Logging Added**:
+- `Got '\(command)' (\(payload.count) bytes) before version, waiting for version...`
+- `Invalid peer version \(peerVersion) (payload: \(payload.count) bytes)`
+- `Version payload too short: \(data.count) bytes (need 80+)`
+- `Reconnect cooldown: waiting \(waitTime)s...`
+- `Never received version message after \(versionAttempts) attempts`
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Version message waiting, validation, reconnection cooldown
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
