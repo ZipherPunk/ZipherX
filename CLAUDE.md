@@ -6112,6 +6112,115 @@ self.recordConnectionAttempt(address.host, port: address.port)
 
 ---
 
+### 115. CRITICAL: Multi-Input Transaction Anchor Mismatch Fix (December 10, 2025)
+
+**Problem**: Multi-input transactions (spending multiple notes) were rejected by the network with "invalid proof" error. The transaction was built successfully (2373 bytes) but not found in mempool.
+
+**Evidence from z.log**:
+```
+[16:33:58.276] 📝 Computed anchor from rebuilt tree: 0977233dbe2c0dc6...
+[16:33:58.319] 📝 Computed anchor from rebuilt tree: b7530811f4e214dd...
+```
+Two different anchors for two notes in the same transaction!
+
+**Root Cause**: In `rebuildWitnessForNote()` and `rebuildWitnessesForNotes()`:
+1. Each note's witness was rebuilt only up to that note's height (`noteHeight`)
+2. Note 1 at height 2936379 → tree built to 2936379 → anchor `0977...`
+3. Note 2 at height 2938279 → tree built to 2938279 → anchor `b753...`
+4. Different notes got different anchors!
+
+**Sapling Protocol Requirement**: ALL spends in a transaction MUST share the SAME anchor. When anchors are different:
+- librustzcash uses the first note's anchor
+- Second note's witness doesn't match that anchor
+- zk-SNARK proof is invalid
+- `librustzcash_sapling_check_spend()` fails
+- Transaction rejected with `bad-txns-sapling-spend-description-invalid`
+
+**Fix Applied**: Build tree to CHAIN TIP for all notes, not just to each note's height:
+
+1. **rebuildWitnessForNote()** - Added `chainHeight` parameter:
+   ```swift
+   func rebuildWitnessForNote(
+       cmu: Data,
+       noteHeight: UInt64,
+       downloadedTreeHeight: UInt64,
+       chainHeight: UInt64? = nil  // FIX #115
+   ) async throws -> (witness: Data, anchor: Data)?
+
+   // Fetch CMUs to targetHeight (chain tip), not just noteHeight
+   let targetHeight = chainHeight ?? NetworkManager.shared.getChainHeight()
+   let allDeltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+   ```
+
+2. **rebuildWitnessesForNotes()** - Added `chainHeight` parameter:
+   ```swift
+   func rebuildWitnessesForNotes(
+       notes: [SpendableNote],
+       downloadedTreeHeight: UInt64,
+       chainHeight: UInt64? = nil  // FIX #115
+   ) async throws -> [(note: SpendableNote, witness: Data, anchor: Data)]
+
+   // All notes built to same targetHeight = same anchor
+   let targetHeight = chainHeight ?? NetworkManager.shared.getChainHeight()
+   deltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+   ```
+
+3. **All callers updated** to pass `chainHeight` from the transaction context
+
+**Result**:
+- All notes now built to the SAME chain tip height
+- All witnesses have the SAME anchor
+- zk-SNARK proof is valid
+- Transaction accepted by network
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Fixed both rebuild functions and all callers
+
+---
+
+### Data Persistence - Delta CMUs, Tree State, Witnesses, Anchors
+
+**Question**: Est-ce que le delta CMU/tree/witnesses/anchor sont persistés au cas où l'utilisateur ferme l'app?
+
+**Oui, tout est persisté!** Voici où chaque donnée est stockée:
+
+| Donnée | Stockage | Fichier |
+|--------|----------|---------|
+| **Tree State** (arbre Merkle complet) | SQLite table `tree_state` | `zipherx_wallet.db` |
+| **Witnesses** (1028 octets chacun) | SQLite table `notes.witness` | `zipherx_wallet.db` |
+| **Anchors** (32 octets) | SQLite table `notes.anchor` | `zipherx_wallet.db` |
+| **Last Scanned Height** | SQLite table `sync_state` | `zipherx_wallet.db` |
+| **Boost File CMUs** | Cache Documents | `commitment_tree.bin` (~33 MB) |
+| **Headers (avec finalSaplingRoot)** | SQLite | `zipherx_headers.db` |
+
+**Flux au redémarrage de l'app**:
+1. `WalletManager.preloadCommitmentTree()` charge l'arbre depuis la DB
+2. Si `tree_state` existe → arbre chargé instantanément (~1s)
+3. Sinon → charge depuis le boost file (~54s pour 1M+ CMUs)
+4. Les notes ont déjà leurs witnesses stockés en DB
+5. Background sync détecte les nouveaux blocs et met à jour les witnesses
+
+**Code de sauvegarde** (après rebuild):
+```swift
+// TransactionBuilder.swift
+if let serializedTree = ZipherXFFI.treeSerialize() {
+    try? WalletDatabase.shared.saveTreeState(serializedTree)
+    print("💾 Updated tree state saved to database")
+}
+
+// FilterScanner.swift - après append de CMUs
+if let treeData = ZipherXFFI.treeSerialize() {
+    try? WalletDatabase.shared.saveTreeState(treeData)
+}
+```
+
+**Garantie**: Si l'utilisateur ferme l'app après une synchronisation, au prochain lancement:
+- L'arbre est à l'état exact du dernier sync
+- Les witnesses sont valides pour les notes existantes
+- Seuls les nouveaux blocs (delta) doivent être synchronisés
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

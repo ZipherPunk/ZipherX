@@ -338,10 +338,12 @@ final class TransactionBuilder {
             }
 
             // Rebuild witness using downloaded tree + fetched CMUs
+            // FIX #115: Pass chainHeight for consistent anchor
             if let result = try await rebuildWitnessForNote(
                 cmu: cmu,
                 noteHeight: noteHeight,
-                downloadedTreeHeight: downloadedTreeHeight
+                downloadedTreeHeight: downloadedTreeHeight,
+                chainHeight: chainHeight
             ) {
                 print("✅ Successfully rebuilt witness for note at height \(noteHeight)")
                 witnessToUse = result.witness
@@ -802,9 +804,11 @@ final class TransactionBuilder {
                     let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
                     print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
 
+                    // FIX #115: Pass chainHeight for consistent anchor across all notes
                     let results = try await rebuildWitnessesForNotes(
                         notes: selectedNotes,
-                        downloadedTreeHeight: cachedBoostHeight
+                        downloadedTreeHeight: cachedBoostHeight,
+                        chainHeight: chainHeight
                     )
 
                     for result in results {
@@ -820,15 +824,17 @@ final class TransactionBuilder {
                 let maxNoteHeight = selectedNotes.map { $0.height }.max() ?? 0
                 print("📊 Cached boost height: \(cachedBoostHeight), max note height: \(maxNoteHeight)")
 
+                // FIX #115: Pass chainHeight for consistent anchor across all notes
                 let results = try await rebuildWitnessesForNotes(
                     notes: selectedNotes,
-                    downloadedTreeHeight: cachedBoostHeight
+                    downloadedTreeHeight: cachedBoostHeight,
+                    chainHeight: chainHeight
                 )
 
                 for result in results {
                     preparedSpends.append((note: result.note, witness: result.witness))
                 }
-                print("✅ Created \(preparedSpends.count) witnesses with SAME anchor")
+                print("✅ Created \(preparedSpends.count) witnesses with SAME anchor (at chain tip \(chainHeight))")
             }
         } else {
             // Single-input transaction - use existing logic
@@ -878,10 +884,12 @@ final class TransactionBuilder {
                     }
 
                     print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight)")
+                    // FIX #115: Pass chainHeight for consistent anchor
                     if let result = try await rebuildWitnessForNote(
                         cmu: cmu,
                         noteHeight: noteHeight,
-                        downloadedTreeHeight: downloadedTreeHeight
+                        downloadedTreeHeight: downloadedTreeHeight,
+                        chainHeight: chainHeight
                     ) {
                         witnessToUse = result.witness
                     } else {
@@ -1183,12 +1191,27 @@ final class TransactionBuilder {
     /// Rebuild witness for a note that's beyond the bundled tree height
     /// This fetches CMUs from the chain and builds the tree up to the note's position
     /// Returns tuple of (witness, anchor) where anchor is the tree root at noteHeight
+    /// FIX #115: Added chainHeight parameter - fetch CMUs to chain tip for valid anchor
     func rebuildWitnessForNote(
         cmu: Data,
         noteHeight: UInt64,
-        downloadedTreeHeight: UInt64
+        downloadedTreeHeight: UInt64,
+        chainHeight: UInt64? = nil  // FIX #115: Target height for tree building
     ) async throws -> (witness: Data, anchor: Data)? {
-        print("🔄 Rebuilding witness for note at height \(noteHeight)...")
+        // FIX #115: Determine target height - use chain tip, not just note height
+        let targetHeight: UInt64
+        if let explicitHeight = chainHeight {
+            targetHeight = max(noteHeight, explicitHeight)
+        } else {
+            // Fetch current chain height for valid anchor
+            do {
+                let currentHeight = try await NetworkManager.shared.getChainHeight()
+                targetHeight = max(noteHeight, currentHeight)
+            } catch {
+                targetHeight = noteHeight  // Fallback
+            }
+        }
+        print("🔄 Rebuilding witness for note at height \(noteHeight), tree to height \(targetHeight)...")
         print("📝 Note CMU: \(cmu.map { String(format: "%02x", $0) }.joined().prefix(16))...")
 
         // 1. Load CMU file from GitHub cache
@@ -1219,13 +1242,14 @@ final class TransactionBuilder {
         let treeSize = ZipherXFFI.treeSize()
         print("✅ Tree now has \(treeSize) commitments")
 
-        // 4. Fetch additional CMUs from blocks between downloadedTreeHeight+1 and noteHeight
+        // 4. Fetch additional CMUs from blocks between downloadedTreeHeight+1 and targetHeight
+        // FIX #115: Fetch to targetHeight (chain tip), not just noteHeight
         let startHeight = downloadedTreeHeight + 1
-        print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight)...")
+        print("📡 Fetching CMUs from blocks \(startHeight) to \(targetHeight)...")
 
         // Batch fetch all CMUs using P2P-first approach
-        let allDeltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: noteHeight)
-        print("📊 Got \(allDeltaCMUs.count) CMUs from blocks \(startHeight) to \(noteHeight)")
+        let allDeltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+        print("📊 Got \(allDeltaCMUs.count) CMUs from blocks \(startHeight) to \(targetHeight)")
 
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
@@ -1267,7 +1291,7 @@ final class TransactionBuilder {
         }
 
         guard notePosition != nil else {
-            print("❌ Note CMU not found in blocks \(startHeight)-\(noteHeight)")
+            print("❌ Note CMU not found in blocks \(startHeight)-\(targetHeight)")
             return nil
         }
 
@@ -1304,15 +1328,38 @@ final class TransactionBuilder {
     /// Rebuild witnesses for MULTIPLE notes in a single tree-building pass
     /// This ensures all witnesses have the SAME anchor (required for multi-input transactions)
     /// Handles notes both within AND beyond the downloaded CMU range
+    /// FIX #115: Rebuild witnesses for multiple notes to a CONSISTENT chain tip height
+    /// All witnesses will share the same anchor (tree root at chainHeight)
     func rebuildWitnessesForNotes(
         notes: [SpendableNote],
-        downloadedTreeHeight: UInt64
+        downloadedTreeHeight: UInt64,
+        chainHeight: UInt64? = nil  // FIX #115: Optional chain height for consistent anchor
     ) async throws -> [(note: SpendableNote, witness: Data, anchor: Data)] {
         print("🔄 Rebuilding witnesses for \(notes.count) notes using boost + delta sync...")
 
         // Sort notes by height to process them in order
         let sortedNotes = notes.sorted { $0.height < $1.height }
         let maxNoteHeight = sortedNotes.last?.height ?? 0
+
+        // FIX #115: Use chainHeight if provided, otherwise fetch current chain height
+        // This ensures all witnesses are built to the SAME tree state
+        let targetHeight: UInt64
+        if let explicitChainHeight = chainHeight {
+            targetHeight = explicitChainHeight
+            print("📊 Using explicit chain height: \(targetHeight)")
+        } else {
+            // Fetch current chain height for consistent witness building
+            do {
+                targetHeight = try await NetworkManager.shared.getChainHeight()
+                print("📊 Fetched chain height: \(targetHeight)")
+            } catch {
+                // Fallback to max note height if chain height unavailable
+                targetHeight = maxNoteHeight
+                print("⚠️ Could not get chain height, using maxNoteHeight: \(targetHeight)")
+            }
+        }
+
+        print("📊 Will build tree to height \(targetHeight) (max note: \(maxNoteHeight))")
 
         // 1. Collect all note CMUs from database (they're already stored there!)
         var allNoteCMUs: [Data] = []
@@ -1342,14 +1389,16 @@ final class TransactionBuilder {
         print("📊 Boost file has \(boostCMUCount) CMUs up to height \(downloadedTreeHeight)")
 
         // 3. Fetch delta CMUs from chain (only blocks beyond boost file)
+        // FIX #115: Fetch to targetHeight (chain tip), NOT maxNoteHeight
+        // This ensures witnesses are built to a consistent, current tree state
         var deltaCMUs: [Data] = []
-        if maxNoteHeight > downloadedTreeHeight {
+        if targetHeight > downloadedTreeHeight {
             let startHeight = downloadedTreeHeight + 1
-            print("📡 Fetching delta CMUs from blocks \(startHeight) to \(maxNoteHeight)...")
+            print("📡 Fetching delta CMUs from blocks \(startHeight) to \(targetHeight)...")
 
             // Use batched P2P-first fetching (reduces log spam, works with Tor)
-            deltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: maxNoteHeight)
-            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain")
+            deltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain (covering \(targetHeight - startHeight + 1) blocks)")
         }
 
         // 4. Build combined CMU data: boost + delta
