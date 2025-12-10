@@ -1185,53 +1185,46 @@ final class TransactionBuilder {
         let startHeight = downloadedTreeHeight + 1
         print("📡 Fetching CMUs from blocks \(startHeight) to \(noteHeight)...")
 
+        // Batch fetch all CMUs using P2P-first approach
+        let allDeltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: noteHeight)
+        print("📊 Got \(allDeltaCMUs.count) CMUs from blocks \(startHeight) to \(noteHeight)")
+
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
 
-        for height in startHeight...noteHeight {
-            // Fetch block data via NetworkManager
-            do {
-                let blockCMUs = try await fetchCMUsViaInsight(height: height)
-                for blockCMU in blockCMUs {
-                    // Check if this is our note's CMU
-                    if blockCMU == cmu {
-                        // Found our note! Append it and capture witness
-                        let position = ZipherXFFI.treeAppend(cmu: blockCMU)
-                        if position == UInt64.max {
-                            print("❌ Failed to append note CMU")
-                            return nil
-                        }
-
-                        // Create witness immediately after appending our note
-                        let witnessIndex = ZipherXFFI.treeWitnessCurrent()
-                        if witnessIndex == UInt64.max {
-                            print("❌ Failed to create witness at note position")
-                            return nil
-                        }
-
-                        // Continue adding remaining CMUs to update the witness
-                        notePosition = position
-                        print("✅ Found note CMU at position \(position) in block \(height)")
-
-                        // Get witness data after finishing this block's CMUs
-                        // (we need to continue to end of block)
-                        additionalCMUs.append(blockCMU)
-                    } else if notePosition != nil {
-                        // After finding note, continue appending to update witness
-                        _ = ZipherXFFI.treeAppend(cmu: blockCMU)
-                        additionalCMUs.append(blockCMU)
-                    } else {
-                        // Before finding note, just append
-                        let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
-                        if pos == UInt64.max {
-                            print("⚠️ Failed to append CMU at height \(height)")
-                        }
-                        additionalCMUs.append(blockCMU)
-                    }
+        for blockCMU in allDeltaCMUs {
+            // Check if this is our note's CMU
+            if blockCMU == cmu {
+                // Found our note! Append it and capture witness
+                let position = ZipherXFFI.treeAppend(cmu: blockCMU)
+                if position == UInt64.max {
+                    print("❌ Failed to append note CMU")
+                    return nil
                 }
-            } catch {
-                print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
-                // Continue anyway - maybe note is in earlier block
+
+                // Create witness immediately after appending our note
+                let witnessIndex = ZipherXFFI.treeWitnessCurrent()
+                if witnessIndex == UInt64.max {
+                    print("❌ Failed to create witness at note position")
+                    return nil
+                }
+
+                // Continue adding remaining CMUs to update the witness
+                notePosition = position
+                print("✅ Found note CMU at position \(position)")
+
+                additionalCMUs.append(blockCMU)
+            } else if notePosition != nil {
+                // After finding note, continue appending to update witness
+                _ = ZipherXFFI.treeAppend(cmu: blockCMU)
+                additionalCMUs.append(blockCMU)
+            } else {
+                // Before finding note, just append
+                let pos = ZipherXFFI.treeAppend(cmu: blockCMU)
+                if pos == UInt64.max {
+                    print("⚠️ Failed to append CMU")
+                }
+                additionalCMUs.append(blockCMU)
             }
         }
 
@@ -1316,15 +1309,8 @@ final class TransactionBuilder {
             let startHeight = downloadedTreeHeight + 1
             print("📡 Fetching delta CMUs from blocks \(startHeight) to \(maxNoteHeight)...")
 
-            for height in startHeight...maxNoteHeight {
-                do {
-                    let blockCMUs = try await fetchCMUsViaInsight(height: height)
-                    deltaCMUs.append(contentsOf: blockCMUs)
-                    print("   Block \(height): \(blockCMUs.count) CMUs")
-                } catch {
-                    print("⚠️ Failed to fetch CMUs from block \(height): \(error)")
-                }
-            }
+            // Use batched P2P-first fetching (reduces log spam, works with Tor)
+            deltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: maxNoteHeight)
             print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain")
         }
 
@@ -1389,6 +1375,66 @@ final class TransactionBuilder {
 
         print("✅ Rebuilt \(results.count) witnesses with SAME anchor using boost + delta")
         return results
+    }
+
+    /// Fetch CMUs from a range of blocks using P2P first, then InsightAPI fallback
+    /// This batches requests to reduce log spam and uses P2P when Tor mode is enabled
+    private func fetchCMUsFromBlocks(startHeight: UInt64, endHeight: UInt64) async -> [Data] {
+        var allCMUs: [Data] = []
+        let networkManager = NetworkManager.shared
+        let torEnabled = await TorManager.shared.mode == .enabled
+
+        // Try P2P first (especially important for Tor mode)
+        if networkManager.isConnected, let peer = networkManager.getConnectedPeer() {
+            print("📡 Fetching delta CMUs via P2P (blocks \(startHeight)-\(endHeight))...")
+
+            let blockCount = Int(endHeight - startHeight + 1)
+            do {
+                let blocks = try await peer.getFullBlocks(from: startHeight, count: blockCount)
+                for block in blocks {
+                    for tx in block.transactions {
+                        for output in tx.outputs {
+                            // CMU from P2P is already in wire format (little-endian)
+                            allCMUs.append(output.cmu)
+                        }
+                    }
+                }
+                print("📡 P2P: Got \(allCMUs.count) CMUs from \(blocks.count) blocks")
+                return allCMUs
+            } catch {
+                print("⚠️ P2P fetch failed: \(error.localizedDescription)")
+                // Fall through to InsightAPI if not in Tor mode
+            }
+        }
+
+        // InsightAPI fallback (skip if Tor mode and API blocked)
+        if torEnabled {
+            print("⚠️ Skipping InsightAPI - Tor mode enabled and API likely blocked by Cloudflare")
+            return allCMUs
+        }
+
+        // InsightAPI fallback (batch with reduced logging)
+        print("📡 Fetching delta CMUs via InsightAPI (blocks \(startHeight)-\(endHeight))...")
+        var failCount = 0
+
+        for height in startHeight...endHeight {
+            do {
+                let blockCMUs = try await fetchCMUsViaInsight(height: height)
+                allCMUs.append(contentsOf: blockCMUs)
+            } catch {
+                failCount += 1
+                // Only log every 10th failure to reduce spam
+                if failCount == 1 || failCount % 10 == 0 {
+                    print("⚠️ Failed to fetch CMUs from block \(height): \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if failCount > 0 {
+            print("⚠️ Total InsightAPI failures: \(failCount)/\(endHeight - startHeight + 1) blocks")
+        }
+
+        return allCMUs
     }
 
     /// Fetch CMUs from a specific block height via Insight API
