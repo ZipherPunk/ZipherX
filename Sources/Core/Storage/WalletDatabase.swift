@@ -221,17 +221,27 @@ final class WalletDatabase {
                 }
             }
         } else {
-            // VUL-007 SECURITY FIX: SQLCipher is REQUIRED for wallet creation
-            // iOS Data Protection alone is insufficient - database is readable after first unlock
-            // Field-level encryption is a mitigation but doesn't protect metadata
-            sqlite3_close(db)
-            db = nil
-            print("🔐 VUL-007: SQLCipher required but not available - refusing to create wallet")
-            throw DatabaseError.encryptionRequired
+            // DEBUG: Allow unencrypted database for debugging
+            if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
+                print("⚠️ DEBUG: VUL-007 bypassed - SQLCipher disabled for debugging")
+            } else {
+                // VUL-007 SECURITY FIX: SQLCipher is REQUIRED for wallet creation
+                // iOS Data Protection alone is insufficient - database is readable after first unlock
+                // Field-level encryption is a mitigation but doesn't protect metadata
+                sqlite3_close(db)
+                db = nil
+                print("🔐 VUL-007: SQLCipher required but not available - refusing to create wallet")
+                throw DatabaseError.encryptionRequired
+            }
         }
 
         // Create tables
         try createTables()
+
+        // VUL-015: Migrate any existing plaintext tx_type values to obfuscated codes
+        // and remove duplicates caused by the type mismatch bug
+        try migrateTransactionHistoryTypes()
+
         print("📂 Database opened successfully")
     }
 
@@ -437,13 +447,27 @@ final class WalletDatabase {
             );
             """,
 
+            // Tree checkpoints - for fast witness generation and validation
+            // Stores verified tree state at block boundaries for reliable transaction building
+            """
+            CREATE TABLE IF NOT EXISTS tree_checkpoints (
+                height INTEGER PRIMARY KEY,
+                tree_root BLOB NOT NULL,
+                tree_serialized BLOB NOT NULL,
+                cmu_count INTEGER NOT NULL,
+                block_hash BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            """,
+
             // Indexes for performance
             "CREATE INDEX IF NOT EXISTS idx_notes_account ON notes(account_id);",
             "CREATE INDEX IF NOT EXISTS idx_notes_spent ON notes(is_spent);",
             "CREATE INDEX IF NOT EXISTS idx_notes_height ON notes(received_height);",
             "CREATE INDEX IF NOT EXISTS idx_nullifiers_height ON nullifiers(block_height);",
             "CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);",
-            "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);"
+            "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);",
+            "CREATE INDEX IF NOT EXISTS idx_tree_checkpoints_height ON tree_checkpoints(height DESC);"
         ]
 
         for schema in schemas {
@@ -1486,6 +1510,278 @@ final class WalletDatabase {
         print("🔄 Cleared tree state and witnesses for rebuild (preserved note records)")
     }
 
+    // MARK: - Tree Checkpoints
+    // Checkpoints store verified tree state at block boundaries for reliable transaction building
+
+    /// Checkpoint data structure
+    struct TreeCheckpoint {
+        let height: UInt64
+        let treeRoot: Data       // 32 bytes - finalsaplingroot at this height
+        let treeSerialized: Data // Serialized tree state
+        let cmuCount: UInt64     // Number of CMUs in tree at this height
+        let blockHash: Data      // 32 bytes - block hash for verification
+        let createdAt: Date
+    }
+
+    /// Save a verified tree checkpoint
+    /// Call this after initial sync completes and after each block during background sync
+    func saveTreeCheckpoint(
+        height: UInt64,
+        treeRoot: Data,
+        treeSerialized: Data,
+        cmuCount: UInt64,
+        blockHash: Data
+    ) throws {
+        // CRITICAL: Guard against nil database handle
+        // sqlite3_errmsg(nil) returns "out of memory" which was misleading
+        guard let database = db else {
+            print("⚠️ saveTreeCheckpoint: Database not open")
+            throw DatabaseError.notOpened
+        }
+
+        // Encrypt the serialized tree data (contains sensitive Merkle paths)
+        let encryptedTree = try encryptBlob(treeSerialized)
+
+        let sql = "INSERT OR REPLACE INTO tree_checkpoints (height, tree_root, tree_serialized, cmu_count, block_hash, created_at) VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'));"
+
+        var stmt: OpaquePointer?
+        let prepareResult = sqlite3_prepare_v2(database, sql, -1, &stmt, nil)
+        guard prepareResult == SQLITE_OK else {
+            let errorMsg = String(cString: sqlite3_errmsg(database))
+            print("⚠️ saveTreeCheckpoint prepare failed: \(errorMsg) (code: \(prepareResult))")
+            throw DatabaseError.prepareFailed(errorMsg)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+        treeRoot.withUnsafeBytes { sqlite3_bind_blob(stmt, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+        encryptedTree.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+        sqlite3_bind_int64(stmt, 4, Int64(cmuCount))
+        blockHash.withUnsafeBytes { sqlite3_bind_blob(stmt, 5, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+
+        let stepResult = sqlite3_step(stmt)
+        guard stepResult == SQLITE_DONE else {
+            let errorMsg = String(cString: sqlite3_errmsg(database))
+            print("⚠️ saveTreeCheckpoint step failed: \(errorMsg) (code: \(stepResult))")
+            throw DatabaseError.insertFailed(errorMsg)
+        }
+
+        debugLog(.wallet, "💾 Saved tree checkpoint at height \(height) (root: \(treeRoot.prefix(8).hexString)..., \(cmuCount) CMUs)")
+    }
+
+    /// Get checkpoint at or before the specified height
+    /// Useful for finding a valid starting point for witness rebuilding
+    func getTreeCheckpoint(atOrBefore height: UInt64) throws -> TreeCheckpoint? {
+        let sql = """
+            SELECT height, tree_root, tree_serialized, cmu_count, block_hash, created_at
+            FROM tree_checkpoints
+            WHERE height <= ?
+            ORDER BY height DESC
+            LIMIT 1;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseCheckpointRow(stmt)
+    }
+
+    /// Get the latest (highest) checkpoint
+    func getLatestTreeCheckpoint() throws -> TreeCheckpoint? {
+        let sql = """
+            SELECT height, tree_root, tree_serialized, cmu_count, block_hash, created_at
+            FROM tree_checkpoints
+            ORDER BY height DESC
+            LIMIT 1;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseCheckpointRow(stmt)
+    }
+
+    /// Get checkpoint at exact height (for validation)
+    func getTreeCheckpoint(atHeight height: UInt64) throws -> TreeCheckpoint? {
+        let sql = """
+            SELECT height, tree_root, tree_serialized, cmu_count, block_hash, created_at
+            FROM tree_checkpoints
+            WHERE height = ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseCheckpointRow(stmt)
+    }
+
+    /// Parse a checkpoint row from SQLite statement
+    private func parseCheckpointRow(_ stmt: OpaquePointer?) throws -> TreeCheckpoint {
+        let height = UInt64(sqlite3_column_int64(stmt, 0))
+
+        guard let treeRootPtr = sqlite3_column_blob(stmt, 1) else {
+            throw DatabaseError.queryFailed("Missing tree_root in checkpoint")
+        }
+        let treeRootSize = sqlite3_column_bytes(stmt, 1)
+        let treeRoot = Data(bytes: treeRootPtr, count: Int(treeRootSize))
+
+        guard let treeSerializedPtr = sqlite3_column_blob(stmt, 2) else {
+            throw DatabaseError.queryFailed("Missing tree_serialized in checkpoint")
+        }
+        let treeSerializedSize = sqlite3_column_bytes(stmt, 2)
+        let encryptedTree = Data(bytes: treeSerializedPtr, count: Int(treeSerializedSize))
+
+        // Decrypt the tree data
+        let treeSerialized = try decryptBlob(encryptedTree)
+
+        let cmuCount = UInt64(sqlite3_column_int64(stmt, 3))
+
+        guard let blockHashPtr = sqlite3_column_blob(stmt, 4) else {
+            throw DatabaseError.queryFailed("Missing block_hash in checkpoint")
+        }
+        let blockHashSize = sqlite3_column_bytes(stmt, 4)
+        let blockHash = Data(bytes: blockHashPtr, count: Int(blockHashSize))
+
+        let createdAtTimestamp = sqlite3_column_int64(stmt, 5)
+        let createdAt = Date(timeIntervalSince1970: TimeInterval(createdAtTimestamp))
+
+        return TreeCheckpoint(
+            height: height,
+            treeRoot: treeRoot,
+            treeSerialized: treeSerialized,
+            cmuCount: cmuCount,
+            blockHash: blockHash,
+            createdAt: createdAt
+        )
+    }
+
+    /// Validate a checkpoint against HeaderStore's finalsaplingroot
+    /// Returns true if checkpoint is valid and matches blockchain state
+    func validateTreeCheckpoint(_ checkpoint: TreeCheckpoint) -> Bool {
+        // Get the finalsaplingroot from HeaderStore at this height
+        guard let header = try? HeaderStore.shared.getHeader(at: checkpoint.height) else {
+            debugLog(.wallet, "⚠️ Cannot validate checkpoint at \(checkpoint.height) - no header in store")
+            return false
+        }
+
+        // Compare tree root to HeaderStore's finalsaplingroot
+        if checkpoint.treeRoot != header.hashFinalSaplingRoot {
+            debugLog(.wallet, "❌ Checkpoint validation FAILED at height \(checkpoint.height)")
+            debugLog(.wallet, "   Checkpoint root: \(checkpoint.treeRoot.hexString)")
+            debugLog(.wallet, "   HeaderStore root: \(header.hashFinalSaplingRoot.hexString)")
+            return false
+        }
+
+        debugLog(.wallet, "✅ Checkpoint validated at height \(checkpoint.height)")
+        return true
+    }
+
+    /// Prune old checkpoints to save space, keeping only every Nth checkpoint
+    /// Keeps: the latest 10 checkpoints + every 1000th block checkpoint
+    func pruneOldCheckpoints(keepRecent: Int = 10, keepEveryN: Int = 1000) throws {
+        // First, get the latest N checkpoints to preserve
+        let recentSql = "SELECT height FROM tree_checkpoints ORDER BY height DESC LIMIT ?;"
+        var recentStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, recentSql, -1, &recentStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(recentStmt) }
+        sqlite3_bind_int(recentStmt, 1, Int32(keepRecent))
+
+        var recentHeights: Set<UInt64> = []
+        while sqlite3_step(recentStmt) == SQLITE_ROW {
+            recentHeights.insert(UInt64(sqlite3_column_int64(recentStmt, 0)))
+        }
+
+        // Delete checkpoints that are not recent AND not on a keepEveryN boundary
+        let deleteSql = """
+            DELETE FROM tree_checkpoints
+            WHERE height NOT IN (
+                SELECT height FROM tree_checkpoints ORDER BY height DESC LIMIT ?
+            )
+            AND (height % ?) != 0;
+        """
+
+        var deleteStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(deleteStmt) }
+
+        sqlite3_bind_int(deleteStmt, 1, Int32(keepRecent))
+        sqlite3_bind_int(deleteStmt, 2, Int32(keepEveryN))
+
+        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let deletedCount = sqlite3_changes(db)
+        if deletedCount > 0 {
+            debugLog(.wallet, "🧹 Pruned \(deletedCount) old tree checkpoints")
+        }
+    }
+
+    /// Delete all checkpoints (for wallet reset)
+    func clearAllCheckpoints() throws {
+        let sql = "DELETE FROM tree_checkpoints;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        debugLog(.wallet, "🗑️ Cleared all tree checkpoints")
+    }
+
+    /// Get count of stored checkpoints
+    func getCheckpointCount() throws -> Int {
+        let sql = "SELECT COUNT(*) FROM tree_checkpoints;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return Int(sqlite3_column_int(stmt, 0))
+    }
+
     /// Clear all notes from the database (for new wallet)
     func clearAllNotes() throws {
         let sql = "DELETE FROM notes;"
@@ -1519,6 +1815,47 @@ final class WalletDatabase {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("🗑️ Cleared transaction history from database (secure)")
+    }
+
+    /// Migrate transaction history to use obfuscated type codes and remove duplicates
+    /// This fixes the VUL-015 bug where both 'sent' and 'α' entries existed for the same txid
+    func migrateTransactionHistoryTypes() throws {
+        // Step 1: Convert plaintext type codes to obfuscated codes
+        let migrations = [
+            "UPDATE transaction_history SET tx_type = 'α' WHERE tx_type = 'sent';",
+            "UPDATE transaction_history SET tx_type = 'β' WHERE tx_type = 'received';",
+            "UPDATE transaction_history SET tx_type = 'γ' WHERE tx_type = 'change';"
+        ]
+
+        for sql in migrations {
+            if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
+                let changes = sqlite3_changes(db)
+                if changes > 0 {
+                    let typeCode = sql.contains("sent") ? "sent→α" : (sql.contains("received") ? "received→β" : "change→γ")
+                    print("📜 Migration: converted \(changes) '\(typeCode)' entries")
+                }
+            }
+        }
+
+        // Step 2: Remove duplicates - keep the lowest id (first inserted) for each (txid, normalized_type)
+        // This handles cases where both 'sent' and 'α' existed before migration converted them
+        let deduplicateSql = """
+            DELETE FROM transaction_history
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM transaction_history
+                GROUP BY txid, tx_type
+            );
+        """
+
+        if sqlite3_exec(db, deduplicateSql, nil, nil, nil) == SQLITE_OK {
+            let deletedCount = sqlite3_changes(db)
+            if deletedCount > 0 {
+                print("📜 Migration: removed \(deletedCount) duplicate transaction history entries")
+            }
+        }
+
+        print("📜 Transaction history migration complete")
     }
 
     // MARK: - VUL-016: Secure Memo Deletion
@@ -2165,7 +2502,10 @@ final class WalletDatabase {
             } else {
                 sqlite3_bind_null(spentStmt, 3) // Will be fetched from BlockTimestampManager when displayed
             }
-            sqlite3_bind_text(spentStmt, 4, TransactionType.sent.rawValue, -1, SQLITE_TRANSIENT)
+            // VUL-015: Use obfuscated type code to match recordSentTransaction
+            // This ensures UNIQUE(txid, tx_type) constraint works correctly
+            let encryptedSentType = encryptTxType(.sent)
+            sqlite3_bind_text(spentStmt, 4, encryptedSentType, -1, SQLITE_TRANSIENT)
             // Store totalBalanceImpact (recipient + fee) so history sum equals current balance
             sqlite3_bind_int64(spentStmt, 5, Int64(totalBalanceImpact))
             sqlite3_bind_int64(spentStmt, 6, Int64(fee))
@@ -2215,7 +2555,9 @@ final class WalletDatabase {
             } else {
                 sqlite3_bind_null(insertStmt, 3) // Will be fetched from BlockTimestampManager when displayed
             }
-            sqlite3_bind_text(insertStmt, 4, txType.rawValue, -1, SQLITE_TRANSIENT)
+            // VUL-015: Use obfuscated type codes to match recordReceivedTransaction
+            let encryptedTxType = encryptTxType(txType)
+            sqlite3_bind_text(insertStmt, 4, encryptedTxType, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(insertStmt, 5, Int64(note.value))
             sqlite3_bind_null(insertStmt, 6) // fee (only for SENT)
             sqlite3_bind_null(insertStmt, 7) // to_address

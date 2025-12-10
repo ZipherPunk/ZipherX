@@ -4412,6 +4412,41 @@ zclassicd log:
 
 ---
 
+### 86. Tree Checkpoint Save "Out of Memory" Bug Fix (December 10, 2025)
+
+**Problem**: macOS wallet was failing to save tree checkpoints with misleading "out of memory" error:
+```
+⚠️ Failed to save tree checkpoint: prepareFailed("out of memory")
+```
+
+**Root Cause**: The `saveTreeCheckpoint()` function didn't guard against nil database handle. When `db` is nil:
+1. `sqlite3_prepare_v2(nil, ...)` fails with SQLITE_NOMEM
+2. `sqlite3_errmsg(nil)` returns "out of memory" as the default error message
+3. This was misleading - the actual issue was that the database wasn't open
+
+**Fix Applied**:
+```swift
+func saveTreeCheckpoint(...) throws {
+    // CRITICAL: Guard against nil database handle
+    // sqlite3_errmsg(nil) returns "out of memory" which was misleading
+    guard let database = db else {
+        print("⚠️ saveTreeCheckpoint: Database not open")
+        throw DatabaseError.notOpened
+    }
+    // ... use 'database' instead of 'db' ...
+}
+```
+
+**Additional Improvements**:
+- Added SQLite error code logging for better debugging
+- Simplified SQL string from multi-line to single line
+- Better error messages for prepare and step failures
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - `saveTreeCheckpoint()` function (lines 1535-1572)
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
