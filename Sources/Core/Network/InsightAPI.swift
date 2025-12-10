@@ -201,11 +201,17 @@ final class InsightAPI: NSObject {
     /// Uses conservative approach: returns MINIMUM of sources that agree within tolerance
     /// This prevents syncing beyond what's verified by multiple independent sources
     ///
-    /// Sources: InsightAPI (Zelcore), P2P peers
+    /// Sources (priority order):
+    /// 1. InsightAPI (Zelcore explorer) - trusted baseline
+    /// 2. P2P peer heights (version handshake)
+    /// 3. HeaderStore (locally verified headers with Equihash PoW)
+    /// 4. Boost file height (known verified minimum)
+    ///
     /// Agreement: Sources must be within 5 blocks of each other
     /// Result: Minimum of agreeing sources (conservative - never sync beyond verified height)
     ///
     /// SECURITY: Peers reporting heights >10 blocks above consensus are BANNED
+    /// TOR-ONLY MODE: Falls back to local verified sources when remote sources unavailable
     func getConsensusChainHeight(networkManager: NetworkManager) async -> UInt64 {
         let maxDeviation: UInt64 = 5
         let banThreshold: UInt64 = 10  // Ban peers >10 blocks above consensus
@@ -230,7 +236,38 @@ final class InsightAPI: NSObject {
             }
         }
 
-        // 3. Find consensus - sources that agree within tolerance
+        // 3. TOR-ONLY FALLBACK: Use locally verified sources when remote sources fail
+        if heights.isEmpty {
+            print("🧅 [Consensus] No remote heights available - using local verified sources")
+
+            // 3a. HeaderStore - headers synced via P2P with Equihash PoW verification
+            if let headerHeight = try? HeaderStore.shared.getLatestHeight(), headerHeight > 0 {
+                heights.append(("HeaderStore-PoW", headerHeight, nil))
+                print("📡 [Consensus] HeaderStore (PoW verified): \(headerHeight)")
+            }
+
+            // 3b. Boost file height - known verified minimum
+            let boostHeight = ZipherXConstants.effectiveTreeHeight
+            if boostHeight > 0 {
+                heights.append(("BoostFile", boostHeight, nil))
+                print("📡 [Consensus] Boost file: \(boostHeight)")
+            }
+
+            // 3c. Last scanned height from database
+            if let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(), lastScanned > 0 {
+                heights.append(("LastScanned", lastScanned, nil))
+                print("📡 [Consensus] Last scanned: \(lastScanned)")
+            }
+
+            // 3d. Cached chain height from NetworkManager (last successful fetch)
+            let cachedHeight = networkManager.chainHeight
+            if cachedHeight > 0 {
+                heights.append(("CachedHeight", cachedHeight, nil))
+                print("📡 [Consensus] Cached height: \(cachedHeight)")
+            }
+        }
+
+        // 4. Find consensus - sources that agree within tolerance
         guard !heights.isEmpty else {
             print("❌ [Consensus] No valid heights available!")
             return 0

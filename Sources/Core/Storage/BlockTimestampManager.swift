@@ -156,6 +156,9 @@ final class BlockTimestampManager {
         // This ensures timestamps are available via HeaderStore.getBlockTime()
         // which is the single source of truth for the wallet
         do {
+            // CRITICAL: Ensure HeaderStore is opened (creates block_times table if needed)
+            try HeaderStore.shared.open()
+
             // Check if HeaderStore already has these timestamps to avoid duplicate work
             let existingCount = try HeaderStore.shared.getBlockTimesCount()
             if existingCount < Int(count) {
