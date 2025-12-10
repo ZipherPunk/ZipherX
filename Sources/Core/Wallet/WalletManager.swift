@@ -597,8 +597,8 @@ final class WalletManager: ObservableObject {
             }
 
             var alreadyCurrentCount = 0
-            var rebuiltCount = 0
             var anchorUpdatedCount = 0
+            var needsRebuildCount = 0
 
             for note in notes {
                 // Check if witness anchor matches current tree root
@@ -625,34 +625,10 @@ final class WalletManager: ObservableObject {
                     }
                 }
 
-                // Need to rebuild witness - it's stale or missing
-                // Get note position from CMU in current tree
-                guard let cmu = note.cmu else {
-                    print("⚠️ Pre-witness: Note has no CMU, skipping")
-                    continue
-                }
-
-                guard let position = ZipherXFFI.findCmuPosition(cmu: cmu), position > 0 else {
-                    print("⚠️ Pre-witness: Note CMU not found in tree, skipping")
-                    continue
-                }
-
-                // Create fresh witness from current tree state
-                guard let newWitness = ZipherXFFI.treeCreateWitness(at: UInt64(position)) else {
-                    print("⚠️ Pre-witness: Failed to create witness at position \(position)")
-                    continue
-                }
-
-                // Save rebuilt witness and current anchor
-                try WalletDatabase.shared.updateNoteWitness(
-                    noteId: note.id,
-                    witness: newWitness
-                )
-                try WalletDatabase.shared.updateNoteAnchor(
-                    noteId: note.id,
-                    anchor: currentTreeRoot
-                )
-                rebuiltCount += 1
+                // Witness needs rebuild - will be handled at send time
+                // Pre-rebuild is a lightweight optimization, not a full rebuild
+                // TransactionBuilder.rebuildWitnessForNote() handles full rebuilds
+                needsRebuildCount += 1
             }
 
             // Summary
@@ -662,8 +638,8 @@ final class WalletManager: ObservableObject {
             if anchorUpdatedCount > 0 {
                 print("⚡ Pre-witness: \(anchorUpdatedCount) anchor(s) updated (witness valid)")
             }
-            if rebuiltCount > 0 {
-                print("🔧 Pre-witness: \(rebuiltCount) witness(es) rebuilt for instant payment")
+            if needsRebuildCount > 0 {
+                print("ℹ️ Pre-witness: \(needsRebuildCount) note(s) need rebuild at send time")
             }
         } catch {
             print("⚠️ Pre-witness rebuild failed: \(error.localizedDescription)")
