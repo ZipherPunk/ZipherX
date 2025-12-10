@@ -1705,6 +1705,56 @@ final class WalletManager: ObservableObject {
         }
         print("👤 Account ID: \(account.id)")
 
+        // ============================================
+        // STEP 1: Try QUICK FIX first (extract anchors from existing witnesses)
+        // This is instant and fixes the witness/anchor mismatch issue
+        // ============================================
+        print("⚡ STEP 1: Attempting quick anchor fix...")
+        onProgress(0.05, 0, 100)
+
+        let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.id)
+        var notesWithValidWitness = 0
+        var anchorsFixed = 0
+
+        for note in notes {
+            // Check if note has a valid witness (at least 1028 bytes for proper witness)
+            guard note.witness.count >= 1028 else {
+                print("⚠️ Note \(note.id) (height \(note.height)): invalid witness (\(note.witness.count) bytes)")
+                continue
+            }
+
+            notesWithValidWitness += 1
+
+            // Extract anchor from witness and save it
+            if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
+                try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                anchorsFixed += 1
+
+                let anchorHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("✅ Note \(note.id) (height \(note.height)): anchor fixed to \(anchorHex)...")
+            }
+        }
+
+        print("📊 Quick fix result: \(anchorsFixed)/\(notes.count) notes fixed")
+
+        // If ALL notes have valid witnesses and we fixed all anchors, we're done!
+        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count {
+            print("✅ Quick fix successful! All \(anchorsFixed) notes repaired instantly")
+            onProgress(1.0, 100, 100)
+
+            // Refresh balance to update UI
+            try await refreshBalance()
+            print("✅ Database repair complete - quick fix was sufficient")
+            return
+        }
+
+        // ============================================
+        // STEP 2: Some notes missing witnesses - need full rescan
+        // ============================================
+        print("⚠️ Quick fix insufficient (\(notesWithValidWitness)/\(notes.count) have valid witnesses)")
+        print("🔄 Proceeding with full rescan...")
+        onProgress(0.1, 0, 100)
+
         // FULL RESYNC: Delete ALL notes (not just after tree height)
         // This ensures all corrupted data is removed
         print("🗑️ Deleting ALL notes for full resync...")
@@ -1796,6 +1846,54 @@ final class WalletManager: ObservableObject {
         // Refresh balance
         try await refreshBalance()
         print("✅ Database repair complete - full resync finished")
+    }
+
+    /// Quick fix: Extract anchors from existing witnesses
+    /// This fixes the witness/anchor mismatch without a full rescan
+    /// The witness contains the tree root it was built against - extract and save it
+    func fixAnchorsFromWitnesses() async throws -> Int {
+        guard isWalletCreated else {
+            throw WalletError.walletNotCreated
+        }
+
+        // Get spending key
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+
+        // Ensure database is open
+        let dbKey = Data(SHA256.hash(data: spendingKey))
+        try WalletDatabase.shared.open(encryptionKey: dbKey)
+
+        // Get account ID
+        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+            throw WalletError.walletNotCreated
+        }
+
+        // Get all notes with witnesses
+        let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.id)
+        print("🔧 Fixing anchors for \(notes.count) notes...")
+
+        var fixedCount = 0
+        for note in notes {
+            guard note.witness.count >= 100 else {
+                print("⚠️ Note \(note.id): witness too short (\(note.witness.count) bytes)")
+                continue
+            }
+
+            // Extract anchor from witness
+            if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
+                // Update anchor in database
+                try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                fixedCount += 1
+
+                let anchorHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("✅ Note \(note.id) (height \(note.height)): anchor fixed to \(anchorHex)...")
+            } else {
+                print("⚠️ Note \(note.id): could not extract anchor from witness")
+            }
+        }
+
+        print("✅ Fixed anchors for \(fixedCount)/\(notes.count) notes")
+        return fixedCount
     }
 
     /// Rebuild witnesses from downloaded tree height

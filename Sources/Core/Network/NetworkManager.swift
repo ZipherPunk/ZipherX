@@ -2921,7 +2921,7 @@ final class NetworkManager: ObservableObject {
             // CRITICAL FIX: Mempool verification failed - the transaction was likely REJECTED!
             // P2P peers may "accept" into their local mempool but then reject during validation.
             // If we can't see it in the explorer mempool, it's NOT a valid transaction.
-            print("❌ BROADCAST FAILED: Transaction not visible in mempool after 3 attempts")
+            print("❌ BROADCAST FAILED: Transaction not visible in mempool after 5 attempts")
             print("❌ The transaction was likely rejected by the network (invalid proof)")
             onProgress?("error", "Transaction rejected by network", 0.0)
 

@@ -155,6 +155,13 @@ final class Peer {
         self.score = PeerScore()
     }
 
+    /// CRITICAL: Ensure connection is cancelled when Peer is deallocated
+    /// Prevents file descriptor leaks
+    deinit {
+        connection?.cancel()
+        connection = nil
+    }
+
     // MARK: - Scoring
 
     func recordSuccess() {
@@ -296,6 +303,10 @@ final class Peer {
         // Don't restrict to wifi - allow any network interface
         // parameters.requiredInterfaceType = .wifi
 
+        // CRITICAL: Cancel old connection to prevent file descriptor leak
+        connection?.cancel()
+        connection = nil
+
         connection = NWConnection(to: endpoint, using: parameters)
 
         // Add timeout for connection
@@ -374,6 +385,11 @@ final class Peer {
         )
 
         let parameters = NWParameters.tcp
+
+        // CRITICAL: Cancel old connection to prevent file descriptor leak
+        connection?.cancel()
+        connection = nil
+
         connection = NWConnection(to: proxyEndpoint, using: parameters)
 
         // Wait for connection to proxy with proper continuation handling

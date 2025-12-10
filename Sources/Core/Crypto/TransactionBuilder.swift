@@ -263,24 +263,57 @@ final class TransactionBuilder {
         }
 
         // OPTIMIZATION: Check if witness is already current (background sync keeps it updated)
-        // If note.anchor matches current tree root, we can use the stored witness directly!
         var witnessToUse = note.witness
         var needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
 
+        // Check if we have a valid anchor from header store
+        let haveHeaderAnchor = !anchorFromHeader.allSatisfy { $0 == 0 }
+
         if needsRebuild {
             print("⚠️ Witness invalid (\(note.witness.count) bytes), needs rebuild")
-        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
-            // Check if stored anchor matches current tree root
-            if let currentTreeRoot = ZipherXFFI.treeRoot() {
-                if note.anchor == currentTreeRoot {
-                    print("✅ Witness is current (anchor matches tree root) - INSTANT mode!")
-                    // Use the current tree root as anchor since witness is already synced
-                    anchorFromHeader = currentTreeRoot
+        } else if haveHeaderAnchor {
+            // CRITICAL: Verify witness root matches header anchor!
+            // The witness contains the tree root it was built against.
+            // If this matches the header anchor (blockchain's canonical finalSaplingRoot),
+            // we can use the witness directly. If not, the witness is stale/wrong.
+            if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
+                let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                let headerAnchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+                if witnessRoot == anchorFromHeader {
+                    print("✅ Witness root matches header anchor - INSTANT mode!")
+                    print("   witnessRoot: \(witnessRootHex)... == headerAnchor: \(headerAnchorHex)...")
                     needsRebuild = false
                 } else {
-                    let storedHex = note.anchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    let currentHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("⚠️ Witness anchor (\(storedHex)...) differs from tree root (\(currentHex)...), rebuilding...")
+                    // CRITICAL ERROR: Witness was built with wrong tree state!
+                    // This can't be fixed at transaction time - need database repair.
+                    print("❌ WITNESS/ANCHOR MISMATCH DETECTED!")
+                    print("   witnessRoot:   \(witnessRootHex)...")
+                    print("   headerAnchor:  \(headerAnchorHex)...")
+                    print("   Note height:   \(noteHeight)")
+                    print("")
+                    print("💡 The witness was saved with a different tree state than the blockchain's.")
+                    print("   To fix: Go to Settings → 'Repair Notes (fix balance)'")
+                    throw TransactionError.witnessAnchorMismatch(
+                        noteHeight: noteHeight,
+                        witnessRoot: witnessRootHex,
+                        headerAnchor: headerAnchorHex
+                    )
+                }
+            } else {
+                print("⚠️ Could not extract root from witness, will rebuild")
+                needsRebuild = true
+            }
+        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+            // No header anchor available - check if stored anchor matches witness root
+            if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
+                if note.anchor == witnessRoot {
+                    // Stored anchor matches witness - use them together
+                    print("✅ Stored anchor matches witness root - using stored anchor")
+                    anchorFromHeader = note.anchor
+                    needsRebuild = false
+                } else {
+                    print("⚠️ Stored anchor doesn't match witness root, rebuilding...")
                     needsRebuild = true
                 }
             }
@@ -1013,11 +1046,16 @@ final class TransactionBuilder {
                 continue
             }
 
-            // The anchor is the current tree root, not from the witness
+            // CRITICAL FIX: Use stored anchor from database if available
+            // The stored anchor was computed when the witness was created during PHASE 2 scan
+            // This ensures witness and anchor are consistent!
+            // Fall back to current tree root only if no stored anchor exists
+            let noteAnchor = dbNote.anchor ?? anchor
+
             // Witness format: 4 bytes position + 32*32 bytes merkle path
             let note = SpendableNote(
                 value: dbNote.value,
-                anchor: anchor, // Use current tree root
+                anchor: noteAnchor, // Use stored anchor (consistent with witness)
                 witness: dbNote.witness,
                 diversifier: dbNote.diversifier,
                 rcm: dbNote.rcm,
@@ -1680,6 +1718,7 @@ enum TransactionError: LocalizedError {
     case noteLargeEnough(largestNote: UInt64, required: UInt64)
     case memoTooLong(length: Int, max: Int)  // VUL-020
     case dustOutput(amount: UInt64, threshold: UInt64)  // VUL-024
+    case witnessAnchorMismatch(noteHeight: UInt64, witnessRoot: String, headerAnchor: String)
 
     var errorDescription: String? {
         switch self {
@@ -1703,6 +1742,8 @@ enum TransactionError: LocalizedError {
             let amountZCL = Double(amount) / 100_000_000
             let thresholdZCL = Double(threshold) / 100_000_000
             return "Output too small: \(String(format: "%.8f", amountZCL)) ZCL (minimum \(String(format: "%.8f", thresholdZCL)) ZCL to cover fees)"
+        case .witnessAnchorMismatch(let noteHeight, _, _):
+            return "Witness/anchor mismatch at height \(noteHeight). Database repair needed. Go to Settings → 'Repair Notes (fix balance)'"
         }
     }
 }

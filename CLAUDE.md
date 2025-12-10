@@ -5074,6 +5074,88 @@ private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt
 
 ---
 
+### 99. CRITICAL: Witness/Anchor Mismatch Fix (December 10, 2025)
+
+**Problem**: Transaction building failed with "Failed to generate zero-knowledge proof" because stored anchors didn't match witness state.
+
+**Root Cause**: FilterScanner PHASE 2 was saving `currentAnchor` (tree root at END of scan) for ALL notes. Each note should have the anchor from when its witness was built, not the end-of-scan tree root.
+
+**Evidence**:
+- Note 365 stored anchor: `00DA8C54E9374F22...`
+- Header store anchor at note height: `0977233DBE2C0DC6...`
+- These don't match → invalid zk-proof
+
+**Solution: Three-Part Fix**
+
+1. **FilterScanner - Extract Anchor from Witness** (`FilterScanner.swift:959-984`):
+   ```swift
+   // Get anchor from witness itself (most accurate - matches witness state)
+   if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessData) {
+       try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+   }
+   ```
+
+2. **TransactionBuilder - Validate Before Build** (`TransactionBuilder.swift:279-301`):
+   ```swift
+   if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
+       if witnessRoot == anchorFromHeader {
+           print("✅ Witness root matches header anchor - INSTANT mode!")
+           needsRebuild = false
+       } else {
+           throw TransactionError.witnessAnchorMismatch(...)
+       }
+   }
+   ```
+
+3. **Smart Repair Database** (`WalletManager.swift:1708-1748`):
+   - **STEP 1 (INSTANT)**: Extract anchors from existing witnesses
+   - If all notes repaired → done in <1 second
+   - **STEP 2 (ONLY IF NEEDED)**: Full rescan only if missing witnesses
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Extract anchor from witness using `witnessGetRoot()`
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Validate witness/anchor match, new error type
+- `Sources/Core/Wallet/WalletManager.swift` - Smart repair with quick fix first
+
+---
+
+### 100. CRITICAL: File Descriptor Leak Fix (December 10, 2025)
+
+**Problem**: App crashed with "Too many open files" (error 24) after ~7000+ socket connections. Connections C7941+ failed to create.
+
+**Root Cause**: `Peer.connect()` and `connectViaSocks5()` created new `NWConnection` objects without cancelling the old ones. Each reconnection attempt leaked a file descriptor.
+
+**Solution: Three Layers of Protection**
+
+1. **connect() - Cancel before create** (`Peer.swift:299-301`):
+   ```swift
+   // CRITICAL: Cancel old connection to prevent file descriptor leak
+   connection?.cancel()
+   connection = nil
+   connection = NWConnection(to: endpoint, using: parameters)
+   ```
+
+2. **connectViaSocks5() - Cancel before create** (`Peer.swift:382-384`):
+   ```swift
+   // CRITICAL: Cancel old connection to prevent file descriptor leak
+   connection?.cancel()
+   connection = nil
+   connection = NWConnection(to: proxyEndpoint, using: parameters)
+   ```
+
+3. **deinit - Cleanup on deallocation** (`Peer.swift:158-163`):
+   ```swift
+   deinit {
+       connection?.cancel()
+       connection = nil
+   }
+   ```
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Cancel connections before creating new, add deinit
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

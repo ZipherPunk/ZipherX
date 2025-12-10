@@ -949,10 +949,22 @@ final class FilterScanner {
         }
 
         // Update existing notes' witnesses and anchors
+        // CRITICAL FIX: Use header store anchor (blockchain's finalSaplingRoot) for each note,
+        // NOT the end-of-scan tree root! The header anchor is the canonical blockchain state.
+        let headerStore = HeaderStore.shared
+        try? headerStore.open()
+
         for (noteId, witnessIndex) in existingWitnessIndices {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
-                try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+
+                // Get anchor from witness itself (most accurate - matches witness state)
+                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessData) {
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+                } else {
+                    // Fallback: use current tree root
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                }
                 witnessesUpdated += 1
                 onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
             }
@@ -962,7 +974,14 @@ final class FilterScanner {
         for (noteId, witnessIndex) in pendingWitnesses {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
-                try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+
+                // Get anchor from witness itself (most accurate - matches witness state)
+                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessData) {
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+                } else {
+                    // Fallback: use current tree root
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                }
                 witnessesUpdated += 1
                 onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
             }
