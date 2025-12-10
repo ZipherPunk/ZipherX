@@ -700,7 +700,10 @@ final class WalletManager: ObservableObject {
                                     let blockCount = Int(endHeight - currentHeight + 1)
 
                                     if let peer = networkManager.getConnectedPeer() {
-                                        let blocks = try await peer.getFullBlocks(from: currentHeight, count: blockCount)
+                                        // FIX #108: Add 15s timeout to prevent pre-witness rebuild from hanging
+                                        let blocks = try await withTimeout(seconds: 15) {
+                                            try await peer.getFullBlocks(from: currentHeight, count: blockCount)
+                                        }
                                         for block in blocks {
                                             for tx in block.transactions {
                                                 for output in tx.outputs {
@@ -708,6 +711,8 @@ final class WalletManager: ObservableObject {
                                                 }
                                             }
                                         }
+                                    } else {
+                                        throw NetworkError.notConnected
                                     }
                                     currentHeight = endHeight + 1
                                 }
