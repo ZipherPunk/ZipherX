@@ -4624,6 +4624,68 @@ This fix ensures transaction building works in fully decentralized mode without 
 
 ---
 
+### 88. Tor SOCKS5 Proxy Socket Leak Fix (December 10, 2025)
+
+**Problem**: Thousands of "Too many open files" errors flooding logs:
+```
+nw_socket_initialize_socket [C25783:1] Failed to create socket(2,1) [24: Too many open files]
+nw_endpoint_flow_attach_protocols [C25783 127.0.0.1:9150 ...] Failed to attach socket protocol
+```
+
+**Root Cause**: Socket leak in Tor proxy verification code:
+1. `isSocksProxyReady()` created a new `NWConnection` on every call
+2. `waitForSocksProxyReady()` called it every 500ms for 30 seconds = **60 connections per caller**
+3. Multiple peers called it simultaneously = **N peers × 60+ connections = thousands of sockets**
+4. Redundant `isSocksProxyReady()` check in Peer.swift added another connection per peer
+
+**Solution: Cached Proxy State with Lock**
+
+1. **Added `socksProxyVerified` cache** - Once proxy is verified ready, return cached result
+2. **Added `isWaitingForSocksProxy` lock** - Only one caller tests at a time, others wait for result
+3. **Added `resetSocksProxyState()`** - Clears cache when Tor stops
+4. **Removed redundant check** in Peer.swift - `waitForSocksProxyReady()` already verifies
+
+**Before vs After**:
+| Scenario | Before | After |
+|----------|--------|-------|
+| 10 peers connecting | 10 × 60 = **600 sockets** | **~60 sockets max** |
+| Already verified | Still creates connections | **Returns cached (0 sockets)** |
+
+**Files Modified**:
+- `Sources/Core/Network/TorManager.swift` - Added caching and locking
+- `Sources/Core/Network/Peer.swift` - Removed redundant `isSocksProxyReady()` check
+
+---
+
+### 89. Removed Debug Encryption Log Spam (December 10, 2025)
+
+**Problem**: Logs flooded with "⚠️ DEBUG: Decryption DISABLED - returning raw data" messages (40+ times).
+
+**Solution**: Removed the print statements from `encryptBlob()` and `decryptBlob()` while keeping `DEBUG_DISABLE_ENCRYPTION = true` for debugging purposes.
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - Removed debug print statements
+
+---
+
+### 90. Tree Validation Height Fix (December 10, 2025)
+
+**Problem**: Misleading error "Witness anchors don't match current tree - STALE!" when anchors were actually identical.
+
+**Root Cause**:
+- `last_scanned_height` (2938601) was greater than max header height (2938586)
+- `getHeader(at: lastScanned)` returned nil → `treeIsValid = false`
+- Error message showed identical anchors but claimed they didn't match
+
+**Solution**:
+1. Added fallback to use `getLatestHeight()` when header at `lastScanned` unavailable
+2. Improved error message to distinguish between actual anchor mismatch vs validation failure
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Tree validation logic and error messages
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

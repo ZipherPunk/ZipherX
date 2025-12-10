@@ -27,7 +27,6 @@ final class WalletDatabase {
 
     // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
     // WARNING: Only set to true for debugging purposes! Set back to false before release!
-    // TODO: Re-enable (set to false) after all tests pass: send/receive/history
     private static let DEBUG_DISABLE_ENCRYPTION = true
 
     /// Encrypt sensitive data before storing in database
@@ -36,7 +35,6 @@ final class WalletDatabase {
     private func encryptBlob(_ data: Data) throws -> Data {
         // DEBUG: Skip encryption for debugging database issues
         if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
-            print("⚠️ DEBUG: Encryption DISABLED - storing plaintext")
             return data
         }
 
@@ -54,7 +52,6 @@ final class WalletDatabase {
     private func decryptBlob(_ encryptedData: Data) throws -> Data {
         // DEBUG: Skip decryption for debugging database issues
         if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
-            print("⚠️ DEBUG: Decryption DISABLED - returning raw data")
             return encryptedData
         }
 

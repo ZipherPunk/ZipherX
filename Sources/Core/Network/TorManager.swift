@@ -120,6 +120,13 @@ public final class TorManager: ObservableObject {
     /// Circuit isolation counter (different value = different circuit via SOCKS auth)
     private var circuitIsolationCounter: UInt64 = 0
 
+    /// Cache for SOCKS proxy ready state (prevents repeated connection tests)
+    private var socksProxyVerified = false
+
+    /// Lock to prevent multiple concurrent waitForSocksProxyReady() calls
+    private var isWaitingForSocksProxy = false
+    private let socksProxyLock = NSLock()
+
     // MARK: - Initialization
 
     private init() {
@@ -346,6 +353,7 @@ public final class TorManager: ObservableObject {
         connectionState = .disconnected
         socksPort = 0
         isStartingTor = false
+        resetSocksProxyState()  // Clear cached proxy state
 
         // Notify HiddenServiceManager that Tor is disconnected
         Task {
@@ -500,8 +508,14 @@ public final class TorManager: ObservableObject {
 
     /// Test if the SOCKS5 proxy is actually accepting connections
     /// Returns true if we can establish a TCP connection to the proxy port
+    /// OPTIMIZED: Returns cached result if already verified to prevent socket leak
     public func isSocksProxyReady() async -> Bool {
         guard socksPort > 0 else { return false }
+
+        // OPTIMIZATION: Return cached state if already verified
+        if socksProxyVerified {
+            return true
+        }
 
         return await withCheckedContinuation { continuation in
             let endpoint = NWEndpoint.hostPort(
@@ -511,17 +525,22 @@ public final class TorManager: ObservableObject {
             let connection = NWConnection(to: endpoint, using: .tcp)
 
             var hasResumed = false
-            let queue = DispatchQueue(label: "socks-test")
+            let queue = DispatchQueue(label: "socks-test-\(UUID().uuidString.prefix(8))")
 
-            connection.stateUpdateHandler = { state in
+            connection.stateUpdateHandler = { [weak self] state in
                 guard !hasResumed else { return }
                 switch state {
                 case .ready:
                     hasResumed = true
+                    // Cache success state
+                    Task { @MainActor in
+                        self?.socksProxyVerified = true
+                    }
                     connection.cancel()
                     continuation.resume(returning: true)
                 case .failed, .cancelled:
                     hasResumed = true
+                    connection.cancel()  // Ensure cleanup
                     continuation.resume(returning: false)
                 default:
                     break
@@ -534,7 +553,7 @@ public final class TorManager: ObservableObject {
             queue.asyncAfter(deadline: .now() + 2) {
                 guard !hasResumed else { return }
                 hasResumed = true
-                connection.cancel()
+                connection.cancel()  // Ensure cleanup on timeout
                 continuation.resume(returning: false)
             }
         }
@@ -542,7 +561,32 @@ public final class TorManager: ObservableObject {
 
     /// Wait for SOCKS proxy to become ready (up to maxWait seconds)
     /// Returns true if proxy became ready within the timeout
+    /// OPTIMIZED: Prevents multiple concurrent waits and caches result
     public func waitForSocksProxyReady(maxWait: TimeInterval = 30) async -> Bool {
+        // OPTIMIZATION: Return immediately if already verified
+        if socksProxyVerified {
+            return true
+        }
+
+        // OPTIMIZATION: Prevent multiple concurrent callers from each creating 60 connections
+        socksProxyLock.lock()
+        if isWaitingForSocksProxy {
+            socksProxyLock.unlock()
+            // Another caller is already waiting - just wait for the result
+            while isWaitingForSocksProxy && !socksProxyVerified {
+                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+            }
+            return socksProxyVerified
+        }
+        isWaitingForSocksProxy = true
+        socksProxyLock.unlock()
+
+        defer {
+            socksProxyLock.lock()
+            isWaitingForSocksProxy = false
+            socksProxyLock.unlock()
+        }
+
         let startTime = Date()
         var attempts = 0
 
@@ -559,6 +603,14 @@ public final class TorManager: ObservableObject {
 
         print("🧅 SOCKS proxy NOT ready after \(maxWait) seconds (\(attempts) attempts)")
         return false
+    }
+
+    /// Reset SOCKS proxy verified state (called when Tor stops)
+    private func resetSocksProxyState() {
+        socksProxyVerified = false
+        socksProxyLock.lock()
+        isWaitingForSocksProxy = false
+        socksProxyLock.unlock()
     }
 }
 

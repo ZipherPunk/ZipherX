@@ -362,11 +362,8 @@ final class Peer {
             throw NetworkError.connectionFailed("Tor not connected")
         }
 
-        // Verify SOCKS proxy is actually ready before attempting connection
-        let proxyReady = await TorManager.shared.isSocksProxyReady()
-        guard proxyReady else {
-            throw NetworkError.connectionFailed("SOCKS5 proxy not accepting connections on port \(socksPort)")
-        }
+        // NOTE: Removed redundant isSocksProxyReady() check - waitForSocksProxyReady()
+        // already verifies this and caches the result. This prevents socket leak.
 
         print("🧅 [\(host)] Connecting via SOCKS5 proxy (port \(socksPort))...")
 

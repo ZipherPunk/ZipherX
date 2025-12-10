@@ -594,38 +594,66 @@ final class TransactionBuilder {
             // CRITICAL SECURITY FIX: Validate tree root against blockchain's finalsaplingroot!
             // The FFI tree can become corrupted. We MUST verify against trusted chain data.
             var treeIsValid = true
+            var validationHeight: UInt64 = 0
+
             if let currentTreeRoot = currentTreeRoot,
-               let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(),
-               let trustedHeader = try? headerStore.getHeader(at: lastScanned) {
-                let trustedRoot = trustedHeader.hashFinalSaplingRoot
-                let treeRootHex = currentTreeRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
-                let trustedRootHex = trustedRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+               let lastScanned = try? WalletDatabase.shared.getLastScannedHeight() {
 
-                if currentTreeRoot != trustedRoot {
-                    print("🚨 [SECURITY] Tree root mismatch detected!")
-                    print("   FFI tree root:      \(treeRootHex)...")
-                    print("   Blockchain expects: \(trustedRootHex)... at height \(lastScanned)")
+                // Try to get header at lastScanned height
+                var trustedHeader = try? headerStore.getHeader(at: lastScanned)
+                validationHeight = lastScanned
 
-                    // Try checkpoint-based recovery FIRST (faster than full rebuild)
-                    if await tryRestoreFromCheckpoint(targetHeight: lastScanned) {
-                        print("✅ Tree restored from checkpoint - retrying validation...")
-                        // Re-check tree root after restoration
-                        if let newRoot = ZipherXFFI.treeRoot(), newRoot == trustedRoot {
-                            print("✅ Checkpoint restoration successful - tree is now valid!")
-                            treeIsValid = true
+                // FIX: If lastScanned > max header height, use max available header instead
+                if trustedHeader == nil {
+                    if let maxHeaderHeight = try? headerStore.getLatestHeight(),
+                       let fallbackHeader = try? headerStore.getHeader(at: maxHeaderHeight) {
+                        print("📝 lastScanned (\(lastScanned)) > max header (\(maxHeaderHeight)), using max header for validation")
+                        trustedHeader = fallbackHeader
+                        validationHeight = maxHeaderHeight
+                    }
+                }
+
+                if let header = trustedHeader {
+                    let trustedRoot = header.hashFinalSaplingRoot
+                    let treeRootHex = currentTreeRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+                    let trustedRootHex = trustedRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
+
+                    if currentTreeRoot != trustedRoot {
+                        print("🚨 [SECURITY] Tree root mismatch detected!")
+                        print("   FFI tree root:      \(treeRootHex)...")
+                        print("   Blockchain expects: \(trustedRootHex)... at height \(validationHeight)")
+
+                        // Try checkpoint-based recovery FIRST (faster than full rebuild)
+                        if await tryRestoreFromCheckpoint(targetHeight: validationHeight) {
+                            print("✅ Tree restored from checkpoint - retrying validation...")
+                            // Re-check tree root after restoration
+                            if let newRoot = ZipherXFFI.treeRoot(), newRoot == trustedRoot {
+                                print("✅ Checkpoint restoration successful - tree is now valid!")
+                                treeIsValid = true
+                            } else {
+                                print("⚠️ Checkpoint restoration didn't fix tree - will rebuild witnesses")
+                                treeIsValid = false
+                            }
                         } else {
-                            print("⚠️ Checkpoint restoration didn't fix tree - will rebuild witnesses")
+                            print("⚠️ No valid checkpoint available - forcing witness rebuild!")
                             treeIsValid = false
                         }
                     } else {
-                        print("⚠️ No valid checkpoint available - forcing witness rebuild!")
-                        treeIsValid = false
+                        print("✅ Tree root validated against blockchain finalsaplingroot at height \(validationHeight)")
                     }
                 } else {
-                    print("✅ Tree root validated against blockchain finalsaplingroot at height \(lastScanned)")
+                    // No headers available at all - trust anchors if they match tree
+                    print("⚠️ No headers available for validation - checking anchor match...")
+                    if commonAnchor == currentTreeRoot {
+                        print("✅ Anchors match current tree root - assuming valid")
+                        treeIsValid = true
+                    } else {
+                        print("⚠️ Anchors don't match tree root - will rebuild")
+                        treeIsValid = false
+                    }
                 }
             } else {
-                print("⚠️ Could not validate tree root (missing header data)")
+                print("⚠️ Could not validate tree root (missing tree root or lastScanned)")
                 treeIsValid = false
             }
 
@@ -638,10 +666,17 @@ final class TransactionBuilder {
                     preparedSpends.append((note: note, witness: note.witness))
                 }
             } else if allValid && commonAnchor != nil && currentTreeRoot != nil {
-                // Anchors match each other but are STALE (tree has moved on)
+                // Check if anchors match but tree validation failed, OR if anchors are actually stale
                 let commonHex = commonAnchor!.prefix(8).map { String(format: "%02x", $0) }.joined()
                 let treeHex = currentTreeRoot!.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("⚠️ Witness anchors (\(commonHex)...) don't match current tree (\(treeHex)...) - STALE!")
+
+                if commonAnchor == currentTreeRoot {
+                    // Anchors match tree, but treeIsValid=false (validation couldn't confirm against blockchain)
+                    print("⚠️ Anchors match tree (\(commonHex)...) but blockchain validation failed - rebuilding witnesses...")
+                } else {
+                    // Anchors are genuinely stale (tree has moved on)
+                    print("⚠️ Witness anchors (\(commonHex)...) don't match current tree (\(treeHex)...) - STALE!")
+                }
 
                 // FAST PATH: Try checkpoint-based delta sync (max ~10 blocks)
                 // This is MUCH faster than rebuilding from boost file
