@@ -524,6 +524,15 @@ struct TransactionDetailView: View {
             }
         }
 
+        // Priority 3: Use BlockTimestampManager (in-memory cache from boost file)
+        // This works even if HeaderStore database insert failed
+        if transaction.height > 0 {
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: transaction.height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+                return formatter.string(from: date)
+            }
+        }
+
         // Last resort: show "Unknown" instead of fake estimate
         return "Unknown"
     }

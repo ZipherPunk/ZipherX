@@ -391,23 +391,70 @@ final class HeaderStore {
     /// Insert block timestamps from boost file data
     /// data: Raw timestamp data (4 bytes per timestamp, little-endian)
     /// startHeight: First block height in the data
+    /// Uses chunked inserts to avoid SQLite out-of-memory errors
     func insertBlockTimesFromBoostData(_ data: Data, startHeight: UInt64) throws {
         let timestampCount = data.count / 4
         guard timestampCount > 0 else { return }
 
-        print("⏰ HeaderStore: Loading \(timestampCount) timestamps from boost file (heights \(startHeight) to \(startHeight + UInt64(timestampCount) - 1))")
+        let endHeight = startHeight + UInt64(timestampCount) - 1
+        print("⏰ HeaderStore: Loading \(timestampCount) timestamps from boost file (heights \(startHeight) to \(endHeight))")
 
-        var timestamps: [(UInt64, UInt32)] = []
-        timestamps.reserveCapacity(timestampCount)
+        // Process in chunks of 50,000 to avoid out-of-memory errors
+        let chunkSize = 50000
+        var processedCount = 0
 
-        data.withUnsafeBytes { ptr in
-            for i in 0..<timestampCount {
-                let timestamp = ptr.load(fromByteOffset: i * 4, as: UInt32.self)
-                timestamps.append((startHeight + UInt64(i), timestamp))
+        let sql = "INSERT OR REPLACE INTO block_times (height, timestamp) VALUES (?, ?);"
+
+        try data.withUnsafeBytes { ptr in
+            var currentIndex = 0
+
+            while currentIndex < timestampCount {
+                // Begin transaction for this chunk
+                guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+                    throw DatabaseError.insertFailed("Failed to begin transaction")
+                }
+
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+                }
+
+                let endIndex = min(currentIndex + chunkSize, timestampCount)
+
+                for i in currentIndex..<endIndex {
+                    let timestamp = ptr.load(fromByteOffset: i * 4, as: UInt32.self)
+                    let height = startHeight + UInt64(i)
+
+                    sqlite3_reset(stmt)
+                    sqlite3_bind_int64(stmt, 1, Int64(height))
+                    sqlite3_bind_int64(stmt, 2, Int64(timestamp))
+
+                    guard sqlite3_step(stmt) == SQLITE_DONE else {
+                        let error = String(cString: sqlite3_errmsg(db))
+                        sqlite3_finalize(stmt)
+                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                        throw DatabaseError.insertFailed(error)
+                    }
+                }
+
+                sqlite3_finalize(stmt)
+
+                // Commit this chunk
+                guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                    throw DatabaseError.insertFailed("Failed to commit transaction")
+                }
+
+                processedCount += (endIndex - currentIndex)
+                currentIndex = endIndex
+
+                // Progress log every 500k entries
+                if processedCount % 500000 == 0 || processedCount == timestampCount {
+                    print("⏰ HeaderStore: Inserted \(processedCount)/\(timestampCount) timestamps...")
+                }
             }
         }
 
-        try insertBlockTimesBatch(timestamps)
         print("✅ HeaderStore: Loaded \(timestampCount) timestamps into block_times table")
     }
 
