@@ -5499,6 +5499,55 @@ func getBlocksByHashes(hashes: [Data]) async throws -> [CompactBlock] {
 
 ---
 
+### 106. CRITICAL: Negative Peer Height Crash + Sybil Attack Protection (December 10, 2025)
+
+**Problem 1 - App Crash**:
+```
+Swift/Integers.swift:3048: Fatal error: Negative value is not representable
+```
+macOS app crashed when malicious peer sent negative height via Int32, then code tried `UInt64(negativeValue)`.
+
+**Problem 2 - Sybil Attack**:
+Malicious peers reported fake height `669590754` (real: ~2938893). Even though they were banned, their heights were STILL being used in consensus calculations, causing:
+- Chain height showing 669 million (wrong!)
+- Background sync trying to sync 666 million blocks
+- Spam banning same peers repeatedly
+
+**Root Cause**:
+1. `peerStartHeight` is `Int32` - malicious peers can send negative values
+2. `UInt64(peer.peerStartHeight)` crashes when peerStartHeight < 0
+3. Banned peer check was missing in consensus calculation loops
+
+**Solution**: Two-part fix across 8 locations:
+
+1. **Safe conversion with guard**:
+```swift
+guard peer.peerStartHeight > 0 else { continue }
+let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
+```
+
+2. **Skip banned peers in consensus**:
+```swift
+guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+```
+
+**Locations Fixed (8 total)**:
+- `NetworkManager.swift:845` - fetchStatsOnThread P2P consensus
+- `NetworkManager.swift:1517` - fetchNetworkStats TOR mode consensus
+- `NetworkManager.swift:1564` - fetchNetworkStats fallback heights
+- `NetworkManager.swift:3011` - getChainHeight peer consensus
+- `NetworkManager.swift:3041` - getChainHeight outlier detection
+- `NetworkManager.swift:3352` - getMaxChainHeight peer heights
+- `HeaderSyncManager.swift:162` - getChainTip P2P consensus
+- `InsightAPI.swift:232` - getChainHeightWithConsensus P2P heights
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - 6 locations fixed
+- `Sources/Core/Network/HeaderSyncManager.swift` - 1 location fixed
+- `Sources/Core/Network/InsightAPI.swift` - 1 location fixed
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

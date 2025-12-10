@@ -159,7 +159,9 @@ final class HeaderSyncManager {
         do {
             let peers = try await networkManager.getConnectedPeers(min: minPeers)
             for peer in peers {
-                let h = UInt64(peer.peerStartHeight)
+                // SECURITY: Handle negative heights (malicious peers send Int32 that wraps to negative)
+                guard peer.peerStartHeight > 0 else { continue }
+                let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > 0 {
                     peerHeights.append(h)
                 }

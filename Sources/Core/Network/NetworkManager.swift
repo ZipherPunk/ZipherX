@@ -838,11 +838,13 @@ final class NetworkManager: ObservableObject {
         // When Tor is enabled, use P2P ONLY (InsightAPI blocked by Cloudflare)
         // When Tor is disabled, InsightAPI is authoritative
 
-        // 1. Get P2P peer consensus height FIRST
+        // 1. Get P2P peer consensus height FIRST (skip banned peers)
         var peerHeights: [UInt64: Int] = [:]
         var peerMaxHeight: UInt64 = 0
         for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
+            // SECURITY: Skip banned peers and handle negative heights (malicious peers)
+            guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 peerHeights[h, default: 0] += 1
                 peerMaxHeight = max(peerMaxHeight, h)
@@ -1508,11 +1510,13 @@ final class NetworkManager: ObservableObject {
 
         if torEnabled {
             // TOR MODE: P2P consensus is authoritative
-            // 1. Get P2P peer consensus height
+            // 1. Get P2P peer consensus height (skip banned peers, handle negative heights)
             var peerHeights: [UInt64: Int] = [:]
             var peerMaxHeight: UInt64 = 0
             for peer in peers {
-                let h = UInt64(peer.peerStartHeight)
+                // SECURITY: Skip banned peers and negative heights (malicious peers)
+                guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > 0 {
                     peerHeights[h, default: 0] += 1
                     peerMaxHeight = max(peerMaxHeight, h)
@@ -1557,7 +1561,9 @@ final class NetworkManager: ObservableObject {
             // 3. If still no height, try P2P peer heights from version handshake
             if currentChainHeight == 0 {
                 for peer in peers {
-                    let h = UInt64(peer.peerStartHeight)
+                    // SECURITY: Skip banned peers and negative heights (malicious peers)
+                    guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                    let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                     if h > currentChainHeight {
                         currentChainHeight = h
                     }
@@ -2997,12 +3003,14 @@ final class NetworkManager: ObservableObject {
         }
 
         // 3. PEER CONSENSUS - The most trustworthy source for chain height
-        // Collect heights from all connected peers and find consensus
+        // Collect heights from all connected peers and find consensus (skip banned peers)
         var peerHeights: [UInt64: Int] = [:]  // height -> count of peers reporting it
         var peerMaxHeight: UInt64 = 0
 
         for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
+            // SECURITY: Skip banned peers and negative heights (malicious peers)
+            guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 peerHeights[h, default: 0] += 1
                 if h > peerMaxHeight {
@@ -3030,7 +3038,9 @@ final class NetworkManager: ObservableObject {
         let maxOutlierTolerance: UInt64 = 500
         if peerConsensusHeight > 0 {
             for peer in peers {
-                let h = UInt64(peer.peerStartHeight)
+                // Skip already banned peers, skip negative heights
+                guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > peerConsensusHeight + maxOutlierTolerance {
                     print("""
                     🚨🚨🚨 SECURITY ALERT: FAKE HEIGHT DETECTED 🚨🚨🚨
@@ -3337,9 +3347,11 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // 2. Peer version heights (may be fake)
+        // 2. Peer version heights (may be fake) - skip banned peers and negative heights
         for peer in peers {
-            let h = UInt64(peer.peerStartHeight)
+            // SECURITY: Skip banned peers and negative heights (malicious peers)
+            guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 // Validate against trusted source
                 if trustedHeight > 0 && h > trustedHeight + maxDeviation {
