@@ -315,6 +315,29 @@ final class NetworkManager: ObservableObject {
     private func connectToNewCustomNode(host: String, port: UInt16) async {
         print("🔄 Attempting immediate connection to custom node: \(host):\(port)")
 
+        // For .onion addresses, wait for circuit warmup
+        if host.hasSuffix(".onion") {
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if !torConnected {
+                print("⏳ Waiting for Tor to connect before trying .onion custom node...")
+                // Wait up to 30 seconds for Tor to connect
+                for _ in 0..<30 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if await TorManager.shared.connectionState.isConnected { break }
+                }
+            }
+
+            // Now wait for circuit warmup
+            let circuitsReady = await TorManager.shared.isOnionCircuitsReady
+            if !circuitsReady {
+                let remaining = await TorManager.shared.onionCircuitWarmupRemaining
+                if remaining > 0 {
+                    print("⏳ Waiting \(Int(remaining))s for .onion circuits to warm up...")
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                }
+            }
+        }
+
         let peer = Peer(host: host, port: port, networkMagic: networkMagic)
         do {
             try await peer.connect()
@@ -1364,6 +1387,9 @@ final class NetworkManager: ObservableObject {
                             self.newAddresses.remove(key)
                             self.triedAddresses.insert(key)
                             self.addressLock.unlock()
+
+                            // Also update custom node stats if this is a custom node
+                            self.recordCustomNodeConnection(host: peer.host, port: peer.port, success: true)
                         }
 
                         // Request addresses from new peer (async)
@@ -3874,6 +3900,9 @@ final class NetworkManager: ObservableObject {
                     knownAddresses[key]?.successes += 1
                     newAddresses.remove(key)
                     triedAddresses.insert(key)
+
+                    // Also update custom node stats if this is a custom node
+                    recordCustomNodeConnection(host: address.host, port: address.port, success: true)
 
                     // Request addresses from new peer
                     if let addresses = try? await peer.getAddresses() {
