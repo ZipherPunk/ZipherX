@@ -1315,7 +1315,7 @@ Both binaries must be installed to /usr/local/bin:
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 10))
-                        Text("Embedded Tor (Arti) - SOCKS5 port 9150")
+                        Text("Embedded Tor (Arti) - SOCKS5 port 9250")
                             .font(.system(size: 10, design: .monospaced))
                     }
                     .foregroundColor(.green)

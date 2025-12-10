@@ -4686,6 +4686,92 @@ nw_endpoint_flow_attach_protocols [C25783 127.0.0.1:9150 ...] Failed to attach s
 
 ---
 
+### 91. Equihash Parameter Fix for Post-Bubbles Blocks (December 10, 2025)
+
+**Problem**: Equihash verification was using wrong parameters (200,9) for current blocks, expecting 1344-byte solutions when actual solutions are 400 bytes.
+
+**Root Cause**: Zclassic changed Equihash parameters at the Bubbles upgrade (block 585,318):
+- Before Bubbles (blocks 0-585,317): Equihash(200, 9) - 1344 byte solutions
+- After Bubbles (blocks 585,318+): Equihash(192, 7) - 400 byte solutions
+
+Current blockchain is well past block 2.9M, so all blocks use (192,7).
+
+**Solution**: Updated Equihash constants:
+
+| File | Change |
+|------|--------|
+| `lib.rs` | `N=192, K=7, EXPECTED_SOLUTION_LEN=400` |
+| `Checkpoints.swift` | `EquihashParams.n=192, k=7, solutionSize=400` |
+
+**Formula**: Solution size = `2^K * (N / (K+1) + 1) / 8`
+- (200,9): `2^9 * (200/10 + 1) / 8 = 512 * 21 / 8 = 1344 bytes`
+- (192,7): `2^7 * (192/8 + 1) / 8 = 128 * 25 / 8 = 400 bytes`
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Equihash parameters
+- `Sources/Core/Network/Checkpoints.swift` - EquihashParams enum
+
+---
+
+### 92. TorManager @MainActor Await Fixes (December 10, 2025)
+
+**Problem**: Compilation errors - `TorManager.shared.mode` access required `await` because TorManager is `@MainActor`.
+
+**Solution**: Added `await` to all 4 locations accessing `TorManager.shared.mode` in async contexts:
+
+| File | Line | Function |
+|------|------|----------|
+| `TransactionBuilder.swift` | 1561 | `buildShieldedTransactionWithProgress()` |
+| `NetworkManager.swift` | 785 | `refreshChainHeight()` |
+| `NetworkManager.swift` | 1450 | `fetchNetworkStats()` |
+| `NetworkManager.swift` | 2931 | `getChainHeight()` |
+
+---
+
+### 93. iOS Version Compatibility Fix for OSAllocatedUnfairLock (December 10, 2025)
+
+**Problem**: `OSAllocatedUnfairLock` requires iOS 16+, causing compilation errors on older deployment targets.
+
+**Solution**: Replaced with NSLock-based `ResumedFlag` class:
+
+```swift
+final class ResumedFlag: @unchecked Sendable {
+    private var _resumed = false
+    private let lock = NSLock()
+
+    func checkAndSet() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if _resumed { return true }
+        _resumed = true
+        return false
+    }
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Replaced `OSAllocatedUnfairLock` usage
+
+---
+
+### 94. Fixed Arti SOCKS Port to 9250 (December 10, 2025)
+
+**Problem**: Arti SOCKS port was dynamic (49419, etc.), causing issues when zclassicd config was pointing to old ports after ZipherX restart.
+
+**Solution**: Changed to fixed port 9250 to avoid conflicts:
+
+| Port | Service |
+|------|---------|
+| 9050 | Homebrew/System Tor |
+| 9150 | Tor Browser |
+| **9250** | ZipherX Arti (fixed) |
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/tor.rs` - `FIXED_SOCKS_PORT = 9250`
+- `Sources/Features/Settings/SettingsView.swift` - UI text updated
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

@@ -138,14 +138,18 @@ enum ZclassicCheckpoints {
 
 /// Equihash proof-of-work parameters for Zclassic
 enum EquihashParams {
-    /// Equihash n parameter
-    static let n: UInt32 = 200
+    // Zclassic changed Equihash parameters at Bubbles upgrade (block 585,318):
+    // - Before Bubbles (0-585,317): Equihash(200, 9) - 1344 byte solutions
+    // - After Bubbles (585,318+): Equihash(192, 7) - 400 byte solutions
 
-    /// Equihash k parameter
-    static let k: UInt32 = 9
+    /// Equihash n parameter (post-Bubbles)
+    static let n: UInt32 = 192
 
-    /// Solution size in bytes
-    static let solutionSize: Int = 1344
+    /// Equihash k parameter (post-Bubbles)
+    static let k: UInt32 = 7
+
+    /// Solution size in bytes (post-Bubbles): 2^7 * 25 / 8 = 400
+    static let solutionSize: Int = 400
 
     /// Nonce size in bytes
     static let nonceSize: Int = 32
@@ -232,8 +236,8 @@ extension BlockHeader {
         data.append(contentsOf: withUnsafeBytes(of: bits.littleEndian) { Array($0) })
         // Nonce (32 bytes)
         data.append(nonce)
-        // Equihash solution (1344 bytes for Equihash(200,9))
-        // Solution is prefixed with compactSize (3 bytes for 1344: fd 40 05)
+        // Equihash solution (400 bytes for post-Bubbles Equihash(192,7))
+        // Solution is prefixed with compactSize (2 bytes for 400: fd 90 01)
         // For hash computation, we include: fd + len(2 bytes) + solution data
         let solutionLen = UInt16(solution.count)
         data.append(0xfd) // compactSize prefix for 253-65535

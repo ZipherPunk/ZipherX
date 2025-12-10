@@ -777,51 +777,73 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Refresh chain height (InsightAPI authoritative, P2P fallback)
+    /// Refresh chain height (P2P consensus primary when Tor enabled, InsightAPI fallback)
     /// Also triggers background sync if wallet is behind
     private func refreshChainHeight() async {
         guard isConnected else { return }
 
-        // CRITICAL: InsightAPI is authoritative - it represents actual network state
-        // P2P peers and HeaderStore can have corrupt/fake data from malicious peers
+        let torEnabled = await TorManager.shared.mode == .enabled
         var newHeight: UInt64 = 0
         var networkTruthHeight: UInt64 = 0
 
-        // 1. ALWAYS get network truth from InsightAPI first
-        if let status = try? await InsightAPI.shared.getStatus() {
-            networkTruthHeight = status.height
-            newHeight = networkTruthHeight
-            print("📡 [API] Network height (authoritative): \(networkTruthHeight)")
-        }
+        // When Tor is enabled, use P2P ONLY (InsightAPI blocked by Cloudflare)
+        // When Tor is disabled, InsightAPI is authoritative
 
-        // 2. Check header store - but REJECT if it exceeds network truth (indicates corrupt data)
-        if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-            if networkTruthHeight > 0 && headerHeight > networkTruthHeight + 10 {
-                print("⚠️ HeaderStore height \(headerHeight) exceeds network truth \(networkTruthHeight) - ignoring stale/fake data")
-                // TODO: Consider clearing corrupt headers
-            } else if networkTruthHeight == 0 {
-                // Only use HeaderStore if we couldn't reach InsightAPI
-                newHeight = max(newHeight, headerHeight)
-                print("📡 [P2P] Using HeaderStore height (API unavailable): \(headerHeight)")
-            }
-        }
-
-        // 3. Check P2P peer heights - same validation
+        // 1. Get P2P peer consensus height FIRST
+        var peerHeights: [UInt64: Int] = [:]
+        var peerMaxHeight: UInt64 = 0
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
-            if networkTruthHeight > 0 && h > networkTruthHeight + 10 {
-                // Ignore peers claiming heights beyond network truth
-                continue
-            }
-            if h > 0 && networkTruthHeight == 0 {
-                // Only use peer heights if InsightAPI unavailable
-                newHeight = max(newHeight, h)
+            if h > 0 {
+                peerHeights[h, default: 0] += 1
+                peerMaxHeight = max(peerMaxHeight, h)
             }
         }
 
-        // If we got network truth, make sure we use it
-        if networkTruthHeight > 0 {
-            newHeight = networkTruthHeight
+        // Find consensus (most peers within 10 blocks of max)
+        var peerConsensusHeight: UInt64 = 0
+        var consensusCount = 0
+        for (height, count) in peerHeights {
+            if peerMaxHeight > 0 && height >= peerMaxHeight - 10 && count > consensusCount {
+                peerConsensusHeight = height
+                consensusCount = count
+            }
+        }
+
+        // 2. Get InsightAPI height ONLY if Tor is disabled
+        if !torEnabled {
+            if let status = try? await InsightAPI.shared.getStatus() {
+                networkTruthHeight = status.height
+                print("📡 [API] Network height: \(networkTruthHeight)")
+            }
+        } else {
+            print("🧅 Tor enabled - using P2P consensus only (InsightAPI blocked by Cloudflare)")
+        }
+
+        // 3. Determine best height
+        if torEnabled {
+            // TOR MODE: P2P consensus is authoritative
+            if peerConsensusHeight > 0 && consensusCount >= 2 {
+                newHeight = peerConsensusHeight
+                print("🧅 [P2P] Peer consensus height: \(newHeight) (\(consensusCount) peers)")
+            } else if peerMaxHeight > 0 {
+                newHeight = peerMaxHeight
+                print("🧅 [P2P] Using peer max height (no consensus): \(newHeight)")
+            } else if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                newHeight = headerHeight
+                print("🧅 [P2P] Using HeaderStore height: \(newHeight)")
+            }
+        } else {
+            // NORMAL MODE: InsightAPI authoritative, P2P fallback
+            if networkTruthHeight > 0 {
+                newHeight = networkTruthHeight
+            } else if peerConsensusHeight > 0 && consensusCount >= 2 {
+                newHeight = peerConsensusHeight
+                print("📡 [P2P] Using peer consensus (API unavailable): \(newHeight)")
+            } else if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                newHeight = headerHeight
+                print("📡 [P2P] Using HeaderStore height (API unavailable): \(newHeight)")
+            }
         }
 
         // Only update and log if height changed
@@ -1412,7 +1434,7 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Fetch network statistics (P2P-first, InsightAPI fallback)
+    /// Fetch network statistics (P2P-first when Tor enabled, InsightAPI fallback when disabled)
     func fetchNetworkStats() async {
         // Update Tor/Onion peer counts (so UI shows current connected .onion peers)
         await updateTorAvailability()
@@ -1425,32 +1447,68 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // Get authoritative chain height from InsightAPI
-        // This is the source of truth for display - don't trust stale local headers
+        let torEnabled = await TorManager.shared.mode == .enabled
         var currentChainHeight: UInt64 = 0
         _ = await MainActor.run { self.chainHeight }  // Check previous height (used for comparison below)
 
-        // 1. First try InsightAPI (authoritative network source)
-        if let status = try? await InsightAPI.shared.getStatus() {
-            currentChainHeight = status.height
-            await MainActor.run {
-                self.networkDifficulty = status.difficulty
-            }
-        }
+        // When Tor enabled: P2P ONLY (InsightAPI blocked by Cloudflare)
+        // When Tor disabled: InsightAPI authoritative, P2P fallback
 
-        // 2. If API unavailable, fallback to header store (may be stale)
-        if currentChainHeight == 0 {
-            if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-                currentChainHeight = headerHeight
-            }
-        }
-
-        // 3. If still no height, try P2P peer heights from version handshake
-        if currentChainHeight == 0 {
+        if torEnabled {
+            // TOR MODE: P2P consensus is authoritative
+            // 1. Get P2P peer consensus height
+            var peerHeights: [UInt64: Int] = [:]
+            var peerMaxHeight: UInt64 = 0
             for peer in peers {
                 let h = UInt64(peer.peerStartHeight)
-                if h > currentChainHeight {
-                    currentChainHeight = h
+                if h > 0 {
+                    peerHeights[h, default: 0] += 1
+                    peerMaxHeight = max(peerMaxHeight, h)
+                }
+            }
+
+            // Find consensus (most peers within 10 blocks of max)
+            for (height, count) in peerHeights {
+                if peerMaxHeight > 0 && height >= peerMaxHeight - 10 && count > 1 {
+                    if height > currentChainHeight {
+                        currentChainHeight = height
+                    }
+                }
+            }
+
+            // Fallback to max peer height if no consensus
+            if currentChainHeight == 0 && peerMaxHeight > 0 {
+                currentChainHeight = peerMaxHeight
+            }
+
+            // Fallback to header store
+            if currentChainHeight == 0, let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                currentChainHeight = headerHeight
+            }
+        } else {
+            // NORMAL MODE: InsightAPI authoritative
+            // 1. First try InsightAPI (authoritative network source)
+            if let status = try? await InsightAPI.shared.getStatus() {
+                currentChainHeight = status.height
+                await MainActor.run {
+                    self.networkDifficulty = status.difficulty
+                }
+            }
+
+            // 2. If API unavailable, fallback to header store (may be stale)
+            if currentChainHeight == 0 {
+                if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                    currentChainHeight = headerHeight
+                }
+            }
+
+            // 3. If still no height, try P2P peer heights from version handshake
+            if currentChainHeight == 0 {
+                for peer in peers {
+                    let h = UInt64(peer.peerStartHeight)
+                    if h > currentChainHeight {
+                        currentChainHeight = h
+                    }
                 }
             }
         }
@@ -2870,14 +2928,19 @@ final class NetworkManager: ObservableObject {
 
         // P2P-FIRST architecture: prioritize trustless P2P data
         // CRITICAL: Always verify against network - don't trust stale cached values!
-        print("📡 Getting chain height (P2P-first)...")
+        let torEnabled = await TorManager.shared.mode == .enabled
+        print("📡 Getting chain height (P2P-first, Tor=\(torEnabled ? "ON" : "OFF"))...")
 
-        // 1. Get authoritative network height from InsightAPI (most reliable)
-        // This serves as ground truth to detect stale/invalid local state
+        // 1. Get network height from InsightAPI - ONLY if Tor is disabled
+        // InsightAPI is blocked by Cloudflare when accessed via Tor
         var networkHeight: UInt64 = 0
-        if let status = try? await InsightAPI.shared.getStatus() {
-            networkHeight = status.height
-            print("📡 [API] Network height: \(networkHeight)")
+        if !torEnabled {
+            if let status = try? await InsightAPI.shared.getStatus() {
+                networkHeight = status.height
+                print("📡 [API] Network height: \(networkHeight)")
+            }
+        } else {
+            print("🧅 Tor enabled - skipping InsightAPI (Cloudflare blocks Tor)")
         }
 
         // 2. Check header store (our locally verified headers)
@@ -2887,39 +2950,88 @@ final class NetworkManager: ObservableObject {
             print("📡 [P2P] HeaderStore height: \(headerHeight)")
         }
 
-        // 3. Check P2P peer heights from version handshake
+        // 3. PEER CONSENSUS - The most trustworthy source for chain height
+        // Collect heights from all connected peers and find consensus
+        var peerHeights: [UInt64: Int] = [:]  // height -> count of peers reporting it
         var peerMaxHeight: UInt64 = 0
+
         for peer in peers {
             let h = UInt64(peer.peerStartHeight)
-            if h > peerMaxHeight {
-                peerMaxHeight = h
+            if h > 0 {
+                peerHeights[h, default: 0] += 1
+                if h > peerMaxHeight {
+                    peerMaxHeight = h
+                }
             }
         }
-        if peerMaxHeight > 0 {
-            print("📡 [P2P] Peer max height: \(peerMaxHeight)")
+
+        // Find peer consensus height (height reported by most peers, must be within 10 blocks of max)
+        var peerConsensusHeight: UInt64 = 0
+        var consensusCount = 0
+        for (height, count) in peerHeights {
+            // Only consider heights close to max (within 10 blocks)
+            if peerMaxHeight > 0 && height >= peerMaxHeight - 10 && count > consensusCount {
+                peerConsensusHeight = height
+                consensusCount = count
+            }
         }
 
-        // 4. Determine best height - prefer network truth over potentially stale local data
-        // If network height is available and local headers are significantly higher (>100 blocks),
-        // the local headers may be invalid/stale - use network height instead
+        if peerConsensusHeight > 0 {
+            print("📡 [P2P] Peer consensus: \(peerConsensusHeight) (\(consensusCount)/\(peers.count) peers agree)")
+        }
+
+        // SECURITY: Detect and ban peers reporting heights VERY far from consensus
+        let maxOutlierTolerance: UInt64 = 500
+        if peerConsensusHeight > 0 {
+            for peer in peers {
+                let h = UInt64(peer.peerStartHeight)
+                if h > peerConsensusHeight + maxOutlierTolerance {
+                    print("""
+                    🚨🚨🚨 SECURITY ALERT: FAKE HEIGHT DETECTED 🚨🚨🚨
+                    ⚠️ Peer \(peer.host) reports height \(h)
+                    ⚠️ Peer consensus: \(peerConsensusHeight)
+                    ⚠️ Difference: \(h - peerConsensusHeight) blocks AHEAD (tolerance: \(maxOutlierTolerance))
+                    🔒 BANNING peer for 7 days...
+                    🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+                    """)
+                    banPeer(peer, reason: .corruptedData)
+                    peer.disconnect()
+                }
+            }
+        }
+
+        // WARNING: If peer consensus is significantly higher than HeaderStore, headers are lagging
+        if headerHeight > 0 && peerConsensusHeight > headerHeight + 50 {
+            print("⚠️ HeaderStore is \(peerConsensusHeight - headerHeight) blocks behind peer consensus - header sync needed!")
+        }
+
+        // 4. Determine best height - PEER CONSENSUS is PRIMARY (decentralized!)
+        // Priority: Peer consensus > InsightAPI > HeaderStore > Cached
         var bestHeight: UInt64 = 0
 
-        if networkHeight > 0 {
+        if peerConsensusHeight > 0 && consensusCount >= 2 {
+            // BEST: Peer consensus (decentralized, trustworthy if 2+ peers agree)
+            bestHeight = peerConsensusHeight
+            print("📡 Using PEER CONSENSUS height: \(bestHeight) (\(consensusCount) peers)")
+        } else if networkHeight > 0 {
+            // FALLBACK: InsightAPI (centralized but usually accurate)
             bestHeight = networkHeight
-            // Warn if local state seems corrupted (claims more blocks than network has)
-            if headerHeight > networkHeight + 10 {
-                print("⚠️ HeaderStore height (\(headerHeight)) exceeds network (\(networkHeight)) - possible stale data")
-            }
-        } else if headerHeight > 0 {
-            bestHeight = headerHeight
+            print("📡 Using InsightAPI height: \(bestHeight)")
         } else if peerMaxHeight > 0 {
+            // FALLBACK: Single peer max (less trustworthy)
             bestHeight = peerMaxHeight
+            print("📡 Using peer max height (no consensus): \(bestHeight)")
+        } else if headerHeight > 0 {
+            // FALLBACK: HeaderStore (local, can be lagging)
+            bestHeight = headerHeight
+            print("📡 Using HeaderStore height: \(bestHeight)")
         } else if chainHeight > 0 {
-            bestHeight = chainHeight  // Last resort: use cached value
+            // LAST RESORT: Cached value
+            bestHeight = chainHeight
+            print("📡 Using cached height: \(bestHeight)")
         }
 
         if bestHeight > 0 {
-            print("📡 Using chain height: \(bestHeight)")
             return bestHeight
         }
 
@@ -3936,7 +4048,7 @@ struct BlockHeader: Hashable {
     let timestamp: UInt32
     let bits: UInt32
     let nonce: Data // Equihash nonce (32 bytes)
-    let solution: Data // Equihash solution (1344 bytes for Equihash(200,9))
+    let solution: Data // Equihash solution (400 bytes for post-Bubbles Equihash(192,7))
 }
 
 struct CompactFilter: Hashable {

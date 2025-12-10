@@ -27,9 +27,10 @@ static TOR_STATE: AtomicU8 = AtomicU8::new(0);
 /// Bootstrap progress (0-100)
 static TOR_BOOTSTRAP_PROGRESS: AtomicU8 = AtomicU8::new(0);
 
-/// SOCKS proxy port - fixed at 9150 for compatibility with zclassicd
-/// (9150 is the standard Tor Browser SOCKS port, 9050 is system Tor)
-const FIXED_SOCKS_PORT: u16 = 9150;
+/// SOCKS proxy port - fixed at 9250 to avoid conflicts
+/// (9050 = homebrew/system Tor, 9150 = Tor Browser)
+/// ZipherX uses 9250 so it can coexist with other Tor instances
+const FIXED_SOCKS_PORT: u16 = 9250;
 
 /// SOCKS proxy port (stored after binding)
 static TOR_SOCKS_PORT: AtomicU16 = AtomicU16::new(0);

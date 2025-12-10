@@ -376,31 +376,55 @@ final class Peer {
         let parameters = NWParameters.tcp
         connection = NWConnection(to: proxyEndpoint, using: parameters)
 
-        // Wait for connection to proxy
+        // Wait for connection to proxy with proper continuation handling
+        // Use a class-based lock for thread-safe flag (NSLock is Sendable)
+        final class ResumedFlag: @unchecked Sendable {
+            private var _resumed = false
+            private let lock = NSLock()
+
+            func checkAndSet() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                if _resumed { return true }
+                _resumed = true
+                return false
+            }
+        }
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    var hasResumed = false
+                    let resumed = ResumedFlag()
 
                     self.connection?.stateUpdateHandler = { state in
-                        guard !hasResumed else { return }
-
                         switch state {
                         case .ready:
-                            hasResumed = true
-                            continuation.resume()
+                            if !resumed.checkAndSet() {
+                                continuation.resume()
+                            }
                         case .failed(let error):
-                            hasResumed = true
-                            continuation.resume(throwing: NetworkError.connectionFailed(error.localizedDescription))
+                            if !resumed.checkAndSet() {
+                                continuation.resume(throwing: NetworkError.connectionFailed(error.localizedDescription))
+                            }
                         case .cancelled:
-                            hasResumed = true
-                            continuation.resume(throwing: NetworkError.connectionFailed("Connection cancelled"))
+                            if !resumed.checkAndSet() {
+                                continuation.resume(throwing: NetworkError.connectionFailed("Connection cancelled"))
+                            }
                         default:
                             break
                         }
                     }
 
                     self.connection?.start(queue: self.queue)
+
+                    // CRITICAL: Handle task cancellation to prevent continuation leak
+                    Task {
+                        // Wait a bit longer than timeout to ensure we catch the cancellation
+                        try? await Task.sleep(nanoseconds: 11_000_000_000)
+                        if !resumed.checkAndSet() {
+                            continuation.resume(throwing: NetworkError.timeout)
+                        }
+                    }
                 }
             }
 
@@ -1614,7 +1638,7 @@ final class Peer {
             // 100-103: timestamp (4 bytes)
             // 104-107: bits (4 bytes)
             // 108-139: nonce (32 bytes)
-            // 140+:    solution (1344 bytes for Equihash(200,9))
+            // 140+:    solution (400 bytes for post-Bubbles Equihash(192,7))
             let header = BlockHeader(
                 version: response.loadInt32(at: offset),
                 prevBlockHash: Data(response[(offset + 4)..<(offset + 36)]),
@@ -1812,7 +1836,7 @@ final class Peer {
         // Equihash solution follows: compactSize + solution data
         let (solutionSize, solutionSizeBytes) = readCompactSize(data, at: offset)
         offset += solutionSizeBytes
-        // Zclassic uses compressed Equihash solutions (400 bytes), not uncompressed (1344 bytes)
+        // Post-Bubbles Zclassic uses Equihash(192,7) with 400-byte solutions
         let safeSolutionSize = min(solutionSize, 10000)
         guard offset + Int(safeSolutionSize) <= data.count else {
             return nil

@@ -477,8 +477,8 @@ final class HeaderSyncManager {
         for i in 0..<count {
             // Zcash/Zclassic header format in "headers" P2P message:
             // - 140 bytes header (4 version + 32 prevhash + 32 merkle + 32 sapling + 4 time + 4 bits + 32 nonce)
-            // - varint solution_len (typically 3 bytes for 1344)
-            // - solution (typically 1344 bytes for Equihash(200,9))
+            // - varint solution_len (typically 3 bytes for 400: fd 90 01)
+            // - solution (400 bytes for post-Bubbles Equihash(192,7))
             // - varint tx_count (always 0 in headers message, so 1 byte)
 
             guard offset + 140 <= data.count else {

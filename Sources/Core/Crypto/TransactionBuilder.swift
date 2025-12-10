@@ -682,11 +682,23 @@ final class TransactionBuilder {
                 // This is MUCH faster than rebuilding from boost file
                 let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
                 let chainHeight = try await NetworkManager.shared.getChainHeight()
+
+                // CRITICAL FIX: Detect when checkpoint is ahead of chain height
+                // This can happen when HeaderStore lags behind the real blockchain
+                // Note: chainHeight comes from getChainHeight() which may use lagging HeaderStore
+                if lastScanned > chainHeight {
+                    // Only warn, don't reset - the checkpoint might be correct, HeaderStore might be lagging
+                    let diff = lastScanned - chainHeight
+                    print("⚠️ Checkpoint \(lastScanned) is \(diff) blocks AHEAD of returned chain height \(chainHeight)")
+                    print("   This likely means HeaderStore is lagging behind. Skipping delta sync...")
+                    // Don't reset - just skip fast path and use boost rebuild which handles this correctly
+                }
+
                 let blocksBehind = chainHeight > lastScanned ? chainHeight - lastScanned : 0
 
                 print("⚡ FAST PATH: Checkpoint at \(lastScanned), chain at \(chainHeight) (\(blocksBehind) blocks behind)")
 
-                if blocksBehind <= 50 && lastScanned > 0 {
+                if blocksBehind <= 50 && blocksBehind > 0 && lastScanned > 0 {
                     // FAST: Delta sync from checkpoint (max 50 blocks)
                     print("⚡ Using fast delta sync (\(blocksBehind) blocks)...")
 
@@ -1495,6 +1507,12 @@ final class TransactionBuilder {
     /// Fetch CMUs for a range of blocks using P2P peers (preferred) or InsightAPI fallback
     /// Uses on-demand P2P which fetches headers directly via getheaders (no pre-synced HeaderStore required)
     private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt64) async throws -> [Data] {
+        // SAFETY: Prevent crash from integer underflow when startHeight > endHeight
+        guard startHeight <= endHeight else {
+            print("⚠️ fetchCMUsForBlockRange: Invalid range \(startHeight) to \(endHeight) - returning empty")
+            return []
+        }
+
         var allCMUs: [Data] = []
         let totalBlocks = Int(endHeight - startHeight + 1)
 
@@ -1531,14 +1549,23 @@ final class TransactionBuilder {
             return allCMUs
 
         } catch NetworkError.notConnected {
-            print("⚠️ P2P not connected, trying InsightAPI fallback...")
+            print("⚠️ P2P not connected")
         } catch NetworkError.p2pFetchFailed {
-            print("⚠️ P2P fetch failed, trying InsightAPI fallback...")
+            print("⚠️ P2P fetch failed")
         } catch {
-            print("⚠️ P2P fetch error: \(error.localizedDescription), trying InsightAPI fallback...")
+            print("⚠️ P2P fetch error: \(error.localizedDescription)")
         }
 
-        // InsightAPI fallback (may fail if Tor is blocking Cloudflare)
+        // CRITICAL: When Tor is enabled, do NOT use InsightAPI (blocked by Cloudflare)
+        // Only P2P works through Tor - if P2P fails, we must fail the operation
+        let torEnabled = await TorManager.shared.mode == .enabled
+        if torEnabled {
+            print("🧅 Tor enabled - InsightAPI fallback DISABLED (Cloudflare blocks Tor)")
+            print("❌ P2P CMU fetch failed and no fallback available")
+            throw NetworkError.p2pFetchFailed
+        }
+
+        // InsightAPI fallback - ONLY when Tor is disabled
         print("📡 Attempting InsightAPI fallback for \(totalBlocks) blocks...")
 
         let batchSize = 50
