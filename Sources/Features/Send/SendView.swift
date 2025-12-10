@@ -86,6 +86,9 @@ struct SendView: View {
     @State private var preparationTask: Task<Void, Never>? = nil
     @State private var preparationProgress: String = ""
 
+    // FIX #109: Debounce preparation to prevent multiple concurrent builds when typing
+    @State private var preparationDebounceTask: Task<Void, Never>? = nil
+
     var body: some View {
         ZStack {
             ScrollView {
@@ -1022,6 +1025,9 @@ struct SendView: View {
 
     /// Invalidate any prepared transaction
     private func invalidatePreparedTransaction() {
+        // FIX #109: Also cancel debounce task
+        preparationDebounceTask?.cancel()
+        preparationDebounceTask = nil
         preparationTask?.cancel()
         preparationTask = nil
         preparedTransaction = nil
@@ -1030,6 +1036,7 @@ struct SendView: View {
     }
 
     /// Check if we should trigger transaction preparation
+    /// FIX #109: Added 1.5s debounce to prevent multiple concurrent builds when user is typing
     private func triggerPreparationIfNeeded() {
         // Only prepare if input is valid
         guard isValidInput && !isSending && !hasPendingTransaction else {
@@ -1037,6 +1044,9 @@ struct SendView: View {
             if !isValidInput && isPreparingTransaction {
                 invalidatePreparedTransaction()
             }
+            // Also cancel debounce task
+            preparationDebounceTask?.cancel()
+            preparationDebounceTask = nil
             return
         }
 
@@ -1050,15 +1060,35 @@ struct SendView: View {
             return
         }
 
-        // Cancel any existing preparation
-        preparationTask?.cancel()
+        // FIX #109: Cancel any existing debounce task (user is still typing)
+        preparationDebounceTask?.cancel()
 
-        // Start new preparation
-        isPreparingTransaction = true
-        preparationProgress = "Initializing..."
+        // FIX #109: Debounce - wait 1.5 seconds after user stops typing before preparing
+        // This prevents launching multiple concurrent witness rebuilds which cancel each other
+        preparationDebounceTask = Task {
+            do {
+                // Wait 1.5 seconds for user to finish typing
+                try await Task.sleep(nanoseconds: 1_500_000_000)
 
-        preparationTask = Task {
-            await prepareTransaction()
+                // After debounce, check if task was cancelled (user typed again)
+                try Task.checkCancellation()
+
+                // Now actually start preparation
+                await MainActor.run {
+                    // Cancel any existing preparation
+                    preparationTask?.cancel()
+
+                    // Start new preparation
+                    isPreparingTransaction = true
+                    preparationProgress = "Initializing..."
+
+                    preparationTask = Task {
+                        await prepareTransaction()
+                    }
+                }
+            } catch {
+                // Task was cancelled (user typed again) - this is normal, ignore
+            }
         }
     }
 

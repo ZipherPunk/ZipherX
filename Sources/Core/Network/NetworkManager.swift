@@ -838,13 +838,25 @@ final class NetworkManager: ObservableObject {
         // When Tor is enabled, use P2P ONLY (InsightAPI blocked by Cloudflare)
         // When Tor is disabled, InsightAPI is authoritative
 
-        // 1. Get P2P peer consensus height FIRST (skip banned peers)
+        // FIX #111: Get HeaderStore height FIRST for Sybil detection
+        let headerStoreHeightForValidation = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let sybilThreshold = headerStoreHeightForValidation > 0 ? headerStoreHeightForValidation + 1000 : UInt64(10_000_000) // 10M if no headers
+
+        // 1. Get P2P peer consensus height FIRST (skip banned peers + detect Sybil attackers)
         var peerHeights: [UInt64: Int] = [:]
         var peerMaxHeight: UInt64 = 0
         for peer in peers {
             // SECURITY: Skip banned peers and handle negative heights (malicious peers)
             guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
+
+            // FIX #111: DETECT AND BAN SYBIL ATTACKERS reporting impossible heights
+            if h > sybilThreshold {
+                print("🚨 [SYBIL BAN] Peer \(peer.host) reporting FAKE height \(h) - BANNING!")
+                banAddress(peer.host, port: peer.port, reason: .corruptedData)  // Ban for 7 days
+                continue  // Don't use this peer's height
+            }
+
             if h > 0 {
                 peerHeights[h, default: 0] += 1
                 peerMaxHeight = max(peerMaxHeight, h)
@@ -872,16 +884,31 @@ final class NetworkManager: ObservableObject {
         }
 
         // 3. Determine best height
+        // FIX #111: ALWAYS use HeaderStore as ground truth to reject Sybil attack heights
+        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 1000 : UInt64.max
+
         if torEnabled {
-            // TOR MODE: P2P consensus is authoritative
+            // TOR MODE: P2P consensus is authoritative, BUT validate against HeaderStore
             if peerConsensusHeight > 0 && consensusCount >= 2 {
-                newHeight = peerConsensusHeight
-                print("🧅 [P2P] Peer consensus height: \(newHeight) (\(consensusCount) peers)")
-            } else if peerMaxHeight > 0 {
+                // FIX #111: Validate consensus height against HeaderStore
+                if peerConsensusHeight <= maxReasonableHeight {
+                    newHeight = peerConsensusHeight
+                    print("🧅 [P2P] Peer consensus height: \(newHeight) (\(consensusCount) peers)")
+                } else {
+                    print("🚨 [SYBIL] Consensus height \(peerConsensusHeight) rejected (HeaderStore: \(headerStoreHeight))")
+                    newHeight = headerStoreHeight
+                }
+            } else if peerMaxHeight > 0 && peerMaxHeight <= maxReasonableHeight {
+                // FIX #111: Only use peerMaxHeight if it's reasonable (within 1000 of HeaderStore)
                 newHeight = peerMaxHeight
                 print("🧅 [P2P] Using peer max height (no consensus): \(newHeight)")
-            } else if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-                newHeight = headerHeight
+            } else if peerMaxHeight > maxReasonableHeight {
+                // FIX #111: Reject obviously fake heights from Sybil attack
+                print("🚨 [SYBIL] Peer max height \(peerMaxHeight) rejected (HeaderStore: \(headerStoreHeight))")
+                newHeight = headerStoreHeight
+            } else if headerStoreHeight > 0 {
+                newHeight = headerStoreHeight
                 print("🧅 [P2P] Using HeaderStore height: \(newHeight)")
             }
         } else {
@@ -1532,14 +1559,26 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
-            // Fallback to max peer height if no consensus
-            if currentChainHeight == 0 && peerMaxHeight > 0 {
-                currentChainHeight = peerMaxHeight
-            }
-
-            // Fallback to header store
+            // SECURITY FIX #108: Don't trust max peer height without consensus
+            // Fallback to header store first (locally verified headers are trustworthy)
             if currentChainHeight == 0, let headerHeight = try? HeaderStore.shared.getLatestHeight() {
                 currentChainHeight = headerHeight
+                print("📊 Using HeaderStore height (no P2P consensus): \(headerHeight)")
+            }
+
+            // Only use peer max height if it's within reasonable range of header store
+            // This prevents Sybil attack where single malicious peer reports fake height
+            if currentChainHeight == 0 && peerMaxHeight > 0 {
+                // If we have a cached height, validate peer height against it
+                let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                if cachedHeight > 0 && peerMaxHeight > cachedHeight + 1000 {
+                    // Peer height is suspiciously far ahead - likely fake
+                    print("🚨 [SECURITY] Rejecting suspicious peer height \(peerMaxHeight) (cached: \(cachedHeight))")
+                    // Use cached height as safer fallback
+                    currentChainHeight = cachedHeight
+                } else {
+                    currentChainHeight = peerMaxHeight
+                }
             }
         } else {
             // NORMAL MODE: InsightAPI authoritative

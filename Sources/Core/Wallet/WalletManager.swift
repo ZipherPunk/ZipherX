@@ -699,20 +699,17 @@ final class WalletManager: ObservableObject {
                                     let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
                                     let blockCount = Int(endHeight - currentHeight + 1)
 
-                                    if let peer = networkManager.getConnectedPeer() {
-                                        // FIX #108: Add 15s timeout to prevent pre-witness rebuild from hanging
-                                        let blocks = try await withTimeout(seconds: 15) {
-                                            try await peer.getFullBlocks(from: currentHeight, count: blockCount)
-                                        }
-                                        for block in blocks {
-                                            for tx in block.transactions {
-                                                for output in tx.outputs {
-                                                    deltaCMUs.append(output.cmu)
-                                                }
+                                    // FIX #110: Use getBlocksOnDemandP2P which has multi-peer retry and reconnection logic
+                                    // This prevents "Not connected to network" errors when peers become stale
+                                    let blocks = try await withTimeout(seconds: 15) {
+                                        try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
+                                    }
+                                    for block in blocks {
+                                        for tx in block.transactions {
+                                            for output in tx.outputs {
+                                                deltaCMUs.append(output.cmu)
                                             }
                                         }
-                                    } else {
-                                        throw NetworkError.notConnected
                                     }
                                     currentHeight = endHeight + 1
                                 }

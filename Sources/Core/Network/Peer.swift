@@ -1578,6 +1578,25 @@ final class Peer {
         return (command, payload)
     }
 
+    /// FIX #112: Receive P2P message with timeout to prevent infinite hangs
+    /// This is critical for block fetches where the peer may drop connection silently
+    func receiveMessageWithTimeout(seconds: TimeInterval = 15) async throws -> (String, Data) {
+        return try await withThrowingTaskGroup(of: (String, Data).self) { group in
+            group.addTask {
+                try await self.receiveMessage()
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw NetworkError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
     // MARK: - Network I/O
 
     private func send(_ data: Data) async throws {
@@ -1748,79 +1767,127 @@ final class Peer {
         // Protocol version (BIP155 support)
         payload.append(contentsOf: withUnsafeBytes(of: UInt32(170012).littleEndian) { Array($0) })
 
-        // Hash count = 1 (we'll use genesis or a known hash)
+        // Hash count = 1
         payload.append(UInt8(1))
 
-        // Block locator hash - use genesis hash to get headers from beginning
-        // For specific height, we'd need to know that block's hash
-        let genesisHash = Data(repeating: 0, count: 32)
-        payload.append(genesisHash)
+        // FIX #107: Build proper block locator to get headers at the correct height
+        // We need the hash at (height - 1) to request headers starting at height
+        let locatorHeight = height > 0 ? height - 1 : 0
+        var locatorHash: Data?
 
-        // Stop hash (zeros = get up to 2000 headers)
-        payload.append(Data(repeating: 0, count: 32))
+        // Try 1: HeaderStore (cached headers)
+        if let lastHeader = try? HeaderStore.shared.getHeader(at: locatorHeight) {
+            locatorHash = lastHeader.blockHash
+            debugLog(.network, "📋 getBlockHeaders: Using HeaderStore hash for locator at height \(locatorHeight)")
+        }
 
-        try await sendMessage(command: "getheaders", payload: payload)
-
-        // Skip any non-headers messages
-        var command = ""
-        var response = Data()
-        var attempts = 0
-
-        while command != "headers" && attempts < 5 {
-            let (cmd, resp) = try await receiveMessage()
-            if cmd == "headers" {
-                command = cmd
-                response = resp
-                break
+        // Try 2: Checkpoints
+        if locatorHash == nil, let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
+            if let hashData = Data(hexString: checkpointHex) {
+                locatorHash = Data(hashData.reversed())  // Convert to wire format
+                debugLog(.network, "📋 getBlockHeaders: Using checkpoint for locator at height \(locatorHeight)")
             }
-            print("⏭️ Skipping \(cmd), waiting for headers...")
-            attempts += 1
         }
 
-        guard command == "headers" else {
-            return []
+        // Try 3: BundledBlockHashes
+        if locatorHash == nil {
+            let bundledHashes = BundledBlockHashes.shared
+            if bundledHashes.isLoaded, let hash = bundledHashes.getBlockHash(at: locatorHeight) {
+                locatorHash = hash  // Already in wire format
+                debugLog(.network, "📋 getBlockHeaders: Using BundledBlockHashes for locator at height \(locatorHeight)")
+            }
         }
 
-        // Parse headers response
-        var headers: [BlockHeader] = []
-        var offset = 0
-
-        // First byte is varint count
-        guard response.count >= 1 else { return [] }
-        let headerCount = Int(response[offset])
-        offset += 1
-
-        let headerSize = 1487 // Zcash/Zclassic header size with Equihash solution
-
-        for _ in 0..<min(headerCount, count) {
-            guard offset + headerSize <= response.count else { break }
-
-            // Zcash/Zclassic block header layout (140 bytes base + solution):
-            // 0-3:     version (4 bytes)
-            // 4-35:    prevBlockHash (32 bytes)
-            // 36-67:   merkleRoot (32 bytes)
-            // 68-99:   finalSaplingRoot (32 bytes) - reserved/hashFinalSaplingRoot
-            // 100-103: timestamp (4 bytes)
-            // 104-107: bits (4 bytes)
-            // 108-139: nonce (32 bytes)
-            // 140+:    solution (400 bytes for post-Bubbles Equihash(192,7))
-            let header = BlockHeader(
-                version: response.loadInt32(at: offset),
-                prevBlockHash: Data(response[(offset + 4)..<(offset + 36)]),
-                merkleRoot: Data(response[(offset + 36)..<(offset + 68)]),
-                finalSaplingRoot: Data(response[(offset + 68)..<(offset + 100)]),
-                timestamp: response.loadUInt32(at: offset + 100),
-                bits: response.loadUInt32(at: offset + 104),
-                nonce: Data(response[(offset + 108)..<(offset + 140)]),
-                solution: Data(response[(offset + 140)..<(offset + headerSize)])
-            )
-
-            headers.append(header)
-            offset += headerSize
+        // Try 4: Find nearest checkpoint BELOW the requested height
+        if locatorHash == nil {
+            let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
+            for checkpointHeight in checkpoints {
+                if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+                    if let hashData = Data(hexString: checkpointHex) {
+                        locatorHash = Data(hashData.reversed())  // Convert to wire format
+                        debugLog(.network, "📋 getBlockHeaders: Using nearest checkpoint at \(checkpointHeight) for height \(locatorHeight)")
+                        break
+                    }
+                }
+            }
         }
 
-        print("📋 Received \(headers.count) headers")
-        return headers
+        // Append locator hash (or zero hash as last resort - will get genesis headers)
+        if let hash = locatorHash {
+            payload.append(hash)
+        } else {
+            debugLog(.error, "🚨 getBlockHeaders: No locator found for height \(locatorHeight), using zero hash!")
+            payload.append(Data(count: 32))
+        }
+
+        // Stop hash (zeros = get maximum headers)
+        payload.append(Data(count: 32))
+
+        // FIX #107: Wrap send+receive in withExclusiveAccess to prevent race conditions
+        return try await withExclusiveAccess {
+            try await self.sendMessage(command: "getheaders", payload: payload)
+
+            // Skip any non-headers messages
+            var command = ""
+            var response = Data()
+            var attempts = 0
+
+            while command != "headers" && attempts < 5 {
+                let (cmd, resp) = try await self.receiveMessage()
+                if cmd == "headers" {
+                    command = cmd
+                    response = resp
+                    break
+                }
+                print("⏭️ Skipping \(cmd), waiting for headers...")
+                attempts += 1
+            }
+
+            guard command == "headers" else {
+                return []
+            }
+
+            // Parse headers response
+            var headers: [BlockHeader] = []
+            var offset = 0
+
+            // First byte is varint count
+            guard response.count >= 1 else { return [] }
+            let headerCount = Int(response[offset])
+            offset += 1
+
+            let headerSize = 1487 // Zcash/Zclassic header size with Equihash solution
+
+            for _ in 0..<min(headerCount, count) {
+                guard offset + headerSize <= response.count else { break }
+
+                // Zcash/Zclassic block header layout (140 bytes base + solution):
+                // 0-3:     version (4 bytes)
+                // 4-35:    prevBlockHash (32 bytes)
+                // 36-67:   merkleRoot (32 bytes)
+                // 68-99:   finalSaplingRoot (32 bytes) - reserved/hashFinalSaplingRoot
+                // 100-103: timestamp (4 bytes)
+                // 104-107: bits (4 bytes)
+                // 108-139: nonce (32 bytes)
+                // 140+:    solution (400 bytes for post-Bubbles Equihash(192,7))
+                let header = BlockHeader(
+                    version: response.loadInt32(at: offset),
+                    prevBlockHash: Data(response[(offset + 4)..<(offset + 36)]),
+                    merkleRoot: Data(response[(offset + 36)..<(offset + 68)]),
+                    finalSaplingRoot: Data(response[(offset + 68)..<(offset + 100)]),
+                    timestamp: response.loadUInt32(at: offset + 100),
+                    bits: response.loadUInt32(at: offset + 104),
+                    nonce: Data(response[(offset + 108)..<(offset + 140)]),
+                    solution: Data(response[(offset + 140)..<(offset + headerSize)])
+                )
+
+                headers.append(header)
+                offset += headerSize
+            }
+
+            print("📋 Received \(headers.count) headers")
+            return headers
+        }
     }
 
     func getCompactFilters(from height: UInt64, count: Int) async throws -> [CompactFilter] {
@@ -1904,6 +1971,7 @@ final class Peer {
     /// Get full blocks by height range using getheaders then getdata
     func getFullBlocks(from height: UInt64, count: Int) async throws -> [CompactBlock] {
         // Step 1: Get block headers to obtain hashes
+        // getBlockHeaders already uses withExclusiveAccess (Fix #105)
         let headers = try await getBlockHeaders(from: height, count: count)
 
         guard !headers.isEmpty else {
@@ -1924,49 +1992,55 @@ final class Peer {
             getdataPayload.append(hash)
         }
 
-        try await sendMessage(command: "getdata", payload: getdataPayload)
+        // FIX #111: Wrap send+receive in withExclusiveAccess to prevent race conditions
+        // Without this, mempool scan could consume block messages meant for this operation
+        return try await withExclusiveAccess {
+            try await self.sendMessage(command: "getdata", payload: getdataPayload)
 
-        // Receive block messages
-        // FIX: Use while loop to handle unexpected messages (like leftover 'headers') without advancing block index
-        var blocks: [CompactBlock] = []
-        var blockIndex = 0
-        var unexpectedMessages = 0
-        let maxUnexpectedMessages = 10  // Prevent infinite loop if peer keeps sending wrong messages
+            // Receive block messages
+            // FIX: Use while loop to handle unexpected messages (like leftover 'headers') without advancing block index
+            var blocks: [CompactBlock] = []
+            var blockIndex = 0
+            var unexpectedMessages = 0
+            let maxUnexpectedMessages = 10  // Prevent infinite loop if peer keeps sending wrong messages
 
-        while blockIndex < blockHashes.count && unexpectedMessages < maxUnexpectedMessages {
-            let (command, response) = try await receiveMessage()
+            while blockIndex < blockHashes.count && unexpectedMessages < maxUnexpectedMessages {
+                // FIX #112: Use receiveMessageWithTimeout to prevent infinite hang on block fetch
+                // 15s timeout per block message - if peer drops connection, we'll retry with next peer
+                let (command, response) = try await self.receiveMessageWithTimeout(seconds: 15)
 
-            // If we receive a non-block message, drain it and retry (don't advance blockIndex)
-            guard command == "block" else {
-                print("⚠️ Expected block, got \(command) - draining and retrying")
-                unexpectedMessages += 1
-                continue  // Keep waiting for the actual block
+                // If we receive a non-block message, drain it and retry (don't advance blockIndex)
+                guard command == "block" else {
+                    print("⚠️ Expected block, got \(command) - draining and retrying")
+                    unexpectedMessages += 1
+                    continue  // Keep waiting for the actual block
+                }
+
+                let hash = blockHashes[blockIndex]
+
+                // Parse the full block
+                if var block = self.parseCompactBlock(response) {
+                    // Set correct height and preserve finalSaplingRoot
+                    block = CompactBlock(
+                        blockHeight: height + UInt64(blockIndex),
+                        blockHash: hash,
+                        prevHash: block.prevHash,
+                        finalSaplingRoot: block.finalSaplingRoot,
+                        time: block.time,
+                        transactions: block.transactions
+                    )
+                    blocks.append(block)
+                    print("📦 Got block \(height + UInt64(blockIndex))")
+                }
+                blockIndex += 1
             }
 
-            let hash = blockHashes[blockIndex]
-
-            // Parse the full block
-            if var block = parseCompactBlock(response) {
-                // Set correct height and preserve finalSaplingRoot
-                block = CompactBlock(
-                    blockHeight: height + UInt64(blockIndex),
-                    blockHash: hash,
-                    prevHash: block.prevHash,
-                    finalSaplingRoot: block.finalSaplingRoot,
-                    time: block.time,
-                    transactions: block.transactions
-                )
-                blocks.append(block)
-                print("📦 Got block \(height + UInt64(blockIndex))")
+            if unexpectedMessages > 0 {
+                print("⚠️ Drained \(unexpectedMessages) unexpected messages during block fetch")
             }
-            blockIndex += 1
-        }
 
-        if unexpectedMessages > 0 {
-            print("⚠️ Drained \(unexpectedMessages) unexpected messages during block fetch")
+            return blocks
         }
-
-        return blocks
     }
 
     /// Parse a compact block from raw data

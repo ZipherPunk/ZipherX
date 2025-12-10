@@ -1431,7 +1431,10 @@ final class TransactionBuilder {
 
             for peer in connectedPeers.prefix(3) {  // Try up to 3 peers
                 do {
-                    let blocks = try await peer.getFullBlocks(from: startHeight, count: blockCount)
+                    // FIX #108: Add 15s timeout to prevent P2P fetch from hanging indefinitely
+                    let blocks = try await withTimeout(seconds: 15) {
+                        try await peer.getFullBlocks(from: startHeight, count: blockCount)
+                    }
                     for block in blocks {
                         for tx in block.transactions {
                             for output in tx.outputs {

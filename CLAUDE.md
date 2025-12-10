@@ -5548,6 +5548,349 @@ guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
 
 ---
 
+### 107. Pre-Witness Delta CMU Fetch Hang Fix (December 10, 2025)
+
+**Problem**: Pre-witness rebuild was hanging for 60+ seconds trying to fetch delta CMUs for notes beyond the boost file height. The 15s timeout wasn't effectively canceling the operation.
+
+**Symptoms in Log**:
+```
+[14:15:10] 🔄 Pre-witness: 3 note(s) beyond boost file, fetching delta CMUs...
+[14:16:14] ⚠️ Pre-witness: Failed to fetch delta CMUs: Operation canceled
+```
+(64 seconds elapsed instead of 15s timeout)
+
+**Root Cause**: `Peer.getBlockHeadersInternal()` was using **genesis hash (zeros)** as the block locator (line 1756):
+```swift
+// OLD (wrong):
+let genesisHash = Data(repeating: 0, count: 32)
+payload.append(genesisHash)
+```
+
+This told the peer "I have nothing, send me headers from block 0". The peer would try to send ~2.9M headers, causing:
+1. P2P `receiveMessage()` to wait indefinitely for huge response
+2. `withTimeout(15)` threw but inner operation continued (socket blocked)
+3. Eventually NWConnection was canceled, throwing error 89
+
+**Solution**: Updated `getBlockHeadersInternal()` to use proper block locators (same logic as `HeaderSyncManager.buildGetHeadersPayload()`):
+
+1. **Try HeaderStore** - Cached headers database
+2. **Try Checkpoints** - Hardcoded checkpoint hashes
+3. **Try BundledBlockHashes** - Downloaded from GitHub
+4. **Try Nearest Checkpoint** - Find closest checkpoint below requested height
+5. **Fallback** - Zero hash only as absolute last resort (with warning)
+
+Also wrapped the send+receive sequence in `withExclusiveAccess` to prevent race conditions with block listener.
+
+**Code Changes**:
+```swift
+// FIX #107: Build proper block locator to get headers at the correct height
+let locatorHeight = height > 0 ? height - 1 : 0
+var locatorHash: Data?
+
+// Try 1: HeaderStore (cached headers)
+if let lastHeader = try? HeaderStore.shared.getHeader(at: locatorHeight) {
+    locatorHash = lastHeader.blockHash
+}
+
+// Try 2: Checkpoints
+if locatorHash == nil, let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
+    locatorHash = Data(hashData.reversed())  // Wire format
+}
+
+// Try 3: BundledBlockHashes
+// Try 4: Nearest checkpoint below height
+// ...
+
+// Wrap send+receive in withExclusiveAccess
+return try await withExclusiveAccess {
+    try await self.sendMessage(command: "getheaders", payload: payload)
+    // ... receive and parse ...
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - `getBlockHeadersInternal()` now uses proper block locators + withExclusiveAccess
+
+---
+
+### 108. Pre-Witness P2P Fetch Timeout + Sybil Attack Protection (December 10, 2025)
+
+**Problem**: Transaction build stuck at "Generating ZK-proof" stage. Investigation revealed:
+1. Pre-witness rebuild was fetching delta CMUs via P2P with no timeout
+2. P2P fetch would hang indefinitely waiting for blocks
+3. Additionally, single malicious peer could inject fake chain height (669 million) bypassing consensus
+
+**Root Cause 1 - No P2P Timeout**:
+- `fetchCMUsFromBlocks()` in TransactionBuilder called `peer.getFullBlocks()` without timeout
+- If P2P peer was slow or unresponsive, the call would hang forever
+- This blocked the entire transaction build process
+
+**Root Cause 2 - Sybil Height Bypass**:
+- In Tor mode, if no P2P consensus found, code fell back to `peerMaxHeight`
+- Single malicious peer reporting 669,590,529 would be used as chain height
+- This triggered impossible background sync of 666 million blocks
+
+**Fix Applied**:
+
+1. **P2P Timeout** (`TransactionBuilder.swift:1434-1437`):
+   ```swift
+   // FIX #108: Add 15s timeout to prevent P2P fetch from hanging indefinitely
+   let blocks = try await withTimeout(seconds: 15) {
+       try await peer.getFullBlocks(from: startHeight, count: blockCount)
+   }
+   ```
+
+2. **Sybil Height Validation** (`NetworkManager.swift:1535-1555`):
+   ```swift
+   // SECURITY FIX #108: Don't trust max peer height without consensus
+   // Fallback to header store first (locally verified headers are trustworthy)
+   if currentChainHeight == 0, let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+       currentChainHeight = headerHeight
+   }
+
+   // Only use peer max height if it's within reasonable range of cached height
+   if currentChainHeight == 0 && peerMaxHeight > 0 {
+       let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+       if cachedHeight > 0 && peerMaxHeight > cachedHeight + 1000 {
+           // Reject suspicious height - likely fake
+           print("🚨 [SECURITY] Rejecting suspicious peer height \(peerMaxHeight)")
+           currentChainHeight = cachedHeight
+       } else {
+           currentChainHeight = peerMaxHeight
+       }
+   }
+   ```
+
+**Security Properties**:
+- P2P fetches now timeout after 15 seconds, preventing indefinite hangs
+- Fake peer heights >1000 blocks ahead of cached height are rejected
+- HeaderStore (Equihash-verified headers) takes priority over unvalidated peer heights
+- Single malicious peer can no longer inject fake chain height
+
+**Files Modified**:
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Added 15s timeout to P2P CMU fetch
+- `Sources/Core/Network/NetworkManager.swift` - Added Sybil height validation in Tor mode
+
+---
+
+### 109. Transaction Preparation Debounce - Prevent Concurrent Witness Rebuilds (December 10, 2025)
+
+**Problem**: When user types in the AMOUNT field, multiple concurrent witness rebuilds were being triggered, causing all P2P fetches to be cancelled with `CancellationError`.
+
+**Symptoms in Log**:
+```
+[15:05:27.760] ⚠️ Database witnesses not usable, rebuilding from boost + delta...
+[15:05:28.912] ⚠️ Database witnesses not usable, rebuilding from boost + delta...
+[15:05:33.785] ⚠️ P2P fetch from 74.50.74.102 failed: CancellationError
+[15:05:38.730] 📊 Fetched 0 delta CMUs from chain  ← All fetches cancelled!
+```
+
+**Root Cause**:
+1. `onChange(of: amount)` triggers `triggerPreparationIfNeeded()` on EVERY keystroke
+2. `triggerPreparationIfNeeded()` calls `preparationTask?.cancel()` and starts new preparation
+3. Each new preparation cancels the previous one's P2P operations
+4. When user types "0.001", preparation is cancelled 4 times (once per character!)
+5. All P2P/InsightAPI requests get `CancellationError` from Swift Task cancellation
+
+**Fix Applied** (`SendView.swift`):
+
+1. **Added debounce task state**:
+   ```swift
+   @State private var preparationDebounceTask: Task<Void, Never>? = nil
+   ```
+
+2. **Modified `triggerPreparationIfNeeded()` with 1.5s debounce**:
+   ```swift
+   // Cancel any existing debounce task (user is still typing)
+   preparationDebounceTask?.cancel()
+
+   // Debounce - wait 1.5 seconds after user stops typing before preparing
+   preparationDebounceTask = Task {
+       do {
+           try await Task.sleep(nanoseconds: 1_500_000_000)  // 1.5 seconds
+           try Task.checkCancellation()
+
+           // After debounce, actually start preparation
+           await MainActor.run {
+               preparationTask?.cancel()
+               isPreparingTransaction = true
+               preparationProgress = "Initializing..."
+               preparationTask = Task { await prepareTransaction() }
+           }
+       } catch {
+           // Task cancelled (user typed again) - normal, ignore
+       }
+   }
+   ```
+
+3. **Updated `invalidatePreparedTransaction()` to cancel debounce task**
+
+**How Debounce Works**:
+```
+User types "0"    → Debounce starts (1.5s timer)
+User types "."    → Previous debounce cancelled, new debounce starts
+User types "0"    → Previous debounce cancelled, new debounce starts
+User types "0"    → Previous debounce cancelled, new debounce starts
+User types "1"    → Previous debounce cancelled, new debounce starts
+[User stops typing]
+[1.5 seconds pass]
+→ ONLY NOW: prepareTransaction() is called ONCE
+→ P2P fetch runs without cancellation
+→ Witness rebuilt successfully!
+```
+
+**Files Modified**:
+- `Sources/Features/Send/SendView.swift` - Added debounce to transaction preparation
+
+---
+
+### 110. Pre-Witness Delta CMU Fetch Using getBlocksOnDemandP2P (December 10, 2025)
+
+**Problem**: Pre-witness rebuild hung at "Generating ZK-SNARK proof" because P2P peers became stale during delta CMU fetch.
+
+**Symptoms in Log**:
+```
+[15:14:50.410] 🔄 [185.205.246.161] Connection stale (idle 66s), reconnecting...
+[15:14:50.410] ⚠️ P2P fetch from 185.205.246.161 failed: Not connected to network
+[15:14:50.410] ⚠️ P2P fetch from 74.50.74.102 failed: Not connected to network
+[15:14:50.428] ⚠️ All P2P peers failed to fetch CMUs
+[15:14:50.429] 📡 Fetching delta CMUs via InsightAPI (blocks 2935316-2936379)...
+← InsightAPI blocked by Cloudflare in Tor mode → hang
+```
+
+**Root Cause**:
+1. `preRebuildWitnessesForInstantPayment()` used `peer.getFullBlocks()` directly
+2. `getConnectedPeer()` returned a peer that was stale (idle >60s)
+3. Stale peers failed with "Not connected to network"
+4. Fallback to InsightAPI was blocked by Cloudflare when using Tor
+5. Result: Delta CMU fetch hung, transaction building stuck
+
+**Fix Applied** (`WalletManager.swift:702-706`):
+```swift
+// OLD: Used single peer that could be stale
+if let peer = networkManager.getConnectedPeer() {
+    let blocks = try await peer.getFullBlocks(from: currentHeight, count: blockCount)
+}
+
+// NEW: Use getBlocksOnDemandP2P with multi-peer retry and reconnection
+let blocks = try await withTimeout(seconds: 15) {
+    try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
+}
+```
+
+**Why getBlocksOnDemandP2P is Better**:
+- Has automatic peer reconnection if no ready peers available
+- Tries multiple peers if first one fails
+- Uses `peer.ensureConnected()` before fetching
+- Doesn't require pre-synced HeaderStore (fetches headers on-demand via P2P `getheaders`)
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Use `getBlocksOnDemandP2P()` for delta CMU fetch
+
+---
+
+### 111. Sybil Attack Detection and Auto-Ban in Tor Mode (December 10, 2025)
+
+**Problem**: Malicious peers reporting fake height 669,590,754 (real: ~2,938,963) were poisoning chain height in Tor mode, causing:
+- Background sync trying to sync 666 million blocks
+- Transaction building failing due to wrong anchor
+- App showing impossible chain height
+
+**Root Cause**: The `refreshChainHeight()` function in Tor mode used `peerMaxHeight` as fallback when no consensus was reached, but this value wasn't validated against HeaderStore.
+
+**Fixes Applied**:
+
+1. **Auto-ban Sybil attackers** (`NetworkManager.swift:853-858`):
+   ```swift
+   // FIX #111: DETECT AND BAN SYBIL ATTACKERS reporting impossible heights
+   if h > sybilThreshold {
+       print("🚨 [SYBIL BAN] Peer \(peer.host) reporting FAKE height \(h) - BANNING!")
+       banPeer(peer.host, reason: .corruptedData)  // Ban for 7 days
+       continue  // Don't use this peer's height
+   }
+   ```
+
+2. **HeaderStore validation for all heights** (`NetworkManager.swift:882-897`):
+   ```swift
+   // FIX #111: Validate consensus height against HeaderStore
+   if peerConsensusHeight <= maxReasonableHeight {
+       newHeight = peerConsensusHeight
+   } else {
+       print("🚨 [SYBIL] Consensus height \(peerConsensusHeight) rejected")
+       newHeight = headerStoreHeight
+   }
+   ```
+
+3. **getFullBlocks race condition fix** (`Peer.swift:1976-2022`):
+   - Added `withExclusiveAccess()` wrapper around block fetch
+   - Prevents mempool scan from consuming block messages
+
+**Sybil Detection Logic**:
+```
+HeaderStore height: 2,938,960
+Threshold: HeaderStore + 1000 = 2,939,960
+Peer reports: 669,590,754
+→ 669,590,754 > 2,939,960 → SYBIL DETECTED → BAN PEER
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Sybil detection/ban, HeaderStore validation
+- `Sources/Core/Network/Peer.swift` - `getFullBlocks()` wrapped in `withExclusiveAccess()`
+
+---
+
+### 112. P2P Block Fetch Timeout to Prevent Infinite Hang (December 10, 2025)
+
+**Problem**: Transaction building took 4+ minutes. Analysis of zmac.log showed a 2 minute 39 second gap with NO logs between "fetching delta CMUs" and "Starting broadcast".
+
+**Timeline Evidence**:
+```
+[15:25:19.839] 🔄 Pre-witness: 2 note(s) beyond boost file, fetching delta CMUs...
+[15:25:19.839] 🔗 P2P on-demand: Fetching 50 blocks from height 2935316
+[15:25:20.404] 📋 Received 50 headers
+[15:25:20.670] 🔮 scanMempoolForIncoming: requesting mempool txs from peer 37.187.76.79...
+← 2 min 39 sec gap with ZERO logs →
+[15:27:59.221] 📡 Starting broadcast, connected: true, peers: 11
+```
+
+**Root Cause**: `getFullBlocks()` received headers but then waited indefinitely for block data that never came. The `receiveMessage()` call blocks forever if the peer drops connection silently. The outer `withTimeout(15)` didn't work because Swift's task cancellation is cooperative - `receiveMessage()` never checked for cancellation.
+
+**Fix Applied** (`Peer.swift`):
+
+1. **Added `receiveMessageWithTimeout()`** - New method that wraps `receiveMessage()` with a proper timeout using `withThrowingTaskGroup`:
+   ```swift
+   func receiveMessageWithTimeout(seconds: TimeInterval = 15) async throws -> (String, Data) {
+       return try await withThrowingTaskGroup(of: (String, Data).self) { group in
+           group.addTask { try await self.receiveMessage() }
+           group.addTask {
+               try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+               throw NetworkError.timeout
+           }
+           let result = try await group.next()!
+           group.cancelAll()
+           return result
+       }
+   }
+   ```
+
+2. **Updated `getFullBlocks()` to use timeout** (`Peer.swift:2008-2010`):
+   ```swift
+   // FIX #112: Use receiveMessageWithTimeout to prevent infinite hang on block fetch
+   // 15s timeout per block message - if peer drops connection, we'll retry with next peer
+   let (command, response) = try await self.receiveMessageWithTimeout(seconds: 15)
+   ```
+
+**Expected Behavior After Fix**:
+- Each block message has 15s max wait time
+- If timeout fires, `NetworkError.timeout` is thrown
+- `getBlocksOnDemandP2P()` catches the error and tries next peer
+- Total retry across all peers is bounded, no more infinite hangs
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Added `receiveMessageWithTimeout()`, updated `getFullBlocks()` block receive loop
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.
