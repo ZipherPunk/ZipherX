@@ -5352,6 +5352,60 @@ Also updated:
 
 ---
 
+### 104. CRITICAL: Async Lock Release Bug - ROOT CAUSE of Invalid Magic Bytes (December 10, 2025)
+
+**Problem**: Despite all previous race condition fixes, invalid magic bytes errors persisted on ALL peers simultaneously. The `PeerMessageLock` wasn't actually protecting anything.
+
+**Root Cause**: The lock release was happening **asynchronously**, not when the protected code finished:
+
+```swift
+// OLD CODE (BROKEN):
+func withExclusiveAccess<T>(_ operation: () async throws -> T) async throws -> T {
+    await messageLock.acquire()
+    defer {
+        Task { await messageLock.release() }  // BUG HERE!
+    }
+    return try await operation()
+}
+```
+
+The `Task { }` creates a **new async task** that runs at some **future point**, not immediately when `defer` executes. Timeline:
+
+1. Operation A acquires lock
+2. Operation A finishes, function returns
+3. `defer` runs, creates Task to release lock (but Task doesn't run yet!)
+4. Lock is STILL HELD even though Operation A has returned
+5. Operation A starts another P2P request (thinks lock is free)
+6. Block listener tries `tryAcquire()`, returns false (lock appears held)
+7. Eventually, the release Task runs (sometime later)
+8. By now, multiple operations have read from the socket concurrently → invalid magic bytes
+
+**The lock was essentially non-functional** because it was released asynchronously after the protected code had already finished executing.
+
+**Fix**: Release lock synchronously using do/catch instead of defer+Task:
+
+```swift
+// NEW CODE (CORRECT):
+func withExclusiveAccess<T>(_ operation: () async throws -> T) async throws -> T {
+    await messageLock.acquire()
+    do {
+        let result = try await operation()
+        await messageLock.release()  // Released BEFORE returning
+        return result
+    } catch {
+        await messageLock.release()  // Released on error too
+        throw error
+    }
+}
+```
+
+Now the lock is released **synchronously** before the function returns, ensuring proper mutual exclusion.
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Fixed `withExclusiveAccess()` to release lock synchronously
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

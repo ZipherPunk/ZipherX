@@ -256,10 +256,18 @@ final class Peer {
     /// This prevents concurrent operations from interfering with each other
     func withExclusiveAccess<T>(_ operation: () async throws -> T) async throws -> T {
         await messageLock.acquire()
-        defer {
-            Task { await messageLock.release() }
+        // CRITICAL FIX: Release lock synchronously, NOT in a Task
+        // The old code `defer { Task { await messageLock.release() } }` was broken:
+        // Task{} creates an async task that runs LATER, so the lock was still held
+        // when this function returned, causing all the race conditions.
+        do {
+            let result = try await operation()
+            await messageLock.release()
+            return result
+        } catch {
+            await messageLock.release()
+            throw error
         }
-        return try await operation()
     }
 
     /// Send a request and wait for a specific response command
