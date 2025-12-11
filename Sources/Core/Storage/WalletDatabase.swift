@@ -3119,16 +3119,24 @@ struct TransactionHistoryItem {
             return formatter.string(from: date)
         }
 
-        // Fallback: try to get from HeaderStore
+        // Fallback: try to get from HeaderStore (checks BOTH headers table AND block_times table)
         if height > 0 {
-            if let header = try? HeaderStore.shared.getHeader(at: height) {
-                let date = Date(timeIntervalSince1970: TimeInterval(header.time))
+            if let timestamp = try? HeaderStore.shared.getBlockTime(at: height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+                return formatter.string(from: date)
+            }
+        }
+
+        // FIX #120: If HeaderStore fails, also try BlockTimestampManager (in-memory cache from boost file)
+        if height > 0 {
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+                let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
                 return formatter.string(from: date)
             }
         }
 
         // Final fallback: estimate using dynamic reference (current chain height = NOW)
-        // This avoids hardcoded timestamps that become stale
+        // FIX #120: Show (est) suffix so user knows this is not the real timestamp
         if height > 0 {
             let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
             let currentHeight = NetworkManager.shared.chainHeight
