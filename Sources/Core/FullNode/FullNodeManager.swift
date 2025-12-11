@@ -114,8 +114,15 @@ public class FullNodeManager: ObservableObject {
         self.daemonDebugLevel = .none
         self.daemonDebugLevel = loadDebugLevel()
 
-        checkNodeStatus()
-        startAutoRefresh()
+        // FIX #135: Only check node status and start polling in Full Node mode
+        // In Light Mode, there's no daemon to poll - avoid "Connection refused" spam
+        if WalletModeManager.shared.currentMode == .fullNode {
+            checkNodeStatus()
+            startAutoRefresh()
+        } else {
+            // In Light Mode, set status to unknown and don't poll
+            daemonStatus = .unknown
+        }
     }
 
     deinit {
@@ -123,8 +130,16 @@ public class FullNodeManager: ObservableObject {
     }
 
     /// Start automatic status refresh timer
+    /// FIX #135: Only starts polling if in Full Node mode
     public func startAutoRefresh() {
         stopAutoRefresh()
+
+        // FIX #135: Don't poll daemon in Light Mode
+        guard WalletModeManager.shared.currentMode == .fullNode else {
+            print("📱 FullNodeManager: Light Mode - skipping daemon status polling")
+            return
+        }
+
         statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: Self.STATUS_REFRESH_INTERVAL, repeats: true) { [weak self] _ in
             self?.checkNodeStatus()
         }
@@ -139,7 +154,15 @@ public class FullNodeManager: ObservableObject {
     // MARK: - Status Checking
 
     /// Check overall node status
+    /// FIX #135: Only checks status in Full Node mode
     public func checkNodeStatus() {
+        // FIX #135: Skip status check in Light Mode - no daemon to check
+        guard WalletModeManager.shared.currentMode == .fullNode else {
+            // Stop the timer if it's running in Light Mode (shouldn't happen but safety check)
+            stopAutoRefresh()
+            return
+        }
+
         Task {
             await checkInstallation()
             await checkBlockchain()

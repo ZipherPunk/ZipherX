@@ -186,10 +186,40 @@ final class NetworkManager: ObservableObject {
 
     /// FIX #130: Set header syncing state (called from WalletManager)
     /// When true, mempool scan is disabled to prevent P2P race conditions
+    /// FIX #139: Also pauses/resumes block listeners for faster header sync
+    /// FIX #140: Made synchronous to ensure listeners are paused BEFORE header sync starts
     func setHeaderSyncing(_ syncing: Bool) {
-        Task { @MainActor in
-            self.isHeaderSyncing = syncing
-            print("📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
+        // FIX #140: Set flag synchronously (no Task wrapper) so it takes effect immediately
+        self.isHeaderSyncing = syncing
+        debugLog(.network, "📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
+
+        // FIX #139: Pause block listeners during header sync for 100x faster sync
+        // FIX #140: Call synchronously - must happen BEFORE header sync starts
+        if syncing {
+            self.pauseAllBlockListeners()
+        } else {
+            self.resumeAllBlockListeners()
+        }
+    }
+
+    /// FIX #139: Pause all block listeners to free up peer locks for header sync
+    private func pauseAllBlockListeners() {
+        debugLog(.network, "⏸️ FIX #140: Pausing \(peers.count) block listeners for header sync...")
+        var stoppedCount = 0
+        for peer in peers {
+            if peer.isListening {
+                peer.stopBlockListener()
+                stoppedCount += 1
+            }
+        }
+        debugLog(.network, "⏸️ FIX #140: Stopped \(stoppedCount) block listeners")
+    }
+
+    /// FIX #139: Resume all block listeners after header sync
+    private func resumeAllBlockListeners() {
+        debugLog(.network, "▶️ FIX #140: Resuming block listeners for \(peers.count) peers...")
+        for peer in peers {
+            peer.startBlockListener()
         }
     }
 
@@ -4101,10 +4131,28 @@ final class NetworkManager: ObservableObject {
             }
 
             // Connect to new peers if needed
+            // FIX #134: Track tried addresses in this rotation to prevent infinite loop
+            var triedInThisRotation = Set<String>()
+            var consecutiveCooldownSkips = 0
+            let maxCooldownSkips = 20  // Break after 20 consecutive cooldown skips
+
             while peers.count < MIN_PEERS {
                 guard let address = selectBestAddress() else {
                     break
                 }
+
+                let addressKey = "\(address.host):\(address.port)"
+
+                // FIX #134: Skip if we already tried this address in this rotation
+                if triedInThisRotation.contains(addressKey) {
+                    consecutiveCooldownSkips += 1
+                    if consecutiveCooldownSkips >= maxCooldownSkips {
+                        // All available addresses are either on cooldown or already tried
+                        break
+                    }
+                    continue
+                }
+                triedInThisRotation.insert(addressKey)
 
                 if isBanned(address.host) {
                     continue
@@ -4113,9 +4161,15 @@ final class NetworkManager: ObservableObject {
                 // FIX #121: Add cooldown check to prevent infinite reconnection loops
                 // Without this, rotatePeers could spam connect() calls to failing addresses
                 if isOnCooldown(address.host, port: address.port) {
-                    print("⏳ [\(address.host)] On cooldown, skipping in rotatePeers")
+                    // FIX #134: Only log once per address per rotation (no spam)
+                    consecutiveCooldownSkips += 1
+                    if consecutiveCooldownSkips >= maxCooldownSkips {
+                        print("⏳ All \(triedInThisRotation.count) addresses on cooldown, waiting...")
+                        break
+                    }
                     continue
                 }
+                consecutiveCooldownSkips = 0  // Reset counter on successful non-cooldown address
                 recordConnectionAttempt(address.host, port: address.port)
 
                 if let peer = try? await connectToPeer(address) {

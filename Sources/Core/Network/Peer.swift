@@ -146,8 +146,15 @@ final class Peer {
 
     // Block announcement listener
     private var blockListenerTask: Task<Void, Never>?
-    private var isListening = false
+    private var _isListening = false
     private let listenerLock = NSLock()
+
+    /// FIX #140: Public getter for isListening (used by NetworkManager to check listener state)
+    var isListening: Bool {
+        listenerLock.lock()
+        defer { listenerLock.unlock() }
+        return _isListening
+    }
 
     /// Callback when a new block is announced via P2P inv message
     /// Parameters: block hash (32 bytes, wire format)
@@ -879,9 +886,9 @@ final class Peer {
     /// NOTE: The listener only runs when peer is idle (not busy with other operations)
     func startBlockListener() {
         // ATOMIC CHECK: Use lock to prevent multiple listeners from starting
-        // Without lock, two concurrent calls could both pass the guard before either sets isListening
+        // Without lock, two concurrent calls could both pass the guard before either sets _isListening
         listenerLock.lock()
-        if isListening {
+        if _isListening {
             listenerLock.unlock()
             print("📡 [\(host)] Block listener already running, skipping")
             return
@@ -889,7 +896,7 @@ final class Peer {
         // Cancel any existing task just to be safe
         blockListenerTask?.cancel()
         blockListenerTask = nil
-        isListening = true
+        _isListening = true
         listenerLock.unlock()
 
         blockListenerTask = Task { [weak self] in
@@ -911,7 +918,7 @@ final class Peer {
             var consecutiveErrors = 0
             let maxConsecutiveErrors = 5
 
-            while self.isListening && self.connection != nil {
+            while self._isListening && self.connection != nil {
                 do {
                     // RACE CONDITION FIX: Acquire lock before receiving to prevent
                     // concurrent socket reads with other P2P operations.
@@ -961,16 +968,16 @@ final class Peer {
                     }
                 } catch {
                     // Connection closed or error - stop listening
-                    if self.isListening {
+                    if self._isListening {
                         print("📡 [\(self.host)] Block listener stopped: \(error.localizedDescription)")
                     }
                     break
                 }
             }
 
-            // Reset isListening when task ends (use lock for thread safety)
+            // Reset _isListening when task ends (use lock for thread safety)
             self.listenerLock.lock()
-            self.isListening = false
+            self._isListening = false
             self.listenerLock.unlock()
             print("📡 [\(self.host)] Block listener ended")
         }
@@ -979,7 +986,7 @@ final class Peer {
     /// Stop listening for block announcements
     func stopBlockListener() {
         listenerLock.lock()
-        isListening = false
+        _isListening = false
         blockListenerTask?.cancel()
         blockListenerTask = nil
         listenerLock.unlock()
@@ -998,7 +1005,7 @@ final class Peer {
             }
 
             group.addTask {
-                // 30 second timeout - allows periodic check of isListening
+                // 30 second timeout - allows periodic check of _isListening
                 try await Task.sleep(nanoseconds: 30_000_000_000)
                 throw NetworkError.timeout
             }
@@ -1023,8 +1030,9 @@ final class Peer {
             }
 
             group.addTask {
-                // 30 second timeout - allows periodic check of isListening
-                try await Task.sleep(nanoseconds: 30_000_000_000)
+                // FIX #138: Reduced from 30s to 5s to allow header sync to acquire lock faster
+                // Block listener will retry immediately, so short timeout doesn't miss messages
+                try await Task.sleep(nanoseconds: 5_000_000_000)
                 throw NetworkError.timeout
             }
 

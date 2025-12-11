@@ -16,8 +16,9 @@ final class HeaderSyncManager {
     private let minPeers = 3  // Minimum peers for header sync
     private let consensusThreshold = 3  // Require 3 peers to agree on headers
 
-    // Sync state
-    private var isSyncing = false
+    // Sync state - FIX #133: Use static to prevent duplicate syncs from multiple instances
+    private static var isSyncing = false
+    private static let syncLock = NSLock()
     private let syncQueue = DispatchQueue(label: "com.zipherx.headersync", qos: .userInitiated)
 
     // Progress tracking
@@ -33,12 +34,21 @@ final class HeaderSyncManager {
     /// Sync headers from a starting height to network tip
     /// Uses multi-peer consensus to ensure data integrity
     func syncHeaders(from startHeight: UInt64) async throws {
-        guard !isSyncing else {
+        // FIX #133: Use static lock to prevent duplicate syncs from multiple HeaderSyncManager instances
+        Self.syncLock.lock()
+        guard !Self.isSyncing else {
+            Self.syncLock.unlock()
+            print("⚠️ Header sync already in progress (skipping duplicate)")
             throw SyncError.alreadySyncing
         }
+        Self.isSyncing = true
+        Self.syncLock.unlock()
 
-        isSyncing = true
-        defer { isSyncing = false }
+        defer {
+            Self.syncLock.lock()
+            Self.isSyncing = false
+            Self.syncLock.unlock()
+        }
 
         print("🔄 Starting header sync from height \(startHeight)")
 
@@ -184,7 +194,10 @@ final class HeaderSyncManager {
                 continue
             }
 
-            let payload = buildGetHeadersPayload(startHeight: currentHeight)
+            // FIX #133: Destructure tuple to get actual locator height
+            let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
+            // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
+            let headersStartHeight = actualLocatorHeight + 1
 
             do {
                 let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
@@ -197,7 +210,8 @@ final class HeaderSyncManager {
                         attempts += 1
                         let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 15)
                         if command == "headers" {
-                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: currentHeight)
+                            // FIX #133: Use correct starting height from actual locator
+                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
                         }
                     }
 
@@ -210,11 +224,12 @@ final class HeaderSyncManager {
                     continue
                 }
 
-                // Verify chain and store
-                try verifyHeaderChain(headers, startingAt: currentHeight)
+                // FIX #133: Verify chain starting at correct height
+                try verifyHeaderChain(headers, startingAt: headersStartHeight)
                 try headerStore.insertHeaders(headers)
 
-                let actualEndHeight = currentHeight + UInt64(headers.count) - 1
+                // FIX #133: Use actual header heights, not requested heights
+                let actualEndHeight = headersStartHeight + UInt64(headers.count) - 1
                 currentHeight = actualEndHeight + 1
 
                 // Report progress
@@ -235,121 +250,123 @@ final class HeaderSyncManager {
         }
     }
 
-    /// FIX #122: Fast sequential header sync with peer rotation for large ranges (>500 headers)
-    /// IMPORTANT: P2P getheaders returns headers AFTER the locator hash, so we MUST chain sequentially
+    /// FIX #141: PARALLEL header requests - request from ALL peers, take first response
+    /// Over Tor, latency varies wildly. Parallel requests ensure fastest peer wins.
+    /// IMPORTANT: P2P getheaders returns headers AFTER the locator hash
     /// Each batch uses the last received header's hash as locator for the next batch
-    /// Rotates between peers for fault tolerance and speed
     private func syncHeadersParallel(from startHeight: UInt64, to chainTip: UInt64) async throws {
-        print("🚀 Using FAST SEQUENTIAL sync with peer rotation for \(chainTip - startHeight) headers")
+        print("🚀 FIX #141: Using PARALLEL header requests for \(chainTip - startHeight) headers")
 
         let peers = networkManager.peers.filter { $0.isConnectionReady }
         guard !peers.isEmpty else {
             throw SyncError.insufficientPeers(got: 0, need: 1)
         }
 
-        print("📊 Using \(peers.count) peers with rotation for fault tolerance")
+        print("📊 Requesting headers from ALL \(peers.count) peers in parallel (first response wins)")
 
         var currentHeight = startHeight
-        var peerIndex = 0
         var totalSynced = 0
-        var failedPeers = Set<String>()
         let totalNeeded = Int(chainTip - startHeight)
         let startTime = Date()
+        var consecutiveFailures = 0
+        let maxConsecutiveFailures = 3
 
         while currentHeight < chainTip {
-            // CRITICAL FIX: Get FRESH peers list on each iteration
+            // FIX #133: Destructure tuple to get actual locator height
+            let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
+            // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
+            let headersStartHeight = actualLocatorHeight + 1
+
+            // Get fresh peer list for each batch
             let currentPeers = networkManager.peers.filter { $0.isConnectionReady }
-
-            // Get next peer (rotate for load balancing)
-            var peer: Peer?
-            for i in 0..<max(currentPeers.count, 1) {
-                let idx = (peerIndex + i) % max(currentPeers.count, 1)
-                guard idx < currentPeers.count else { continue }
-                let candidate = currentPeers[idx]
-                if !failedPeers.contains(candidate.host) {
-                    peer = candidate
-                    peerIndex = idx + 1
-                    break
+            guard !currentPeers.isEmpty else {
+                print("⚠️ No connected peers, waiting 1s...")
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    throw SyncError.insufficientPeers(got: 0, need: 1)
                 }
-            }
-
-            guard let peer = peer else {
-                print("⚠️ All peers failed, refreshing peer list...")
-                // Wait and REFRESH the peers list from NetworkManager
-                try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds to let peers reconnect
-
-                // CRITICAL: Get FRESH peer list, not cached one
-                let freshPeers = networkManager.peers.filter { $0.isConnectionReady }
-                if !freshPeers.isEmpty {
-                    // Reset failed peers and continue with fresh list
-                    failedPeers.removeAll()
-                    print("✅ Found \(freshPeers.count) fresh peers, continuing sync...")
-                    continue
-                }
-
-                // Still no peers - throw error
-                throw SyncError.insufficientPeers(got: 0, need: 1)
-            }
-
-            // Build payload using last synced header's hash as locator
-            let payload = buildGetHeadersPayload(startHeight: currentHeight)
-
-            do {
-                let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
-                    try await peer.sendMessage(command: "getheaders", payload: payload)
-
-                    var receivedHeaders: [ZclassicBlockHeader]?
-                    var attempts = 0
-
-                    while receivedHeaders == nil && attempts < 5 {
-                        attempts += 1
-                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 15)
-                        if command == "headers" {
-                            // Parse headers with correct starting height
-                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: currentHeight)
-                        }
-                    }
-
-                    return receivedHeaders ?? []
-                }
-
-                guard !headers.isEmpty else {
-                    print("⚠️ No headers from \(peer.host), trying next peer")
-                    failedPeers.insert(peer.host)
-                    continue
-                }
-
-                // Verify chain continuity for this batch
-                try verifyHeaderChain(headers, startingAt: currentHeight)
-
-                // Store headers
-                try headerStore.insertHeaders(headers)
-
-                totalSynced += headers.count
-                currentHeight += UInt64(headers.count)
-
-                let percent = totalSynced * 100 / max(totalNeeded, 1)
-                let elapsed = Date().timeIntervalSince(startTime)
-                let rate = elapsed > 0 ? Double(totalSynced) / elapsed : 0
-                print("✅ Synced \(totalSynced)/\(totalNeeded) headers (\(percent)%) - \(Int(rate)) headers/sec")
-
-                // Report progress
-                let progress = HeaderSyncProgress(
-                    currentHeight: currentHeight - 1,
-                    totalHeight: chainTip,
-                    headersStored: try headerStore.getHeaderCount()
-                )
-                onProgress?(progress)
-
-            } catch {
-                print("⚠️ Peer \(peer.host) failed: \(error.localizedDescription)")
-                failedPeers.insert(peer.host)
                 continue
             }
+
+            // FIX #141: Request from ALL peers in parallel, take first valid response
+            // This dramatically speeds up sync over Tor where latency varies wildly
+            let headers: [ZclassicBlockHeader]? = await withTaskGroup(of: (Peer, [ZclassicBlockHeader]?).self) { group in
+                // Start requests to all peers
+                for peer in currentPeers {
+                    group.addTask {
+                        do {
+                            let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
+                                try await peer.sendMessage(command: "getheaders", payload: payload)
+
+                                // FIX #141: Short 2s timeout - if peer doesn't respond quickly, skip it
+                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 2)
+                                if command == "headers" {
+                                    // FIX #133: Use correct starting height
+                                    return try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                                }
+                                return []
+                            }
+                            return (peer, result.isEmpty ? nil : result)
+                        } catch {
+                            return (peer, nil)
+                        }
+                    }
+                }
+
+                // Take FIRST valid response (fastest peer wins!)
+                for await (peer, result) in group {
+                    if let headers = result, !headers.isEmpty {
+                        print("⚡ FIX #141: Got \(headers.count) headers from \(peer.host) (first responder)")
+                        group.cancelAll()  // Cancel other requests
+                        return headers
+                    }
+                }
+                return nil
+            }
+
+            guard let headers = headers, !headers.isEmpty else {
+                print("⚠️ No headers from any peer, retrying...")
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    // Wait and retry with fresh peers
+                    print("⚠️ \(maxConsecutiveFailures) consecutive failures, waiting 2s for peers...")
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    consecutiveFailures = 0
+                }
+                continue
+            }
+
+            // Success - reset failure counter
+            consecutiveFailures = 0
+
+            // FIX #133: Verify chain continuity with correct starting height
+            try verifyHeaderChain(headers, startingAt: headersStartHeight)
+
+            // Store headers
+            try headerStore.insertHeaders(headers)
+
+            totalSynced += headers.count
+            // FIX #133: Use actual header end height for next iteration
+            currentHeight = headersStartHeight + UInt64(headers.count)
+
+            let percent = totalSynced * 100 / max(totalNeeded, 1)
+            let elapsed = Date().timeIntervalSince(startTime)
+            let rate = elapsed > 0 ? Double(totalSynced) / elapsed : 0
+            print("✅ Synced \(totalSynced)/\(totalNeeded) headers (\(percent)%) - \(Int(rate)) headers/sec")
+
+            // Report progress
+            let progress = HeaderSyncProgress(
+                currentHeight: currentHeight - 1,
+                totalHeight: chainTip,
+                headersStored: try headerStore.getHeaderCount()
+            )
+            onProgress?(progress)
         }
 
         let totalTime = Date().timeIntervalSince(startTime)
-        print("🎉 Header sync complete: \(totalSynced) headers in \(String(format: "%.1f", totalTime)) seconds")
+        let finalRate = totalTime > 0 ? Double(totalSynced) / totalTime : 0
+        print("🎉 Header sync complete: \(totalSynced) headers in \(String(format: "%.1f", totalTime)) seconds (\(Int(finalRate)) headers/sec)")
     }
 
     /// Fetch headers from a single peer for a specific range
@@ -359,7 +376,10 @@ final class HeaderSyncManager {
         var currentHeight = startHeight
 
         while currentHeight < endHeight {
-            let payload = buildGetHeadersPayload(startHeight: currentHeight)
+            // FIX #133: Destructure tuple to get actual locator height
+            let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
+            // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
+            let headersStartHeight = actualLocatorHeight + 1
 
             let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
                 try await peer.sendMessage(command: "getheaders", payload: payload)
@@ -367,11 +387,13 @@ final class HeaderSyncManager {
                 var receivedHeaders: [ZclassicBlockHeader]?
                 var attempts = 0
 
-                while receivedHeaders == nil && attempts < 5 {
+                // FIX #137: Reduced timeout for faster peer rotation
+                while receivedHeaders == nil && attempts < 2 {
                     attempts += 1
-                    let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 15)
+                    let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
                     if command == "headers" {
-                        receivedHeaders = try self.parseHeadersPayload(response, startingAt: currentHeight)
+                        // FIX #133: Use correct starting height from actual locator
+                        receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
                     }
                 }
 
@@ -381,7 +403,8 @@ final class HeaderSyncManager {
             guard !headers.isEmpty else { break }
 
             allHeaders.append(contentsOf: headers)
-            currentHeight = currentHeight + UInt64(headers.count)
+            // FIX #133: Use actual header end height for next iteration
+            currentHeight = headersStartHeight + UInt64(headers.count)
 
             // Stop if we've reached our target
             if currentHeight >= endHeight { break }
@@ -645,8 +668,10 @@ final class HeaderSyncManager {
         startHeight: UInt64,
         endHeight: UInt64
     ) async throws -> [ZclassicBlockHeader] {
-        // Build getheaders payload (can be done outside the lock)
-        let payload = buildGetHeadersPayload(startHeight: startHeight)
+        // FIX #133: Destructure tuple to get actual locator height
+        let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: startHeight)
+        // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
+        let headersStartHeight = actualLocatorHeight + 1
 
         // CRITICAL FIX: Wrap entire send+receive sequence in withExclusiveAccess
         // This prevents block listener from reading our response while we're waiting for it
@@ -665,9 +690,9 @@ final class HeaderSyncManager {
                 let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 30)
 
                 if command == "headers" {
-                    // Got the headers we requested!
-                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: startHeight)
-                    print("✅ Received \(receivedHeaders?.count ?? 0) headers from peer")
+                    // FIX #133: Use correct starting height from actual locator
+                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                    print("✅ Received \(receivedHeaders?.count ?? 0) headers from peer (starting at height \(headersStartHeight))")
                 } else {
                     // Ignore other messages (inv, addr, ping, etc.)
                     print("📭 Peer sent '\(command)' message, waiting for headers...")
@@ -688,7 +713,9 @@ final class HeaderSyncManager {
 
     /// Build getheaders payload
     /// Format: version (4) + hash_count (varint) + block_hashes (32 each) + stop_hash (32)
-    private func buildGetHeadersPayload(startHeight: UInt64) -> Data {
+    /// Returns: (payload, actualLocatorHeight) - the actual height of the locator used
+    /// FIX #133: Track actual locator height to detect height offset issues
+    private func buildGetHeadersPayload(startHeight: UInt64) -> (payload: Data, actualLocatorHeight: UInt64) {
         var payload = Data()
 
         // Protocol version (BIP155 support)
@@ -701,6 +728,7 @@ final class HeaderSyncManager {
         // Block locator hash - need the hash at (startHeight - 1) to request headers starting at startHeight
         let locatorHeight = startHeight > 0 ? startHeight - 1 : 0
         var locatorHash: Data?
+        var actualLocatorHeight = locatorHeight  // FIX #133: Track actual height used
 
         // First try: Get from HeaderStore (cached headers)
         if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
@@ -727,14 +755,17 @@ final class HeaderSyncManager {
         }
 
         // Fourth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
-        // This ensures we always get post-Bubbles headers even if we don't have the exact hash
+        // FIX #133: This MUST update actualLocatorHeight to reflect the real starting point
+        // Otherwise headers will be assigned wrong heights!
         if locatorHash == nil {
             let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
             for checkpointHeight in checkpoints {
                 if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
                     if let hashData = Data(hexString: checkpointHex) {
                         locatorHash = Data(hashData.reversed())  // Convert to wire format
+                        actualLocatorHeight = checkpointHeight  // FIX #133: Track actual checkpoint height!
                         print("📋 Using nearest checkpoint at height \(checkpointHeight) (requested \(locatorHeight))")
+                        print("⚠️ FIX #133: Headers will start at height \(checkpointHeight + 1), not \(startHeight)!")
                         break
                     }
                 }
@@ -748,12 +779,13 @@ final class HeaderSyncManager {
         } else {
             print("🚨 No locator hash available for height \(locatorHeight), using zero hash (may get wrong Equihash params!)")
             payload.append(Data(count: 32))
+            actualLocatorHeight = 0  // Headers will start from genesis
         }
 
         // Stop hash (zero = get maximum headers)
         payload.append(Data(count: 32))
 
-        return payload
+        return (payload, actualLocatorHeight)
     }
 
     /// Parse headers from P2P message with Equihash(200,9) PoW verification

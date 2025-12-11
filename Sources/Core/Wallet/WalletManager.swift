@@ -681,6 +681,92 @@ final class WalletManager: ObservableObject {
     private var isBackgroundSyncing = false
     private let backgroundSyncLock = NSLock()
 
+    // MARK: - FIX #132: Header Sync for Missing Timestamps
+
+    /// Ensure header timestamps are synced for all transactions
+    /// This can be called independently from FAST START mode to sync timestamps
+    /// without requiring new blocks (which triggers backgroundSyncToHeight)
+    func ensureHeaderTimestamps() async {
+        print("📜 FIX #120: Checking for transactions needing timestamps...")
+
+        // FIX #120: First, detect and clear wrong timestamps in the gap between boost file and header store
+        // Boost file (BlockTimestampManager) covers up to ~2935315
+        // HeaderStore may start from a higher height (e.g., 2938701)
+        // Transactions in the gap have wrong estimated timestamps that need to be re-fetched
+        let boostMaxHeight = BlockTimestampManager.shared.maxHeight
+        if let headerMinHeight = try? HeaderStore.shared.getMinHeight(), headerMinHeight > boostMaxHeight + 1 {
+            let cleared = try? WalletDatabase.shared.clearWrongTimestampsInGap(
+                boostEndHeight: boostMaxHeight,
+                headerStartHeight: headerMinHeight
+            )
+            if let cleared = cleared, cleared > 0 {
+                print("📜 FIX #120: Cleared \(cleared) wrong timestamps, will sync headers to fix")
+            }
+        }
+
+        // Check if any transactions need timestamps from earlier heights
+        guard let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() else {
+            print("✅ FIX #120: No transactions need timestamps (all have dates)")
+            return
+        }
+
+        print("📜 FIX #120: Syncing headers from height \(earliestNeedingTimestamp) for timestamps")
+
+        // FIX #136: Set header syncing flag to pause mempool scan during sync
+        // This prevents P2P race conditions that cause header sync to get stuck
+        NetworkManager.shared.setHeaderSyncing(true)
+        defer {
+            NetworkManager.shared.setHeaderSyncing(false)
+        }
+
+        let hsm = HeaderSyncManager(
+            headerStore: HeaderStore.shared,
+            networkManager: NetworkManager.shared
+        )
+
+        // FIX #136: Report progress to UI for header sync during FAST START mode
+        hsm.onProgress = { [weak self] progress in
+            Task { @MainActor in
+                if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                    self?.syncTasks[index].status = .inProgress
+                    self?.syncTasks[index].detail = "Syncing timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
+                    let progressPercentage = progress.totalHeight > 0
+                        ? Double(progress.currentHeight) / Double(progress.totalHeight)
+                        : 0.0
+                    self?.syncTasks[index].progress = progressPercentage
+                }
+            }
+        }
+
+        do {
+            try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+            print("✅ FIX #120: Header sync for timestamps completed")
+
+            // Mark task as completed
+            await MainActor.run {
+                if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                    syncTasks[index].status = .completed
+                    syncTasks[index].detail = "Timestamps synced"
+                    syncTasks[index].progress = 1.0
+                }
+            }
+
+            // Fix any transactions that have NULL timestamps (now that headers are synced)
+            let fixedCount = try? WalletDatabase.shared.fixTransactionBlockTimes()
+            print("📜 FIX #120: Fixed \(fixedCount ?? 0) transaction timestamps")
+        } catch {
+            print("⚠️ FIX #120: Header sync for timestamps failed: \(error.localizedDescription)")
+
+            // Mark task as failed
+            await MainActor.run {
+                if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                    syncTasks[index].status = .failed(error.localizedDescription)
+                    syncTasks[index].detail = "Sync failed"
+                }
+            }
+        }
+    }
+
     /// Sync tree to current chain height in background
     /// Called automatically when new blocks arrive
     /// This is lightweight - just appends new CMUs and updates witnesses

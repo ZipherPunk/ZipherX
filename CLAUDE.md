@@ -6579,6 +6579,179 @@ func getAddresses() async throws -> [PeerAddress] {
 
 ---
 
+### 132. Header Sync in FAST START Mode (December 11, 2025)
+
+**Problem**: Transaction history missing dates after app restart - FAST START mode was skipping header sync entirely.
+
+**Root Cause**: FAST START mode (for consecutive launches) only called:
+1. `networkManager.connect()`
+2. `networkManager.fetchNetworkStats()`
+
+Header sync only ran inside `backgroundSyncToHeight()` which requires `targetHeight > currentHeight`. When the wallet is already synced (FAST START condition), header sync never ran.
+
+**Solution**: Added `ensureHeaderTimestamps()` function to WalletManager that syncs headers independently:
+
+```swift
+// WalletManager.swift
+func ensureHeaderTimestamps() async {
+    let hsm = HeaderSyncManager(...)
+
+    if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
+        try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+        WalletDatabase.shared.fixTransactionBlockTimes()
+    }
+}
+```
+
+Called from FAST START background task in ContentView:
+```swift
+Task {
+    try await networkManager.connect()
+    await networkManager.fetchNetworkStats()
+    // FIX #132: Sync timestamps even when no new blocks
+    await walletManager.ensureHeaderTimestamps()
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Added `ensureHeaderTimestamps()` function
+- `Sources/App/ContentView.swift` - Call `ensureHeaderTimestamps()` in FAST START
+
+---
+
+### 140. Header Sync Speed Fix - Synchronous Block Listener Pause (December 11, 2025)
+
+**Problem**: Header sync was running at only 5 headers/sec instead of the target 500 headers/sec. Block listeners were still receiving block announcements during header sync:
+```
+[11:45:58.380] 📦 [185.205.246.161] Received 1 new block announcement(s)!
+[11:45:58.381] 📦 New block announced: 3b35682c15ffef8c...
+```
+
+**Root Cause**: The `setHeaderSyncing(true)` function was using `Task { @MainActor in }` which caused the block listener pause to happen **asynchronously**. By the time the task ran to pause the listeners, header sync had already started and was competing for peer locks.
+
+**Solution**: Made the block listener pause/resume **synchronous**:
+
+1. **NetworkManager.swift** - Removed Task wrapper:
+```swift
+// BEFORE (FIX #139 - async, didn't work):
+func setHeaderSyncing(_ syncing: Bool) {
+    Task { @MainActor in
+        self.isHeaderSyncing = syncing
+        if syncing { self.pauseAllBlockListeners() }
+        // ...
+    }
+}
+
+// AFTER (FIX #140 - synchronous, works!):
+func setHeaderSyncing(_ syncing: Bool) {
+    // No Task wrapper - runs synchronously
+    self.isHeaderSyncing = syncing
+    if syncing { self.pauseAllBlockListeners() }
+    else { self.resumeAllBlockListeners() }
+}
+```
+
+2. **Peer.swift** - Added public `isListening` getter:
+```swift
+private var _isListening = false
+
+var isListening: Bool {
+    listenerLock.lock()
+    defer { listenerLock.unlock() }
+    return _isListening
+}
+```
+
+3. **Enhanced logging** in `pauseAllBlockListeners()` and `resumeAllBlockListeners()` to verify listeners are actually stopped.
+
+**Expected Result**: When header sync starts:
+1. Log shows "⏸️ FIX #140: Pausing X block listeners for header sync..."
+2. Log shows "⏸️ FIX #140: Stopped X block listeners"
+3. NO block announcements during header sync
+4. Header sync achieves 100+ headers/sec (no lock contention)
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Synchronous setHeaderSyncing(), improved logging
+- `Sources/Core/Network/Peer.swift` - Public isListening getter, renamed internal to _isListening
+
+---
+
+### 133. CRITICAL: Header Height Assignment Bug - Wrong Transaction Dates (December 11, 2025)
+
+**Problem**: Transaction history showing dates ~10-12 days in the past. Block at "height 2940035" in HeaderStore was actually for height 2927879 on blockchain - a 12,156 block offset!
+
+**Root Cause**: When `buildGetHeadersPayload()` used the "nearest checkpoint fallback" (line 747-762), it would use a checkpoint at height 2926122 when the requested height was 2938278. P2P protocol returns headers AFTER the locator hash, so peers returned headers starting at 2926123. But `parseHeadersPayload()` was assigning heights starting at 2938279 (the originally requested height).
+
+**Technical Details**:
+1. User requests headers starting at height 2938279
+2. `buildGetHeadersPayload(startHeight: 2938279)` needs locator hash at height 2938278
+3. HeaderStore doesn't have hash for 2938278 (not yet synced)
+4. Checkpoints don't have exact match for 2938278
+5. BundledBlockHashes not loaded or missing height
+6. Falls back to "nearest checkpoint BELOW": finds checkpoint at 2926122
+7. P2P returns headers starting at 2926123 (after locator)
+8. **BUG**: Code assigned heights starting at 2938279 instead of 2926123
+9. Headers stored with WRONG heights → timestamps off by ~10 days
+
+**Solution (FIX #133)**: Track actual locator height and use it for header assignment:
+
+1. **Modified `buildGetHeadersPayload()` return type**:
+   ```swift
+   // BEFORE:
+   private func buildGetHeadersPayload(startHeight: UInt64) -> Data
+
+   // AFTER:
+   private func buildGetHeadersPayload(startHeight: UInt64) -> (payload: Data, actualLocatorHeight: UInt64)
+   ```
+
+2. **Track actual checkpoint height when using fallback**:
+   ```swift
+   if locatorHash == nil {
+       let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
+       for checkpointHeight in checkpoints {
+           if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+               locatorHash = Data(hashData.reversed())
+               actualLocatorHeight = checkpointHeight  // FIX #133: Track actual height!
+               print("⚠️ FIX #133: Headers will start at height \(checkpointHeight + 1), not \(startHeight)!")
+               break
+           }
+       }
+   }
+   ```
+
+3. **Updated ALL 4 callers** to use correct starting height:
+   ```swift
+   // Destructure tuple
+   let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
+   // Headers start AFTER locator
+   let headersStartHeight = actualLocatorHeight + 1
+
+   // Use correct height for parsing
+   receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+
+   // Use correct height for chain verification
+   try verifyHeaderChain(headers, startingAt: headersStartHeight)
+
+   // Use correct height for next iteration
+   currentHeight = headersStartHeight + UInt64(headers.count)
+   ```
+
+**Callers Updated** (4 total):
+- Line 197: `syncHeadersSimple()` main loop
+- Line 310: `syncHeadersParallel()` main loop
+- Line 384: `fetchHeadersFromPeer()` internal loop
+- Line 677: `requestHeaders()` function
+
+**User Action Required**:
+1. Rebuild app with FIX #133
+2. Clear header database (Settings → Clear Block Headers)
+3. Re-sync headers - timestamps will now be correct
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Modified `buildGetHeadersPayload()` return type, updated all 4 callers
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

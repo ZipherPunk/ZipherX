@@ -168,6 +168,10 @@ struct ContentView: View {
                                     try await networkManager.connect()
                                     await networkManager.fetchNetworkStats()
                                     // Background sync will handle any new blocks automatically
+
+                                    // FIX #132: Ensure header timestamps are synced
+                                    // This runs even when no new blocks (FAST START mode)
+                                    await walletManager.ensureHeaderTimestamps()
                                 } catch {
                                     print("⚠️ Background connect error: \(error.localizedDescription)")
                                 }
@@ -278,15 +282,19 @@ struct ContentView: View {
 
                         // ALSO wait for wallet height to match chain height
                         // This ensures we're truly synced, not just "not syncing"
+                        print("🔍 FIX #120: Entering height verification phase...")
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Verifying blockchain height...")
                         }
+                        print("🔍 FIX #120: Set connecting status, now fetching network stats...")
                         var syncWaitCount = 0
                         let maxSyncWait = 300 // 30 seconds max wait for height sync
 
                         // Fetch initial stats to get current heights
+                        print("🔍 FIX #120: Fetching network stats for height verification...")
                         await networkManager.fetchNetworkStats()
                         let targetHeight = networkManager.chainHeight
+                        print("🔍 FIX #120: Target height: \(targetHeight), wallet height: \(networkManager.walletHeight)")
 
                         while networkManager.chainHeight > 0 &&
                               networkManager.walletHeight < networkManager.chainHeight &&
@@ -318,12 +326,14 @@ struct ContentView: View {
 
                         // CATCH-UP: Check for blocks that arrived during setup
                         // Re-fetch current chain height and sync any new blocks
+                        print("🔍 FIX #120: Height verification complete, checking for new blocks...")
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Checking for new blocks...")
                         }
                         await networkManager.fetchNetworkStats()
                         let currentChainHeight = networkManager.chainHeight
                         let currentWalletHeight = networkManager.walletHeight
+                        print("🔍 FIX #120: Chain height: \(currentChainHeight), wallet height: \(currentWalletHeight)")
 
                         // Only catch-up if wallet is actually synced (walletHeight > 0)
                         // and there are just a few missed blocks (not the entire chain)
@@ -368,24 +378,9 @@ struct ContentView: View {
                         // Re-enable background sync now that initial sync is complete
                         networkManager.suppressBackgroundSync = false
 
-                        // FIX #120: Run wallet health checks before showing completion
-                        await MainActor.run {
-                            walletManager.setConnecting(true, status: "Running health checks...")
-                        }
-                        let healthResults = await WalletHealthCheck.shared.runAllChecks()
-                        WalletHealthCheck.shared.printSummary(healthResults)
-
-                        // Check for critical failures
-                        if WalletHealthCheck.shared.hasCriticalFailures(healthResults) {
-                            print("❌ CRITICAL: Wallet health check failed! App may not function correctly.")
-                            // TODO: Show error dialog to user
-                        }
-
-                        // Get non-critical issues for potential auto-fix
-                        let fixableIssues = WalletHealthCheck.shared.getFixableIssues(healthResults)
-                        if !fixableIssues.isEmpty {
-                            print("⚠️ Non-critical issues found: \(fixableIssues.map { $0.checkName })")
-                        }
+                        // FIX #120: Skip health checks for now - they were causing UI to hang
+                        // TODO: Re-enable with proper timeout mechanism
+                        print("🔍 FIX #120: Skipping health checks (disabled to fix UI hang)")
 
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
@@ -393,9 +388,11 @@ struct ContentView: View {
 
                         // Calculate final duration and show completion screen
                         // Uses effectiveStartTime (walletCreationTime if set, otherwise appStartupTime)
+                        print("🔍 FIX #120: All checks done, showing completion screen")
                         await MainActor.run {
                             syncCompletionDuration = Date().timeIntervalSince(effectiveStartTime)
                             showCompletionScreen = true
+                            print("🔍 FIX #120: showCompletionScreen = true, isInitialSync = \(isInitialSync)")
                         }
 
                         // Wait for user to click the enter button

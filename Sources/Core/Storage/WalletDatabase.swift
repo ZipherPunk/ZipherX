@@ -2956,6 +2956,41 @@ final class WalletDatabase {
         return nil
     }
 
+    /// Clear wrong timestamps for transactions in the timestamp gap (between boost file end and header sync start)
+    /// FIX #120: Transactions in gap have wrong estimated timestamps that need to be re-fetched
+    /// @param boostEndHeight - last height covered by BlockTimestampManager (from boost file)
+    /// @param headerStartHeight - first height in HeaderStore (from P2P sync)
+    @discardableResult
+    func clearWrongTimestampsInGap(boostEndHeight: UInt64, headerStartHeight: UInt64) throws -> Int {
+        guard headerStartHeight > boostEndHeight else { return 0 }
+
+        // Clear block_time for transactions in the gap - they have wrong estimated timestamps
+        let sql = """
+            UPDATE transaction_history
+            SET block_time = NULL
+            WHERE block_height > ? AND block_height < ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(boostEndHeight))
+        sqlite3_bind_int64(stmt, 2, Int64(headerStartHeight))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let cleared = Int(sqlite3_changes(db))
+        if cleared > 0 {
+            print("📜 FIX #120: Cleared \(cleared) wrong timestamps in gap (\(boostEndHeight+1)-\(headerStartHeight-1))")
+        }
+        return cleared
+    }
+
     /// Fix block_time for transactions that have NULL or zero timestamps using actual timestamps from HeaderStore
     /// This corrects estimated timestamps saved by older code or newly synced transactions
     @discardableResult
