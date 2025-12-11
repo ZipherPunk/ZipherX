@@ -2237,7 +2237,8 @@ final class WalletDatabase {
         // Exclude change outputs and deduplicate:
         // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
         // 2. Also exclude received transactions where the same txid exists as sent
-        // 3. GROUP BY normalized_type, value, block_height to deduplicate (handles plaintext + obfuscated codes)
+        // 3. Use subquery with DISTINCT to deduplicate BEFORE ordering
+        // NOTE: GROUP BY can cause unpredictable order - use DISTINCT on dedup key instead
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
@@ -2249,16 +2250,21 @@ final class WalletDatabase {
                     WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
                 )
             )
-            GROUP BY
-                CASE
-                    WHEN t1.tx_type IN ('sent', 'α') THEN 'sent'
-                    WHEN t1.tx_type IN ('received', 'β') THEN 'received'
-                    WHEN t1.tx_type IN ('change', 'γ') THEN 'change'
-                    ELSE t1.tx_type
-                END,
-                value,
-                block_height
-            ORDER BY block_height DESC, created_at DESC
+            AND t1.rowid IN (
+                SELECT MIN(rowid)
+                FROM transaction_history
+                WHERE tx_type NOT IN ('change', 'γ')
+                GROUP BY
+                    CASE
+                        WHEN tx_type IN ('sent', 'α') THEN 'sent'
+                        WHEN tx_type IN ('received', 'β') THEN 'received'
+                        WHEN tx_type IN ('change', 'γ') THEN 'change'
+                        ELSE tx_type
+                    END,
+                    value,
+                    block_height
+            )
+            ORDER BY block_height DESC
             LIMIT ? OFFSET ?;
         """
 

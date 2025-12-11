@@ -93,9 +93,6 @@ struct HistoryView: View {
     private var transactionList: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
-                // DEBUG: Log the order at render time
-                let _ = print("📜 TXHIST [UI] Rendering \(transactions.count) transactions, first 5 heights: \(transactions.prefix(5).map { $0.height })")
-
                 ForEach(transactions, id: \.uniqueId) { transaction in
                     VStack(spacing: 0) {
                         transactionRow(transaction)
@@ -184,17 +181,12 @@ struct HistoryView: View {
 
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
 
-                // Deduplicate by type+value+height (same transaction shouldn't appear twice)
-                var seen = Set<String>()
-                let deduped = items.filter { item in
-                    let key = "\(item.type.rawValue)_\(item.value)_\(item.height)"
-                    if seen.contains(key) { return false }
-                    seen.insert(key)
-                    return true
-                }
+                // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)
+                // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
+                // No additional deduplication needed here - just use items directly to preserve order
 
                 DispatchQueue.main.async {
-                    self.transactions = deduped
+                    self.transactions = items
                     self.isLoading = false
                 }
             } catch {
