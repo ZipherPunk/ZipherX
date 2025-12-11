@@ -1625,14 +1625,24 @@ final class NetworkManager: ObservableObject {
                 }
             }
         } else {
-            // FIX #120: P2P ONLY MODE - No InsightAPI calls
-            // NORMAL MODE: P2P consensus authoritative (InsightAPI disabled)
-            // 1. First try header store (locally verified)
+            // FIX #120: P2P ONLY MODE - InsightAPI commented out
+            // NORMAL MODE: InsightAPI authoritative
+            // 1. First try InsightAPI (authoritative network source)
+            // if let status = try? await InsightAPI.shared.getStatus() {
+            //     currentChainHeight = status.height
+            //     await MainActor.run {
+            //         self.networkDifficulty = status.difficulty
+            //     }
+            // }
+
+            // 2. If API unavailable, fallback to header store (may be stale)
+            // if currentChainHeight == 0 {
             if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
                 currentChainHeight = headerHeight
             }
+            // }
 
-            // 2. If no headers, try P2P peer heights from version handshake
+            // 3. If still no height, try P2P peer heights from version handshake
             if currentChainHeight == 0 {
                 for peer in peers {
                     // SECURITY: Skip banned peers and negative heights (malicious peers)
@@ -1983,21 +1993,23 @@ final class NetworkManager: ObservableObject {
         var confirmedCount = 0
 
         for txid in pendingTxids {
+            // FIX #120: InsightAPI commented out - P2P only
             // Check if transaction has confirmations via InsightAPI
-            do {
-                let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
-                print("📤 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
-                if txInfo.confirmations > 0 {
-                    print("📤 Tx \(txid.prefix(16))... CONFIRMED! Calling confirmOutgoingTx...")
-                    await confirmOutgoingTx(txid: txid)
-                    confirmedCount += 1
-                }
-            } catch {
-                print("📤 Failed to check tx \(txid.prefix(16))...: \(error)")
-                // If we can't find the tx and we've been tracking it, it might be confirmed
-                // with a different txid format. Check if mempoolOutgoing should be cleared
-                // after multiple failed lookups.
-            }
+            // do {
+            //     let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
+            //     print("📤 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
+            //     if txInfo.confirmations > 0 {
+            //         print("📤 Tx \(txid.prefix(16))... CONFIRMED! Calling confirmOutgoingTx...")
+            //         await confirmOutgoingTx(txid: txid)
+            //         confirmedCount += 1
+            //     }
+            // } catch {
+            //     print("📤 Failed to check tx \(txid.prefix(16))...: \(error)")
+            //     // If we can't find the tx and we've been tracking it, it might be confirmed
+            //     // with a different txid format. Check if mempoolOutgoing should be cleared
+            //     // after multiple failed lookups.
+            // }
+            print("📤 Tx \(txid.prefix(16))... (InsightAPI disabled - using P2P only)")
         }
 
         // Safety: If all pending txids were confirmed but mempoolOutgoing is still > 0,
@@ -2018,23 +2030,25 @@ final class NetworkManager: ObservableObject {
         if confirmedCount > 0 {
             print("⛏️ \(confirmedCount) tx(s) confirmed - triggering wallet sync to update change notes...")
 
+            // FIX #120: InsightAPI commented out - use P2P chain height
             // Get current chain height from InsightAPI
-            if let status = try? await InsightAPI.shared.getStatus() {
-                let currentHeight = status.height
-                let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+            // if let status = try? await InsightAPI.shared.getStatus() {
+            //     let currentHeight = status.height
+            let currentHeight = chainHeight  // Use cached P2P chain height
+            let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
 
-                if currentHeight > walletHeight {
-                    print("⛏️ Chain height \(currentHeight) > wallet height \(walletHeight) - syncing...")
-                    // Trigger background sync to scan the confirmed tx block
-                    await WalletManager.shared.backgroundSyncToHeight(currentHeight)
-                    // Refresh balance to update confirmation counts
-                    try? await WalletManager.shared.refreshBalance()
-                } else {
-                    // Even if heights match, still refresh balance to update confirmations
-                    print("⛏️ Heights match but refreshing balance to update confirmations...")
-                    try? await WalletManager.shared.refreshBalance()
-                }
+            if currentHeight > walletHeight {
+                print("⛏️ Chain height \(currentHeight) > wallet height \(walletHeight) - syncing...")
+                // Trigger background sync to scan the confirmed tx block
+                await WalletManager.shared.backgroundSyncToHeight(currentHeight)
+                // Refresh balance to update confirmation counts
+                try? await WalletManager.shared.refreshBalance()
+            } else {
+                // Even if heights match, still refresh balance to update confirmations
+                print("⛏️ Heights match but refreshing balance to update confirmations...")
+                try? await WalletManager.shared.refreshBalance()
             }
+            // }
         }
     }
 
@@ -2066,16 +2080,19 @@ final class NetworkManager: ObservableObject {
         var confirmedCount = 0
 
         for (txid, amount) in pendingIncoming {
+            // FIX #120: InsightAPI commented out - P2P only
             // Check if transaction has confirmations via InsightAPI
-            do {
-                let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
-                if txInfo.confirmations >= 1 {
-                    await confirmIncomingTx(txid: txid, amount: amount)
-                    confirmedCount += 1
-                }
-            } catch {
-                // Silently skip failed checks
-            }
+            // do {
+            //     let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
+            //     if txInfo.confirmations >= 1 {
+            //         await confirmIncomingTx(txid: txid, amount: amount)
+            //         confirmedCount += 1
+            //     }
+            // } catch {
+            //     // Silently skip failed checks
+            // }
+            _ = txid  // Suppress unused warning
+            _ = amount
         }
 
         // Safety: If all pending txids were confirmed but mempoolIncoming is still > 0,
@@ -2242,6 +2259,7 @@ final class NetworkManager: ObservableObject {
                 continue
             }
 
+            // FIX #120: P2P only - InsightAPI fallback commented out
             // Try to get raw tx from P2P peer first, then InsightAPI fallback
             var rawTx: Data?
             do {
@@ -2250,12 +2268,12 @@ final class NetworkManager: ObservableObject {
             } catch {
                 print("⚠️ P2P getMempoolTransaction failed for \(txHashHex.prefix(12))...: \(error.localizedDescription)")
                 // Fallback to InsightAPI - use getRawTransaction endpoint
-                do {
-                    rawTx = try await InsightAPI.shared.getRawTransaction(txid: txHashHex)
-                    print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
-                } catch {
-                    print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
-                }
+                // do {
+                //     rawTx = try await InsightAPI.shared.getRawTransaction(txid: txHashHex)
+                //     print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
+                // } catch {
+                //     print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
+                // }
             }
 
             guard let rawTx = rawTx else {
@@ -2799,20 +2817,22 @@ final class NetworkManager: ObservableObject {
     func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
+        // FIX #120: InsightAPI commented out - P2P only
         // If no P2P peers, fall back to InsightAPI broadcast
         if !isConnected || peers.isEmpty {
-            print("⚠️ No P2P peers available, using InsightAPI broadcast...")
-            onProgress?("api", "Submitting to blockchain...", 0.3)
-
-            do {
-                let txid = try await InsightAPI.shared.broadcastTransaction(rawTx)
-                print("✅ InsightAPI broadcast successful: \(txid)")
-                onProgress?("api", "Submitted - awaiting miners", 1.0)
-                return txid
-            } catch {
-                print("❌ InsightAPI broadcast failed: \(error)")
-                throw NetworkError.broadcastFailed
-            }
+            print("⚠️ No P2P peers available - cannot broadcast (P2P only mode)")
+            // onProgress?("api", "Submitting to blockchain...", 0.3)
+            //
+            // do {
+            //     let txid = try await InsightAPI.shared.broadcastTransaction(rawTx)
+            //     print("✅ InsightAPI broadcast successful: \(txid)")
+            //     onProgress?("api", "Submitted - awaiting miners", 1.0)
+            //     return txid
+            // } catch {
+            //     print("❌ InsightAPI broadcast failed: \(error)")
+            //     throw NetworkError.broadcastFailed
+            // }
+            throw NetworkError.connectionFailed("No P2P peers available for broadcast")
         }
 
         let peerCount = peers.count
@@ -2903,28 +2923,38 @@ final class NetworkManager: ObservableObject {
                     return
                 }
 
-                onProgress?("verify", "Verifying mempool acceptance...", 0.5)
+                // FIX #120: InsightAPI mempool check commented out - P2P only
+                // If P2P peers accepted, assume success (mempool check via API disabled)
+                onProgress?("verify", "Propagating to miners...", 0.8)
 
                 // Check mempool - 5 attempts with 1 second between each (5 seconds total)
                 // This gives time for transaction to propagate and be validated by the network
-                for attempt in 1...5 {
-                    onProgress?("verify", "Verifying mempool (attempt \(attempt)/5)...", 0.5 + Double(attempt) * 0.08)
-                    if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
-                        print("✅ Transaction VERIFIED in mempool: \(txId)")
-                        onProgress?("verify", "In mempool - awaiting miners", 1.0)
-                        await state.setVerified()
-                        // Update UI state: mempool verified (for progressive messaging)
-                        await MainActor.run {
-                            self.setMempoolVerified()
-                        }
-                        return // Exit immediately!
-                    }
-                    print("⏳ Mempool check attempt \(attempt)/5: not yet visible")
-                    if attempt < 5 {
-                        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second between checks
-                    }
+                // for attempt in 1...5 {
+                //     onProgress?("verify", "Verifying mempool (attempt \(attempt)/5)...", 0.5 + Double(attempt) * 0.08)
+                //     if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
+                //         print("✅ Transaction VERIFIED in mempool: \(txId)")
+                //         onProgress?("verify", "In mempool - awaiting miners", 1.0)
+                //         await state.setVerified()
+                //         // Update UI state: mempool verified (for progressive messaging)
+                //         await MainActor.run {
+                //             self.setMempoolVerified()
+                //         }
+                //         return // Exit immediately!
+                //     }
+                //     print("⏳ Mempool check attempt \(attempt)/5: not yet visible")
+                //     if attempt < 5 {
+                //         try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second between checks
+                //     }
+                // }
+                // print("❌ Transaction NOT found in mempool after 5 attempts")
+
+                // P2P only mode: If peers accepted, mark as verified
+                print("✅ P2P broadcast accepted - marking as verified (InsightAPI disabled)")
+                onProgress?("verify", "Accepted by network - awaiting miners", 1.0)
+                await state.setVerified()
+                await MainActor.run {
+                    self.setMempoolVerified()
                 }
-                print("❌ Transaction NOT found in mempool after 5 attempts")
             }
 
             // The mempool verification task will set isVerified() and return
@@ -2971,19 +3001,21 @@ final class NetworkManager: ObservableObject {
 
         // Check results
         guard let txId = await state.getTxId() else {
+            // FIX #120: InsightAPI fallback commented out - P2P only
             // P2P broadcast failed - fall back to InsightAPI
-            print("⚠️ P2P broadcast failed, trying InsightAPI...")
-            onProgress?("api", "Retrying via backup route...", 0.5)
-
-            do {
-                let apiTxId = try await InsightAPI.shared.broadcastTransaction(rawTx)
-                print("✅ InsightAPI broadcast successful: \(apiTxId)")
-                onProgress?("api", "Submitted - awaiting miners", 1.0)
-                return apiTxId
-            } catch {
-                print("❌ InsightAPI broadcast also failed: \(error)")
-                throw NetworkError.broadcastFailed
-            }
+            print("⚠️ P2P broadcast failed - no fallback (P2P only mode)")
+            // onProgress?("api", "Retrying via backup route...", 0.5)
+            //
+            // do {
+            //     let apiTxId = try await InsightAPI.shared.broadcastTransaction(rawTx)
+            //     print("✅ InsightAPI broadcast successful: \(apiTxId)")
+            //     onProgress?("api", "Submitted - awaiting miners", 1.0)
+            //     return apiTxId
+            // } catch {
+            //     print("❌ InsightAPI broadcast also failed: \(error)")
+            //     throw NetworkError.broadcastFailed
+            // }
+            throw NetworkError.broadcastFailed
         }
 
         let successCount = await state.getSuccessCount()
@@ -3057,17 +3089,20 @@ final class NetworkManager: ObservableObject {
         let torEnabled = await TorManager.shared.mode == .enabled
         print("📡 Getting chain height (P2P-first, Tor=\(torEnabled ? "ON" : "OFF"))...")
 
+        // FIX #120: InsightAPI commented out - P2P only
         // 1. Get network height from InsightAPI - ONLY if Tor is disabled
         // InsightAPI is blocked by Cloudflare when accessed via Tor
         var networkHeight: UInt64 = 0
-        if !torEnabled {
-            if let status = try? await InsightAPI.shared.getStatus() {
-                networkHeight = status.height
-                print("📡 [API] Network height: \(networkHeight)")
-            }
-        } else {
-            print("🧅 Tor enabled - skipping InsightAPI (Cloudflare blocks Tor)")
-        }
+        // if !torEnabled {
+        //     if let status = try? await InsightAPI.shared.getStatus() {
+        //         networkHeight = status.height
+        //         print("📡 [API] Network height: \(networkHeight)")
+        //     }
+        // } else {
+        //     print("🧅 Tor enabled - skipping InsightAPI (Cloudflare blocks Tor)")
+        // }
+        _ = torEnabled  // Suppress unused warning
+        print("📡 P2P only mode - InsightAPI disabled")
 
         // 2. Check header store (our locally verified headers)
         var headerHeight: UInt64 = 0
@@ -3398,16 +3433,19 @@ final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
+        // FIX #120: InsightAPI commented out - P2P only
         // SECURITY: Get InsightAPI height first to validate P2P sources
         var trustedHeight: UInt64 = 0
         let maxDeviation: UInt64 = 10
 
-        do {
-            let status = try await InsightAPI.shared.getStatus()
-            trustedHeight = status.height
-        } catch {
-            print("⚠️ InsightAPI unavailable for P2P height validation")
-        }
+        // do {
+        //     let status = try await InsightAPI.shared.getStatus()
+        //     trustedHeight = status.height
+        // } catch {
+        //     print("⚠️ InsightAPI unavailable for P2P height validation")
+        // }
+        _ = maxDeviation  // Suppress unused warning (validation disabled)
+        print("📡 P2P only mode - using HeaderStore as trusted source")
 
         var maxHeight: UInt64 = 0
 
@@ -3856,26 +3894,29 @@ final class NetworkManager: ObservableObject {
             }
         }
 
+        // FIX #120: InsightAPI fallback commented out - P2P only
         // Fallback to InsightAPI if P2P failed
         if block == nil {
-            do {
-                let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: height)
-                let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
-                var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-
-                for txid in insightBlock.tx {
-                    let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
-                    let spends = txInfo?.spendDescs
-                    let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
-
-                    if !outputs.isEmpty || (spends?.isEmpty == false) {
-                        txDataList.append((txid, outputs, spends))
-                    }
-                }
-                return (height, hashFromAPI, UInt32(insightBlock.time), txDataList)
-            } catch {
-                return nil
-            }
+            // do {
+            //     let hashFromAPI = try await InsightAPI.shared.getBlockHash(height: height)
+            //     let insightBlock = try await InsightAPI.shared.getBlock(hash: hashFromAPI)
+            //     var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+            //
+            //     for txid in insightBlock.tx {
+            //         let txInfo = try? await InsightAPI.shared.getTransaction(txid: txid)
+            //         let spends = txInfo?.spendDescs
+            //         let outputs = try await InsightAPI.shared.getShieldedOutputsFromRaw(txid: txid)
+            //
+            //         if !outputs.isEmpty || (spends?.isEmpty == false) {
+            //             txDataList.append((txid, outputs, spends))
+            //         }
+            //     }
+            //     return (height, hashFromAPI, UInt32(insightBlock.time), txDataList)
+            // } catch {
+            //     return nil
+            // }
+            print("⚠️ P2P block fetch failed - no fallback (P2P only mode)")
+            return nil
         }
 
         guard let block = block else { return nil }
