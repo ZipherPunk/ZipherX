@@ -2298,36 +2298,24 @@ struct CypherpunkMainView: View {
                 print("📜 TXHIST [S7]: Populated \(populated) entries (received + sent)")
 
                 // Now fetch the history
+                // NOTE: Deduplication is handled in SQL query (WalletDatabase.getTransactionHistory)
+                // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
                 print("📜 TXHIST [S7]: getTransactionHistory returned \(items.count) items")
 
-                // Deduplicate by type+value+height (same transaction shouldn't appear twice)
-                // Using height instead of txid because same tx can have different txid representations
-                var seen = Set<String>()
-                let deduped = items.filter { item in
-                    let key = "\(item.type.rawValue)_\(item.value)_\(item.height)"
-                    if seen.contains(key) {
-                        print("📜 TXHIST [S7]: Duplicate filtered out: \(key)")
-                        return false
-                    }
-                    seen.insert(key)
-                    return true
-                }
-                print("📜 TXHIST [S7]: After dedup: \(deduped.count) items (removed \(items.count - deduped.count) dupes)")
-
                 // Debug: count sent vs received
-                let sentCount = deduped.filter { $0.type == .sent }.count
-                let receivedCount = deduped.filter { $0.type == .received }.count
+                let sentCount = items.filter { $0.type == .sent }.count
+                let receivedCount = items.filter { $0.type == .received }.count
                 print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
 
-                // Debug: print first 5 items to trace duplicates
-                for (i, item) in deduped.prefix(5).enumerated() {
+                // Debug: print first 5 items to verify order
+                for (i, item) in items.prefix(5).enumerated() {
                     let fullTxid = item.txid.map { String(format: "%02x", $0) }.joined()
                     print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), txid=\(fullTxid), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
                 }
 
                 DispatchQueue.main.async {
-                    self.transactions = deduped
+                    self.transactions = items
                     self.isLoadingHistory = false
                 }
             } catch {
