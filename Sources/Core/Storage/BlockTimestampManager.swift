@@ -252,7 +252,11 @@ final class BlockTimestampManager {
 
     /// Get timestamp from file only (for performance when we know it's in range)
     func getFileTimestamp(at height: UInt64) -> UInt32? {
-        guard let data = timestampData else { return nil }
+        guard let data = timestampData else {
+            // FIX #120 DEBUG: timestampData is nil but we might have DB timestamps
+            // This happens when timestamps were loaded from HeaderStore.block_times without in-memory cache
+            return nil
+        }
         guard height <= maxHeight else { return nil }
 
         // Calculate offset based on format

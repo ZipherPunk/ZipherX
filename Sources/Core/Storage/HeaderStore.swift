@@ -302,9 +302,17 @@ final class HeaderStore {
     func getBlockTime(at height: UInt64) throws -> UInt32? {
         // FIX #120: Ensure database is open before querying
         if db == nil {
-            try open()
+            do {
+                try open()
+            } catch {
+                print("⚠️ HeaderStore.getBlockTime: Failed to open db: \(error)")
+                return nil
+            }
         }
-        guard db != nil else { return nil }
+        guard db != nil else {
+            print("⚠️ HeaderStore.getBlockTime: db is nil after open attempt")
+            return nil
+        }
 
         // First, check full headers table (P2P synced headers have priority)
         let headerSql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
@@ -318,6 +326,7 @@ final class HeaderStore {
         if sqlite3_step(stmt) == SQLITE_ROW {
             let timestamp = UInt32(sqlite3_column_int64(stmt, 0))
             sqlite3_finalize(stmt)
+            print("⏰ HeaderStore.getBlockTime: height=\(height), found in headers table: \(timestamp)")
             return timestamp
         }
         sqlite3_finalize(stmt)
@@ -333,8 +342,12 @@ final class HeaderStore {
         sqlite3_bind_int64(stmt2, 1, Int64(height))
 
         if sqlite3_step(stmt2) == SQLITE_ROW {
-            return UInt32(sqlite3_column_int64(stmt2, 0))
+            let timestamp = UInt32(sqlite3_column_int64(stmt2, 0))
+            print("⏰ HeaderStore.getBlockTime: height=\(height), found in block_times table: \(timestamp)")
+            return timestamp
         }
+
+        print("⏰ HeaderStore.getBlockTime: height=\(height), NOT FOUND in either table")
         return nil
     }
 

@@ -2286,8 +2286,12 @@ final class WalletDatabase {
             if height > 0 {
                 if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
                     blockTime = UInt64(timestamp)
+                    print("📜 TIMESTAMP DEBUG: height=\(height), got timestamp=\(timestamp) from BlockTimestampManager")
                 } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
                     blockTime = UInt64(headerTime)
+                    print("📜 TIMESTAMP DEBUG: height=\(height), got timestamp=\(headerTime) from HeaderStore")
+                } else {
+                    print("📜 TIMESTAMP DEBUG: height=\(height), NO timestamp found (BlockTimestampManager maxHeight=\(BlockTimestampManager.shared.maxHeight), boost range=476969-2935315)")
                 }
             }
             // If still nil (header not synced yet), leave as nil - UI will handle it
@@ -3129,14 +3133,18 @@ struct TransactionHistoryItem {
         // Use actual block timestamp if available
         if let blockTime = blockTime, blockTime > 0 {
             let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
-            return formatter.string(from: date)
+            let result = formatter.string(from: date)
+            print("📅 dateString: height=\(height), using blockTime=\(blockTime) -> \(result)")
+            return result
         }
 
         // Fallback: try to get from HeaderStore (checks BOTH headers table AND block_times table)
         if height > 0 {
             if let timestamp = try? HeaderStore.shared.getBlockTime(at: height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
-                return formatter.string(from: date)
+                let result = formatter.string(from: date)
+                print("📅 dateString: height=\(height), using HeaderStore timestamp=\(timestamp) -> \(result)")
+                return result
             }
         }
 
@@ -3144,7 +3152,9 @@ struct TransactionHistoryItem {
         if height > 0 {
             if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
-                return formatter.string(from: date)
+                let result = formatter.string(from: date)
+                print("📅 dateString: height=\(height), using BlockTimestampManager timestamp=\(timestamp) -> \(result)")
+                return result
             }
         }
 
@@ -3160,10 +3170,13 @@ struct TransactionHistoryItem {
             let estimatedTimestamp = currentTime + (Double(heightDiff) * blockTimeInterval)
             let date = Date(timeIntervalSince1970: estimatedTimestamp)
 
-            return formatter.string(from: date) + " (est)"
+            let result = formatter.string(from: date) + " (est)"
+            print("📅 dateString: height=\(height), ESTIMATE (no timestamp found) -> \(result)")
+            return result
         }
 
         // No timestamp available
+        print("📅 dateString: height=\(height), NO timestamp - returning nil")
         return nil
     }
 }
