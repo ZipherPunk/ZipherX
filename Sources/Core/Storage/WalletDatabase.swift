@@ -2179,6 +2179,12 @@ final class WalletDatabase {
     func getTransactionHistory(limit: Int = 100, offset: Int = 0) throws -> [TransactionHistoryItem] {
         print("📜 getTransactionHistory called")
 
+        // FIX #120: Guard against nil database handle
+        guard db != nil else {
+            print("⚠️ getTransactionHistory: Database not open, returning empty")
+            return []
+        }
+
         // FIRST: Clean up any duplicate transactions in the database
         // Duplicates can occur when same tx is recorded with different txid byte orders
         // Keep the one with the lowest id (first inserted)
@@ -2378,6 +2384,13 @@ final class WalletDatabase {
     /// NOTE: This function uses INSERT OR IGNORE to only ADD missing entries.
     /// It does NOT clear existing history - WalletManager's entries are preserved.
     func populateHistoryFromNotes() throws -> Int {
+        // FIX #120: Guard against nil database handle
+        // sqlite3_errmsg(nil) returns "out of memory" which is misleading
+        guard db != nil else {
+            print("⚠️ populateHistoryFromNotes: Database not open, skipping")
+            return 0
+        }
+
         // IMPORTANT: Do NOT clear transaction history here!
         // WalletManager records SENT transactions with the correct amount at send time.
         // Clearing would wipe out that correct value, then we'd recalculate from notes
