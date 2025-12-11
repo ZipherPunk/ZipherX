@@ -1439,12 +1439,18 @@ final class WalletManager: ObservableObject {
                 }
 
                 // Get starting height for sync
-                // We want headers from downloadedTreeHeight + 1 onwards (tree includes up to downloadedTreeHeight)
-                // The getheaders protocol returns headers AFTER the locator hash
+                // FIX #120: Must sync ALL headers from earliest transaction needing timestamp to chain tip
+                // This ensures 100% real timestamps at startup - no estimates!
                 // VUL-018: Use shared constant for downloaded tree height
                 let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
-                let startHeight: UInt64
-                if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= downloadedTreeHeight {
+                var startHeight: UInt64
+
+                // Priority 1: Check for transactions that need timestamps
+                if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
+                    // Sync from earliest tx without timestamp (ensures we cover ALL gap)
+                    startHeight = earliestNeedingTimestamp
+                    print("📊 FIX #120: Starting header sync from earliest missing timestamp at height \(startHeight)")
+                } else if let latestHeight = try HeaderStore.shared.getLatestHeight(), latestHeight >= downloadedTreeHeight {
                     // Resume from where we left off
                     startHeight = latestHeight + 1
                     print("📊 Resuming header sync from height \(startHeight)")

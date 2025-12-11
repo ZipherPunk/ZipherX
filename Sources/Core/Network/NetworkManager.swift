@@ -3779,9 +3779,62 @@ final class NetworkManager: ObservableObject {
             print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
         }
 
-        guard !blockHashes.isEmpty else {
-            print("⚠️ [\(peer.host)] No block hashes for height \(startHeight) (not in HeaderStore or BundledHashes)")
-            return nil
+        // FIX #120: If no hashes found, use on-demand P2P fetch (fetches headers first)
+        if blockHashes.isEmpty {
+            print("📦 [\(peer.host)] Using on-demand P2P fetch for blocks \(startHeight)-\(startHeight + UInt64(count) - 1)")
+            do {
+                let blocks = try await peer.getFullBlocks(from: startHeight, count: count)
+                var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                for block in blocks {
+                    let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
+                    let blockTimestamp = block.time
+                    var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
+
+                    for tx in block.transactions {
+                        var shieldedOutputs: [ShieldedOutput] = []
+                        for output in tx.outputs {
+                            let cmuHex = Data(output.cmu.reversed()).map { String(format: "%02x", $0) }.joined()
+                            let epkHex = Data(output.epk.reversed()).map { String(format: "%02x", $0) }.joined()
+                            let ciphertextHex = output.ciphertext.map { String(format: "%02x", $0) }.joined()
+                            let shieldedOutput = ShieldedOutput(
+                                cv: String(repeating: "0", count: 64),
+                                cmu: cmuHex,
+                                ephemeralKey: epkHex,
+                                encCiphertext: ciphertextHex,
+                                outCiphertext: String(repeating: "0", count: 160),
+                                proof: String(repeating: "0", count: 384)
+                            )
+                            shieldedOutputs.append(shieldedOutput)
+                        }
+
+                        var shieldedSpends: [ShieldedSpend]? = nil
+                        if !tx.spends.isEmpty {
+                            shieldedSpends = tx.spends.map { spend in
+                                let nullifierHex = Data(spend.nullifier.reversed()).map { String(format: "%02x", $0) }.joined()
+                                return ShieldedSpend(
+                                    cv: String(repeating: "0", count: 64),
+                                    anchor: String(repeating: "0", count: 64),
+                                    nullifier: nullifierHex,
+                                    rk: String(repeating: "0", count: 64),
+                                    proof: String(repeating: "0", count: 384),
+                                    spendAuthSig: String(repeating: "0", count: 128)
+                                )
+                            }
+                        }
+
+                        let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+                        if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
+                            txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
+                        }
+                    }
+
+                    results.append((block.height, finalBlockHash, blockTimestamp, txDataList))
+                }
+                return results.isEmpty ? nil : results
+            } catch {
+                print("⚠️ [\(peer.host)] On-demand P2P fetch failed: \(error.localizedDescription)")
+                return nil
+            }
         }
 
         // Check peer connection before attempting fetches
