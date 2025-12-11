@@ -442,6 +442,7 @@ enum ExplorerError: Error, LocalizedError {
     case invalidQuery
     case invalidResponse
     case notFound
+    case networkError(String)
 
     var errorDescription: String? {
         switch self {
@@ -451,6 +452,8 @@ enum ExplorerError: Error, LocalizedError {
             return "Invalid response from explorer"
         case .notFound:
             return "Not found"
+        case .networkError(let message):
+            return message
         }
     }
 }
