@@ -907,15 +907,17 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // 2. Get InsightAPI height ONLY if Tor is disabled
-        if !torEnabled {
-            if let status = try? await InsightAPI.shared.getStatus() {
-                networkTruthHeight = status.height
-                print("📡 [API] Network height: \(networkTruthHeight)")
-            }
-        } else {
-            print("🧅 Tor enabled - using P2P consensus only (InsightAPI blocked by Cloudflare)")
-        }
+        // 2. P2P ONLY MODE - No InsightAPI calls
+        // FIX #120: Commented out InsightAPI - using P2P only
+        // if !torEnabled {
+        //     if let status = try? await InsightAPI.shared.getStatus() {
+        //         networkTruthHeight = status.height
+        //         print("📡 [API] Network height: \(networkTruthHeight)")
+        //     }
+        // } else {
+        //     print("🧅 Tor enabled - using P2P consensus only (InsightAPI blocked by Cloudflare)")
+        // }
+        print("📡 Using P2P consensus only (InsightAPI disabled)")
 
         // 3. Determine best height
         // FIX #111: ALWAYS use HeaderStore as ground truth to reject Sybil attack heights
@@ -1623,23 +1625,14 @@ final class NetworkManager: ObservableObject {
                 }
             }
         } else {
-            // NORMAL MODE: InsightAPI authoritative
-            // 1. First try InsightAPI (authoritative network source)
-            if let status = try? await InsightAPI.shared.getStatus() {
-                currentChainHeight = status.height
-                await MainActor.run {
-                    self.networkDifficulty = status.difficulty
-                }
+            // FIX #120: P2P ONLY MODE - No InsightAPI calls
+            // NORMAL MODE: P2P consensus authoritative (InsightAPI disabled)
+            // 1. First try header store (locally verified)
+            if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
+                currentChainHeight = headerHeight
             }
 
-            // 2. If API unavailable, fallback to header store (may be stale)
-            if currentChainHeight == 0 {
-                if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-                    currentChainHeight = headerHeight
-                }
-            }
-
-            // 3. If still no height, try P2P peer heights from version handshake
+            // 2. If no headers, try P2P peer heights from version handshake
             if currentChainHeight == 0 {
                 for peer in peers {
                     // SECURITY: Skip banned peers and negative heights (malicious peers)
