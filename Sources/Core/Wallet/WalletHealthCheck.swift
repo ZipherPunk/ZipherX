@@ -81,8 +81,9 @@ final class WalletHealthCheck {
     private func checkDatabaseIntegrity() async -> HealthCheckResult {
         do {
             // Check wallet database
-            let noteCount = try WalletDatabase.shared.getAllNotes().count
-            let historyCount = try WalletDatabase.shared.getTransactionHistoryCount()
+            let noteCount = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1).count
+            let history = try WalletDatabase.shared.getTransactionHistory(limit: 10000, offset: 0)
+            let historyCount = history.count
 
             // Check header store
             let headerStats = try HeaderStore.shared.getStats()
@@ -177,7 +178,7 @@ final class WalletHealthCheck {
 
             // Compare with P2P network consensus
             let networkManager = NetworkManager.shared
-            guard networkManager.connectedPeerCount >= 2 else {
+            guard networkManager.connectedPeers >= 2 else {
                 return .passed("Hash Accuracy", details: "Not enough peers to verify (need 2+)")
             }
 
@@ -228,7 +229,7 @@ final class WalletHealthCheck {
 
     /// Check P2P network connectivity
     private func checkP2PConnectivity() async -> HealthCheckResult {
-        let connectedPeers = NetworkManager.shared.connectedPeerCount
+        let connectedPeers = NetworkManager.shared.connectedPeers
         let minPeers = 3
 
         if connectedPeers >= minPeers {

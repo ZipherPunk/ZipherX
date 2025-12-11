@@ -1390,6 +1390,7 @@ final class WalletManager: ObservableObject {
                 // This caused timestamps to show 2016 instead of 2025
                 // Detection: If a header at recent height has timestamp < 2024, it's corrupted
                 let corruptedTimestampThreshold: UInt32 = 1704067200 // Jan 1, 2024 UTC
+                let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
                 if let latestHeight = try? HeaderStore.shared.getLatestHeight(),
                    latestHeight >= effectiveTreeHeight,
                    let sampleHeader = try? HeaderStore.shared.getHeader(at: effectiveTreeHeight + 100),
