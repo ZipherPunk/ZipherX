@@ -93,6 +93,9 @@ struct HistoryView: View {
     private var transactionList: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
+                // DEBUG: Log the order at render time
+                let _ = print("📜 TXHIST [UI] Rendering \(transactions.count) transactions, first 5 heights: \(transactions.prefix(5).map { $0.height })")
+
                 ForEach(transactions, id: \.uniqueId) { transaction in
                     VStack(spacing: 0) {
                         transactionRow(transaction)
