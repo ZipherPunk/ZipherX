@@ -131,6 +131,19 @@ struct ContentView: View {
                             // Load balance from database (instant)
                             walletManager.loadCachedBalance()
 
+                            // FIX #120: Quick health check for fast start (just database + tree)
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Quick health check...")
+                            }
+                            let quickHealthResults = await WalletHealthCheck.shared.runAllChecks()
+                            let hasCritical = WalletHealthCheck.shared.hasCriticalFailures(quickHealthResults)
+                            if hasCritical {
+                                print("❌ FAST START: Critical health check failures detected")
+                                WalletHealthCheck.shared.printSummary(quickHealthResults)
+                            } else {
+                                print("✅ FAST START: Health check passed")
+                            }
+
                             // Mark initial sync as complete immediately
                             await MainActor.run {
                                 walletManager.setConnecting(false, status: nil)
@@ -345,6 +358,29 @@ struct ContentView: View {
 
                         // Re-enable background sync now that initial sync is complete
                         networkManager.suppressBackgroundSync = false
+
+                        // FIX #120: Run wallet health checks before showing completion
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Running health checks...")
+                        }
+                        let healthResults = await WalletHealthCheck.shared.runAllChecks()
+                        WalletHealthCheck.shared.printSummary(healthResults)
+
+                        // Check for critical failures
+                        if WalletHealthCheck.shared.hasCriticalFailures(healthResults) {
+                            print("❌ CRITICAL: Wallet health check failed! App may not function correctly.")
+                            // TODO: Show error dialog to user
+                        }
+
+                        // Get non-critical issues for potential auto-fix
+                        let fixableIssues = WalletHealthCheck.shared.getFixableIssues(healthResults)
+                        if !fixableIssues.isEmpty {
+                            print("⚠️ Non-critical issues found: \(fixableIssues.map { $0.checkName })")
+                        }
+
+                        await MainActor.run {
+                            walletManager.setConnecting(false, status: nil)
+                        }
 
                         // Calculate final duration and show completion screen
                         // Uses effectiveStartTime (walletCreationTime if set, otherwise appStartupTime)
