@@ -77,9 +77,16 @@ class ExplorerViewModel: ObservableObject {
         }
         #endif
 
-        // Use InsightAPI
-        let status = try await InsightAPI.shared.getStatus()
-        return try await searchBlock(height: status.height)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let status = try await InsightAPI.shared.getStatus()
+        // return try await searchBlock(height: status.height)
+
+        // P2P-only: Use NetworkManager chain height
+        let chainHeight = await NetworkManager.shared.chainHeight
+        guard chainHeight > 0 else {
+            throw ExplorerError.networkError("No P2P peers connected")
+        }
+        return try await searchBlock(height: chainHeight)
     }
 
     private func searchBlock(height: UInt64) async throws -> ExplorerResult {
@@ -94,9 +101,12 @@ class ExplorerViewModel: ObservableObject {
         }
         #endif
 
-        // Use InsightAPI
-        let block = try await fetchBlockFromInsight(height: height)
-        return .block(block)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let block = try await fetchBlockFromInsight(height: height)
+        // return .block(block)
+
+        // P2P-only: Explorer requires Full Node mode or will show limited data
+        throw ExplorerError.networkError("Explorer requires Full Node mode (P2P-only mode active)")
     }
 
     private func searchBlockByHash(_ hash: String) async throws -> ExplorerResult {
@@ -112,9 +122,10 @@ class ExplorerViewModel: ObservableObject {
         }
         #endif
 
-        // InsightAPI - get block by hash
-        let block = try await fetchBlockByHashFromInsight(hash: hash)
-        return .block(block)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let block = try await fetchBlockByHashFromInsight(hash: hash)
+        // return .block(block)
+        throw ExplorerError.networkError("Explorer requires Full Node mode (P2P-only mode active)")
     }
 
     private func searchTransaction(txid: String) async throws -> ExplorerResult {
@@ -129,9 +140,10 @@ class ExplorerViewModel: ObservableObject {
         }
         #endif
 
-        // Use InsightAPI
-        let tx = try await fetchTransactionFromInsight(txid: txid)
-        return .transaction(tx)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let tx = try await fetchTransactionFromInsight(txid: txid)
+        // return .transaction(tx)
+        throw ExplorerError.networkError("Explorer requires Full Node mode (P2P-only mode active)")
     }
 
     private func searchAddress(_ address: String, isShielded: Bool) async throws -> ExplorerResult {
@@ -162,9 +174,10 @@ class ExplorerViewModel: ObservableObject {
         }
         #endif
 
-        // Use InsightAPI for transparent address
-        let addressInfo = try await fetchAddressFromInsight(address: address)
-        return .address(addressInfo)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let addressInfo = try await fetchAddressFromInsight(address: address)
+        // return .address(addressInfo)
+        throw ExplorerError.networkError("Explorer requires Full Node mode (P2P-only mode active)")
     }
 
     // MARK: - RPC Parsing

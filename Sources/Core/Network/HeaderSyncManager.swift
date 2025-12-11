@@ -212,16 +212,20 @@ final class HeaderSyncManager {
             print("📡 Using P2P consensus (no local headers)")
         }
 
+        // FIX #120: InsightAPI commented out - P2P only
         // 4. FALLBACK: If P2P consensus unavailable, try InsightAPI as last resort
+        // if maxHeight == 0 {
+        //     print("⚠️ VUL-006: No P2P consensus available, falling back to InsightAPI")
+        //     do {
+        //         let status = try await InsightAPI.shared.getStatus()
+        //         maxHeight = status.height
+        //         print("📡 [FALLBACK] InsightAPI chain tip: \(maxHeight)")
+        //     } catch {
+        //         print("❌ InsightAPI also unavailable: \(error)")
+        //     }
+        // }
         if maxHeight == 0 {
-            print("⚠️ VUL-006: No P2P consensus available, falling back to InsightAPI")
-            do {
-                let status = try await InsightAPI.shared.getStatus()
-                maxHeight = status.height
-                print("📡 [FALLBACK] InsightAPI chain tip: \(maxHeight)")
-            } catch {
-                print("❌ InsightAPI also unavailable: \(error)")
-            }
+            print("❌ P2P-only mode: No peers available for chain height consensus")
         }
 
         if maxHeight > 0 {

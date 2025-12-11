@@ -1305,31 +1305,39 @@ final class WalletManager: ObservableObject {
         }
 
         // SECURITY CHECK: Validate lastScannedHeight against trusted chain height
+        // FIX #120: InsightAPI commented out - P2P only
         // Malicious P2P peers may have caused fake heights to be stored
-        let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
+        // let effectiveTreeHeight = ZipherXConstants.effectiveTreeHeight
+        // do {
+        //     let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
+        //     if lastScanned > effectiveTreeHeight {
+        //         // Query InsightAPI for trusted chain height
+        //         let status = try await InsightAPI.shared.getStatus()
+        //         let trustedHeight = status.height
+        //         let maxAheadTolerance: UInt64 = 10
+        //
+        //         if lastScanned > trustedHeight + maxAheadTolerance {
+        //             print("🚨 [SECURITY] Detected FAKE lastScannedHeight: \(lastScanned)")
+        //             print("🚨 [SECURITY] Trusted chain height is: \(trustedHeight)")
+        //             print("🧹 Resetting to downloaded tree height...")
+        //
+        //             // Reset to safe state
+        //             try WalletDatabase.shared.updateLastScannedHeight(effectiveTreeHeight, hash: Data(count: 32))
+        //             try? HeaderStore.shared.open()
+        //             try? HeaderStore.shared.clearAllHeaders()
+        //
+        //             print("✅ Fake sync state cleared - will rescan from trusted height")
+        //         }
+        //     }
+        // } catch {
+        //     print("⚠️ Could not validate lastScannedHeight: \(error)")
+
+        // P2P-only: Skip fake height validation (relies on P2P peer consensus)
         do {
-            let lastScanned = try WalletDatabase.shared.getLastScannedHeight()
-            if lastScanned > effectiveTreeHeight {
-                // Query InsightAPI for trusted chain height
-                let status = try await InsightAPI.shared.getStatus()
-                let trustedHeight = status.height
-                let maxAheadTolerance: UInt64 = 10
-
-                if lastScanned > trustedHeight + maxAheadTolerance {
-                    print("🚨 [SECURITY] Detected FAKE lastScannedHeight: \(lastScanned)")
-                    print("🚨 [SECURITY] Trusted chain height is: \(trustedHeight)")
-                    print("🧹 Resetting to downloaded tree height...")
-
-                    // Reset to safe state
-                    try WalletDatabase.shared.updateLastScannedHeight(effectiveTreeHeight, hash: Data(count: 32))
-                    try? HeaderStore.shared.open()
-                    try? HeaderStore.shared.clearAllHeaders()
-
-                    print("✅ Fake sync state cleared - will rescan from trusted height")
-                }
-            }
+            let _ = try WalletDatabase.shared.getLastScannedHeight()
+            // Validation disabled in P2P-only mode
         } catch {
-            print("⚠️ Could not validate lastScannedHeight: \(error)")
+            print("⚠️ Could not read lastScannedHeight: \(error)")
             // Continue anyway - HeaderSyncManager will also validate
         }
 
@@ -3372,51 +3380,57 @@ final class WalletManager: ObservableObject {
 
     /// Check if a nullifier has been spent on the blockchain
     /// Scans transactions from the note's height to current tip
+    /// FIX #120: InsightAPI commented out - P2P only
     private func checkNullifierSpentOnChain(nullifier: String, afterHeight: UInt64) async throws -> Bool {
+        // FIX #120: InsightAPI commented out - P2P only
         // Strategy: Check blocks from note height to current tip for spending transactions
         // This is expensive, so we batch and parallelize
+        //
+        // let api = InsightAPI.shared
+        // let status = try await api.getStatus()
+        // let currentHeight = status.height
+        //
+        // // Don't scan more than 5000 blocks (arbitrary limit for performance)
+        // let maxScanBlocks: UInt64 = 5000
+        // let startHeight = afterHeight
+        // let endHeight = min(currentHeight, afterHeight + maxScanBlocks)
+        //
+        // // Batch size for parallel processing
+        // let batchSize: UInt64 = 100
+        //
+        // for batchStart in stride(from: startHeight, to: endHeight, by: Int(batchSize)) {
+        //     let batchEnd = min(batchStart + batchSize, endHeight)
+        //
+        //     // Check each block in this batch
+        //     for height in batchStart..<batchEnd {
+        //         do {
+        //             let blockHash = try await api.getBlockHash(height: height)
+        //             let block = try await api.getBlock(hash: blockHash)
+        //
+        //             // Check each transaction in the block
+        //             for txid in block.tx {
+        //                 let tx = try await api.getTransaction(txid: txid)
+        //
+        //                 // Check if any spend matches our nullifier
+        //                 if let spends = tx.spendDescs {
+        //                     for spend in spends {
+        //                         if spend.nullifier == nullifier {
+        //                             return true // Found! This note was spent
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         } catch {
+        //             // Skip blocks that fail to fetch
+        //             continue
+        //         }
+        //     }
+        // }
+        //
+        // return false
 
-        let api = InsightAPI.shared
-        let status = try await api.getStatus()
-        let currentHeight = status.height
-
-        // Don't scan more than 5000 blocks (arbitrary limit for performance)
-        let maxScanBlocks: UInt64 = 5000
-        let startHeight = afterHeight
-        let endHeight = min(currentHeight, afterHeight + maxScanBlocks)
-
-        // Batch size for parallel processing
-        let batchSize: UInt64 = 100
-
-        for batchStart in stride(from: startHeight, to: endHeight, by: Int(batchSize)) {
-            let batchEnd = min(batchStart + batchSize, endHeight)
-
-            // Check each block in this batch
-            for height in batchStart..<batchEnd {
-                do {
-                    let blockHash = try await api.getBlockHash(height: height)
-                    let block = try await api.getBlock(hash: blockHash)
-
-                    // Check each transaction in the block
-                    for txid in block.tx {
-                        let tx = try await api.getTransaction(txid: txid)
-
-                        // Check if any spend matches our nullifier
-                        if let spends = tx.spendDescs {
-                            for spend in spends {
-                                if spend.nullifier == nullifier {
-                                    return true // Found! This note was spent
-                                }
-                            }
-                        }
-                    }
-                } catch {
-                    // Skip blocks that fail to fetch
-                    continue
-                }
-            }
-        }
-
+        // P2P-only: This function is disabled - nullifier checking done via P2P scan
+        print("⚠️ checkNullifierSpentOnChain disabled in P2P-only mode")
         return false
     }
 }
