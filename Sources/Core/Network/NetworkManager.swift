@@ -3952,9 +3952,15 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
-            // Remove banned/disconnected peers
+            // Remove banned/disconnected peers AND peers with dead connections
+            // FIX #119: Also remove peers that are not connection-ready to prevent socket accumulation
             peers.removeAll { peer in
-                isBanned(peer.host) || peer.shouldBan()
+                let shouldRemove = isBanned(peer.host) || peer.shouldBan() || !peer.isConnectionReady
+                if shouldRemove && !isBanned(peer.host) && !peer.shouldBan() {
+                    // Peer has dead connection but isn't banned - disconnect and remove
+                    peer.disconnect()
+                }
+                return shouldRemove
             }
 
             // Find worst performing peer to rotate out

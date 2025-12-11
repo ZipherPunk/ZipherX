@@ -898,7 +898,9 @@ final class WalletManager: ObservableObject {
 
                         // Fetch delta CMUs from chain via P2P
                         let networkManager = NetworkManager.shared
-                        if networkManager.isConnected {
+                        // FIX #119: Check for actual connected peers, not just "isConnected" flag
+                        let connectedPeerCount = networkManager.connectedPeers
+                        if connectedPeerCount > 0 {
                             // Fetch blocks between boostHeight+1 and maxNoteHeight
                             // FIX #115: More resilient P2P fetch with per-batch retry and longer timeouts
                             var deltaCMUs: [Data] = []
@@ -906,12 +908,15 @@ final class WalletManager: ObservableObject {
                             let batchSize = 50
                             var failedBatches = 0
                             let maxRetries = 2
+                            let maxConsecutiveFailures = 3  // FIX #119: Stop after 3 consecutive batch failures
 
                             var currentHeight = startHeight
-                            while currentHeight <= maxNoteHeight {
+                            var consecutiveFailures = 0
+                            while currentHeight <= maxNoteHeight && consecutiveFailures < maxConsecutiveFailures {
                                 let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
                                 let blockCount = Int(endHeight - currentHeight + 1)
 
+                                var batchSucceeded = false
                                 // Retry each batch up to maxRetries times
                                 for attempt in 1...maxRetries {
                                     do {
@@ -927,6 +932,8 @@ final class WalletManager: ObservableObject {
                                                 }
                                             }
                                         }
+                                        batchSucceeded = true
+                                        consecutiveFailures = 0  // Reset on success
                                         break // Success, exit retry loop
                                     } catch {
                                         if attempt < maxRetries {
@@ -939,7 +946,16 @@ final class WalletManager: ObservableObject {
                                     }
                                 }
 
+                                if !batchSucceeded {
+                                    consecutiveFailures += 1
+                                }
+
                                 currentHeight = endHeight + 1
+                            }
+
+                            // FIX #119: Log if we stopped early due to network issues
+                            if consecutiveFailures >= maxConsecutiveFailures {
+                                print("⚠️ Pre-witness: Stopping delta fetch after \(maxConsecutiveFailures) consecutive failures (network unavailable)")
                             }
 
                             // Only proceed if we got some CMUs (allow partial success)
@@ -977,7 +993,7 @@ final class WalletManager: ObservableObject {
                                 print("⚠️ Pre-witness: All P2P batches failed, notes will rebuild at send time")
                             }
                         } else {
-                            print("⚠️ Pre-witness: No P2P connection for delta CMU fetch")
+                            print("⚠️ Pre-witness: No P2P peers connected (0 peers) - skipping delta CMU fetch")
                         }
                     }
 
