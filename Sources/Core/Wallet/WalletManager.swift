@@ -764,11 +764,22 @@ final class WalletManager: ObservableObject {
 
             // Sync headers for the new blocks so we have real timestamps
             // This ensures transaction history shows correct dates instead of "(est)"
+            // FIX #120: Also sync from earliest transaction that needs a timestamp
             do {
                 let hsm = HeaderSyncManager(
                     headerStore: HeaderStore.shared,
                     networkManager: NetworkManager.shared
                 )
+
+                // Check if any transactions need timestamps from earlier heights
+                if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
+                    if earliestNeedingTimestamp < currentHeight {
+                        print("📜 FIX #120: Syncing headers from \(earliestNeedingTimestamp) for missing timestamps")
+                        try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+                    }
+                }
+
+                // Also sync from current height for new blocks
                 try await hsm.syncHeaders(from: currentHeight + 1)
 
                 // Fix any transactions that have estimated timestamps

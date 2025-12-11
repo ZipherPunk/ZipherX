@@ -2834,6 +2834,25 @@ final class WalletDatabase {
         }
     }
 
+    /// Get the earliest transaction height that needs a timestamp
+    /// Used by background sync to know how far back to sync headers
+    /// FIX #120: Sync headers from earliest missing timestamp, not just current height
+    func getEarliestHeightNeedingTimestamp() throws -> UInt64? {
+        let sql = "SELECT MIN(block_height) FROM transaction_history WHERE block_height > 0 AND (block_time IS NULL OR block_time = 0);"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let height = sqlite3_column_int64(stmt, 0)
+            return height > 0 ? UInt64(height) : nil
+        }
+        return nil
+    }
+
     /// Fix block_time for transactions that have NULL or zero timestamps using actual timestamps from HeaderStore
     /// This corrects estimated timestamps saved by older code or newly synced transactions
     func fixTransactionBlockTimes() throws {
