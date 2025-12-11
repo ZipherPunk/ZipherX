@@ -326,7 +326,6 @@ final class HeaderStore {
         if sqlite3_step(stmt) == SQLITE_ROW {
             let timestamp = UInt32(sqlite3_column_int64(stmt, 0))
             sqlite3_finalize(stmt)
-            print("⏰ HeaderStore.getBlockTime: height=\(height), found in headers table: \(timestamp)")
             return timestamp
         }
         sqlite3_finalize(stmt)
@@ -343,11 +342,9 @@ final class HeaderStore {
 
         if sqlite3_step(stmt2) == SQLITE_ROW {
             let timestamp = UInt32(sqlite3_column_int64(stmt2, 0))
-            print("⏰ HeaderStore.getBlockTime: height=\(height), found in block_times table: \(timestamp)")
             return timestamp
         }
 
-        print("⏰ HeaderStore.getBlockTime: height=\(height), NOT FOUND in either table")
         return nil
     }
 

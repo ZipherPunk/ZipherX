@@ -2275,7 +2275,6 @@ final class WalletDatabase {
 
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let txidPtr = sqlite3_column_blob(stmt, 0) else {
-                print("📜 DB: Skipping row with NULL txid")
                 continue
             }
             let txidLen = sqlite3_column_bytes(stmt, 0)
@@ -2286,12 +2285,8 @@ final class WalletDatabase {
             if height > 0 {
                 if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
                     blockTime = UInt64(timestamp)
-                    print("📜 TIMESTAMP DEBUG: height=\(height), got timestamp=\(timestamp) from BlockTimestampManager")
                 } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
                     blockTime = UInt64(headerTime)
-                    print("📜 TIMESTAMP DEBUG: height=\(height), got timestamp=\(headerTime) from HeaderStore")
-                } else {
-                    print("📜 TIMESTAMP DEBUG: height=\(height), NO timestamp found (BlockTimestampManager maxHeight=\(BlockTimestampManager.shared.maxHeight), boost range=476969-2935315)")
                 }
             }
             // If still nil (header not synced yet), leave as nil - UI will handle it
@@ -2318,12 +2313,10 @@ final class WalletDatabase {
                 status: TransactionStatus(rawValue: statusStr) ?? .confirmed,
                 confirmations: confirmations
             )
-            print("📜 DB: Item created - txidLen=\(txidLen), type=\(txType.rawValue), value=\(value), height=\(height), txidString=\(item.txidString.prefix(16))...")
 
             items.append(item)
         }
 
-        print("📜 DB: getTransactionHistory returning \(items.count) items")
         return items
     }
 
@@ -3130,21 +3123,17 @@ struct TransactionHistoryItem {
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
 
-        // Use actual block timestamp if available
+        // Use actual block timestamp if available (already set by getTransactionHistory)
         if let blockTime = blockTime, blockTime > 0 {
             let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
-            let result = formatter.string(from: date)
-            print("📅 dateString: height=\(height), using blockTime=\(blockTime) -> \(result)")
-            return result
+            return formatter.string(from: date)
         }
 
         // Fallback: try to get from HeaderStore (checks BOTH headers table AND block_times table)
         if height > 0 {
             if let timestamp = try? HeaderStore.shared.getBlockTime(at: height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
-                let result = formatter.string(from: date)
-                print("📅 dateString: height=\(height), using HeaderStore timestamp=\(timestamp) -> \(result)")
-                return result
+                return formatter.string(from: date)
             }
         }
 
@@ -3152,9 +3141,7 @@ struct TransactionHistoryItem {
         if height > 0 {
             if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
-                let result = formatter.string(from: date)
-                print("📅 dateString: height=\(height), using BlockTimestampManager timestamp=\(timestamp) -> \(result)")
-                return result
+                return formatter.string(from: date)
             }
         }
 
@@ -3170,13 +3157,10 @@ struct TransactionHistoryItem {
             let estimatedTimestamp = currentTime + (Double(heightDiff) * blockTimeInterval)
             let date = Date(timeIntervalSince1970: estimatedTimestamp)
 
-            let result = formatter.string(from: date) + " (est)"
-            print("📅 dateString: height=\(height), ESTIMATE (no timestamp found) -> \(result)")
-            return result
+            return formatter.string(from: date) + " (est)"
         }
 
         // No timestamp available
-        print("📅 dateString: height=\(height), NO timestamp - returning nil")
         return nil
     }
 }
