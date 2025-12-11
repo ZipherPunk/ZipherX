@@ -867,8 +867,14 @@ final class NetworkManager: ObservableObject {
         // When Tor is disabled, InsightAPI is authoritative
 
         // FIX #111: Get HeaderStore height FIRST for Sybil detection
+        // CRITICAL FIX: During initial sync, headers are behind chain tip. Use a much larger tolerance
+        // to avoid banning legitimate peers during catch-up sync.
         let headerStoreHeightForValidation = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-        let sybilThreshold = headerStoreHeightForValidation > 0 ? headerStoreHeightForValidation + 1000 : UInt64(10_000_000) // 10M if no headers
+        // Use 10,000 blocks tolerance during initial sync (headers may be far behind)
+        // Once synced (within 100 blocks of chain), reduce to 1000 for stricter protection
+        let isInitialSyncPhase = headerStoreHeightForValidation < ZipherXConstants.bundledTreeHeight
+        let sybilTolerance: UInt64 = isInitialSyncPhase ? 50_000 : 10_000  // Much higher tolerance during initial sync
+        let sybilThreshold = headerStoreHeightForValidation > 0 ? headerStoreHeightForValidation + sybilTolerance : UInt64(100_000_000) // 100M if no headers
 
         // 1. Get P2P peer consensus height FIRST (skip banned peers + detect Sybil attackers)
         var peerHeights: [UInt64: Int] = [:]

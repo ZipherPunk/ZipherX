@@ -6221,6 +6221,167 @@ if let treeData = ZipherXFFI.treeSerialize() {
 
 ---
 
+### 116. Local Delta Bundle for Instant Witness Generation (December 10, 2025)
+
+**Feature**: Local caching of shielded outputs for instant witness generation without network fetches.
+
+**Problem**: After the GitHub boost file height, each transaction required fetching CMUs via P2P (30-60s delay).
+
+**Solution**: `DeltaCMUManager` accumulates shielded outputs locally during sync, using the exact same 652-byte format as the GitHub boost file.
+
+**Architecture**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     CMU Data Sources                             │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────────┐    ┌──────────────────────────────┐   │
+│  │  commitment_tree.bin │    │  shielded_outputs_delta.bin  │   │
+│  │  (GitHub boost)      │    │  (Local delta bundle)        │   │
+│  │                      │    │                              │   │
+│  │  Height: 0 → 2935315 │    │  Height: 2935316 → chainTip  │   │
+│  │  ~1,042,000 outputs  │    │  Variable (grows with sync)  │   │
+│  │  ~33 MB (downloaded) │    │  ~16KB-1MB (local)           │   │
+│  └──────────────────────┘    └──────────────────────────────┘   │
+│                                                                  │
+│  Priority: Delta Bundle → P2P → InsightAPI                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**File Format** (identical to GitHub boost):
+```
+Each record: 652 bytes
+- height: UInt32 LE (4 bytes)
+- index: UInt32 LE (4 bytes) - output index within block
+- cmu: 32 bytes (wire format)
+- epk: 32 bytes (wire format)
+- ciphertext: 580 bytes
+```
+
+**Performance Impact**:
+
+| Scenario | Before (P2P) | After (Delta) |
+|----------|--------------|---------------|
+| Note in boost file | ~35s | ~35s |
+| Note after boost file | ~65-95s | **~35s** |
+| Improvement | - | **30-60s faster** |
+
+**Files Created/Modified**:
+- `Sources/Core/Storage/DeltaCMUManager.swift` - NEW: Delta bundle manager
+- `Sources/Core/Network/FilterScanner.swift` - Collects outputs during PHASE 2
+- `Sources/Core/Crypto/TransactionBuilder.swift` - Uses delta bundle first
+- `Sources/Core/Wallet/WalletManager.swift` - Clears delta on wallet delete
+
+**Key Functions**:
+```swift
+// DeltaCMUManager.swift
+func appendOutputs(_ outputs: [DeltaOutput], toHeight: UInt64, treeRoot: Data)
+func loadDeltaCMUs() -> [Data]?
+func getManifest() -> DeltaManifest?
+func clearDeltaBundle()
+
+// FilterScanner.swift - collection during sync
+if deltaCollectionEnabled {
+    let deltaOutput = DeltaCMUManager.DeltaOutput(
+        height: UInt32(height),
+        index: UInt32(outputIndex),
+        cmu: cmu,
+        epk: epk,
+        ciphertext: encCiphertext
+    )
+    deltaOutputsCollected.append(deltaOutput)
+}
+
+// TransactionBuilder.swift - instant lookup
+if let deltaManifest = deltaManager.getManifest() {
+    if startHeight >= deltaManifest.startHeight && endHeight <= deltaManifest.endHeight {
+        // Full range covered by delta bundle!
+        allCMUs = deltaCMUs[startOffset...endOffset]
+        print("📦 DeltaCMU: Got CMUs from local delta bundle (INSTANT!)")
+        return allCMUs
+    }
+}
+```
+
+---
+
+### 117. CRITICAL: Repair Database Anchor Validation (December 11, 2025)
+
+**Problem**: "Repair Database" function's STEP 1 "Quick Fix" was extracting anchors from existing witnesses and declaring success without validating that those anchors were actually correct. If witnesses were built from a corrupted tree, the corruption was preserved.
+
+**Root Cause**: STEP 1 checked if notes had witnesses and extracted anchors from them, but didn't verify that the extracted anchors matched the current FFI tree root (which should match blockchain's finalsaplingroot).
+
+**Solution**: Added `anchorsValidated` check in `repairNotesAfterDownloadedTree()` (WalletManager.swift lines 1976-2012):
+
+```swift
+// CRITICAL: Validate that extracted anchors are actually CORRECT
+var anchorsValidated = false
+if anchorsFixed > 0 {
+    if let currentTreeRoot = ZipherXFFI.treeRoot() {
+        if let firstNote = notes.first,
+           let witnessAnchor = ZipherXFFI.witnessGetRoot(firstNote.witness) {
+            if witnessAnchor == currentTreeRoot {
+                print("✅ Anchor validation PASSED: witness root matches current tree")
+                anchorsValidated = true
+            } else {
+                print("⚠️ Anchor validation FAILED: witness root ≠ tree root")
+                print("⚠️ Witnesses were built from corrupted tree - need full rebuild!")
+            }
+        }
+    }
+}
+
+// Only use quick fix if ALL notes have valid witnesses AND anchors are validated correct
+if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
+    print("✅ Quick fix successful! All \(notes.count) notes repaired instantly")
+    return  // Quick fix success - return early
+}
+// else proceed to STEP 2 (full rescan from scratch)
+```
+
+**Behavior Change**:
+- **Before**: Quick Fix extracted anchors → returned success (even if anchors were wrong)
+- **After**: Quick Fix extracts anchors → validates against tree root → only returns success if validation passes
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - lines 1976-2012
+
+---
+
+### 118. SendView Missing "verify" Phase Handler (December 11, 2025)
+
+**Problem**: UI got stuck showing "Accepted by 2/3 peers" even though transaction was verified in mempool. User had to close/reopen app to see success.
+
+**Root Cause**: NetworkManager sends `"verify"` phase during mempool verification, but SendView's switch statement didn't have a `case "verify":` handler. The phase went to `default: break` and was silently ignored.
+
+**Solution**: Added `case "verify":` to handle mempool verification phase (SendView.swift lines 967-981):
+
+```swift
+case "verify":
+    // FIX #118: Handle mempool verification phase
+    // NetworkManager sends "verify" phase during mempool checking
+    if progress == 1.0 || detail?.contains("mempool") == true {
+        // Mempool verified - show success!
+        updateStepSync("broadcast", status: .completed, detail: detail ?? "In mempool - awaiting miners")
+        // Show success screen now that mempool is verified
+        if !txId.isEmpty {
+            showSuccess = true
+            isSending = false
+        }
+    } else {
+        // Still verifying
+        updateStepSync("broadcast", status: .inProgress, detail: detail, progress: progress)
+    }
+```
+
+**Behavior Change**:
+- **Before**: UI stuck at "Accepted by X/Y peers" indefinitely
+- **After**: UI transitions to success screen when mempool verification completes
+
+**Files Modified**:
+- `Sources/Features/Send/SendView.swift` - lines 967-981
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

@@ -45,6 +45,10 @@ struct BalanceView: View {
     @State private var clearingTime: TimeInterval? = nil
     @State private var clearingIsOutgoing: Bool = false  // true for sender, false for receiver
 
+    // Blinking state for "Synced" indicator when syncing in progress
+    @State private var syncedTextVisible: Bool = true
+    private let blinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -338,6 +342,14 @@ struct BalanceView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justClearedOutgoing = nil
                 }
+            }
+        }
+        .onReceive(blinkTimer) { _ in
+            // Toggle visibility for blinking effect when syncing
+            if walletManager.isSyncing {
+                syncedTextVisible.toggle()
+            } else {
+                syncedTextVisible = true  // Always visible when not syncing
             }
         }
     }
@@ -917,12 +929,16 @@ struct BalanceView: View {
                         .foregroundColor(theme.errorColor)
                     Spacer()
                 } else if networkManager.chainHeight > 0 && networkManager.walletHeight >= networkManager.chainHeight {
+                    // Blockchain is synced - check if we need to blink (syncing in progress)
+                    let isSyncing = walletManager.isSyncing
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(theme.successColor)
                         .font(.system(size: 10))
+                        .opacity(isSyncing ? (syncedTextVisible ? 1.0 : 0.3) : 1.0)
                     Text("Synced")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
+                        .opacity(isSyncing ? (syncedTextVisible ? 1.0 : 0.3) : 1.0)
                     Spacer()
                 } else {
                     Image(systemName: "clock")
@@ -1572,9 +1588,8 @@ struct BalanceView: View {
                 .font(theme.captionFont)
                 .foregroundColor(theme.textPrimary)
                 .lineLimit(1)
-            Spacer()
+                .fixedSize(horizontal: true, vertical: false)
         }
-        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

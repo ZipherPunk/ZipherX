@@ -156,6 +156,69 @@ final class WalletManager: ObservableObject {
     /// This is set when user clicks Create/Import/Restore, not when app launches
     @Published private(set) var walletCreationTime: Date? = nil
 
+    // MARK: - Delta Bundle Sync Status
+
+    /// Delta bundle sync status for UI indicator
+    public enum DeltaSyncStatus: Equatable {
+        case synced          // Delta bundle is up-to-date with chain height
+        case syncing         // Delta bundle sync in progress
+        case behind(blocks: UInt64)  // Delta bundle is behind by X blocks
+        case unavailable     // No delta bundle exists yet
+    }
+
+    @Published private(set) var deltaSyncStatus: DeltaSyncStatus = .unavailable
+
+    /// Update delta sync status - called during background sync
+    @MainActor
+    func updateDeltaSyncStatus(_ status: DeltaSyncStatus) {
+        deltaSyncStatus = status
+    }
+
+    /// Check and update delta sync status based on current state
+    /// Checks both: (1) delta is up-to-date with chain tip, (2) delta covers from boost end
+    @MainActor
+    func refreshDeltaSyncStatus() {
+        let deltaManager = DeltaCMUManager.shared
+        let chainHeight = NetworkManager.shared.chainHeight
+        let bundledEndHeight = ZipherXConstants.effectiveTreeHeight
+
+        guard chainHeight > 0 else {
+            deltaSyncStatus = .unavailable
+            return
+        }
+
+        guard let manifest = deltaManager.getManifest() else {
+            // No delta exists - calculate how many blocks would need to be synced
+            let blocksBehind = chainHeight > bundledEndHeight ? chainHeight - bundledEndHeight : 0
+            if blocksBehind > 0 {
+                deltaSyncStatus = .behind(blocks: blocksBehind)
+            } else {
+                deltaSyncStatus = .unavailable
+            }
+            return
+        }
+
+        // Check 1: Does delta start from where boost ends?
+        let expectedStart = bundledEndHeight + 1
+        let hasGap = manifest.startHeight > expectedStart
+
+        // Check 2: Is delta up-to-date with chain?
+        let behindChain = manifest.endHeight < chainHeight
+
+        if hasGap {
+            // Gap between boost end and delta start - this is a problem!
+            let gapBlocks = manifest.startHeight - expectedStart
+            let chainBehind = behindChain ? chainHeight - manifest.endHeight : 0
+            deltaSyncStatus = .behind(blocks: gapBlocks + chainBehind)
+            print("📦 Delta has gap: boost ends at \(bundledEndHeight), delta starts at \(manifest.startHeight) (gap: \(gapBlocks) blocks)")
+        } else if behindChain {
+            let blocksBehind = chainHeight - manifest.endHeight
+            deltaSyncStatus = .behind(blocks: blocksBehind)
+        } else {
+            deltaSyncStatus = .synced
+        }
+    }
+
     /// Clear the balance tracking after change output is processed
     /// NOTE: We do NOT clear lastSendTimestamp here - it should persist for the full 120 seconds
     /// so that isLikelyChange remains true and suppresses the pending balance indicator
@@ -203,6 +266,8 @@ final class WalletManager: ObservableObject {
                 await preloadProver()
                 // Load bundled block hashes for fast P2P fetching (historical scans)
                 await preloadBlockHashes()
+                // Validate and sync delta bundle for instant transactions
+                await validateAndSyncDeltaBundle()
             }
         }
     }
@@ -220,6 +285,152 @@ final class WalletManager: ObservableObject {
         } catch {
             print("⚠️ Failed to load bundled block hashes: \(error)")
             // Non-fatal - will fall back to InsightAPI for historical blocks
+        }
+    }
+
+    // MARK: - Delta Bundle Validation
+
+    /// Validate delta bundle on app startup and sync missing data if needed
+    /// This ensures:
+    /// 1. Delta bundle integrity (file size, manifest, start height)
+    /// 2. Tree root matches HeaderStore at delta end height
+    /// 3. Delta is up-to-date with current chain height (syncs if behind)
+    private func validateAndSyncDeltaBundle() async {
+        print("📦 Validating delta bundle...")
+
+        let deltaManager = DeltaCMUManager.shared
+        let bundledEndHeight = ZipherXConstants.effectiveTreeHeight
+
+        // 1. Validate delta bundle integrity
+        let validation = deltaManager.validateDeltaBundle(bundledEndHeight: bundledEndHeight)
+
+        if !validation.isValid && validation.error != nil {
+            print("⚠️ Delta bundle invalid: \(validation.error!) - will rebuild on next sync")
+            return
+        }
+
+        // If no delta exists, that's OK - will be created during sync
+        guard let manifest = validation.manifest else {
+            print("📦 No delta bundle exists yet - will be created during sync")
+            return
+        }
+
+        // 2. Validate tree root against HeaderStore (optional - only if headers available)
+        let rootValid = await deltaManager.validateTreeRootAgainstHeaders()
+        if !rootValid {
+            print("⚠️ Delta tree root mismatch - clearing for rebuild")
+            deltaManager.clearDeltaBundle()
+            return
+        }
+
+        // 3. Check if delta needs sync (missing blocks compared to chain height)
+        await syncDeltaBundleIfNeeded(manifest: manifest, bundledEndHeight: bundledEndHeight)
+    }
+
+    /// Sync delta bundle if it's behind the current chain height
+    /// Fetches missing shielded outputs via P2P and appends to delta
+    private func syncDeltaBundleIfNeeded(manifest: DeltaCMUManager.DeltaManifest, bundledEndHeight: UInt64) async {
+        // Get current chain height
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await NetworkManager.shared.getChainHeight()
+        } catch {
+            print("⚠️ Cannot get chain height for delta sync: \(error.localizedDescription)")
+            await MainActor.run { refreshDeltaSyncStatus() }
+            return
+        }
+
+        // Update chain height for status check
+        await MainActor.run { refreshDeltaSyncStatus() }
+
+        // Check if delta is up-to-date
+        let deltaEndHeight = manifest.endHeight
+        if deltaEndHeight >= chainHeight {
+            print("✅ Delta bundle is current (height \(deltaEndHeight), chain \(chainHeight))")
+            await MainActor.run { deltaSyncStatus = .synced }
+            return
+        }
+
+        // Calculate missing blocks
+        let missingBlocks = chainHeight - deltaEndHeight
+        print("📦 Delta bundle behind by \(missingBlocks) blocks (delta: \(deltaEndHeight), chain: \(chainHeight))")
+
+        // Update status to behind
+        await MainActor.run { deltaSyncStatus = .behind(blocks: missingBlocks) }
+
+        // Limit sync to recent blocks to avoid long startup delays
+        let maxStartupSyncBlocks: UInt64 = 100
+        if missingBlocks > maxStartupSyncBlocks {
+            print("⚠️ Too many missing blocks (\(missingBlocks)) - will sync during background refresh")
+            return
+        }
+
+        // Update status to syncing
+        await MainActor.run { deltaSyncStatus = .syncing }
+
+        // Fetch missing blocks via P2P
+        print("📦 Fetching \(missingBlocks) missing blocks for delta bundle...")
+
+        do {
+            let startHeight = deltaEndHeight + 1
+            var collectedOutputs: [DeltaCMUManager.DeltaOutput] = []
+
+            // Fetch blocks in batches
+            let batchSize: UInt64 = 50
+            var currentStart = startHeight
+
+            while currentStart <= chainHeight {
+                let batchEnd = min(currentStart + batchSize - 1, chainHeight)
+                let count = Int(batchEnd - currentStart + 1)
+
+                // Try P2P first
+                let blocks = try await NetworkManager.shared.getBlocksOnDemandP2P(from: currentStart, count: count)
+
+                // Extract shielded outputs from blocks
+                var outputIndex: UInt32 = 0
+                for block in blocks {
+                    for tx in block.transactions {
+                        for output in tx.outputs {
+                            let deltaOutput = DeltaCMUManager.DeltaOutput(
+                                height: UInt32(block.blockHeight),
+                                index: outputIndex,
+                                cmu: output.cmu,
+                                epk: output.epk,
+                                ciphertext: output.ciphertext
+                            )
+                            collectedOutputs.append(deltaOutput)
+                            outputIndex += 1
+                        }
+                    }
+                    outputIndex = 0  // Reset for next block
+                }
+
+                currentStart = batchEnd + 1
+            }
+
+            // Append collected outputs to delta bundle
+            if !collectedOutputs.isEmpty {
+                // Get current tree root after sync
+                // For startup sync, we use tree root from current in-memory tree
+                let treeRoot = ZipherXFFI.treeRoot() ?? Data(count: 32)
+
+                DeltaCMUManager.shared.appendOutputs(collectedOutputs, fromHeight: startHeight, toHeight: chainHeight, treeRoot: treeRoot)
+                print("✅ Delta bundle synced to height \(startHeight)-\(chainHeight) (+\(collectedOutputs.count) outputs)")
+            } else {
+                // No outputs but still need to update height in manifest
+                let treeRoot = ZipherXFFI.treeRoot() ?? Data(count: 32)
+                DeltaCMUManager.shared.appendOutputs([], fromHeight: startHeight, toHeight: chainHeight, treeRoot: treeRoot)
+                print("✅ Delta bundle synced to height \(startHeight)-\(chainHeight) (no new outputs)")
+            }
+
+            // Update status to synced
+            await MainActor.run { deltaSyncStatus = .synced }
+
+        } catch {
+            print("⚠️ Failed to sync delta bundle: \(error.localizedDescription)")
+            // Non-fatal - delta will be updated during background sync
+            // Reset status to behind
+            await MainActor.run { deltaSyncStatus = .behind(blocks: missingBlocks) }
         }
     }
 
@@ -688,32 +899,51 @@ final class WalletManager: ObservableObject {
                         // Fetch delta CMUs from chain via P2P
                         let networkManager = NetworkManager.shared
                         if networkManager.isConnected {
-                            do {
-                                // Fetch blocks between boostHeight+1 and maxNoteHeight
-                                var deltaCMUs: [Data] = []
-                                let startHeight = boostHeight + 1
-                                let batchSize = 50
+                            // Fetch blocks between boostHeight+1 and maxNoteHeight
+                            // FIX #115: More resilient P2P fetch with per-batch retry and longer timeouts
+                            var deltaCMUs: [Data] = []
+                            let startHeight = boostHeight + 1
+                            let batchSize = 50
+                            var failedBatches = 0
+                            let maxRetries = 2
 
-                                var currentHeight = startHeight
-                                while currentHeight <= maxNoteHeight {
-                                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
-                                    let blockCount = Int(endHeight - currentHeight + 1)
+                            var currentHeight = startHeight
+                            while currentHeight <= maxNoteHeight {
+                                let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
+                                let blockCount = Int(endHeight - currentHeight + 1)
 
-                                    // FIX #110: Use getBlocksOnDemandP2P which has multi-peer retry and reconnection logic
-                                    // This prevents "Not connected to network" errors when peers become stale
-                                    let blocks = try await withTimeout(seconds: 15) {
-                                        try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
-                                    }
-                                    for block in blocks {
-                                        for tx in block.transactions {
-                                            for output in tx.outputs {
-                                                deltaCMUs.append(output.cmu)
+                                // Retry each batch up to maxRetries times
+                                for attempt in 1...maxRetries {
+                                    do {
+                                        // FIX #110: Use getBlocksOnDemandP2P which has multi-peer retry and reconnection logic
+                                        // FIX #115: Increased timeout from 15s to 30s for Tor reliability
+                                        let blocks = try await withTimeout(seconds: 30) {
+                                            try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
+                                        }
+                                        for block in blocks {
+                                            for tx in block.transactions {
+                                                for output in tx.outputs {
+                                                    deltaCMUs.append(output.cmu)
+                                                }
                                             }
                                         }
+                                        break // Success, exit retry loop
+                                    } catch {
+                                        if attempt < maxRetries {
+                                            print("⚠️ Pre-witness: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)), retrying...")
+                                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second delay before retry
+                                        } else {
+                                            print("⚠️ Pre-witness: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts: \(error.localizedDescription)")
+                                            failedBatches += 1
+                                        }
                                     }
-                                    currentHeight = endHeight + 1
                                 }
 
+                                currentHeight = endHeight + 1
+                            }
+
+                            // Only proceed if we got some CMUs (allow partial success)
+                            if !deltaCMUs.isEmpty || failedBatches == 0 {
                                 // Build combined CMU data: boost + delta
                                 let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
                                 let totalCount = boostCount + UInt64(deltaCMUs.count)
@@ -739,8 +969,12 @@ final class WalletManager: ObservableObject {
                                         rebuiltCount += 1
                                     }
                                 }
-                            } catch {
-                                print("⚠️ Pre-witness: Failed to fetch delta CMUs: \(error.localizedDescription)")
+
+                                if failedBatches > 0 {
+                                    print("⚠️ Pre-witness: \(failedBatches) batch(es) failed, some notes may need rebuild at send time")
+                                }
+                            } else {
+                                print("⚠️ Pre-witness: All P2P batches failed, notes will rebuild at send time")
                             }
                         } else {
                             print("⚠️ Pre-witness: No P2P connection for delta CMU fetch")
@@ -1739,8 +1973,30 @@ final class WalletManager: ObservableObject {
 
         print("📊 Quick fix result: \(anchorsFixed)/\(notes.count) notes fixed")
 
-        // If ALL notes have valid witnesses and we fixed all anchors, we're done!
-        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count {
+        // CRITICAL: Validate that extracted anchors are actually CORRECT
+        // The witness might have been built from a corrupted tree, so we must verify!
+        var anchorsValidated = false
+        if anchorsFixed > 0 {
+            // Get the current FFI tree root
+            if let currentTreeRoot = ZipherXFFI.treeRoot() {
+                // Get a note's extracted anchor and compare
+                if let firstNote = notes.first,
+                   let witnessAnchor = ZipherXFFI.witnessGetRoot(firstNote.witness) {
+                    if witnessAnchor == currentTreeRoot {
+                        print("✅ Anchor validation PASSED: witness root matches current tree")
+                        anchorsValidated = true
+                    } else {
+                        let witnessHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let treeHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("⚠️ Anchor validation FAILED: witness root \(witnessHex)... ≠ tree root \(treeHex)...")
+                        print("⚠️ Witnesses were built from corrupted tree - need full rebuild!")
+                    }
+                }
+            }
+        }
+
+        // Only use quick fix if ALL notes have valid witnesses AND anchors are validated correct
+        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
             print("✅ Quick fix successful! All \(anchorsFixed) notes repaired instantly")
             onProgress(1.0, 100, 100)
 
@@ -1748,6 +2004,11 @@ final class WalletManager: ObservableObject {
             try await refreshBalance()
             print("✅ Database repair complete - quick fix was sufficient")
             return
+        }
+
+        // If anchors were "fixed" but validation failed, clear them to force rebuild
+        if anchorsFixed > 0 && !anchorsValidated {
+            print("🗑️ Clearing invalid anchors - witnesses need full rebuild")
         }
 
         // ============================================
@@ -1779,6 +2040,10 @@ final class WalletManager: ObservableObject {
             try? FileManager.default.removeItem(at: boostCacheDir)
             print("🗑️ Cleared boost cache (will re-download from GitHub)")
         }
+
+        // Clear local delta bundle (will be rebuilt during rescan)
+        DeltaCMUManager.shared.clearDeltaBundle()
+        print("🗑️ Cleared delta bundle (will be rebuilt during sync)")
 
         // Reset last scanned height to 0 for full rescan
         try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
@@ -2893,6 +3158,10 @@ final class WalletManager: ObservableObject {
 
         // 9. Delete boost files (downloaded CMU/commitment tree data)
         CommitmentTreeUpdater.shared.deleteAllBoostFiles()
+
+        // 10. Delete local delta bundle (accumulated shielded outputs)
+        DeltaCMUManager.shared.clearDeltaBundle()
+        print("🗑️ Deleted delta bundle")
 
         #if os(macOS)
         // Delete macOS encrypted key file

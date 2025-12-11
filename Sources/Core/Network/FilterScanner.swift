@@ -84,6 +84,13 @@ final class FilterScanner {
     // We still append CMUs to tree but skip tryDecryptNote() calls
     private var isNewWalletInitialSync = false
 
+    // DELTA BUNDLE: Collect shielded outputs during PHASE 2 for local caching
+    // Format: 652 bytes per output (same as GitHub boost file)
+    // This enables instant witness generation on subsequent launches
+    private var deltaOutputsCollected: [DeltaCMUManager.DeltaOutput] = []
+    private var deltaCollectionStartHeight: UInt64 = 0
+    private var deltaCollectionEnabled = false
+
     // MARK: - Progress Helpers
 
     /// Map phase-local progress (0-1) to overall progress within that phase's range
@@ -807,6 +814,29 @@ final class FilterScanner {
             onStatusUpdate?("phase2", "Building commitment tree...")
             reportPhase2Progress(0.0, height: currentHeight, maxHeight: targetHeight)
 
+            // DELTA BUNDLE: Enable collection for outputs AFTER the bundled/downloaded range
+            // These outputs will be saved locally for instant witness generation
+            let bundledEndHeight = cmuDataHeight > 0 ? cmuDataHeight : ZipherXConstants.bundledTreeHeight
+            if currentHeight > bundledEndHeight {
+                deltaCollectionEnabled = true
+                // SMART START: Continue from existing delta if valid, otherwise from boost end
+                if let manifest = DeltaCMUManager.shared.getManifest(), manifest.endHeight >= bundledEndHeight {
+                    // Delta exists and is valid - continue from where it left off
+                    deltaCollectionStartHeight = manifest.endHeight + 1
+                    print("📦 DeltaCMU: Continuing from existing delta (height \(manifest.endHeight) → \(currentHeight))")
+                } else {
+                    // No delta or invalid - start fresh from boost end
+                    deltaCollectionStartHeight = bundledEndHeight + 1
+                    print("📦 DeltaCMU: Starting fresh from boost end (height \(bundledEndHeight + 1))")
+                }
+                deltaOutputsCollected.removeAll()
+
+                // Update delta sync status to syncing
+                await MainActor.run {
+                    WalletManager.shared.updateDeltaSyncStatus(.syncing)
+                }
+            }
+
             // Pre-fetch task for next batch (runs in background)
             var nextBatchTask: Task<[(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])], Error>? = nil
 
@@ -1002,6 +1032,44 @@ final class FilterScanner {
 
         // Save tree checkpoint after scan completes
         await saveTreeCheckpointAfterSync()
+
+        // DELTA BUNDLE: Save collected outputs for instant witness generation
+        if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
+            if let treeRoot = ZipherXFFI.treeRoot() {
+                let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
+                DeltaCMUManager.shared.appendOutputs(
+                    deltaOutputsCollected,
+                    fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
+                    toHeight: lastScanned,
+                    treeRoot: treeRoot
+                )
+                print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
+
+                // Update delta sync status to synced
+                await MainActor.run {
+                    WalletManager.shared.updateDeltaSyncStatus(.synced)
+                }
+            }
+            deltaOutputsCollected.removeAll()
+            deltaCollectionEnabled = false
+        } else if deltaCollectionEnabled {
+            // No outputs collected but delta collection was enabled
+            // Still need to update manifest height so system knows we've scanned these blocks
+            if let treeRoot = ZipherXFFI.treeRoot() {
+                let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
+                DeltaCMUManager.shared.appendOutputs(
+                    [],  // Empty outputs
+                    fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
+                    toHeight: lastScanned,
+                    treeRoot: treeRoot
+                )
+                print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+            }
+            await MainActor.run {
+                WalletManager.shared.updateDeltaSyncStatus(.synced)
+            }
+            deltaCollectionEnabled = false
+        }
 
         print("✅ Scan complete")
     }
@@ -1409,7 +1477,7 @@ final class FilterScanner {
             }
         }
 
-        for (_, output) in outputs.enumerated() {
+        for (outputIndex, output) in outputs.enumerated() {
             // Convert hex strings to binary data
             guard let cmuDisplay = Data(hexString: output.cmu),
                   let epkDisplay = Data(hexString: output.ephemeralKey),
@@ -1420,6 +1488,19 @@ final class FilterScanner {
             // Reverse byte order: display format (big-endian) -> wire format (little-endian)
             let epk = epkDisplay.reversedBytes()
             let cmu = cmuDisplay.reversedBytes()
+
+            // DELTA BUNDLE: Collect output for local caching (enables instant witness generation)
+            // Format: 652 bytes = height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
+            if deltaCollectionEnabled {
+                let deltaOutput = DeltaCMUManager.DeltaOutput(
+                    height: UInt32(height),
+                    index: UInt32(outputIndex),
+                    cmu: cmu,
+                    epk: epk,
+                    ciphertext: encCiphertext
+                )
+                deltaOutputsCollected.append(deltaOutput)
+            }
 
             // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
             let treePosition = ZipherXFFI.treeAppend(cmu: cmu)

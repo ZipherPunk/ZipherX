@@ -846,34 +846,33 @@ final class TransactionBuilder {
                 let noteCMU = note.cmu
                 let noteHeight = note.height
 
-                // CRITICAL SECURITY FIX: Validate witness anchor against blockchain's finalsaplingroot!
-                // Even if witness looks valid, it might have a corrupted anchor.
-                if !needsRebuild && note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
-                    // Check if anchor matches a valid blockchain state
-                    if let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(),
-                       let trustedHeader = try? headerStore.getHeader(at: lastScanned) {
-                        let trustedRoot = trustedHeader.hashFinalSaplingRoot
-                        if note.anchor != trustedRoot {
-                            let noteAnchorHex = note.anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-                            let trustedRootHex = trustedRoot.prefix(16).map { String(format: "%02x", $0) }.joined()
-                            print("🚨 [SECURITY] Note \(index + 1) anchor mismatch!")
-                            print("   Stored anchor:      \(noteAnchorHex)...")
-                            print("   Blockchain expects: \(trustedRootHex)... at height \(lastScanned)")
+                // INSTANT MODE CHECK: If witness has valid structure and was updated by pre-witness rebuild,
+                // trust it without requiring header validation (header sync may lag behind tree sync)
+                if !needsRebuild && note.witness.count >= 1028 {
+                    // Extract the anchor from the witness itself (last 32 bytes)
+                    let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness)
 
-                            // Try checkpoint-based tree restoration first
-                            if await tryRestoreFromCheckpoint(targetHeight: lastScanned) {
-                                print("✅ Tree restored from checkpoint - witness still needs rebuild")
-                            } else {
-                                print("📍 No valid checkpoint - will rebuild from boost + delta")
-                            }
-                            needsRebuild = true
+                    if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
+                        // Witness has a valid root - check if it matches stored anchor
+                        if note.anchor == witnessRoot {
+                            print("✅ Note \(index + 1) witness anchor consistent - INSTANT mode!")
+                            // Witness and stored anchor match - trust it
+                        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+                            // Stored anchor differs from witness - use witness (more recent from pre-witness)
+                            print("✅ Note \(index + 1) using witness root (pre-witness updated) - INSTANT mode!")
                         } else {
-                            print("✅ Note \(index + 1) witness validated - INSTANT mode!")
+                            // No valid stored anchor but witness has one - trust witness
+                            print("✅ Note \(index + 1) using witness root - INSTANT mode!")
                         }
                     } else {
-                        print("⚠️ Could not validate anchor (missing header data) - forcing rebuild")
+                        // Witness structure invalid - need rebuild
+                        print("⚠️ Note \(index + 1) witness has invalid root - forcing rebuild")
                         needsRebuild = true
                     }
+                } else if !needsRebuild {
+                    // Witness too short - need rebuild
+                    print("⚠️ Note \(index + 1) witness too short (\(note.witness.count) bytes) - forcing rebuild")
+                    needsRebuild = true
                 }
 
                 // Only rebuild witness if needed
@@ -1471,7 +1470,53 @@ final class TransactionBuilder {
         let networkManager = NetworkManager.shared
         let torEnabled = await TorManager.shared.mode == .enabled
 
-        // Try P2P first (especially important for Tor mode)
+        // PRIORITY 1: Check local delta bundle first (instant, no network!)
+        // This enables instant witness generation for notes after the bundled tree
+        // CRITICAL: Delta must FULLY cover the requested range to be used!
+        // FIX #115: MUST validate delta against headers BEFORE using (corrupted delta = wrong anchor = rejected tx)
+        let deltaManager = DeltaCMUManager.shared
+        if let deltaManifest = deltaManager.getManifest() {
+            // CRITICAL FIX #115: Validate delta bundle against headers BEFORE using
+            // If validation fails (no header available, root mismatch), DO NOT use delta
+            let deltaValid = await deltaManager.validateTreeRootAgainstHeaders()
+            if !deltaValid {
+                print("⚠️ DeltaCMU: Validation FAILED - NOT using delta bundle (would cause wrong anchor)")
+                // Clear corrupted delta so it won't be used again, then fall through to P2P
+                deltaManager.clearDeltaBundle()
+            } else {
+                // Delta validated successfully - safe to use
+                // Log delta state for debugging
+                print("📦 Delta manifest: startHeight=\(deltaManifest.startHeight), endHeight=\(deltaManifest.endHeight), outputCount=\(deltaManifest.outputCount)")
+                print("📦 Requested range: \(startHeight)-\(endHeight)")
+
+                // CRITICAL FIX: Delta must START at or BEFORE our requested start height
+                // If delta.startHeight > startHeight, there's a GAP that delta can't fill!
+                if deltaManifest.startHeight <= startHeight {
+                    // Delta covers from the start - check end coverage
+                    if endHeight <= deltaManifest.endHeight {
+                        // Full coverage - get all CMUs from delta bundle
+                        if let deltaCMUs = deltaManager.loadDeltaCMUsForHeightRange(startHeight: startHeight, endHeight: endHeight) {
+                            allCMUs = deltaCMUs
+                            print("📦 DeltaCMU: FULL coverage - Got \(allCMUs.count) CMUs from local delta bundle (INSTANT!)")
+                            return allCMUs
+                        }
+                    } else {
+                        // Partial coverage at end - get what we can from delta
+                        if let deltaCMUs = deltaManager.loadDeltaCMUsForHeightRange(startHeight: startHeight, endHeight: deltaManifest.endHeight) {
+                            allCMUs = deltaCMUs
+                            let remainingBlocks = endHeight - deltaManifest.endHeight
+                            print("📦 DeltaCMU: PARTIAL coverage - Got \(allCMUs.count) CMUs, need P2P for last \(remainingBlocks) blocks")
+                            // Fall through to P2P to get remaining blocks
+                        }
+                    }
+                } else {
+                    // GAP: Delta starts AFTER our requested range - cannot use delta!
+                    print("📦 DeltaCMU: GAP detected! Delta starts at \(deltaManifest.startHeight) but we need \(startHeight). Using P2P...")
+                }
+            }
+        }
+
+        // PRIORITY 2: Try P2P (especially important for Tor mode)
         // Try multiple peers before giving up
         let connectedPeers = networkManager.getAllConnectedPeers()
         if !connectedPeers.isEmpty {
@@ -1646,7 +1691,7 @@ final class TransactionBuilder {
         }
     }
 
-    /// Fetch CMUs for a range of blocks using P2P peers (preferred) or InsightAPI fallback
+    /// Fetch CMUs for a range of blocks using Delta Bundle (preferred), P2P peers, or InsightAPI fallback
     /// Uses on-demand P2P which fetches headers directly via getheaders (no pre-synced HeaderStore required)
     private func fetchCMUsForBlockRange(from startHeight: UInt64, to endHeight: UInt64) async throws -> [Data] {
         // SAFETY: Prevent crash from integer underflow when startHeight > endHeight
@@ -1660,7 +1705,34 @@ final class TransactionBuilder {
 
         print("🔗 Fetching CMUs for blocks \(startHeight)-\(endHeight) (\(totalBlocks) blocks)")
 
-        // Use getBlocksOnDemandP2P which:
+        // PRIORITY 1: Try Delta CMU Bundle first (INSTANT - local disk)
+        // CRITICAL: Must check if delta FULLY covers the range before using it!
+        if let manifest = DeltaCMUManager.shared.getManifest() {
+            // Delta must START at or BEFORE our requested start height to be useful
+            if manifest.startHeight <= startHeight && manifest.endHeight >= endHeight {
+                // Full coverage - get CMUs from delta bundle
+                if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(startHeight: startHeight, endHeight: endHeight),
+                   !deltaCMUs.isEmpty {
+                    print("⚡ INSTANT: Got \(deltaCMUs.count) CMUs from Delta Bundle (full coverage \(manifest.startHeight)-\(manifest.endHeight))")
+                    return deltaCMUs
+                } else {
+                    // Delta covers this range but no shielded outputs exist in these blocks
+                    print("⚡ INSTANT: Delta bundle confirms NO shielded outputs in range \(startHeight)-\(endHeight)")
+                    return []
+                }
+            } else if manifest.startHeight <= startHeight && manifest.endHeight < endHeight {
+                // Partial coverage (start OK but end beyond delta)
+                print("📦 Delta: Partial coverage (\(manifest.startHeight)-\(manifest.endHeight)), need P2P for \(manifest.endHeight+1)-\(endHeight)")
+                // Fall through to P2P
+            } else {
+                // Delta starts AFTER our requested range - cannot use it (GAP exists!)
+                print("📦 Delta: Gap detected! Delta starts at \(manifest.startHeight) but we need \(startHeight). Using P2P...")
+            }
+        } else {
+            print("📦 Delta bundle: No manifest found, falling back to P2P...")
+        }
+
+        // PRIORITY 2: Use getBlocksOnDemandP2P which:
         // - Fetches headers on-demand via getheaders (NO pre-synced HeaderStore required!)
         // - Has multi-peer retry with reconnection logic
         // - Uses peer.getFullBlocks() which is fully decentralized

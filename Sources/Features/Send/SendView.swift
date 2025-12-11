@@ -964,6 +964,21 @@ struct SendView: View {
             }
             // Update broadcast step progress (but don't show success yet!)
             updateStepSync("broadcast", status: .inProgress, detail: detail?.replacingOccurrences(of: #"\s*\[txid:[^\]]+\]"#, with: "", options: .regularExpression), progress: progress)
+        case "verify":
+            // FIX #118: Handle mempool verification phase
+            // NetworkManager sends "verify" phase during mempool checking
+            if progress == 1.0 || detail?.contains("mempool") == true {
+                // Mempool verified - show success!
+                updateStepSync("broadcast", status: .completed, detail: detail ?? "In mempool - awaiting miners")
+                // Show success screen now that mempool is verified
+                if !txId.isEmpty {
+                    showSuccess = true
+                    isSending = false
+                }
+            } else {
+                // Still verifying
+                updateStepSync("broadcast", status: .inProgress, detail: detail, progress: progress)
+            }
         case "error":
             // CRITICAL: Handle broadcast error - transaction was rejected!
             let errorDetail = detail ?? "Transaction rejected by network"

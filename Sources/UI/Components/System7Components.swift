@@ -144,17 +144,29 @@ struct System7MenuBar: View {
 
     private var theme: AppTheme { themeManager.currentTheme }
 
-    // Logo rotation speed: 1.0 = normal, 3.0 = fast (during tx/sync)
+    // Logo rotation speed based on Delta CMU sync status:
+    // - 1.0 = normal (delta fully synced)
+    // - 3.0 = fast (delta sync in progress, behind, OR pending transaction)
     private var currentRotationSpeed: Double {
-        // Check if syncing
-        if walletManager.isSyncing {
-            return 3.0  // Fast rotation during sync
+        // Check delta CMU sync status first
+        switch walletManager.deltaSyncStatus {
+        case .syncing:
+            return 3.0  // Fast rotation during delta sync
+        case .behind:
+            return 3.0  // Fast rotation - delta needs sync (user should notice!)
+        case .unavailable:
+            // No delta bundle yet - check if blockchain sync is happening
+            if walletManager.isSyncing {
+                return 3.0  // Fast rotation during blockchain sync
+            }
+            return 1.0  // Normal - new wallet or delta not yet created
+        case .synced:
+            // Delta is synced - check for pending transactions
+            if networkManager.mempoolOutgoing > 0 || networkManager.justDetectedIncomingMempool != nil {
+                return 3.0  // Fast rotation during pending transaction
+            }
+            return 1.0  // Normal speed - fully synced
         }
-        // Check for pending transactions
-        if networkManager.mempoolOutgoing > 0 || networkManager.justDetectedIncomingMempool != nil {
-            return 3.0  // Fast rotation during pending transaction
-        }
-        return 1.0  // Normal speed
     }
 
     // Timer for logo rotation
