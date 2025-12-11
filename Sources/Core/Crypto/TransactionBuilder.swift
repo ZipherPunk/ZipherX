@@ -1615,7 +1615,7 @@ final class TransactionBuilder {
         // return cmus
 
         // P2P-only: This function is no longer used, CMUs come from P2P
-        throw TransactionError.invalidWitness("InsightAPI disabled - use P2P for CMU fetching")
+        throw NetworkError.p2pFetchFailed
     }
 
     // MARK: - Checkpoint-Based Tree Restoration

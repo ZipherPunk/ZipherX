@@ -2362,13 +2362,17 @@ final class FilterScanner {
     // MARK: - Helper Methods
 
     private func getChainHeight() async throws -> UInt64 {
+        // FIX #120: InsightAPI commented out - P2P only
         // SECURITY: Use unified consensus function that:
         // 1. Collects heights from InsightAPI + P2P peers
         // 2. Finds agreeing sources within 5 blocks
         // 3. Returns MINIMUM of agreeing sources (conservative)
         // 4. BANS peers reporting heights >10 blocks above consensus
 
-        let consensusHeight = await insightAPI.getConsensusChainHeight(networkManager: networkManager)
+        // let consensusHeight = await insightAPI.getConsensusChainHeight(networkManager: networkManager)
+
+        // P2P-only: get chain height from NetworkManager
+        let consensusHeight = try await networkManager.getChainHeight()
 
         guard consensusHeight > 0 else {
             throw ScanError.networkError
