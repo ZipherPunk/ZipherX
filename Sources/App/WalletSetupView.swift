@@ -1241,13 +1241,22 @@ struct WalletSetupView: View {
 
     private func fetchBlockHeight() {
         Task {
-            do {
-                let status = try await InsightAPI.shared.getStatus()
+            // FIX #120: InsightAPI commented out - P2P only
+            // do {
+            //     let status = try await InsightAPI.shared.getStatus()
+            //     await MainActor.run {
+            //         currentBlockHeight = status.height
+            //     }
+            // } catch {
+            //     print("Failed to fetch block height: \(error)")
+            // }
+
+            // P2P fallback: use NetworkManager chain height
+            let p2pHeight = await NetworkManager.shared.chainHeight
+            if p2pHeight > 0 {
                 await MainActor.run {
-                    currentBlockHeight = status.height
+                    currentBlockHeight = p2pHeight
                 }
-            } catch {
-                print("Failed to fetch block height: \(error)")
             }
         }
     }

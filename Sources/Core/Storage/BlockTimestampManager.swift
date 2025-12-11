@@ -376,18 +376,27 @@ final class BlockTimestampManager {
     // MARK: - Async Fetch for Missing Timestamps
 
     /// Fetch timestamp from InsightAPI for a specific height
+    /// FIX #120: InsightAPI commented out - P2P only
+    /// Timestamps should come from P2P block headers or boost file
     func fetchTimestamp(at height: UInt64) async -> UInt32? {
-        // Get block hash first
-        guard let blockHash = try? await InsightAPI.shared.getBlockHash(height: height) else {
-            return nil
+        // FIX #120: InsightAPI commented out - P2P only
+        // // Get block hash first
+        // guard let blockHash = try? await InsightAPI.shared.getBlockHash(height: height) else {
+        //     return nil
+        // }
+        // // Get block info
+        // guard let block = try? await InsightAPI.shared.getBlock(hash: blockHash) else {
+        //     return nil
+        // }
+        // let timestamp = UInt32(block.time)
+        // cacheTimestamp(height: height, timestamp: timestamp)
+        // return timestamp
+
+        // P2P fallback: try HeaderStore first
+        if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
+            return UInt32(headerTime)
         }
-        // Get block info
-        guard let block = try? await InsightAPI.shared.getBlock(hash: blockHash) else {
-            return nil
-        }
-        let timestamp = UInt32(block.time)
-        cacheTimestamp(height: height, timestamp: timestamp)
-        return timestamp
+        return nil
     }
 
     /// Batch fetch timestamps for heights without timestamps

@@ -1583,13 +1583,12 @@ struct BalanceView: View {
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
             Text(value)
                 .font(theme.captionFont)
                 .foregroundColor(theme.textPrimary)
                 .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
         }
+        .minimumScaleFactor(0.7)
     }
 }
 

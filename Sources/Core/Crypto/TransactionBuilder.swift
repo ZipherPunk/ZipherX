@@ -1579,38 +1579,43 @@ final class TransactionBuilder {
     }
 
     /// Fetch CMUs from a specific block height via Insight API
+    /// FIX #120: InsightAPI commented out - P2P only
     private func fetchCMUsViaInsight(height: UInt64) async throws -> [Data] {
-        let insightAPI = InsightAPI.shared
+        // FIX #120: InsightAPI commented out - P2P only
+        // let insightAPI = InsightAPI.shared
+        //
+        // // Get block hash
+        // let blockHash = try await insightAPI.getBlockHash(height: height)
+        //
+        // // Get block to get transaction IDs
+        // let block = try await insightAPI.getBlock(hash: blockHash)
+        //
+        // // Extract CMUs from shielded outputs of each transaction
+        // var cmus: [Data] = []
+        //
+        // for txid in block.tx {
+        //     do {
+        //         let tx = try await insightAPI.getTransaction(txid: txid)
+        //         if let outputs = tx.vShieldedOutput {
+        //             for output in outputs {
+        //                 if let cmuData = Data(hex: output.cmu) {
+        //                     // CMU from Insight API is in big-endian (display format)
+        //                     // Need to reverse to little-endian (wire format) for tree
+        //                     let cmuLE = Data(cmuData.reversed())
+        //                     cmus.append(cmuLE)
+        //                 }
+        //             }
+        //         }
+        //     } catch {
+        //         // Skip transactions that fail to fetch
+        //         continue
+        //     }
+        // }
+        //
+        // return cmus
 
-        // Get block hash
-        let blockHash = try await insightAPI.getBlockHash(height: height)
-
-        // Get block to get transaction IDs
-        let block = try await insightAPI.getBlock(hash: blockHash)
-
-        // Extract CMUs from shielded outputs of each transaction
-        var cmus: [Data] = []
-
-        for txid in block.tx {
-            do {
-                let tx = try await insightAPI.getTransaction(txid: txid)
-                if let outputs = tx.vShieldedOutput {
-                    for output in outputs {
-                        if let cmuData = Data(hex: output.cmu) {
-                            // CMU from Insight API is in big-endian (display format)
-                            // Need to reverse to little-endian (wire format) for tree
-                            let cmuLE = Data(cmuData.reversed())
-                            cmus.append(cmuLE)
-                        }
-                    }
-                }
-            } catch {
-                // Skip transactions that fail to fetch
-                continue
-            }
-        }
-
-        return cmus
+        // P2P-only: This function is no longer used, CMUs come from P2P
+        throw TransactionError.invalidWitness("InsightAPI disabled - use P2P for CMU fetching")
     }
 
     // MARK: - Checkpoint-Based Tree Restoration
@@ -1770,49 +1775,57 @@ final class TransactionBuilder {
             print("⚠️ P2P fetch error: \(error.localizedDescription)")
         }
 
+        // FIX #120: InsightAPI commented out - P2P only
         // CRITICAL: When Tor is enabled, do NOT use InsightAPI (blocked by Cloudflare)
         // Only P2P works through Tor - if P2P fails, we must fail the operation
-        let torEnabled = await TorManager.shared.mode == .enabled
-        if torEnabled {
-            print("🧅 Tor enabled - InsightAPI fallback DISABLED (Cloudflare blocks Tor)")
-            print("❌ P2P CMU fetch failed and no fallback available")
-            throw NetworkError.p2pFetchFailed
-        }
+        // let torEnabled = await TorManager.shared.mode == .enabled
+        // if torEnabled {
+        //     print("🧅 Tor enabled - InsightAPI fallback DISABLED (Cloudflare blocks Tor)")
+        //     print("❌ P2P CMU fetch failed and no fallback available")
+        //     throw NetworkError.p2pFetchFailed
+        // }
+        //
+        // // InsightAPI fallback - ONLY when Tor is disabled
+        // print("📡 Attempting InsightAPI fallback for \(totalBlocks) blocks...")
+        //
+        // let batchSize = 50
+        // var currentStart = startHeight
+        // var insightErrors = 0
+        //
+        // while currentStart <= endHeight {
+        //     let batchEnd = min(currentStart + UInt64(batchSize) - 1, endHeight)
+        //
+        //     for height in currentStart...batchEnd {
+        //         do {
+        //             let cmus = try await fetchCMUsViaInsight(height: height)
+        //             allCMUs.append(contentsOf: cmus)
+        //         } catch {
+        //             insightErrors += 1
+        //             if insightErrors <= 3 {
+        //                 print("⚠️ InsightAPI failed for block \(height): \(error.localizedDescription)")
+        //             }
+        //             // Continue to next block, don't abort entirely
+        //         }
+        //     }
+        //     currentStart = batchEnd + 1
+        // }
+        //
+        // if insightErrors > 0 {
+        //     print("⚠️ InsightAPI had \(insightErrors) errors out of \(totalBlocks) blocks")
+        // }
+        //
+        // if allCMUs.isEmpty && totalBlocks > 0 {
+        //     throw NetworkError.p2pFetchFailed
+        // }
+        //
+        // print("✅ InsightAPI fallback complete: \(allCMUs.count) CMUs")
 
-        // InsightAPI fallback - ONLY when Tor is disabled
-        print("📡 Attempting InsightAPI fallback for \(totalBlocks) blocks...")
-
-        let batchSize = 50
-        var currentStart = startHeight
-        var insightErrors = 0
-
-        while currentStart <= endHeight {
-            let batchEnd = min(currentStart + UInt64(batchSize) - 1, endHeight)
-
-            for height in currentStart...batchEnd {
-                do {
-                    let cmus = try await fetchCMUsViaInsight(height: height)
-                    allCMUs.append(contentsOf: cmus)
-                } catch {
-                    insightErrors += 1
-                    if insightErrors <= 3 {
-                        print("⚠️ InsightAPI failed for block \(height): \(error.localizedDescription)")
-                    }
-                    // Continue to next block, don't abort entirely
-                }
-            }
-            currentStart = batchEnd + 1
-        }
-
-        if insightErrors > 0 {
-            print("⚠️ InsightAPI had \(insightErrors) errors out of \(totalBlocks) blocks")
-        }
-
+        // P2P-only mode: if P2P fails, we fail
         if allCMUs.isEmpty && totalBlocks > 0 {
+            print("❌ P2P CMU fetch failed - no InsightAPI fallback (P2P-only mode)")
             throw NetworkError.p2pFetchFailed
         }
 
-        print("✅ InsightAPI fallback complete: \(allCMUs.count) CMUs")
         return allCMUs
     }
 }

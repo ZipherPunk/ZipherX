@@ -44,9 +44,13 @@ final class HeaderSyncManager {
 
         // SECURITY: Use multi-source consensus for chain height
         // Don't trust any single source (InsightAPI could be compromised too!)
-        // Get consensus from: InsightAPI + multiple P2P peers
+        // Get consensus from: P2P peers (InsightAPI disabled)
         // Peers reporting fake heights will be BANNED automatically
-        let consensusHeight = await InsightAPI.shared.getConsensusChainHeight(networkManager: networkManager)
+        // FIX #120: InsightAPI commented out - P2P only
+        // let consensusHeight = await InsightAPI.shared.getConsensusChainHeight(networkManager: networkManager)
+
+        // P2P-only consensus: get from NetworkManager
+        let consensusHeight = try await networkManager.getChainHeight()
 
         guard consensusHeight > 0 else {
             print("❌ No consensus on chain height - cannot sync safely")
