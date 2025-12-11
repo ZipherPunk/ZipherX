@@ -159,6 +159,10 @@ final class NetworkManager: ObservableObject {
     /// UI should show warning when this is true (incoming tx detection disabled)
     @Published private(set) var p2pMempoolWarning: Bool = false
 
+    /// FIX #130: Flag to indicate header sync is in progress
+    /// Mempool scan will be paused during header sync to prevent P2P race conditions
+    @Published private(set) var isHeaderSyncing: Bool = false
+
     /// Sybil attack detection - published when a fake peer is banned
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
     @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
@@ -180,12 +184,22 @@ final class NetworkManager: ObservableObject {
     /// Set to true during ContentView's initial sync task, false after completion
     var suppressBackgroundSync: Bool = false
 
+    /// FIX #130: Set header syncing state (called from WalletManager)
+    /// When true, mempool scan is disabled to prevent P2P race conditions
+    func setHeaderSyncing(_ syncing: Bool) {
+        Task { @MainActor in
+            self.isHeaderSyncing = syncing
+            print("📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
+        }
+    }
+
     // MARK: - Connection Cooldown (FIX #114)
     /// Track last connection attempt per address to prevent infinite reconnection loops
     /// Key: "host:port", Value: timestamp of last attempt
     private var connectionAttempts: [String: Date] = [:]
     private let connectionAttemptsLock = NSLock()
-    private let CONNECTION_COOLDOWN: TimeInterval = 5.0  // 5 seconds between attempts to same address
+    /// FIX #122: Reduced from 5s to 2s for faster header sync
+    private let CONNECTION_COOLDOWN: TimeInterval = 2.0  // 2 seconds between attempts to same address
 
     /// Check if an address is on cooldown (recently attempted)
     private func isOnCooldown(_ host: String, port: UInt16) -> Bool {
@@ -534,8 +548,21 @@ final class NetworkManager: ObservableObject {
         }
     }
 
-    /// Check if an address is banned
+    // HARDCODED PERMANENTLY BANNED PEERS - Known malicious Sybil attackers
+    // These IPs have been observed reporting fake chain heights (e.g., 669M blocks)
+    // They are PERMANENTLY banned and cannot be unbanned
+    private let permanentlyBannedPeers: Set<String> = [
+        // Add known malicious peer IPs here as they are discovered
+        // Format: "IP.address" (no port)
+    ]
+
+    /// Check if an address is banned (internal use)
     private func isBanned(_ host: String) -> Bool {
+        // Check permanently banned list first (hardcoded, cannot be unbanned)
+        if permanentlyBannedPeers.contains(host) {
+            return true
+        }
+
         guard let ban = bannedPeers[host] else {
             return false
         }
@@ -547,6 +574,11 @@ final class NetworkManager: ObservableObject {
         }
 
         return true
+    }
+
+    /// Public method to check if a peer is banned (for use by other managers)
+    func isPeerBanned(_ host: String) -> Bool {
+        return isBanned(host)
     }
 
     /// Ban a peer
@@ -921,8 +953,10 @@ final class NetworkManager: ObservableObject {
 
         // 3. Determine best height
         // FIX #111: ALWAYS use HeaderStore as ground truth to reject Sybil attack heights
+        // FIX #120: Increase tolerance to 10000 blocks during header sync catch-up
+        // This allows P2P consensus while headers are syncing (can take several minutes)
         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-        let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 1000 : UInt64.max
+        let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 10000 : UInt64.max
 
         if torEnabled {
             // TOR MODE: P2P consensus is authoritative, BUT validate against HeaderStore
@@ -2128,6 +2162,12 @@ final class NetworkManager: ObservableObject {
     /// Scan mempool for incoming shielded transactions
     /// Uses trial decryption to detect payments before confirmation
     private func scanMempoolForIncoming() async {
+        // FIX #130: Skip mempool scan if header sync is in progress to prevent P2P race conditions
+        if isHeaderSyncing {
+            print("🔮 scanMempoolForIncoming: skipped (header sync in progress)")
+            return
+        }
+
         print("🔮 scanMempoolForIncoming: starting...")
 
         // Get all connected peers and try them in order
@@ -4069,6 +4109,14 @@ final class NetworkManager: ObservableObject {
                 if isBanned(address.host) {
                     continue
                 }
+
+                // FIX #121: Add cooldown check to prevent infinite reconnection loops
+                // Without this, rotatePeers could spam connect() calls to failing addresses
+                if isOnCooldown(address.host, port: address.port) {
+                    print("⏳ [\(address.host)] On cooldown, skipping in rotatePeers")
+                    continue
+                }
+                recordConnectionAttempt(address.host, port: address.port)
 
                 if let peer = try? await connectToPeer(address) {
                     peers.append(peer)

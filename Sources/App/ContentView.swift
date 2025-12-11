@@ -117,8 +117,17 @@ struct ContentView: View {
                         let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
                         let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
 
-                        // Fast start if: already synced (within 50 blocks) AND has cached data
-                        let isFastStart = lastScannedHeight > 0 && cachedChainHeight > 0 && blocksBehind <= 50
+                        // FIX #120: Check if cached chain height is stale
+                        // If lastScannedHeight is significantly AHEAD of cached height, the cache is stale
+                        // This can happen if P2P peers reported fake heights or cache wasn't updated
+                        let cacheIsStale = lastScannedHeight > cachedChainHeight + 100
+                        if cacheIsStale {
+                            print("⚠️ STALE CACHE: lastScannedHeight (\(lastScannedHeight)) >> cachedChainHeight (\(cachedChainHeight))")
+                            print("⚠️ Disabling FAST START - need to verify chain height via P2P")
+                        }
+
+                        // Fast start if: already synced (within 50 blocks) AND has cached data AND cache is not stale
+                        let isFastStart = lastScannedHeight > 0 && cachedChainHeight > 0 && blocksBehind <= 50 && !cacheIsStale
 
                         if isFastStart {
                             print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(blocksBehind) blocks behind)")

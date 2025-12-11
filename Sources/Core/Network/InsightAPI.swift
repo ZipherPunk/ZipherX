@@ -229,8 +229,8 @@ final class InsightAPI: NSObject {
         // 2. P2P peer heights (version handshake)
         let p2pPeers = networkManager.peers
         for (index, peer) in p2pPeers.enumerated() {
-            // SECURITY: Handle negative heights (malicious peers send Int32 that wraps to negative)
-            guard peer.peerStartHeight > 0 else { continue }
+            // SECURITY: Skip banned peers and handle negative heights (malicious peers send Int32 that wraps to negative)
+            guard !networkManager.isPeerBanned(peer.host), peer.peerStartHeight > 0 else { continue }
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 heights.append(("P2P-\(index):\(peer.host)", h, peer))

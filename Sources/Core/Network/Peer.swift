@@ -140,7 +140,9 @@ final class Peer {
     private var lastActivity: Date?
 
     /// Max idle time before connection is considered stale (in seconds)
-    private let maxIdleTime: TimeInterval = 60
+    /// INCREASED from 60 to 180 for Tor mode - P2P over Tor is slower due to 3-hop circuits
+    /// This allows header sync to complete with 3-peer consensus over Tor
+    private let maxIdleTime: TimeInterval = 180
 
     // Block announcement listener
     private var blockListenerTask: Task<Void, Never>?
@@ -163,6 +165,13 @@ final class Peer {
     /// Multiple code paths calling connect() simultaneously can overwhelm the SOCKS5 proxy
     private var isConnecting = false
     private let connectionLock = NSLock()
+
+    /// FIX #121: STATIC cooldown tracker to prevent duplicate Peer instances from connecting simultaneously
+    /// The instance-level isConnecting doesn't help when two Peer objects exist for the same host
+    /// FIX #122: Reduced from 5s to 2s for faster header sync
+    private static var globalConnectionAttempts: [String: Date] = [:]
+    private static let globalConnectionLock = NSLock()
+    private static let globalCooldownInterval: TimeInterval = 2.0
 
     init(host: String, port: UInt16, networkMagic: [UInt8]) {
         self.id = UUID().uuidString
@@ -341,6 +350,25 @@ final class Peer {
                 throw NetworkError.timeout
             }
         }
+
+        // FIX #121: GLOBAL cooldown check to prevent duplicate Peer instances from connecting
+        // Multiple Peer objects can exist for the same host (created by different code paths)
+        // The instance-level cooldown only prevents the SAME instance from reconnecting
+        let hostKey = "\(host):\(port)"
+        Self.globalConnectionLock.lock()
+        if let globalLastAttempt = Self.globalConnectionAttempts[hostKey] {
+            let timeSinceGlobal = Date().timeIntervalSince(globalLastAttempt)
+            if timeSinceGlobal < Self.globalCooldownInterval {
+                Self.globalConnectionLock.unlock()
+                connectionLock.unlock()
+                let waitTime = Self.globalCooldownInterval - timeSinceGlobal
+                print("⏳ [\(host)] GLOBAL cooldown: \(String(format: "%.1f", waitTime))s remaining (another instance connecting)")
+                throw NetworkError.timeout
+            }
+        }
+        Self.globalConnectionAttempts[hostKey] = Date()
+        Self.globalConnectionLock.unlock()
+
         // Record this attempt BEFORE releasing lock to prevent races
         lastAttempt = Date()
 
@@ -796,7 +824,8 @@ final class Peer {
 
     /// Reconnect if connection is not ready or stale
     /// Minimum time between reconnection attempts (seconds)
-    private static let minReconnectInterval: TimeInterval = 5.0
+    /// FIX #122: Reduced from 5s to 2s for faster header sync
+    private static let minReconnectInterval: TimeInterval = 2.0
 
     func ensureConnected() async throws {
         let needsReconnect = !isConnectionReady || isConnectionStale
@@ -1224,17 +1253,20 @@ final class Peer {
 
     /// Request addresses from this peer (supports both addr and addrv2 responses)
     func getAddresses() async throws -> [PeerAddress] {
-        try await sendMessage(command: "getaddr", payload: Data())
+        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
+        return try await withExclusiveAccess {
+            try await sendMessage(command: "getaddr", payload: Data())
 
-        let (command, response) = try await receiveMessage()
+            let (command, response) = try await receiveMessage()
 
-        switch command {
-        case "addr":
-            return parseAddrPayload(response)
-        case "addrv2":
-            return parseAddrV2Payload(response)
-        default:
-            return []
+            switch command {
+            case "addr":
+                return parseAddrPayload(response)
+            case "addrv2":
+                return parseAddrV2Payload(response)
+            default:
+                return []
+            }
         }
     }
 
@@ -1636,104 +1668,110 @@ final class Peer {
     // MARK: - RPC Methods
 
     func getShieldedBalance(address: String) async throws -> ShieldedBalance {
-        // Build getaddressbalance request
-        let payload = buildAddressPayload(address)
-        try await sendMessage(command: "getbalance", payload: payload)
+        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
+        return try await withExclusiveAccess {
+            // Build getaddressbalance request
+            let payload = buildAddressPayload(address)
+            try await sendMessage(command: "getbalance", payload: payload)
 
-        let (_, response) = try await receiveMessage()
+            let (_, response) = try await receiveMessage()
 
-        // Parse balance response
-        guard response.count >= 16 else {
-            throw NetworkError.consensusNotReached
+            // Parse balance response
+            guard response.count >= 16 else {
+                throw NetworkError.consensusNotReached
+            }
+
+            let confirmed = response.loadUInt64(at: 0)
+            let pending = response.loadUInt64(at: 8)
+
+            return ShieldedBalance(confirmed: confirmed, pending: pending)
         }
-
-        let confirmed = response.loadUInt64(at: 0)
-        let pending = response.loadUInt64(at: 8)
-
-        return ShieldedBalance(confirmed: confirmed, pending: pending)
     }
 
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
-        try await sendMessage(command: "tx", payload: rawTx)
+        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
+        return try await withExclusiveAccess {
+            try await sendMessage(command: "tx", payload: rawTx)
 
-        // NOTE: In Bitcoin/Zcash P2P protocol, successful tx broadcast has NO response!
-        // The node either:
-        // 1. Silently accepts (no response) - SUCCESS
-        // 2. Sends a "reject" message - FAILURE
-        //
-        // We do a SHORT wait (500ms) for potential reject message, then assume success.
+            // NOTE: In Bitcoin/Zcash P2P protocol, successful tx broadcast has NO response!
+            // The node either:
+            // 1. Silently accepts (no response) - SUCCESS
+            // 2. Sends a "reject" message - FAILURE
+            //
+            // We do a SHORT wait (500ms) for potential reject message, then assume success.
 
-        // TX ID is the double SHA256 hash of the raw transaction
-        let txId = rawTx.doubleSHA256().reversed()
-        let txIdString = txId.map { String(format: "%02x", $0) }.joined()
+            // TX ID is the double SHA256 hash of the raw transaction
+            let txId = rawTx.doubleSHA256().reversed()
+            let txIdString = txId.map { String(format: "%02x", $0) }.joined()
 
-        // Short wait for potential reject message (non-blocking)
-        do {
-            // Use a short timeout - if no reject within 500ms, assume accepted
-            let checkForReject = Task {
-                try await Task.sleep(nanoseconds: 500_000_000) // 500ms
-            }
-
-            // Try to receive any immediate reject message
-            let receiveTask = Task {
-                try await receiveMessage()
-            }
-
-            // Race: either timeout wins (success) or we get a message
-            let result = try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
-                group.addTask {
-                    try await checkForReject.value
-                    return nil // Timeout = no reject = success
-                }
-                group.addTask {
-                    let (cmd, resp) = try await receiveTask.value
-                    return (cmd, resp)
+            // Short wait for potential reject message (non-blocking)
+            do {
+                // Use a short timeout - if no reject within 500ms, assume accepted
+                let checkForReject = Task {
+                    try await Task.sleep(nanoseconds: 500_000_000) // 500ms
                 }
 
-                // First to complete wins
-                if let firstResult = try await group.next() {
-                    group.cancelAll()
-                    return firstResult
+                // Try to receive any immediate reject message
+                let receiveTask = Task {
+                    try await self.receiveMessage()
                 }
-                return nil
-            }
 
-            // Check if we got a reject message
-            if let (command, response) = result, command == "reject" {
-                // Parse reject message
-                var offset = 0
-                if response.count > 0 {
-                    let msgLen = Int(response[0])
-                    offset = 1 + msgLen
-                }
-                if offset < response.count {
-                    let rejectCode = response[offset]
-                    let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
-                    let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
-
-                    var reason = ""
-                    if offset + 1 < response.count {
-                        let reasonLen = Int(response[offset + 1])
-                        if offset + 2 + reasonLen <= response.count {
-                            reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
-                        }
+                // Race: either timeout wins (success) or we get a message
+                let result = try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
+                    group.addTask {
+                        try await checkForReject.value
+                        return nil // Timeout = no reject = success
                     }
-                    print("❌ Transaction rejected: \(codeName) - \(reason)")
-                    throw NetworkError.transactionRejected
+                    group.addTask {
+                        let (cmd, resp) = try await receiveTask.value
+                        return (cmd, resp)
+                    }
+
+                    // First to complete wins
+                    if let firstResult = try await group.next() {
+                        group.cancelAll()
+                        return firstResult
+                    }
+                    return nil
+                }
+
+                // Check if we got a reject message
+                if let (command, response) = result, command == "reject" {
+                    // Parse reject message
+                    var offset = 0
+                    if response.count > 0 {
+                        let msgLen = Int(response[0])
+                        offset = 1 + msgLen
+                    }
+                    if offset < response.count {
+                        let rejectCode = response[offset]
+                        let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
+                        let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
+
+                        var reason = ""
+                        if offset + 1 < response.count {
+                            let reasonLen = Int(response[offset + 1])
+                            if offset + 2 + reasonLen <= response.count {
+                                reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
+                            }
+                        }
+                        print("❌ Transaction rejected: \(codeName) - \(reason)")
+                        throw NetworkError.transactionRejected
+                    }
+                }
+            } catch NetworkError.transactionRejected {
+                // Transaction was explicitly rejected by the peer - this is a REAL failure!
+                throw NetworkError.transactionRejected
+            } catch {
+                // Ignore timeout/cancellation errors - they mean success (no reject received)
+                if !(error is CancellationError) {
+                    print("⚠️ Broadcast check error: \(error)")
                 }
             }
-        } catch NetworkError.transactionRejected {
-            // Transaction was explicitly rejected by the peer - this is a REAL failure!
-            throw NetworkError.transactionRejected
-        } catch {
-            // Ignore timeout/cancellation errors - they mean success (no reject received)
-            if !(error is CancellationError) {
-                print("⚠️ Broadcast check error: \(error)")
-            }
-        }
 
-        print("📡 Broadcast sent to peer, txid: \(txIdString.prefix(16))...")
-        return txIdString
+            print("📡 Broadcast sent to peer, txid: \(txIdString.prefix(16))...")
+            return txIdString
+        }
     }
 
     func getBlockHeaders(from height: UInt64, count: Int) async throws -> [BlockHeader] {
@@ -2824,9 +2862,12 @@ final class Peer {
         let payloadHex = payload.map { String(format: "%02x", $0) }.joined()
         print("🧅 DEBUG addrv2 payload (\(payload.count) bytes): \(payloadHex)")
 
-        // Send addrv2 message
-        try await sendMessage(command: "addrv2", payload: payload)
-        print("🧅 Advertised our .onion address to peer \(host): \(onionAddress):\(port)")
+        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
+        try await withExclusiveAccess {
+            // Send addrv2 message
+            try await sendMessage(command: "addrv2", payload: payload)
+            print("🧅 Advertised our .onion address to peer \(host): \(onionAddress):\(port)")
+        }
     }
 
     /// Decode Tor v3 onion address from base32 to bytes

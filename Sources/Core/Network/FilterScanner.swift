@@ -103,9 +103,9 @@ final class FilterScanner {
     private func reportPhase1Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
         let overall = mapProgress(localProgress, in: phase1ProgressRange)
         onProgress?(overall, height, maxHeight)
-        if localProgress < 0.01 {
-            onStatusUpdate?("phase1", "Decrypting shielded notes (parallel)...")
-        }
+        // FIX #128: Always show progress percentage during note decryption
+        let percent = Int(localProgress * 100)
+        onStatusUpdate?("phase1", "Decrypting shielded notes (\(percent)%)...")
     }
 
     /// Report progress for PHASE 1.5 (witness computation)
@@ -128,9 +128,10 @@ final class FilterScanner {
     private func reportPhase2Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
         let overall = mapProgress(localProgress, in: phase2ProgressRange)
         onProgress?(overall, height, maxHeight)
-        if localProgress < 0.01 {
-            onStatusUpdate?("phase2", "Building commitment tree...")
-        }
+        // FIX #128: Always show progress percentage during tree building
+        let percent = Int(localProgress * 100)
+        let blocksRemaining = maxHeight > height ? maxHeight - height : 0
+        onStatusUpdate?("phase2", "Building commitment tree (\(percent)%, \(blocksRemaining) blocks left)...")
     }
 
     init(networkManager: NetworkManager = .shared,
@@ -2379,7 +2380,9 @@ final class FilterScanner {
         }
 
         // Also validate HeaderStore against consensus
-        let maxHeightDeviation: UInt64 = 10
+        // FIX #126: P2P getheaders returns up to 160 headers from locator, so headers
+        // can legitimately be ~160 blocks ahead of consensus. Use 200 as safety margin.
+        let maxHeightDeviation: UInt64 = 200
         if let hsHeight = try? HeaderStore.shared.getLatestHeight() {
             if hsHeight > consensusHeight + maxHeightDeviation {
                 print("🚨 SECURITY: Fake headers detected (store: \(hsHeight), consensus: \(consensusHeight)) - clearing")
@@ -2660,8 +2663,9 @@ final class FilterScanner {
             }
 
             print("🔧 PHASE 1.5: Computing \(targetCMUs.count) witnesses (batch mode)")
-            onStatusUpdate?("phase1.5", "Computing \(targetCMUs.count) Merkle witnesses...")
-            reportPhase15Progress(0.1, current: 0, total: targetCMUs.count)
+            // FIX #127: Batch mode computes all witnesses in single FFI call - show spinner, not 0/N
+            onStatusUpdate?("phase1.5", "Building commitment tree for \(targetCMUs.count) notes...")
+            reportPhase15Progress(0.1, current: 0, total: 1)  // Indeterminate progress
             let startTime = Date()
 
             // Use BATCH witness function - builds tree once and creates all witnesses in single pass

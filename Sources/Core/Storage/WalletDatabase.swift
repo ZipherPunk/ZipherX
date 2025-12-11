@@ -1846,6 +1846,93 @@ final class WalletDatabase {
         print("🗑️ Cleared transaction history from database (secure)")
     }
 
+    /// FIX #120: Repair transaction history timestamps
+    /// Updates all block_time values using correct timestamps from HeaderStore
+    /// For heights without timestamps, extrapolates from last known timestamp (150s per block)
+    func repairTransactionHistoryTimestamps() throws -> Int {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // Get all distinct heights from transaction history (sorted ascending)
+        let selectSql = "SELECT DISTINCT block_height FROM transaction_history WHERE block_height > 0 ORDER BY block_height;"
+        var selectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(selectStmt) }
+
+        var heights: [UInt64] = []
+        while sqlite3_step(selectStmt) == SQLITE_ROW {
+            let height = UInt64(sqlite3_column_int64(selectStmt, 0))
+            heights.append(height)
+        }
+
+        print("📜 FIX #120: Repairing timestamps for \(heights.count) unique heights...")
+
+        // Update each height with correct timestamp from HeaderStore
+        let updateSql = "UPDATE transaction_history SET block_time = ? WHERE block_height = ?;"
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+
+        // NO EXTRAPOLATION - ONLY REAL TIMESTAMPS!
+        var repairedCount = 0
+        var missingCount = 0
+
+        for height in heights {
+            // ONLY use REAL timestamps from HeaderStore (block_times or headers table)
+            // NO extrapolation, NO estimation - REAL DATA ONLY!
+            guard let realTimestamp = try? HeaderStore.shared.getBlockTime(at: height) else {
+                // No real timestamp available - skip this height, don't fake it!
+                missingCount += 1
+                print("⏳ Height \(height): No real timestamp yet (will sync from P2P)")
+                continue
+            }
+
+            sqlite3_reset(updateStmt)
+            sqlite3_bind_int64(updateStmt, 1, Int64(realTimestamp))
+            sqlite3_bind_int64(updateStmt, 2, Int64(height))
+
+            if sqlite3_step(updateStmt) == SQLITE_DONE {
+                repairedCount += Int(sqlite3_changes(db))
+            }
+        }
+
+        if missingCount > 0 {
+            print("⚠️ FIX #120: \(missingCount) heights need P2P header sync for real timestamps")
+        }
+        print("✅ FIX #120: Repaired \(repairedCount) timestamps (NO extrapolation - real data only)")
+        return repairedCount
+    }
+
+    /// FIX #120: Get transaction heights above a given height that need timestamps
+    func getTransactionHeightsAbove(_ minHeight: UInt64) throws -> [UInt64] {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        let sql = "SELECT DISTINCT block_height FROM transaction_history WHERE block_height > ? ORDER BY block_height;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(minHeight))
+
+        var heights: [UInt64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let height = UInt64(sqlite3_column_int64(stmt, 0))
+            heights.append(height)
+        }
+
+        return heights
+    }
+
     /// Migrate transaction history to use obfuscated type codes and remove duplicates
     /// This fixes the VUL-015 bug where both 'sent' and 'α' entries existed for the same txid
     func migrateTransactionHistoryTypes() throws {
@@ -2871,7 +2958,8 @@ final class WalletDatabase {
 
     /// Fix block_time for transactions that have NULL or zero timestamps using actual timestamps from HeaderStore
     /// This corrects estimated timestamps saved by older code or newly synced transactions
-    func fixTransactionBlockTimes() throws {
+    @discardableResult
+    func fixTransactionBlockTimes() throws -> Int {
         // Get all transactions with NULL or zero block_time
         let selectSql = "SELECT id, block_height FROM transaction_history WHERE block_height > 0 AND (block_time IS NULL OR block_time = 0);"
 
@@ -2918,6 +3006,7 @@ final class WalletDatabase {
         if fixedCount > 0 {
             print("📜 Fixed block_time for \(fixedCount) transactions using real timestamps from HeaderStore")
         }
+        return fixedCount
     }
 
     /// Get all pending/unconfirmed transactions
@@ -3151,22 +3240,8 @@ struct TransactionHistoryItem {
             }
         }
 
-        // Final fallback: estimate using dynamic reference (current chain height = NOW)
-        // FIX #120: Show (est) suffix so user knows this is not the real timestamp
-        if height > 0 {
-            let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
-            let currentHeight = NetworkManager.shared.chainHeight
-            let currentTime = Date().timeIntervalSince1970
-
-            // Calculate: height relative to current chain tip
-            let heightDiff = Int64(height) - Int64(currentHeight)
-            let estimatedTimestamp = currentTime + (Double(heightDiff) * blockTimeInterval)
-            let date = Date(timeIntervalSince1970: estimatedTimestamp)
-
-            return formatter.string(from: date) + " (est)"
-        }
-
-        // No timestamp available
+        // ONLY REAL TIMESTAMPS - NO ESTIMATION
+        // Return nil if no real timestamp found - dates will appear after P2P header sync completes
         return nil
     }
 }

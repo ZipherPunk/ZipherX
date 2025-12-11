@@ -6382,6 +6382,203 @@ case "verify":
 
 ---
 
+### 119. FAST START MODE Stale Cache Height Bug (December 11, 2025)
+
+**Problem**: Balance showing wrong amount on consecutive app launches. First launch after rescan showed correct balance, but subsequent launches showed stale balance.
+
+**Root Cause**: FAST START MODE used `cachedChainHeight` from UserDefaults without verifying if the wallet had actually synced to that height. If `lastScannedHeight < cachedChainHeight`, the balance was incorrect because recent notes weren't scanned.
+
+**Solution**: Added `cacheIsStale` check in ContentView.swift that compares `cachedChainHeight` with `lastScannedHeight`:
+
+```swift
+let cacheIsStale = cachedChainHeight > lastScannedHeight + 50
+
+if !cacheIsStale && blocksBehind <= 50 && lastScannedHeight > 0 {
+    // FAST START MODE - safe to use cached balance
+} else {
+    // Stale cache - need full sync
+}
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Added cacheIsStale check
+
+---
+
+### 120. Header Sync Timeout to Prevent Infinite Hang (December 11, 2025)
+
+**Problem**: Header sync getting stuck indefinitely, preventing transaction timestamps from being populated. Log showed "Syncing headers from 2935410" but no completion message.
+
+**Root Cause**: `receiveMessage()` in HeaderSyncManager's `requestHeaders()` had no timeout - it would block forever waiting for unresponsive peers.
+
+**Solution**: Changed `receiveMessage()` to `receiveMessageWithTimeout(seconds: 30)`:
+
+```swift
+// In HeaderSyncManager.requestHeaders():
+while receivedHeaders == nil && attempts < maxAttempts {
+    attempts += 1
+    // FIX #120: Use timeout to prevent infinite blocking on unresponsive peers
+    let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 30)
+
+    if command == "headers" {
+        receivedHeaders = try self.parseHeadersPayload(response, startingAt: startHeight)
+        print("✅ Received \(receivedHeaders?.count ?? 0) headers from peer")
+    }
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - lines 402-408
+
+---
+
+### 121. Infinite SOCKS5 Reconnection Loop Fix v2 (December 11, 2025)
+
+**Problem**: App showing infinite SOCKS5 connection attempts at 09:22:07 - same peer connecting multiple times at identical timestamp:
+```
+[09:22:07.476] 🧅 [157.90.223.151] Connecting via SOCKS5 proxy...
+[09:22:07.476] 🧅 [157.90.223.151] Connecting via SOCKS5 proxy...
+```
+
+**Root Causes**:
+1. `rotatePeers()` loop in NetworkManager had no cooldown check before `connectToPeer()`
+2. Multiple Peer instances could exist for the same host - the instance-level `isConnecting` flag didn't prevent different instances from connecting simultaneously
+
+**Solution**: Two-part fix:
+
+1. **NetworkManager.swift** - Added cooldown check to `rotatePeers()`:
+```swift
+// FIX #121: Add cooldown check to prevent infinite reconnection loops
+if isOnCooldown(address.host, port: address.port) {
+    print("⏳ [\(address.host)] On cooldown, skipping in rotatePeers")
+    continue
+}
+recordConnectionAttempt(address.host, port: address.port)
+```
+
+2. **Peer.swift** - Added GLOBAL (static) cooldown tracker:
+```swift
+// Static cooldown tracker for ALL Peer instances
+private static var globalConnectionAttempts: [String: Date] = [:]
+private static let globalConnectionLock = NSLock()
+private static let globalCooldownInterval: TimeInterval = 5.0
+
+// In connect():
+let hostKey = "\(host):\(port)"
+Self.globalConnectionLock.lock()
+if let globalLastAttempt = Self.globalConnectionAttempts[hostKey] {
+    let timeSinceGlobal = Date().timeIntervalSince(globalLastAttempt)
+    if timeSinceGlobal < Self.globalCooldownInterval {
+        // Block - another Peer instance for this host is already connecting
+        throw NetworkError.timeout
+    }
+}
+Self.globalConnectionAttempts[hostKey] = Date()
+Self.globalConnectionLock.unlock()
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Added cooldown check to rotatePeers()
+- `Sources/Core/Network/Peer.swift` - Added static global cooldown tracker
+
+---
+
+### 130. P2P Race Condition: Mempool Scan vs Header Sync (December 11, 2025)
+
+**Problem**: Header sync failing because ALL peers get "Invalid magic bytes" errors. The P2P socket streams become desynchronized due to concurrent access.
+
+**Root Cause**: Mempool scan and header sync both use the same P2P peer connections. When mempool scan runs during header sync:
+1. Both operations read from the same TCP socket
+2. One operation reads data intended for the other
+3. Socket stream becomes desynchronized
+4. All subsequent reads get garbage data (wrong offset in stream)
+
+**Evidence from Log**:
+```
+[10:55:47] 🧅 [140.174.189.17] Invalid magic bytes: got 8160355a, expected 24e92764
+[10:55:47] 🧅 [140.174.189.3] Invalid magic bytes: got 8160355a, expected 24e92764
+[10:55:48] 🧅 [37.187.76.79] Invalid magic bytes: got ff9a0ce8, expected 24e92764
+... ALL 5 peers corrupted within seconds
+```
+
+**Solution**: Added `isHeaderSyncing` flag to pause mempool scan during header sync:
+
+1. **NetworkManager.swift** - Flag and setter:
+```swift
+/// FIX #130: Flag to indicate header sync is in progress
+@Published private(set) var isHeaderSyncing: Bool = false
+
+func setHeaderSyncing(_ syncing: Bool) {
+    Task { @MainActor in
+        self.isHeaderSyncing = syncing
+        print("📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
+    }
+}
+```
+
+2. **NetworkManager.swift** - Skip mempool scan when header sync active:
+```swift
+private func scanMempoolForIncoming() async {
+    // FIX #130: Skip mempool scan if header sync in progress
+    if isHeaderSyncing {
+        print("🔮 scanMempoolForIncoming: skipped (header sync in progress)")
+        return
+    }
+    // ... rest of function
+}
+```
+
+3. **WalletManager.swift** - Set flag around header sync:
+```swift
+// FIX #130: Set header syncing flag to pause mempool scan
+NetworkManager.shared.setHeaderSyncing(true)
+defer { NetworkManager.shared.setHeaderSyncing(false) }
+try await headerSync.syncHeaders(from: startHeight)
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Added isHeaderSyncing flag, setter, and check in scanMempoolForIncoming()
+- `Sources/Core/Wallet/WalletManager.swift` - Set flag before/after header sync
+
+---
+
+### 131. CRITICAL: Wrap ALL P2P Functions in withExclusiveAccess (December 11, 2025)
+
+**Problem**: Several P2P functions were calling `sendMessage()`/`receiveMessage()` directly without the `withExclusiveAccess` lock, causing race conditions that desynchronize the socket stream.
+
+**Root Cause**: Not all P2P functions were using the exclusive access lock. When multiple operations ran concurrently on the same peer, they would read/write to the socket simultaneously, corrupting the message stream.
+
+**Functions Fixed** (wrapped in `withExclusiveAccess`):
+
+1. **getAddresses()** - Peer discovery via `getaddr` command
+2. **broadcastTransaction()** - Transaction broadcast via `tx` command
+3. **getShieldedBalance()** - Balance query via `getbalance` command
+4. **advertiseOnionAddress()** - Advertise .onion via `addrv2` command
+
+**Code Example**:
+```swift
+// BEFORE (race condition):
+func getAddresses() async throws -> [PeerAddress] {
+    try await sendMessage(command: "getaddr", payload: Data())
+    let (command, response) = try await receiveMessage()
+    // ...
+}
+
+// AFTER (FIX #131 - thread-safe):
+func getAddresses() async throws -> [PeerAddress] {
+    return try await withExclusiveAccess {
+        try await sendMessage(command: "getaddr", payload: Data())
+        let (command, response) = try await receiveMessage()
+        // ...
+    }
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Wrapped 4 functions in `withExclusiveAccess`
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

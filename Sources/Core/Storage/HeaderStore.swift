@@ -252,6 +252,27 @@ final class HeaderStore {
         return UInt64(sqlite3_column_int64(stmt, 0))
     }
 
+    /// Get minimum height in database
+    func getMinHeight() throws -> UInt64? {
+        let sql = "SELECT MIN(height) FROM headers;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        if sqlite3_column_type(stmt, 0) == SQLITE_NULL {
+            return nil
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
     /// Get total header count
     func getHeaderCount() throws -> Int {
         let sql = "SELECT COUNT(*) FROM headers;"
@@ -314,10 +335,11 @@ final class HeaderStore {
             return nil
         }
 
-        // First, check full headers table (P2P synced headers have priority)
-        let headerSql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
+        // FIX #120: PRIORITY 1 - Check block_times table FIRST (boost file data is most reliable)
+        // The boost file timestamps are verified correct, while P2P-synced headers can be corrupted
+        let blockTimeSql = "SELECT timestamp FROM block_times WHERE height = ? LIMIT 1;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, headerSql, -1, &stmt, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, blockTimeSql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
 
@@ -330,10 +352,11 @@ final class HeaderStore {
         }
         sqlite3_finalize(stmt)
 
-        // Second, check block_times table (from boost file)
-        let blockTimeSql = "SELECT timestamp FROM block_times WHERE height = ? LIMIT 1;"
+        // FIX #120: PRIORITY 2 - Fallback to headers table (P2P synced)
+        // Only used for heights above boost file range - NO estimation, only real data
+        let headerSql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
         var stmt2: OpaquePointer?
-        guard sqlite3_prepare_v2(db, blockTimeSql, -1, &stmt2, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, headerSql, -1, &stmt2, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt2) }
@@ -345,6 +368,7 @@ final class HeaderStore {
             return timestamp
         }
 
+        // FIX #120: Return nil if no real timestamp available - NO estimation
         return nil
     }
 
@@ -564,6 +588,27 @@ final class HeaderStore {
         }
 
         print("🗑️ Cleared all headers")
+    }
+
+    /// FIX #120: Clear headers above a specific height
+    /// Used to clear corrupted P2P-synced headers above the boost file range
+    func clearHeadersAboveHeight(_ height: UInt64) throws {
+        let sql = "DELETE FROM headers WHERE height > ?;"
+        var stmt: OpaquePointer?
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let deletedCount = sqlite3_changes(db)
+        print("🗑️ FIX #120: Cleared \(deletedCount) headers above height \(height)")
     }
 
     /// Delete the entire header database file (for wallet deletion)

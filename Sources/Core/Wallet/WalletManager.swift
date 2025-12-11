@@ -598,6 +598,8 @@ final class WalletManager: ObservableObject {
                 Task { @MainActor in
                     self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for download
                     self.treeLoadStatus = status
+                    // FIX #124: Update overall progress during download
+                    self.updateOverallProgress(phase: .downloadingTree, phaseProgress: progress)
                 }
             }
             downloadedTreeHeight = height
@@ -775,16 +777,26 @@ final class WalletManager: ObservableObject {
                 if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
                     if earliestNeedingTimestamp < currentHeight {
                         print("📜 FIX #120: Syncing headers from \(earliestNeedingTimestamp) for missing timestamps")
-                        try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+                        do {
+                            try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+                            print("✅ FIX #120: Header sync completed for timestamps")
+                        } catch {
+                            print("⚠️ FIX #120: Header sync failed: \(error.localizedDescription)")
+                        }
                     }
                 }
 
                 // Also sync from current height for new blocks
-                try await hsm.syncHeaders(from: currentHeight + 1)
+                do {
+                    try await hsm.syncHeaders(from: currentHeight + 1)
+                    print("✅ Header sync for new blocks completed")
+                } catch {
+                    print("⚠️ Header sync for new blocks failed: \(error.localizedDescription)")
+                }
 
                 // Fix any transactions that have estimated timestamps
-                try? WalletDatabase.shared.fixTransactionBlockTimes()
-                print("📜 Fixed transaction timestamps after background sync")
+                let fixedCount = try? WalletDatabase.shared.fixTransactionBlockTimes()
+                print("📜 Fixed transaction timestamps: \(fixedCount ?? 0) updated")
             } catch {
                 // Header sync failed but block scan succeeded - not critical
                 print("⚠️ Background header sync failed: \(error.localizedDescription)")
@@ -1357,19 +1369,14 @@ final class WalletManager: ObservableObject {
         // Headers are only needed for transaction building (anchor verification)
         await updateTask("headers", status: .inProgress)
 
-        // In Full Node mode, skip P2P header sync - we use RPC for chain data
-        var shouldSkipHeaderSync = false
-        #if os(macOS)
-        if await WalletModeManager.shared.currentMode == .fullNode {
-            shouldSkipHeaderSync = true
-            print("📡 Full Node mode: Skipping P2P header sync (using RPC)")
-            await updateTask("headers", status: .completed, detail: "RPC mode")
-        }
-        #endif
+        // FIX #120: ALWAYS use P2P header sync - even in Full Node mode
+        // NO RPC for sync/repair - P2P only as per user requirement
+        let shouldSkipHeaderSync = false  // Never skip P2P header sync
+        print("📡 Using P2P header sync (NO RPC for sync/repair)")
 
         if !shouldSkipHeaderSync {
 
-        let maxHeaderRetries = 2  // Reduced from 3 to fail faster
+        let maxHeaderRetries = 4  // FIX #120: Increased retries to allow peer connections
         var headerSyncSuccess = false
         var lastHeaderError: Error?
 
@@ -1378,8 +1385,8 @@ final class WalletManager: ObservableObject {
                 if attempt > 1 {
                     print("🔄 Header sync retry attempt \(attempt)/\(maxHeaderRetries)...")
                     await updateTask("headers", status: .inProgress, detail: "Retry \(attempt)/\(maxHeaderRetries)")
-                    // Wait briefly for peers to recover - reduced from 2 seconds
-                    try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+                    // FIX #120: Wait longer for peers to connect via Tor (2 seconds)
+                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
                 }
 
                 print("📥 Opening header store...")
@@ -1446,6 +1453,11 @@ final class WalletManager: ObservableObject {
                 let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
                 var startHeight: UInt64
 
+                // FIX #125: Only sync latest 100 blocks for consensus verification (FAST!)
+                // Unless there are transactions that specifically need timestamps
+                let chainTip = try await headerSync.getChainTip()
+                let maxHeadersToSync: UInt64 = 100  // Only sync latest 100 blocks for speed
+
                 // Priority 1: Check for transactions that need timestamps
                 if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
                     // Sync from earliest tx without timestamp (ensures we cover ALL gap)
@@ -1456,9 +1468,25 @@ final class WalletManager: ObservableObject {
                     startHeight = latestHeight + 1
                     print("📊 Resuming header sync from height \(startHeight)")
                 } else {
-                    // Start from downloadedTreeHeight + 1 (checkpoint at downloadedTreeHeight used as locator)
-                    startHeight = downloadedTreeHeight + 1
-                    print("📊 Starting header sync from height \(startHeight) (checkpoint at \(downloadedTreeHeight))")
+                    // FIX #125: Only sync latest 100 blocks instead of all headers since boost file
+                    // This makes header sync ~30x faster (100 headers vs 4500+)
+                    let normalStart = downloadedTreeHeight + 1
+                    if chainTip > normalStart + maxHeadersToSync {
+                        startHeight = chainTip - maxHeadersToSync
+                        print("📊 FIX #125: FAST SYNC - only latest \(maxHeadersToSync) headers (\(startHeight) → \(chainTip))")
+                    } else {
+                        startHeight = normalStart
+                        print("📊 Starting header sync from height \(startHeight) (checkpoint at \(downloadedTreeHeight))")
+                    }
+                }
+
+                // FIX #130: Set header syncing flag to pause mempool scan during sync
+                // This prevents P2P race conditions that cause "invalid magic bytes" errors
+                NetworkManager.shared.setHeaderSyncing(true)
+
+                defer {
+                    // FIX #130: Clear flag when sync completes (success or error)
+                    NetworkManager.shared.setHeaderSyncing(false)
                 }
 
                 try await headerSync.syncHeaders(from: startHeight)
@@ -1975,6 +2003,12 @@ final class WalletManager: ObservableObject {
         let dbKey = Data(SHA256.hash(data: spendingKey))
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened for repair")
+
+        // FIX #122: Clear headers to fix timestamp gaps and sync issues
+        print("🗑️ Clearing block headers to fix timestamps...")
+        try? HeaderStore.shared.clearAllHeaders()
+        try? HeaderStore.shared.clearBlockTimes()
+        print("✅ Headers cleared - will re-sync with correct timestamps")
 
         // Get account ID
         guard let account = try WalletDatabase.shared.getAccount(index: 0) else {

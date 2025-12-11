@@ -316,7 +316,7 @@ struct SettingsView: View {
                 startRepairNotes()
             }
         } message: {
-            Text("This repairs database corruption by:\n\n• Clearing invalid transaction history\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Re-scanning from boost file height\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Sent transactions show as failed\n• Tree root doesn't match blockchain\n\nThis will take 5-15 minutes.\n\nDo you want to continue?")
+            Text("This repairs database corruption by:\n\n• Clearing ALL block headers (fixes timestamps)\n• Clearing invalid transaction history\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Re-scanning from boost file height\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Transaction dates show NO DATE\n• Sent transactions show as failed\n• Tree root doesn't match blockchain\n\nThis will take 5-15 minutes.\n\nDo you want to continue?")
         }
         .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
             Button("Cancel - Keep Wallet", role: .cancel) {}
@@ -1917,7 +1917,7 @@ Both binaries must be installed to /usr/local/bin:
             .foregroundColor(theme.textPrimary)
 
             // Info box
-            Text("Use this to fix corrupted database, wrong balance, or failed transactions that show as successful.")
+            Text("Use this to fix corrupted database, wrong balance, missing timestamps, or failed transactions that show as successful.")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

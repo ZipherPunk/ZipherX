@@ -2300,19 +2300,14 @@ struct CypherpunkMainView: View {
                 // Now fetch the history
                 // NOTE: Deduplication is handled in SQL query (WalletDatabase.getTransactionHistory)
                 // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
-                let items = try WalletDatabase.shared.getTransactionHistory(limit: 50)
+                // FIX #129: Show ALL transactions - was limit:50 which cut off older transactions
+                let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
                 print("📜 TXHIST [S7]: getTransactionHistory returned \(items.count) items")
 
                 // Debug: count sent vs received
                 let sentCount = items.filter { $0.type == .sent }.count
                 let receivedCount = items.filter { $0.type == .received }.count
                 print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
-
-                // Debug: print first 5 items to verify order
-                for (i, item) in items.prefix(5).enumerated() {
-                    let fullTxid = item.txid.map { String(format: "%02x", $0) }.joined()
-                    print("📜 TXHIST [S7] item[\(i)]: uniqueId=\(item.uniqueId), txid=\(fullTxid), type=\(item.type.rawValue), value=\(item.value), height=\(item.height)")
-                }
 
                 DispatchQueue.main.async {
                     self.transactions = items

@@ -179,7 +179,8 @@ struct HistoryView: View {
                     print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
                 }
 
-                let items = try WalletDatabase.shared.getTransactionHistory(limit: 100)
+                // FIX #129: Show ALL transactions (up to 1000) - was limit:100 which cut off older transactions
+                let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
 
                 // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)
                 // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
@@ -528,8 +529,9 @@ struct TransactionDetailView: View {
             }
         }
 
-        // Last resort: show "Unknown" instead of fake estimate
-        return "Unknown"
+        // Last resort: show "Syncing..." - NO FAKE ESTIMATES!
+        // Real timestamp will appear after P2P header sync completes
+        return "Syncing..."
     }
 
     private func copyTxid() {
