@@ -274,23 +274,46 @@ final class BlockTimestampManager {
         }
     }
 
-    /// Add timestamp to runtime cache (called during sync)
+    /// Add timestamp to runtime cache AND persist to HeaderStore (called during sync)
+    /// FIX #120: Now persists to DB so timestamps survive app restart
     func cacheTimestamp(height: UInt64, timestamp: UInt32) {
         guard height > maxHeight else { return }  // Don't cache file range
+
+        // 1. Runtime cache for immediate access
         cacheLock.lock()
         runtimeCache[height] = timestamp
         cacheLock.unlock()
+
+        // 2. Persist to HeaderStore.block_times for future sessions
+        do {
+            try HeaderStore.shared.insertBlockTime(height: height, timestamp: timestamp)
+        } catch {
+            // Non-fatal - runtime cache still works for this session
+        }
     }
 
-    /// Batch cache timestamps (for efficiency during sync)
+    /// Batch cache timestamps AND persist to HeaderStore (for efficiency during sync)
+    /// FIX #120: Now persists to DB so timestamps survive app restart
     func cacheTimestamps(_ timestamps: [(UInt64, UInt32)]) {
+        var toCache: [(UInt64, UInt32)] = []
+
         cacheLock.lock()
         for (height, timestamp) in timestamps {
             if height > maxHeight {
                 runtimeCache[height] = timestamp
+                toCache.append((height, timestamp))
             }
         }
         cacheLock.unlock()
+
+        // Batch persist to HeaderStore.block_times
+        if !toCache.isEmpty {
+            do {
+                try HeaderStore.shared.insertBlockTimesBatch(toCache)
+            } catch {
+                // Non-fatal - runtime cache still works for this session
+            }
+        }
     }
 
     /// Check if timestamp is available for height

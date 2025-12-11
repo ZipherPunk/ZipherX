@@ -342,6 +342,12 @@ final class HeaderStore {
 
     /// Insert a single block timestamp (from boost file or sync)
     func insertBlockTime(height: UInt64, timestamp: UInt32) throws {
+        // FIX #120: Ensure database is open before inserting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = "INSERT OR REPLACE INTO block_times (height, timestamp) VALUES (?, ?);"
 
         var stmt: OpaquePointer?
@@ -362,6 +368,12 @@ final class HeaderStore {
     /// timestamps: Array of (height, timestamp) pairs
     func insertBlockTimesBatch(_ timestamps: [(UInt64, UInt32)]) throws {
         guard !timestamps.isEmpty else { return }
+
+        // FIX #120: Ensure database is open before inserting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
 
         guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
             throw DatabaseError.insertFailed("Failed to begin transaction")
