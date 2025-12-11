@@ -3828,7 +3828,7 @@ final class NetworkManager: ObservableObject {
                         }
                     }
 
-                    results.append((block.height, finalBlockHash, blockTimestamp, txDataList))
+                    results.append((block.blockHeight, finalBlockHash, blockTimestamp, txDataList))
                 }
                 return results.isEmpty ? nil : results
             } catch {
