@@ -42,25 +42,40 @@ final class BlockTimestampManager {
 
     // MARK: - Loading
 
-    /// Load cached file from Documents directory
+    /// Load cached file from Documents directory or check HeaderStore.block_times
     private func loadCachedTimestamps() {
-        // Check for cached file in Documents
-        guard FileManager.default.fileExists(atPath: cacheFilePath.path) else {
-            print("⏰ BlockTimestampManager: No cached timestamps file, will download from GitHub")
-            return
+        // First, check for cached file in Documents
+        if FileManager.default.fileExists(atPath: cacheFilePath.path) {
+            do {
+                let data = try Data(contentsOf: cacheFilePath, options: .mappedIfSafe)
+                self.timestampData = data
+                self.maxHeight = UInt64(data.count / 4) - 1
+                print("✅ BlockTimestampManager: Loaded cached timestamps for blocks 0-\(maxHeight)")
+                return
+            } catch {
+                print("❌ BlockTimestampManager: Failed to load file cache: \(error)")
+            }
         }
 
+        // FIX #120: Check HeaderStore.block_times table (timestamps may already be in DB from previous session)
+        // This is the unified timestamp storage that was populated when boost file was downloaded
         do {
-            let data = try Data(contentsOf: cacheFilePath, options: .mappedIfSafe)
-            self.timestampData = data
-
-            // Calculate max height from file size (4 bytes per timestamp)
-            self.maxHeight = UInt64(data.count / 4) - 1
-
-            print("✅ BlockTimestampManager: Loaded cached timestamps for blocks 0-\(maxHeight)")
+            try HeaderStore.shared.open()
+            let dbCount = try HeaderStore.shared.getBlockTimesCount()
+            if dbCount > 0 {
+                // Timestamps exist in database - set maxHeight so getTimestamp() will use HeaderStore
+                // We don't load into memory, just mark that timestamps are available via DB
+                self.maxHeight = UInt64(dbCount) + 476969 - 1  // dbCount covers Sapling activation onwards
+                self.isBoostFormat = true
+                self.boostStartHeight = 476969  // Sapling activation
+                print("✅ BlockTimestampManager: Found \(dbCount) timestamps in HeaderStore.block_times (max height ~\(maxHeight))")
+                return
+            }
         } catch {
-            print("❌ BlockTimestampManager: Failed to load cached: \(error)")
+            print("⚠️ BlockTimestampManager: HeaderStore check failed: \(error.localizedDescription)")
         }
+
+        print("⏰ BlockTimestampManager: No cached timestamps, will download from GitHub on sync")
     }
 
     // MARK: - Load from Boost File

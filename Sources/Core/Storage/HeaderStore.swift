@@ -300,6 +300,12 @@ final class HeaderStore {
     /// Checks: 1) Full headers table (from P2P sync), 2) block_times table (from boost file)
     /// Returns the actual Unix timestamp for the block
     func getBlockTime(at height: UInt64) throws -> UInt32? {
+        // FIX #120: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         // First, check full headers table (P2P synced headers have priority)
         let headerSql = "SELECT time FROM headers WHERE height = ? LIMIT 1;"
         var stmt: OpaquePointer?
@@ -463,6 +469,12 @@ final class HeaderStore {
 
     /// Get count of timestamps in block_times table
     func getBlockTimesCount() throws -> Int {
+        // FIX #120: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return 0 }
+
         let sql = "SELECT COUNT(*) FROM block_times;"
 
         var stmt: OpaquePointer?
