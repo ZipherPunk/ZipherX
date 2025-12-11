@@ -56,22 +56,25 @@ final class WalletHealthCheck {
 
     /// Check if all required bundle files exist
     private func checkBundleFiles() async -> HealthCheckResult {
+        // Use SaplingParams which knows the correct path (AppDirectories.saplingParams)
+        let params = SaplingParams.shared
+
+        if params.areParamsReady {
+            return .passed("Bundle Files", details: "All Sapling parameters present at \(params.spendParamsPath.deletingLastPathComponent().lastPathComponent)")
+        }
+
+        // Check which ones are missing for detailed error
         var missing: [String] = []
-
-        // Check Sapling parameters
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let spendPath = documentsPath.appendingPathComponent("sapling-spend.params")
-        let outputPath = documentsPath.appendingPathComponent("sapling-output.params")
-
-        if !FileManager.default.fileExists(atPath: spendPath.path) {
+        if !FileManager.default.fileExists(atPath: params.spendParamsPath.path) {
             missing.append("sapling-spend.params")
         }
-        if !FileManager.default.fileExists(atPath: outputPath.path) {
+        if !FileManager.default.fileExists(atPath: params.outputParamsPath.path) {
             missing.append("sapling-output.params")
         }
 
         if missing.isEmpty {
-            return .passed("Bundle Files", details: "All Sapling parameters present")
+            // Files exist but may have wrong size
+            return .failed("Bundle Files", details: "Sapling params exist but may be corrupted (size mismatch)", critical: true)
         } else {
             return .failed("Bundle Files", details: "Missing: \(missing.joined(separator: ", "))", critical: true)
         }
@@ -136,30 +139,43 @@ final class WalletHealthCheck {
             let history = try WalletDatabase.shared.getTransactionHistory(limit: 10000, offset: 0)
             var historyReceived: UInt64 = 0
             var historySent: UInt64 = 0
+            var historyFees: UInt64 = 0
+            var receivedCount = 0
+            var sentCount = 0
 
             for tx in history {
                 switch tx.type {
                 case .received:
                     historyReceived += tx.value
+                    receivedCount += 1
                 case .sent:
-                    historySent += tx.value + (tx.fee ?? 0)
+                    historySent += tx.value
+                    historyFees += (tx.fee ?? 0)
+                    sentCount += 1
                 case .change:
                     break // Change is internal, doesn't affect balance
                 }
             }
 
-            let historyBalance = Int64(historyReceived) - Int64(historySent)
+            let historyBalance = Int64(historyReceived) - Int64(historySent) - Int64(historyFees)
 
             // Compare
             let noteBalanceZCL = Double(noteBalance) / 100_000_000.0
             let historyBalanceZCL = Double(historyBalance) / 100_000_000.0
             let diff = abs(noteBalanceZCL - historyBalanceZCL)
 
+            // Debug logging
+            print("🏥 Balance Check Debug:")
+            print("   Notes: \(notes.count) unspent = \(noteBalance) zatoshis")
+            print("   History: \(receivedCount) received = \(historyReceived) zatoshis")
+            print("   History: \(sentCount) sent = \(historySent) + \(historyFees) fees = \(historySent + historyFees) zatoshis")
+            print("   Computed: received(\(historyReceived)) - sent(\(historySent)) - fees(\(historyFees)) = \(historyBalance) zatoshis")
+
             if diff < 0.00000001 {  // Allow for rounding
-                return .passed("Balance Reconciliation", details: "Balance: \(String(format: "%.8f", noteBalanceZCL)) ZCL matches history")
+                return .passed("Balance Reconciliation", details: "Balance: \(String(format: "%.8f", noteBalanceZCL)) ZCL matches history (\(receivedCount)↓ \(sentCount)↑)")
             } else {
                 return .failed("Balance Reconciliation",
-                    details: "Notes: \(String(format: "%.8f", noteBalanceZCL)) ZCL, History: \(String(format: "%.8f", historyBalanceZCL)) ZCL, Diff: \(String(format: "%.8f", diff)) ZCL",
+                    details: "Notes: \(String(format: "%.8f", noteBalanceZCL)) ZCL (\(notes.count) notes), History: \(String(format: "%.8f", historyBalanceZCL)) ZCL (\(receivedCount)↓ - \(sentCount)↑), Diff: \(String(format: "%.8f", diff)) ZCL",
                     critical: false)
             }
         } catch {

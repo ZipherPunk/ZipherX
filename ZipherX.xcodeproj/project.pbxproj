@@ -114,12 +114,14 @@
 		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
 		B5432C123C1ECD9D24CA0466 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
+		B5B246CE197ED4FFA22ECDDB /* WalletHealthCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */; };
 		B999C8F0D77345F8DF9D5479 /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD23F43B8205785891BF585 /* BlockHeader.swift */; };
 		BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6C673DA8922F1FE8EAAB2C04 /* Assets.xcassets */; };
 		BE9229075EDEE71F40F43823 /* ModernTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */; };
 		BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */; };
 		C055B8D18EA58A8EB0AC75BD /* HiddenServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */; };
 		C0B80B951C400D297715A372 /* SQLCipher.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */; };
+		C0ED26F2F475F41511A2DDAB /* WalletHealthCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */; };
 		C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
 		C61887F6EE1FB29B17567B67 /* CypherpunkTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */; };
 		C6307F815EFF9450C89C86CD /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
@@ -179,6 +181,7 @@
 		4F54464087D684EC795896B7 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
 		58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZipherXFFI.xcframework; path = Libraries/ZipherXFFI.xcframework; sourceTree = "<group>"; };
 		5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterScanner.swift; sourceTree = "<group>"; };
+		5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletHealthCheck.swift; sourceTree = "<group>"; };
 		630CFD90F45505D02500501A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		6626F058762A0D0666024868 /* BundledBlockHashes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundledBlockHashes.swift; sourceTree = "<group>"; };
 		682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Checkpoints.swift; sourceTree = "<group>"; };
@@ -259,6 +262,7 @@
 			children = (
 				C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */,
 				84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */,
+				5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */,
 				9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */,
 			);
 			path = Wallet;
@@ -772,6 +776,7 @@
 				06809D718F601662F7E64D8B /* TorManager.swift in Sources */,
 				BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */,
 				90604ADFA09E5EB4C3ED5245 /* WalletDatabase.swift in Sources */,
+				C0ED26F2F475F41511A2DDAB /* WalletHealthCheck.swift in Sources */,
 				DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */,
 				52BC66B9631F78F1CFF46212 /* WalletMode.swift in Sources */,
 				ED160AAE5D5BE3EE9480FEF2 /* WalletSetupView.swift in Sources */,
@@ -844,6 +849,7 @@
 				099D7898F55101699514DC81 /* TorManager.swift in Sources */,
 				745902783803843898150674 /* TransactionBuilder.swift in Sources */,
 				416268C8206067F62AE5C1B4 /* WalletDatabase.swift in Sources */,
+				B5B246CE197ED4FFA22ECDDB /* WalletHealthCheck.swift in Sources */,
 				7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */,
 				5B9788995FB9227C7F0D5864 /* WalletMode.swift in Sources */,
 				2A310DACA7C2E48D320A1600 /* WalletSetupView.swift in Sources */,
