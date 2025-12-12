@@ -7836,6 +7836,72 @@ App Launch (FAST START mode detected)
 
 ---
 
+### 154. FAST START Progress Bar Stuck at 0% + Individual Task Progress (December 12, 2025)
+
+**Problem 1**: During FAST START mode, all tasks showed as completed with green checkmarks, but the overall progress bar stayed at 0%.
+
+**Problem 2**: Individual tasks didn't show their own progress bars during in-progress state.
+
+**Root Cause**:
+1. `currentSyncProgress` used `walletManager.overallProgress` which was never updated in FAST START
+2. `updateSyncTask()` didn't accept a `progress` parameter, so individual task progress couldn't be set
+3. `currentSyncProgress` only computed from `walletManager.syncTasks` (4 tasks), but UI displayed 6 tasks (including tree + connect)
+
+**Solution (FIX #154)**: Three-part fix:
+
+1. **Use `currentSyncTasks` for progress calculation** - Includes all 6 displayed tasks:
+```swift
+if isFastStartMode {
+    let allTasks = currentSyncTasks  // All 6 tasks including tree + connect
+    // ... compute from all tasks
+}
+```
+
+2. **Add progress parameter to `updateSyncTask()`**:
+```swift
+func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
+    if let index = syncTasks.firstIndex(where: { $0.id == id }) {
+        syncTasks[index].status = status
+        if let detail = detail { syncTasks[index].detail = detail }
+        if let progress = progress { syncTasks[index].progress = progress }
+    }
+}
+```
+
+3. **Update task progress in peer waiting loop**:
+```swift
+while networkManager.connectedPeers < 3 && peerWait < maxPeerWait {
+    let peerProgress = min(Double(networkManager.connectedPeers) / 3.0, 1.0)
+    walletManager.updateSyncTask(id: "fast_peers", status: .inProgress,
+                                  detail: "\(networkManager.connectedPeers)/3 peers",
+                                  progress: peerProgress)
+}
+```
+
+**FAST START Tasks** (6 total for UI display):
+| Task ID | Title | Progress Source |
+|---------|-------|-----------------|
+| tree | Load Sapling note tree | Tree already loaded (instant ✓) |
+| connect | Join P2P network | Peer count tracking |
+| fast_balance | Retrieve cached balance | Database load (instant ✓) |
+| fast_peers | Verify peer consensus | peers connected / 3 |
+| fast_headers | Sync block timestamps | walletManager.headerSyncProgress |
+| fast_health | Validate wallet health | health check completion |
+
+**Overall Progress Calculation** (from 6 tasks):
+| State | Progress |
+|-------|----------|
+| 1 in progress | 8.3% (1/6 × 50%) |
+| 2 completed, 1 in progress | 41.6% (33.3% + 8.3%) |
+| 4 completed, 1 in progress | 75% (66.6% + 8.3%) |
+| 6 completed | 100% |
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Modified `currentSyncProgress` to use `currentSyncTasks`, added individual task progress updates
+- `Sources/Core/Wallet/WalletManager.swift` - Added `progress` parameter to `updateSyncTask()`
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

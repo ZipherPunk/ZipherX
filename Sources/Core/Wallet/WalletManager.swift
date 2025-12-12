@@ -2884,13 +2884,17 @@ final class WalletManager: ObservableObject {
         updateTaskWithProgress(taskId, detail: detail, progress: progress)
     }
 
-    /// Update a sync task status and detail - called from ContentView for FAST START
+    /// Update a sync task status, detail, and progress - called from ContentView for FAST START
+    /// FIX #154: Added progress parameter for individual task progress bars
     @MainActor
-    func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil) {
+    func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
             syncTasks[index].status = status
             if let detail = detail {
                 syncTasks[index].detail = detail
+            }
+            if let progress = progress {
+                syncTasks[index].progress = progress
             }
         }
     }

@@ -189,10 +189,10 @@ struct ContentView: View {
                                     while networkManager.connectedPeers < 3 && peerWait < maxPeerWait {
                                         try await Task.sleep(nanoseconds: 100_000_000) // 100ms
                                         peerWait += 1
-                                        if peerWait % 50 == 0 {
-                                            await MainActor.run {
-                                                walletManager.setConnecting(true, status: "Waiting for peers (\(networkManager.connectedPeers)/3)...")
-                                            }
+                                        // FIX #154: Update task progress every 100ms
+                                        let peerProgress = min(Double(networkManager.connectedPeers) / 3.0, 1.0)
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "fast_peers", status: .inProgress, detail: "\(networkManager.connectedPeers)/3 peers", progress: peerProgress)
                                         }
                                     }
 
@@ -976,7 +976,40 @@ struct ContentView: View {
     /// Combined progress for all sync phases - MONOTONIC (never decreases!)
     /// Uses WalletManager.overallProgress which only ever increases
     private var currentSyncProgress: Double {
-        // Use the monotonic progress from WalletManager
+        // FIX #154: Check if we're in FAST START mode (tasks have fast_ prefix)
+        let isFastStartMode = walletManager.syncTasks.contains { $0.id.hasPrefix("fast_") }
+
+        if isFastStartMode {
+            // FIX #154: Compute progress from FAST START task completion
+            // Use currentSyncTasks which includes tree + connect + fast_* tasks (6 total)
+            let allTasks = currentSyncTasks
+            let totalTasks = allTasks.count
+            guard totalTasks > 0 else { return 0.0 }
+
+            var completedCount = 0
+            var inProgressCount = 0
+
+            for task in allTasks {
+                switch task.status {
+                case .completed, .failed:
+                    completedCount += 1
+                case .inProgress:
+                    inProgressCount += 1
+                case .pending:
+                    break
+                }
+            }
+
+            // Each completed task contributes proportionally, in-progress = 50% credit
+            let completedProgress = Double(completedCount) / Double(totalTasks)
+            let inProgressProgress = (Double(inProgressCount) / Double(totalTasks)) * 0.5
+
+            let progress = min(completedProgress + inProgressProgress, 1.0)
+            print("🔍 FIX #154: FAST START progress = \(Int(progress * 100))% (completed=\(completedCount), inProgress=\(inProgressCount), total=\(totalTasks))")
+            return progress
+        }
+
+        // Use the monotonic progress from WalletManager for normal sync
         // This never goes backward, providing smooth UX
         let baseProgress = walletManager.overallProgress
 
