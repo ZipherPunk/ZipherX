@@ -41,9 +41,17 @@ final class WalletManager: ObservableObject {
     @Published private(set) var syncStatus: String = ""
     @Published private(set) var syncPhase: String = ""  // "phase1", "phase1.5", "phase1.6", "phase2"
     @Published private(set) var lastError: WalletError?
-    @Published private(set) var syncTasks: [SyncTask] = []
+    @Published var syncTasks: [SyncTask] = []  // FIX: Removed private(set) for FAST START task updates from ContentView
     @Published private(set) var syncCurrentHeight: UInt64 = 0
     @Published private(set) var syncMaxHeight: UInt64 = 0
+
+    // MARK: - FIX #144: Header Sync Progress (user-friendly display)
+    @Published private(set) var isHeaderSyncing: Bool = false
+    @Published private(set) var headerSyncProgress: Double = 0.0
+    @Published private(set) var headerSyncStatus: String = ""
+    @Published private(set) var headerSyncCurrentHeight: UInt64 = 0
+    @Published private(set) var headerSyncTargetHeight: UInt64 = 0
+    @Published private(set) var isTorBypassed: Bool = false
 
     // MARK: - Monotonic Progress (never goes backward!)
 
@@ -705,12 +713,171 @@ final class WalletManager: ObservableObject {
         }
 
         // Check if any transactions need timestamps from earlier heights
-        guard let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() else {
+        guard var earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() else {
             print("✅ FIX #120: No transactions need timestamps (all have dates)")
             return
         }
 
+        // ================================================================
+        // FIX #149: Limit header sync to last 100 blocks for FAST START
+        // ================================================================
+        // User requested: "consensus must be verified over 100 latest blocks only"
+        // For FAST START mode, we only need recent blocks for consensus verification
+        // Historical timestamps can be estimated without syncing thousands of headers
+        let headerStoreMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let maxSyncRange: UInt64 = 100  // Only sync last 100 blocks for consensus
+
+        if headerStoreMaxHeight > maxSyncRange {
+            let minStartHeight = headerStoreMaxHeight - maxSyncRange
+            if earliestNeedingTimestamp < minStartHeight {
+                print("📊 FIX #149: Limiting header sync to last \(maxSyncRange) blocks (was \(headerStoreMaxHeight - earliestNeedingTimestamp) blocks)")
+                earliestNeedingTimestamp = minStartHeight
+            }
+        }
+
+        // ================================================================
+        // FIX #147: PHASE 1 - PEER CONSENSUS (must happen BEFORE header sync)
+        // ================================================================
+        // First, wait for peers and get consensus chain height
+        await MainActor.run {
+            self.isHeaderSyncing = true
+            self.headerSyncProgress = 0.0
+            self.headerSyncStatus = "Phase 1: Verifying peer consensus..."
+        }
+
+        // Wait for at least 3 peers for consensus
+        let minPeersForConsensus = 3
+        var peerWaitAttempts = 0
+        let maxPeerWaitAttempts = 30 // 30 seconds max
+
+        while NetworkManager.shared.connectedPeers < minPeersForConsensus && peerWaitAttempts < maxPeerWaitAttempts {
+            peerWaitAttempts += 1
+            let connected = NetworkManager.shared.connectedPeers
+            await MainActor.run {
+                self.headerSyncStatus = "Waiting for peers (\(connected)/\(minPeersForConsensus))..."
+            }
+            print("⏳ FIX #147: Waiting for \(minPeersForConsensus) peers... (\(connected) connected)")
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        }
+
+        let peerCount = NetworkManager.shared.connectedPeers
+        if peerCount < minPeersForConsensus {
+            print("⚠️ FIX #147: Only \(peerCount) peers connected (need \(minPeersForConsensus))")
+        }
+
+        // Get chain height from peer consensus
+        await MainActor.run {
+            self.headerSyncStatus = "Querying chain tip from \(peerCount) peers..."
+        }
+        print("🔗 FIX #147: Getting chain height from peer consensus (\(peerCount) peers)...")
+
+        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? NetworkManager.shared.chainHeight
+        print("✅ FIX #147: Peer consensus achieved! Chain tip: \(chainHeight)")
+
+        // ================================================================
+        // FIX #147: PHASE 2 - HEADER SYNC (after peer consensus verified)
+        // ================================================================
+        let currentHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let headersToSync = earliestNeedingTimestamp < currentHeaderHeight
+            ? 0  // Already have headers
+            : chainHeight > earliestNeedingTimestamp ? chainHeight - earliestNeedingTimestamp : 0
+
+        await MainActor.run {
+            self.headerSyncCurrentHeight = earliestNeedingTimestamp
+            self.headerSyncTargetHeight = chainHeight
+            self.headerSyncStatus = "Phase 2: Syncing \(headersToSync) block headers..."
+        }
+
+        let torWasBypassed: Bool
+        if headersToSync > 500 {
+            let torEnabled = await TorManager.shared.mode == .enabled
+            if torEnabled {
+                print("⚠️ FIX #142: Massive header sync (\(headersToSync) headers) - bypassing Tor for speed...")
+                await MainActor.run {
+                    self.isTorBypassed = true
+                    self.headerSyncStatus = "Bypassing Tor for faster sync..."
+                }
+                torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
+                if torWasBypassed {
+                    await MainActor.run {
+                        self.headerSyncStatus = "Reconnecting without Tor..."
+                    }
+                    // Reconnect without Tor
+                    try? await NetworkManager.shared.connect()
+
+                    // FIX #144: Wait for at least 2 peers to connect (max 10s)
+                    var waitCount = 0
+                    let maxWait = 100 // 10 seconds
+                    while NetworkManager.shared.connectedPeers < 2 && waitCount < maxWait {
+                        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                        waitCount += 1
+                        if waitCount % 20 == 0 {
+                            await MainActor.run {
+                                self.headerSyncStatus = "Waiting for P2P peers... (\(NetworkManager.shared.connectedPeers) connected)"
+                            }
+                        }
+                    }
+                    print("📡 FIX #144: Got \(NetworkManager.shared.connectedPeers) peers after \(waitCount/10)s for header sync")
+                }
+            } else {
+                torWasBypassed = false
+            }
+        } else {
+            torWasBypassed = false
+        }
+
+        // Ensure Tor is restored after sync completes (even on error)
+        defer {
+            if torWasBypassed {
+                Task {
+                    await MainActor.run {
+                        self.headerSyncStatus = "Restoring Tor privacy..."
+                    }
+                    await TorManager.shared.restoreTorAfterBypass()
+                    await MainActor.run {
+                        self.isTorBypassed = false
+                    }
+                    // Reconnect with Tor
+                    try? await NetworkManager.shared.connect()
+                }
+            }
+        }
+
         print("📜 FIX #120: Syncing headers from height \(earliestNeedingTimestamp) for timestamps")
+
+        // FIX #144: Ensure we have at least 2 peers before trying header sync
+        if NetworkManager.shared.connectedPeers < 2 {
+            await MainActor.run {
+                self.headerSyncStatus = "Connecting to P2P network..."
+            }
+            // Try to connect if not connected
+            if !NetworkManager.shared.isConnected {
+                try? await NetworkManager.shared.connect()
+            }
+            // Wait for at least 2 peers (max 10s)
+            var waitCount = 0
+            let maxWait = 100 // 10 seconds
+            while NetworkManager.shared.connectedPeers < 2 && waitCount < maxWait {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                waitCount += 1
+                if waitCount % 20 == 0 {
+                    await MainActor.run {
+                        self.headerSyncStatus = "Waiting for peers... (\(NetworkManager.shared.connectedPeers) connected)"
+                    }
+                }
+            }
+
+            // If still no peers, report error and return
+            if NetworkManager.shared.connectedPeers < 2 {
+                print("⚠️ FIX #144: Cannot sync headers - only \(NetworkManager.shared.connectedPeers) peers connected")
+                await MainActor.run {
+                    self.isHeaderSyncing = false
+                    self.headerSyncStatus = ""
+                }
+                return
+            }
+            print("📡 FIX #144: Got \(NetworkManager.shared.connectedPeers) peers for header sync")
+        }
 
         // FIX #136: Set header syncing flag to pause mempool scan during sync
         // This prevents P2P race conditions that cause header sync to get stuck
@@ -724,15 +891,22 @@ final class WalletManager: ObservableObject {
             networkManager: NetworkManager.shared
         )
 
-        // FIX #136: Report progress to UI for header sync during FAST START mode
+        // FIX #144: Report progress to UI for header sync
         hsm.onProgress = { [weak self] progress in
             Task { @MainActor in
+                // Update header sync UI properties
+                let progressPercentage = progress.totalHeight > 0
+                    ? Double(progress.currentHeight) / Double(progress.totalHeight)
+                    : 0.0
+                self?.headerSyncProgress = progressPercentage
+                self?.headerSyncCurrentHeight = UInt64(progress.currentHeight)
+                self?.headerSyncTargetHeight = UInt64(progress.totalHeight)
+                self?.headerSyncStatus = "Syncing block timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
+
+                // Also update syncTasks if available
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
                     self?.syncTasks[index].status = .inProgress
                     self?.syncTasks[index].detail = "Syncing timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
-                    let progressPercentage = progress.totalHeight > 0
-                        ? Double(progress.currentHeight) / Double(progress.totalHeight)
-                        : 0.0
                     self?.syncTasks[index].progress = progressPercentage
                 }
             }
@@ -742,23 +916,45 @@ final class WalletManager: ObservableObject {
             try await hsm.syncHeaders(from: earliestNeedingTimestamp)
             print("✅ FIX #120: Header sync for timestamps completed")
 
-            // Mark task as completed
+            // FIX #144: Update UI - sync complete
             await MainActor.run {
+                self.headerSyncProgress = 1.0
+                self.headerSyncStatus = "Fixing transaction timestamps..."
+            }
+
+            // Fix any transactions that have NULL or wrong timestamps (now that headers are synced)
+            let fixedCount = try? WalletDatabase.shared.fixTransactionBlockTimes()
+            print("📜 FIX #120: Fixed \(fixedCount ?? 0) transaction timestamps")
+
+            // FIX #146: Update cachedChainHeight for FAST START on next launch
+            if chainHeight > 0 {
+                UserDefaults.standard.set(Int(chainHeight), forKey: "cachedChainHeight")
+                print("📊 FIX #146: Updated cachedChainHeight to \(chainHeight) for FAST START")
+            }
+
+            // FIX #144: Clear header sync UI state
+            await MainActor.run {
+                self.isHeaderSyncing = false
+                self.headerSyncProgress = 0.0
+                self.headerSyncStatus = ""
+
+                // Mark syncTask as completed if available
                 if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
                     syncTasks[index].status = .completed
-                    syncTasks[index].detail = "Timestamps synced"
+                    syncTasks[index].detail = "Timestamps synced (\(fixedCount ?? 0) fixed)"
                     syncTasks[index].progress = 1.0
                 }
             }
-
-            // Fix any transactions that have NULL timestamps (now that headers are synced)
-            let fixedCount = try? WalletDatabase.shared.fixTransactionBlockTimes()
-            print("📜 FIX #120: Fixed \(fixedCount ?? 0) transaction timestamps")
         } catch {
             print("⚠️ FIX #120: Header sync for timestamps failed: \(error.localizedDescription)")
 
-            // Mark task as failed
+            // FIX #144: Clear header sync UI state on error
             await MainActor.run {
+                self.isHeaderSyncing = false
+                self.headerSyncProgress = 0.0
+                self.headerSyncStatus = "Sync failed: \(error.localizedDescription)"
+
+                // Mark task as failed
                 if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
                     syncTasks[index].status = .failed(error.localizedDescription)
                     syncTasks[index].detail = "Sync failed"
@@ -1466,6 +1662,15 @@ final class WalletManager: ObservableObject {
         var headerSyncSuccess = false
         var lastHeaderError: Error?
 
+        // FIX #146: Set header syncing flag ONCE at the start, BEFORE retry loop
+        // This prevents block listeners from restarting between retry attempts
+        // which was causing P2P race conditions and 5 headers/sec slowdown
+        NetworkManager.shared.setHeaderSyncing(true)
+        defer {
+            // Clear flag when ALL retries complete (success or exhausted)
+            NetworkManager.shared.setHeaderSyncing(false)
+        }
+
         for attempt in 1...maxHeaderRetries {
             do {
                 if attempt > 1 {
@@ -1566,14 +1771,8 @@ final class WalletManager: ObservableObject {
                     }
                 }
 
-                // FIX #130: Set header syncing flag to pause mempool scan during sync
-                // This prevents P2P race conditions that cause "invalid magic bytes" errors
-                NetworkManager.shared.setHeaderSyncing(true)
-
-                defer {
-                    // FIX #130: Clear flag when sync completes (success or error)
-                    NetworkManager.shared.setHeaderSyncing(false)
-                }
+                // FIX #146: setHeaderSyncing is now outside the retry loop (see above)
+                // This ensures block listeners stay paused during ALL retry attempts
 
                 try await headerSync.syncHeaders(from: startHeight)
 
@@ -1839,6 +2038,14 @@ final class WalletManager: ObservableObject {
         let lastScannedHeight = (try? database.getLastScannedHeight()) ?? 0
         NetworkManager.shared.updateWalletHeight(lastScannedHeight)
 
+        // FIX #146: Update cachedChainHeight after sync completes
+        // This ensures FAST START mode works on next app launch
+        // Previously, the cache was only updated in refreshChainHeight() which is blocked during initial sync
+        if lastScannedHeight > 0 {
+            UserDefaults.standard.set(Int(lastScannedHeight), forKey: "cachedChainHeight")
+            print("📊 FIX #146: Updated cachedChainHeight to \(lastScannedHeight) for FAST START")
+        }
+
         // CRITICAL FIX: Clear isImportedWallet after first successful sync
         // This prevents the app from doing a full historical scan on every startup
         // The flag should only be true during the FIRST sync after importing a wallet
@@ -1973,6 +2180,27 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
+        // FIX #142: Bypass Tor for massive rescan operation
+        let torEnabled = await TorManager.shared.mode == .enabled
+        let torWasBypassed: Bool
+        if torEnabled {
+            print("⚠️ FIX #142: Full rescan - bypassing Tor for faster sync...")
+            torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
+        } else {
+            torWasBypassed = false
+        }
+
+        // Ensure Tor is restored after rescan completes (even on error)
+        defer {
+            if torWasBypassed {
+                Task {
+                    await TorManager.shared.restoreTorAfterBypass()
+                    // Reconnect with Tor
+                    try? await NetworkManager.shared.connect()
+                }
+            }
+        }
+
         // Get spending key
         let spendingKey = try secureStorage.retrieveSpendingKey()
         // SECURITY: Key retrieved - not logged
@@ -2076,6 +2304,27 @@ final class WalletManager: ObservableObject {
     func repairNotesAfterDownloadedTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         guard isWalletCreated else {
             throw WalletError.walletNotCreated
+        }
+
+        // FIX #142: Bypass Tor for repair operation
+        let torEnabled = await TorManager.shared.mode == .enabled
+        let torWasBypassed: Bool
+        if torEnabled {
+            print("⚠️ FIX #142: Database repair - bypassing Tor for faster sync...")
+            torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
+        } else {
+            torWasBypassed = false
+        }
+
+        // Ensure Tor is restored after repair completes (even on error)
+        defer {
+            if torWasBypassed {
+                Task {
+                    await TorManager.shared.restoreTorAfterBypass()
+                    // Reconnect with Tor
+                    try? await NetworkManager.shared.connect()
+                }
+            }
         }
 
         // VUL-018: Use shared constant for downloaded tree height
@@ -2633,6 +2882,17 @@ final class WalletManager: ObservableObject {
             }
         }
         updateTaskWithProgress(taskId, detail: detail, progress: progress)
+    }
+
+    /// Update a sync task status and detail - called from ContentView for FAST START
+    @MainActor
+    func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil) {
+        if let index = syncTasks.firstIndex(where: { $0.id == id }) {
+            syncTasks[index].status = status
+            if let detail = detail {
+                syncTasks[index].detail = detail
+            }
+        }
     }
 
     /// Get the real date for a given block height

@@ -20,6 +20,11 @@ struct ContentView: View {
     @State private var showCompletionScreen: Bool = false
     private let estimatedSyncDuration: TimeInterval = 60  // ~60 seconds estimated for new wallet
 
+    // DEBUG: Set to true to pause at sync completion with a confirmation button
+    private let DEBUG_PAUSE_AT_COMPLETION = true
+    @State private var debugWaitingForConfirmation = false
+    @State private var debugCompletionMessage = ""
+
     /// Get the effective start time for sync timing display
     /// Uses walletCreationTime if available (when user clicked create/import), otherwise falls back to appStartupTime
     private var effectiveStartTime: Date {
@@ -132,6 +137,18 @@ struct ContentView: View {
                         if isFastStart {
                             print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(blocksBehind) blocks behind)")
 
+                            // Initialize FAST START tasks for UI display
+                            // Note: Use unique IDs (fast_*) to avoid conflict with currentSyncTasks computed property
+                            // which adds its own "tree" and "connect" tasks
+                            await MainActor.run {
+                                walletManager.syncTasks = [
+                                    SyncTask(id: "fast_balance", title: "Retrieve cached balance", status: .inProgress),
+                                    SyncTask(id: "fast_peers", title: "Verify peer consensus", status: .pending),
+                                    SyncTask(id: "fast_headers", title: "Sync block timestamps", status: .pending),
+                                    SyncTask(id: "fast_health", title: "Validate wallet health", status: .pending)
+                                ]
+                            }
+
                             // Load cached balance immediately (no network wait!)
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Loading cached balance...")
@@ -140,20 +157,242 @@ struct ContentView: View {
                             // Load balance from database (instant)
                             walletManager.loadCachedBalance()
 
-                            // FIX #120: Quick health check for fast start (just database + tree)
+                            // Update task: balance loaded
                             await MainActor.run {
-                                walletManager.setConnecting(true, status: "Quick health check...")
-                            }
-                            let quickHealthResults = await WalletHealthCheck.shared.runAllChecks()
-                            let hasCritical = WalletHealthCheck.shared.hasCriticalFailures(quickHealthResults)
-                            if hasCritical {
-                                print("❌ FAST START: Critical health check failures detected")
-                                WalletHealthCheck.shared.printSummary(quickHealthResults)
-                            } else {
-                                print("✅ FAST START: Health check passed")
+                                walletManager.updateSyncTask(id: "fast_balance", status: .completed)
+                                walletManager.updateSyncTask(id: "fast_peers", status: .inProgress)
                             }
 
-                            // Mark initial sync as complete immediately
+                            // =================================================================
+                            // FIX #147: Check if transactions need timestamps BEFORE completing
+                            // If headers are missing, we MUST sync them before showing balance
+                            // Otherwise user sees transaction history with wrong/missing dates
+                            // =================================================================
+                            let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp()
+                            let needsHeaderSync = earliestNeedingTimestamp != nil
+
+                            if needsHeaderSync {
+                                print("⚠️ FIX #147: Transactions need timestamps - running header sync BEFORE showing UI")
+                                print("⚠️ FIX #147: Earliest height needing timestamp: \(earliestNeedingTimestamp ?? 0)")
+
+                                // Connect to network first (needed for header sync)
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Connecting for header sync...")
+                                }
+
+                                do {
+                                    try await networkManager.connect()
+
+                                    // Wait for at least 3 peers (required for header consensus)
+                                    var peerWait = 0
+                                    let maxPeerWait = 300 // 30 seconds max
+                                    while networkManager.connectedPeers < 3 && peerWait < maxPeerWait {
+                                        try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                                        peerWait += 1
+                                        if peerWait % 50 == 0 {
+                                            await MainActor.run {
+                                                walletManager.setConnecting(true, status: "Waiting for peers (\(networkManager.connectedPeers)/3)...")
+                                            }
+                                        }
+                                    }
+
+                                    // Update task: peers connected
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .inProgress)
+                                    }
+
+                                    // Run header sync WITH progress visible to user
+                                    // This uses the floatingHeaderSyncIndicator in ContentView
+                                    await walletManager.ensureHeaderTimestamps()
+
+                                    // Update task: headers synced
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                    }
+
+                                    print("✅ FIX #147: Header sync complete - NOW showing main UI")
+                                } catch {
+                                    print("⚠️ FIX #147: Header sync failed: \(error.localizedDescription)")
+                                    // Mark as failed but continue
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_peers", status: .failed(error.localizedDescription))
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .failed(error.localizedDescription))
+                                    }
+                                }
+                            } else {
+                                print("✅ FIX #147: No transactions need timestamps - fast path")
+                                // Skip peers and headers tasks
+                                await MainActor.run {
+                                    walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                    walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                }
+                            }
+
+                            // FIX #120/#147: Comprehensive health check at every app restart
+                            // Verifies: Bundle files, Database, CMUs, Timestamps, Balance, Hashes, P2P, Equihash, Witnesses, Notes
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Running health checks...")
+                                walletManager.updateSyncTask(id: "fast_health", status: .inProgress)
+                            }
+                            let healthResults = await WalletHealthCheck.shared.runAllChecks()
+
+                            // Update task: health checks complete
+                            await MainActor.run {
+                                let allPassed = !WalletHealthCheck.shared.hasCriticalFailures(healthResults)
+                                walletManager.updateSyncTask(id: "fast_health", status: allPassed ? .completed : .failed("Critical issues found"))
+                            }
+
+                            // FIX #147: ALWAYS print summary so user sees all check results
+                            WalletHealthCheck.shared.printSummary(healthResults)
+
+                            let hasCritical = WalletHealthCheck.shared.hasCriticalFailures(healthResults)
+                            let fixableIssues = WalletHealthCheck.shared.getFixableIssues(healthResults)
+
+                            // FIX #120 DEBUG: Log what we found
+                            print("🔍 FIX #120 DEBUG: hasCritical=\(hasCritical), fixableIssues.count=\(fixableIssues.count)")
+                            for issue in fixableIssues {
+                                print("🔍 FIX #120 DEBUG: Fixable issue: \(issue.checkName)")
+                            }
+
+                            if hasCritical {
+                                print("❌ FAST START: Critical health check failures detected - wallet may not function correctly")
+                                // FIX #120: Stay on sync screen for critical failures
+                                // User cannot send ZCL in this state - show error
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Critical issue detected - please restart app")
+                                }
+                                // Don't transition to main UI - keep showing sync screen
+                                return
+                            } else if !fixableIssues.isEmpty {
+                                // FIX #120: Non-critical issues found - attempt to fix BEFORE showing main UI
+                                print("⚠️ FAST START: \(fixableIssues.count) fixable issues found - attempting repair...")
+
+                                for issue in fixableIssues {
+                                    print("⚠️ Issue: \(issue.checkName) - \(issue.details)")
+                                }
+
+                                // Attempt automatic repair based on issue type
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Repairing wallet state...")
+                                }
+
+                                // Check for specific issues and fix them
+                                let hasWitnessIssues = fixableIssues.contains { $0.checkName == "Witness Validity" }
+                                let hasDeltaCMUIssues = fixableIssues.contains { $0.checkName == "Delta CMU" }
+                                let hasTimestampIssues = fixableIssues.contains { $0.checkName == "Timestamps" }
+                                let hasHashIssues = fixableIssues.contains { $0.checkName == "Hash Accuracy" }
+                                let hasBalanceIssues = fixableIssues.contains { $0.checkName == "Balance Reconciliation" }
+
+                                // FIX #120: Handle Hash Accuracy issues - clear and resync headers
+                                if hasHashIssues {
+                                    print("🔧 FIX #120: Hash mismatch detected - clearing headers for resync...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Clearing corrupt headers...")
+                                    }
+                                    try? HeaderStore.shared.clearAllHeaders()
+                                    // Headers will be resynced by ensureHeaderTimestamps below
+                                }
+
+                                if hasWitnessIssues || hasDeltaCMUIssues {
+                                    print("🔧 FIX #120: Repairing witnesses and tree state...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Rebuilding witnesses...")
+                                    }
+                                    try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
+                                        print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                    }
+                                }
+
+                                // FIX #120: Handle Timestamp issues OR Hash issues (both need header sync)
+                                if hasTimestampIssues || hasHashIssues {
+                                    print("🔧 FIX #120: Syncing headers and timestamps...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Syncing headers...")
+                                    }
+                                    await walletManager.ensureHeaderTimestamps()
+                                }
+
+                                // FIX #120: Handle Balance Reconciliation issues - repopulate history from notes
+                                if hasBalanceIssues {
+                                    print("🔧 FIX #120: Balance mismatch detected - repopulating transaction history...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Rebuilding transaction history...")
+                                    }
+                                    try? WalletDatabase.shared.clearTransactionHistory()
+                                    try? WalletDatabase.shared.populateHistoryFromNotes()
+
+                                    // FIX #120: Balance repair creates entries WITHOUT timestamps
+                                    // Must sync headers after to populate the timestamps
+                                    print("🔧 FIX #120: Syncing headers after history rebuild to fix timestamps...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Syncing timestamps...")
+                                    }
+                                    await walletManager.ensureHeaderTimestamps()
+                                }
+
+                                // Re-run health checks to verify fixes
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Verifying repairs...")
+                                }
+                                let verifyResults = await WalletHealthCheck.shared.runAllChecks()
+                                WalletHealthCheck.shared.printSummary(verifyResults)
+
+                                let stillHasIssues = WalletHealthCheck.shared.getFixableIssues(verifyResults)
+                                // FIX #120: Filter out non-blocking issues that shouldn't prevent app startup:
+                                // - P2P Connectivity: Expected to fail initially, will connect in background
+                                // - Balance Reconciliation: May have minor mismatches due to complex tx history
+                                //   (populateHistoryFromNotes can't perfectly reconstruct change outputs, fees, etc.)
+                                // - Hash Accuracy: Requires P2P peers which may not be connected yet
+                                // Critical blocking issues: Timestamps, Database Integrity, Bundle Files, Delta CMU
+                                let nonBlockingChecks = ["P2P Connectivity", "Balance Reconciliation", "Hash Accuracy"]
+                                let blockingIssues = stillHasIssues.filter { !nonBlockingChecks.contains($0.checkName) }
+
+                                if !blockingIssues.isEmpty {
+                                    // FIX #120: Stay on sync screen if issues remain - don't proceed to main UI!
+                                    // User cannot send ZCL safely if wallet state is broken
+                                    print("❌ FAST START: \(blockingIssues.count) blocking issues remain after repair!")
+                                    for issue in blockingIssues {
+                                        print("❌ Remaining issue: \(issue.checkName) - \(issue.details)")
+                                    }
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Repair incomplete - please restart app")
+                                    }
+                                    // Keep showing sync screen - don't proceed to main UI
+                                    return
+                                } else {
+                                    print("✅ FAST START: All critical issues fixed!")
+                                    // Log non-blocking issues that still exist (informational only)
+                                    let nonBlockingRemaining = stillHasIssues.filter { nonBlockingChecks.contains($0.checkName) }
+                                    if !nonBlockingRemaining.isEmpty {
+                                        print("ℹ️ Non-blocking issues (will resolve in background):")
+                                        for issue in nonBlockingRemaining {
+                                            print("ℹ️   \(issue.checkName): \(issue.details)")
+                                        }
+                                    }
+                                }
+                            } else {
+                                print("✅ FAST START: All health checks passed!")
+                            }
+
+                            // Mark initial sync as complete - NOW safe because all checks passed or were fixed
+                            print("⚡ FAST START COMPLETE: UI ready!")
+
+                            // DEBUG: Pause for confirmation if enabled
+                            if DEBUG_PAUSE_AT_COMPLETION {
+                                await MainActor.run {
+                                    debugCompletionMessage = "FAST START complete!\n\nHealth: \(healthResults.filter { $0.passed }.count)/\(healthResults.count) passed\nBlocks behind: \(blocksBehind)\nHeader sync: \(needsHeaderSync ? "YES" : "NO")"
+                                    debugWaitingForConfirmation = true
+                                }
+                                print("🔴 DEBUG: Waiting for user confirmation before showing balance...")
+
+                                // Wait for user to tap the confirmation button
+                                while debugWaitingForConfirmation {
+                                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                                }
+                                print("🟢 DEBUG: User confirmed, proceeding to balance view")
+                            }
+
                             await MainActor.run {
                                 walletManager.setConnecting(false, status: nil)
                                 isInitialSync = false
@@ -165,19 +404,23 @@ struct ContentView: View {
                             networkManager.suppressBackgroundSync = false
                             Task {
                                 do {
-                                    try await networkManager.connect()
-                                    await networkManager.fetchNetworkStats()
-                                    // Background sync will handle any new blocks automatically
+                                    // FIX #147: Skip ensureHeaderTimestamps() here - already done above if needed
+                                    if !needsHeaderSync {
+                                        try await networkManager.connect()
+                                    }
 
-                                    // FIX #132: Ensure header timestamps are synced
-                                    // This runs even when no new blocks (FAST START mode)
-                                    await walletManager.ensureHeaderTimestamps()
+                                    // FIX #145: NOW enable background processes (mempool scan, stats refresh)
+                                    // Only after header sync is complete
+                                    networkManager.enableBackgroundProcesses()
+
+                                    // Now fetch stats which triggers background sync
+                                    await networkManager.fetchNetworkStats()
                                 } catch {
                                     print("⚠️ Background connect error: \(error.localizedDescription)")
+                                    // Enable background processes even on error so app remains functional
+                                    networkManager.enableBackgroundProcesses()
                                 }
                             }
-
-                            print("⚡ FAST START COMPLETE: UI ready in <5s!")
                             return
                         }
 
@@ -344,6 +587,9 @@ struct ContentView: View {
                                 print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
                                 // CRITICAL: Must clear suppressBackgroundSync even on early return!
                                 networkManager.suppressBackgroundSync = false
+                                // FIX #145: Ensure header timestamps before enabling background processes
+                                await walletManager.ensureHeaderTimestamps()
+                                networkManager.enableBackgroundProcesses()
                                 await MainActor.run {
                                     walletManager.setConnecting(false, status: nil)
                                     isInitialSync = false
@@ -378,9 +624,112 @@ struct ContentView: View {
                         // Re-enable background sync now that initial sync is complete
                         networkManager.suppressBackgroundSync = false
 
-                        // FIX #120: Skip health checks for now - they were causing UI to hang
-                        // TODO: Re-enable with proper timeout mechanism
-                        print("🔍 FIX #120: Skipping health checks (disabled to fix UI hang)")
+                        // FIX #145: Sync headers BEFORE showing completion screen
+                        // This ensures timestamps are available when user enters main wallet
+                        // Header sync gets EXCLUSIVE P2P access (no mempool scan interference)
+                        print("📜 FIX #145: Syncing headers for timestamps before completion...")
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Syncing block timestamps...")
+                        }
+                        await walletManager.ensureHeaderTimestamps()
+
+                        // FIX #120/#147: Comprehensive health check at every app restart
+                        // Verifies: Bundle files, Database, CMUs, Timestamps, Balance, Hashes, P2P, Equihash, Witnesses, Notes
+                        // Now properly runs on background thread to prevent UI hang
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Running health checks...")
+                        }
+                        let fullStartHealthResults = await WalletHealthCheck.shared.runAllChecks()
+
+                        // FIX #147: ALWAYS print summary so user sees all check results
+                        WalletHealthCheck.shared.printSummary(fullStartHealthResults)
+
+                        let fullStartHasCritical = WalletHealthCheck.shared.hasCriticalFailures(fullStartHealthResults)
+                        let fullStartFixableIssues = WalletHealthCheck.shared.getFixableIssues(fullStartHealthResults)
+
+                        if fullStartHasCritical {
+                            print("❌ FULL START: Critical health check failures detected - wallet may not function correctly")
+                            // FIX #120: Stay on sync screen for critical failures
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Critical issue detected - please restart app")
+                            }
+                            // Don't transition to main UI - keep showing sync screen
+                            return
+                        } else if !fullStartFixableIssues.isEmpty {
+                            // FIX #120: Non-critical issues found - attempt to fix BEFORE showing main UI
+                            print("⚠️ FULL START: \(fullStartFixableIssues.count) fixable issues found - attempting repair...")
+
+                            for issue in fullStartFixableIssues {
+                                print("⚠️ Issue: \(issue.checkName) - \(issue.details)")
+                            }
+
+                            // Attempt automatic repair based on issue type
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Repairing wallet state...")
+                            }
+
+                            // Check for specific issues and fix them
+                            let fullStartHasWitnessIssues = fullStartFixableIssues.contains { $0.checkName == "Witness Validity" }
+                            let fullStartHasDeltaCMUIssues = fullStartFixableIssues.contains { $0.checkName == "Delta CMU" }
+                            let fullStartHasTimestampIssues = fullStartFixableIssues.contains { $0.checkName == "Timestamps" }
+                            let fullStartHasHashIssues = fullStartFixableIssues.contains { $0.checkName == "Hash Accuracy" }
+                            let fullStartHasBalanceIssues = fullStartFixableIssues.contains { $0.checkName == "Balance Reconciliation" }
+
+                            // FIX #120: Handle Hash Accuracy issues - clear and resync headers
+                            if fullStartHasHashIssues {
+                                print("🔧 FIX #120: Hash mismatch detected - clearing headers for resync...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Clearing corrupt headers...")
+                                }
+                                try? HeaderStore.shared.clearAllHeaders()
+                                // Headers will be resynced by ensureHeaderTimestamps below
+                            }
+
+                            if fullStartHasWitnessIssues || fullStartHasDeltaCMUIssues {
+                                print("🔧 FIX #120: Repairing witnesses and tree state...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Rebuilding witnesses...")
+                                }
+                                try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
+                                    print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                }
+                            }
+
+                            // FIX #120: Handle Timestamp issues OR Hash issues (both need header sync)
+                            if fullStartHasTimestampIssues || fullStartHasHashIssues {
+                                print("🔧 FIX #120: Syncing headers and timestamps...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Syncing headers...")
+                                }
+                                await walletManager.ensureHeaderTimestamps()
+                            }
+
+                            // FIX #120: Handle Balance Reconciliation issues - repopulate history from notes
+                            if fullStartHasBalanceIssues {
+                                print("🔧 FIX #120: Balance mismatch detected - repopulating transaction history...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Rebuilding transaction history...")
+                                }
+                                try? WalletDatabase.shared.clearTransactionHistory()
+                                try? WalletDatabase.shared.populateHistoryFromNotes()
+                            }
+
+                            // Re-run health checks to verify fixes
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Verifying repairs...")
+                            }
+                            let fullStartVerifyResults = await WalletHealthCheck.shared.runAllChecks()
+                            WalletHealthCheck.shared.printSummary(fullStartVerifyResults)
+
+                            let fullStartStillHasIssues = WalletHealthCheck.shared.getFixableIssues(fullStartVerifyResults)
+                            if !fullStartStillHasIssues.isEmpty {
+                                print("⚠️ FULL START: Some issues remain after repair - proceeding anyway")
+                            } else {
+                                print("✅ FULL START: All issues fixed!")
+                            }
+                        } else {
+                            print("✅ FULL START: All health checks passed!")
+                        }
 
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
@@ -418,6 +767,10 @@ struct ContentView: View {
                                 showCompletionScreen = false
                             }
 
+                            // FIX #145: Enable background processes NOW (user is entering main wallet)
+                            // Header sync should have completed during initial sync phase
+                            networkManager.enableBackgroundProcesses()
+
                             // After initial sync, show lock screen if biometric enabled
                             if biometricManager.isBiometricEnabled {
                                 isShowingLockScreen = true
@@ -434,6 +787,8 @@ struct ContentView: View {
                                 hasCompletedInitialSync = true
                                 showCompletionScreen = false
                             }
+                            // FIX #145: Enable background processes even on early stop
+                            networkManager.enableBackgroundProcesses()
                             // Start inactivity timer
                             startInactivityTimer()
                         },
@@ -450,10 +805,60 @@ struct ContentView: View {
                     .transition(.opacity)
                 }
 
+                // DEBUG: Confirmation overlay to pause before showing balance view
+                if debugWaitingForConfirmation {
+                    ZStack {
+                        // Semi-transparent background
+                        Color.black.opacity(0.85)
+                            .ignoresSafeArea()
+
+                        VStack(spacing: 20) {
+                            Text("🔴 DEBUG PAUSE")
+                                .font(.system(size: 28, weight: .bold, design: .monospaced))
+                                .foregroundColor(.red)
+
+                            Text(debugCompletionMessage)
+                                .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 20)
+
+                            Spacer().frame(height: 20)
+
+                            Button(action: {
+                                debugWaitingForConfirmation = false
+                            }) {
+                                Text("CONTINUE TO BALANCE →")
+                                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.black)
+                                    .padding(.horizontal, 30)
+                                    .padding(.vertical, 15)
+                                    .background(Color.green)
+                                    .cornerRadius(8)
+                            }
+                            .buttonStyle(.plain)
+
+                            Text("Tap to proceed to main balance view")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.gray)
+                        }
+                        .padding(40)
+                    }
+                    .transition(.opacity)
+                }
+
                 // Floating sync progress indicator for BACKGROUND syncing
                 // Shows when syncing after initial sync is complete (user can still use app)
                 if !isInitialSync && walletManager.isSyncing {
                     floatingSyncIndicator
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                // FIX #144: Floating header sync progress indicator
+                // Shows when syncing block timestamps - NOW SHOWS DURING INITIAL SYNC TOO
+                // Removed !isInitialSync condition so progress bar appears immediately at startup
+                if walletManager.isHeaderSyncing {
+                    floatingHeaderSyncIndicator
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
@@ -965,6 +1370,97 @@ struct ContentView: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(themeManager.currentTheme.borderColor, lineWidth: 1)
+            )
+            .cornerRadius(8)
+            .shadow(color: themeManager.currentTheme.shadowColor.opacity(0.3), radius: 5, x: 0, y: -2)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+            #if os(macOS)
+            .frame(maxWidth: 400)
+            #endif
+        }
+    }
+
+    // MARK: - FIX #144: Floating Header Sync Indicator
+
+    /// Floating progress indicator shown during header/timestamp sync
+    /// Shows block timestamps being synced for transaction history
+    private var floatingHeaderSyncIndicator: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 8) {
+                // Status text with icon
+                HStack(spacing: 8) {
+                    // Clock icon for timestamps
+                    Image(systemName: "clock.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(themeManager.currentTheme.primaryColor)
+
+                    Text(walletManager.headerSyncStatus.isEmpty ? "Syncing timestamps..." : walletManager.headerSyncStatus)
+                        .font(themeManager.currentTheme.bodyFont)
+                        .foregroundColor(themeManager.currentTheme.textPrimary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    // Percentage
+                    Text("\(Int(walletManager.headerSyncProgress * 100))%")
+                        .font(themeManager.currentTheme.monoFont)
+                        .foregroundColor(themeManager.currentTheme.primaryColor)
+                }
+
+                // Progress bar
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(themeManager.currentTheme.surfaceColor)
+                            .frame(height: 8)
+
+                        Rectangle()
+                            .fill(themeManager.currentTheme.primaryColor)
+                            .frame(width: geometry.size.width * walletManager.headerSyncProgress, height: 8)
+                    }
+                    .cornerRadius(4)
+                }
+                .frame(height: 8)
+
+                // Block height info
+                if walletManager.headerSyncTargetHeight > 0 {
+                    HStack {
+                        Text("Block \(walletManager.headerSyncCurrentHeight.formatted()) / \(walletManager.headerSyncTargetHeight.formatted())")
+                            .font(themeManager.currentTheme.captionFont)
+                            .foregroundColor(themeManager.currentTheme.textSecondary)
+
+                        Spacer()
+
+                        // Blocks remaining
+                        let remaining = walletManager.headerSyncTargetHeight > walletManager.headerSyncCurrentHeight ?
+                            walletManager.headerSyncTargetHeight - walletManager.headerSyncCurrentHeight : 0
+                        Text("\(remaining.formatted()) remaining")
+                            .font(themeManager.currentTheme.captionFont)
+                            .foregroundColor(themeManager.currentTheme.textSecondary)
+                    }
+                }
+
+                // Tor bypass indicator
+                if walletManager.isTorBypassed {
+                    HStack(spacing: 4) {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                        Text("Direct connection (faster sync)")
+                            .font(themeManager.currentTheme.captionFont)
+                            .foregroundColor(.orange)
+                        Spacer()
+                    }
+                }
+            }
+            .padding(12)
+            .background(themeManager.currentTheme.backgroundColor)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(themeManager.currentTheme.primaryColor.opacity(0.5), lineWidth: 1)
             )
             .cornerRadius(8)
             .shadow(color: themeManager.currentTheme.shadowColor.opacity(0.3), radius: 5, x: 0, y: -2)

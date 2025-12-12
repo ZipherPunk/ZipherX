@@ -186,6 +186,63 @@ public final class TorManager: ObservableObject {
         return true
     }
 
+    // MARK: - FIX #142: Temporary Tor Bypass for Massive Operations
+
+    /// Track if Tor was bypassed for a massive operation
+    private var wasTorEnabledBeforeBypass = false
+    private var isBypassActive = false
+
+    /// Temporarily disable Tor for massive operations (header sync, full rescan)
+    /// Returns true if Tor was disabled (caller should call restoreTorAfterBypass when done)
+    public func bypassTorForMassiveOperation() async -> Bool {
+        guard mode == .enabled && !isBypassActive else {
+            return false
+        }
+
+        print("🧅 FIX #142: Temporarily disabling Tor for faster sync...")
+        wasTorEnabledBeforeBypass = true
+        isBypassActive = true
+
+        // Stop Tor and set mode to disabled
+        await stopArti()
+
+        // Don't persist the mode change - just change in memory
+        // We'll restore it after the operation
+        await MainActor.run {
+            self.connectionState = .disconnected
+        }
+
+        // Disconnect existing peers so they reconnect without Tor
+        await NetworkManager.shared.disconnectAllPeers()
+
+        print("🧅 FIX #142: Tor bypassed - using direct connections for faster sync")
+        return true
+    }
+
+    /// Restore Tor after massive operation completes
+    public func restoreTorAfterBypass() async {
+        guard wasTorEnabledBeforeBypass && isBypassActive else {
+            return
+        }
+
+        print("🧅 FIX #142: Restoring Tor after sync complete...")
+        isBypassActive = false
+        wasTorEnabledBeforeBypass = false
+
+        // Disconnect direct peers before switching back to Tor
+        await NetworkManager.shared.disconnectAllPeers()
+
+        // Restart Tor
+        await startArti()
+
+        print("🧅 FIX #142: Tor restored - maximum privacy mode active")
+    }
+
+    /// Check if Tor bypass is currently active
+    public var isTorBypassed: Bool {
+        return isBypassActive
+    }
+
     /// Get URLSession configured for Tor proxy
     public func getTorURLSession(isolate: Bool = false) -> URLSession {
         guard mode == .enabled, connectionState.isConnected, socksPort > 0 else {
@@ -308,12 +365,10 @@ public final class TorManager: ObservableObject {
         } else {
             connectionState = .disconnected
 
-            // Remove Tor proxy from zclassic.conf when Tor is disabled
+            // FIX: Do NOT automatically modify zclassic.conf
+            // User must manually configure proxy settings
             #if os(macOS)
-            FullNodeManager.shared.removeTorProxy()
-            Task {
-                await FullNodeManager.shared.refreshDaemonNetwork()
-            }
+            print("🧅 Tor disabled - user can remove proxy from zclassic.conf manually if needed")
             #endif
         }
     }
@@ -442,12 +497,11 @@ public final class TorManager: ObservableObject {
                                 print("🧅 Tor fully connected! SOCKS proxy verified on port \(port)")
                                 print("🧅 .onion circuits will be ready in \(self.onionCircuitWarmupSeconds)s")
 
-                                // Notify FullNodeManager to update zclassic.conf with Tor proxy
+                                // FIX: Do NOT automatically modify zclassic.conf
+                                // User must manually configure proxy settings or explicitly save from Settings
+                                // The app should NEVER modify user's config files without explicit action
                                 #if os(macOS)
-                                FullNodeManager.shared.updateTorProxy(host: self.proxyHost, port: port)
-                                Task {
-                                    await FullNodeManager.shared.refreshDaemonNetwork()
-                                }
+                                print("🧅 Tor proxy available at \(self.proxyHost):\(port) - user can configure zclassic.conf manually if needed")
                                 #endif
 
                                 // Notify HiddenServiceManager that Tor is now connected

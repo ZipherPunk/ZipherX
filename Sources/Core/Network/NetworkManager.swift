@@ -184,6 +184,23 @@ final class NetworkManager: ObservableObject {
     /// Set to true during ContentView's initial sync task, false after completion
     var suppressBackgroundSync: Bool = false
 
+    /// FIX #145: Flag to control when background processes can run
+    /// Initially false - set to true ONLY after initial sync completes
+    /// Prevents mempool scan, stats refresh, etc. from interfering with critical startup sync
+    @Published private(set) var backgroundProcessesEnabled: Bool = false
+
+    /// FIX #145: Enable background processes (called after initial sync completes)
+    func enableBackgroundProcesses() {
+        backgroundProcessesEnabled = true
+        debugLog(.network, "✅ FIX #145: Background processes ENABLED (initial sync complete)")
+    }
+
+    /// FIX #145: Disable background processes (for testing/reset)
+    func disableBackgroundProcesses() {
+        backgroundProcessesEnabled = false
+        debugLog(.network, "⏸️ FIX #145: Background processes DISABLED")
+    }
+
     /// FIX #130: Set header syncing state (called from WalletManager)
     /// When true, mempool scan is disabled to prevent P2P race conditions
     /// FIX #139: Also pauses/resumes block listeners for faster header sync
@@ -921,6 +938,12 @@ final class NetworkManager: ObservableObject {
     private func refreshChainHeight() async {
         guard isConnected else { return }
 
+        // FIX #145: Skip if background processes are disabled (initial sync in progress)
+        guard backgroundProcessesEnabled else {
+            debugLog(.network, "📊 refreshChainHeight: skipped (initial sync in progress)")
+            return
+        }
+
         let torEnabled = await TorManager.shared.mode == .enabled
         var newHeight: UInt64 = 0
         var networkTruthHeight: UInt64 = 0
@@ -1541,6 +1564,9 @@ final class NetworkManager: ObservableObject {
 
                         // Stop if we've reached target
                         if connectedCount >= targetPeers {
+                            // FIX #151: Cancel remaining tasks so withTaskGroup doesn't hang
+                            // waiting for slow/unresponsive connection attempts
+                            group.cancelAll()
                             break
                         }
                     }
@@ -1620,6 +1646,13 @@ final class NetworkManager: ObservableObject {
         DispatchQueue.main.async {
             self.connectedPeers = 0
             self.isConnected = false
+        }
+    }
+
+    /// FIX #142: Disconnect all peers (alias for disconnect() used by TorManager bypass)
+    func disconnectAllPeers() async {
+        await MainActor.run {
+            self.disconnect()
         }
     }
 
@@ -2192,6 +2225,12 @@ final class NetworkManager: ObservableObject {
     /// Scan mempool for incoming shielded transactions
     /// Uses trial decryption to detect payments before confirmation
     private func scanMempoolForIncoming() async {
+        // FIX #145: Skip if background processes are disabled (initial sync in progress)
+        guard backgroundProcessesEnabled else {
+            print("🔮 scanMempoolForIncoming: skipped (initial sync in progress)")
+            return
+        }
+
         // FIX #130: Skip mempool scan if header sync is in progress to prevent P2P race conditions
         if isHeaderSyncing {
             print("🔮 scanMempoolForIncoming: skipped (header sync in progress)")

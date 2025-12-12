@@ -400,11 +400,17 @@ final class Peer {
         // Use Tor parameters if Tor is enabled (for privacy even with regular IPs)
         // CRITICAL: If Tor mode is enabled, ALWAYS use SOCKS5 (connectViaSocks5 will wait for Tor)
         // This prevents direct connections when Tor isn't ready yet
+        // FIX #144: Check isTorBypassed - when bypassed, connect directly for speed
         let torEnabled = await TorManager.shared.mode == .enabled
-        if torEnabled {
+        let torBypassed = await TorManager.shared.isTorBypassed
+        if torEnabled && !torBypassed {
             // Route through Tor SOCKS5 proxy for privacy (will wait for Tor if not ready)
             try await connectViaSocks5()
             return
+        }
+        // FIX #144: If Tor is bypassed, use direct connection for faster header sync
+        if torBypassed {
+            print("📡 [\(host)] Connecting directly (Tor bypassed for speed)")
         }
         let parameters = NWParameters.tcp
         // Don't restrict to wifi - allow any network interface
@@ -417,30 +423,45 @@ final class Peer {
         connection = NWConnection(to: endpoint, using: parameters)
 
         // Add timeout for connection
+        // FIX #152: Use withTaskCancellationHandler to ensure continuation resumes on cancellation
         return try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    var hasResumed = false
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        var hasResumed = false
+                        let resumeLock = NSLock()
 
-                    self.connection?.stateUpdateHandler = { state in
-                        guard !hasResumed else { return }
-
-                        switch state {
-                        case .ready:
-                            hasResumed = true
-                            continuation.resume()
-                        case .failed(let error):
-                            hasResumed = true
-                            continuation.resume(throwing: NetworkError.connectionFailed(error.localizedDescription))
-                        case .cancelled:
-                            hasResumed = true
-                            continuation.resume(throwing: NetworkError.connectionFailed("Connection cancelled"))
-                        default:
-                            break
+                        // FIX #152: Check if task is already cancelled before starting
+                        if Task.isCancelled {
+                            continuation.resume(throwing: CancellationError())
+                            return
                         }
-                    }
 
-                    self.connection?.start(queue: self.queue)
+                        self.connection?.stateUpdateHandler = { state in
+                            resumeLock.lock()
+                            defer { resumeLock.unlock() }
+                            guard !hasResumed else { return }
+
+                            switch state {
+                            case .ready:
+                                hasResumed = true
+                                continuation.resume()
+                            case .failed(let error):
+                                hasResumed = true
+                                continuation.resume(throwing: NetworkError.connectionFailed(error.localizedDescription))
+                            case .cancelled:
+                                hasResumed = true
+                                continuation.resume(throwing: NetworkError.connectionFailed("Connection cancelled"))
+                            default:
+                                break
+                            }
+                        }
+
+                        self.connection?.start(queue: self.queue)
+                    }
+                } onCancel: {
+                    // FIX #152: When task is cancelled, cancel the NWConnection to trigger state change
+                    self.connection?.cancel()
                 }
             }
 
@@ -953,7 +974,14 @@ final class Peer {
 
                 } catch NetworkError.timeout {
                     // Timeout is normal - just continue listening
+                    // FIX #120: Check if we should stop after each timeout
+                    if !self._isListening {
+                        break
+                    }
                     continue
+                } catch is CancellationError {
+                    // FIX #120: Listener was stopped - exit cleanly without error message
+                    break
                 } catch NetworkError.invalidMagicBytes {
                     // For .onion peers, invalid magic bytes might be Tor noise - retry with backoff
                     consecutiveErrors += 1
@@ -1019,6 +1047,12 @@ final class Peer {
     /// Tolerant version for block listener - throws invalidMagicBytes instead of handshakeFailed
     /// This allows the listener to retry on Tor noise instead of immediately stopping
     private func receiveMessageNonBlockingTolerant() async throws -> (String, Data) {
+        // FIX #120: Check if listener should stop BEFORE starting receive
+        // This allows stopBlockListener() to immediately cancel pending receives
+        guard _isListening else {
+            throw CancellationError()
+        }
+
         guard let connection = connection else {
             throw NetworkError.notConnected
         }
@@ -1026,13 +1060,15 @@ final class Peer {
         // Use a short timeout to periodically check if we should stop
         return try await withThrowingTaskGroup(of: (String, Data).self) { group in
             group.addTask {
+                // FIX #120: Check cancellation before blocking on receive
+                try Task.checkCancellation()
                 return try await self.receiveMessageTolerant()
             }
 
             group.addTask {
-                // FIX #138: Reduced from 30s to 5s to allow header sync to acquire lock faster
-                // Block listener will retry immediately, so short timeout doesn't miss messages
-                try await Task.sleep(nanoseconds: 5_000_000_000)
+                // FIX #120: Reduced from 5s to 1s to allow faster listener shutdown
+                // This is the maximum time stopBlockListener() will wait before listener exits
+                try await Task.sleep(nanoseconds: 1_000_000_000)
                 throw NetworkError.timeout
             }
 
@@ -1145,7 +1181,9 @@ final class Peer {
         let maxVersionAttempts = 5  // Max messages to check before giving up on version
 
         while !receivedVersion && versionAttempts < maxVersionAttempts {
-            let (command, payload) = try await receiveMessage()
+            // FIX #150: Use timeout to prevent hung connections during startup
+            // NWConnection.receive() doesn't respond to Swift task cancellation
+            let (command, payload) = try await receiveMessageWithTimeout(seconds: 10)
             versionAttempts += 1
 
             if command == "version" {
@@ -1191,7 +1229,8 @@ final class Peer {
         let maxAttempts = 8  // Increased to allow for sendaddrv2 after verack
 
         while attempts < maxAttempts {
-            let (command, _) = try await receiveMessage()
+            // FIX #150: Use timeout to prevent hung connections during startup
+            let (command, _) = try await receiveMessageWithTimeout(seconds: 10)
             attempts += 1
 
             if command == "verack" {

@@ -68,8 +68,27 @@ final class HeaderSyncManager {
             return
         }
 
-        let totalHeaders = Int(chainTip - startHeight)
-        print("📥 Need to sync \(totalHeaders) headers")
+        // FIX #141: Check what we ACTUALLY need to sync
+        // If we already have headers up to a certain height, start from there instead
+        var effectiveStartHeight = startHeight
+        if let maxStoredHeight = try? headerStore.getLatestHeight(),
+           maxStoredHeight >= startHeight {
+            // We already have headers from startHeight up to maxStoredHeight
+            // Only sync from maxStoredHeight + 1
+            effectiveStartHeight = maxStoredHeight + 1
+
+            if effectiveStartHeight > chainTip {
+                print("✅ FIX #141: Already have headers up to \(maxStoredHeight), nothing new to sync!")
+                return
+            }
+
+            print("📋 FIX #141: Already have headers up to \(maxStoredHeight)")
+            print("📋 FIX #141: Starting sync from \(effectiveStartHeight) instead of \(startHeight)")
+            print("📋 FIX #141: This saves syncing \(effectiveStartHeight - startHeight) headers we already have!")
+        }
+
+        let totalHeaders = Int(chainTip - effectiveStartHeight)
+        print("📥 Need to sync \(totalHeaders) headers (from \(effectiveStartHeight) to \(chainTip))")
 
         // FIX #122: FAST PARALLEL HEADER SYNC
         // Instead of sequential batch-by-batch with consensus, use parallel fetching:
@@ -80,10 +99,17 @@ final class HeaderSyncManager {
 
         if totalHeaders <= 500 {
             // Small sync - use simple single-peer fetch (faster for small ranges)
-            try await syncHeadersSimple(from: startHeight, to: chainTip)
+            try await syncHeadersSimple(from: effectiveStartHeight, to: chainTip)
         } else {
             // Large sync - use parallel multi-peer fetch
-            try await syncHeadersParallel(from: startHeight, to: chainTip)
+            try await syncHeadersParallel(from: effectiveStartHeight, to: chainTip)
+        }
+
+        // FIX #141: Fill any gaps that may have been created during sync
+        // This is important when parallel sync has chain discontinuity errors
+        let gapsFilled = try await fillHeaderGaps()
+        if gapsFilled > 0 {
+            print("📋 Filled \(gapsFilled) header gaps after main sync")
         }
 
         print("🎉 Header sync complete! Synced to height \(chainTip)")
@@ -291,38 +317,69 @@ final class HeaderSyncManager {
 
             // FIX #141: Request from ALL peers in parallel, take first valid response
             // This dramatically speeds up sync over Tor where latency varies wildly
-            let headers: [ZclassicBlockHeader]? = await withTaskGroup(of: (Peer, [ZclassicBlockHeader]?).self) { group in
-                // Start requests to all peers
+            // FIX #142: Increased timeout from 2s to 15s for Tor compatibility
+            // FIX #148: Use detached tasks to avoid waiting for cancelled peer timeouts
+            //          The old withTaskGroup waited for ALL tasks even after cancelAll()
+            //          This caused 36+ second delays between batches
+            var headers: [ZclassicBlockHeader]?
+            let totalPeers = currentPeers.count
+
+            // Thread-safe state for tracking completion
+            final class SyncState: @unchecked Sendable {
+                var tasksCompleted = 0
+                var resumed = false
+                let lock = NSLock()
+            }
+            let state = SyncState()
+
+            // Create a continuation to get the first result without waiting for others
+            headers = await withCheckedContinuation { continuation in
                 for peer in currentPeers {
-                    group.addTask {
+                    Task.detached { [state, headersStartHeight, totalPeers] in
+                        defer {
+                            state.lock.lock()
+                            state.tasksCompleted += 1
+                            // If all tasks failed and we haven't resumed yet, resume with nil
+                            if state.tasksCompleted >= totalPeers && !state.resumed {
+                                state.resumed = true
+                                state.lock.unlock()
+                                continuation.resume(returning: nil)
+                            } else {
+                                state.lock.unlock()
+                            }
+                        }
+
                         do {
                             let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
                                 try await peer.sendMessage(command: "getheaders", payload: payload)
-
-                                // FIX #141: Short 2s timeout - if peer doesn't respond quickly, skip it
-                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 2)
+                                // FIX #142: 15s timeout for Tor mode
+                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 15)
                                 if command == "headers" {
-                                    // FIX #133: Use correct starting height
                                     return try self.parseHeadersPayload(response, startingAt: headersStartHeight)
                                 }
                                 return []
                             }
-                            return (peer, result.isEmpty ? nil : result)
+
+                            // First valid response wins - resume immediately!
+                            if !result.isEmpty {
+                                state.lock.lock()
+                                if !state.resumed {
+                                    state.resumed = true
+                                    state.lock.unlock()
+                                    print("⚡ FIX #148: Got \(result.count) headers from \(peer.host) (INSTANT - no wait for others)")
+                                    continuation.resume(returning: result)
+                                } else {
+                                    state.lock.unlock()
+                                }
+                            }
                         } catch {
-                            return (peer, nil)
+                            // Task failed or cancelled - don't log CancellationError spam
+                            if !(error is CancellationError) {
+                                print("⚠️ Peer \(peer.host) header request failed: \(error.localizedDescription)")
+                            }
                         }
                     }
                 }
-
-                // Take FIRST valid response (fastest peer wins!)
-                for await (peer, result) in group {
-                    if let headers = result, !headers.isEmpty {
-                        print("⚡ FIX #141: Got \(headers.count) headers from \(peer.host) (first responder)")
-                        group.cancelAll()  // Cancel other requests
-                        return headers
-                    }
-                }
-                return nil
             }
 
             guard let headers = headers, !headers.isEmpty else {
@@ -754,7 +811,26 @@ final class HeaderSyncManager {
             }
         }
 
-        // Fourth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
+        // FIX #141: Fourth try - Use HIGHEST available header from HeaderStore as locator
+        // This prevents re-syncing thousands of headers we already have!
+        // Only do this if the max height is BEFORE the requested locatorHeight (otherwise First try would have worked)
+        if locatorHash == nil {
+            if let maxStoredHeight = try? headerStore.getLatestHeight(),
+               maxStoredHeight > 0 && maxStoredHeight < locatorHeight {
+                // Check if we have headers close to what we need (within 10000 blocks)
+                // If HeaderStore has height 2938000 and we need 2939409, use 2938000
+                if locatorHeight - maxStoredHeight < 10000 {
+                    if let nearestHeader = try? headerStore.getHeader(at: maxStoredHeight) {
+                        locatorHash = nearestHeader.blockHash
+                        actualLocatorHeight = maxStoredHeight
+                        print("📋 FIX #141: Using HeaderStore MAX height \(maxStoredHeight) as locator (requested \(locatorHeight))")
+                        print("📋 This saves syncing \(locatorHeight - maxStoredHeight) headers we don't have yet")
+                    }
+                }
+            }
+        }
+
+        // Fifth try: Find nearest checkpoint BELOW the requested height (P2P-safe fallback)
         // FIX #133: This MUST update actualLocatorHeight to reflect the real starting point
         // Otherwise headers will be assigned wrong heights!
         if locatorHash == nil {

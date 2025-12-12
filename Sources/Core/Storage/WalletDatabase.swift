@@ -2995,8 +2995,9 @@ final class WalletDatabase {
     /// This corrects estimated timestamps saved by older code or newly synced transactions
     @discardableResult
     func fixTransactionBlockTimes() throws -> Int {
-        // Get all transactions with NULL or zero block_time
-        let selectSql = "SELECT id, block_height FROM transaction_history WHERE block_height > 0 AND (block_time IS NULL OR block_time = 0);"
+        // FIX #143: Get ALL transactions and verify their timestamps against HeaderStore
+        // Previously this only fixed NULL/zero timestamps, but incorrect timestamps also need fixing
+        let selectSql = "SELECT id, block_height, block_time FROM transaction_history WHERE block_height > 0;"
 
         var selectStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
@@ -3009,12 +3010,24 @@ final class WalletDatabase {
         while sqlite3_step(selectStmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(selectStmt, 0)
             let height = UInt64(sqlite3_column_int64(selectStmt, 1))
+            let currentTime = UInt32(sqlite3_column_int64(selectStmt, 2))
 
-            // Get actual block time - try BlockTimestampManager first (bundled data), then HeaderStore
-            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
-                updates.append((id: id, time: timestamp))
-            } else if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
-                updates.append((id: id, time: blockTime))
+            // FIX #143: Get correct block time from HeaderStore (P2P synced headers are authoritative)
+            // PRIORITY 1: HeaderStore headers table (real P2P-synced data)
+            // PRIORITY 2: BlockTimestampManager (boost file for historical blocks)
+            var correctTime: UInt32?
+            if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
+                correctTime = blockTime
+            } else if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
+                correctTime = timestamp
+            }
+
+            // FIX #143: Only update if we have a correct time AND it differs from current
+            if let correct = correctTime {
+                if currentTime != correct {
+                    updates.append((id: id, time: correct))
+                    print("📜 Correcting timestamp for height \(height): \(currentTime) -> \(correct)")
+                }
             }
         }
 
@@ -3039,7 +3052,9 @@ final class WalletDatabase {
         }
 
         if fixedCount > 0 {
-            print("📜 Fixed block_time for \(fixedCount) transactions using real timestamps from HeaderStore")
+            print("📜 FIX #143: Corrected block_time for \(fixedCount) transactions using real timestamps from HeaderStore")
+        } else {
+            print("📜 All transaction timestamps are correct (no corrections needed)")
         }
         return fixedCount
     }
