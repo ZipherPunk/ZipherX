@@ -726,6 +726,42 @@ size_t zipherx_scan_boost_outputs(
 );
 
 // =============================================================================
+// Transaction Verification (FIX #xxx - VUL-002)
+// Validate Sapling proofs BEFORE broadcasting to prevent invalid TX propagation
+// =============================================================================
+
+/// Error codes for transaction verification
+typedef enum {
+    TX_VERIFY_SUCCESS = 0,
+    TX_VERIFY_INVALID_DATA = 1,
+    TX_VERIFY_PARSE_FAILED = 2,
+    TX_VERIFY_NO_SAPLING_BUNDLE = 3,
+    TX_VERIFY_SPEND_FAILED = 4,
+    TX_VERIFY_OUTPUT_FAILED = 5,
+    TX_VERIFY_BINDING_SIG_FAILED = 6,
+    TX_VERIFY_MISSING_KEY = 7,
+    TX_VERIFY_INVALID_SIGHASH = 8
+} TxVerifyError;
+
+/// Verify a serialized Sapling transaction before broadcasting
+/// This performs the same validation as zclassic's mempool acceptance:
+/// - Validates all SpendDescription proofs
+/// - Validates all OutputDescription proofs
+/// - Validates the binding signature
+///
+/// @param tx_data Serialized transaction bytes
+/// @param tx_len Length of transaction data
+/// @param chain_height Current chain height (for branch ID selection)
+/// @param error_out Pointer to receive error code on failure
+/// @return true if transaction is valid, false otherwise
+bool zipherx_verify_transaction(
+    const uint8_t *tx_data,
+    size_t tx_len,
+    uint64_t chain_height,
+    uint32_t *error_out
+);
+
+// =============================================================================
 // Tor (Arti) Integration - Embedded Tor for iOS and macOS
 // =============================================================================
 
@@ -805,6 +841,35 @@ bool zipherx_tor_hidden_service_is_available(void);
 
 /// Get hidden service port (typically 8033 for Zclassic P2P)
 uint16_t zipherx_tor_hidden_service_get_port(void);
+
+// =============================================================================
+// MARK: - Hidden Service Keypair (Persistent .onion Address)
+// =============================================================================
+
+/// Generate a new Ed25519 keypair for hidden service (64 bytes: 32 secret + 32 public)
+/// The keypair determines the .onion address - save it for persistent addresses
+/// Returns 0 on success, 1 on error
+int32_t zipherx_tor_generate_hs_keypair(uint8_t *out_keypair);
+
+/// Set the hidden service keypair from 64 bytes (32-byte secret + 32-byte public)
+/// This keypair will be used when starting the hidden service to maintain a fixed .onion address
+/// Must be called BEFORE zipherx_tor_hidden_service_start()
+/// Returns 0 on success, 1 on error
+int32_t zipherx_tor_set_hs_keypair(const uint8_t *keypair, size_t len);
+
+/// Clear the stored hidden service keypair
+/// Next hidden service start will generate a random .onion address
+/// Returns 0 on success
+int32_t zipherx_tor_clear_hs_keypair(void);
+
+/// Check if a persistent keypair is set
+/// Returns 1 if keypair is set, 0 if not
+int32_t zipherx_tor_has_hs_keypair(void);
+
+/// Get the .onion address that would be generated from the stored keypair
+/// Returns NULL if no keypair is set
+/// Caller must free with zipherx_tor_free_string
+char* zipherx_tor_get_keypair_onion_address(void);
 
 // =============================================================================
 // MARK: - Cypherpunk Chat (Encrypted P2P Messaging over Tor)

@@ -38,15 +38,20 @@ ureq = { version = "2.9", features = ["json"] }
 base64 = "0.21"
 bls12_381 = "0.8"
 equihash = "0.2"
+bellman = "0.14"
+subtle = "2.5"
 
 # Arti - Rust implementation of Tor for embedded use
 # onion-service-client: connecting to .onion addresses
 # onion-service-service: hosting a .onion hidden service (ZipherX becomes discoverable!)
-arti-client = { version = "0.37", default-features = false, features = ["tokio", "rustls", "onion-service-client", "onion-service-service"] }
+# experimental-api: enables launch_onion_service_with_hsid for persistent .onion addresses
+arti-client = { version = "0.37", default-features = false, features = ["tokio", "rustls", "onion-service-client", "onion-service-service", "experimental-api"] }
 tor-rtcompat = { version = "0.37", features = ["tokio", "rustls"] }
 tor-hsservice = "0.37"
 tor-hscrypto = "0.37"
+tor-llcrypto = "0.37"
 tor-cell = "0.37"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 tor-proto = "0.37"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net", "macros"] }
 once_cell = "1.19"

@@ -123,6 +123,14 @@ public final class TorManager: ObservableObject {
     /// Cache for SOCKS proxy ready state (prevents repeated connection tests)
     private var socksProxyVerified = false
 
+    // MARK: - Persistent Onion Address (FIX #169)
+
+    /// Keychain key for storing the hidden service keypair
+    private let hsKeypairKeychainKey = "com.zipherx.hidden-service-keypair"
+
+    /// The persistent .onion address (derived from stored keypair)
+    @Published public private(set) var persistentOnionAddress: String?
+
     /// Lock to prevent multiple concurrent waitForSocksProxyReady() calls
     private var isWaitingForSocksProxy = false
     private let socksProxyLock = NSLock()
@@ -148,6 +156,17 @@ public final class TorManager: ObservableObject {
         // Check if Arti is available
         let isAvailable = zipherx_tor_is_available()
         print("🧅 TorManager initialized, mode: \(mode.displayName), Arti available: \(isAvailable)")
+
+        // FIX #169: Load persistent keypair from Keychain if it exists
+        // This ensures the .onion address is consistent across app launches
+        if let keypairData = loadKeypairFromKeychain() {
+            if setKeypairInFFI(keypairData) {
+                persistentOnionAddress = getOnionAddressFromFFI()
+                print("🧅 FIX #169: Loaded persistent keypair - address: \(persistentOnionAddress ?? "nil")")
+            }
+        } else {
+            print("🧅 FIX #169: No persistent keypair - will generate new one when hidden service starts")
+        }
     }
 
     // MARK: - Public API
@@ -695,6 +714,162 @@ public final class TorManager: ObservableObject {
         socksProxyLock.lock()
         isWaitingForSocksProxy = false
         socksProxyLock.unlock()
+    }
+
+    // MARK: - FIX #169: Persistent Hidden Service Keypair Management
+
+    /// Check if a persistent keypair exists in Keychain
+    public var hasPersistentKeypair: Bool {
+        loadKeypairFromKeychain() != nil
+    }
+
+    /// Generate a new Ed25519 keypair and save to Keychain
+    /// Returns the .onion address that will be used, or nil on error
+    public func generateAndSaveKeypair() -> String? {
+        var keypairBuffer = [UInt8](repeating: 0, count: 64)
+
+        let result = keypairBuffer.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            zipherx_tor_generate_hs_keypair(ptr.baseAddress)
+        }
+
+        guard result == 0 else {
+            print("🧅 FIX #169: Failed to generate keypair")
+            return nil
+        }
+
+        // Save to Keychain
+        let keypairData = Data(keypairBuffer)
+        guard saveKeypairToKeychain(keypairData) else {
+            print("🧅 FIX #169: Failed to save keypair to Keychain")
+            return nil
+        }
+
+        // Set the keypair in FFI for future hidden service starts
+        _ = setKeypairInFFI(keypairData)
+
+        // Get the .onion address from the keypair
+        let onionAddress = getOnionAddressFromFFI()
+        persistentOnionAddress = onionAddress
+
+        print("🧅 FIX #169: Generated and saved persistent keypair")
+        print("🧅 FIX #169: Persistent .onion address: \(onionAddress ?? "nil")")
+
+        return onionAddress
+    }
+
+    /// Load keypair from Keychain and set it in FFI
+    /// Call this before starting the hidden service
+    /// Returns the .onion address, or nil if no keypair exists
+    public func loadAndSetPersistentKeypair() -> String? {
+        guard let keypairData = loadKeypairFromKeychain() else {
+            print("🧅 FIX #169: No persistent keypair found - will generate random .onion address")
+            persistentOnionAddress = nil
+            return nil
+        }
+
+        // Set the keypair in FFI
+        guard setKeypairInFFI(keypairData) else {
+            print("🧅 FIX #169: Failed to set keypair in FFI")
+            return nil
+        }
+
+        // Get the .onion address
+        let onionAddress = getOnionAddressFromFFI()
+        persistentOnionAddress = onionAddress
+
+        print("🧅 FIX #169: Loaded persistent keypair from Keychain")
+        print("🧅 FIX #169: Persistent .onion address: \(onionAddress ?? "nil")")
+
+        return onionAddress
+    }
+
+    /// Clear the stored keypair (will generate random address on next start)
+    public func clearPersistentKeypair() {
+        // Clear from FFI
+        _ = zipherx_tor_clear_hs_keypair()
+
+        // Delete from Keychain
+        deleteKeypairFromKeychain()
+
+        persistentOnionAddress = nil
+
+        print("🧅 FIX #169: Cleared persistent keypair - next start will use random address")
+    }
+
+    /// Regenerate keypair (clear old, generate new)
+    /// Returns the new .onion address, or nil on error
+    public func regenerateKeypair() -> String? {
+        clearPersistentKeypair()
+        return generateAndSaveKeypair()
+    }
+
+    // MARK: - Private Keychain Helpers
+
+    private func saveKeypairToKeychain(_ keypairData: Data) -> Bool {
+        // Delete existing if any
+        deleteKeypairFromKeychain()
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: hsKeypairKeychainKey,
+            kSecValueData as String: keypairData,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status != errSecSuccess {
+            print("🧅 FIX #169: Keychain save error: \(status)")
+            return false
+        }
+        return true
+    }
+
+    private func loadKeypairFromKeychain() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: hsKeypairKeychainKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data, data.count == 64 {
+            return data
+        }
+        return nil
+    }
+
+    private func deleteKeypairFromKeychain() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: hsKeypairKeychainKey
+        ]
+
+        SecItemDelete(query as CFDictionary)
+    }
+
+    // MARK: - Private FFI Helpers
+
+    private func setKeypairInFFI(_ keypairData: Data) -> Bool {
+        let result = keypairData.withUnsafeBytes { ptr -> Int32 in
+            guard let baseAddress = ptr.baseAddress else { return 1 }
+            return zipherx_tor_set_hs_keypair(baseAddress.assumingMemoryBound(to: UInt8.self), keypairData.count)
+        }
+        return result == 0
+    }
+
+    private func getOnionAddressFromFFI() -> String? {
+        guard let addressPtr = zipherx_tor_get_keypair_onion_address() else {
+            return nil
+        }
+        let address = String(cString: addressPtr)
+        zipherx_tor_free_string(addressPtr)
+        return address
     }
 }
 

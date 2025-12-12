@@ -6,11 +6,12 @@
 
 use arti_client::{TorClient, TorClientConfig, StreamPrefs};
 use tor_rtcompat::PreferredRuntime;
+use tor_hscrypto::pk::{HsIdKeypair, HsIdKey};
 use tokio::runtime::Runtime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::OnceCell;
-use std::sync::{Arc, Mutex, atomic::{AtomicU8, AtomicU16, AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU8, AtomicU16, AtomicBool, AtomicPtr, Ordering}};
 use std::path::PathBuf;
 use std::net::SocketAddr;
 
@@ -477,7 +478,7 @@ pub extern "C" fn zipherx_tor_is_available() -> bool {
 
 use tor_hsservice::config::{OnionServiceConfig, OnionServiceConfigBuilder};
 use tor_hsservice::RunningOnionService;
-use std::sync::atomic::AtomicPtr;
+// AtomicPtr already imported at line 14
 
 /// Running hidden service handle - MUST be kept alive for the service to accept connections
 static HIDDEN_SERVICE_HANDLE: OnceCell<Mutex<Option<Arc<RunningOnionService>>>> = OnceCell::new();
@@ -494,6 +495,11 @@ const HIDDEN_SERVICE_P2P_PORT: u16 = 8033;
 
 /// Chat port for encrypted messaging (8034 = ZipherX chat)
 const HIDDEN_SERVICE_CHAT_PORT: u16 = 8034;
+
+/// Persistent hidden service keypair (64 bytes: 32-byte secret + 32-byte public)
+/// When set, the hidden service will use this keypair instead of generating a new one
+/// This enables persistent .onion addresses across app restarts
+static HIDDEN_SERVICE_KEYPAIR: Mutex<Option<[u8; 64]>> = Mutex::new(None);
 
 /// Callback type for incoming connections (connection_id, peer_host, peer_port)
 static INCOMING_CONNECTION_CALLBACK: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -569,11 +575,52 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
     let config: OnionServiceConfig = config_builder.build()?;
 
+    // Check if we have a persistent keypair stored
+    let stored_keypair = HIDDEN_SERVICE_KEYPAIR.lock()
+        .map_err(|_| "Failed to lock keypair storage")?
+        .clone();
+
     eprintln!("🧅 Launching hidden service...");
 
-    // Launch the onion service
-    let (service, rend_requests) = client.launch_onion_service(config)?
-        .ok_or("Hidden service returned None")?;
+    // Launch the onion service - with or without a pre-existing keypair
+    let (service, rend_requests) = if let Some(keypair_bytes) = stored_keypair {
+        // Use stored keypair for persistent .onion address
+        eprintln!("🧅 Using persistent keypair for fixed .onion address");
+
+        // Extract secret key from the 64-byte keypair (first 32 bytes)
+        // The second 32 bytes are the public key (for verification only)
+        let secret_bytes: [u8; 32] = keypair_bytes[..32].try_into()
+            .map_err(|_| "Invalid secret key length")?;
+        let stored_public_bytes: [u8; 32] = keypair_bytes[32..].try_into()
+            .map_err(|_| "Invalid public key length")?;
+
+        // Create tor_llcrypto Keypair from secret bytes
+        // This internally uses ed25519_dalek::SigningKey and derives the public key
+        use tor_llcrypto::pk::ed25519::{Keypair as TorKeypair, ExpandedKeypair};
+
+        let tor_keypair = TorKeypair::from_bytes(&secret_bytes);
+
+        // Verify the derived public key matches the stored one
+        let derived_public = tor_keypair.verifying_key();
+        if *derived_public.as_bytes() != stored_public_bytes {
+            return Err("Keypair mismatch: derived public key doesn't match stored public key".into());
+        }
+
+        // Create ExpandedKeypair from Keypair, then HsIdKeypair from ExpandedKeypair
+        // HsIdKeypair wraps an ExpandedKeypair (which is different from regular Keypair)
+        let expanded_keypair = ExpandedKeypair::from(&tor_keypair);
+        let hs_id_keypair = HsIdKeypair::from(expanded_keypair);
+
+        // Launch with the persistent keypair using the keystore-based API
+        // This inserts the keypair into Arti's keystore and launches the service
+        client.launch_onion_service_with_hsid(config, hs_id_keypair)?
+            .ok_or("Hidden service returned None (with keypair)")?
+    } else {
+        // Generate new random address
+        eprintln!("🧅 No persistent keypair - generating new random .onion address");
+        client.launch_onion_service(config)?
+            .ok_or("Hidden service returned None")?
+    };
 
     // CRITICAL: Store the service handle to keep it alive
     // Without this, the hidden service stops accepting connections immediately!
@@ -1239,6 +1286,126 @@ pub extern "C" fn zipherx_tor_hidden_service_get_address() -> *mut libc::c_char 
         }
     }
     std::ptr::null_mut()
+}
+
+// ==================================================================================
+// PERSISTENT KEYPAIR MANAGEMENT - For fixed .onion addresses
+// ==================================================================================
+
+/// Generate a new Ed25519 keypair for hidden service
+/// Returns 64 bytes (32-byte secret key + 32-byte public key) into the provided buffer
+/// Returns 0 on success, 1 on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tor_generate_hs_keypair(out_keypair: *mut u8) -> i32 {
+    if out_keypair.is_null() {
+        return 1;
+    }
+
+    use rand::rngs::OsRng;
+    use ed25519_dalek::SigningKey;
+
+    // Generate a new random Ed25519 signing key
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let secret_bytes = signing_key.to_bytes(); // 32 bytes
+    let public_bytes = signing_key.verifying_key().to_bytes(); // 32 bytes
+
+    // Copy to output buffer: [secret(32) | public(32)]
+    let out_slice = std::slice::from_raw_parts_mut(out_keypair, 64);
+    out_slice[..32].copy_from_slice(&secret_bytes);
+    out_slice[32..64].copy_from_slice(&public_bytes);
+
+    eprintln!("🧅 Generated new hidden service keypair");
+    0
+}
+
+/// Set the hidden service keypair from 64 bytes (32-byte secret + 32-byte public)
+/// This keypair will be used when starting the hidden service to maintain a fixed .onion address
+/// Returns 0 on success, 1 on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tor_set_hs_keypair(keypair: *const u8, len: usize) -> i32 {
+    if keypair.is_null() || len != 64 {
+        eprintln!("🧅 Invalid keypair: null or wrong length (got {}, expected 64)", len);
+        return 1;
+    }
+
+    let keypair_slice = std::slice::from_raw_parts(keypair, 64);
+    let mut keypair_array = [0u8; 64];
+    keypair_array.copy_from_slice(keypair_slice);
+
+    if let Ok(mut guard) = HIDDEN_SERVICE_KEYPAIR.lock() {
+        *guard = Some(keypair_array);
+        eprintln!("🧅 Hidden service keypair set (persistent .onion address enabled)");
+        return 0;
+    }
+
+    1
+}
+
+/// Clear the stored hidden service keypair
+/// The next hidden service start will generate a new random address
+/// Returns 0 on success
+#[no_mangle]
+pub extern "C" fn zipherx_tor_clear_hs_keypair() -> i32 {
+    if let Ok(mut guard) = HIDDEN_SERVICE_KEYPAIR.lock() {
+        *guard = None;
+        eprintln!("🧅 Hidden service keypair cleared");
+        return 0;
+    }
+    1
+}
+
+/// Check if a persistent keypair is set
+/// Returns 1 if set, 0 if not set
+#[no_mangle]
+pub extern "C" fn zipherx_tor_has_hs_keypair() -> i32 {
+    if let Ok(guard) = HIDDEN_SERVICE_KEYPAIR.lock() {
+        if guard.is_some() { 1 } else { 0 }
+    } else {
+        0
+    }
+}
+
+/// Get the .onion address that would be generated from the stored keypair
+/// This can be called before starting the hidden service to preview the address
+/// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+/// Returns null if no keypair is set
+#[no_mangle]
+pub extern "C" fn zipherx_tor_get_keypair_onion_address() -> *mut libc::c_char {
+    let keypair = match HIDDEN_SERVICE_KEYPAIR.lock() {
+        Ok(guard) => match *guard {
+            Some(kp) => kp,
+            None => return std::ptr::null_mut(),
+        },
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    // Extract public key (second 32 bytes)
+    let pubkey_bytes: [u8; 32] = keypair[32..64].try_into().unwrap();
+
+    // Compute .onion address from public key
+    // Tor v3 spec: CHECKSUM = H(".onion checksum" || PUBKEY || VERSION)[:2]
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(&pubkey_bytes);
+    hasher.update(&[0x03u8]); // Version 3
+    let checksum_full = hasher.finalize();
+    let checksum = [checksum_full[0], checksum_full[1]];
+
+    // Combine: pubkey(32) + checksum(2) + version(1) = 35 bytes
+    let mut address_bytes = Vec::with_capacity(35);
+    address_bytes.extend_from_slice(&pubkey_bytes);
+    address_bytes.extend_from_slice(&checksum);
+    address_bytes.push(0x03); // Version 3
+
+    // Base32 encode (lowercase, no padding)
+    let onion_base32 = base32_encode(&address_bytes);
+    let onion_addr = format!("{}.onion", onion_base32);
+
+    match std::ffi::CString::new(onion_addr) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Set callback for incoming P2P connections
