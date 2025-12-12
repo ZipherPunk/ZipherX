@@ -201,6 +201,14 @@ final class HeaderSyncManager {
     private func syncHeadersSimple(from startHeight: UInt64, to chainTip: UInt64) async throws {
         print("⚡ Using simple sync with peer rotation for \(chainTip - startHeight) headers")
 
+        // FIX #155: Report initial progress (0%) before starting
+        let initialProgress = HeaderSyncProgress(
+            currentHeight: startHeight,
+            totalHeight: chainTip,
+            headersStored: (try? headerStore.getHeaderCount()) ?? 0
+        )
+        onProgress?(initialProgress)
+
         var currentHeight = startHeight
         var failedPeers = Set<String>()
 
@@ -287,6 +295,14 @@ final class HeaderSyncManager {
         guard !peers.isEmpty else {
             throw SyncError.insufficientPeers(got: 0, need: 1)
         }
+
+        // FIX #155: Report initial progress (0%) before starting
+        let initialProgress = HeaderSyncProgress(
+            currentHeight: startHeight,
+            totalHeight: chainTip,
+            headersStored: (try? headerStore.getHeaderCount()) ?? 0
+        )
+        onProgress?(initialProgress)
 
         print("📊 Requesting headers from ALL \(peers.count) peers in parallel (first response wins)")
 

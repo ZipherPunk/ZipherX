@@ -7902,6 +7902,52 @@ while networkManager.connectedPeers < 3 && peerWait < maxPeerWait {
 
 ---
 
+### 155. FAST START Health Check Details + Header Sync Progress (December 12, 2025)
+
+**Problem 1**: FAST START completion screen showed "Health: 9/10 passed" but didn't show WHICH check failed.
+
+**Problem 2**: Header sync progress bar showed no intermediate progress (jumped from 0% to 100% instantly).
+
+**Root Causes**:
+1. `debugCompletionMessage` only showed pass/fail counts, not the names of failed checks
+2. `syncHeadersSimple()` and `syncHeadersParallel()` only called `onProgress` AFTER each batch completed, not at the start
+
+**Solution (FIX #155)**: Two-part fix:
+
+1. **Show failed health check names in completion screen** (`ContentView.swift`):
+```swift
+let passedCount = healthResults.filter { $0.passed }.count
+let failedChecks = healthResults.filter { !$0.passed }
+var healthMessage = "Health: \(passedCount)/\(healthResults.count) passed"
+if !failedChecks.isEmpty {
+    healthMessage += "\n\n⚠️ Failed checks:"
+    for check in failedChecks {
+        healthMessage += "\n• \(check.checkName)"
+    }
+}
+```
+
+2. **Report initial progress (0%) before starting sync** (`HeaderSyncManager.swift`):
+```swift
+// In both syncHeadersSimple() and syncHeadersParallel()
+let initialProgress = HeaderSyncProgress(
+    currentHeight: startHeight,
+    totalHeight: chainTip,
+    headersStored: (try? headerStore.getHeaderCount()) ?? 0
+)
+onProgress?(initialProgress)
+```
+
+**Result**:
+- Completion screen now shows: "⚠️ Failed checks: • Balance Reconciliation"
+- Header sync progress bar starts at 0% immediately when sync begins
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Show failed health check names in debug message
+- `Sources/Core/Network/HeaderSyncManager.swift` - Report initial progress in both sync methods
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

@@ -296,11 +296,21 @@ struct ContentView: View {
 
                                 if hasWitnessIssues || hasDeltaCMUIssues {
                                     print("🔧 FIX #120: Repairing witnesses and tree state...")
+                                    // FIX #156: Add repair task to task list for UI visibility
                                     await MainActor.run {
                                         walletManager.setConnecting(true, status: "Rebuilding witnesses...")
+                                        walletManager.syncTasks.append(SyncTask(id: "fast_repair", title: "Rebuild Merkle witnesses", status: .inProgress, progress: 0.0))
                                     }
                                     try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
                                         print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                        // FIX #156: Update task progress in UI
+                                        Task { @MainActor in
+                                            walletManager.updateSyncTask(id: "fast_repair", status: .inProgress, detail: "\(current)/\(total) witnesses", progress: progress)
+                                        }
+                                    }
+                                    // FIX #156: Mark repair task as complete
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_repair", status: .completed)
                                     }
                                 }
 
@@ -381,7 +391,17 @@ struct ContentView: View {
                             // DEBUG: Pause for confirmation if enabled
                             if DEBUG_PAUSE_AT_COMPLETION {
                                 await MainActor.run {
-                                    debugCompletionMessage = "FAST START complete!\n\nHealth: \(healthResults.filter { $0.passed }.count)/\(healthResults.count) passed\nBlocks behind: \(blocksBehind)\nHeader sync: \(needsHeaderSync ? "YES" : "NO")"
+                                    // FIX #155: Show which health checks failed
+                                    let passedCount = healthResults.filter { $0.passed }.count
+                                    let failedChecks = healthResults.filter { !$0.passed }
+                                    var healthMessage = "Health: \(passedCount)/\(healthResults.count) passed"
+                                    if !failedChecks.isEmpty {
+                                        healthMessage += "\n\n⚠️ Failed checks:"
+                                        for check in failedChecks {
+                                            healthMessage += "\n• \(check.checkName)"
+                                        }
+                                    }
+                                    debugCompletionMessage = "FAST START complete!\n\n\(healthMessage)\nBlocks behind: \(blocksBehind)\nHeader sync: \(needsHeaderSync ? "YES" : "NO")"
                                     debugWaitingForConfirmation = true
                                 }
                                 print("🔴 DEBUG: Waiting for user confirmation before showing balance...")
@@ -687,11 +707,21 @@ struct ContentView: View {
 
                             if fullStartHasWitnessIssues || fullStartHasDeltaCMUIssues {
                                 print("🔧 FIX #120: Repairing witnesses and tree state...")
+                                // FIX #156: Add repair task to task list for UI visibility
                                 await MainActor.run {
                                     walletManager.setConnecting(true, status: "Rebuilding witnesses...")
+                                    walletManager.syncTasks.append(SyncTask(id: "full_repair", title: "Rebuild Merkle witnesses", status: .inProgress, progress: 0.0))
                                 }
                                 try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
                                     print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                    // FIX #156: Update task progress in UI
+                                    Task { @MainActor in
+                                        walletManager.updateSyncTask(id: "full_repair", status: .inProgress, detail: "\(current)/\(total) witnesses", progress: progress)
+                                    }
+                                }
+                                // FIX #156: Mark repair task as complete
+                                await MainActor.run {
+                                    walletManager.updateSyncTask(id: "full_repair", status: .completed)
                                 }
                             }
 
