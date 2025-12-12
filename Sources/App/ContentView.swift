@@ -137,6 +137,10 @@ struct ContentView: View {
                         if isFastStart {
                             print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(blocksBehind) blocks behind)")
 
+                            // FIX #162: Set flag to prevent Views from calling populateHistoryFromNotes()
+                            // during FAST START - it would undo any repairs we make
+                            walletManager.setRepairingHistory(true)
+
                             // Initialize FAST START tasks for UI display
                             // Note: Use unique IDs (fast_*) to avoid conflict with currentSyncTasks computed property
                             // which adds its own "tree" and "connect" tasks
@@ -323,22 +327,40 @@ struct ContentView: View {
                                     await walletManager.ensureHeaderTimestamps()
                                 }
 
-                                // FIX #120: Handle Balance Reconciliation issues - repopulate history from notes
+                                // FIX #162: Handle Balance Reconciliation issues - rebuild history from unspent notes ONLY
+                                // The old populateHistoryFromNotes() created fake transactions with synthetic txids
+                                // causing more corruption. New approach: clear history and add ONLY unspent notes as received.
                                 if hasBalanceIssues {
-                                    print("🔧 FIX #120: Balance mismatch detected - repopulating transaction history...")
+                                    print("🔧 FIX #162: Balance mismatch detected - rebuilding transaction history...")
                                     await MainActor.run {
-                                        walletManager.setConnecting(true, status: "Rebuilding transaction history...")
+                                        walletManager.setConnecting(true, status: "Repairing balance history...")
+                                        walletManager.syncTasks.append(SyncTask(id: "balance_repair_early", title: "Rebuild transaction history", status: .inProgress, progress: 0.0))
+                                    }
+
+                                    // Step 1: Clear corrupted history
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "balance_repair_early", status: .inProgress, detail: "Clearing old history...", progress: 0.2)
                                     }
                                     try? WalletDatabase.shared.clearTransactionHistory()
-                                    try? WalletDatabase.shared.populateHistoryFromNotes()
 
-                                    // FIX #120: Balance repair creates entries WITHOUT timestamps
-                                    // Must sync headers after to populate the timestamps
-                                    print("🔧 FIX #120: Syncing headers after history rebuild to fix timestamps...")
+                                    // Step 2: Rebuild from unspent notes
                                     await MainActor.run {
-                                        walletManager.setConnecting(true, status: "Syncing timestamps...")
+                                        walletManager.updateSyncTask(id: "balance_repair_early", status: .inProgress, detail: "Adding unspent notes...", progress: 0.5)
+                                    }
+                                    try? WalletDatabase.shared.rebuildHistoryFromUnspentNotes()
+
+                                    print("🔧 FIX #162: History rebuilt from unspent notes only (no synthetic txids)")
+
+                                    // Step 3: Sync headers to get timestamps for the new entries
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "balance_repair_early", status: .inProgress, detail: "Syncing timestamps...", progress: 0.7)
                                     }
                                     await walletManager.ensureHeaderTimestamps()
+
+                                    // Step 4: Mark complete
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "balance_repair_early", status: .completed, detail: "History rebuilt!", progress: 1.0)
+                                    }
                                 }
 
                                 // Re-run health checks to verify fixes
@@ -351,25 +373,81 @@ struct ContentView: View {
                                 let stillHasIssues = WalletHealthCheck.shared.getFixableIssues(verifyResults)
                                 // FIX #120: Filter out non-blocking issues that shouldn't prevent app startup:
                                 // - P2P Connectivity: Expected to fail initially, will connect in background
-                                // - Balance Reconciliation: May have minor mismatches due to complex tx history
-                                //   (populateHistoryFromNotes can't perfectly reconstruct change outputs, fees, etc.)
                                 // - Hash Accuracy: Requires P2P peers which may not be connected yet
-                                // Critical blocking issues: Timestamps, Database Integrity, Bundle Files, Delta CMU
-                                let nonBlockingChecks = ["P2P Connectivity", "Balance Reconciliation", "Hash Accuracy"]
+                                // FIX #162: Balance Reconciliation is now CRITICAL - if notes don't match history,
+                                // it means transaction data is corrupted and user sees wrong info
+                                // Critical blocking issues: Timestamps, Database Integrity, Bundle Files, Delta CMU, Balance Reconciliation
+                                let nonBlockingChecks = ["P2P Connectivity", "Hash Accuracy"]
                                 let blockingIssues = stillHasIssues.filter { !nonBlockingChecks.contains($0.checkName) }
 
                                 if !blockingIssues.isEmpty {
-                                    // FIX #120: Stay on sync screen if issues remain - don't proceed to main UI!
-                                    // User cannot send ZCL safely if wallet state is broken
-                                    print("❌ FAST START: \(blockingIssues.count) blocking issues remain after repair!")
-                                    for issue in blockingIssues {
-                                        print("❌ Remaining issue: \(issue.checkName) - \(issue.details)")
+                                    // FIX #162: Check if Balance Reconciliation is the remaining issue
+                                    // This can happen when balance check only fails AFTER timestamp sync corrects data
+                                    let hasBalanceIssueAfterVerify = blockingIssues.contains { $0.checkName == "Balance Reconciliation" }
+
+                                    if hasBalanceIssueAfterVerify {
+                                        print("🔧 FIX #162: Balance mismatch detected AFTER verification - repairing now...")
+                                        await MainActor.run {
+                                            walletManager.setConnecting(true, status: "Repairing balance history...")
+                                            walletManager.syncTasks.append(SyncTask(id: "balance_repair", title: "Rebuild transaction history", status: .inProgress, progress: 0.0))
+                                        }
+
+                                        // Step 1: Clear corrupted history
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "balance_repair", status: .inProgress, detail: "Clearing old history...", progress: 0.2)
+                                        }
+                                        try? WalletDatabase.shared.clearTransactionHistory()
+
+                                        // Step 2: Rebuild from unspent notes
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "balance_repair", status: .inProgress, detail: "Adding unspent notes...", progress: 0.5)
+                                        }
+                                        try? WalletDatabase.shared.rebuildHistoryFromUnspentNotes()
+
+                                        // Step 3: Sync timestamps for new entries
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "balance_repair", status: .inProgress, detail: "Syncing timestamps...", progress: 0.7)
+                                        }
+                                        await walletManager.ensureHeaderTimestamps()
+
+                                        // Step 4: Mark complete
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "balance_repair", status: .completed, detail: "History rebuilt!", progress: 1.0)
+                                        }
+
+                                        print("✅ FIX #162: Balance repair completed - verifying...")
+
+                                        // Re-verify after this repair
+                                        let finalResults = await WalletHealthCheck.shared.runAllChecks()
+                                        WalletHealthCheck.shared.printSummary(finalResults)
+
+                                        let finalIssues = WalletHealthCheck.shared.getFixableIssues(finalResults)
+                                        let finalBlocking = finalIssues.filter { !nonBlockingChecks.contains($0.checkName) }
+
+                                        if !finalBlocking.isEmpty {
+                                            print("❌ FAST START: Issues still remain after balance repair!")
+                                            for issue in finalBlocking {
+                                                print("❌ Final issue: \(issue.checkName) - \(issue.details)")
+                                            }
+                                            await MainActor.run {
+                                                walletManager.setConnecting(true, status: "Repair failed - please restart app")
+                                            }
+                                            return
+                                        }
+                                        print("✅ FIX #162: Balance repair successful!")
+                                    } else {
+                                        // FIX #120: Stay on sync screen if issues remain - don't proceed to main UI!
+                                        // User cannot send ZCL safely if wallet state is broken
+                                        print("❌ FAST START: \(blockingIssues.count) blocking issues remain after repair!")
+                                        for issue in blockingIssues {
+                                            print("❌ Remaining issue: \(issue.checkName) - \(issue.details)")
+                                        }
+                                        await MainActor.run {
+                                            walletManager.setConnecting(true, status: "Repair incomplete - please restart app")
+                                        }
+                                        // Keep showing sync screen - don't proceed to main UI
+                                        return
                                     }
-                                    await MainActor.run {
-                                        walletManager.setConnecting(true, status: "Repair incomplete - please restart app")
-                                    }
-                                    // Keep showing sync screen - don't proceed to main UI
-                                    return
                                 } else {
                                     print("✅ FAST START: All critical issues fixed!")
                                     // Log non-blocking issues that still exist (informational only)
@@ -414,6 +492,9 @@ struct ContentView: View {
                             }
 
                             await MainActor.run {
+                                // FIX #162: Clear repair flag - FAST START complete, Views can now call populateHistoryFromNotes
+                                walletManager.setRepairingHistory(false)
+
                                 walletManager.setConnecting(false, status: nil)
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
@@ -734,14 +815,17 @@ struct ContentView: View {
                                 await walletManager.ensureHeaderTimestamps()
                             }
 
-                            // FIX #120: Handle Balance Reconciliation issues - repopulate history from notes
+                            // FIX #162: Handle Balance Reconciliation issues - rebuild history from unspent notes ONLY
+                            // The old populateHistoryFromNotes() created fake transactions with synthetic txids
+                            // causing more corruption. New approach: clear history and add ONLY unspent notes as received.
                             if fullStartHasBalanceIssues {
-                                print("🔧 FIX #120: Balance mismatch detected - repopulating transaction history...")
+                                print("🔧 FIX #162: Balance mismatch detected - rebuilding transaction history...")
                                 await MainActor.run {
                                     walletManager.setConnecting(true, status: "Rebuilding transaction history...")
                                 }
                                 try? WalletDatabase.shared.clearTransactionHistory()
-                                try? WalletDatabase.shared.populateHistoryFromNotes()
+                                try? WalletDatabase.shared.rebuildHistoryFromUnspentNotes()
+                                print("🔧 FIX #162: History rebuilt from unspent notes only (no synthetic txids)")
                             }
 
                             // Re-run health checks to verify fixes

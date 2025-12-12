@@ -171,12 +171,19 @@ struct HistoryView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // ALWAYS populate from notes to ensure SENT transactions are generated
-                // The populateHistoryFromNotes() function clears and rebuilds,
-                // which is necessary to correctly calculate SENT entries from spent notes
-                let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                if populatedCount > 0 {
-                    print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
+                // FIX #162: Skip populateHistoryFromNotes() during FAST START repair
+                // Otherwise it would undo the balance reconciliation repair
+                let isRepairing = WalletManager.shared.isRepairingHistory
+                if isRepairing {
+                    print("📜 HistoryView: Skipping populateHistoryFromNotes (repair in progress)")
+                } else {
+                    // ALWAYS populate from notes to ensure SENT transactions are generated
+                    // The populateHistoryFromNotes() function clears and rebuilds,
+                    // which is necessary to correctly calculate SENT entries from spent notes
+                    let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if populatedCount > 0 {
+                        print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
+                    }
                 }
 
                 // FIX #129: Show ALL transactions (up to 1000) - was limit:100 which cut off older transactions

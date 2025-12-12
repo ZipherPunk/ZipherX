@@ -138,6 +138,7 @@ final class WalletHealthCheck {
     }
 
     /// Verify balance matches sum of history (+received - sent)
+    /// FIX #162: Auto-repair when mismatch detected
     private func checkBalanceHistoryMatch() async -> HealthCheckResult {
         do {
             // Get current balance from unspent notes
@@ -183,9 +184,81 @@ final class WalletHealthCheck {
             if diff < 0.00000001 {  // Allow for rounding
                 return .passed("Balance Reconciliation", details: "Balance: \(String(format: "%.8f", noteBalanceZCL)) ZCL matches history (\(receivedCount)↓ \(sentCount)↑)")
             } else {
-                return .failed("Balance Reconciliation",
-                    details: "Notes: \(String(format: "%.8f", noteBalanceZCL)) ZCL (\(notes.count) notes), History: \(String(format: "%.8f", historyBalanceZCL)) ZCL (\(receivedCount)↓ - \(sentCount)↑), Diff: \(String(format: "%.8f", diff)) ZCL",
-                    critical: false)
+                // ================================================================
+                // FIX #162: AUTO-REPAIR when balance/history mismatch detected
+                // ================================================================
+                print("🔧 FIX #162: Balance mismatch detected! Auto-repairing history...")
+                print("   Notes balance: \(noteBalance) zatoshis")
+                print("   History balance: \(historyBalance) zatoshis")
+                print("   Difference: \(abs(Int64(noteBalance) - historyBalance)) zatoshis")
+
+                do {
+                    // Step 1: Clear existing transaction history
+                    print("🔧 FIX #162: Step 1 - Clearing transaction history...")
+                    try WalletDatabase.shared.clearTransactionHistory()
+
+                    // Step 2: Rebuild history from notes (includes RECEIVED + SENT)
+                    print("🔧 FIX #162: Step 2 - Rebuilding history from notes...")
+                    try WalletDatabase.shared.rebuildHistoryFromUnspentNotes()
+
+                    // Step 3: Repair timestamps
+                    print("🔧 FIX #162: Step 3 - Repairing timestamps...")
+                    let timestampsFixed = try WalletDatabase.shared.fixTransactionBlockTimes()
+                    print("🔧 FIX #162: Fixed \(timestampsFixed) timestamps")
+
+                    // Verify repair succeeded
+                    let repairedHistory = try WalletDatabase.shared.getTransactionHistory(limit: 10000, offset: 0)
+                    var repairedReceived: UInt64 = 0
+                    var repairedSent: UInt64 = 0
+                    var repairedFees: UInt64 = 0
+                    var repairedReceivedCount = 0
+                    var repairedSentCount = 0
+
+                    for tx in repairedHistory {
+                        switch tx.type {
+                        case .received:
+                            repairedReceived += tx.value
+                            repairedReceivedCount += 1
+                        case .sent:
+                            repairedSent += tx.value
+                            repairedFees += (tx.fee ?? 0)
+                            repairedSentCount += 1
+                        case .change:
+                            break
+                        }
+                    }
+
+                    let repairedBalance = Int64(repairedReceived) - Int64(repairedSent) - Int64(repairedFees)
+                    let repairedBalanceZCL = Double(repairedBalance) / 100_000_000.0
+                    let repairedDiff = abs(noteBalanceZCL - repairedBalanceZCL)
+
+                    // Debug logging for repaired state
+                    print("🔧 FIX #162 v3: Verification after repair:")
+                    print("   Repaired history: \(repairedReceivedCount) received, \(repairedSentCount) sent")
+                    print("   Repaired received total: \(repairedReceived) zatoshis")
+                    print("   Repaired sent total: \(repairedSent) zatoshis")
+                    print("   Repaired fees total: \(repairedFees) zatoshis")
+                    print("   Repaired balance: received(\(repairedReceived)) - sent(\(repairedSent)) - fees(\(repairedFees)) = \(repairedBalance) zatoshis")
+                    print("   Notes balance (unspent): \(noteBalance) zatoshis")
+                    print("   Diff: \(abs(Int64(noteBalance) - repairedBalance)) zatoshis")
+
+                    if repairedDiff < 0.00000001 {
+                        print("✅ FIX #162 v3: Auto-repair SUCCEEDED!")
+                        return .passed("Balance Reconciliation", details: "AUTO-REPAIRED! Balance: \(String(format: "%.8f", noteBalanceZCL)) ZCL now matches history (\(repairedReceivedCount)↓ \(repairedSentCount)↑)")
+                    } else {
+                        print("⚠️ FIX #162 v3: Auto-repair completed but mismatch persists")
+                        print("   This may indicate spent notes not properly detected (nullifier issue)")
+                        print("   Try Full Rescan from Settings to re-detect spent notes")
+                        return .failed("Balance Reconciliation",
+                            details: "AUTO-REPAIR attempted but mismatch persists. Notes: \(String(format: "%.8f", noteBalanceZCL)) ZCL, History: \(String(format: "%.8f", repairedBalanceZCL)) ZCL. May need Full Rescan.",
+                            critical: false)
+                    }
+                } catch {
+                    print("❌ FIX #162: Auto-repair FAILED: \(error.localizedDescription)")
+                    return .failed("Balance Reconciliation",
+                        details: "AUTO-REPAIR FAILED: \(error.localizedDescription). Manual repair may be needed.",
+                        critical: false)
+                }
             }
         } catch {
             return .failed("Balance Reconciliation", details: error.localizedDescription, critical: false)

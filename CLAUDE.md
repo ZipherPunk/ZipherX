@@ -82,6 +82,13 @@ Latest fixes:
 - FIX #157: Header sync timeout (20s per-peer, 60s total) for FAST START
 - FIX #158: Filter banned peers from TX broadcast (Sybil protection)
 - FIX #159: Permanent Sybil bans - indefinite until manual unban
+- FIX #162 v3: Balance Reconciliation AUTO-REPAIR at startup
+  - Created `getAllNotes()` function that returns ALL notes (spent + unspent)
+  - Previous `getAllUnspentNotes()` was misleading - had `WHERE is_spent = 0`
+  - `rebuildHistoryFromUnspentNotes()` now uses `getAllNotes()` for RECEIVED
+  - Correct formula: RECEIVED (all notes) - SENT - FEES = UNSPENT balance
+  - Groups spent notes by `spent_in_tx`, calculates sent = inputs - change - fee
+  - Views check `isRepairingHistory` flag to prevent undoing repair
 
 ## Security Score: 100/100
 

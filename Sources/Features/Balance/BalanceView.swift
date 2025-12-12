@@ -811,12 +811,19 @@ struct BalanceView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // ALWAYS populate from notes to ensure SENT transactions are generated
-                // The populateHistoryFromNotes() function clears and rebuilds,
-                // which is necessary to correctly calculate SENT entries from spent notes
-                print("📜 TXHIST: Populating history from notes...")
-                let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                print("📜 TXHIST: Populate result: \(populated) entries (received + sent)")
+                // FIX #162: Skip populateHistoryFromNotes() during FAST START repair
+                // Otherwise it would undo the balance reconciliation repair
+                let isRepairing = WalletManager.shared.isRepairingHistory
+                if isRepairing {
+                    print("📜 TXHIST: Skipping populateHistoryFromNotes (repair in progress)")
+                } else {
+                    // ALWAYS populate from notes to ensure SENT transactions are generated
+                    // The populateHistoryFromNotes() function clears and rebuilds,
+                    // which is necessary to correctly calculate SENT entries from spent notes
+                    print("📜 TXHIST: Populating history from notes...")
+                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                    print("📜 TXHIST: Populate result: \(populated) entries (received + sent)")
+                }
 
                 // Now fetch the history
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)

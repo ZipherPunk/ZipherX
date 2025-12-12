@@ -1038,6 +1038,86 @@ final class WalletDatabase {
         return notes
     }
 
+    /// FIX #162 v3: Get ALL notes (both spent and unspent) - for balance reconciliation
+    /// This is needed to calculate total received amount which must equal spent + unspent
+    func getAllNotes(accountId: Int64) throws -> [WalletNote] {
+        let sql = """
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
+            FROM notes
+            WHERE account_id = ?
+            ORDER BY received_height ASC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        var notes: [WalletNote] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let divPtr = sqlite3_column_blob(stmt, 1)
+            let divLen = sqlite3_column_bytes(stmt, 1)
+            let value = UInt64(sqlite3_column_int64(stmt, 2))
+            let rcmPtr = sqlite3_column_blob(stmt, 3)
+            let rcmLen = sqlite3_column_bytes(stmt, 3)
+            let nfPtr = sqlite3_column_blob(stmt, 5)
+            let nfLen = sqlite3_column_bytes(stmt, 5)
+            let height = UInt64(sqlite3_column_int64(stmt, 7))
+
+            // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
+            let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
+            let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
+            let diversifier = try decryptBlob(encryptedDiv)
+            let rcm = try decryptBlob(encryptedRcm)
+
+            // Witness might be NULL
+            var witnessData = Data()
+            if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
+                let witnessPtr = sqlite3_column_blob(stmt, 8)
+                let witnessLen = sqlite3_column_bytes(stmt, 8)
+                let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                witnessData = try decryptBlob(encryptedWitness)
+            }
+
+            // CMU might be NULL (not encrypted - public on chain)
+            var cmuData: Data? = nil
+            if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
+                let cmuPtr = sqlite3_column_blob(stmt, 9)
+                let cmuLen = sqlite3_column_bytes(stmt, 9)
+                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+            }
+
+            // Anchor might be NULL
+            var anchorData: Data? = nil
+            if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
+                let anchorPtr = sqlite3_column_blob(stmt, 10)
+                let anchorLen = sqlite3_column_bytes(stmt, 10)
+                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+            }
+
+            let note = WalletNote(
+                id: id,
+                diversifier: diversifier,
+                value: value,
+                rcm: rcm,
+                nullifier: Data(bytes: nfPtr!, count: Int(nfLen)),
+                height: height,
+                witness: witnessData,
+                cmu: cmuData,
+                anchor: anchorData
+            )
+
+            notes.append(note)
+        }
+
+        return notes
+    }
+
     /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
@@ -1844,6 +1924,182 @@ final class WalletDatabase {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("🗑️ Cleared transaction history from database (secure)")
+    }
+
+    /// FIX #162 v3: Rebuild transaction history from ALL notes
+    /// This creates a consistent history where:
+    /// - RECEIVED = sum of ALL notes (spent + unspent)
+    /// - SENT = sum of sent amounts from spent notes
+    /// - Balance = RECEIVED - SENT - FEES = sum of UNSPENT notes
+    /// Unlike populateHistoryFromNotes() which creates fake transactions with synthetic txids,
+    /// this function creates accurate entries from actual note data.
+    func rebuildHistoryFromUnspentNotes() throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // SQLITE_TRANSIENT tells SQLite to copy the data immediately
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // ============================================================
+        // PART 1: Insert RECEIVED transactions from ALL notes (spent + unspent)
+        // FIX #162 v3: Must include spent notes too for balance to reconcile!
+        // ============================================================
+        let allNotes = try getAllNotes(accountId: 1)  // FIX #162 v3: Now correctly gets ALL notes including spent
+        print("🔧 FIX #162 v3: Rebuilding history from \(allNotes.count) notes (all, including spent)")
+
+        let insertReceivedSql = """
+            INSERT OR IGNORE INTO transaction_history (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL);
+        """
+        var insertReceivedStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, insertReceivedSql, -1, &insertReceivedStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(insertReceivedStmt) }
+
+        var receivedCount = 0
+        for note in allNotes {
+            let txid: Data
+            if let cmu = note.cmu, !cmu.isEmpty {
+                txid = cmu
+            } else {
+                var uniqueData = Data()
+                uniqueData.append(contentsOf: withUnsafeBytes(of: note.height.littleEndian) { Data($0) })
+                uniqueData.append(contentsOf: withUnsafeBytes(of: note.value.littleEndian) { Data($0) })
+                uniqueData.append(note.diversifier)
+                txid = uniqueData.prefix(32)
+            }
+
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertReceivedStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(insertReceivedStmt, 2, Int64(note.height))
+            sqlite3_bind_null(insertReceivedStmt, 3)
+
+            let receivedType = encryptTxType(.received)
+            sqlite3_bind_text(insertReceivedStmt, 4, receivedType, -1, SQLITE_TRANSIENT)
+
+            sqlite3_bind_int64(insertReceivedStmt, 5, Int64(note.value))
+
+            note.diversifier.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertReceivedStmt, 6, ptr.baseAddress, Int32(note.diversifier.count), SQLITE_TRANSIENT)
+            }
+
+            if sqlite3_step(insertReceivedStmt) == SQLITE_DONE {
+                receivedCount += 1
+            }
+            sqlite3_reset(insertReceivedStmt)
+        }
+
+        // ============================================================
+        // PART 2: Insert SENT transactions from spent notes
+        // FIX #162: Group spent notes by spent_in_tx to calculate sent amounts
+        // ============================================================
+        let spentSql = """
+            SELECT spent_in_tx, spent_height, SUM(value) as total_input
+            FROM notes
+            WHERE is_spent = 1 AND spent_in_tx IS NOT NULL AND spent_height IS NOT NULL
+            GROUP BY spent_in_tx
+            ORDER BY spent_height DESC;
+        """
+        var spentStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, spentSql, -1, &spentStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(spentStmt) }
+
+        // Collect spent transaction info
+        var spentTxs: [(txid: Data, height: UInt64, totalInput: UInt64)] = []
+        while sqlite3_step(spentStmt) == SQLITE_ROW {
+            let txidPtr = sqlite3_column_blob(spentStmt, 0)
+            let txidLen = sqlite3_column_bytes(spentStmt, 0)
+            let height = UInt64(sqlite3_column_int64(spentStmt, 1))
+            let totalInput = UInt64(sqlite3_column_int64(spentStmt, 2))
+
+            if let ptr = txidPtr, txidLen > 0 {
+                let txid = Data(bytes: ptr, count: Int(txidLen))
+                // Skip fake boost txids (they start with "boost_spent_")
+                if !txid.starts(with: Data("boost_spent_".utf8)) {
+                    spentTxs.append((txid: txid, height: height, totalInput: totalInput))
+                }
+            }
+        }
+
+        print("🔧 FIX #162: Found \(spentTxs.count) real sent transactions from spent notes")
+
+        // For each spent tx, calculate: sent amount = total input - change - fee
+        // Change = notes received at same height in same tx
+        // Fee = 10000 zatoshis (standard fee)
+        let insertSentSql = """
+            INSERT OR IGNORE INTO transaction_history (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL);
+        """
+        var insertSentStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, insertSentSql, -1, &insertSentStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(insertSentStmt) }
+
+        var sentCount = 0
+        let defaultFee: UInt64 = 10000
+
+        for spentTx in spentTxs {
+            // Look for change outputs (notes received at the same height)
+            // Change notes typically have the same diversifier or received_height == spent_height
+            let changeSql = """
+                SELECT COALESCE(SUM(value), 0) FROM notes
+                WHERE received_height = ? AND is_spent = 0;
+            """
+            var changeStmt: OpaquePointer?
+            var changeAmount: UInt64 = 0
+            if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(changeStmt, 1, Int64(spentTx.height))
+                if sqlite3_step(changeStmt) == SQLITE_ROW {
+                    changeAmount = UInt64(sqlite3_column_int64(changeStmt, 0))
+                }
+                sqlite3_finalize(changeStmt)
+            }
+
+            // Sent amount = inputs - change - fee
+            // If totalInput < change + fee, something is wrong, skip
+            guard spentTx.totalInput > changeAmount + defaultFee else {
+                print("🔧 FIX #162: Skipping tx with totalInput \(spentTx.totalInput) <= change \(changeAmount) + fee \(defaultFee)")
+                continue
+            }
+
+            let sentAmount = spentTx.totalInput - changeAmount - defaultFee
+
+            spentTx.txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertSentStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(insertSentStmt, 2, Int64(spentTx.height))
+            sqlite3_bind_null(insertSentStmt, 3)
+
+            let sentType = encryptTxType(.sent)
+            sqlite3_bind_text(insertSentStmt, 4, sentType, -1, SQLITE_TRANSIENT)
+
+            sqlite3_bind_int64(insertSentStmt, 5, Int64(sentAmount))
+            sqlite3_bind_int64(insertSentStmt, 6, Int64(defaultFee))
+
+            if sqlite3_step(insertSentStmt) == SQLITE_DONE {
+                sentCount += 1
+                print("🔧 FIX #162: Added SENT tx at height \(spentTx.height): \(sentAmount) zatoshis (input: \(spentTx.totalInput), change: \(changeAmount), fee: \(defaultFee))")
+            }
+            sqlite3_reset(insertSentStmt)
+        }
+
+        // Calculate totals for logging
+        let totalReceived = allNotes.reduce(0) { $0 + $1.value }
+        let unspentNotes = try getUnspentNotes(accountId: 1)
+        let unspentBalance = unspentNotes.reduce(0) { $0 + $1.value }
+        let spentNotesCount = allNotes.count - unspentNotes.count
+        print("🔧 FIX #162 v3: Inserted \(receivedCount)/\(allNotes.count) received entries")
+        print("🔧 FIX #162 v3: - Total ALL notes (spent+unspent): \(allNotes.count)")
+        print("🔧 FIX #162 v3: - Spent notes: \(spentNotesCount), Unspent notes: \(unspentNotes.count)")
+        print("🔧 FIX #162 v3: - Total received: \(totalReceived) zatoshis")
+        print("🔧 FIX #162 v3: Inserted \(sentCount) sent entries")
+        print("🔧 FIX #162 v3: Expected balance (unspent only) = \(unspentBalance) zatoshis")
     }
 
     /// FIX #120: Repair transaction history timestamps

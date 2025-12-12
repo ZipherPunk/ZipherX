@@ -53,6 +53,17 @@ final class WalletManager: ObservableObject {
     @Published private(set) var headerSyncTargetHeight: UInt64 = 0
     @Published private(set) var isTorBypassed: Bool = false
 
+    // MARK: - FIX #162: Prevent history corruption during repair
+    /// When true, Views should NOT call populateHistoryFromNotes() as it would undo repair
+    @Published private(set) var isRepairingHistory: Bool = false
+
+    func setRepairingHistory(_ repairing: Bool) {
+        Task { @MainActor in
+            self.isRepairingHistory = repairing
+            print("🔧 FIX #162: isRepairingHistory = \(repairing)")
+        }
+    }
+
     // MARK: - Monotonic Progress (never goes backward!)
 
     /// Overall progress that ONLY increases (0.0 → 1.0)
@@ -1110,6 +1121,10 @@ final class WalletManager: ObservableObject {
             // This ensures all unspent notes have witnesses matching current tree root
             // so the user can send instantly without waiting for witness rebuild
             await preRebuildWitnessesForInstantPayment(accountId: account.id)
+
+            // FIX #161: Check if any pending incoming transactions were confirmed in this block
+            // This clears the "awaiting..." message when the incoming tx gets its first confirmation
+            await NetworkManager.shared.checkPendingIncomingConfirmations()
 
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")

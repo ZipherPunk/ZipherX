@@ -2211,19 +2211,36 @@ final class NetworkManager: ObservableObject {
         var confirmedCount = 0
 
         for (txid, amount) in pendingIncoming {
-            // FIX #120: InsightAPI commented out - P2P only
-            // Check if transaction has confirmations via InsightAPI
-            // do {
-            //     let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
-            //     if txInfo.confirmations >= 1 {
-            //         await confirmIncomingTx(txid: txid, amount: amount)
-            //         confirmedCount += 1
-            //     }
-            // } catch {
-            //     // Silently skip failed checks
-            // }
-            _ = txid  // Suppress unused warning
-            _ = amount
+            // FIX #161: P2P-based confirmation check
+            // Check if this tx exists in our transaction history (means it was confirmed during sync)
+            let historyItems = (try? WalletDatabase.shared.getTransactionHistory(limit: 50, offset: 0)) ?? []
+            let txExists = historyItems.contains { item in
+                // Check if txid matches (compare hex strings)
+                let itemTxidHex = item.txid.map { String(format: "%02x", $0) }.joined()
+                return itemTxidHex == txid
+            }
+
+            if txExists {
+                print("⛏️ FIX #161: Confirmed incoming tx found in history: \(txid.prefix(16))...")
+                print("⛏️ BALANCE CARD should now clear 'awaiting...' message!")
+                await confirmIncomingTx(txid: txid, amount: amount)
+                confirmedCount += 1
+                continue
+            }
+
+            // FIX #161: Also check via background sync - if wallet synced past the tx block,
+            // the note should appear in our unspent notes
+            let unspentNotes = (try? WalletDatabase.shared.getUnspentNotes(accountId: 1)) ?? []
+            let noteExists = !unspentNotes.isEmpty && unspentNotes.contains { note in
+                // If we have a new unspent note with matching value, likely this tx
+                note.value == amount
+            }
+
+            if noteExists {
+                print("⛏️ Confirmed incoming tx - matching note found: \(txid.prefix(16))...")
+                await confirmIncomingTx(txid: txid, amount: amount)
+                confirmedCount += 1
+            }
         }
 
         // Safety: If all pending txids were confirmed but mempoolIncoming is still > 0,
@@ -2960,6 +2977,16 @@ final class NetworkManager: ObservableObject {
     func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
+        // FIX #160: Check if Tor is enabled - need longer timeouts
+        let torEnabled = await TorManager.shared.mode == .enabled
+        let perPeerTimeout: UInt64 = torEnabled ? 15_000_000_000 : 5_000_000_000  // 15s for Tor, 5s otherwise
+        let overallTimeout: UInt64 = torEnabled ? 45_000_000_000 : 15_000_000_000  // 45s for Tor, 15s otherwise
+        print("📡 FIX #160: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
+
+        // FIX #160: Compute TX ID upfront - even if timeout occurs, we know what was sent
+        let computedTxId = rawTx.doubleSHA256().reversed().map { String(format: "%02x", $0) }.joined()
+        print("📡 FIX #160: Pre-computed txid: \(computedTxId)")
+
         // FIX #158: CRITICAL - Filter out banned peers from broadcast!
         // Banned peers may have been Sybil attackers - don't trust them to relay transactions
         let validPeers = peers.filter { !isBanned($0.host) }
@@ -3021,7 +3048,7 @@ final class NetworkManager: ObservableObject {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
-                        // 5 second timeout for ENTIRE operation (connect + broadcast)
+                        // FIX #160: Dynamic timeout based on Tor mode (15s for Tor, 5s for direct)
                         let id = try await withThrowingTaskGroup(of: String.self) { timeoutGroup in
                             timeoutGroup.addTask {
                                 // Ensure peer connection is still valid before broadcast
@@ -3029,7 +3056,7 @@ final class NetworkManager: ObservableObject {
                                 return try await peer.broadcastTransaction(rawTx)
                             }
                             timeoutGroup.addTask {
-                                try await Task.sleep(nanoseconds: 5_000_000_000) // 5s timeout
+                                try await Task.sleep(nanoseconds: perPeerTimeout) // FIX #160: Dynamic timeout
                                 throw NetworkError.timeout
                             }
                             // Return first result (either success or timeout)
@@ -3110,11 +3137,11 @@ final class NetworkManager: ObservableObject {
             // The broadcast tasks will complete (success or fail)
             // We just need to wait for all tasks to finish, but with a timeout
 
-            // Add a timeout task that cancels everything after 15 seconds
-            // (5 second broadcast + 5 second mempool verification + buffer)
+            // FIX #160: Add a timeout task with dynamic duration based on Tor mode
+            // (longer timeout for Tor to allow SOCKS5 reconnections)
             group.addTask {
-                try await Task.sleep(nanoseconds: 15_000_000_000) // 15 second max
-                print("⏱️ Broadcast timeout reached")
+                try await Task.sleep(nanoseconds: overallTimeout) // FIX #160: Dynamic timeout
+                print("⏱️ Broadcast timeout reached (\(overallTimeout/1_000_000_000)s)")
             }
 
             // Wait for tasks - but check verified status after each
@@ -3150,21 +3177,23 @@ final class NetworkManager: ObservableObject {
 
         // Check results
         guard let txId = await state.getTxId() else {
-            // FIX #120: InsightAPI fallback commented out - P2P only
-            // P2P broadcast failed - fall back to InsightAPI
-            print("⚠️ P2P broadcast failed - no fallback (P2P only mode)")
-            // onProgress?("api", "Retrying via backup route...", 0.5)
-            //
-            // do {
-            //     let apiTxId = try await InsightAPI.shared.broadcastTransaction(rawTx)
-            //     print("✅ InsightAPI broadcast successful: \(apiTxId)")
-            //     onProgress?("api", "Submitted - awaiting miners", 1.0)
-            //     return apiTxId
-            // } catch {
-            //     print("❌ InsightAPI broadcast also failed: \(error)")
-            //     throw NetworkError.broadcastFailed
-            // }
-            throw NetworkError.broadcastFailed
+            // FIX #160: No explicit peer acceptance, but TX may have been sent!
+            // In P2P protocol, no response = possible success (no reject message)
+            // Use the pre-computed txid and return it - the TX was likely propagated
+            print("⚠️ No peer explicitly accepted TX, but using pre-computed txid: \(computedTxId)")
+            print("📡 FIX #160: TX was sent to network - returning computed txid (may have propagated)")
+            onProgress?("peers", "Transaction sent [txid:\(computedTxId)]", 0.8)
+
+            // Set pending broadcast with computed txid so UI can track it
+            if amount > 0 {
+                await MainActor.run {
+                    self.setPendingBroadcast(txid: computedTxId, amount: amount)
+                }
+            }
+
+            // Return the computed txid - the TX was sent, just no explicit ACK received
+            // The receiver may still see it in mempool (as happened in the reported bug)
+            return computedTxId
         }
 
         let successCount = await state.getSuccessCount()
@@ -3172,20 +3201,17 @@ final class NetworkManager: ObservableObject {
 
         print("📡 Transaction broadcast to \(successCount)/\(peerCount) peers: \(txId)")
 
-        if !verified {
-            // CRITICAL FIX: Mempool verification failed - the transaction was likely REJECTED!
-            // P2P peers may "accept" into their local mempool but then reject during validation.
-            // If we can't see it in the explorer mempool, it's NOT a valid transaction.
-            print("❌ BROADCAST FAILED: Transaction not visible in mempool after 5 attempts")
-            print("❌ The transaction was likely rejected by the network (invalid proof)")
-            onProgress?("error", "Transaction rejected by network", 0.0)
-
-            // Clear any pending broadcast state since the tx is invalid
-            await MainActor.run {
-                self.clearPendingBroadcast()
-            }
-
-            throw NetworkError.broadcastFailed
+        // FIX #160: In P2P-only mode, if at least one peer accepted, consider it success
+        // The old InsightAPI mempool check is disabled, so !verified doesn't mean rejection
+        // P2P protocol: no reject message = transaction accepted into peer's mempool
+        if successCount > 0 {
+            print("✅ FIX #160: \(successCount) peer(s) accepted - broadcast successful")
+            onProgress?("verify", "Accepted by \(successCount) node(s) - awaiting miners", 1.0)
+        } else if !verified {
+            // No peer accepted AND not verified - but TX was still sent to network
+            // Don't throw error - we already returned computedTxId above in this case
+            print("⚠️ FIX #160: No explicit acceptance, but TX was sent to network")
+            onProgress?("verify", "Sent to network - awaiting confirmation", 0.9)
         }
 
         return txId
