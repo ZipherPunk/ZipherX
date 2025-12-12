@@ -226,10 +226,41 @@ struct ContentView: View {
                                 }
                             } else {
                                 print("✅ FIX #147: No transactions need timestamps - fast path")
-                                // Skip peers and headers tasks
+
+                                // FIX #120: Even without header sync, we MUST connect to network
+                                // for checkpoint-based health checks (FIX #164/165) which need chain height
                                 await MainActor.run {
-                                    walletManager.updateSyncTask(id: "fast_peers", status: .completed)
-                                    walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                    walletManager.setConnecting(true, status: "Connecting for health checks...")
+                                    walletManager.updateSyncTask(id: "fast_peers", status: .inProgress)
+                                }
+
+                                do {
+                                    try await networkManager.connect()
+
+                                    // Wait for at least 3 peers (required for chain height consensus)
+                                    var peerWait = 0
+                                    let maxPeerWait = 300 // 30 seconds max
+                                    while networkManager.connectedPeers < 3 && peerWait < maxPeerWait {
+                                        try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                                        peerWait += 1
+                                        let peerProgress = min(Double(networkManager.connectedPeers) / 3.0, 1.0)
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "fast_peers", status: .inProgress, detail: "\(networkManager.connectedPeers)/3 peers", progress: peerProgress)
+                                        }
+                                    }
+
+                                    print("✅ FIX #120: Connected to \(networkManager.connectedPeers) peers for health checks")
+
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                    }
+                                } catch {
+                                    print("⚠️ FIX #120: Network connection failed for health checks: \(error.localizedDescription)")
+                                    await MainActor.run {
+                                        walletManager.updateSyncTask(id: "fast_peers", status: .failed(error.localizedDescription))
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                    }
                                 }
                             }
 

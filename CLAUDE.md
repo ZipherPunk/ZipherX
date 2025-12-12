@@ -99,6 +99,12 @@ Latest fixes:
   - Detects BOTH incoming notes (trial decryption) AND spent notes (nullifiers)
   - Checkpoint updated after: startup scan, send TX success, incoming TX confirmed
   - Ensures wallet ALWAYS discovers new ZCL sent while app was closed
+- FIX #120 (v2): FAST START must connect to P2P network before health checks
+  - Previous bug: Fast path skipped network connection when no header sync needed
+  - FIX #164/165 health checks need chain height from P2P peers
+  - Health checks ran with chain height = 0, causing checkpoint sync to be skipped
+  - Now: Even in fast path, connect to 3+ peers BEFORE running health checks
+  - Ensures checkpoint-based sync ALWAYS runs to detect missed transactions
 
 ## Security Score: 100/100
 
