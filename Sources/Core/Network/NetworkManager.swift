@@ -690,6 +690,39 @@ final class NetworkManager: ObservableObject {
         print("🚫 Banned address \(host): \(reason.rawValue)")
     }
 
+    /// FIX #159: PERMANENTLY ban a peer for Sybil attacks
+    /// These bans do NOT expire automatically and require manual unbanning by the user
+    /// Use this for peers that report fake chain heights (Sybil attackers)
+    func banPeerPermanentlyForSybil(_ host: String, port: UInt16, fakeHeight: UInt64, realHeight: UInt64) {
+        addressLock.lock()
+
+        // Use -1 as banDuration to indicate PERMANENT ban (FIX #159)
+        let ban = BannedPeer(
+            address: host,
+            banTime: Date(),
+            banDuration: -1,  // PERMANENT - will never expire
+            reason: .fakeChainHeight
+        )
+        bannedPeers[host] = ban
+        let newCount = bannedPeers.count
+
+        // Remove from known good addresses
+        let key = "\(host):\(port)"
+        knownAddresses.removeValue(forKey: key)
+        triedAddresses.remove(key)
+        newAddresses.remove(key)
+        addressLock.unlock()
+
+        // Update published count and notify UI about Sybil attack
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
+            self.sybilAttackDetected = (peer: host, fakeHeight: fakeHeight, realHeight: realHeight)
+        }
+
+        print("🚨 [SYBIL ATTACK] PERMANENTLY BANNED \(host) for reporting fake height \(fakeHeight) (real: ~\(realHeight))")
+        print("🚨 [SYBIL ATTACK] This peer is banned INDEFINITELY - manual unban required through Settings!")
+    }
+
     /// Get list of all currently banned peers
     func getBannedPeers() -> [BannedPeer] {
         addressLock.lock()
@@ -970,9 +1003,10 @@ final class NetworkManager: ObservableObject {
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
 
             // FIX #111: DETECT AND BAN SYBIL ATTACKERS reporting impossible heights
+            // FIX #159: Use PERMANENT ban for Sybil attackers (requires manual unban)
             if h > sybilThreshold {
-                print("🚨 [SYBIL BAN] Peer \(peer.host) reporting FAKE height \(h) - BANNING!")
-                banAddress(peer.host, port: peer.port, reason: .corruptedData)  // Ban for 7 days
+                print("🚨 [SYBIL BAN] Peer \(peer.host) reporting FAKE height \(h) (threshold: \(sybilThreshold)) - PERMANENTLY BANNING!")
+                banPeerPermanentlyForSybil(peer.host, port: peer.port, fakeHeight: h, realHeight: headerStoreHeightForValidation)
                 continue  // Don't use this peer's height
             }
 
@@ -2926,9 +2960,14 @@ final class NetworkManager: ObservableObject {
     func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
+        // FIX #158: CRITICAL - Filter out banned peers from broadcast!
+        // Banned peers may have been Sybil attackers - don't trust them to relay transactions
+        let validPeers = peers.filter { !isBanned($0.host) }
+        print("📡 FIX #158: Filtered peers: \(peers.count) total, \(validPeers.count) valid (not banned)")
+
         // FIX #120: InsightAPI commented out - P2P only
         // If no P2P peers, fall back to InsightAPI broadcast
-        if !isConnected || peers.isEmpty {
+        if !isConnected || validPeers.isEmpty {
             print("⚠️ No P2P peers available - cannot broadcast (P2P only mode)")
             // onProgress?("api", "Submitting to blockchain...", 0.3)
             //
@@ -2941,11 +2980,11 @@ final class NetworkManager: ObservableObject {
             //     print("❌ InsightAPI broadcast failed: \(error)")
             //     throw NetworkError.broadcastFailed
             // }
-            throw NetworkError.connectionFailed("No P2P peers available for broadcast")
+            throw NetworkError.connectionFailed("No P2P peers available for broadcast (all peers banned or disconnected)")
         }
 
-        let peerCount = peers.count
-        print("📡 Broadcasting to \(peerCount) peers...")
+        let peerCount = validPeers.count
+        print("📡 Broadcasting to \(peerCount) peers (excluding banned)...")
         onProgress?("peers", "Propagating to network (\(peerCount) peers)...", 0.0)
 
         // Use actor for thread-safe state
@@ -2976,8 +3015,9 @@ final class NetworkManager: ObservableObject {
         // Broadcast to all peers - but check mempool after FIRST success
         // Use short timeout (5s) to avoid waiting for slow/dead peers
         await withThrowingTaskGroup(of: Void.self) { group in
-            // Add broadcast tasks for all peers with fast timeout
-            for peer in peers {
+            // Add broadcast tasks for all valid (non-banned) peers with fast timeout
+            // FIX #158: Use validPeers instead of peers to exclude banned Sybil attackers
+            for peer in validPeers {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {

@@ -79,9 +79,9 @@ ZipherX is a secure, decentralized cryptocurrency wallet for iOS/macOS based on 
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
-- FIX #154: FAST START progress bar stuck at 0%
-- FIX #155: Show failed health check name in UI
-- FIX #156: Add 'Rebuild witnesses' task with progress bar
+- FIX #157: Header sync timeout (20s per-peer, 60s total) for FAST START
+- FIX #158: Filter banned peers from TX broadcast (Sybil protection)
+- FIX #159: Permanent Sybil bans - indefinite until manual unban
 
 ## Security Score: 100/100
 

@@ -913,7 +913,24 @@ final class WalletManager: ObservableObject {
         }
 
         do {
-            try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+            // FIX #157: Add 60-second total timeout for header sync in FAST START
+            // We're only syncing ~10-100 headers, so this should be plenty of time
+            // If a peer is stuck, the per-peer timeout (20s) will trigger first
+            // This is a safety net to ensure FAST START never hangs for 2+ minutes
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await hsm.syncHeaders(from: earliestNeedingTimestamp)
+                }
+
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 60_000_000_000)  // 60 seconds max
+                    throw NetworkError.timeout
+                }
+
+                // Wait for first to complete (either sync finishes or timeout)
+                _ = try await group.next()
+                group.cancelAll()
+            }
             print("✅ FIX #120: Header sync for timestamps completed")
 
             // FIX #144: Update UI - sync complete
@@ -946,7 +963,12 @@ final class WalletManager: ObservableObject {
                 }
             }
         } catch {
-            print("⚠️ FIX #120: Header sync for timestamps failed: \(error.localizedDescription)")
+            // FIX #157: Log timeout specifically
+            if case NetworkError.timeout = error {
+                print("⚠️ FIX #157: Header sync timed out after 60s - continuing without full timestamps")
+            } else {
+                print("⚠️ FIX #120: Header sync for timestamps failed: \(error.localizedDescription)")
+            }
 
             // FIX #144: Clear header sync UI state on error
             await MainActor.run {

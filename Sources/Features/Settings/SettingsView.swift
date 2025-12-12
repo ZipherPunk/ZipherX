@@ -3044,10 +3044,16 @@ struct BannedPeerRow: View {
                             .font(theme.captionFont)
                             .foregroundColor(.red)
 
-                        // Time remaining
-                        Text("• \(timeRemaining)")
-                            .font(theme.captionFont)
-                            .foregroundColor(theme.textSecondary)
+                        // Time remaining or PERMANENT indicator (FIX #159)
+                        if peer.isPermanent {
+                            Text("• 🚨 PERMANENT")
+                                .font(theme.captionFont.bold())
+                                .foregroundColor(.red)
+                        } else {
+                            Text("• \(timeRemaining)")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
                     }
                 }
 

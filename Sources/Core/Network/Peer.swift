@@ -3031,11 +3031,30 @@ struct PeerScore {
 struct BannedPeer {
     let address: String
     let banTime: Date
-    let banDuration: TimeInterval // Default 24 hours
+    let banDuration: TimeInterval // Default 24 hours, -1 means PERMANENT (FIX #159)
     let reason: BanReason
 
+    /// FIX #159: Indicates if this is a permanent ban (Sybil attackers)
+    /// Permanent bans do NOT expire automatically and require manual unbanning
+    var isPermanent: Bool {
+        banDuration < 0
+    }
+
     var isExpired: Bool {
-        Date() > banTime.addingTimeInterval(banDuration)
+        // FIX #159: Permanent bans (duration < 0) NEVER expire
+        if isPermanent {
+            return false
+        }
+        return Date() > banTime.addingTimeInterval(banDuration)
+    }
+
+    /// Time remaining for temporary bans, nil for permanent bans
+    var timeRemaining: TimeInterval? {
+        if isPermanent {
+            return nil
+        }
+        let remaining = banTime.addingTimeInterval(banDuration).timeIntervalSinceNow
+        return max(0, remaining)
     }
 }
 
