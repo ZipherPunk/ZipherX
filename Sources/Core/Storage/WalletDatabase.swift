@@ -697,6 +697,29 @@ final class WalletDatabase {
             _ = sqlite3_exec(db, "DELETE FROM transaction_history WHERE txid = X'00' AND value = 0;", nil, nil, nil)
             print("📂 Migration 6: 'change' type already supported")
         }
+
+        // Migration 7: FIX #165 - Add verified_checkpoint_height column to sync_state
+        // This stores the last block height where balance/history was verified correct.
+        // On startup, app MUST scan from checkpoint to chain tip to catch ALL missed transactions.
+        var syncStateColumns: Set<String> = []
+        var pragmaStmtSync: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(sync_state);", -1, &pragmaStmtSync, nil) == SQLITE_OK {
+            while sqlite3_step(pragmaStmtSync) == SQLITE_ROW {
+                if let columnName = sqlite3_column_text(pragmaStmtSync, 1) {
+                    syncStateColumns.insert(String(cString: columnName))
+                }
+            }
+            sqlite3_finalize(pragmaStmtSync)
+        }
+
+        if !syncStateColumns.contains("verified_checkpoint_height") {
+            let alterSql = "ALTER TABLE sync_state ADD COLUMN verified_checkpoint_height INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 7: Added verified_checkpoint_height column to sync_state (FIX #165)")
+            } else {
+                print("⚠️ Migration 7: Failed to add verified_checkpoint_height: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
     }
 
     // MARK: - Account Operations
@@ -1522,6 +1545,56 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+    }
+
+    // MARK: - FIX #165: Verified Checkpoint
+
+    /// Get the last verified checkpoint height where balance/history was confirmed correct.
+    /// At startup, app MUST scan from this checkpoint to chain tip to catch ALL missed transactions.
+    func getVerifiedCheckpointHeight() throws -> UInt64 {
+        let sql = "SELECT verified_checkpoint_height FROM sync_state WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Update the verified checkpoint height.
+    /// Call this when:
+    /// 1. App startup sync completes successfully (both incoming and spent tx detected)
+    /// 2. Send transaction completes successfully (balance/history updated)
+    /// 3. Any time balance/history is verified as correct
+    func updateVerifiedCheckpointHeight(_ height: UInt64) throws {
+        // Validate height
+        let maxReasonableHeight: UInt64 = 10_000_000
+        guard height <= maxReasonableHeight else {
+            print("🚨 [FIX #165] Refusing to write invalid checkpoint height: \(height)")
+            return
+        }
+
+        let sql = "UPDATE sync_state SET verified_checkpoint_height = ? WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("✅ [FIX #165] Updated verified checkpoint to height \(height)")
     }
 
     // MARK: - Tree State

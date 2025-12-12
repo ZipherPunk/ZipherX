@@ -2094,6 +2094,11 @@ final class NetworkManager: ObservableObject {
             // Also send system notification
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
         }
+
+        // FIX #165: Update checkpoint after confirmed incoming tx (balance/history verified correct)
+        if let chainHeight = try? await getChainHeight() {
+            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
+        }
     }
 
     /// Check if any pending outgoing transactions have been confirmed

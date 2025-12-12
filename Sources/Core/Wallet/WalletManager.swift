@@ -3158,6 +3158,11 @@ final class WalletManager: ObservableObject {
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
+        // FIX #165: Update checkpoint after successful send (balance/history verified correct)
+        if let chainHeight = try? await NetworkManager.shared.getChainHeight() {
+            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
+        }
+
         // Signal completion with txid visible in progress message
         onProgress("broadcast", "Transaction complete!", 1.0)
 
@@ -3281,6 +3286,11 @@ final class WalletManager: ObservableObject {
 
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
+
+        // FIX #165: Update checkpoint after successful send (balance/history verified correct)
+        if let chainHeight = try? await NetworkManager.shared.getChainHeight() {
+            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
+        }
 
         // Refresh balance
         try await refreshBalance()

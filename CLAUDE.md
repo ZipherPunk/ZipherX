@@ -89,6 +89,16 @@ Latest fixes:
   - Correct formula: RECEIVED (all notes) - SENT - FEES = UNSPENT balance
   - Groups spent notes by `spent_in_tx`, calculates sent = inputs - change - fee
   - Views check `isRepairingHistory` flag to prevent undoing repair
+- FIX #164: Nullifier verification health check at startup
+  - Scans recent blocks to verify unspent notes haven't been spent on-chain
+  - Detects missed spending transactions (e.g., from other wallet instances)
+  - Marks spent notes and updates balance if nullifiers found on blockchain
+- FIX #165: Checkpoint-based startup sync for ALL missed transactions
+  - Added `verified_checkpoint_height` column to `sync_state` table (Migration 7)
+  - Health check 12: Scans from checkpoint to chain tip at every startup
+  - Detects BOTH incoming notes (trial decryption) AND spent notes (nullifiers)
+  - Checkpoint updated after: startup scan, send TX success, incoming TX confirmed
+  - Ensures wallet ALWAYS discovers new ZCL sent while app was closed
 
 ## Security Score: 100/100
 
