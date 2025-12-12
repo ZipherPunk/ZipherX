@@ -97,7 +97,12 @@ Latest fixes:
   - Added `verified_checkpoint_height` column to `sync_state` table (Migration 7)
   - Health check 12: Scans from checkpoint to chain tip at every startup
   - Detects BOTH incoming notes (trial decryption) AND spent notes (nullifiers)
-  - Checkpoint updated after: startup scan, send TX success, incoming TX confirmed
+- FIX #165 v2: Checkpoint only updated on TX CONFIRMATION, not mempool
+  - REMOVED checkpoint update from `sendShieldedWithProgress()` and `sendShielded()`
+  - ADDED checkpoint update to `confirmOutgoingTx()` (when sent TX is mined)
+  - ADDED checkpoint update to `confirmIncomingTx()` (when received TX is mined)
+  - Fixes edge case: if user sends from another wallet before TX confirms,
+    the other transaction would be missed because checkpoint was set too early
   - Ensures wallet ALWAYS discovers new ZCL sent while app was closed
 - FIX #120 (v2): FAST START must connect to P2P network before health checks
   - Previous bug: Fast path skipped network connection when no header sync needed

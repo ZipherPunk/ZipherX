@@ -2018,6 +2018,14 @@ final class NetworkManager: ObservableObject {
             }
             print("📤 confirmOutgoingTx: txid not found in pending list (already confirmed or never tracked)")
         }
+
+        // FIX #165 v2: Update checkpoint when TX is CONFIRMED (mined), not at mempool
+        // This ensures if user sends from another wallet before this TX confirms,
+        // the checkpoint scan will still catch that other transaction.
+        if let chainHeight = try? await getChainHeight() {
+            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
+            print("📍 FIX #165 v2: Checkpoint updated to \(chainHeight) after outgoing TX confirmed")
+        }
     }
 
     /// Called when an incoming transaction is confirmed (found in a block during scanning)
@@ -2095,9 +2103,12 @@ final class NetworkManager: ObservableObject {
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
         }
 
-        // FIX #165: Update checkpoint after confirmed incoming tx (balance/history verified correct)
+        // FIX #165 v2: Update checkpoint when TX is CONFIRMED (mined), not at mempool
+        // This ensures if user sends from another wallet before this TX confirms,
+        // the checkpoint scan will still catch that other transaction.
         if let chainHeight = try? await getChainHeight() {
             try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
+            print("📍 FIX #165 v2: Checkpoint updated to \(chainHeight) after incoming TX confirmed")
         }
     }
 

@@ -3158,10 +3158,11 @@ final class WalletManager: ObservableObject {
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
-        // FIX #165: Update checkpoint after successful send (balance/history verified correct)
-        if let chainHeight = try? await NetworkManager.shared.getChainHeight() {
-            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
-        }
+        // FIX #165 v2: DON'T update checkpoint here - TX is only in mempool, not confirmed!
+        // Checkpoint should only be updated when TX is MINED (confirmed in a block)
+        // Otherwise, if user sends from another wallet before this confirms,
+        // the checkpoint would skip over that other transaction.
+        // Checkpoint update moved to confirmOutgoingTx() which is called when TX is mined.
 
         // Signal completion with txid visible in progress message
         onProgress("broadcast", "Transaction complete!", 1.0)
@@ -3287,10 +3288,8 @@ final class WalletManager: ObservableObject {
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
 
-        // FIX #165: Update checkpoint after successful send (balance/history verified correct)
-        if let chainHeight = try? await NetworkManager.shared.getChainHeight() {
-            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(chainHeight)
-        }
+        // FIX #165 v2: DON'T update checkpoint here - TX is only in mempool, not confirmed!
+        // Checkpoint update moved to confirmOutgoingTx() which is called when TX is mined.
 
         // Refresh balance
         try await refreshBalance()
