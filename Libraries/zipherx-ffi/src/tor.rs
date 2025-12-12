@@ -583,7 +583,10 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     eprintln!("🧅 Launching hidden service...");
 
     // Launch the onion service - with or without a pre-existing keypair
-    let (service, rend_requests) = if let Some(keypair_bytes) = stored_keypair {
+    // Box the rend_requests stream to unify the types from both branches
+    // (launch_onion_service_with_hsid and launch_onion_service return different opaque types)
+    use std::pin::Pin;
+    let (service, rend_requests): (_, Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>) = if let Some(keypair_bytes) = stored_keypair {
         // Use stored keypair for persistent .onion address
         eprintln!("🧅 Using persistent keypair for fixed .onion address");
 
@@ -613,13 +616,15 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
         // Launch with the persistent keypair using the keystore-based API
         // This inserts the keypair into Arti's keystore and launches the service
-        client.launch_onion_service_with_hsid(config, hs_id_keypair)?
-            .ok_or("Hidden service returned None (with keypair)")?
+        let (svc, rend) = client.launch_onion_service_with_hsid(config, hs_id_keypair)?
+            .ok_or("Hidden service returned None (with keypair)")?;
+        (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
     } else {
         // Generate new random address
         eprintln!("🧅 No persistent keypair - generating new random .onion address");
-        client.launch_onion_service(config)?
-            .ok_or("Hidden service returned None")?
+        let (svc, rend) = client.launch_onion_service(config)?
+            .ok_or("Hidden service returned None")?;
+        (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
     };
 
     // CRITICAL: Store the service handle to keep it alive
