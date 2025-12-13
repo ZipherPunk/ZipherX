@@ -2468,9 +2468,33 @@ final class FilterScanner {
         // SECURITY: Requires minimum 3 peers for consensus before accepting height
         // This prevents Sybil attacks where malicious peers report fake heights
 
-        // FIX #167: First verify we have enough peers for consensus
-        let connectedPeers = networkManager.connectedPeers
+        // FIX #228: Wait for enough peers before giving up on import sync
+        // Problem: Import sync was failing immediately with 2 peers, leaving wallet with 0 balance
         let minPeersForConsensus = 3
+        let maxRetries = 5
+        let retryDelay: UInt64 = 3_000_000_000 // 3 seconds
+
+        for attempt in 1...maxRetries {
+            let connectedPeers = networkManager.connectedPeers
+            if connectedPeers >= minPeersForConsensus {
+                break
+            }
+
+            if attempt < maxRetries {
+                print("⏳ [FIX #228] Waiting for peers: \(connectedPeers)/\(minPeersForConsensus) (attempt \(attempt)/\(maxRetries))")
+                try await Task.sleep(nanoseconds: retryDelay)
+
+                // Try to connect to more peers
+                if connectedPeers < minPeersForConsensus {
+                    try? await networkManager.connect()
+                }
+            } else {
+                print("🚨 [FIX #228] Insufficient peers for consensus after \(maxRetries) retries: \(connectedPeers)/\(minPeersForConsensus)")
+                throw ScanError.networkError
+            }
+        }
+
+        let connectedPeers = networkManager.connectedPeers
         guard connectedPeers >= minPeersForConsensus else {
             print("🚨 [FIX #167] Insufficient peers for consensus: \(connectedPeers)/\(minPeersForConsensus)")
             throw ScanError.networkError
