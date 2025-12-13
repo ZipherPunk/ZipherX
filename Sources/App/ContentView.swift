@@ -861,9 +861,10 @@ struct ContentView: View {
                         // and there are just a few missed blocks (not the entire chain)
                         if currentWalletHeight > 0 && currentChainHeight > currentWalletHeight {
                             let missedBlocks = currentChainHeight - currentWalletHeight
-                            // FIX #204: Increase limit from 100 to 1000 blocks (~16 hours)
-                            // After import, wallet may be 300-500 blocks behind chain tip
-                            guard missedBlocks < 1000 else {
+                            // FIX #204 v2: Increase limit to 50000 blocks (~1 month)
+                            // User may not open app for days/weeks - all those blocks are valid
+                            // Only reject if it looks like full chain sync (millions of blocks)
+                            guard missedBlocks < 50000 else {
                                 print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
                                 // CRITICAL: Must clear suppressBackgroundSync even on early return!
                                 networkManager.suppressBackgroundSync = false
