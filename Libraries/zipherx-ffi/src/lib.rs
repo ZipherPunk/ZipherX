@@ -48,12 +48,18 @@ use chacha20poly1305::aead::generic_array::GenericArray;
 use incrementalmerkletree::{MerklePath, Position, frontier::CommitmentTree, witness::IncrementalWitness, Hashable};
 use zcash_primitives::merkle_tree::{read_commitment_tree, write_commitment_tree, read_incremental_witness, write_incremental_witness, HashSer};
 use zcash_proofs::prover::LocalTxProver;
+use zcash_proofs::sapling::SaplingVerificationContext;
+use zcash_proofs::ZcashParameters;
 use group::{GroupEncoding, cofactor::CofactorGroup, Curve};
 use ff::{PrimeField, Field};
 use rand::rngs::OsRng;
 
 // Global prover instance
 static PROVER: Mutex<Option<LocalTxProver>> = Mutex::new(None);
+
+// Global verifying keys - stored separately from prover since LocalTxProver doesn't expose its VKs
+// These are used by zipherx_verify_transaction() to validate Sapling proofs before broadcast
+static VERIFYING_KEYS: Mutex<Option<ZcashParameters>> = Mutex::new(None);
 
 // Sapling tree depth
 const SAPLING_COMMITMENT_TREE_DEPTH: u8 = 32;
@@ -1071,11 +1077,26 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
         LocalTxProver::from_bytes(spend_bytes, output_bytes)
     });
 
+    // Also load verifying keys using parse_parameters (VUL-002 FIX)
+    let vk_result = std::panic::catch_unwind(|| {
+        zcash_proofs::parse_parameters(spend_bytes, output_bytes, None)
+    });
+
     match prover {
         Ok(p) => {
             let mut global_prover = PROVER.lock().unwrap();
             *global_prover = Some(p);
             eprintln!("✅ Prover initialized from memory");
+
+            // Store verifying keys for VUL-002 transaction verification
+            if let Ok(params) = vk_result {
+                let mut global_vk = VERIFYING_KEYS.lock().unwrap();
+                *global_vk = Some(params);
+                eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
+            } else {
+                eprintln!("⚠️ Could not load verifying keys - TX validation may not work");
+            }
+
             true
         }
         Err(e) => {
@@ -1168,11 +1189,26 @@ pub unsafe extern "C" fn zipherx_init_prover(
         LocalTxProver::new(spend_path, output_path)
     });
 
+    // Also load verifying keys using load_parameters (VUL-002 FIX)
+    let vk_result = std::panic::catch_unwind(|| {
+        zcash_proofs::load_parameters(spend_path, output_path, None)
+    });
+
     match prover {
         Ok(p) => {
             let mut global_prover = PROVER.lock().unwrap();
             *global_prover = Some(p);
             eprintln!("✅ Prover initialized with Sapling parameters");
+
+            // Store verifying keys for VUL-002 transaction verification
+            if let Ok(params) = vk_result {
+                let mut global_vk = VERIFYING_KEYS.lock().unwrap();
+                *global_vk = Some(params);
+                eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
+            } else {
+                eprintln!("⚠️ Could not load verifying keys - TX validation may not work");
+            }
+
             true
         }
         Err(e) => {
@@ -2333,6 +2369,159 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
     debug_log!("✅ Tree loaded with {} commitments", count);
 
     true
+}
+
+/// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
+/// This eliminates PHASE 1.5 by combining tree loading with witness creation.
+///
+/// Parameters:
+/// - data: Bundled CMU data [count: u64][cmu1: 32]...
+/// - data_len: Length of CMU data
+/// - target_cmus: Array of 32-byte target CMUs to create witnesses for
+/// - target_count: Number of target CMUs
+/// - positions_out: Output array for positions (u64 * target_count)
+/// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+/// - progress_callback: Progress callback(current, total)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
+    data: *const u8,
+    data_len: usize,
+    target_cmus: *const u8,
+    target_count: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+    progress_callback: TreeLoadProgressCallback,
+) -> usize {
+    if data_len < 8 {
+        return 0;
+    }
+
+    let bytes = slice::from_raw_parts(data, data_len);
+
+    // Read count
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        debug_log!("❌ CMU count {} exceeds safe maximum {}", count, max_safe_count);
+        return 0;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+    if data_len < expected_len {
+        return 0;
+    }
+
+    debug_log!("🔧 FIX #197: Loading tree with {} CMUs AND creating {} witnesses in single pass",
+               count, target_count);
+    let start_time = std::time::Instant::now();
+
+    // Build HashMap of target CMUs for O(1) lookup
+    let targets = if target_count > 0 && !target_cmus.is_null() {
+        Some(slice::from_raw_parts(target_cmus, target_count * 32))
+    } else {
+        None
+    };
+
+    let mut target_map: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    if let Some(targets) = targets {
+        for i in 0..target_count {
+            let offset = i * 32;
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(&targets[offset..offset + 32]);
+            target_map.insert(cmu, i);
+        }
+    }
+
+    // Storage for witnesses captured during tree build
+    let mut captured_witnesses: Vec<(usize, u64, IncrementalWitness<zcash_primitives::sapling::Node, 32>)> = Vec::new();
+
+    // Report initial progress
+    progress_callback(0, count);
+
+    // Build tree, capturing witnesses at target positions
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut offset = 8;
+    let mut found_count = 0;
+
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        let node = match zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+
+        if tree.append(node.clone()).is_err() {
+            return 0;
+        }
+
+        // Check if this CMU is a target
+        if !target_map.is_empty() {
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(cmu_bytes);
+            if let Some(&orig_idx) = target_map.get(&cmu) {
+                // Capture witness at this position
+                let witness = IncrementalWitness::from_tree(tree.clone());
+                captured_witnesses.push((orig_idx, i, witness));
+                found_count += 1;
+                debug_log!("📍 FIX #197: Target {} found at position {}", orig_idx, i);
+            }
+        }
+
+        // Update existing witnesses with new node
+        for (_, _, witness) in &mut captured_witnesses {
+            if witness.tree().size() > 0 {
+                witness.append(node.clone()).ok();
+            }
+        }
+
+        // Report progress every 10000 CMUs
+        if i > 0 && i % 10000 == 0 {
+            progress_callback(i, count);
+        }
+    }
+
+    // Final progress
+    progress_callback(count, count);
+
+    // Store tree in global
+    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    *pos_guard = count;
+
+    let tree_time = start_time.elapsed();
+    debug_log!("⏱️ FIX #197: Tree loaded in {:.1}s, found {}/{} targets",
+               tree_time.as_secs_f64(), found_count, target_count);
+
+    // Serialize witnesses to output
+    let mut success_count = 0;
+    for (orig_idx, pos, witness) in captured_witnesses {
+        let pos_ptr = positions_out.add(orig_idx);
+        let witness_ptr = witnesses_out.add(orig_idx * 1028);
+
+        let mut serialized = Vec::new();
+        if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+            *pos_ptr = pos;
+            std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+            if serialized.len() < 1028 {
+                std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+            }
+            success_count += 1;
+        } else {
+            *pos_ptr = u64::MAX;
+        }
+    }
+
+    debug_log!("✅ FIX #197: Tree loaded + {} witnesses created in {:.1}s (PHASE 1.5 eliminated!)",
+               success_count, start_time.elapsed().as_secs_f64());
+    success_count
 }
 
 /// Create a witness for a specific CMU from bundled CMU data
@@ -4157,4 +4346,280 @@ impl ShieldedOutput<SaplingDomain<ZclassicNetwork>, ENC_CIPHERTEXT_SIZE> for Boo
     fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
         &self.enc_ciphertext
     }
+}
+
+// =============================================================================
+// VUL-002: Local Transaction Verification (FIX #xxx)
+// Validate Sapling proofs BEFORE broadcasting to prevent invalid TX propagation
+// This mirrors the mempool validation in zclassic/src/main.cpp ContextualCheckTransaction()
+// =============================================================================
+
+/// Error codes for transaction verification
+#[repr(u32)]
+pub enum TxVerifyError {
+    Success = 0,
+    InvalidTransactionData = 1,
+    FailedToParseTransaction = 2,
+    NoSaplingBundle = 3,
+    SpendVerificationFailed = 4,
+    OutputVerificationFailed = 5,
+    BindingSignatureFailed = 6,
+    MissingVerifyingKey = 7,
+    InvalidSignatureHash = 8,
+}
+
+/// Verify a serialized Sapling transaction before broadcasting
+///
+/// This function performs the same verification as ContextualCheckTransaction() in zclassic:
+/// 1. Parse the serialized transaction
+/// 2. For each SpendDescription: call check_spend()
+/// 3. For each OutputDescription: call check_output()
+/// 4. Call final_check() to verify the binding signature
+///
+/// # Safety
+/// - tx_data: Pointer to serialized transaction bytes
+/// - tx_len: Length of transaction data
+/// - chain_height: Current chain height (for branch ID selection)
+/// - error_out: Output for error code if verification fails
+///
+/// # Returns
+/// true if transaction is valid, false otherwise
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_transaction(
+    tx_data: *const u8,
+    tx_len: usize,
+    chain_height: u64,
+    error_out: *mut u32,
+) -> bool {
+    use zcash_primitives::transaction::Transaction;
+    use zcash_primitives::consensus::BranchId;
+    use std::io::Cursor;
+
+    // Safety check
+    if tx_data.is_null() || tx_len == 0 {
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::InvalidTransactionData as u32;
+        }
+        return false;
+    }
+
+    let tx_bytes = slice::from_raw_parts(tx_data, tx_len);
+
+    // Get branch ID for current height (Zclassic uses Buttercup after block 707,000)
+    let height = BlockHeight::from_u32(chain_height as u32);
+    let branch_id = BranchId::for_height(&ZclassicNetwork, height);
+
+    eprintln!("🔍 VUL-002 FIX: Verifying transaction ({} bytes) at height {} with branch ID {:?}",
+        tx_len, chain_height, branch_id);
+
+    // Parse the transaction
+    let tx = match Transaction::read(&mut Cursor::new(tx_bytes), branch_id) {
+        Ok(tx) => tx,
+        Err(e) => {
+            eprintln!("❌ Failed to parse transaction: {:?}", e);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::FailedToParseTransaction as u32;
+            }
+            return false;
+        }
+    };
+
+    // Get the Sapling bundle - if none, nothing to verify (pure transparent tx)
+    let sapling_bundle = match tx.sapling_bundle() {
+        Some(bundle) => bundle,
+        None => {
+            eprintln!("ℹ️ Transaction has no Sapling bundle - no Sapling verification needed");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::Success as u32;
+            }
+            return true;
+        }
+    };
+
+    let shielded_spends = sapling_bundle.shielded_spends();
+    let shielded_outputs = sapling_bundle.shielded_outputs();
+    let value_balance = sapling_bundle.value_balance();
+
+    eprintln!("🔍 Sapling bundle: {} spends, {} outputs, value_balance: {:?}",
+        shielded_spends.len(), shielded_outputs.len(), value_balance);
+
+    // If no spends and no outputs, nothing to verify
+    if shielded_spends.is_empty() && shielded_outputs.is_empty() {
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::Success as u32;
+        }
+        return true;
+    }
+
+    // Get verifying keys from our static storage (populated during prover init)
+    let vk_guard = VERIFYING_KEYS.lock().unwrap();
+    let vk_params = match vk_guard.as_ref() {
+        Some(params) => params,
+        None => {
+            eprintln!("❌ Verifying keys not initialized - call zipherx_init_prover first");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::MissingVerifyingKey as u32;
+            }
+            return false;
+        }
+    };
+
+    // Create verification context (ZIP 216 enabled for modern transactions)
+    let mut ctx = SaplingVerificationContext::new(true);
+
+    // Compute sighash (dataToBeSigned) - this is what spend auth sigs and binding sig sign
+    // For Sapling v4 transactions, we use v4_signature_hash directly which doesn't need txid_parts
+    use zcash_primitives::transaction::sighash::{SignableInput};
+    use zcash_primitives::transaction::sighash_v4::v4_signature_hash;
+
+    // Get the TransactionData from the Transaction for sighash computation
+    let tx_data = tx.into_data();
+
+    // For v4 (Sapling) transactions, compute sighash directly
+    let sighash_hash = v4_signature_hash(&tx_data, &SignableInput::Shielded);
+    let sighash_bytes: [u8; 32] = sighash_hash.as_bytes().try_into().expect("sighash is 32 bytes");
+
+    eprintln!("🔍 Computed sighash for verification");
+
+    // Re-get sapling bundle from tx_data (tx was consumed by into_data())
+    let sapling_bundle = match tx_data.sapling_bundle() {
+        Some(bundle) => bundle,
+        None => {
+            // Shouldn't happen since we checked above, but be safe
+            eprintln!("ℹ️ Transaction has no Sapling bundle - no Sapling verification needed");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::Success as u32;
+            }
+            return true;
+        }
+    };
+
+    let shielded_spends = sapling_bundle.shielded_spends();
+    let shielded_outputs = sapling_bundle.shielded_outputs();
+
+    // Verify each SpendDescription
+    for (i, spend) in shielded_spends.iter().enumerate() {
+        let cv = spend.cv();
+        let anchor = spend.anchor();
+        let nullifier = spend.nullifier();
+        let rk = spend.rk();
+        let zkproof_bytes = spend.zkproof();
+        let spend_auth_sig = spend.spend_auth_sig();
+
+        // Parse the zkproof bytes into a Proof<Bls12> for verification
+        use bellman::groth16::Proof;
+        use bls12_381::Bls12;
+        let zkproof = match Proof::<Bls12>::read(&zkproof_bytes[..]) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("❌ SpendDescription {} failed to parse zkproof: {:?}", i, e);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::SpendVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        // check_spend expects: cv, anchor, &nullifier.0, rk, &sighash, spend_auth_sig, zkproof, &spend_vk
+        let spend_valid = ctx.check_spend(
+            cv,
+            *anchor,
+            &nullifier.0,
+            rk.clone(),
+            &sighash_bytes,
+            *spend_auth_sig,
+            zkproof,
+            &vk_params.spend_vk,
+        );
+
+        if !spend_valid {
+            eprintln!("❌ SpendDescription {} verification FAILED", i);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::SpendVerificationFailed as u32;
+            }
+            return false;
+        }
+        eprintln!("✅ SpendDescription {} verified", i);
+    }
+
+    // Verify each OutputDescription
+    for (i, output) in shielded_outputs.iter().enumerate() {
+        let cv = output.cv();
+        let cmu = output.cmu();
+        let ephemeral_key_bytes = output.ephemeral_key();
+        let zkproof_bytes = output.zkproof();
+
+        // Parse the zkproof bytes into a Proof<Bls12>
+        use bellman::groth16::Proof;
+        use bls12_381::Bls12;
+        let zkproof = match Proof::<Bls12>::read(&zkproof_bytes[..]) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("❌ OutputDescription {} failed to parse zkproof: {:?}", i, e);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::OutputVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        // Convert EphemeralKeyBytes to ExtendedPoint via AffinePoint
+        // EphemeralKeyBytes is a newtype around [u8; 32]
+        // from_bytes returns CtOption<T>, use into_option() to convert to Option<T>
+        use subtle::CtOption;
+        let epk = match jubjub::AffinePoint::from_bytes(ephemeral_key_bytes.0).into_option() {
+            Some(affine) => jubjub::ExtendedPoint::from(affine),
+            None => {
+                eprintln!("❌ OutputDescription {} has invalid ephemeral key", i);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::OutputVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        let output_valid = ctx.check_output(
+            cv,
+            *cmu,
+            epk,
+            zkproof,
+            &vk_params.output_vk,
+        );
+
+        if !output_valid {
+            eprintln!("❌ OutputDescription {} verification FAILED", i);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::OutputVerificationFailed as u32;
+            }
+            return false;
+        }
+        eprintln!("✅ OutputDescription {} verified", i);
+    }
+
+    // Final check: verify the binding signature
+    // This ensures value balance is correct and transaction wasn't tampered with
+    let value_balance = sapling_bundle.value_balance();
+    let binding_sig = sapling_bundle.authorization().binding_sig;
+
+    let final_valid = ctx.final_check(
+        *value_balance,
+        &sighash_bytes,
+        binding_sig,
+    );
+
+    if !final_valid {
+        eprintln!("❌ Binding signature verification FAILED");
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::BindingSignatureFailed as u32;
+        }
+        return false;
+    }
+
+    eprintln!("✅ Binding signature verified");
+    eprintln!("✅ Transaction verification PASSED - safe to broadcast");
+
+    if !error_out.is_null() {
+        *error_out = TxVerifyError::Success as u32;
+    }
+    true
 }

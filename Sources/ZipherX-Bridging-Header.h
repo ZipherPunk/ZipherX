@@ -446,6 +446,26 @@ bool zipherx_tree_load_from_cmus_with_progress(
     TreeLoadProgressCallback progress_callback
 );
 
+/// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
+/// This eliminates PHASE 1.5 by combining tree loading with witness creation.
+/// @param data Bundled CMU data [count: u64][cmu1: 32]...
+/// @param data_len Length of CMU data
+/// @param target_cmus Array of 32-byte target CMUs to create witnesses for
+/// @param target_count Number of target CMUs
+/// @param positions_out Output array for positions (uint64_t * target_count)
+/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
+/// @param progress_callback Progress callback(current, total)
+/// @return Number of witnesses successfully created
+size_t zipherx_tree_load_with_witnesses(
+    const uint8_t *data,
+    size_t data_len,
+    const uint8_t *target_cmus,
+    size_t target_count,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out,
+    TreeLoadProgressCallback progress_callback
+);
+
 /// Create a witness for a specific CMU from bundled CMU data
 /// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
 /// @param cmu_data Pointer to bundled CMU file data [count: u64][cmu1: 32]...

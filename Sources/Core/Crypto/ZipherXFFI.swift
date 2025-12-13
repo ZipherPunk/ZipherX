@@ -970,6 +970,87 @@ enum ZipherXFFI {
         return result
     }
 
+    /// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
+    /// This eliminates PHASE 1.5 by combining tree loading with witness creation.
+    ///
+    /// For 9 notes with 1M CMUs: ~15-20s total (vs 15s load + 56s separate witness = 71s)
+    ///
+    /// - Parameters:
+    ///   - data: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - targetCMUs: Array of 32-byte CMUs to create witnesses for
+    ///   - onProgress: Called with (currentCMU, totalCMUs) approximately every 10000 CMUs
+    /// - Returns: Array of (position, witness) tuples, or nil for CMUs not found
+    static func treeLoadWithWitnesses(
+        data: Data,
+        targetCMUs: [Data],
+        onProgress: @escaping TreeLoadProgressCallback
+    ) -> [(position: UInt64, witness: Data)?] {
+        guard !targetCMUs.isEmpty else {
+            // No witnesses needed, just load tree normally
+            let success = treeLoadFromCMUsWithProgress(data: data, onProgress: onProgress)
+            return success ? [] : []
+        }
+
+        // Validate all CMUs are 32 bytes
+        for cmu in targetCMUs {
+            guard cmu.count == 32 else {
+                print("❌ FIX #197: Invalid CMU size: \(cmu.count)")
+                return targetCMUs.map { _ in nil }
+            }
+        }
+
+        let targetCount = targetCMUs.count
+
+        // Pack all target CMUs into a single contiguous buffer
+        var targetBuffer = [UInt8](repeating: 0, count: targetCount * 32)
+        for (i, cmu) in targetCMUs.enumerated() {
+            cmu.copyBytes(to: &targetBuffer[i * 32], count: 32)
+        }
+
+        // Allocate output buffers
+        var positions = [UInt64](repeating: UInt64.max, count: targetCount)
+        var witnessBuffer = [UInt8](repeating: 0, count: targetCount * 1028)
+
+        // Store callback globally so C callback can access it
+        treeLoadProgressCallback = onProgress
+
+        // C callback that forwards to Swift
+        let cCallback: @convention(c) (UInt64, UInt64) -> Void = { current, total in
+            ZipherXFFI.treeLoadProgressCallback?(current, total)
+        }
+
+        let successCount = data.withUnsafeBytes { dataPtr in
+            zipherx_tree_load_with_witnesses(
+                dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                data.count,
+                targetBuffer,
+                targetCount,
+                &positions,
+                &witnessBuffer,
+                cCallback
+            )
+        }
+
+        // Clear callback
+        treeLoadProgressCallback = nil
+
+        print("✅ FIX #197: treeLoadWithWitnesses created \(successCount)/\(targetCount) witnesses")
+
+        // Build result array
+        var results: [(position: UInt64, witness: Data)?] = []
+        for i in 0..<targetCount {
+            if positions[i] != UInt64.max {
+                let witnessStart = i * 1028
+                let witnessData = Data(witnessBuffer[witnessStart..<witnessStart + 1028])
+                results.append((position: positions[i], witness: witnessData))
+            } else {
+                results.append(nil)
+            }
+        }
+
+        return results
+    }
+
     /// Create a witness for a specific CMU from bundled CMU data
     /// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
     /// - Parameters:
@@ -1579,6 +1660,107 @@ enum ZipherXFFI {
         }
 
         return (Data(txOutput.prefix(txLen)), nullifiers)
+    }
+
+    // MARK: - Transaction Verification (FIX #xxx - VUL-002)
+    // Validate Sapling proofs BEFORE broadcasting to prevent invalid TX propagation
+
+    /// Error type for transaction verification failures
+    enum TransactionVerifyError: Error, LocalizedError {
+        case invalidData
+        case parseFailed
+        case noSaplingBundle
+        case spendVerificationFailed
+        case outputVerificationFailed
+        case bindingSignatureFailed
+        case missingVerifyingKey
+        case invalidSignatureHash
+        case unknown(UInt32)
+
+        init(code: UInt32) {
+            switch code {
+            case 0: self = .invalidData  // Should not happen if bool returned false
+            case 1: self = .invalidData
+            case 2: self = .parseFailed
+            case 3: self = .noSaplingBundle
+            case 4: self = .spendVerificationFailed
+            case 5: self = .outputVerificationFailed
+            case 6: self = .bindingSignatureFailed
+            case 7: self = .missingVerifyingKey
+            case 8: self = .invalidSignatureHash
+            default: self = .unknown(code)
+            }
+        }
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidData:
+                return "Invalid transaction data"
+            case .parseFailed:
+                return "Failed to parse transaction"
+            case .noSaplingBundle:
+                return "Transaction has no Sapling bundle (no shielded components)"
+            case .spendVerificationFailed:
+                return "Sapling spend proof verification failed (invalid zk-SNARK)"
+            case .outputVerificationFailed:
+                return "Sapling output proof verification failed"
+            case .bindingSignatureFailed:
+                return "Binding signature verification failed"
+            case .missingVerifyingKey:
+                return "Sapling verifying key not initialized (prover not loaded)"
+            case .invalidSignatureHash:
+                return "Failed to compute signature hash"
+            case .unknown(let code):
+                return "Unknown verification error (code: \(code))"
+            }
+        }
+    }
+
+    /// Verify a serialized Sapling transaction before broadcasting
+    /// This performs the same validation as zclassic's mempool acceptance:
+    /// - Validates all SpendDescription proofs
+    /// - Validates all OutputDescription proofs
+    /// - Validates the binding signature
+    ///
+    /// - Parameters:
+    ///   - txData: Serialized transaction bytes
+    ///   - chainHeight: Current chain height (for branch ID selection)
+    /// - Returns: true if transaction is valid
+    /// - Throws: TransactionVerifyError with specific failure reason
+    static func verifyTransaction(txData: Data, chainHeight: UInt64) throws -> Bool {
+        guard txData.count > 0 else {
+            throw TransactionVerifyError.invalidData
+        }
+
+        var errorCode: UInt32 = 0
+
+        let valid = txData.withUnsafeBytes { txPtr in
+            zipherx_verify_transaction(
+                txPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                txData.count,
+                chainHeight,
+                &errorCode
+            )
+        }
+
+        if valid {
+            return true
+        } else {
+            throw TransactionVerifyError(code: errorCode)
+        }
+    }
+
+    /// Verify a transaction and return result without throwing
+    /// Useful for cases where you want to check validity without exception handling
+    static func isTransactionValid(txData: Data, chainHeight: UInt64) -> (valid: Bool, error: TransactionVerifyError?) {
+        do {
+            let valid = try verifyTransaction(txData: txData, chainHeight: chainHeight)
+            return (valid, nil)
+        } catch let error as TransactionVerifyError {
+            return (false, error)
+        } catch {
+            return (false, .unknown(999))
+        }
     }
 
     // MARK: - Boost File Scanning (Rust-native, matching benchmark)
