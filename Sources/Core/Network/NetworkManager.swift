@@ -1120,7 +1120,8 @@ final class NetworkManager: ObservableObject {
             // FIX #196: Skip peers with invalid peerVersion - their peerStartHeight is garbage!
             // When VERSION parsing fails (e.g., "Duplicate version message"), peerVersion is 0 or negative
             // and peerStartHeight contains random data that could trigger false Sybil detection
-            guard peer.peerVersion >= Peer.minPeerProtocolVersion else {
+            // MIN_PEER_PROTO_VERSION = 170002 (Overwinter+)
+            guard peer.peerVersion >= 170002 else {
                 print("⚠️ FIX #196: Skipping peer \(peer.host) with invalid version \(peer.peerVersion) - height data unreliable")
                 continue
             }
