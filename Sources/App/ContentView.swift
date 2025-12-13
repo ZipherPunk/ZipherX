@@ -813,30 +813,37 @@ struct ContentView: View {
                         let targetHeight = cachedHeight > 0 ? cachedHeight : networkManager.chainHeight
                         print("🔍 FIX #198: Using cached height: \(targetHeight), wallet height: \(networkManager.walletHeight) (skipped 36s Tor wait!)")
 
-                        while networkManager.chainHeight > 0 &&
-                              networkManager.walletHeight < networkManager.chainHeight &&
-                              syncWaitCount < maxSyncWait {
-                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                            syncWaitCount += 1
+                        // FIX #205: Skip the 30-second wait loop when background sync is suppressed
+                        // The wallet CAN'T sync during this phase because suppressBackgroundSync = true
+                        // Catch-up sync at line 872+ will handle the missed blocks directly
+                        if !networkManager.suppressBackgroundSync {
+                            while networkManager.chainHeight > 0 &&
+                                  networkManager.walletHeight < networkManager.chainHeight &&
+                                  syncWaitCount < maxSyncWait {
+                                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                                syncWaitCount += 1
 
-                            // Update status more frequently (every 500ms) with detailed progress
-                            if syncWaitCount % 5 == 0 {
-                                let walletH = networkManager.walletHeight
-                                let chainH = networkManager.chainHeight
-                                let blocksRemaining = chainH > walletH ? chainH - walletH : 0
-                                let elapsed = Double(syncWaitCount) / 10.0 // seconds elapsed
+                                // Update status more frequently (every 500ms) with detailed progress
+                                if syncWaitCount % 5 == 0 {
+                                    let walletH = networkManager.walletHeight
+                                    let chainH = networkManager.chainHeight
+                                    let blocksRemaining = chainH > walletH ? chainH - walletH : 0
+                                    let elapsed = Double(syncWaitCount) / 10.0 // seconds elapsed
 
-                                await MainActor.run {
-                                    if blocksRemaining > 0 {
-                                        walletManager.setConnecting(true, status: "Syncing \(blocksRemaining) remaining blocks... (\(String(format: "%.1f", elapsed))s)")
-                                    } else {
-                                        walletManager.setConnecting(true, status: "Finalizing sync... (\(String(format: "%.1f", elapsed))s)")
+                                    await MainActor.run {
+                                        if blocksRemaining > 0 {
+                                            walletManager.setConnecting(true, status: "Syncing \(blocksRemaining) remaining blocks... (\(String(format: "%.1f", elapsed))s)")
+                                        } else {
+                                            walletManager.setConnecting(true, status: "Finalizing sync... (\(String(format: "%.1f", elapsed))s)")
+                                        }
                                     }
                                 }
-                            }
 
-                            // FIX #198: Don't re-fetch stats during loop - uses Tor which is slow
-                            // The wallet height updates automatically during backgroundSyncToHeight
+                                // FIX #198: Don't re-fetch stats during loop - uses Tor which is slow
+                                // The wallet height updates automatically during backgroundSyncToHeight
+                            }
+                        } else {
+                            print("🔍 FIX #205: Skipped 30s wait loop (background sync suppressed)")
                         }
 
                         // CATCH-UP: Check for blocks that arrived during setup
@@ -854,8 +861,9 @@ struct ContentView: View {
                         // and there are just a few missed blocks (not the entire chain)
                         if currentWalletHeight > 0 && currentChainHeight > currentWalletHeight {
                             let missedBlocks = currentChainHeight - currentWalletHeight
-                            // Sanity check: should only be a few blocks, not thousands
-                            guard missedBlocks < 100 else {
+                            // FIX #204: Increase limit from 100 to 1000 blocks (~16 hours)
+                            // After import, wallet may be 300-500 blocks behind chain tip
+                            guard missedBlocks < 1000 else {
                                 print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
                                 // CRITICAL: Must clear suppressBackgroundSync even on early return!
                                 networkManager.suppressBackgroundSync = false
