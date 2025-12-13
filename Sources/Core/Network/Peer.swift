@@ -112,6 +112,10 @@ final class Peer {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.zipherx.peer")
 
+    /// FIX #184: Lock for thread-safe connection access (prevents double-free crash)
+    /// Multiple tasks (timeout, disconnect, deinit) can race to cancel the connection
+    private let connectionLock = NSLock()
+
     /// Message lock to serialize P2P operations
     private let messageLock = PeerMessageLock()
 
@@ -196,9 +200,13 @@ final class Peer {
 
     /// CRITICAL: Ensure connection is cancelled when Peer is deallocated
     /// Prevents file descriptor leaks
+    /// FIX #184: Use lock to prevent race with concurrent cancel operations
     deinit {
-        connection?.cancel()
+        connectionLock.lock()
+        let conn = connection
         connection = nil
+        connectionLock.unlock()
+        conn?.cancel()
     }
 
     // MARK: - Scoring
@@ -829,10 +837,14 @@ final class Peer {
         print("🧅 [\(host)] SOCKS5 authentication successful")
     }
 
+    /// FIX #184: Thread-safe disconnect to prevent double-free crash
     func disconnect() {
         stopBlockListener()
-        connection?.cancel()
+        connectionLock.lock()
+        let conn = connection
         connection = nil
+        connectionLock.unlock()
+        conn?.cancel()
         isConnectedViaTor = false
     }
 
@@ -1772,7 +1784,14 @@ final class Peer {
                 flag.didTimeout = true
                 // FIX #170: NWConnection doesn't respond to Swift cancellation
                 // Force-cancel the connection to unblock the receive
-                self?.connection?.forceCancel()
+                // FIX #184: Use lock for thread-safe access
+                if let self = self {
+                    self.connectionLock.lock()
+                    let conn = self.connection
+                    self.connection = nil
+                    self.connectionLock.unlock()
+                    conn?.forceCancel()
+                }
                 throw NetworkError.timeout
             }
 
@@ -1782,11 +1801,7 @@ final class Peer {
                 return result
             } catch {
                 group.cancelAll()
-                // If we timed out, we force-cancelled the connection
-                // So we need to reconnect next time
-                if flag.didTimeout {
-                    connection = nil
-                }
+                // FIX #184: Connection already set to nil in timeout task (thread-safe)
                 throw error
             }
         }
