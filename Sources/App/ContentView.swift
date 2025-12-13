@@ -852,10 +852,13 @@ struct ContentView: View {
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Checking for new blocks...")
                         }
-                        // FIX #198: Use existing networkManager values (already set during import)
+                        // FIX #206 v2: Use DATABASE value, not cached networkManager.walletHeight
+                        // Bug: networkManager.walletHeight was stale (not updated after sync)
+                        // Result: catch-up triggered even though wallet is fully synced
                         let currentChainHeight = targetHeight  // Use cached target from above
-                        let currentWalletHeight = networkManager.walletHeight
-                        print("🔍 FIX #198: Chain height: \(currentChainHeight), wallet height: \(currentWalletHeight) (no Tor wait)")
+                        let dbWalletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                        let currentWalletHeight = max(dbWalletHeight, networkManager.walletHeight)
+                        print("🔍 FIX #206 v2: Chain height: \(currentChainHeight), wallet height: \(currentWalletHeight) (from DB: \(dbWalletHeight))")
 
                         // Only catch-up if wallet is actually synced (walletHeight > 0)
                         // and there are just a few missed blocks (not the entire chain)

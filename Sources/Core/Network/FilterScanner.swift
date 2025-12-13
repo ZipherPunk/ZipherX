@@ -171,6 +171,14 @@ final class FilterScanner {
             print("❌ Failed to get chain height")
             throw ScanError.networkError
         }
+
+        // FIX #216: Sanity check on chain height (absolute max 10M blocks)
+        let absoluteMaxHeight: UInt64 = 10_000_000
+        guard latestHeight <= absoluteMaxHeight else {
+            print("🚨 FIX #216: REJECTED impossible chain height \(latestHeight) (absolute max: \(absoluteMaxHeight))")
+            throw ScanError.networkError
+        }
+
         currentChainHeight = latestHeight
 
         // LOAD SHIELDED OUTPUTS FROM BOOST FILE
@@ -851,7 +859,25 @@ final class FilterScanner {
             // - Fetches 4 batches IN PARALLEL using TaskGroup
             // - Progress during FETCH phase: "📥 Fetching blocks X/Y"
             // - Progress during PROCESSING phase: "🔧 Processing blocks X/Y"
-            let totalBlocksToFetch = Int(targetHeight - currentHeight + 1)
+
+            // FIX #216: Sanity check - reject impossible block counts (Sybil attack protection)
+            // If targetHeight somehow got corrupted to ~669M by a malicious peer,
+            // the subtraction would produce hundreds of millions of blocks
+            guard targetHeight >= currentHeight else {
+                print("🚨 FIX #216: Invalid scan range: target \(targetHeight) < current \(currentHeight)")
+                return  // Exit the scan - we're already synced
+            }
+
+            let rawBlockCount = targetHeight - currentHeight + 1
+            let maxReasonableBlocks: UInt64 = 100_000  // Max 100K blocks in one scan
+            guard rawBlockCount <= maxReasonableBlocks else {
+                print("🚨 FIX #216: REJECTED impossible block count \(rawBlockCount) (max: \(maxReasonableBlocks))")
+                print("🚨 FIX #216: targetHeight=\(targetHeight), currentHeight=\(currentHeight)")
+                print("🚨 FIX #216: This is likely a corrupt chain height from a malicious peer")
+                return  // Exit the scan - corrupt height detected
+            }
+
+            let totalBlocksToFetch = Int(rawBlockCount)
             let prefetchBatchSize = 500  // 500 blocks per batch
             let parallelBatches = 4      // Fetch 4 batches simultaneously (2000 blocks at once)
 
@@ -1002,6 +1028,14 @@ final class FilterScanner {
             let processDuration = Date().timeIntervalSince(processStartTime)
             let processRate = Double(scannedBlocks) / max(processDuration, 0.001)
             print("✅ FIX #190: Processed \(scannedBlocks) blocks in \(String(format: "%.1f", processDuration))s (\(String(format: "%.0f", processRate)) blocks/sec)")
+
+            // FIX #206: Save FINAL lastScannedHeight after PHASE 2 completes
+            // Bug: updateLastScannedHeight only called every 500 blocks, missing the final blocks
+            // Result: walletHeight < chainHeight triggers unnecessary catch-up sync
+            // Fix: Always save targetHeight at end of scan
+            let finalHeight = targetHeight
+            try? database.updateLastScannedHeight(finalHeight, hash: Data(count: 32))
+            print("📍 FIX #206: Final lastScannedHeight saved: \(finalHeight)")
         }
 
         // Final tree persistence

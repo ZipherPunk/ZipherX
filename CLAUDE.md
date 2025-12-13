@@ -80,9 +80,11 @@ ZipherX is a secure, decentralized cryptocurrency wallet for iOS/macOS based on 
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
-- FIX #157: Header sync timeout (20s per-peer, 60s total) for FAST START
-- FIX #158: Filter banned peers from TX broadcast (Sybil protection)
-- FIX #159: Permanent Sybil bans - indefinite until manual unban
+- FIX #220: False "external wallet spend" warning for own transactions (check transaction_history)
+- FIX #219: Payment request PAID status badge + RECEIVED celebration in chat
+- FIX #218: Cypherpunk-styled VUL-002 warning with copyable TXID
+- FIX #217: Quick scan now finds INCOMING notes (trial decryption), not just spent nullifiers
+- FIX #213: Absolute chain height sanity check (reject > 10M)
 - FIX #162 v3: Balance Reconciliation AUTO-REPAIR at startup
   - Created `getAllNotes()` function that returns ALL notes (spent + unspent)
   - Previous `getAllUnspentNotes()` was misleading - had `WHERE is_spent = 0`
@@ -264,6 +266,47 @@ Latest fixes:
     - `mmap_size = 256MB` / `128MB` - memory-mapped I/O
     - `temp_store = MEMORY` - temp tables in RAM
   - **Files Modified**: `Sources/Core/Storage/WalletDatabase.swift`, `Sources/Core/Storage/HeaderStore.swift`
+- FIX #206: Final lastScannedHeight not saved after PHASE 2 sync
+  - **Bug**: `updateLastScannedHeight` only called every 500 blocks during PHASE 2
+  - **Result**: walletHeight could be up to 499 blocks behind chainHeight after sync
+  - **Symptom**: Unnecessary "Catch-up: X blocks" triggered right after import completes
+  - **Fix Part 1**: Save `targetHeight` at END of PHASE 2 processing loop (FilterScanner.swift)
+  - **Fix Part 2**: Use database value for catch-up check, not stale `networkManager.walletHeight` (ContentView.swift)
+  - **Files Modified**: `Sources/Core/Network/FilterScanner.swift`, `Sources/App/ContentView.swift`
+- FIX #207: P2P `getheaders` response parsing was wrong (Equihash health check failure)
+  - **Bug**: Used fixed `headerSize = 1487` bytes, but actual header is ~544 bytes
+  - **Structure**: 140 bytes header + varint (3 bytes) + 400 bytes solution + 1 byte tx_count = 544
+  - **Symptom**: Solution field had 1347 bytes, timestamps showed garbage (wrong offsets)
+  - **Result**: Equihash verification failed with "solution length mismatch: got 1347, expected 400"
+  - **Fix**: Properly parse varint prefix to get correct solution length
+  - **Files Modified**: `Sources/Core/Network/Peer.swift`
+- FIX #208: Persistent .onion keypair never loaded before hidden service start
+  - **Bug**: `HiddenServiceManager.start()` called `zipherx_tor_hidden_service_start()` directly
+  - **Missing**: Never called `TorManager.loadAndSetPersistentKeypair()` or `generateAndSaveKeypair()`
+  - **Symptom**: Each app restart generated new random .onion address (FIX #169 wasn't working)
+  - **Result**: Chat contacts had stale .onion addresses, "Onion Service not reachable" errors
+  - **Fix**: Before starting hidden service, check for persistent keypair:
+    - If exists: Load from Keychain via `loadAndSetPersistentKeypair()`
+    - If not: Generate new keypair and save via `generateAndSaveKeypair()`
+    - Then start hidden service (Rust FFI will use the set keypair)
+  - **Files Modified**: `Sources/Core/Network/HiddenServiceManager.swift`
+- FIX #209: Hidden service keystore and Tor persistent state fails on iOS
+  - **Error 1**: `tor: bad API usage (bug): Error while trying to access a key store`
+  - **Error 2**: `tor: problem with filesystem permissions: Error while trying to access persistent state`
+  - **Root Causes**:
+    1. `TorClientConfig::default()` uses system paths (`~/.local/share/arti`) that don't exist on iOS
+    2. Arti's `fs-mistrust` crate checks Unix permissions which don't apply in iOS app sandbox
+  - **Fixes**:
+    1. Use `TorClientConfigBuilder::from_directories(state_dir, cache_dir)` for custom paths
+    2. Set `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1` environment variable before Arti init
+    3. Create keystore directory before launching hidden service
+  - **Result**: Arti now stores state in app's Documents directory without permission errors
+  - **Fallback**: If keystore still fails, fall back to random address (last resort)
+  - **Files Modified**: `Libraries/zipherx-ffi/src/tor.rs`
+- UI: Compact status bar for narrow screens
+  - **Issue**: Status bar at bottom wrapping to 2 lines on iPhone 16
+  - **Fix**: Reduced spacing (16→8), smaller fonts (10→9), shorter labels ("SYNCED"→"OK")
+  - **Files Modified**: `Sources/UI/Components/System7Components.swift`
 
 ## Security Score: 100/100
 

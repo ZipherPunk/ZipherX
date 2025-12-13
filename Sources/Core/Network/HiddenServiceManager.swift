@@ -165,6 +165,20 @@ public final class HiddenServiceManager: ObservableObject {
 
         print("🧅 Starting hidden service (onion hosting)...")
 
+        // FIX #208: Ensure persistent keypair is loaded or generated BEFORE starting
+        // This guarantees the same .onion address across app restarts
+        if TorManager.shared.hasPersistentKeypair {
+            // Load existing keypair from Keychain into FFI
+            if let address = TorManager.shared.loadAndSetPersistentKeypair() {
+                print("🧅 FIX #208: Loaded persistent keypair - .onion will be: \(address.prefix(16))...")
+            }
+        } else {
+            // Generate new keypair and save to Keychain
+            if let address = TorManager.shared.generateAndSaveKeypair() {
+                print("🧅 FIX #208: Generated new persistent keypair - .onion will be: \(address.prefix(16))...")
+            }
+        }
+
         // Start hidden service in background
         let result = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {

@@ -117,20 +117,31 @@ pub extern "C" fn zipherx_tor_start() -> i32 {
 /// Async function to start Tor and SOCKS5 proxy server
 async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = get_tor_data_dir();
+    let state_dir = data_dir.join("state");
+    let cache_dir = data_dir.join("cache");
 
-    // Create data directory if it doesn't exist
-    std::fs::create_dir_all(&data_dir)?;
+    // Create directories if they don't exist
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(&cache_dir)?;
 
     eprintln!("🧅 Tor data directory: {:?}", data_dir);
+    eprintln!("🧅 State directory: {:?}", state_dir);
+    eprintln!("🧅 Cache directory: {:?}", cache_dir);
 
-    // Build Tor configuration using default config with custom paths
-    // Note: Arti 0.37+ requires CfgPath type, so we use environment variables
-    // to set the directories instead
-    std::env::set_var("ARTI_CACHE_DIR", data_dir.join("cache").to_string_lossy().to_string());
-    std::env::set_var("ARTI_STATE_DIR", data_dir.join("state").to_string_lossy().to_string());
+    // FIX #209: Disable filesystem permission checks on iOS/macOS
+    // Unix-style file permissions don't apply the same way in app sandboxes
+    // Without this, Arti fails with "problem with filesystem permissions: Error while trying to access persistent state"
+    // Reference: https://docs.rs/fs-mistrust/latest/fs_mistrust/
+    std::env::set_var("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS", "1");
+    eprintln!("🧅 FIX #209: Disabled fs-mistrust permission checks for app sandbox");
 
-    // Use default configuration
-    let config = TorClientConfig::default();
+    // FIX #209: Use TorClientConfigBuilder with explicit paths
+    // This ensures keystore path is properly set (derived from state_dir)
+    // Previously: TorClientConfig::default() used system paths (~/.local/share/arti) that don't exist on iOS
+    use arti_client::config::TorClientConfigBuilder;
+    let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+        .build()
+        .map_err(|e| format!("Failed to build Tor config: {}", e))?;
 
     eprintln!("🧅 Starting Arti Tor client...");
     TOR_BOOTSTRAP_PROGRESS.store(10, Ordering::SeqCst);
@@ -568,6 +579,13 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
     drop(client_storage); // Release the lock before async operations
 
+    // FIX #209: Ensure keystore directories exist for persistent keypairs
+    // Arti stores keys in state_dir/keys - create it if needed
+    let data_dir = get_tor_data_dir();
+    let keys_dir = data_dir.join("state").join("keys");
+    let _ = std::fs::create_dir_all(&keys_dir);
+    eprintln!("🧅 Keystore directory: {:?}", keys_dir);
+
     // Build hidden service configuration
     // The service will listen for rendezvous requests
     let mut config_builder = OnionServiceConfigBuilder::default();
@@ -586,7 +604,7 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     // Box the rend_requests stream to unify the types from both branches
     // (launch_onion_service_with_hsid and launch_onion_service return different opaque types)
     use std::pin::Pin;
-    let (service, rend_requests): (_, Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>) = if let Some(keypair_bytes) = stored_keypair {
+    let (service, rend_requests): (_, Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>) = if let Some(keypair_bytes) = stored_keypair.clone() {
         // Use stored keypair for persistent .onion address
         eprintln!("🧅 Using persistent keypair for fixed .onion address");
 
@@ -616,9 +634,23 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
         // Launch with the persistent keypair using the keystore-based API
         // This inserts the keypair into Arti's keystore and launches the service
-        let (svc, rend) = client.launch_onion_service_with_hsid(config, hs_id_keypair)?
-            .ok_or("Hidden service returned None (with keypair)")?;
-        (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
+        // FIX #209: Try with keypair first, fall back to random if keystore fails
+        match client.launch_onion_service_with_hsid(config.clone(), hs_id_keypair) {
+            Ok(Some((svc, rend))) => {
+                eprintln!("🧅 Hidden service launched with persistent keypair");
+                (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
+            }
+            Ok(None) => {
+                return Err("Hidden service returned None (with keypair)".into());
+            }
+            Err(e) => {
+                // FIX #209: Keystore access failed - fall back to random address
+                eprintln!("🧅 FIX #209: Persistent keypair failed ({}), falling back to random address", e);
+                let (svc, rend) = client.launch_onion_service(config)?
+                    .ok_or("Hidden service returned None (fallback)")?;
+                (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
+            }
+        }
     } else {
         // Generate new random address
         eprintln!("🧅 No persistent keypair - generating new random .onion address");

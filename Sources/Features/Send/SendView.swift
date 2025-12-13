@@ -62,6 +62,7 @@ struct SendView: View {
     @State private var showSuccess = false
     @State private var showError = false
     @State private var errorMessage = ""
+    @State private var failedTxId = ""  // FIX #218: Track TXID for failed transactions (for copying)
     @State private var txId = ""
     @State private var isAddressValid = false
     @State private var isAddressTransparent = false
@@ -88,6 +89,10 @@ struct SendView: View {
 
     // FIX #109: Debounce preparation to prevent multiple concurrent builds when typing
     @State private var preparationDebounceTask: Task<Void, Never>? = nil
+
+    // FIX #210: Tor unavailable alert - offer to send without Tor
+    @State private var showTorUnavailableAlert = false
+    @State private var pendingSendWithoutTor = false
 
     var body: some View {
         ZStack {
@@ -134,6 +139,18 @@ struct SendView: View {
                             Text("Transaction ready - instant send enabled")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.successColor)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
+                    // FIX #174: Show why SEND is disabled when pending transaction exists
+                    if hasPendingTransaction, let message = pendingTransactionMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: networkManager.externalWalletSpendDetected != nil ? "exclamationmark.triangle.fill" : "clock.fill")
+                                .foregroundColor(networkManager.externalWalletSpendDetected != nil ? .orange : theme.warningColor)
+                            Text(message)
+                                .font(theme.captionFont)
+                                .foregroundColor(networkManager.externalWalletSpendDetected != nil ? .orange : theme.warningColor)
                         }
                         .padding(.vertical, 4)
                     }
@@ -308,10 +325,41 @@ struct SendView: View {
         } message: {
             Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
         }
-        .alert("Error", isPresented: $showError) {
-            Button("OK", role: .cancel) {}
+        // FIX #218: Enhanced error alert with Copy TXID button for mempool rejections
+        .alert("Transaction Issue", isPresented: $showError) {
+            if !failedTxId.isEmpty {
+                Button("Copy TXID") {
+                    #if os(iOS)
+                    UIPasteboard.general.string = failedTxId
+                    #elseif os(macOS)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(failedTxId, forType: .string)
+                    #endif
+                }
+            }
+            Button("OK", role: .cancel) {
+                failedTxId = ""  // Clear after dismissing
+            }
         } message: {
             Text(errorMessage)
+        }
+        // FIX #210: Tor unavailable alert - offer to send without Tor
+        .alert("Tor Connection Issue", isPresented: $showTorUnavailableAlert) {
+            Button("Wait for Tor", role: .cancel) {
+                pendingSendWithoutTor = false
+            }
+            Button("Send without Tor") {
+                pendingSendWithoutTor = true
+                // Temporarily disable Tor for this send
+                Task {
+                    await TorManager.shared.temporarilyBypassTor()
+                    await MainActor.run {
+                        proceedWithSend()
+                    }
+                }
+            }
+        } message: {
+            Text("Tor is enabled but not running. Your transaction cannot be broadcast anonymously.\n\nSend without Tor? Your IP may be visible to peers.")
         }
         .onChange(of: networkManager.outgoingClearingTrigger) { _ in
             // Sender's tx verified in mempool - show Clearing celebration!
@@ -639,6 +687,10 @@ struct SendView: View {
 
     /// Check if there's a pending outgoing transaction that hasn't confirmed yet
     private var hasPendingTransaction: Bool {
+        // FIX #174: Check for ANY pending mempool transaction (our tx OR external wallet spend)
+        if networkManager.hasPendingMempoolTransaction {
+            return true
+        }
         // Check both mempoolOutgoing and lastSendTimestamp with pending balance
         if networkManager.mempoolOutgoing > 0 {
             return true
@@ -650,6 +702,22 @@ struct SendView: View {
             return true
         }
         return false
+    }
+
+    /// FIX #174: Reason why SEND is disabled (for user display)
+    private var pendingTransactionMessage: String? {
+        if let reason = networkManager.pendingTransactionReason {
+            return reason
+        }
+        if networkManager.mempoolOutgoing > 0 {
+            return "Awaiting confirmation for your transaction"
+        }
+        if let lastSend = walletManager.lastSendTimestamp,
+           Date().timeIntervalSince(lastSend) < 300.0,
+           walletManager.pendingBalance > 0 {
+            return "Previous transaction not yet confirmed"
+        }
+        return nil
     }
 
     /// Dynamic button title based on state
@@ -683,6 +751,30 @@ struct SendView: View {
     }
 
     private func sendTransaction() {
+        // FIX #210: Check if Tor mode is enabled but Tor isn't running
+        Task {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            let socksPort = await TorManager.shared.socksPort
+
+            if torMode == .enabled && (!torConnected || socksPort == 0) {
+                // Tor is enabled but not running - show alert
+                await MainActor.run {
+                    print("⚠️ FIX #210: Tor enabled but not running - showing alert")
+                    showTorUnavailableAlert = true
+                }
+                return
+            }
+
+            // Tor is fine or disabled - proceed with send
+            await MainActor.run {
+                proceedWithSend()
+            }
+        }
+    }
+
+    /// Actually proceed with the send (after Tor check passed or user chose to bypass)
+    private func proceedWithSend() {
         // Require Face ID / Touch ID authentication before sending
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
         // Use round() to avoid floating-point precision loss
@@ -757,11 +849,37 @@ struct SendView: View {
 
                 // Broadcast the prepared transaction
                 let networkMgr = NetworkManager.shared
-                let broadcastedTxId = try await networkMgr.broadcastTransactionWithProgress(prepared.rawTx, amount: prepared.amount) { phase, detail, progress in
+                let broadcastResult = try await networkMgr.broadcastTransactionWithProgress(prepared.rawTx, amount: prepared.amount) { phase, detail, progress in
                     Task { @MainActor in
                         self.handleProgressUpdate(step: phase, detail: detail, progress: progress)
                     }
                 }
+
+                // VUL-002: Extract txId from BroadcastResult
+                let broadcastedTxId = broadcastResult.txId
+
+                // VUL-002: CRITICAL - Only write to database if mempool verification succeeded!
+                guard broadcastResult.mempoolVerified else {
+                    print("🚨 VUL-002 SendView: MEMPOOL REJECTED - Not writing to database!")
+                    print("🚨 VUL-002 SendView: txId=\(broadcastedTxId), peers=\(broadcastResult.peerCount), mempool=false")
+                    // FIX #218: Cypherpunk-styled warning with TXID for reference
+                    throw WalletError.transactionFailed("""
+                        ⚡ MEMPOOL REJECTION ⚡
+
+                        The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+
+                        🔒 YOUR FUNDS ARE SAFE
+                        No transaction was recorded in your wallet.
+
+                        📋 TXID (for reference):
+                        \(broadcastedTxId)
+
+                        "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                        — A Cypherpunk's Manifesto
+                        """)
+                }
+
+                print("✅ VUL-002 SendView: Mempool VERIFIED - safe to record transaction")
 
                 // Track as pending outgoing
                 let pendingFee: UInt64 = 10_000
@@ -817,6 +935,9 @@ struct SendView: View {
 
                 print("⚡ INSTANT SEND complete! Txid: \(broadcastedTxId)")
 
+                // FIX #210: Restore Tor after transaction completes
+                await TorManager.shared.restoreAfterSingleTxBypass()
+
                 // Refresh balance in background
                 Task {
                     try? await walletManager.refreshBalance()
@@ -844,9 +965,13 @@ struct SendView: View {
                 } else {
                     await MainActor.run {
                         errorMessage = error.localizedDescription
+                        // FIX #218: Extract TXID from error message for copy button
+                        failedTxId = extractTxIdFromError(error.localizedDescription)
                         showError = true
                         isSending = false
                     }
+                    // FIX #210: Restore Tor after transaction fails
+                    await TorManager.shared.restoreAfterSingleTxBypass()
                 }
             }
         }
@@ -905,6 +1030,9 @@ struct SendView: View {
                     isSending = false
                     sendProgress = []
                 }
+
+                // FIX #210: Restore Tor after transaction completes
+                await TorManager.shared.restoreAfterSingleTxBypass()
             } catch {
                 await MainActor.run {
                     // Mark current step as failed
@@ -912,9 +1040,14 @@ struct SendView: View {
                         sendProgress[currentIdx].status = .failed(error.localizedDescription)
                     }
                     errorMessage = error.localizedDescription
+                    // FIX #218: Extract TXID from error message for copy button
+                    failedTxId = extractTxIdFromError(error.localizedDescription)
                     showError = true
                     isSending = false
                 }
+
+                // FIX #210: Restore Tor after transaction fails
+                await TorManager.shared.restoreAfterSingleTxBypass()
             }
         }
     }
@@ -984,6 +1117,8 @@ struct SendView: View {
             let errorDetail = detail ?? "Transaction rejected by network"
             updateStepSync("broadcast", status: .failed(errorDetail), detail: errorDetail)
             errorMessage = errorDetail
+            // FIX #218: Extract TXID from error message for copy button
+            failedTxId = extractTxIdFromError(errorDetail)
             showError = true
             isSending = false
         case "broadcast":
@@ -1034,6 +1169,25 @@ struct SendView: View {
         amount = ""
         memo = ""
         invalidatePreparedTransaction()
+    }
+
+    // FIX #218: Extract TXID from error message (64-character hex string after "TXID")
+    private func extractTxIdFromError(_ message: String) -> String {
+        // Look for patterns like "TXID (for reference):\n" followed by a 64-char hex
+        let txidPatterns = [
+            "TXID \\(for reference\\):\\s*([a-fA-F0-9]{64})",
+            "txid[:\\s]+([a-fA-F0-9]{64})",
+            "([a-fA-F0-9]{64})"  // Fallback: any 64-char hex string
+        ]
+
+        for pattern in txidPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               let match = regex.firstMatch(in: message, options: [], range: NSRange(message.startIndex..., in: message)),
+               let range = Range(match.range(at: 1), in: message) {
+                return String(message[range])
+            }
+        }
+        return ""
     }
 
     // MARK: - Instant Send Preparation Functions

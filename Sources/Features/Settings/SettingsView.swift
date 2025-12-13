@@ -140,6 +140,10 @@ struct SettingsView: View {
     @State private var fullRescanHeight = ""
     @State private var showRebuildWitnessesWarning = false
     @State private var showRepairNotesWarning = false
+    @State private var showScanUnrecordedWarning = false
+    @State private var showScanUnrecordedResult = false
+    @State private var scanUnrecordedResultMessage = ""
+    @State private var isScanningUnrecorded = false
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
@@ -204,10 +208,8 @@ struct SettingsView: View {
                 // Repair Database button (standalone)
                 repairDatabaseSection
 
-                /* DISABLED: Debug logging section - hide for now
-                // Debug section
+                // Debug logging section (FIX #189: Re-enabled for debugging)
                 debugLoggingSection
-                */
 
                 /* DISABLED: Blockchain data section - hide for now
                 // Rescan section
@@ -312,11 +314,26 @@ struct SettingsView: View {
         }
         .alert("Repair Database", isPresented: $showRepairNotesWarning) {
             Button("Cancel", role: .cancel) {}
-            Button("Repair", role: .destructive) {
+            Button("Repair (Tor will be disabled)", role: .destructive) {
                 startRepairNotes()
             }
         } message: {
-            Text("This repairs database corruption by:\n\n• Clearing ALL block headers (fixes timestamps)\n• Clearing invalid transaction history\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Re-scanning from boost file height\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Transaction dates show NO DATE\n• Sent transactions show as failed\n• Tree root doesn't match blockchain\n\nThis will take 5-15 minutes.\n\nDo you want to continue?")
+            Text("⚠️ PRIVACY NOTICE ⚠️\n\nTor will be TEMPORARILY DISABLED during repair for faster P2P scanning. Your IP will be visible to blockchain peers during this operation.\n\n━━━━━━━━━━━━━━━━━━━━━━\n\nThis repairs database corruption by:\n• Re-scanning blockchain for spent notes\n• Clearing ALL block headers (fixes timestamps)\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Notes marked unspent but are spent\n• Transaction dates show NO DATE\n\nThis will take 5-15 minutes.\nTor will be restored after completion.\n\nDo you want to continue?")
+        }
+        // FIX #214: Scan for unrecorded transactions alert
+        .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Scan Now", role: .destructive) {
+                startScanForUnrecordedTx()
+            }
+        } message: {
+            Text("This will quickly scan blocks from your last checkpoint to find any transactions that were broadcast but not recorded in the database.\n\nUse this if:\n• Send showed 'failed' but TX went through\n• Balance doesn't reflect a recent send\n• Tor timeout during broadcast\n\nThis is fast (usually < 30 seconds).")
+        }
+        // FIX #214: Scan result alert
+        .alert("Scan Complete", isPresented: $showScanUnrecordedResult) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(scanUnrecordedResultMessage)
         }
         .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
             Button("Cancel - Keep Wallet", role: .cancel) {}
@@ -1941,6 +1958,38 @@ Both binaries must be installed to /usr/local/bin:
                         .stroke(Color.purple.opacity(0.8), lineWidth: 2)
                 )
             }
+
+            // FIX #214: Scan for Unrecorded TX button - ORANGE (fast, from checkpoint only)
+            Button(action: {
+                showScanUnrecordedWarning = true
+            }) {
+                HStack {
+                    if isScanningUnrecorded {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "magnifyingglass.circle")
+                            .font(.system(size: 12))
+                    }
+                    Text(isScanningUnrecorded ? "Scanning..." : "Scan for Unrecorded TX")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.orange)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.orange.opacity(0.8), lineWidth: 2)
+                )
+            }
+            .disabled(isScanningUnrecorded)
+
+            Text("Quick scan from last checkpoint to find transactions that were broadcast but not recorded (e.g., Tor timeout).")
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding()
         .background(theme.surfaceColor)
@@ -2839,6 +2888,15 @@ Both binaries must be installed to /usr/local/bin:
                     }
                 }
 
+                // FIX #212: Also scan for unrecorded broadcast transactions
+                // This recovers from the scenario where broadcast succeeded but VUL-002 blocked db write
+                // Scan from checkpoint (not beginning) - unrecorded broadcasts only happen after checkpoint
+                print("🔧 FIX #212: Scanning for unrecorded broadcasts from checkpoint...")
+                let recovered = try await walletManager.repairUnrecordedSpends(fromCheckpoint: true)
+                if recovered > 0 {
+                    print("✅ FIX #212: Recovered \(recovered) unrecorded transaction(s)")
+                }
+
                 // Complete
                 await MainActor.run {
                     rescanProgress = 1.0
@@ -2853,6 +2911,45 @@ Both binaries must be installed to /usr/local/bin:
                     print("❌ Repair error: \(error)")
                     rescanProgress = -1
                 }
+            }
+        }
+    }
+
+    // MARK: - FIX #214/217: Scan for Unrecorded Transactions Only
+
+    private func startScanForUnrecordedTx() {
+        isScanningUnrecorded = true
+
+        Task { @MainActor in
+            do {
+                print("🔍 FIX #217: Starting comprehensive scan for missing transactions...")
+
+                // Get checkpoint info for logging
+                let checkpoint = try WalletDatabase.shared.getVerifiedCheckpointHeight()
+                let chainHeight = NetworkManager.shared.chainHeight
+                print("🔍 FIX #217: Scanning from checkpoint \(checkpoint) to chain tip \(chainHeight)")
+
+                // FIX #217: Use scanForMissingTransactions which uses FilterScanner
+                // This finds BOTH incoming notes (trial decryption) AND spent notes (nullifier matching)
+                // Much more comprehensive than the old repairUnrecordedSpends which only checked nullifiers
+                let recovered = try await walletManager.scanForMissingTransactions()
+
+                // Update UI state directly (we're on MainActor)
+                isScanningUnrecorded = false
+                if recovered > 0 {
+                    scanUnrecordedResultMessage = "Found \(recovered) missing transaction(s)!\n\nYour balance and history have been updated."
+                    print("✅ FIX #217: Recovered \(recovered) missing transaction(s)")
+                } else {
+                    scanUnrecordedResultMessage = "No missing transactions found.\n\nYour database is consistent with the blockchain."
+                    print("✅ FIX #217: No missing transactions found")
+                }
+                showScanUnrecordedResult = true
+
+            } catch {
+                isScanningUnrecorded = false
+                scanUnrecordedResultMessage = "Scan failed: \(error.localizedDescription)"
+                showScanUnrecordedResult = true
+                print("❌ FIX #217: Scan error: \(error)")
             }
         }
     }

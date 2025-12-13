@@ -35,12 +35,9 @@ final class SQLCipherManager {
     /// This checks if encryption key has been applied to the actual database file
     var isWalletDatabaseEncrypted: Bool {
         guard isSQLCipherAvailable else { return false }
-        // Check the actual wallet database file
-        let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        if let dbPath = documentsDir?.appendingPathComponent("zipherx_wallet.db").path {
-            return isDatabaseEncrypted(path: dbPath)
-        }
-        return false
+        // Check the actual wallet database file using centralized path
+        let dbPath = AppDirectories.database.appendingPathComponent("zipherx_wallet.db").path
+        return isDatabaseEncrypted(path: dbPath)
     }
 
     /// Cached encryption key (derived with biometric protection)

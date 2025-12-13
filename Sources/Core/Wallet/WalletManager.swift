@@ -3298,7 +3298,21 @@ final class WalletManager: ObservableObject {
                 networkManager.clearPendingBroadcast()
             }
 
-            throw WalletError.transactionFailed("Transaction rejected by network mempool. Your funds are safe - no transaction was recorded.")
+            // FIX #218: Cypherpunk-styled warning with TXID for reference
+            throw WalletError.transactionFailed("""
+                ⚡ MEMPOOL REJECTION ⚡
+
+                The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+
+                🔒 YOUR FUNDS ARE SAFE
+                No transaction was recorded in your wallet.
+
+                📋 TXID (for reference):
+                \(txId)
+
+                "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                — A Cypherpunk's Manifesto
+                """)
         }
 
         // MEMPOOL VERIFIED - Safe to write to database
@@ -3456,7 +3470,21 @@ final class WalletManager: ObservableObject {
                 networkManager.clearPendingBroadcast()
             }
 
-            throw WalletError.transactionFailed("Transaction rejected by network mempool. Your funds are safe - no transaction was recorded.")
+            // FIX #218: Cypherpunk-styled warning with TXID for reference
+            throw WalletError.transactionFailed("""
+                ⚡ MEMPOOL REJECTION ⚡
+
+                The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+
+                🔒 YOUR FUNDS ARE SAFE
+                No transaction was recorded in your wallet.
+
+                📋 TXID (for reference):
+                \(txId)
+
+                "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                — A Cypherpunk's Manifesto
+                """)
         }
 
         // MEMPOOL VERIFIED - Safe to write to database
@@ -4113,6 +4141,245 @@ final class WalletManager: ObservableObject {
         // P2P-only: This function is disabled - nullifier checking done via P2P scan
         print("⚠️ checkNullifierSpentOnChain disabled in P2P-only mode")
         return false
+    }
+
+    // MARK: - FIX #212: Detect and Recover Unrecorded Broadcast Transactions
+
+    /// FIX #212: Scan recent blocks for nullifiers matching our unspent notes
+    /// This recovers from the scenario where a broadcast succeeded but VUL-002 blocked the database write
+    /// (e.g., broadcast timeout through Tor but TX actually propagated)
+    ///
+    /// - Parameters:
+    ///   - fromCheckpoint: If true, scan from last checkpoint (faster). If false, scan last 100 blocks.
+    ///   - onProgress: Progress callback with (current, total) blocks
+    /// - Returns: Number of unrecorded spends that were recovered
+    @MainActor
+    func repairUnrecordedSpends(fromCheckpoint: Bool = true, onProgress: ((Int, Int) -> Void)? = nil) async throws -> Int {
+        print("🔧 FIX #212: Scanning for unrecorded broadcast transactions...")
+
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get our unspent notes
+        let unspentNotes = try database.getAllUnspentNotes(accountId: 1)
+        guard !unspentNotes.isEmpty else {
+            print("✅ FIX #212: No unspent notes to check")
+            return 0
+        }
+
+        // Build set of our nullifier hashes for quick lookup
+        // Note: unspentNotes contain already-hashed nullifiers (VUL-009)
+        var ourNullifiers: [Data: WalletNote] = [:]
+        for note in unspentNotes {
+            ourNullifiers[note.nullifier] = note
+        }
+        print("🔍 FIX #212: Checking \(unspentNotes.count) unspent notes for on-chain spends")
+
+        // Determine scan range
+        let chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : (try? await networkManager.getChainHeight()) ?? 0
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #212: Cannot get chain height - skipping")
+            return 0
+        }
+
+        var startHeight: UInt64
+        if fromCheckpoint {
+            // Scan from checkpoint (should be recent)
+            let checkpoint = try database.getVerifiedCheckpointHeight()
+            startHeight = checkpoint > 0 ? checkpoint : (chainHeight > 100 ? chainHeight - 100 : 0)
+        } else {
+            // Scan last 100 blocks
+            startHeight = chainHeight > 100 ? chainHeight - 100 : 0
+        }
+
+        let blocksToScan = chainHeight > startHeight ? Int(chainHeight - startHeight) : 0
+        guard blocksToScan > 0 else {
+            print("✅ FIX #212: Already at chain tip - no blocks to scan")
+            return 0
+        }
+
+        print("🔍 FIX #212: Scanning blocks \(startHeight) to \(chainHeight) (\(blocksToScan) blocks)")
+
+        // Fetch blocks via P2P
+        var recoveredCount = 0
+        let batchSize: UInt64 = 50
+
+        var batchStart = startHeight
+        while batchStart < chainHeight {
+            let batchEnd = min(batchStart + batchSize, chainHeight)
+            let count = Int(batchEnd - batchStart)
+
+            onProgress?(Int(batchStart - startHeight), blocksToScan)
+
+            do {
+                // Fetch block data with transaction details
+                let blocks = try await networkManager.getBlocksDataP2P(from: batchStart, count: count)
+
+                for (height, _, _, txData) in blocks {
+                    for (txidHex, _, spends) in txData {
+                        guard let spends = spends, !spends.isEmpty else { continue }
+
+                        // Check each spend's nullifier
+                        for spend in spends {
+                            // Convert hex nullifier to Data
+                            guard let nullifierData = Data(hexString: spend.nullifier) else { continue }
+
+                            // VUL-009: Hash the on-chain nullifier to compare with stored hashes
+                            let hashedNullifier = database.hashNullifier(nullifierData)
+
+                            if let matchedNote = ourNullifiers[hashedNullifier] {
+                                // Found! This note was spent on-chain but not recorded
+                                print("🚨 FIX #212: Found unrecorded spend!")
+                                print("   Note value: \(matchedNote.value) zatoshis")
+                                print("   Spent in TX: \(txidHex.prefix(16))...")
+                                print("   Spent at height: \(height)")
+
+                                // Convert txid hex to Data
+                                let txidData = Data(hexString: txidHex) ?? hashedNullifier.prefix(32)
+
+                                // Mark the note as spent
+                                try database.markNoteSpentByHashedNullifier(
+                                    hashedNullifier: hashedNullifier,
+                                    txid: txidData,
+                                    spentHeight: height
+                                )
+
+                                // Create SENT history entry if it doesn't exist
+                                let fee: UInt64 = 10_000 // Standard fee
+                                let amountSent = matchedNote.value > fee ? matchedNote.value - fee : matchedNote.value
+
+                                // Check if history entry already exists
+                                let existsInHistory = try database.transactionExists(txid: txidData, type: .sent)
+                                if !existsInHistory {
+                                    _ = try database.insertTransactionHistory(
+                                        txid: txidData,
+                                        height: height,
+                                        blockTime: UInt64(Date().timeIntervalSince1970), // Approximate
+                                        type: .sent,
+                                        value: amountSent,
+                                        fee: fee,
+                                        toAddress: nil, // Unknown recipient
+                                        fromDiversifier: nil,
+                                        memo: "[Recovered by FIX #212 - unrecorded broadcast]"
+                                    )
+                                    print("📜 FIX #212: Created SENT history entry for recovered transaction")
+                                }
+
+                                recoveredCount += 1
+                                // Remove from our tracking set
+                                ourNullifiers.removeValue(forKey: hashedNullifier)
+                            }
+                        }
+                    }
+                }
+            } catch {
+                print("⚠️ FIX #212: Failed to fetch blocks \(batchStart)-\(batchEnd): \(error)")
+                // Continue with next batch
+            }
+
+            batchStart += batchSize
+        }
+
+        onProgress?(blocksToScan, blocksToScan)
+
+        if recoveredCount > 0 {
+            print("✅ FIX #212: Recovered \(recoveredCount) unrecorded broadcast transaction(s)")
+            // Refresh balance to reflect changes
+            try? await refreshBalance()
+            incrementHistoryVersion()
+        } else {
+            print("✅ FIX #212: No unrecorded spends found - database is consistent")
+        }
+
+        return recoveredCount
+    }
+
+    // MARK: - FIX #217: Scan for ALL Missing Transactions (Incoming + Spent)
+
+    /// Scan from checkpoint to chain tip for any missed transactions
+    /// This uses FilterScanner with trial decryption to find:
+    /// - Incoming notes (notes sent TO us that weren't recorded)
+    /// - Spent notes (notes we spent that weren't recorded)
+    /// Much more comprehensive than FIX #212 which only checks nullifiers.
+    /// - Returns: Number of new transactions discovered
+    @MainActor
+    func scanForMissingTransactions() async throws -> Int {
+        print("🔍 FIX #217: Scanning for ALL missing transactions (incoming + spent)...")
+
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get checkpoint - this is our last verified good state
+        let checkpoint = try database.getVerifiedCheckpointHeight()
+
+        // Get chain height
+        var chainHeight = networkManager.chainHeight
+        if chainHeight == 0 {
+            chainHeight = (try? await networkManager.getChainHeight()) ?? 0
+        }
+
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #217: Cannot get chain height - skipping")
+            return 0
+        }
+
+        // FIX #216: Sanity check chain height
+        guard chainHeight < 10_000_000 else {
+            print("🚨 FIX #217: REJECTED impossible chain height \(chainHeight)")
+            return 0
+        }
+
+        guard chainHeight > checkpoint else {
+            print("✅ FIX #217: Already at chain tip (checkpoint=\(checkpoint), chainHeight=\(chainHeight))")
+            return 0
+        }
+
+        let blocksToScan = chainHeight - checkpoint
+        print("🔍 FIX #217: Scanning \(blocksToScan) blocks from checkpoint \(checkpoint) to \(chainHeight)")
+
+        // Count notes before scan
+        let notesBefore = (try? database.getAllNotes(accountId: 1).count) ?? 0
+        let historyBefore = (try? database.getTransactionHistoryCount()) ?? 0
+
+        // Get account and spending key for FilterScanner
+        guard let account = try database.getAccount(index: 0) else {
+            print("⚠️ FIX #217: No account found")
+            return 0
+        }
+
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+
+        // Run FilterScanner from checkpoint - this does:
+        // 1. Trial decryption for incoming notes
+        // 2. Nullifier matching for spent notes
+        // 3. Proper witness updates
+        let scanner = FilterScanner()
+
+        print("🔍 FIX #217: Starting FilterScanner from height \(checkpoint + 1)...")
+        try await scanner.startScan(
+            for: account.id,
+            viewingKey: spendingKey,
+            fromHeight: checkpoint + 1
+        )
+
+        // Count notes after scan
+        let notesAfter = (try? database.getAllNotes(accountId: 1).count) ?? 0
+        let historyAfter = (try? database.getTransactionHistoryCount()) ?? 0
+
+        let newNotes = notesAfter - notesBefore
+        let newHistory = historyAfter - historyBefore
+        let totalRecovered = max(newNotes, newHistory)
+
+        if totalRecovered > 0 {
+            print("✅ FIX #217: Found \(newNotes) new note(s) and \(newHistory) new history entry/entries!")
+            // Refresh balance to reflect changes
+            try? await refreshBalance()
+            incrementHistoryVersion()
+        } else {
+            print("✅ FIX #217: No missing transactions found - database is consistent")
+        }
+
+        return totalRecovered
     }
 
     // MARK: - FIX #185: Equihash Proof-of-Work Verification

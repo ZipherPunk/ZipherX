@@ -123,10 +123,11 @@ final class Peer {
     private let rateLimiter = PeerRateLimiter(maxTokens: 100, refillRate: 10)
 
     // Protocol version constants (matching Zclassic/zcashd)
-    // 170012 = BIP155 (addrv2) support for Tor v3 addresses
+    // 170012 = BIP155 (addrv2) support for Tor v3 addresses (MAX VALID)
     // 170011 = Sapling support (backward compatible)
+    // 170010 = Non-BIP155 version
     // 170002 = Minimum supported version (Overwinter+)
-    // WARNING: Sybil attackers send fake reject messages claiming 170020 - IGNORE THEM!
+    // WARNING: Peers demanding 170020+ are Sybil attackers - that version doesn't exist!
     private let protocolVersion: Int32 = 170012
 
     /// FIX #182: Minimum peer protocol version (matching Zclassic MIN_PEER_PROTO_VERSION)
@@ -181,7 +182,6 @@ final class Peer {
     /// Connection lock to prevent concurrent connection attempts
     /// Multiple code paths calling connect() simultaneously can overwhelm the SOCKS5 proxy
     private var isConnecting = false
-    private let connectionLock = NSLock()
 
     /// FIX #121: STATIC cooldown tracker to prevent duplicate Peer instances from connecting simultaneously
     /// The instance-level isConnecting doesn't help when two Peer objects exist for the same host
@@ -1227,14 +1227,13 @@ final class Peer {
                     lastRejectReason = parseRejectMessage(payload)
                     print("⚠️ [\(host)] Got REJECT: \(lastRejectReason ?? "unknown reason")")
 
-                    // FIX #172: SYBIL ATTACK DETECTION
-                    // Zclassic valid protocol versions are: 170011 (Sapling), 170012 (BIP155)
-                    // If a peer claims to require 170020+, they are a Sybil attacker!
-                    if let reason = lastRejectReason, reason.contains("170020") {
-                        print("🚨 [\(host)] SYBIL ATTACK DETECTED: Peer claims invalid version 170020 - BANNING!")
-                        Task {
-                            await NetworkManager.shared.banPeerForSybilAttack(self.host)
-                        }
+                    // FIX #172: Wrong-chain detection (likely Zcash nodes on same port)
+                    // Zclassic valid protocol versions: 170010, 170011 (Sapling), 170012 (BIP155)
+                    // Zcash uses higher versions (170020+, 170100+ for NU5)
+                    // Don't alarm about "Sybil" - these are legitimate nodes for different chain
+                    if let reason = lastRejectReason, reason.contains("170020") || reason.contains("170100") {
+                        print("⚠️ [\(host)] Wrong chain: Peer requires version 170020+ (likely Zcash, not Zclassic)")
+                        // Quietly ban - don't trigger Sybil counter, just skip these nodes
                         throw NetworkError.handshakeFailed
                     }
 
@@ -2072,33 +2071,69 @@ final class Peer {
             let headerCount = Int(response[offset])
             offset += 1
 
-            let headerSize = 1487 // Zcash/Zclassic header size with Equihash solution
-
+            // FIX #207: Parse headers with variable-length solution
+            // Structure: 140 bytes header + varint + solution (400 bytes) + 1 byte tx_count
             for _ in 0..<min(headerCount, count) {
-                guard offset + headerSize <= response.count else { break }
+                // Need at least 140 bytes for base header
+                guard offset + 140 <= response.count else { break }
 
-                // Zcash/Zclassic block header layout (140 bytes base + solution):
+                // Zcash/Zclassic block header layout (140 bytes base):
                 // 0-3:     version (4 bytes)
                 // 4-35:    prevBlockHash (32 bytes)
                 // 36-67:   merkleRoot (32 bytes)
-                // 68-99:   finalSaplingRoot (32 bytes) - reserved/hashFinalSaplingRoot
+                // 68-99:   finalSaplingRoot (32 bytes)
                 // 100-103: timestamp (4 bytes)
                 // 104-107: bits (4 bytes)
                 // 108-139: nonce (32 bytes)
-                // 140+:    solution (400 bytes for post-Bubbles Equihash(192,7))
+                let version = response.loadInt32(at: offset)
+                let prevBlockHash = Data(response[(offset + 4)..<(offset + 36)])
+                let merkleRoot = Data(response[(offset + 36)..<(offset + 68)])
+                let finalSaplingRoot = Data(response[(offset + 68)..<(offset + 100)])
+                let timestamp = response.loadUInt32(at: offset + 100)
+                let bits = response.loadUInt32(at: offset + 104)
+                let nonce = Data(response[(offset + 108)..<(offset + 140)])
+                offset += 140
+
+                // Parse solution length (varint)
+                guard offset < response.count else { break }
+                let firstByte = response[offset]
+                var solutionLen: Int
+                var varintSize: Int
+
+                if firstByte < 253 {
+                    solutionLen = Int(firstByte)
+                    varintSize = 1
+                } else if firstByte == 253 {
+                    guard offset + 3 <= response.count else { break }
+                    solutionLen = Int(response[offset + 1]) | (Int(response[offset + 2]) << 8)
+                    varintSize = 3
+                } else {
+                    // 254/255 for larger values - not expected for solutions
+                    break
+                }
+                offset += varintSize
+
+                // Read solution
+                guard offset + solutionLen <= response.count else { break }
+                let solution = Data(response[offset..<(offset + solutionLen)])
+                offset += solutionLen
+
+                // Skip tx_count (always 0 in headers message)
+                guard offset < response.count else { break }
+                offset += 1
+
                 let header = BlockHeader(
-                    version: response.loadInt32(at: offset),
-                    prevBlockHash: Data(response[(offset + 4)..<(offset + 36)]),
-                    merkleRoot: Data(response[(offset + 36)..<(offset + 68)]),
-                    finalSaplingRoot: Data(response[(offset + 68)..<(offset + 100)]),
-                    timestamp: response.loadUInt32(at: offset + 100),
-                    bits: response.loadUInt32(at: offset + 104),
-                    nonce: Data(response[(offset + 108)..<(offset + 140)]),
-                    solution: Data(response[(offset + 140)..<(offset + headerSize)])
+                    version: version,
+                    prevBlockHash: prevBlockHash,
+                    merkleRoot: merkleRoot,
+                    finalSaplingRoot: finalSaplingRoot,
+                    timestamp: timestamp,
+                    bits: bits,
+                    nonce: nonce,
+                    solution: solution
                 )
 
                 headers.append(header)
-                offset += headerSize
             }
 
             print("📋 Received \(headers.count) headers")

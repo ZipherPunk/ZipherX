@@ -33,7 +33,10 @@ final class HeaderSyncManager {
 
     /// Sync headers from a starting height to network tip
     /// Uses multi-peer consensus to ensure data integrity
-    func syncHeaders(from startHeight: UInt64) async throws {
+    /// - Parameters:
+    ///   - startHeight: Starting block height to sync from
+    ///   - maxHeaders: FIX #180: Optional maximum number of headers to sync (default: unlimited)
+    func syncHeaders(from startHeight: UInt64, maxHeaders: UInt64? = nil) async throws {
         // FIX #133: Use static lock to prevent duplicate syncs from multiple HeaderSyncManager instances
         Self.syncLock.lock()
         guard !Self.isSyncing else {
@@ -60,8 +63,18 @@ final class HeaderSyncManager {
             throw SyncError.noConsensus(heights: [])
         }
 
-        let chainTip = consensusHeight
+        var chainTip = consensusHeight
         print("🎯 Consensus chain tip: \(chainTip)")
+
+        // FIX #180: Apply maxHeaders limit if specified
+        // This ensures we only sync up to maxHeaders blocks, not the entire chain
+        if let maxHeaders = maxHeaders, maxHeaders > 0 {
+            let limitedTip = startHeight + maxHeaders
+            if limitedTip < chainTip {
+                print("📊 FIX #180: Limiting sync to \(maxHeaders) headers (original tip: \(chainTip), limited: \(limitedTip))")
+                chainTip = limitedTip
+            }
+        }
 
         guard chainTip > startHeight else {
             print("✅ Already synced to tip")
@@ -815,7 +828,7 @@ final class HeaderSyncManager {
     private func buildGetHeadersPayload(startHeight: UInt64) -> (payload: Data, actualLocatorHeight: UInt64) {
         var payload = Data()
 
-        // Protocol version (BIP155 support)
+        // Protocol version (170012 = BIP155 support, MAX VALID for Zclassic)
         let version: UInt32 = 170012
         payload.append(contentsOf: withUnsafeBytes(of: version.littleEndian) { Array($0) })
 

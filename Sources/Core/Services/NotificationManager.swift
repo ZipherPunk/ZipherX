@@ -226,6 +226,33 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// FIX #174: Notify when external wallet spends our funds
+    func notifyExternalWalletSpend(amount: UInt64, txid: String) {
+        let zcl = Double(amount) / 100_000_000.0
+        print("🚨 NOTIFICATION: notifyExternalWalletSpend called")
+        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   txid=\(txid.prefix(16))...")
+        print("   >>> ALERT: External wallet spent our funds!")
+
+        let content = UNMutableNotificationContent()
+        content.title = "⚠️ External Wallet Spend Detected"
+        content.body = String(format: "Another wallet spent %.8f ZCL from your address.\nThis was NOT sent by ZipherX!", zcl)
+        content.sound = .defaultCritical // Use critical sound to get attention
+        content.userInfo = ["type": "external_spend", "txid": txid, "amount": amount]
+
+        let request = UNNotificationRequest(
+            identifier: "external-spend-\(txid)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("❌ Failed to send external spend notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Update app badge with pending transaction count
     func updateBadge(count: Int) {
         #if os(iOS)
@@ -251,6 +278,65 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             }
         }
         #endif
+    }
+
+    // MARK: - Chat Notifications (FIX #223)
+
+    /// Chat messages for notifications
+    private let chatCypherpunkMessages = [
+        "Encrypted message received.",
+        "Privacy preserved in communication.",
+        "Secure channel active.",
+        "End-to-end encrypted.",
+        "No middleman can read this."
+    ]
+
+    /// Notify when a chat message is received
+    /// - Parameters:
+    ///   - senderName: Display name of sender (nickname or truncated onion)
+    ///   - messageType: Type of message (text, payment request, etc.)
+    ///   - preview: Optional message preview (for text messages)
+    func notifyChatMessage(from senderName: String, type: String, preview: String? = nil) {
+        let content = UNMutableNotificationContent()
+
+        switch type {
+        case "text":
+            content.title = "💬 \(senderName)"
+            if let preview = preview {
+                // Truncate preview for privacy
+                let truncated = preview.count > 50 ? String(preview.prefix(50)) + "..." : preview
+                content.body = truncated
+            } else {
+                content.body = chatCypherpunkMessages.randomElement() ?? "New encrypted message"
+            }
+
+        case "pay_req":
+            content.title = "💰 Payment Request"
+            content.body = "\(senderName) is requesting payment"
+
+        case "pay_sent", "pay_rcv":
+            content.title = "✅ Payment Received"
+            content.body = "Payment from \(senderName) confirmed"
+
+        default:
+            content.title = "💬 \(senderName)"
+            content.body = chatCypherpunkMessages.randomElement() ?? "New message"
+        }
+
+        content.sound = .default
+        content.categoryIdentifier = "chat"
+
+        let request = UNNotificationRequest(
+            identifier: "chat-\(UUID().uuidString)",
+            content: content,
+            trigger: nil  // Deliver immediately
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("❌ Chat notification error: \(error)")
+            }
+        }
     }
 
     /// Clear all notifications

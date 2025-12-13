@@ -870,13 +870,22 @@ final class ChatManager: ObservableObject {
 
     private func handleReceivedMessage(_ message: ChatMessage, from peer: ChatPeer) {
         switch message.type {
-        case .text, .paymentRequest, .paymentSent:
+        case .text, .paymentRequest, .paymentSent, .paymentReceived:
             addMessageToConversation(message)
             database.saveMessage(message)
 
             // Update unread count
             if selectedConversation != message.fromOnion {
                 incrementUnreadCount(for: message.fromOnion)
+
+                // FIX #223: Send push notification when not viewing this conversation
+                let senderName = message.nickname ?? contacts.first(where: { $0.onionAddress == message.fromOnion })?.displayName ?? String(message.fromOnion.prefix(8)) + "..."
+                let preview = message.type == .text ? message.content : nil
+                NotificationManager.shared.notifyChatMessage(
+                    from: senderName,
+                    type: message.type.rawValue,
+                    preview: preview
+                )
             }
 
             // Send delivery confirmation

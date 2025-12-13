@@ -26,7 +26,8 @@ let CYPHERPUNK_CHAT_PORT: UInt16 = 8034
 enum ChatMessageType: String, Codable {
     case text = "text"              // Regular text message
     case paymentRequest = "pay_req" // ZCL payment request
-    case paymentSent = "pay_sent"   // Notification that payment was sent
+    case paymentSent = "pay_sent"   // Notification that payment was sent (shown to payer)
+    case paymentReceived = "pay_rcv" // FIX #219: Confirmation that payment was received (shown to requester)
     case typing = "typing"          // User is typing indicator
     case delivered = "delivered"    // Message delivery confirmation
     case read = "read"              // Message read receipt

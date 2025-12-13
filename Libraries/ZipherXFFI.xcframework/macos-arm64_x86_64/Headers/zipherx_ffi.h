@@ -154,6 +154,17 @@ size_t zipherx_tree_create_witnesses_parallel(
     uint8_t *witnesses_out
 );
 
+// Extract the Merkle root (anchor) from a serialized witness
+// witness_data: serialized witness (1028 bytes from treeCreateWitnessesBatch)
+// witness_len: length of witness data
+// root_out: 32-byte output buffer for the root
+// Returns: true if successful
+bool zipherx_witness_get_root(
+    const uint8_t *witness_data,
+    size_t witness_len,
+    uint8_t *root_out
+);
+
 // Compute nullifier for a note
 bool zipherx_compute_nullifier(
     const uint8_t *spending_key,
@@ -359,6 +370,162 @@ size_t zipherx_scan_boost_outputs(
     BoostScanNote *notes_out,       // Output buffer for discovered notes
     size_t max_notes,               // Maximum notes that can fit
     BoostScanResult *result_out     // Output for scan summary
+);
+
+// =============================================================================
+// Transaction Verification (FIX #xxx - VUL-002)
+// Validate Sapling proofs BEFORE broadcasting to prevent invalid TX propagation
+// =============================================================================
+
+/// Error codes for transaction verification
+typedef enum {
+    TX_VERIFY_SUCCESS = 0,
+    TX_VERIFY_INVALID_DATA = 1,
+    TX_VERIFY_PARSE_FAILED = 2,
+    TX_VERIFY_NO_SAPLING_BUNDLE = 3,
+    TX_VERIFY_SPEND_FAILED = 4,
+    TX_VERIFY_OUTPUT_FAILED = 5,
+    TX_VERIFY_BINDING_SIG_FAILED = 6,
+    TX_VERIFY_MISSING_KEY = 7,
+    TX_VERIFY_INVALID_SIGHASH = 8
+} TxVerifyError;
+
+/// Verify a serialized Sapling transaction before broadcasting
+/// This performs the same validation as zclassic's mempool acceptance:
+/// - Validates all SpendDescription proofs
+/// - Validates all OutputDescription proofs
+/// - Validates the binding signature
+///
+/// @param tx_data Serialized transaction bytes
+/// @param tx_len Length of transaction data
+/// @param chain_height Current chain height (for branch ID selection)
+/// @param error_out Pointer to receive error code on failure
+/// @return true if transaction is valid, false otherwise
+bool zipherx_verify_transaction(
+    const uint8_t *tx_data,
+    size_t tx_len,
+    uint64_t chain_height,
+    uint32_t *error_out
+);
+
+// =============================================================================
+// Tor (Arti) Integration
+// =============================================================================
+
+// Start the embedded Tor client
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_start(void);
+
+// Stop the Tor client
+// Returns 0 on success
+int32_t zipherx_tor_stop(void);
+
+// Get current Tor state
+// 0 = Disconnected, 1 = Connecting, 2 = Bootstrapping, 3 = Connected, 4 = Error
+uint8_t zipherx_tor_get_state(void);
+
+// Get bootstrap progress (0-100)
+uint8_t zipherx_tor_get_progress(void);
+
+// Get SOCKS proxy port (0 if not connected)
+uint16_t zipherx_tor_get_socks_port(void);
+
+// Get last error message
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+char* zipherx_tor_get_error(void);
+
+// Request new Tor identity (new circuit)
+// Returns 0 on success
+int32_t zipherx_tor_new_identity(void);
+
+// Make an HTTP GET request through Tor
+// Returns response body as null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL on error
+char* zipherx_tor_http_get(const char *url);
+
+// Free a string allocated by Tor functions
+void zipherx_tor_free_string(char *ptr);
+
+// Check if Tor is available (compiled in)
+bool zipherx_tor_is_available(void);
+
+// =============================================================================
+// Hidden Service (Onion Hosting)
+// =============================================================================
+
+// Start the hidden service (requires Tor to be connected)
+// Returns 0 on success, 1 on error, 2 if already running
+int32_t zipherx_tor_hidden_service_start(void);
+
+// Stop the hidden service
+// Returns 0 on success
+int32_t zipherx_tor_hidden_service_stop(void);
+
+// Get hidden service state
+// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
+uint8_t zipherx_tor_hidden_service_get_state(void);
+
+// Get the .onion address of our hidden service
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL if hidden service is not running
+char* zipherx_tor_hidden_service_get_address(void);
+
+// Set callback for incoming P2P connections
+// Callback signature: void(connection_id: u64, host_ptr: const char*, port: u16)
+void zipherx_tor_hidden_service_set_callback(
+    void (*callback)(uint64_t connection_id, const char *host_ptr, uint16_t port)
+);
+
+// Check if hidden service feature is available (compiled in)
+bool zipherx_tor_hidden_service_is_available(void);
+
+// =============================================================================
+// Persistent Hidden Service Keypair (Fixed .onion Address)
+// =============================================================================
+
+// Generate a new Ed25519 keypair for hidden service
+// Returns 64 bytes (32-byte secret + 32-byte public) into out_keypair buffer
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_generate_hs_keypair(uint8_t *out_keypair);
+
+// Set the hidden service keypair (64 bytes: secret + public)
+// This enables persistent .onion address across restarts
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_set_hs_keypair(const uint8_t *keypair, size_t len);
+
+// Clear the stored keypair (next start will generate random address)
+// Returns 0 on success
+int32_t zipherx_tor_clear_hs_keypair(void);
+
+// Check if a persistent keypair is set
+// Returns 1 if set, 0 if not
+int32_t zipherx_tor_has_hs_keypair(void);
+
+// Get the .onion address from the stored keypair (without starting service)
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL if no keypair is set
+char* zipherx_tor_get_keypair_onion_address(void);
+
+// =============================================================================
+// Cypherpunk Chat (Encrypted P2P Messaging over Tor)
+// =============================================================================
+
+// Set callback for incoming chat messages
+// Callback signature: void(connection_id: u64, data_ptr: const u8*, data_len: usize)
+void zipherx_tor_chat_set_callback(
+    void (*callback)(uint64_t connection_id, const uint8_t *data_ptr, size_t data_len)
+);
+
+// Get the chat port for ZipherX encrypted messaging (8034)
+uint16_t zipherx_tor_chat_get_port(void);
+
+// Send an encrypted chat message to an .onion address
+// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_chat_send(
+    const char *onion_address,
+    const uint8_t *data,
+    size_t data_len
 );
 
 #endif // ZIPHERX_FFI_H

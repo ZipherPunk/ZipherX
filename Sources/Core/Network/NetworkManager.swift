@@ -313,6 +313,11 @@ final class NetworkManager: ObservableObject {
     private var peerRotationTimer: Timer?
     private var addressDiscoveryTimer: Timer?
     private var statsRefreshTimer: Timer?
+    // FIX #227: Peer recovery watchdog - runs more frequently to detect lost peers
+    private var peerRecoveryTimer: Timer?
+    private var consecutiveSOCKS5Failures: Int = 0
+    private let SOCKS5_FAILURE_THRESHOLD: Int = 5  // After 5 failures, bypass Tor
+    private let PEER_RECOVERY_INTERVAL: TimeInterval = 30  // Check every 30 seconds
     private let STATS_REFRESH_INTERVAL: TimeInterval = 30 // Refresh chain height every 30 seconds
     private let queue = DispatchQueue(label: "com.zipherx.network", qos: .userInitiated)
 
@@ -545,6 +550,7 @@ final class NetworkManager: ObservableObject {
         setupPeerRotation()
         setupAddressDiscovery()
         setupStatsRefresh()
+        setupPeerRecoveryWatchdog()  // FIX #227: Monitor for lost peers
         loadBundledPeers()      // Load bundled peers first (for fresh installs)
         loadPersistedAddresses() // Then override with persisted (for returning users)
         loadCustomNodes()        // Load user-added custom nodes
@@ -750,7 +756,7 @@ final class NetworkManager: ObservableObject {
     }
 
     /// FIX #172: Ban peer for sending fake protocol version requirements (Sybil attack)
-    /// Zclassic only has versions 170011 (Sapling) and 170012 (BIP155)
+    /// Zclassic only has versions 170010, 170011 (Sapling) and 170012 (BIP155)
     /// Peers claiming to require 170020+ are Sybil attackers!
     func banPeerForSybilAttack(_ host: String) {
         addressLock.lock()
@@ -1205,6 +1211,16 @@ final class NetworkManager: ObservableObject {
                 newHeight = headerHeight
                 print("📡 [P2P] Using HeaderStore height (API unavailable): \(newHeight)")
             }
+        }
+
+        // FIX #213: ABSOLUTE sanity check - reject clearly impossible heights
+        // Zclassic is at ~3M blocks (Dec 2024), growing ~210K/year
+        // 10M blocks won't be reached for ~33 years - any higher is clearly bogus
+        let absoluteMaxHeight: UInt64 = 10_000_000
+        if newHeight > absoluteMaxHeight {
+            print("🚨 FIX #213: REJECTED impossible chain height \(newHeight) (absolute max: \(absoluteMaxHeight))")
+            print("🚨 FIX #213: This is clearly corrupt data from a malicious peer")
+            newHeight = headerStoreHeight > 0 ? headerStoreHeight : chainHeight
         }
 
         // Only update and log if height changed
@@ -1969,6 +1985,13 @@ final class NetworkManager: ObservableObject {
             }
         }
 
+        // FIX #213: ABSOLUTE sanity check - reject clearly impossible heights
+        let absoluteMaxHeight: UInt64 = 10_000_000
+        if currentChainHeight > absoluteMaxHeight {
+            print("🚨 FIX #213: REJECTED impossible chain height \(currentChainHeight) (absolute max: \(absoluteMaxHeight))")
+            currentChainHeight = chainHeight > 0 ? chainHeight : 0
+        }
+
         // Update chain height (only log if changed)
         if currentChainHeight > 0 {
             await MainActor.run {
@@ -2450,17 +2473,15 @@ final class NetworkManager: ObservableObject {
 
             // FIX #161: Also check via background sync - if wallet synced past the tx block,
             // the note should appear in our unspent notes
-            let unspentNotes = (try? WalletDatabase.shared.getUnspentNotes(accountId: 1)) ?? []
-            let noteExists = !unspentNotes.isEmpty && unspentNotes.contains { note in
-                // If we have a new unspent note with matching value, likely this tx
-                note.value == amount
-            }
+            // FIX #215: DO NOT match by value alone - this causes false positives with old notes!
+            // Only consider confirmed if TXID exists in transaction_history (checked above)
+            // The background sync will discover the note and create the history entry
+            // Matching by value would incorrectly find old notes with same amount
 
-            if noteExists {
-                print("⛏️ Confirmed incoming tx - matching note found: \(txid.prefix(16))...")
-                await confirmIncomingTx(txid: txid, amount: amount)
-                confirmedCount += 1
-            }
+            // Note: We leave this as a no-op - the TX will be confirmed when:
+            // 1. Background sync discovers the note and saves it to history, OR
+            // 2. The next checkPendingIncomingConfirmations() finds it in history
+            print("⏳ FIX #215: Waiting for background sync to discover note (txid=\(txid.prefix(16))...)")
         }
 
         // Safety: If all pending txids were confirmed but mempoolIncoming is still > 0,
@@ -2671,7 +2692,15 @@ final class NetworkManager: ObservableObject {
                         // Check if this is from our own pending transaction
                         let isOurPending = pendingOutgoingTxids.contains(txHashHex) || isPendingOutgoingSync(txid: txHashHex)
 
-                        if !isOurPending {
+                        // FIX #220: Also check if this TXID exists in our transaction_history as a SENT tx
+                        // This prevents false "external spend" warnings for our own transactions that
+                        // were already recorded but are still in mempool (pending tracking was cleared)
+                        var isOurRecorded = false
+                        if let txidData = Data(hexString: txHashHex) {
+                            isOurRecorded = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+                        }
+
+                        if !isOurPending && !isOurRecorded {
                             // EXTERNAL WALLET SPEND DETECTED!
                             print("🚨🚨🚨 [EXTERNAL SPEND] TX \(txHashHex.prefix(12))... is spending our note!")
                             print("🚨 [EXTERNAL SPEND] Note value: \(noteInfo.value) zatoshis, nullifier: \(nullifier.prefix(8).map { String(format: "%02x", $0) }.joined())...")
@@ -2693,6 +2722,8 @@ final class NetworkManager: ObservableObject {
 
                             // Send push notification for external spend
                             NotificationManager.shared.notifyExternalWalletSpend(amount: noteInfo.value, txid: txHashHex)
+                        } else if isOurRecorded && !isOurPending {
+                            print("🔮 MEMPOOL: Skipping tx \(txHashHex.prefix(12))... (our recorded sent tx still in mempool)")
                         }
                     }
                 }
@@ -3359,11 +3390,12 @@ final class NetworkManager: ObservableObject {
         print("✅ VUL-002: Transaction verification PASSED - proofs valid, safe to broadcast")
         onProgress?("verify", "Proofs validated ✓", 0.1)
 
-        // FIX #160: Check if Tor is enabled - need longer timeouts
+        // FIX #160 + FIX #211: Check if Tor is enabled - need MUCH longer timeouts
+        // FIX #211: Real-world Tor broadcasts take 30-65 seconds per peer!
         let torEnabled = await TorManager.shared.mode == .enabled
-        let perPeerTimeout: UInt64 = torEnabled ? 15_000_000_000 : 5_000_000_000  // 15s for Tor, 5s otherwise
-        let overallTimeout: UInt64 = torEnabled ? 45_000_000_000 : 15_000_000_000  // 45s for Tor, 15s otherwise
-        print("📡 FIX #160: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
+        let perPeerTimeout: UInt64 = torEnabled ? 75_000_000_000 : 5_000_000_000  // FIX #211: 75s for Tor (was 15s), 5s otherwise
+        let overallTimeout: UInt64 = torEnabled ? 120_000_000_000 : 15_000_000_000  // FIX #211: 120s for Tor (was 45s), 15s otherwise
+        print("📡 FIX #211: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
 
         // FIX #160: Compute TX ID upfront - even if timeout occurs, we know what was sent
         let computedTxId = rawTx.doubleSHA256().reversed().map { String(format: "%02x", $0) }.joined()
@@ -3468,16 +3500,21 @@ final class NetworkManager: ObservableObject {
             }
 
             // Add mempool verification task - runs in parallel, exits early on success
+            // FIX #211: Capture torEnabled for longer wait time through Tor
+            let useTorTimeouts = torEnabled
             group.addTask {
-                // Wait for at least one peer to accept (max 10 seconds, then give up)
+                // FIX #211: Wait for at least one peer to accept
+                // Tor broadcasts take 30-65 seconds per peer, so wait up to 90s
+                // Direct mode: 10 seconds (100 * 100ms)
+                let maxAttempts = useTorTimeouts ? 900 : 100  // 90s for Tor, 10s for direct
                 var waitAttempts = 0
-                while await state.getTxId() == nil && waitAttempts < 100 {
+                while await state.getTxId() == nil && waitAttempts < maxAttempts {
                     try await Task.sleep(nanoseconds: 100_000_000) // 100ms
                     waitAttempts += 1
                 }
 
                 guard let txId = await state.getTxId() else {
-                    print("⚠️ No peer accepted transaction within timeout")
+                    print("⚠️ No peer accepted transaction within \(maxAttempts / 10)s timeout")
                     return
                 }
 
@@ -4707,6 +4744,132 @@ final class NetworkManager: ObservableObject {
                 self.connectedPeers = readyPeers.count
                 self.isConnected = readyPeers.count > 0
             }
+        }
+    }
+
+    // MARK: - FIX #227: Peer Recovery Watchdog
+
+    /// Setup peer recovery watchdog that runs every 30 seconds
+    /// Detects when all peers are lost and triggers immediate reconnection
+    private func setupPeerRecoveryWatchdog() {
+        peerRecoveryTimer = Timer.scheduledTimer(withTimeInterval: PEER_RECOVERY_INTERVAL, repeats: true) { [weak self] _ in
+            self?.checkPeerRecovery()
+        }
+    }
+
+    /// Check if peers need recovery and trigger reconnection if needed
+    private func checkPeerRecovery() {
+        // FIX #227: Don't run during sync/repair/connection operations - they manage their own connections
+        if WalletManager.shared.isSyncing || WalletManager.shared.isRepairingHistory || isConnecting {
+            return  // Skip recovery check during active operations
+        }
+
+        let readyPeers = peers.filter { $0.isConnectionReady }
+        let readyCount = readyPeers.count
+
+        if readyCount == 0 {
+            print("🚨 FIX #227: No ready peers detected! Triggering recovery...")
+
+            // Check if Tor SOCKS failures are the cause
+            if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD && !sybilBypassActive {
+                print("🚨 FIX #227: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
+                sybilBypassActive = true  // Reuse existing bypass flag
+                _torIsAvailable = false   // Force direct connections
+            }
+
+            // Trigger immediate peer reconnection
+            Task {
+                await attemptPeerRecovery()
+            }
+        } else {
+            // Reset SOCKS5 failure counter on successful connections
+            if readyCount >= MIN_PEERS / 2 {
+                consecutiveSOCKS5Failures = 0
+            }
+        }
+
+        // Update published state
+        DispatchQueue.main.async {
+            self.connectedPeers = readyCount
+            self.isConnected = readyCount > 0
+        }
+    }
+
+    /// Attempt to recover peer connections
+    private func attemptPeerRecovery() async {
+        print("🔄 FIX #227: Attempting peer recovery...")
+
+        // Clear dead peer references
+        peers.removeAll { !$0.isConnectionReady }
+
+        // Try bundled peers first (most reliable)
+        let bundledAddresses = knownAddresses.values
+            .filter { $0.source == "bundled" }
+            .map { $0.address }
+
+        var recovered = 0
+        for address in bundledAddresses.prefix(5) {
+            // Skip if on cooldown or banned
+            if isBanned(address.host) || isOnCooldown(address.host, port: address.port) {
+                continue
+            }
+
+            recordConnectionAttempt(address.host, port: address.port)
+
+            do {
+                let peer = try await connectToPeer(address)
+                peers.append(peer)
+                setupBlockListener(for: peer)
+                recovered += 1
+                print("✅ FIX #227: Recovered peer \(address.host)")
+
+                if recovered >= 3 {
+                    break  // Got enough peers
+                }
+            } catch {
+                print("❌ FIX #227: Failed to connect to \(address.host): \(error.localizedDescription)")
+
+                // Track SOCKS5 failures specifically
+                if error.localizedDescription.contains("Socket is not connected") ||
+                   error.localizedDescription.contains("SOCKS") {
+                    consecutiveSOCKS5Failures += 1
+                }
+            }
+        }
+
+        if recovered == 0 {
+            print("⚠️ FIX #227: Could not recover any peers from bundled list")
+
+            // If Tor bypass not active yet and we have failures, try direct
+            if !sybilBypassActive {
+                print("🔧 FIX #227: Enabling Tor bypass for direct connections")
+                sybilBypassActive = true
+                _torIsAvailable = false
+
+                // Retry with direct connections
+                for address in bundledAddresses.prefix(3) {
+                    if isBanned(address.host) { continue }
+
+                    do {
+                        let peer = try await connectToPeer(address)
+                        peers.append(peer)
+                        setupBlockListener(for: peer)
+                        print("✅ FIX #227: Direct connection to \(address.host) succeeded")
+                        break
+                    } catch {
+                        print("❌ FIX #227: Direct connection to \(address.host) failed")
+                    }
+                }
+            }
+        } else {
+            print("✅ FIX #227: Recovered \(recovered) peer(s)")
+        }
+
+        // Update UI
+        DispatchQueue.main.async {
+            let readyPeers = self.peers.filter { $0.isConnectionReady }
+            self.connectedPeers = readyPeers.count
+            self.isConnected = readyPeers.count > 0
         }
     }
 }

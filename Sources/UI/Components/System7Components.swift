@@ -1656,6 +1656,8 @@ struct CypherpunkMainView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
+    // FIX #222: Chat notification badge - observe unread count
+    @StateObject private var chatManager = ChatManager.shared
     @Binding var showSettings: Bool
     @Binding var showSend: Bool
     @Binding var showReceive: Bool
@@ -2059,23 +2061,39 @@ struct CypherpunkMainView: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            // CHAT button (encrypted messaging)
+            // CHAT button (encrypted messaging) with unread badge (FIX #222)
             Button(action: { showChat = true }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.system(size: 18))
-                    Text("CHAT")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                ZStack(alignment: .topTrailing) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "bubble.left.and.bubble.right.fill")
+                            .font(.system(size: 18))
+                        Text("CHAT")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(matrixGreen)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.black)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(matrixGreen, lineWidth: 2)
+                    )
+                    .cornerRadius(8)
+
+                    // FIX #222: Unread message badge
+                    if chatManager.totalUnreadCount > 0 {
+                        ZStack {
+                            Circle()
+                                .fill(Color.red)
+                                .frame(width: 22, height: 22)
+                                .shadow(color: Color.red.opacity(0.6), radius: 4)
+                            Text("\(min(chatManager.totalUnreadCount, 99))")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                        }
+                        .offset(x: 8, y: -8)
+                    }
                 }
-                .foregroundColor(matrixGreen)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(Color.black)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(matrixGreen, lineWidth: 2)
-                )
-                .cornerRadius(8)
             }
             .buttonStyle(PlainButtonStyle())
         }
@@ -2204,64 +2222,56 @@ struct CypherpunkMainView: View {
     // MARK: - Network Status Bar
 
     private var networkStatusBar: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 8) {
             // Zclassic network version
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 Image(systemName: "network")
-                    .font(.system(size: 9))
-                Text("ZCL v2.1.2-1")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 8))
+                Text("ZCL")
+                    .font(.system(size: 9, design: .monospaced))
             }
             .foregroundColor(matrixGreenDark)
-
-            Spacer()
 
             // Sync status
             if walletManager.isSyncing {
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     ProgressView()
-                        .scaleEffect(0.5)
+                        .scaleEffect(0.4)
                         .tint(matrixGreen)
-                    Text("SYNCING...")
-                        .font(.system(size: 9, design: .monospaced))
+                    Text("SYNC")
+                        .font(.system(size: 8, design: .monospaced))
                 }
                 .foregroundColor(matrixGreen)
             } else {
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 9))
-                    Text("SYNCED")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 8))
+                    Text("OK")
+                        .font(.system(size: 8, design: .monospaced))
                 }
                 .foregroundColor(matrixGreenDark)
             }
 
             Spacer()
 
-            // ZCL Price
+            // ZCL Price (compact)
             if networkManager.zclPriceUSD > 0 {
-                HStack(spacing: 4) {
-                    Image(systemName: "dollarsign.circle")
-                        .font(.system(size: 9))
-                    Text(String(format: "$%.4f", networkManager.zclPriceUSD))
-                        .font(.system(size: 10, design: .monospaced))
-                }
-                .foregroundColor(matrixGreenDark)
-
-                Spacer()
+                Text(String(format: "$%.2f", networkManager.zclPriceUSD))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(matrixGreenDark)
             }
 
             // Block height
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 Image(systemName: "cube.fill")
-                    .font(.system(size: 9))
+                    .font(.system(size: 8))
                 Text("\(networkManager.chainHeight)")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 9, design: .monospaced))
             }
             .foregroundColor(matrixGreenDark)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
         .background(Color.black.opacity(0.8))
     }
 

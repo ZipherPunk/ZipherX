@@ -27,7 +27,8 @@ final class WalletDatabase {
 
     // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
     // WARNING: Only set to true for debugging purposes! Set back to false before release!
-    private static let DEBUG_DISABLE_ENCRYPTION = true
+    // Re-enabled encryption after debugging session (FIX #226)
+    private static let DEBUG_DISABLE_ENCRYPTION = false
 
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
@@ -81,7 +82,8 @@ final class WalletDatabase {
 
     /// Hash a nullifier for privacy-preserving storage
     /// Prevents spending pattern analysis if database is compromised
-    private func hashNullifier(_ nullifier: Data) -> Data {
+    /// FIX #212: Made internal (was private) for use in WalletManager.repairUnrecordedSpends()
+    func hashNullifier(_ nullifier: Data) -> Data {
         return Data(SHA256.hash(data: nullifier))
     }
 
@@ -2794,6 +2796,19 @@ final class WalletDatabase {
         print("📜 DB: Insert result - rowId=\(rowId), rowsChanged=\(rowsChanged), txid=\(txid.prefix(8).map { String(format: "%02x", $0) }.joined())..., type=\(type.rawValue)")
 
         return rowId
+    }
+
+    /// Get count of transaction history entries
+    func getTransactionHistoryCount() throws -> Int {
+        guard db != nil else { return 0 }
+        let sql = "SELECT COUNT(*) FROM transaction_history"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+        return 0
     }
 
     /// Get transaction history ordered by height (newest first)

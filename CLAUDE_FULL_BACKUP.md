@@ -7948,6 +7948,123 @@ onProgress?(initialProgress)
 
 ---
 
+### 156. CRITICAL: VUL-002 Phantom Transaction Prevention (December 12, 2025)
+
+**Problem**: User reported transaction `608839f297c6aab255ce24cd656148466f764dcd12a22cc27f9d5ffdb3b37645` was rejected by mempool but wallet showed it as "sent" with 0.0002 ZCL deducted from balance. "Repair Database" didn't fix it, and health check passed despite the phantom TX existing.
+
+**Root Cause Analysis**:
+1. **InsightAPI mempool check was DISABLED** - Lines 3456-3472 in NetworkManager had the mempool verification code commented out
+2. P2P peers ACCEPTED the transaction (they relay anything)
+3. But mempool REJECTED it (invalid proof, stale anchor, or other validation failure)
+4. Since mempool check was disabled, broadcast returned "success" when peers accepted
+5. WalletManager immediately wrote to database BEFORE mempool confirmation
+6. Result: Phantom transaction - exists in local database but NOT on blockchain
+
+**Solution: Three-Part Fix**
+
+**Part 1: Re-enable InsightAPI mempool verification** (`NetworkManager.swift:3458-3499`):
+```swift
+// VUL-002: MANDATORY mempool verification before marking as verified
+var mempoolVerified = false
+for attempt in 1...5 {
+    if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
+        mempoolVerified = true
+        await state.setVerified()
+        return // Exit immediately - mempool confirmed!
+    }
+    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+}
+
+if !mempoolVerified {
+    print("❌ VUL-002: Transaction NOT found in mempool - DO NOT write to database!")
+    // DO NOT call state.setVerified() - intentional
+}
+```
+
+**Part 2: Return BroadcastResult with mempoolVerified flag** (`NetworkManager.swift:3290-3296`):
+```swift
+struct BroadcastResult {
+    let txId: String
+    let mempoolVerified: Bool  // CRITICAL - must be true before DB writes
+    let peerCount: Int
+}
+
+func broadcastTransactionWithProgress(...) async throws -> BroadcastResult
+```
+
+**Part 3: Only write to database AFTER mempool confirmation** (`WalletManager.swift:3172-3190`):
+```swift
+guard broadcastResult.mempoolVerified else {
+    // Mempool did NOT verify - DO NOT write to database!
+    print("🚨 VUL-002: MEMPOOL REJECTED - Not writing to database!")
+    await MainActor.run { networkManager.clearPendingBroadcast() }
+    throw WalletError.transactionFailed("Transaction rejected by mempool. Funds are safe.")
+}
+
+// MEMPOOL VERIFIED - Now safe to write to database
+print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+try WalletDatabase.shared.markNoteSpentByHashedNullifier(...)
+try WalletDatabase.shared.insertTransactionHistory(...)
+```
+
+**Part 4: Phantom TX detection and removal in Repair Database** (`WalletManager.swift:2401-2448`):
+```swift
+// STEP 0: VUL-002 - Remove phantom transactions FIRST
+let sentTxs = try WalletDatabase.shared.getSentTransactions()
+for tx in sentTxs {
+    let (exists, _) = try await InsightAPI.shared.verifyTransactionExists(txid: txidHex)
+    if !exists {
+        print("🚨 VUL-002: PHANTOM TX detected: \(txidHex)")
+        // Restore notes marked as spent by this phantom TX
+        for nullifier in try WalletDatabase.shared.getNullifiersSpentInTx(txid: tx.txid) {
+            try WalletDatabase.shared.unmarkNoteAsSpent(nullifier: nullifier)
+        }
+        // Delete the phantom TX from history
+        try WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid)
+    }
+}
+```
+
+**Part 5: Health check detects phantom TXs** (`WalletHealthCheck.swift:571+`):
+```swift
+func checkSentTransactionsOnChain() async throws -> HealthCheckResult {
+    let sentTxs = try WalletDatabase.shared.getSentTransactions()
+    for tx in sentTxs {
+        let (exists, _) = try await InsightAPI.shared.verifyTransactionExists(txid: txidHex)
+        if !exists {
+            phantomTxs.append(txidHex)
+        }
+    }
+    if !phantomTxs.isEmpty {
+        // Return CRITICAL failure
+    }
+}
+```
+
+**New Database Functions** (`WalletDatabase.swift`):
+- `getSentTransactions()` - Get all SENT transactions for blockchain verification
+- `deletePhantomTransaction(txid:)` - Delete a phantom TX, return its value
+- `unmarkNoteAsSpent(nullifier:)` - Restore a note incorrectly marked as spent
+- `getNullifiersSpentInTx(txid:)` - Get nullifiers of notes marked as spent by a TX
+
+**User Experience After Fix**:
+1. **Prevention**: Invalid TXs now fail with clear error message "Transaction rejected by mempool. Funds are safe."
+2. **Detection**: Health check flags phantom TXs as CRITICAL failure
+3. **Recovery**: "Repair Database" automatically removes phantom TXs and restores notes
+
+**Security Guarantee**:
+- **NO database writes happen without mempool confirmation**
+- This is the CRITICAL user requirement: "nothing must be changed in database without TXN confirmation by PEERS AND MEMPOOL"
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - BroadcastResult struct, mempool verification, return type changes
+- `Sources/Core/Wallet/WalletManager.swift` - VUL-002 guard, phantom TX removal in repair, both send functions updated
+- `Sources/Features/Send/SendView.swift` - VUL-002 guard for prepared transaction instant send flow
+- `Sources/Core/Storage/WalletDatabase.swift` - getSentTransactions(), deletePhantomTransaction(), unmarkNoteAsSpent(), getNullifiersSpentInTx()
+- `Sources/Core/Wallet/WalletHealthCheck.swift` - checkSentTransactionsOnChain() (already existed)
+
+---
+
 ## Contact
 
 For questions about this project, refer to the architecture document or review the security model section.

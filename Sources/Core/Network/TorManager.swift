@@ -262,6 +262,62 @@ public final class TorManager: ObservableObject {
         return isBypassActive
     }
 
+    // MARK: - FIX #210: Temporary Tor Bypass for Single Transaction
+
+    /// Temporarily bypass Tor when it's enabled but not running
+    /// Use this when user wants to send TX despite Tor being unavailable
+    /// Does NOT change the persisted mode setting - just allows direct connections
+    public func temporarilyBypassTor() async {
+        guard mode == .enabled else {
+            print("🧅 FIX #210: Tor not enabled, no bypass needed")
+            return
+        }
+
+        print("🧅 FIX #210: Temporarily bypassing Tor for transaction broadcast")
+        print("🧅 FIX #210: User's IP will be visible to peers for this transaction")
+
+        // Mark bypass active so peers connect directly
+        isBypassActive = true
+        wasTorEnabledBeforeBypass = true
+
+        // Disconnect existing peers (they're waiting for SOCKS)
+        await NetworkManager.shared.disconnectAllPeers()
+
+        // Set connection state to indicate bypass mode
+        await MainActor.run {
+            self.connectionState = .disconnected
+        }
+
+        print("🧅 FIX #210: Tor bypassed - peers will reconnect directly")
+    }
+
+    /// Restore Tor after single transaction completes
+    /// Called automatically by SendView after TX broadcast
+    public func restoreAfterSingleTxBypass() async {
+        guard wasTorEnabledBeforeBypass && isBypassActive else {
+            return
+        }
+
+        print("🧅 FIX #210: Transaction complete - attempting to restore Tor")
+        isBypassActive = false
+        wasTorEnabledBeforeBypass = false
+
+        // Try to restart Tor
+        await startArti()
+
+        // If Tor fails to start, that's okay - it will show in UI
+        // User can manually restart from Settings
+    }
+
+    /// Check if Tor should be used but isn't available
+    /// Returns true if mode is enabled but Tor is not connected and SOCKS is not available
+    public var isTorEnabledButUnavailable: Bool {
+        guard mode == .enabled else { return false }
+        if isBypassActive { return false }  // Already bypassed
+        if connectionState.isConnected { return false }  // Tor is running
+        return true
+    }
+
     /// Get URLSession configured for Tor proxy
     public func getTorURLSession(isolate: Bool = false) -> URLSession {
         guard mode == .enabled, connectionState.isConnected, socksPort > 0 else {

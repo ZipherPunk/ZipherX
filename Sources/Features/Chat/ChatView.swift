@@ -628,9 +628,15 @@ struct ConversationView: View {
                                     DateSeparator(date: message.timestamp)
                                 }
 
+                                // FIX #219: Check if this payment request has been paid
+                                let isPaid = message.type == .paymentRequest && conversation.messages.contains {
+                                    ($0.type == .paymentSent) && ($0.replyTo == message.id)
+                                }
+
                                 MessageBubble(
                                     message: message,
                                     isFromMe: message.fromOnion == chatManager.ourOnionAddress,
+                                    isPaid: isPaid,
                                     onPayNow: { paymentMsg in
                                         paymentRequestToPay = paymentMsg
                                         showPayNowSheet = true
@@ -694,6 +700,8 @@ struct ConversationView: View {
         .sheet(isPresented: $showPaymentRequest) {
             PaymentRequestSheet(contact: contact)
         }
+        // FIX #221: Explicitly pass environment objects to prevent blank screen delay
+        // SwiftUI sheets don't always inherit environment objects properly
         .sheet(isPresented: $showPayNowSheet) {
             if let paymentRequest = paymentRequestToPay {
                 PayNowSheet(
@@ -717,6 +725,9 @@ struct ConversationView: View {
                         paymentRequestToPay = nil
                     }
                 )
+                .environmentObject(WalletManager.shared)
+                .environmentObject(NetworkManager.shared)
+                .environmentObject(themeManager)
             }
         }
     }
@@ -922,6 +933,7 @@ struct MessageBubble: View {
     @EnvironmentObject private var themeManager: ThemeManager
     let message: ChatMessage
     let isFromMe: Bool
+    var isPaid: Bool = false  // FIX #219: True if this payment request has been paid
     var onPayNow: ((ChatMessage) -> Void)? = nil  // Callback for PAY NOW button
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -946,7 +958,16 @@ struct MessageBubble: View {
                 case .paymentRequest:
                     paymentRequestBubble
                 case .paymentSent:
-                    paymentSentBubble
+                    // FIX #219: When I receive a paymentSent from someone else,
+                    // it means THEY paid MY request - show celebration!
+                    if isFromMe {
+                        paymentSentBubble  // I sent payment - show "PAYMENT SENT"
+                    } else {
+                        paymentReceivedBubble  // They paid me - show "PAYMENT RECEIVED" celebration
+                    }
+                case .paymentReceived:
+                    // FIX #219: Explicit payment received type (for backwards compatibility)
+                    paymentReceivedBubble
                 default:
                     EmptyView()
                 }
@@ -1003,18 +1024,19 @@ struct MessageBubble: View {
     private var paymentRequestBubble: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Image(systemName: "dollarsign.circle.fill")
+                Image(systemName: isPaid ? "checkmark.seal.fill" : "dollarsign.circle.fill")
                     .font(.system(size: 18))
-                    .foregroundColor(theme.accentColor)
-                Text("PAYMENT REQUEST")
+                    .foregroundColor(isPaid ? .green : theme.accentColor)
+                Text(isPaid ? "PAYMENT REQUEST - PAID" : "PAYMENT REQUEST")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(theme.accentColor)
+                    .foregroundColor(isPaid ? .green : theme.accentColor)
             }
 
             if let amount = message.formattedAmount {
                 Text(amount)
                     .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundColor(theme.textPrimary)
+                    .foregroundColor(isPaid ? .green.opacity(0.8) : theme.textPrimary)
+                    .strikethrough(isPaid, color: .green.opacity(0.5))
             }
 
             if !message.content.isEmpty {
@@ -1023,7 +1045,8 @@ struct MessageBubble: View {
                     .foregroundColor(theme.textPrimary.opacity(0.7))
             }
 
-            if !isFromMe {
+            // FIX #219: Show PAY NOW button only if not paid and not from me
+            if !isFromMe && !isPaid {
                 Button(action: { onPayNow?(message) }) {
                     HStack {
                         Image(systemName: "arrow.right.circle.fill")
@@ -1037,14 +1060,26 @@ struct MessageBubble: View {
                     .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
+            } else if isPaid {
+                // Show paid confirmation badge
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                    Text("PAID")
+                }
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .foregroundColor(.green)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.green.opacity(0.15))
+                .cornerRadius(8)
             }
         }
         .padding(14)
-        .background(Color.black.opacity(0.25))
+        .background(isPaid ? Color.green.opacity(0.1) : Color.black.opacity(0.25))
         .cornerRadius(14)
         .overlay(
             RoundedRectangle(cornerRadius: 14)
-                .stroke(theme.accentColor.opacity(0.4), lineWidth: 1)
+                .stroke(isPaid ? Color.green.opacity(0.5) : theme.accentColor.opacity(0.4), lineWidth: isPaid ? 2 : 1)
         )
     }
 
@@ -1068,6 +1103,79 @@ struct MessageBubble: View {
         .padding(12)
         .background(theme.accentColor.opacity(0.15))
         .cornerRadius(10)
+    }
+
+    // FIX #219: Celebration bubble when payment request is fulfilled
+    private var paymentReceivedBubble: some View {
+        VStack(alignment: .center, spacing: 8) {
+            // Celebration header
+            HStack {
+                Text("🎉")
+                    .font(.system(size: 24))
+                Text("PAYMENT RECEIVED!")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(.orange)
+                Text("🎉")
+                    .font(.system(size: 24))
+            }
+
+            // Amount with glow effect
+            if let amount = message.formattedAmount {
+                Text(amount)
+                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                    .foregroundColor(.orange)
+                    .shadow(color: .orange.opacity(0.6), radius: 8)
+            }
+
+            // TXID preview
+            if let txid = extractTxIdFromContent(message.content) {
+                VStack(spacing: 4) {
+                    Text("TXID:")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.5))
+                    Text("\(txid.prefix(16))...\(txid.suffix(8))")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(theme.accentColor)
+                }
+            }
+
+            // Cypherpunk quote
+            Text("\"Privacy is a fundamental right.\"")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(theme.textPrimary.opacity(0.3))
+                .italic()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(
+            LinearGradient(
+                colors: [Color.orange.opacity(0.2), theme.accentColor.opacity(0.15)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.orange.opacity(0.5), lineWidth: 2)
+        )
+        .cornerRadius(14)
+    }
+
+    // Helper to extract TXID from message content like "Payment sent: abc123..."
+    private func extractTxIdFromContent(_ content: String) -> String? {
+        // Look for 64-char hex string after "Payment sent:" or just any 64-char hex
+        let patterns = [
+            "Payment sent:\\s*([a-fA-F0-9]{64})",
+            "([a-fA-F0-9]{64})"
+        ]
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               let match = regex.firstMatch(in: content, options: [], range: NSRange(content.startIndex..., in: content)),
+               let range = Range(match.range(at: 1), in: content) {
+                return String(content[range])
+            }
+        }
+        return nil
     }
 
     private func formatTime(_ date: Date) -> String {
@@ -1190,6 +1298,8 @@ struct AddContactSheet: View {
     @State private var nickname = ""
     @State private var errorMessage: String?
     @State private var isAdding = false
+    // FIX #225: QR code scanner
+    @State private var showQRScanner = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1237,9 +1347,31 @@ struct AddContactSheet: View {
                 // Form
                 VStack(spacing: 18) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("ONION ADDRESS")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(theme.accentColor)
+                        HStack {
+                            Text("ONION ADDRESS")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.accentColor)
+
+                            Spacer()
+
+                            // FIX #225: QR Scanner button (iOS only)
+                            #if os(iOS)
+                            Button(action: { showQRScanner = true }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "qrcode.viewfinder")
+                                        .font(.system(size: 14))
+                                    Text("SCAN")
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                }
+                                .foregroundColor(theme.accentColor)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(theme.accentColor.opacity(0.15))
+                                .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            #endif
+                        }
 
                         TextField("xxxxxxxx...xxxxx.onion", text: $onionAddress)
                             .textFieldStyle(.plain)
@@ -1368,6 +1500,24 @@ struct AddContactSheet: View {
         // Ensure entire sheet has consistent background on macOS
         .background(theme.backgroundColor.ignoresSafeArea())
         #endif
+        // FIX #225: QR Scanner sheet (iOS only)
+        #if os(iOS)
+        .sheet(isPresented: $showQRScanner) {
+            ChatQRScannerSheet { scannedAddress in
+                if let address = scannedAddress {
+                    // Extract .onion address from scanned QR code
+                    let cleaned = address.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if cleaned.hasSuffix(".onion") {
+                        onionAddress = cleaned
+                    } else {
+                        errorMessage = "Invalid .onion address"
+                    }
+                }
+                showQRScanner = false
+            }
+            .environmentObject(themeManager)
+        }
+        #endif
     }
 
     private func addContact() {
@@ -1396,6 +1546,8 @@ struct ChatSettingsSheet: View {
 
     // Store quote once to prevent "loop" effect from re-rendering
     @State private var quote: String = ""
+    // FIX #224: Track if address was copied
+    @State private var showCopiedFeedback = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1418,7 +1570,7 @@ struct ChatSettingsSheet: View {
                     .padding(.top, 8)
                     #endif
 
-                    // Identity Section
+                    // Identity Section (FIX #224: QR code + copy button)
                     VStack(alignment: .leading, spacing: 16) {
                         sectionHeader("YOUR IDENTITY")
 
@@ -1438,20 +1590,82 @@ struct ChatSettingsSheet: View {
                             .background(Color.black.opacity(0.2))
                             .cornerRadius(10)
 
+                            // FIX #224: QR Code and .onion address with copy button
                             if let onion = chatManager.ourOnionAddress {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Your .onion Address")
-                                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                        .foregroundColor(theme.textPrimary.opacity(0.5))
-                                    Text(onion)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(theme.accentColor)
-                                        .lineLimit(2)
+                                VStack(spacing: 16) {
+                                    // QR Code
+                                    VStack(spacing: 8) {
+                                        Text("SHARE YOUR ADDRESS")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundColor(theme.accentColor)
+                                            .tracking(2)
+
+                                        // QR Code display
+                                        System7QRCode(data: onion)
+                                            .frame(width: 180, height: 180)
+                                            .background(Color.white)
+                                            .cornerRadius(12)
+                                            .shadow(color: theme.accentColor.opacity(0.3), radius: 8)
+
+                                        Text("Scan to add as contact")
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundColor(theme.textPrimary.opacity(0.5))
+                                    }
+
+                                    // Onion address with copy button
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack {
+                                            Text("Your .onion Address")
+                                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                                .foregroundColor(theme.textPrimary.opacity(0.5))
+                                            Spacer()
+
+                                            // Copy button
+                                            Button(action: {
+                                                #if os(iOS)
+                                                UIPasteboard.general.string = onion
+                                                #else
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(onion, forType: .string)
+                                                #endif
+                                                withAnimation {
+                                                    showCopiedFeedback = true
+                                                }
+                                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                                    withAnimation {
+                                                        showCopiedFeedback = false
+                                                    }
+                                                }
+                                            }) {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+                                                        .font(.system(size: 12))
+                                                    Text(showCopiedFeedback ? "Copied!" : "Copy")
+                                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                                }
+                                                .foregroundColor(showCopiedFeedback ? .green : theme.accentColor)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+
+                                        Text(onion)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(theme.accentColor)
+                                            .lineLimit(3)
+                                            .textSelection(.enabled)
+                                    }
+                                    .padding(14)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.black.opacity(0.2))
+                                    .cornerRadius(10)
                                 }
-                                .padding(14)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.black.opacity(0.2))
-                                .cornerRadius(10)
+                                .padding(16)
+                                .background(Color.black.opacity(0.15))
+                                .cornerRadius(12)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(theme.accentColor.opacity(0.2), lineWidth: 1)
+                                )
                             }
                         }
                     }
@@ -1754,8 +1968,10 @@ struct PaymentRequestSheet: View {
 /// Wraps SendView with pre-filled address and amount
 struct PayNowSheet: View {
     @EnvironmentObject private var themeManager: ThemeManager
-    @EnvironmentObject var walletManager: WalletManager
-    @EnvironmentObject var networkManager: NetworkManager
+    // FIX #221: Use StateObject with shared singleton for reliable access
+    // Environment objects can fail to propagate through sheet presentation
+    @StateObject private var walletManager = WalletManager.shared
+    @StateObject private var networkManager = NetworkManager.shared
     @Environment(\.dismiss) private var dismiss
 
     let contact: ChatContact
@@ -1854,8 +2070,9 @@ struct PayNowSheet: View {
 /// A simplified version of SendView used within PayNowSheet
 /// Pre-fills address, amount, memo and provides success callback
 struct SendViewForPayment: View {
-    @EnvironmentObject var walletManager: WalletManager
-    @EnvironmentObject var networkManager: NetworkManager
+    // FIX #221: Use StateObject with shared singletons for reliable access
+    @StateObject private var walletManager = WalletManager.shared
+    @StateObject private var networkManager = NetworkManager.shared
     @EnvironmentObject var themeManager: ThemeManager
 
     let prefilledAddress: String
@@ -2192,6 +2409,78 @@ struct RoundedCorner: Shape {
             cornerRadii: CGSize(width: radius, height: radius)
         )
         return Path(path.cgPath)
+    }
+}
+
+// MARK: - Chat QR Scanner Sheet (FIX #225)
+
+/// QR code scanner sheet for adding contacts
+struct ChatQRScannerSheet: View {
+    @EnvironmentObject private var themeManager: ThemeManager
+    @Environment(\.dismiss) private var dismiss
+
+    let onScan: (String?) -> Void
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                // Camera view
+                QRScannerView { scannedCode in
+                    onScan(scannedCode)
+                }
+                .edgesIgnoringSafeArea(.all)
+
+                // Overlay UI
+                VStack {
+                    // Top instruction
+                    VStack(spacing: 8) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 40))
+                            .foregroundColor(theme.accentColor)
+                        Text("Scan .onion QR Code")
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                        Text("Point camera at contact's QR code")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                    .padding(20)
+                    .background(Color.black.opacity(0.7))
+                    .cornerRadius(16)
+                    .padding(.top, 60)
+
+                    Spacer()
+
+                    // Viewfinder frame
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(theme.accentColor, lineWidth: 3)
+                        .frame(width: 260, height: 260)
+                        .shadow(color: theme.accentColor.opacity(0.5), radius: 10)
+
+                    Spacer()
+
+                    // Bottom hint
+                    Text("\"Privacy is the power to selectively reveal oneself.\"")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.5))
+                        .italic()
+                        .padding(.bottom, 40)
+                }
+            }
+            .background(Color.black)
+            .navigationTitle("Scan QR Code")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        onScan(nil)
+                    }
+                    .foregroundColor(theme.accentColor)
+                }
+            }
+        }
     }
 }
 #else

@@ -50,13 +50,13 @@ class DeltaCMUManager {
     // MARK: - Properties
 
     private var deltaFileURL: URL {
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsPath.appendingPathComponent(deltaFileName)
+        // Use centralized app data directory (Application Support on macOS, Documents on iOS)
+        return AppDirectories.appData.appendingPathComponent(deltaFileName)
     }
 
     private var manifestFileURL: URL {
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsPath.appendingPathComponent(manifestFileName)
+        // Use centralized app data directory (Application Support on macOS, Documents on iOS)
+        return AppDirectories.appData.appendingPathComponent(manifestFileName)
     }
 
     // Thread safety
