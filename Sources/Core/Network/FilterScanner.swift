@@ -845,56 +845,88 @@ final class FilterScanner {
                 }
             }
 
-            // FIX #190 v5: PRE-FETCH ALL BLOCKS WITH OPTIMIZED BATCH SIZE
-            // - Uses 500 blocks per batch (balance between progress updates and speed)
-            // - Fewer batches = less P2P overhead = faster sync
+            // FIX #190 v6: PARALLEL BATCH FETCHING FOR 3-4x SPEEDUP
+            // - Uses 500 blocks per batch
+            // - Fetches 4 batches IN PARALLEL using TaskGroup
             // - Progress during FETCH phase: "📥 Fetching blocks X/Y"
             // - Progress during PROCESSING phase: "🔧 Processing blocks X/Y"
             let totalBlocksToFetch = Int(targetHeight - currentHeight + 1)
-            let prefetchBatchSize = 500  // 500 blocks per batch for speed (6721/500 = 14 batches vs 42)
+            let prefetchBatchSize = 500  // 500 blocks per batch
+            let parallelBatches = 4      // Fetch 4 batches simultaneously (2000 blocks at once)
 
-            print("🚀 FIX #190 v5: Pre-fetching \(totalBlocksToFetch) blocks (batch size: \(prefetchBatchSize))...")
+            print("🚀 FIX #190 v6: Pre-fetching \(totalBlocksToFetch) blocks (\(parallelBatches)x parallel, batch=\(prefetchBatchSize))...")
             onStatusUpdate?("prefetch", "📥 Fetching 0/\(totalBlocksToFetch) blocks...")
             let prefetchStartTime = Date()
 
-            // Fetch blocks in batches with progress reporting
+            // Fetch blocks using PARALLEL batches for 3-4x speedup
             var prefetchedBlocks: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
             var fetchedCount = 0
             var prefetchHeight = currentHeight
 
             while prefetchHeight <= targetHeight && isScanning {
-                let batchEnd = min(prefetchHeight + UInt64(prefetchBatchSize) - 1, targetHeight)
-                let batchHeights = Array(prefetchHeight...batchEnd).map { UInt64($0) }
+                // Create up to `parallelBatches` concurrent fetch tasks
+                var batchTasks: [(start: UInt64, end: UInt64, heights: [UInt64])] = []
+                var taskStart = prefetchHeight
+
+                for _ in 0..<parallelBatches {
+                    guard taskStart <= targetHeight else { break }
+                    let taskEnd = min(taskStart + UInt64(prefetchBatchSize) - 1, targetHeight)
+                    let heights = Array(taskStart...taskEnd).map { UInt64($0) }
+                    batchTasks.append((start: taskStart, end: taskEnd, heights: heights))
+                    taskStart = taskEnd + 1
+                }
+
+                guard !batchTasks.isEmpty else { break }
 
                 // Report fetch progress (0-50% of PHASE 2)
                 let fetchProgress = Double(fetchedCount) / Double(totalBlocksToFetch)
                 let fetchPercent = Int(fetchProgress * 100)
-                print("📥 FIX #190: Fetching blocks \(fetchedCount)/\(totalBlocksToFetch) (\(fetchPercent)%)...")
+                let batchCount = batchTasks.count
+                print("📥 FIX #190 v6: Fetching \(fetchedCount)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches...")
                 onStatusUpdate?("prefetch", "📥 Fetching \(fetchedCount)/\(totalBlocksToFetch) blocks...")
                 reportPhase2Progress(fetchProgress * 0.5, height: prefetchHeight, maxHeight: targetHeight)
 
-                // Fetch this batch with 60s timeout per batch
-                do {
-                    let batchData = try await withTimeout(seconds: 60) {
-                        try await self.fetchBlocksData(heights: batchHeights)
+                // Fetch all batches IN PARALLEL using TaskGroup
+                let batchResults = await withTaskGroup(of: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
+                    for task in batchTasks {
+                        group.addTask {
+                            do {
+                                return try await withTimeout(seconds: 60) {
+                                    try await self.fetchBlocksData(heights: task.heights)
+                                }
+                            } catch {
+                                print("⚠️ FIX #190 v6: Batch \(task.start)-\(task.end) failed: \(error)")
+                                return nil
+                            }
+                        }
                     }
 
-                    // Add to cache
-                    for (height, txData) in batchData {
-                        prefetchedBlocks[height] = txData
+                    var allResults: [[(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]] = []
+                    for await result in group {
+                        if let data = result {
+                            allResults.append(data)
+                        }
                     }
-                    fetchedCount += batchData.count
-                } catch {
-                    print("⚠️ FIX #190: Batch fetch failed at height \(prefetchHeight): \(error)")
-                    // Continue with next batch - partial data is better than nothing
+                    return allResults
                 }
 
-                prefetchHeight = batchEnd + 1
+                // Merge results into cache
+                for batchData in batchResults {
+                    if let data = batchData {
+                        for (height, txData) in data {
+                            prefetchedBlocks[height] = txData
+                        }
+                        fetchedCount += data.count
+                    }
+                }
+
+                // Move to next set of parallel batches
+                prefetchHeight = batchTasks.last!.end + 1
             }
 
             let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
             let fetchRate = Double(prefetchedBlocks.count) / max(prefetchDuration, 0.001)
-            print("✅ FIX #190: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+            print("✅ FIX #190 v6: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
 
             // PROCESSING PHASE: Build commitment tree from pre-fetched blocks
             print("🔧 FIX #190: Processing \(prefetchedBlocks.count) blocks for commitment tree...")
@@ -944,7 +976,7 @@ final class FilterScanner {
                     scannedBlocks += 1
                     processedCount += 1
 
-                    // FIX #190 v5: Report PROCESSING progress every 500 blocks (matching fetch batch)
+                    // FIX #190 v6: Report PROCESSING progress every 500 blocks
                     // Progress is 50-100% of PHASE 2 (fetch was 0-50%)
                     if processedCount % prefetchBatchSize == 0 || processedCount == 1 {
                         let processProgress = Double(processedCount) / Double(totalBlocksToFetch)
