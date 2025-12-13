@@ -2636,8 +2636,7 @@ Both binaries must be installed to /usr/local/bin:
 
     // FIX #229: Load trusted peers count for display
     private func loadTrustedPeersCount() {
-        if let db = WalletManager.shared.walletDatabase,
-           let peers = try? db.getTrustedPeers() {
+        if let peers = try? WalletDatabase.shared.getTrustedPeers() {
             trustedPeersCount = peers.count
         }
     }

@@ -348,8 +348,7 @@ final class NetworkManager: ObservableObject {
     /// Get trusted peers from database for bootstrap (synchronous wrapper)
     private func getTrustedPeersForBootstrap() -> [String] {
         // Try to get trusted peers from database
-        if let db = WalletManager.shared.walletDatabase,
-           let peers = try? db.getTrustedPeers() {
+        if let peers = try? WalletDatabase.shared.getTrustedPeers() {
             return peers.map { "\($0.host):\($0.port)" }
         }
         // Fallback if database not available (shouldn't happen)

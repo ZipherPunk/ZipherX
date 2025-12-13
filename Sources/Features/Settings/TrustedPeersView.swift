@@ -79,22 +79,16 @@ struct TrustedPeersView: View {
         isLoading = true
         errorMessage = nil
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        Task {
             do {
-                if let db = WalletManager.shared.walletDatabase {
-                    let peers = try db.getTrustedPeers()
-                    DispatchQueue.main.async {
-                        self.trustedPeers = peers
-                        self.isLoading = false
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self.errorMessage = "Database not available"
-                        self.isLoading = false
-                    }
+                let db = WalletDatabase.shared
+                let peers = try db.getTrustedPeers()
+                await MainActor.run {
+                    self.trustedPeers = peers
+                    self.isLoading = false
                 }
             } catch {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     self.errorMessage = error.localizedDescription
                     self.isLoading = false
                 }
@@ -104,7 +98,7 @@ struct TrustedPeersView: View {
 
     private func deletePeer(_ peer: WalletDatabase.TrustedPeer) {
         do {
-            try WalletManager.shared.walletDatabase?.removeTrustedPeer(host: peer.host, port: peer.port)
+            try WalletDatabase.shared.removeTrustedPeer(host: peer.host, port: peer.port)
             loadTrustedPeers()
         } catch {
             errorMessage = error.localizedDescription
@@ -425,7 +419,7 @@ struct AddTrustedPeerSheet: View {
         }
 
         do {
-            try WalletManager.shared.walletDatabase?.addTrustedPeer(
+            try WalletDatabase.shared.addTrustedPeer(
                 host: trimmedHost,
                 port: peerPort,
                 isOnion: isOnion,
@@ -555,7 +549,7 @@ struct EditTrustedPeerSheet: View {
     private func savePeer() {
         // Currently only notes can be edited (host/port are immutable)
         do {
-            try WalletManager.shared.walletDatabase?.addTrustedPeer(
+            try WalletDatabase.shared.addTrustedPeer(
                 host: peer.host,
                 port: peer.port,
                 isOnion: peer.isOnion,
