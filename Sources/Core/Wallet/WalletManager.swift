@@ -13,6 +13,13 @@ enum SyncTaskStatus: Equatable {
     case failed(String)
 }
 
+/// FIX #231: Equihash verification result - distinguishes network errors from actual failures
+enum EquihashVerificationResult {
+    case verified(count: Int)                    // All headers passed Equihash verification
+    case networkError(reason: String)            // Could not fetch headers (not critical)
+    case failed(verified: Int, total: Int)       // Headers fetched but Equihash failed (CRITICAL)
+}
+
 /// Individual sync task
 struct SyncTask: Identifiable {
     let id: String
@@ -56,6 +63,29 @@ final class WalletManager: ObservableObject {
     // MARK: - FIX #162: Prevent history corruption during repair
     /// When true, Views should NOT call populateHistoryFromNotes() as it would undo repair
     @Published private(set) var isRepairingHistory: Bool = false
+
+    // MARK: - FIX #231: Reduced Verification Warning
+    /// Set when Equihash PoW couldn't be verified due to insufficient peers
+    /// User should be warned before accessing wallet
+    @Published var reducedVerificationAlert: ReducedVerificationInfo? = nil
+
+    struct ReducedVerificationInfo {
+        let peerCount: Int
+        let reason: String
+    }
+
+    func setReducedVerificationAlert(peerCount: Int, reason: String) {
+        Task { @MainActor in
+            self.reducedVerificationAlert = ReducedVerificationInfo(peerCount: peerCount, reason: reason)
+            print("⚠️ FIX #231: Reduced verification - \(peerCount) peers, reason: \(reason)")
+        }
+    }
+
+    func clearReducedVerificationAlert() {
+        Task { @MainActor in
+            self.reducedVerificationAlert = nil
+        }
+    }
 
     func setRepairingHistory(_ repairing: Bool) {
         Task { @MainActor in
@@ -4468,15 +4498,16 @@ final class WalletManager: ObservableObject {
     /// FIX #185: Verify Equihash for the latest N block headers
     /// This verifies that the current chain tip has valid proof-of-work
     /// - Parameter count: Number of recent headers to verify (default 100)
-    /// - Returns: True if all headers pass, false if any fail
-    func verifyLatestEquihash(count: Int = 100) async -> Bool {
+    /// - Returns: EquihashVerificationResult distinguishing network errors from actual failures
+    /// FIX #231: Returns enum instead of bool to allow health check to differentiate
+    func verifyLatestEquihash(count: Int = 100) async -> EquihashVerificationResult {
         print("🔬 FIX #185: Verifying Equihash for latest \(count) block headers...")
 
         // Get current chain height from peers
         let chainHeight = UInt64(NetworkManager.shared.chainHeight)
         guard chainHeight > 0 else {
             print("⚠️ FIX #185: Chain height is 0, cannot verify Equihash")
-            return false
+            return .networkError(reason: "Chain height unavailable")
         }
 
         // Calculate start height (ensure we don't go before Bubbles fork)
@@ -4491,12 +4522,14 @@ final class WalletManager: ObservableObject {
             let headers = try await NetworkManager.shared.getBlockHeaders(from: startHeight, count: actualCount)
             allHeaders.append(contentsOf: headers)
         } catch {
+            // FIX #231: Network failure is NOT critical - could be consensus issue, timeout, etc.
             print("⚠️ FIX #185: Failed to fetch headers from \(startHeight): \(error.localizedDescription)")
+            return .networkError(reason: error.localizedDescription)
         }
 
         guard !allHeaders.isEmpty else {
             print("❌ FIX #185: No headers fetched for Equihash verification")
-            return false
+            return .networkError(reason: "No headers received from peers")
         }
 
         // Verify Equihash for all fetched headers
@@ -4505,11 +4538,12 @@ final class WalletManager: ObservableObject {
 
         if success {
             print("✅ FIX #185: Latest headers Equihash verification PASSED (\(passed)/\(allHeaders.count) headers)")
+            return .verified(count: passed)
         } else {
+            // FIX #231: This IS critical - headers were received but Equihash failed!
             print("🚨 FIX #185: Latest headers Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
+            return .failed(verified: passed, total: allHeaders.count)
         }
-
-        return success
     }
 
     // MARK: - FIX #188: Unified Header Fetch with Single-Pass Caching

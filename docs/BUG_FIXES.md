@@ -8572,3 +8572,65 @@ New `TrustedPeersView.swift` allows users to:
 - 140.174.189.17:8033 - Primary confirmed ZCL node
 - 205.209.104.118:8033 - Primary confirmed ZCL node
 - 185.205.246.161:8033 - Secondary ZCL node
+
+---
+
+## FIX #231: False Critical Alert for P2P Consensus Failure (December 2025)
+
+**Problem**: Wallet health check shows "CRITICAL ISSUES DETECTED" when Equihash P2P verification cannot reach consensus, even though wallet is fully functional.
+
+**Symptoms**:
+```
+❌ Equihash PoW: Latest headers failed Equihash verification
+❌ CRITICAL ISSUES DETECTED - Wallet may not function correctly
+```
+
+**Root Cause**:
+- `verifyLatestEquihash()` returned `false` for TWO different cases:
+  1. Network error (couldn't fetch headers, consensus not reached) - NOT critical
+  2. Actual Equihash verification failure - CRITICAL
+- Health check treated both as `critical: true`, causing false alarms
+
+**Solution**:
+
+### 1. New `EquihashVerificationResult` Enum
+Distinguishes between network errors and actual security failures:
+```swift
+enum EquihashVerificationResult {
+    case verified(count: Int)                 // All headers passed Equihash
+    case networkError(reason: String)         // Could not fetch headers (NOT critical)
+    case failed(verified: Int, total: Int)    // Equihash FAILED (CRITICAL)
+}
+```
+
+### 2. Updated `verifyLatestEquihash()`
+- Returns `.networkError(reason:)` when consensus fails or headers can't be fetched
+- Returns `.verified(count:)` when all headers pass
+- Returns `.failed(verified:total:)` ONLY when headers are received but Equihash fails
+
+### 3. Updated Health Check
+- `.networkError` → marked as PASSED with note (network issues don't affect wallet)
+- `.failed` → marked as CRITICAL (actual security concern)
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Added enum, updated `verifyLatestEquihash()`
+- `Sources/Core/Wallet/WalletHealthCheck.swift` - Handle enum result, only flag actual failures as critical
+
+### 5. Cypherpunk-Style User Warning
+Added alert in ContentView with philosophical quote:
+```swift
+.alert("⚠️ Reduced Blockchain Verification", ...) {
+    Text("""
+        Only X peer(s) connected - insufficient for full consensus verification.
+        ...
+        "We cannot expect governments, corporations, or other large, faceless 
+        organizations to grant us privacy out of their beneficence."
+        — A Cypherpunk's Manifesto
+    """)
+}
+```
+
+User must acknowledge "I Accept the Risk" before continuing.
+
+**Additional Files Modified**:
+- `Sources/App/ContentView.swift` - Added `showReducedVerificationAlert` state and alert UI

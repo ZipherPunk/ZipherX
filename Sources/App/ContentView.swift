@@ -49,6 +49,9 @@ struct ContentView: View {
     @State private var showSybilAttackAlert = false
     @State private var showExternalWalletSpendAlert = false
 
+    // FIX #231: Reduced verification warning (insufficient peers for consensus)
+    @State private var showReducedVerificationAlert = false
+
     enum Tab {
         case balance, send, receive, chat, settings
     }
@@ -1633,6 +1636,35 @@ struct ContentView: View {
         .onChange(of: networkManager.externalWalletSpendDetected != nil) { hasSpend in
             if hasSpend {
                 showExternalWalletSpendAlert = true
+            }
+        }
+        // FIX #231: Reduced verification warning (cypherpunk-style)
+        .alert("⚠️ Reduced Blockchain Verification", isPresented: $showReducedVerificationAlert) {
+            Button("I Accept the Risk", role: .cancel) {
+                walletManager.clearReducedVerificationAlert()
+            }
+        } message: {
+            if let info = walletManager.reducedVerificationAlert {
+                Text("""
+                    Only \(info.peerCount) peer(s) connected - insufficient for full consensus verification.
+
+                    Reason: \(info.reason)
+
+                    Your wallet will operate with reduced proof-of-work verification. This is acceptable for most use cases, but provides less protection against sophisticated chain-level attacks.
+
+                    For maximum security, wait for more peers to connect or add trusted peers in Settings.
+
+                    "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy out of their beneficence."
+                    — A Cypherpunk's Manifesto
+                    """)
+            } else {
+                Text("Insufficient peers for full blockchain verification.")
+            }
+        }
+        // FIX #231: Watch for reduced verification alerts
+        .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
+            if hasAlert {
+                showReducedVerificationAlert = true
             }
         }
     }

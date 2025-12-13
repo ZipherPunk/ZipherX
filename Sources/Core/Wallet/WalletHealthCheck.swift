@@ -329,12 +329,30 @@ final class WalletHealthCheck {
 
         // Fallback: If no local solutions and wallet is synced, try P2P fetch
         print("⚠️ FIX #188: No local solutions, falling back to P2P verification...")
-        let p2pSuccess = await WalletManager.shared.verifyLatestEquihash(count: 100)
+        let p2pResult = await WalletManager.shared.verifyLatestEquihash(count: 100)
 
-        if p2pSuccess {
-            return .passed("Equihash PoW", details: "100 headers verified via P2P")
-        } else {
-            return .failed("Equihash PoW", details: "Latest headers failed Equihash verification", critical: true)
+        // FIX #231: Handle different result types appropriately
+        switch p2pResult {
+        case .verified(let count):
+            // Clear any previous reduced verification alert
+            WalletManager.shared.clearReducedVerificationAlert()
+            return .passed("Equihash PoW", details: "\(count) headers verified via P2P")
+
+        case .networkError(let reason):
+            // FIX #231: Network issues are NOT critical - wallet is still functional
+            // BUT user should be warned about reduced verification
+            let peerCount = NetworkManager.shared.connectedPeers.count
+            print("⚠️ FIX #231: Equihash P2P verification skipped - \(reason) (\(peerCount) peers)")
+
+            // Set alert to warn user about reduced verification
+            WalletManager.shared.setReducedVerificationAlert(peerCount: peerCount, reason: reason)
+
+            return .passed("Equihash PoW", details: "Reduced verification (\(peerCount) peers - see warning)")
+
+        case .failed(let verified, let total):
+            // FIX #231: This IS critical - headers received but Equihash failed!
+            // This indicates potential attack or chain fork
+            return .failed("Equihash PoW", details: "CRITICAL: Only \(verified)/\(total) headers passed Equihash", critical: true)
         }
     }
 

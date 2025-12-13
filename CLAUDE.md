@@ -80,11 +80,12 @@ ZipherX is a secure, decentralized cryptocurrency wallet for iOS/macOS based on 
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
+- FIX #231: False critical alert when P2P consensus fails (cypherpunk warning instead)
+- FIX #230: Rust FFI safety improvements (safe_slice, safe_lock! macro)
+- FIX #229: Database-backed trusted peers + UI management + Zcash peer detection
 - FIX #220: False "external wallet spend" warning for own transactions (check transaction_history)
 - FIX #219: Payment request PAID status badge + RECEIVED celebration in chat
 - FIX #218: Cypherpunk-styled VUL-002 warning with copyable TXID
-- FIX #217: Quick scan now finds INCOMING notes (trial decryption), not just spent nullifiers
-- FIX #213: Absolute chain height sanity check (reject > 10M)
 - FIX #162 v3: Balance Reconciliation AUTO-REPAIR at startup
   - Created `getAllNotes()` function that returns ALL notes (spent + unspent)
   - Previous `getAllUnspentNotes()` was misleading - had `WHERE is_spent = 0`
