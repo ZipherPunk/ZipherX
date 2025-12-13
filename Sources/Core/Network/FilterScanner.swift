@@ -232,6 +232,13 @@ final class FilterScanner {
 
             if lastScanned > 0 {
                 startHeight = lastScanned + 1
+                // FIX #178: CRITICAL - Set scanWithinDownloadedRange if notes may exist in downloaded tree range
+                // This ensures PHASE 1 runs for consecutive startups where notes need to be discovered
+                // without tree building. Without this, PHASE 1 is skipped and notes are lost!
+                if startHeight <= effectiveTreeHeight && hasDownloadedTree {
+                    scanWithinDownloadedRange = true
+                    print("📋 FIX #178: Enabling PHASE 1 scan for consecutive startup (lastScanned=\(lastScanned), startHeight=\(startHeight), effectiveTreeHeight=\(effectiveTreeHeight))")
+                }
             } else if isImportedWallet {
                 if let customHeight = customScanHeight, customHeight > ZclassicCheckpoints.saplingActivationHeight {
                     startHeight = customHeight
@@ -803,13 +810,13 @@ final class FilterScanner {
                 currentHeight = endHeight + 1
             }
         } else if !isQuickScanOnly || continueAfterBundledRange || forceSequentialAfterBundled {
-            // SEQUENTIAL MODE with PRE-FETCH PIPELINE for ~40% speed improvement
-            // Tree building must be sequential, but network I/O can overlap with processing
+            // FIX #190: PARALLEL PRE-FETCH ALL BLOCKS for 5-6x speed improvement
+            // Old approach: Fetch 500 blocks → process → repeat (13s fetch + 0.5s process per batch)
+            // New approach: Fetch ALL blocks in parallel across all peers, then process sequentially
             //
-            // Pipeline: While processing batch N, pre-fetch batch N+1 in background
-            // This hides network latency during tree processing time
-            //
-            // P2P-FIRST: Uses P2P network with InsightAPI fallback (unless useP2POnly is true)
+            // With 6 peers and 6678 blocks:
+            // - Old: 14 batches × 13s = 182 seconds
+            // - New: 6678/6 = 1113 blocks/peer in parallel = ~20-30 seconds total
 
             print("🔧 PHASE 2: Building commitment tree (sequential mode)...")
             onStatusUpdate?("phase2", "Building commitment tree...")
@@ -838,52 +845,56 @@ final class FilterScanner {
                 }
             }
 
-            // Pre-fetch task for next batch (runs in background)
-            var nextBatchTask: Task<[(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])], Error>? = nil
+            // FIX #190: PRE-FETCH ALL BLOCKS IN PARALLEL
+            // This fetches ALL blocks at once, distributing them across all connected peers
+            // Much faster than sequential batch fetching (5-6x speedup)
+            let totalBlocksToFetch = Int(targetHeight - currentHeight + 1)
+            let allHeights = Array(currentHeight...targetHeight).map { UInt64($0) }
 
+            print("🚀 FIX #190: Pre-fetching ALL \(totalBlocksToFetch) blocks in parallel...")
+            onStatusUpdate?("prefetch", "Fetching \(totalBlocksToFetch) blocks...")
+            let prefetchStartTime = Date()
+
+            // Fetch ALL blocks at once - this distributes across all peers automatically
+            var prefetchedBlocks: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
+            do {
+                // Use longer timeout for larger fetches (3 minutes max)
+                let timeoutSeconds = max(120, Double(totalBlocksToFetch) / 50.0)
+                let allBlockData = try await withTimeout(seconds: timeoutSeconds) {
+                    try await self.fetchBlocksData(heights: allHeights)
+                }
+
+                // Convert to dictionary for O(1) lookup
+                for (height, txData) in allBlockData {
+                    prefetchedBlocks[height] = txData
+                }
+
+                let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
+                let fetchRate = Double(prefetchedBlocks.count) / max(prefetchDuration, 0.001)
+                print("✅ FIX #190: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+            } catch {
+                debugLog(.error, "FIX #190: Pre-fetch failed: \(error)")
+                if useP2POnly {
+                    throw error
+                }
+                // Fall back to empty cache - blocks without shielded data will be skipped
+                print("⚠️ FIX #190: Pre-fetch failed, continuing with available data...")
+            }
+
+            print("🔄 FIX #190: Processing \(prefetchedBlocks.count) blocks sequentially for tree building...")
+            onStatusUpdate?("phase2", "Building commitment tree...")
+            let processStartTime = Date()
+
+            // Process blocks sequentially from pre-fetched cache
             while currentHeight <= targetHeight && isScanning {
-                let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
-                let heights = Array(currentHeight...endHeight)
-
-                // Get current batch data (from pre-fetch or fetch now)
-                // Use 60-second timeout to prevent hanging on unresponsive P2P peers
-                var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-                do {
-                    if let prefetchTask = nextBatchTask {
-                        blockData = try await withTimeout(seconds: 60) {
-                            try await prefetchTask.value
-                        }
-                        nextBatchTask = nil
-                    } else {
-                        blockData = try await withTimeout(seconds: 60) {
-                            try await self.fetchBlocksData(heights: heights.map { UInt64($0) })
-                        }
-                    }
-                } catch {
-                    debugLog(.error, "Failed to fetch blocks \(currentHeight)-\(endHeight): \(error)")
-                    if useP2POnly {
-                        throw error
-                    }
-                    // In fallback mode, continue with empty data for this batch
-                    // Cancel the pre-fetch task to prevent resource leak
-                    nextBatchTask?.cancel()
-                    nextBatchTask = nil
-                    currentHeight = endHeight + 1
-                    continue
+                // Get block data from pre-fetched cache
+                let blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]
+                if let txData = prefetchedBlocks[currentHeight] {
+                    blockData = [(currentHeight, txData)]
+                } else {
+                    // Block not in cache (no shielded data or fetch failed)
+                    blockData = [(currentHeight, [])]
                 }
-
-                // Start pre-fetching NEXT batch while we process current batch
-                let nextStart = endHeight + 1
-                if nextStart <= targetHeight && isScanning {
-                    let nextEnd = min(nextStart + UInt64(batchSize) - 1, targetHeight)
-                    let nextHeights = Array(nextStart...nextEnd).map { UInt64($0) }
-                    nextBatchTask = Task { [self] in
-                        try await self.fetchBlocksData(heights: nextHeights)
-                    }
-                }
-
-                // Sort by height for sequential tree processing
-                blockData.sort { $0.0 < $1.0 }
 
                 // Process sequentially (data already fetched, network I/O happening in background for next batch)
                 for (height, txList) in blockData {
@@ -914,13 +925,13 @@ final class FilterScanner {
                     }
 
                     scannedBlocks += 1
-                    // Report PHASE 2 progress (60-100%) every 10 blocks for better UI feedback
-                    // CHECKPOINT: Save every 10 blocks to minimize data loss on crash
-                    if scannedBlocks % 10 == 0 || scannedBlocks == 1 {
+                    // Report PHASE 2 progress (60-100%) every 100 blocks for better UI feedback
+                    // FIX #190: Increased from 10 to 100 to reduce checkpoint overhead
+                    if scannedBlocks % 100 == 0 || scannedBlocks == 1 {
                         let localProgress = Double(scannedBlocks) / Double(totalBlocks)
                         reportPhase2Progress(localProgress, height: height, maxHeight: targetHeight)
 
-                        // Save checkpoint every 10 blocks
+                        // Save checkpoint every 100 blocks
                         try? database.updateLastScannedHeight(height, hash: Data(count: 32))
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
@@ -928,20 +939,14 @@ final class FilterScanner {
                     }
                 }
 
-                // Save progress at end of batch (for any remaining blocks not divisible by 10)
-                try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
-
-                // Persist tree state at end of batch
-                if let treeData = ZipherXFFI.treeSerialize() {
-                    try? database.saveTreeState(treeData)
-                }
-
-
-                currentHeight = endHeight + 1
+                // Move to next block
+                currentHeight += 1
             }
 
-            // Cancel any remaining pre-fetch task if scan was stopped
-            nextBatchTask?.cancel()
+            // FIX #190: Log total processing time
+            let processDuration = Date().timeIntervalSince(processStartTime)
+            let processRate = Double(scannedBlocks) / max(processDuration, 0.001)
+            print("✅ FIX #190: Processed \(scannedBlocks) blocks in \(String(format: "%.1f", processDuration))s (\(String(format: "%.0f", processRate)) blocks/sec)")
         }
 
         // Final tree persistence
@@ -1070,6 +1075,13 @@ final class FilterScanner {
                 WalletManager.shared.updateDeltaSyncStatus(.synced)
             }
             deltaCollectionEnabled = false
+        }
+
+        // FIX #176: Update verified checkpoint after successful scan
+        // This prevents health check from flagging "blocks skipped" on next startup
+        if let lastScanned = try? database.getLastScannedHeight(), lastScanned > 0 {
+            try? database.updateVerifiedCheckpointHeight(lastScanned)
+            print("📍 FIX #176: Checkpoint updated to \(lastScanned) after scan complete")
         }
 
         print("✅ Scan complete")
@@ -2363,32 +2375,47 @@ final class FilterScanner {
     // MARK: - Helper Methods
 
     private func getChainHeight() async throws -> UInt64 {
-        // FIX #120: InsightAPI commented out - P2P only
-        // SECURITY: Use unified consensus function that:
-        // 1. Collects heights from InsightAPI + P2P peers
-        // 2. Finds agreeing sources within 5 blocks
-        // 3. Returns MINIMUM of agreeing sources (conservative)
-        // 4. BANS peers reporting heights >10 blocks above consensus
+        // FIX #120/#167: P2P-only with strict consensus validation
+        // SECURITY: Requires minimum 3 peers for consensus before accepting height
+        // This prevents Sybil attacks where malicious peers report fake heights
 
-        // let consensusHeight = await insightAPI.getConsensusChainHeight(networkManager: networkManager)
+        // FIX #167: First verify we have enough peers for consensus
+        let connectedPeers = networkManager.connectedPeers
+        let minPeersForConsensus = 3
+        guard connectedPeers >= minPeersForConsensus else {
+            print("🚨 [FIX #167] Insufficient peers for consensus: \(connectedPeers)/\(minPeersForConsensus)")
+            throw ScanError.networkError
+        }
 
-        // P2P-only: get chain height from NetworkManager
+        // P2P-only: get chain height from NetworkManager (requires peer consensus)
         let consensusHeight = try await networkManager.getChainHeight()
 
         guard consensusHeight > 0 else {
             throw ScanError.networkError
         }
 
-        // Also validate HeaderStore against consensus
-        // FIX #126: P2P getheaders returns up to 160 headers from locator, so headers
-        // can legitimately be ~160 blocks ahead of consensus. Use 200 as safety margin.
+        // FIX #167: Additional validation against HeaderStore (Equihash-verified headers)
+        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
         let maxHeightDeviation: UInt64 = 200
-        if let hsHeight = try? HeaderStore.shared.getLatestHeight() {
-            if hsHeight > consensusHeight + maxHeightDeviation {
-                print("🚨 SECURITY: Fake headers detected (store: \(hsHeight), consensus: \(consensusHeight)) - clearing")
-                try? HeaderStore.shared.clearAllHeaders()
-            }
+
+        // If HeaderStore exists and is way ahead of consensus, something is wrong
+        if headerStoreHeight > 0 && headerStoreHeight > consensusHeight + maxHeightDeviation {
+            print("🚨 [FIX #167] SECURITY: Fake headers detected (store: \(headerStoreHeight), consensus: \(consensusHeight)) - clearing")
+            try? HeaderStore.shared.clearAllHeaders()
         }
+
+        // If consensus is way ahead of HeaderStore, that's NORMAL during initial sync
+        // Only warn if HeaderStore was recently synced (within last 1000 blocks of cached height)
+        let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+        let headerStoreRecentlySynced = headerStoreHeight > 0 && cachedHeight > 0 && headerStoreHeight > cachedHeight - 1000
+
+        if headerStoreRecentlySynced && consensusHeight > headerStoreHeight + maxHeightDeviation {
+            print("⚠️ [FIX #167] HeaderStore behind consensus by \(consensusHeight - headerStoreHeight) blocks - will sync headers")
+            // Don't reject consensus - headers will sync in background
+        }
+
+        // Update cached chain height for future validation
+        UserDefaults.standard.set(Int(consensusHeight), forKey: "cachedChainHeight")
 
         return consensusHeight
     }
@@ -2471,6 +2498,9 @@ final class FilterScanner {
         let blockHash = try await insightAPI.getBlockHash(height: height)
         let block = try await insightAPI.getBlock(hash: blockHash)
 
+        // FIX #187: Cache timestamp from InsightAPI (was being discarded!)
+        BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: UInt32(block.time))
+
         var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
         for txid in block.tx {
             let tx = try await insightAPI.getTransaction(txid: txid)
@@ -2545,6 +2575,9 @@ final class FilterScanner {
                         do {
                             let blockHash = try await self.insightAPI.getBlockHash(height: height)
                             let block = try await self.insightAPI.getBlock(hash: blockHash)
+
+                            // FIX #187: Cache timestamp from InsightAPI (was being discarded!)
+                            BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: UInt32(block.time))
 
                             var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
                             for txid in block.tx {

@@ -210,6 +210,11 @@ final class ChatManager: ObservableObject {
             throw ChatError.invalidMessage("Invalid .onion address format")
         }
 
+        // FIX #192: Prevent adding own address as contact
+        if onionAddress == ourOnionAddress {
+            throw ChatError.invalidMessage("Cannot add yourself as a contact")
+        }
+
         // Check if already exists
         guard !contacts.contains(where: { $0.onionAddress == onionAddress }) else {
             throw ChatError.invalidMessage("Contact already exists")
@@ -714,12 +719,15 @@ final class ChatManager: ObservableObject {
 
         connection.send(content: response, completion: .contentProcessed { _ in })
 
-        // Auto-add as contact if not exists
-        if !contacts.contains(where: { $0.onionAddress == onionAddress }) {
+        // FIX #192: Auto-add as contact if not exists AND not our own address
+        // Without this check, our own .onion address would appear in contacts list!
+        if !contacts.contains(where: { $0.onionAddress == onionAddress }) &&
+           onionAddress != ourOnionAddress {
             let contact = ChatContact(onionAddress: onionAddress, nickname: "")
             contacts.append(contact)
             conversations[onionAddress] = ChatConversation(contact: contact)
             database.saveContact(contact)
+            print("💬 Auto-added contact: \(onionAddress.prefix(16))...")
         }
 
         updateContactOnlineStatus(onionAddress, isOnline: true)

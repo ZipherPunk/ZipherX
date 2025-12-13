@@ -727,6 +727,10 @@ struct ContentView: View {
                         }
                         print("DEBUGZIPHERX: 📡 Task: Got \(networkManager.connectedPeers) peers after \(waitCount/10)s")
 
+                        // FIX #185: Equihash verification happens in health check (verifyLatestEquihash)
+                        // Boost file verification removed - was too slow (10 separate P2P requests)
+                        // Health check verifies latest 100 headers which proves chain validity
+
                         // Brief pause for UI feedback
                         print("DEBUGZIPHERX: 📡 Task: Waiting 0.5s...")
                         try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
@@ -901,6 +905,25 @@ struct ContentView: View {
                             walletManager.setConnecting(true, status: "Syncing block timestamps...")
                         }
                         await walletManager.ensureHeaderTimestamps()
+
+                        // FIX #191: Wait for P2P connectivity BEFORE health checks
+                        // Tor restoration after header sync is async - health checks need network
+                        // Without this, Equihash verification fails ("No peers connected")
+                        await MainActor.run {
+                            walletManager.setConnecting(true, status: "Connecting to P2P network...")
+                        }
+                        print("✅ FIX #191: Waiting for P2P connectivity before health checks...")
+                        var p2pWaitCount = 0
+                        let p2pMaxWait = 50 // 5 seconds max
+                        while networkManager.connectedPeers < 3 && p2pWaitCount < p2pMaxWait {
+                            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                            p2pWaitCount += 1
+                        }
+                        if networkManager.connectedPeers >= 3 {
+                            print("✅ FIX #191: P2P connected (\(networkManager.connectedPeers) peers) - proceeding with health checks")
+                        } else {
+                            print("⚠️ FIX #191: Only \(networkManager.connectedPeers) peers after 5s - running health checks anyway")
+                        }
 
                         // FIX #120/#147: Comprehensive health check at every app restart
                         // Verifies: Bundle files, Database, CMUs, Timestamps, Balance, Hashes, P2P, Equihash, Witnesses, Notes
