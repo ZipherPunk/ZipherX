@@ -27,29 +27,58 @@ export IPHONEOS_DEPLOYMENT_TARGET=14.0
 echo "📱 Deployment targets: macOS $MACOSX_DEPLOYMENT_TARGET, iOS $IPHONEOS_DEPLOYMENT_TARGET"
 echo ""
 
-# Build all targets
+# FIX #203: Build all targets IN PARALLEL (4x faster!)
 echo "═══════════════════════════════════════════════════════════════"
-echo "🔨 Building for macOS (arm64)..."
+echo "🚀 Building ALL targets in PARALLEL..."
 echo "═══════════════════════════════════════════════════════════════"
-cargo build --release
+
+# Start all builds in background
+echo "🔨 [1/4] macOS (arm64)..."
+cargo build --release > /tmp/build_macos_arm64.log 2>&1 &
+PID1=$!
+
+echo "🔨 [2/4] macOS (x86_64)..."
+cargo build --release --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
+PID2=$!
+
+echo "🔨 [3/4] iOS Device (arm64)..."
+cargo build --release --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
+PID3=$!
+
+echo "🔨 [4/4] iOS Simulator (arm64)..."
+cargo build --release --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
+PID4=$!
 
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "🔨 Building for macOS (x86_64)..."
-echo "═══════════════════════════════════════════════════════════════"
-cargo build --release --target x86_64-apple-darwin
+echo "⏳ Waiting for all builds to complete (running in parallel)..."
+
+# Wait for each and check exit status
+FAILED=0
+
+wait $PID1
+if [ $? -eq 0 ]; then echo "✅ macOS (arm64) done"; else echo "❌ macOS (arm64) FAILED"; FAILED=1; fi
+
+wait $PID2
+if [ $? -eq 0 ]; then echo "✅ macOS (x86_64) done"; else echo "❌ macOS (x86_64) FAILED"; FAILED=1; fi
+
+wait $PID3
+if [ $? -eq 0 ]; then echo "✅ iOS Device done"; else echo "❌ iOS Device FAILED"; FAILED=1; fi
+
+wait $PID4
+if [ $? -eq 0 ]; then echo "✅ iOS Simulator done"; else echo "❌ iOS Simulator FAILED"; FAILED=1; fi
+
+if [ $FAILED -eq 1 ]; then
+    echo ""
+    echo "❌ BUILD FAILED! Check logs:"
+    echo "   /tmp/build_macos_arm64.log"
+    echo "   /tmp/build_macos_x86.log"
+    echo "   /tmp/build_ios.log"
+    echo "   /tmp/build_sim.log"
+    exit 1
+fi
 
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "🔨 Building for iOS Device (arm64)..."
-echo "═══════════════════════════════════════════════════════════════"
-cargo build --release --target aarch64-apple-ios
-
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "🔨 Building for iOS Simulator (arm64)..."
-echo "═══════════════════════════════════════════════════════════════"
-cargo build --release --target aarch64-apple-ios-sim
+echo "✅ All 4 targets built successfully!"
 
 # Create universal macOS library
 echo ""
