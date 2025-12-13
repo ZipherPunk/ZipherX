@@ -27,7 +27,7 @@ final class WalletDatabase {
 
     // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
     // WARNING: Only set to true for debugging purposes! Set back to false before release!
-    // Re-enabled encryption after debugging session (FIX #226)
+    // FIX #226: Re-enabled field-level encryption - AES-GCM-256 active for sensitive fields
     private static let DEBUG_DISABLE_ENCRYPTION = false
 
     /// Encrypt sensitive data before storing in database

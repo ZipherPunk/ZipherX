@@ -25,8 +25,8 @@ final class SQLCipherManager {
     static let shared = SQLCipherManager()
 
     // DEBUG: Set to true to disable SQLCipher encryption for debugging
-    // TODO: Re-enable (set to false) after all tests pass: send/receive/history
-    private static let DEBUG_DISABLE_SQLCIPHER = true
+    // FIX #226: Re-enabled SQLCipher - full database encryption active
+    private static let DEBUG_DISABLE_SQLCIPHER = false
 
     /// Whether SQLCipher is available (compiled with encryption support)
     private(set) var isSQLCipherAvailable: Bool = false
