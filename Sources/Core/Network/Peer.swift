@@ -118,11 +118,16 @@ final class Peer {
     /// VUL-011: Rate limiter to prevent excessive requests
     private let rateLimiter = PeerRateLimiter(maxTokens: 100, refillRate: 10)
 
-    // Protocol version
+    // Protocol version constants (matching Zclassic/zcashd)
     // 170012 = BIP155 (addrv2) support for Tor v3 addresses
     // 170011 = Sapling support (backward compatible)
+    // 170002 = Minimum supported version (Overwinter+)
     // WARNING: Sybil attackers send fake reject messages claiming 170020 - IGNORE THEM!
     private let protocolVersion: Int32 = 170012
+
+    /// FIX #182: Minimum peer protocol version (matching Zclassic MIN_PEER_PROTO_VERSION)
+    /// Peers below this version are rejected - they don't support required features
+    private static let minPeerProtocolVersion: Int32 = 170002
     private let services: UInt64 = 1 // NODE_NETWORK
     private let userAgent = "/ZipherX:1.0.0/"
 
@@ -1191,12 +1196,17 @@ final class Peer {
 
                 if command == "version" {
                     parseVersionPayload(payload)
-                    // Validate version - Zclassic peers should be at least version 70002
-                    if peerVersion >= 70002 {
+                    // FIX #182: Validate version - Zclassic peers must be at least 170002 (Overwinter+)
+                    // Previous bug: accepted 70002 which is 2400x too lenient!
+                    if peerVersion >= Peer.minPeerProtocolVersion {
                         receivedVersion = true
                         print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
+                    } else if peerVersion > 0 {
+                        // Peer is running outdated software - reject with clear message
+                        print("❌ [\(host)] Peer version \(peerVersion) is too old (minimum: \(Peer.minPeerProtocolVersion))")
+                        throw NetworkError.handshakeFailed
                     } else {
-                        // Version 0 or very old version - likely parsing issue
+                        // Version 0 - likely parsing issue
                         print("⚠️ [\(host)] Invalid peer version \(peerVersion) (payload: \(payload.count) bytes)")
                         // Continue waiting for valid version
                     }
