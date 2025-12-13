@@ -128,8 +128,9 @@ final class FilterScanner {
     private func reportPhase2Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
         let overall = mapProgress(localProgress, in: phase2ProgressRange)
         onProgress?(overall, height, maxHeight)
-        // FIX #128: Always show progress percentage during tree building
-        let percent = Int(localProgress * 100)
+        // FIX #202: Show OVERALL progress (same as progress bar), not local phase progress
+        // Previous bug: Status showed localProgress (29%) but bar showed overall (90%)
+        let percent = Int(overall * 100)
         let blocksRemaining = maxHeight > height ? maxHeight - height : 0
         onStatusUpdate?("phase2", "Building commitment tree (\(percent)%, \(blocksRemaining) blocks left)...")
     }
