@@ -845,45 +845,61 @@ final class FilterScanner {
                 }
             }
 
-            // FIX #190: PRE-FETCH ALL BLOCKS IN PARALLEL
-            // This fetches ALL blocks at once, distributing them across all connected peers
-            // Much faster than sequential batch fetching (5-6x speedup)
+            // FIX #190 v4: PRE-FETCH ALL BLOCKS WITH FINE-GRAINED PROGRESS
+            // - Uses 160 blocks per batch (matching P2P getdata limit) for frequent progress
+            // - Progress during FETCH phase: "📥 Fetching blocks X/Y"
+            // - Progress during PROCESSING phase: "🔧 Processing blocks X/Y"
             let totalBlocksToFetch = Int(targetHeight - currentHeight + 1)
-            let allHeights = Array(currentHeight...targetHeight).map { UInt64($0) }
+            let prefetchBatchSize = 160  // Match P2P getdata limit for frequent progress updates
 
-            print("🚀 FIX #190: Pre-fetching ALL \(totalBlocksToFetch) blocks in parallel...")
-            onStatusUpdate?("prefetch", "Fetching \(totalBlocksToFetch) blocks...")
+            print("🚀 FIX #190 v4: Pre-fetching \(totalBlocksToFetch) blocks (batch size: \(prefetchBatchSize))...")
+            onStatusUpdate?("prefetch", "📥 Fetching 0/\(totalBlocksToFetch) blocks...")
             let prefetchStartTime = Date()
 
-            // Fetch ALL blocks at once - this distributes across all peers automatically
+            // Fetch blocks in batches with progress reporting
             var prefetchedBlocks: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
-            do {
-                // Use longer timeout for larger fetches (3 minutes max)
-                let timeoutSeconds = max(120, Double(totalBlocksToFetch) / 50.0)
-                let allBlockData = try await withTimeout(seconds: timeoutSeconds) {
-                    try await self.fetchBlocksData(heights: allHeights)
+            var fetchedCount = 0
+            var prefetchHeight = currentHeight
+
+            while prefetchHeight <= targetHeight && isScanning {
+                let batchEnd = min(prefetchHeight + UInt64(prefetchBatchSize) - 1, targetHeight)
+                let batchHeights = Array(prefetchHeight...batchEnd).map { UInt64($0) }
+
+                // Report fetch progress (0-50% of PHASE 2)
+                let fetchProgress = Double(fetchedCount) / Double(totalBlocksToFetch)
+                let fetchPercent = Int(fetchProgress * 100)
+                print("📥 FIX #190: Fetching blocks \(fetchedCount)/\(totalBlocksToFetch) (\(fetchPercent)%)...")
+                onStatusUpdate?("prefetch", "📥 Fetching \(fetchedCount)/\(totalBlocksToFetch) blocks...")
+                reportPhase2Progress(fetchProgress * 0.5, height: prefetchHeight, maxHeight: targetHeight)
+
+                // Fetch this batch with 60s timeout per batch
+                do {
+                    let batchData = try await withTimeout(seconds: 60) {
+                        try await self.fetchBlocksData(heights: batchHeights)
+                    }
+
+                    // Add to cache
+                    for (height, txData) in batchData {
+                        prefetchedBlocks[height] = txData
+                    }
+                    fetchedCount += batchData.count
+                } catch {
+                    print("⚠️ FIX #190: Batch fetch failed at height \(prefetchHeight): \(error)")
+                    // Continue with next batch - partial data is better than nothing
                 }
 
-                // Convert to dictionary for O(1) lookup
-                for (height, txData) in allBlockData {
-                    prefetchedBlocks[height] = txData
-                }
-
-                let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
-                let fetchRate = Double(prefetchedBlocks.count) / max(prefetchDuration, 0.001)
-                print("✅ FIX #190: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
-            } catch {
-                debugLog(.error, "FIX #190: Pre-fetch failed: \(error)")
-                if useP2POnly {
-                    throw error
-                }
-                // Fall back to empty cache - blocks without shielded data will be skipped
-                print("⚠️ FIX #190: Pre-fetch failed, continuing with available data...")
+                prefetchHeight = batchEnd + 1
             }
 
-            print("🔄 FIX #190: Processing \(prefetchedBlocks.count) blocks sequentially for tree building...")
-            onStatusUpdate?("phase2", "Building commitment tree...")
+            let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
+            let fetchRate = Double(prefetchedBlocks.count) / max(prefetchDuration, 0.001)
+            print("✅ FIX #190: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+
+            // PROCESSING PHASE: Build commitment tree from pre-fetched blocks
+            print("🔧 FIX #190: Processing \(prefetchedBlocks.count) blocks for commitment tree...")
+            onStatusUpdate?("phase2", "🔧 Processing 0/\(totalBlocksToFetch) blocks...")
             let processStartTime = Date()
+            var processedCount = 0
 
             // Process blocks sequentially from pre-fetched cache
             while currentHeight <= targetHeight && isScanning {
@@ -896,7 +912,7 @@ final class FilterScanner {
                     blockData = [(currentHeight, [])]
                 }
 
-                // Process sequentially (data already fetched, network I/O happening in background for next batch)
+                // Process sequentially (all data already in memory)
                 for (height, txList) in blockData {
                     guard isScanning else { break }
 
@@ -925,13 +941,20 @@ final class FilterScanner {
                     }
 
                     scannedBlocks += 1
-                    // Report PHASE 2 progress (60-100%) every 100 blocks for better UI feedback
-                    // FIX #190: Increased from 10 to 100 to reduce checkpoint overhead
-                    if scannedBlocks % 100 == 0 || scannedBlocks == 1 {
-                        let localProgress = Double(scannedBlocks) / Double(totalBlocks)
-                        reportPhase2Progress(localProgress, height: height, maxHeight: targetHeight)
+                    processedCount += 1
 
-                        // Save checkpoint every 100 blocks
+                    // FIX #190 v4: Report PROCESSING progress every 160 blocks (matching fetch batch)
+                    // Progress is 50-100% of PHASE 2 (fetch was 0-50%)
+                    if processedCount % prefetchBatchSize == 0 || processedCount == 1 {
+                        let processProgress = Double(processedCount) / Double(totalBlocksToFetch)
+                        let processPercent = Int(processProgress * 100)
+                        print("🔧 FIX #190: Processing blocks \(processedCount)/\(totalBlocksToFetch) (\(processPercent)%)...")
+                        onStatusUpdate?("phase2", "🔧 Processing \(processedCount)/\(totalBlocksToFetch) blocks...")
+                        reportPhase2Progress(0.5 + processProgress * 0.5, height: height, maxHeight: targetHeight)
+                    }
+
+                    // Save checkpoint every 500 blocks (less frequent than progress updates)
+                    if scannedBlocks % 500 == 0 {
                         try? database.updateLastScannedHeight(height, hash: Data(count: 32))
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
