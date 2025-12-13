@@ -104,21 +104,39 @@ actor CommitmentTreeUpdater {
         onProgress?(0.0, "Checking for boost data...")
 
         // Check for valid cached boost file first
-        if let cachedManifest = loadCachedManifest() {
+        let cachedManifest = loadCachedManifest()
+        if let cachedManifest = cachedManifest {
             if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
                 // Verify checksum (can be slow for 500MB file, so skip if file size matches)
                 let attrs = try? FileManager.default.attributesOfItem(atPath: cachedBoostPath.path)
                 let fileSize = attrs?[.size] as? Int ?? 0
 
                 if fileSize == cachedManifest.files.uncompressed.size {
-                    print("🚀 Using cached boost file at height \(cachedManifest.chain_height)")
-                    onProgress?(1.0, "Using cached data")
-                    return (cachedBoostPath, cachedManifest.chain_height, cachedManifest.output_count)
+                    // FIX #178: Check if remote has NEWER version before downloading
+                    // Only fetch remote manifest if cache is valid - compare heights
+                    onProgress?(0.02, "Checking for updates...")
+                    if let remoteManifest = try? await fetchRemoteManifest() {
+                        if remoteManifest.chain_height > cachedManifest.chain_height {
+                            // Remote has newer version - download it
+                            print("🚀 FIX #178: Remote boost file is NEWER (remote=\(remoteManifest.chain_height) > cached=\(cachedManifest.chain_height)) - downloading update...")
+                            // Fall through to download section below
+                        } else {
+                            // Cached version is same or newer - use it
+                            print("🚀 FIX #178: Using cached boost file at height \(cachedManifest.chain_height) (remote=\(remoteManifest.chain_height), no update needed)")
+                            onProgress?(1.0, "Using cached data")
+                            return (cachedBoostPath, cachedManifest.chain_height, cachedManifest.output_count)
+                        }
+                    } else {
+                        // Can't reach GitHub - use cached version
+                        print("🚀 Using cached boost file at height \(cachedManifest.chain_height) (GitHub unreachable)")
+                        onProgress?(1.0, "Using cached data")
+                        return (cachedBoostPath, cachedManifest.chain_height, cachedManifest.output_count)
+                    }
                 }
             }
         }
 
-        // Must download from GitHub
+        // Must download from GitHub (no valid cache OR remote has newer version)
         onProgress?(0.05, "Fetching manifest from GitHub...")
         let remoteManifest = try await fetchRemoteManifest()
 
@@ -127,7 +145,12 @@ actor CommitmentTreeUpdater {
         onProgress?(0.1, "Downloading \(fileSizeMB) MB...")
 
         try await downloadBoostFile(manifest: remoteManifest) { progress in
-            onProgress?(0.1 + progress * 0.85, "Downloading... \(Int(progress * 100))%")
+            let pct = Int(progress * 100)
+            // FIX #179: Add logging to track download progress
+            if pct % 10 == 0 {
+                print("📥 Download progress: \(pct)%")
+            }
+            onProgress?(0.1 + progress * 0.85, "Downloading... \(pct)%")
         }
 
         onProgress?(0.95, "Verifying checksum...")
@@ -569,44 +592,100 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.invalidURL
         }
 
-        var request = URLRequest(url: url)
-        request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+        // FIX #194: Retry on transient GitHub errors (502, 503, 504)
+        let maxRetries = 3
+        var lastError: Error?
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        for attempt in 1...maxRetries {
+            do {
+                var request = URLRequest(url: url)
+                request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw BoostFileError.networkError("GitHub API HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                let (data, response) = try await URLSession.shared.data(for: request)
+
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw BoostFileError.networkError("No HTTP response")
+                }
+
+                // FIX #194: Check for transient errors that should trigger retry
+                let statusCode = httpResponse.statusCode
+                if [502, 503, 504].contains(statusCode) {
+                    print("⚠️ FIX #194: GitHub API returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 3s...")
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    lastError = BoostFileError.networkError("GitHub API HTTP \(statusCode)")
+                    continue
+                }
+
+                guard statusCode == 200 else {
+                    throw BoostFileError.networkError("GitHub API HTTP \(statusCode)")
+                }
+
+                let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+                cachedReleaseInfo = release
+                print("📦 Latest release: \(release.tag_name) with \(release.assets.count) assets")
+                return release
+            } catch {
+                lastError = error
+                if attempt < maxRetries {
+                    print("⚠️ FIX #194: Fetch release failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            }
         }
 
-        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-        cachedReleaseInfo = release
-        print("📦 Latest release: \(release.tag_name) with \(release.assets.count) assets")
-        return release
+        throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
     private func fetchRemoteManifest() async throws -> BoostManifest {
-        // Get latest release from GitHub
-        let release = try await fetchLatestRelease()
+        // FIX #194: Retry on transient GitHub errors (502, 503, 504)
+        let maxRetries = 3
+        var lastError: Error?
 
-        // Find manifest asset
-        guard let manifestAsset = release.assets.first(where: { $0.name == Self.manifestFileName }) else {
-            throw BoostFileError.networkError("Manifest not found in latest release")
+        for attempt in 1...maxRetries {
+            do {
+                // Get latest release from GitHub
+                let release = try await fetchLatestRelease()
+
+                // Find manifest asset
+                guard let manifestAsset = release.assets.first(where: { $0.name == Self.manifestFileName }) else {
+                    throw BoostFileError.networkError("Manifest not found in latest release")
+                }
+
+                guard let url = URL(string: manifestAsset.browser_download_url) else {
+                    throw BoostFileError.invalidURL
+                }
+
+                let (data, response) = try await URLSession.shared.data(from: url)
+
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw BoostFileError.networkError("No HTTP response")
+                }
+
+                // FIX #194: Check for transient errors that should trigger retry
+                let statusCode = httpResponse.statusCode
+                if [502, 503, 504].contains(statusCode) {
+                    print("⚠️ FIX #194: GitHub returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 3s...")
+                    try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second delay
+                    lastError = BoostFileError.networkError("HTTP \(statusCode)")
+                    continue
+                }
+
+                guard statusCode == 200 else {
+                    throw BoostFileError.networkError("HTTP \(statusCode)")
+                }
+
+                let manifest = try JSONDecoder().decode(BoostManifest.self, from: data)
+                return manifest
+            } catch {
+                lastError = error
+                if attempt < maxRetries {
+                    print("⚠️ FIX #194: Fetch manifest failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                    try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second delay
+                }
+            }
         }
 
-        guard let url = URL(string: manifestAsset.browser_download_url) else {
-            throw BoostFileError.invalidURL
-        }
-
-        let (data, response) = try await URLSession.shared.data(from: url)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw BoostFileError.networkError("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
-        }
-
-        let manifest = try JSONDecoder().decode(BoostManifest.self, from: data)
-        return manifest
+        throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
     private func loadCachedManifest() -> BoostManifest? {
@@ -644,31 +723,59 @@ actor CommitmentTreeUpdater {
         print("📥 URL: \(boostAsset.browser_download_url)")
         print("📦 Expected size: \(boostAsset.size) bytes")
 
-        // Create custom session with delegate for progress
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForResource = 3600 // 1 hour timeout for large file
+        // FIX #194: Retry on transient GitHub errors (502, 503, 504)
+        let maxRetries = 3
+        var lastError: Error?
 
-        let delegate = DownloadProgressDelegate { progress in
-            onProgress?(progress)
+        for attempt in 1...maxRetries {
+            do {
+                // Create custom session with delegate for progress
+                let config = URLSessionConfiguration.default
+                config.timeoutIntervalForResource = 3600 // 1 hour timeout for large file
+
+                let delegate = DownloadProgressDelegate { progress in
+                    onProgress?(progress)
+                }
+
+                let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+
+                let (tempURL, response) = try await session.download(from: url)
+
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw BoostFileError.networkError("No HTTP response")
+                }
+
+                // FIX #194: Check for transient errors that should trigger retry
+                let statusCode = httpResponse.statusCode
+                if [502, 503, 504].contains(statusCode) {
+                    print("⚠️ FIX #194: Boost download returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 5s...")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    lastError = BoostFileError.networkError("HTTP \(statusCode) downloading boost file")
+                    continue
+                }
+
+                guard statusCode == 200 else {
+                    throw BoostFileError.networkError("HTTP \(statusCode) downloading boost file")
+                }
+
+                // Move to cache
+                if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
+                    try FileManager.default.removeItem(at: cachedBoostPath)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: cachedBoostPath)
+
+                print("✅ Downloaded boost file: \(boostAsset.size) bytes")
+                return
+            } catch {
+                lastError = error
+                if attempt < maxRetries {
+                    print("⚠️ FIX #194: Boost download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            }
         }
 
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-
-        let (tempURL, response) = try await session.download(from: url)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw BoostFileError.networkError("HTTP \(status) downloading boost file")
-        }
-
-        // Move to cache
-        if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
-            try FileManager.default.removeItem(at: cachedBoostPath)
-        }
-        try FileManager.default.moveItem(at: tempURL, to: cachedBoostPath)
-
-        print("✅ Downloaded boost file: \(boostAsset.size) bytes")
+        throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
     private func verifySHA256(file: URL, expected: String) -> Bool {
