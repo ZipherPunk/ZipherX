@@ -861,27 +861,23 @@ struct ContentView: View {
                         // and there are just a few missed blocks (not the entire chain)
                         if currentWalletHeight > 0 && currentChainHeight > currentWalletHeight {
                             let missedBlocks = currentChainHeight - currentWalletHeight
-                            // FIX #204 v2: Increase limit to 50000 blocks (~1 month)
-                            // User may not open app for days/weeks - all those blocks are valid
-                            // Only reject if it looks like full chain sync (millions of blocks)
-                            guard missedBlocks < 50000 else {
-                                print("⚠️ Catch-up skipped: \(missedBlocks) blocks seems wrong (wallet not synced?)")
-                                // CRITICAL: Must clear suppressBackgroundSync even on early return!
-                                networkManager.suppressBackgroundSync = false
-                                // FIX #145: Ensure header timestamps before enabling background processes
-                                await walletManager.ensureHeaderTimestamps()
-                                networkManager.enableBackgroundProcesses()
-                                await MainActor.run {
-                                    walletManager.setConnecting(false, status: nil)
-                                    isInitialSync = false
-                                    hasCompletedInitialSync = true
-                                }
-                                return
+
+                            // FIX #204 v3: Never reject - always sync, just inform user
+                            // Estimate: ~37 blocks/sec fetch + processing (from logs)
+                            let estimatedSeconds = max(1, Int(missedBlocks / 37))
+                            let timeEstimate: String
+                            if estimatedSeconds < 60 {
+                                timeEstimate = "~\(estimatedSeconds)s"
+                            } else if estimatedSeconds < 3600 {
+                                timeEstimate = "~\(estimatedSeconds / 60)m"
+                            } else {
+                                timeEstimate = "~\(estimatedSeconds / 3600)h \((estimatedSeconds % 3600) / 60)m"
                             }
-                            print("🔄 Catch-up: \(missedBlocks) new block(s) arrived during setup")
+
+                            print("🔄 Catch-up: \(missedBlocks) block(s) since last sync (\(timeEstimate))")
 
                             await MainActor.run {
-                                walletManager.setConnecting(true, status: "Catching up \(missedBlocks) new block(s)...")
+                                walletManager.setConnecting(true, status: "Syncing \(missedBlocks) blocks since last start (\(timeEstimate))...")
                             }
 
                             // Quick sync to catch up missed blocks
