@@ -743,6 +743,7 @@ impl<P: Parameters> ShieldedOutput<SaplingDomain<P>, ENC_CIPHERTEXT_SIZE> for Ra
     }
 }
 
+/// FIX #230: Now uses safe_slice for bounds validation
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     sk: *const u8,
@@ -751,10 +752,40 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     ciphertext: *const u8,
     output: *mut u8,
 ) -> usize {
-    let sk_slice = slice::from_raw_parts(sk, 169);
-    let epk_slice = slice::from_raw_parts(epk, 32);
-    let cmu_slice = slice::from_raw_parts(cmu, 32);
-    let ciphertext_slice = slice::from_raw_parts(ciphertext, 580);
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid sk pointer");
+            return 0;
+        }
+    };
+    let epk_slice = match safe_slice(epk, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid epk pointer");
+            return 0;
+        }
+    };
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid cmu pointer");
+            return 0;
+        }
+    };
+    let ciphertext_slice = match safe_slice(ciphertext, 580) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid ciphertext pointer");
+            return 0;
+        }
+    };
+
+    if output.is_null() {
+        debug_log!("zipherx_try_decrypt_note_with_sk: null output pointer");
+        return 0;
+    }
 
     // Deserialize the ExtendedSpendingKey
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
@@ -964,6 +995,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
 ///
 /// # Returns
 /// Number of successfully decrypted notes
+/// FIX #230: Now uses safe_slice for bounds validation
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
     sk: *const u8,
@@ -976,7 +1008,14 @@ pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
         return 0;
     }
 
-    let sk_slice = slice::from_raw_parts(sk, 169);
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid sk pointer");
+            return 0;
+        }
+    };
 
     // Deserialize the ExtendedSpendingKey
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
@@ -994,9 +1033,21 @@ pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
 
     let block_height = BlockHeight::from_u32(height as u32);
 
-    // Parse all outputs into a Vec for parallel processing
-    let outputs_slice = slice::from_raw_parts(outputs_data, output_count * 644);
-    let results_slice = slice::from_raw_parts_mut(results, output_count * 564);
+    // FIX #230: Validate output data and results pointers
+    let outputs_slice = match safe_slice(outputs_data, output_count * 644) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid outputs_data pointer");
+            return 0;
+        }
+    };
+    let results_slice = match safe_slice_mut(results, output_count * 564) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid results pointer");
+            return 0;
+        }
+    };
 
     // Pre-parse outputs into structs (needed for Rayon)
     let parsed_outputs: Vec<(usize, RawShieldedOutput)> = (0..output_count)
