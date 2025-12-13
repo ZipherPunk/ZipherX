@@ -15,9 +15,10 @@ enum SyncTaskStatus: Equatable {
 
 /// FIX #231: Equihash verification result - distinguishes network errors from actual failures
 enum EquihashVerificationResult {
-    case verified(count: Int)                    // All headers passed Equihash verification
-    case networkError(reason: String)            // Could not fetch headers (not critical)
-    case failed(verified: Int, total: Int)       // Headers fetched but Equihash failed (CRITICAL)
+    case verified(count: Int)                              // All headers passed with full consensus (5+ peers)
+    case verifiedReducedConsensus(count: Int, peers: Int)  // Headers passed but with reduced consensus (<5 peers)
+    case networkError(reason: String)                      // Could not fetch any headers
+    case failed(verified: Int, total: Int)                 // Headers fetched but Equihash failed (CRITICAL)
 }
 
 /// Individual sync task
@@ -4500,6 +4501,7 @@ final class WalletManager: ObservableObject {
     /// - Parameter count: Number of recent headers to verify (default 100)
     /// - Returns: EquihashVerificationResult distinguishing network errors from actual failures
     /// FIX #231: Returns enum instead of bool to allow health check to differentiate
+    /// FIX #231 v2: Now uses best-effort to verify even with reduced consensus
     func verifyLatestEquihash(count: Int = 100) async -> EquihashVerificationResult {
         print("🔬 FIX #185: Verifying Equihash for latest \(count) block headers...")
 
@@ -4515,33 +4517,49 @@ final class WalletManager: ObservableObject {
         let startHeight = max(bubblesHeight, chainHeight > UInt64(count) ? chainHeight - UInt64(count) + 1 : bubblesHeight)
         let actualCount = Int(chainHeight - startHeight + 1)
 
-        // Fetch headers from P2P peers
-        // Note: P2P getheaders limit is 160 headers per request
+        // FIX #231 v2: First try full consensus, then fall back to best-effort
         var allHeaders: [BlockHeader] = []
+        var peerAgreement: Int = 0
+        var hadFullConsensus = false
+
+        // Try full consensus first
         do {
             let headers = try await NetworkManager.shared.getBlockHeaders(from: startHeight, count: actualCount)
-            allHeaders.append(contentsOf: headers)
+            allHeaders = headers
+            peerAgreement = 5  // Full consensus achieved
+            hadFullConsensus = true
+            print("✅ FIX #231: Got headers with full consensus (5+ peers)")
         } catch {
-            // FIX #231: Network failure is NOT critical - could be consensus issue, timeout, etc.
-            print("⚠️ FIX #185: Failed to fetch headers from \(startHeight): \(error.localizedDescription)")
-            return .networkError(reason: error.localizedDescription)
+            // Full consensus failed - try best-effort
+            print("⚠️ FIX #231: Full consensus failed, trying best-effort...")
+            if let result = await NetworkManager.shared.getBlockHeadersBestEffort(from: startHeight, count: actualCount) {
+                allHeaders = result.headers
+                peerAgreement = result.agreementCount
+                print("⚠️ FIX #231: Got headers with reduced consensus (\(peerAgreement) peer(s) agree)")
+            }
         }
 
         guard !allHeaders.isEmpty else {
             print("❌ FIX #185: No headers fetched for Equihash verification")
-            return .networkError(reason: "No headers received from peers")
+            return .networkError(reason: "No headers received from any peers")
         }
 
-        // Verify Equihash for all fetched headers
+        // Verify Equihash for all fetched headers (even with reduced consensus!)
         let passed = verifyEquihashProofOfWork(headers: allHeaders)
         let success = passed == allHeaders.count
 
         if success {
-            print("✅ FIX #185: Latest headers Equihash verification PASSED (\(passed)/\(allHeaders.count) headers)")
-            return .verified(count: passed)
+            if hadFullConsensus {
+                print("✅ FIX #185: Equihash PASSED with full consensus (\(passed)/\(allHeaders.count) headers)")
+                return .verified(count: passed)
+            } else {
+                // FIX #231 v2: Equihash passed but with reduced consensus - still verified!
+                print("⚠️ FIX #231: Equihash PASSED with reduced consensus (\(passed) headers, \(peerAgreement) peers)")
+                return .verifiedReducedConsensus(count: passed, peers: peerAgreement)
+            }
         } else {
             // FIX #231: This IS critical - headers were received but Equihash failed!
-            print("🚨 FIX #185: Latest headers Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
+            print("🚨 FIX #185: Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
             return .failed(verified: passed, total: allHeaders.count)
         }
     }

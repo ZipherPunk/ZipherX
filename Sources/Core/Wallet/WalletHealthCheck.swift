@@ -336,18 +336,30 @@ final class WalletHealthCheck {
         case .verified(let count):
             // Clear any previous reduced verification alert
             WalletManager.shared.clearReducedVerificationAlert()
-            return .passed("Equihash PoW", details: "\(count) headers verified via P2P")
+            return .passed("Equihash PoW", details: "\(count) headers verified (full consensus)")
 
-        case .networkError(let reason):
-            // FIX #231: Network issues are NOT critical - wallet is still functional
-            // BUT user should be warned about reduced verification
-            let peerCount = NetworkManager.shared.connectedPeers.count
-            print("⚠️ FIX #231: Equihash P2P verification skipped - \(reason) (\(peerCount) peers)")
+        case .verifiedReducedConsensus(let count, let peers):
+            // FIX #231 v2: Equihash PASSED but with reduced peer consensus
+            // Still verified! But warn user about reduced consensus
+            print("⚠️ FIX #231: Equihash verified with \(peers) peer(s) (reduced consensus)")
 
             // Set alert to warn user about reduced verification
+            WalletManager.shared.setReducedVerificationAlert(
+                peerCount: peers,
+                reason: "Equihash verified with \(peers) peer(s) instead of 5"
+            )
+
+            return .passed("Equihash PoW", details: "\(count) headers verified (\(peers) peers - reduced consensus)")
+
+        case .networkError(let reason):
+            // FIX #231: Could not fetch ANY headers - network issue
+            let peerCount = NetworkManager.shared.connectedPeers.count
+            print("⚠️ FIX #231: Equihash could not be verified - \(reason) (\(peerCount) peers)")
+
+            // Set alert to warn user
             WalletManager.shared.setReducedVerificationAlert(peerCount: peerCount, reason: reason)
 
-            return .passed("Equihash PoW", details: "Reduced verification (\(peerCount) peers - see warning)")
+            return .passed("Equihash PoW", details: "Could not verify (network: \(reason))")
 
         case .failed(let verified, let total):
             // FIX #231: This IS critical - headers received but Equihash failed!

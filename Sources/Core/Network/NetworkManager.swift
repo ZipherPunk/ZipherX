@@ -3690,6 +3690,38 @@ final class NetworkManager: ObservableObject {
         return headers
     }
 
+    /// FIX #231: Get block headers with best-effort consensus (returns even without full threshold)
+    /// Returns (headers, peerCount) - allows Equihash verification even with reduced peers
+    func getBlockHeadersBestEffort(from height: UInt64, count: Int) async -> (headers: [BlockHeader], agreementCount: Int)? {
+        guard isConnected else {
+            return nil
+        }
+
+        var responses: [[BlockHeader]: Int] = [:]
+
+        await withTaskGroup(of: [BlockHeader]?.self) { group in
+            for peer in peers {
+                group.addTask {
+                    try? await peer.getBlockHeaders(from: height, count: count)
+                }
+            }
+
+            for await result in group {
+                if let headers = result {
+                    responses[headers, default: 0] += 1
+                }
+            }
+        }
+
+        // Return the headers with most peer agreement, even if below threshold
+        guard let (headers, agreementCount) = responses.max(by: { $0.value < $1.value }),
+              !headers.isEmpty else {
+            return nil
+        }
+
+        return (headers, agreementCount)
+    }
+
     /// Get current chain height from peers (P2P-first, InsightAPI fallback)
     func getChainHeight() async throws -> UInt64 {
         guard isConnected else {
