@@ -723,15 +723,19 @@ actor CommitmentTreeUpdater {
         print("📥 URL: \(boostAsset.browser_download_url)")
         print("📦 Expected size: \(boostAsset.size) bytes")
 
-        // FIX #194: Retry on transient GitHub errors (502, 503, 504)
-        let maxRetries = 3
+        // FIX #194 v2: Retry on transient GitHub errors (502, 503, 504)
+        // FIX #195: Use ephemeral session to avoid stale network cache after Tor bypass
+        let maxRetries = 5  // Increased from 3 to handle network stabilization
         var lastError: Error?
 
         for attempt in 1...maxRetries {
             do {
-                // Create custom session with delegate for progress
-                let config = URLSessionConfiguration.default
+                // FIX #195: Use ephemeral configuration to ensure fresh network connections
+                // This prevents issues when Tor is bypassed and network path changes
+                let config = URLSessionConfiguration.ephemeral
                 config.timeoutIntervalForResource = 3600 // 1 hour timeout for large file
+                config.timeoutIntervalForRequest = 60    // 60s per request
+                config.waitsForConnectivity = true       // Wait for network
 
                 let delegate = DownloadProgressDelegate { progress in
                     onProgress?(progress)
@@ -748,8 +752,10 @@ actor CommitmentTreeUpdater {
                 // FIX #194: Check for transient errors that should trigger retry
                 let statusCode = httpResponse.statusCode
                 if [502, 503, 504].contains(statusCode) {
-                    print("⚠️ FIX #194: Boost download returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 5s...")
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    // FIX #195: Longer delay on first attempts to let network stabilize after Tor bypass
+                    let delaySeconds = attempt <= 2 ? 5 : 3
+                    print("⚠️ FIX #194: Boost download returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in \(delaySeconds)s...")
+                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
                     lastError = BoostFileError.networkError("HTTP \(statusCode) downloading boost file")
                     continue
                 }
@@ -769,8 +775,9 @@ actor CommitmentTreeUpdater {
             } catch {
                 lastError = error
                 if attempt < maxRetries {
-                    print("⚠️ FIX #194: Boost download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    let delaySeconds = attempt <= 2 ? 5 : 3
+                    print("⚠️ FIX #194: Boost download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription), retrying in \(delaySeconds)s...")
+                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
                 }
             }
         }

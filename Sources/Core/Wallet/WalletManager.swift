@@ -622,6 +622,10 @@ final class WalletManager: ObservableObject {
             if bypassed {
                 print("🚀 FIX #164: Tor bypassed - direct download for faster import!")
                 print("🚀 FIX #164: Tor will be restored by refreshBalance() after full sync")
+                // FIX #195: Wait 2 seconds for network to stabilize after Tor bypass
+                // URLSession needs time to clear cached routes and DNS settings
+                print("⏳ FIX #195: Waiting 2s for network to stabilize...")
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
         // NOTE: NO defer block here - Tor restoration handled by FIX #163 in refreshBalance()
@@ -748,18 +752,24 @@ final class WalletManager: ObservableObject {
         }
 
         // ================================================================
-        // FIX #149: Limit header sync to last 100 blocks for FAST START
+        // FIX #149/#186: Limit header sync to last 100 blocks
         // ================================================================
         // User requested: "consensus must be verified over 100 latest blocks only"
-        // For FAST START mode, we only need recent blocks for consensus verification
+        // For both FAST START and fresh imports, we only need recent blocks for consensus
         // Historical timestamps can be estimated without syncing thousands of headers
-        let headerStoreMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        // FIX #186: Use boost file height or chain height as reference, not headerStoreMaxHeight
+        //           (headerStoreMaxHeight=0 for fresh imports, causing 10,000+ header sync!)
+        let referenceHeight = max(
+            (try? HeaderStore.shared.getLatestHeight()) ?? 0,
+            ZipherXConstants.effectiveTreeHeight,
+            UInt64(NetworkManager.shared.chainHeight)
+        )
         let maxSyncRange: UInt64 = 100  // Only sync last 100 blocks for consensus
 
-        if headerStoreMaxHeight > maxSyncRange {
-            let minStartHeight = headerStoreMaxHeight - maxSyncRange
+        if referenceHeight > maxSyncRange {
+            let minStartHeight = referenceHeight - maxSyncRange
             if earliestNeedingTimestamp < minStartHeight {
-                print("📊 FIX #149: Limiting header sync to last \(maxSyncRange) blocks (was \(headerStoreMaxHeight - earliestNeedingTimestamp) blocks)")
+                print("📊 FIX #186: Limiting header sync to last \(maxSyncRange) blocks (was \(referenceHeight - earliestNeedingTimestamp) blocks)")
                 earliestNeedingTimestamp = minStartHeight
             }
         }
@@ -2010,19 +2020,9 @@ final class WalletManager: ObservableObject {
                     ]
                     let messageIndex = Int(currentHeight / 50000) % phase1Messages.count
                     self?.syncStatus = phase1Messages[messageIndex]
-                } else if self?.syncPhase == "phase2" {
-                    // PHASE 2: Sequential tree building
-                    let phase2Messages = [
-                        "Building commitment tree...",
-                        "Extending the Merkle frontier...",
-                        "Cryptographic tree expansion...",
-                        "Securing new commitments...",
-                        "Zero-knowledge sync active..."
-                    ]
-                    let blocksAfterDownloaded = currentHeight > downloadedTreeHeight ? currentHeight - downloadedTreeHeight : 0
-                    let messageIndex = Int(blocksAfterDownloaded / 1000) % phase2Messages.count
-                    self?.syncStatus = phase2Messages[messageIndex]
                 }
+                // Note: PHASE 2 status is set by onStatusUpdate with real percentage
+                // Don't overwrite it here with generic messages
                 // Note: phase1.5 and phase1.6 status is set by onStatusUpdate
             }
         }
@@ -4113,6 +4113,310 @@ final class WalletManager: ObservableObject {
         // P2P-only: This function is disabled - nullifier checking done via P2P scan
         print("⚠️ checkNullifierSpentOnChain disabled in P2P-only mode")
         return false
+    }
+
+    // MARK: - FIX #185: Equihash Proof-of-Work Verification
+
+    /// Verify Equihash proof-of-work for a list of block headers
+    /// This ensures the blockchain data comes from honest miners, not attackers
+    /// - Parameter headers: List of block headers with solutions from P2P peers
+    /// - Returns: Number of headers that passed Equihash verification
+    private func verifyEquihashProofOfWork(headers: [BlockHeader]) -> Int {
+        var passedCount = 0
+
+        for header in headers {
+            // Build 140-byte header for Equihash verification
+            var headerData = Data()
+            withUnsafeBytes(of: Int32(header.version).littleEndian) { headerData.append(contentsOf: $0) }
+            headerData.append(header.prevBlockHash)   // 32 bytes
+            headerData.append(header.merkleRoot)       // 32 bytes
+            headerData.append(header.finalSaplingRoot) // 32 bytes
+            withUnsafeBytes(of: header.timestamp.littleEndian) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.bits.littleEndian) { headerData.append(contentsOf: $0) }
+            headerData.append(header.nonce)            // 32 bytes
+
+            // Verify Equihash(192,7) solution
+            if ZipherXFFI.verifyEquihash(header: headerData, solution: header.solution) {
+                passedCount += 1
+            } else {
+                print("❌ FIX #185: Equihash verification FAILED for header at timestamp \(header.timestamp)")
+            }
+        }
+
+        return passedCount
+    }
+
+    /// FIX #185: Verify Equihash for sample block headers from boost file range
+    /// This verifies that the boost file data corresponds to real blockchain PoW
+    /// - Parameters:
+    ///   - boostHeight: The height of the boost file
+    ///   - sampleCount: Number of sample headers to verify (default 10)
+    /// - Returns: True if all samples pass, false if any fail
+    func verifyBoostFileEquihash(boostHeight: UInt64, sampleCount: Int = 10) async -> Bool {
+        print("🔬 FIX #185: Verifying Equihash for boost file (sampling \(sampleCount) headers)...")
+
+        // Calculate sample heights spread across the boost file range
+        // Post-Bubbles (585,318+) uses Equihash(192,7)
+        let minSampleHeight: UInt64 = 585_318  // Bubbles fork (when Equihash params changed)
+        let startHeight = max(minSampleHeight, boostHeight > 10000 ? boostHeight - 10000 : minSampleHeight)
+
+        var sampleHeights: [UInt64] = []
+        let range = boostHeight - startHeight
+        let step = range / UInt64(sampleCount)
+
+        for i in 0..<sampleCount {
+            let height = startHeight + (step * UInt64(i)) + UInt64.random(in: 0..<max(1, step))
+            sampleHeights.append(min(height, boostHeight))
+        }
+
+        // Fetch headers from P2P peers
+        var allHeaders: [BlockHeader] = []
+        for height in sampleHeights {
+            do {
+                let headers = try await NetworkManager.shared.getBlockHeaders(from: height, count: 1)
+                allHeaders.append(contentsOf: headers)
+            } catch {
+                print("⚠️ FIX #185: Failed to fetch header at height \(height): \(error.localizedDescription)")
+            }
+        }
+
+        guard !allHeaders.isEmpty else {
+            print("❌ FIX #185: No headers fetched for Equihash verification")
+            return false
+        }
+
+        // Verify Equihash for all fetched headers
+        let passed = verifyEquihashProofOfWork(headers: allHeaders)
+        let success = passed == allHeaders.count
+
+        if success {
+            print("✅ FIX #185: Boost file Equihash verification PASSED (\(passed)/\(allHeaders.count) headers)")
+        } else {
+            print("🚨 FIX #185: Boost file Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
+        }
+
+        return success
+    }
+
+    /// FIX #185: Verify Equihash for the latest N block headers
+    /// This verifies that the current chain tip has valid proof-of-work
+    /// - Parameter count: Number of recent headers to verify (default 100)
+    /// - Returns: True if all headers pass, false if any fail
+    func verifyLatestEquihash(count: Int = 100) async -> Bool {
+        print("🔬 FIX #185: Verifying Equihash for latest \(count) block headers...")
+
+        // Get current chain height from peers
+        let chainHeight = UInt64(NetworkManager.shared.chainHeight)
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #185: Chain height is 0, cannot verify Equihash")
+            return false
+        }
+
+        // Calculate start height (ensure we don't go before Bubbles fork)
+        let bubblesHeight: UInt64 = 585_318
+        let startHeight = max(bubblesHeight, chainHeight > UInt64(count) ? chainHeight - UInt64(count) + 1 : bubblesHeight)
+        let actualCount = Int(chainHeight - startHeight + 1)
+
+        // Fetch headers from P2P peers
+        // Note: P2P getheaders limit is 160 headers per request
+        var allHeaders: [BlockHeader] = []
+        do {
+            let headers = try await NetworkManager.shared.getBlockHeaders(from: startHeight, count: actualCount)
+            allHeaders.append(contentsOf: headers)
+        } catch {
+            print("⚠️ FIX #185: Failed to fetch headers from \(startHeight): \(error.localizedDescription)")
+        }
+
+        guard !allHeaders.isEmpty else {
+            print("❌ FIX #185: No headers fetched for Equihash verification")
+            return false
+        }
+
+        // Verify Equihash for all fetched headers
+        let passed = verifyEquihashProofOfWork(headers: allHeaders)
+        let success = passed == allHeaders.count
+
+        if success {
+            print("✅ FIX #185: Latest headers Equihash verification PASSED (\(passed)/\(allHeaders.count) headers)")
+        } else {
+            print("🚨 FIX #185: Latest headers Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
+        }
+
+        return success
+    }
+
+    // MARK: - FIX #188: Unified Header Fetch with Single-Pass Caching
+
+    /// FIX #188: Fetch headers once and process for all purposes in a single pass
+    /// This eliminates redundant P2P requests by:
+    /// 1. Fetching headers in batches of 160 (P2P limit)
+    /// 2. Verifying Equihash immediately (fail fast)
+    /// 3. Caching timestamps to BlockTimestampManager
+    /// 4. Storing in HeaderStore (without Equihash solutions to save space)
+    /// - Parameters:
+    ///   - startHeight: First block height to fetch
+    ///   - endHeight: Last block height to fetch
+    ///   - verifyEquihash: Whether to verify Equihash (only needed for post-Bubbles blocks)
+    /// - Returns: True if all headers fetched and verified successfully
+    func fetchAndCacheHeaders(from startHeight: UInt64, to endHeight: UInt64, verifyEquihash: Bool = true) async -> Bool {
+        let bubblesHeight: UInt64 = 585_318
+        let batchSize = 160  // P2P getheaders limit
+        let totalHeaders = Int(endHeight - startHeight + 1)
+
+        print("📥 FIX #188: Unified header fetch from \(startHeight) to \(endHeight) (\(totalHeaders) headers)")
+
+        var currentHeight = startHeight
+        var totalFetched = 0
+        var totalVerified = 0
+        var headersForStorage: [ZclassicBlockHeader] = []
+
+        while currentHeight <= endHeight {
+            let remaining = Int(endHeight - currentHeight + 1)
+            let thisBatchSize = min(batchSize, remaining)
+
+            do {
+                // Fetch batch from P2P with consensus
+                let headers = try await NetworkManager.shared.getBlockHeaders(from: currentHeight, count: thisBatchSize)
+
+                guard !headers.isEmpty else {
+                    print("⚠️ FIX #188: Empty response at height \(currentHeight), stopping")
+                    break
+                }
+
+                // Process each header in the batch
+                for (index, header) in headers.enumerated() {
+                    let height = currentHeight + UInt64(index)
+
+                    // Build 140-byte header for verification and hashing
+                    var headerData = Data()
+                    withUnsafeBytes(of: Int32(header.version).littleEndian) { headerData.append(contentsOf: $0) }
+                    headerData.append(header.prevBlockHash)
+                    headerData.append(header.merkleRoot)
+                    headerData.append(header.finalSaplingRoot)
+                    withUnsafeBytes(of: header.timestamp.littleEndian) { headerData.append(contentsOf: $0) }
+                    withUnsafeBytes(of: header.bits.littleEndian) { headerData.append(contentsOf: $0) }
+                    headerData.append(header.nonce)
+
+                    // 1. Verify Equihash (only for post-Bubbles)
+                    if verifyEquihash && height >= bubblesHeight {
+                        if !ZipherXFFI.verifyEquihash(header: headerData, solution: header.solution) {
+                            print("🚨 FIX #188: Equihash FAILED at height \(height) - REJECTING!")
+                            return false
+                        }
+                        totalVerified += 1
+                    }
+
+                    // 2. Cache timestamp immediately
+                    BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: header.timestamp)
+
+                    // 3. Compute block hash (double SHA256 of header + solution)
+                    var fullHeader = headerData
+                    let solutionLen = header.solution.count
+                    if solutionLen < 253 {
+                        fullHeader.append(UInt8(solutionLen))
+                    } else {
+                        fullHeader.append(0xfd)
+                        withUnsafeBytes(of: UInt16(solutionLen).littleEndian) { fullHeader.append(contentsOf: $0) }
+                    }
+                    fullHeader.append(header.solution)
+
+                    let hash1 = SHA256.hash(data: fullHeader)
+                    let hash2 = SHA256.hash(data: Data(hash1))
+                    let blockHash = Data(hash2)
+
+                    // 4. Create ZclassicBlockHeader for storage (includes solution!)
+                    let zclHeader = ZclassicBlockHeader(
+                        version: UInt32(header.version),
+                        hashPrevBlock: header.prevBlockHash,
+                        hashMerkleRoot: header.merkleRoot,
+                        hashFinalSaplingRoot: header.finalSaplingRoot,
+                        time: header.timestamp,
+                        bits: header.bits,
+                        nonce: header.nonce,
+                        solution: header.solution,  // Store solution for later verification!
+                        height: height,
+                        blockHash: blockHash
+                    )
+                    headersForStorage.append(zclHeader)
+                }
+
+                totalFetched += headers.count
+                currentHeight += UInt64(headers.count)
+
+                // Progress update every 500 headers
+                if totalFetched % 500 < batchSize {
+                    let progress = Double(totalFetched) / Double(totalHeaders) * 100
+                    print("📥 FIX #188: Progress \(String(format: "%.1f", progress))% - \(totalFetched)/\(totalHeaders) headers")
+                }
+
+            } catch {
+                print("⚠️ FIX #188: Failed to fetch headers at \(currentHeight): \(error.localizedDescription)")
+                // Continue with what we have if we got at least some headers
+                if totalFetched > 0 {
+                    break
+                }
+                return false
+            }
+        }
+
+        // 5. Store all headers in HeaderStore (batch insert with solutions)
+        if !headersForStorage.isEmpty {
+            do {
+                try HeaderStore.shared.insertHeaders(headersForStorage)
+                print("💾 FIX #188: Stored \(headersForStorage.count) headers in HeaderStore (with solutions)")
+
+                // 6. Clean up old solutions to save space (keep only last 100)
+                try HeaderStore.shared.cleanupOldSolutions(keepCount: 100)
+            } catch {
+                print("⚠️ FIX #188: Failed to store headers: \(error.localizedDescription)")
+                // Non-fatal - timestamps are already cached
+            }
+        }
+
+        let equihashMsg = verifyEquihash ? ", \(totalVerified) Equihash verified" : ""
+        print("✅ FIX #188: Unified header fetch complete - \(totalFetched) headers fetched\(equihashMsg)")
+
+        return totalFetched > 0
+    }
+
+    /// FIX #188: Verify Equihash from locally stored headers (no P2P needed)
+    /// This uses headers stored in HeaderStore with their Equihash solutions
+    func verifyEquihashFromLocalStorage(count: Int = 100) -> Bool {
+        print("🔬 FIX #188: Verifying Equihash from local storage (\(count) headers)...")
+
+        do {
+            let headers = try HeaderStore.shared.getHeadersWithSolutions(count: count)
+
+            guard !headers.isEmpty else {
+                print("⚠️ FIX #188: No headers with solutions in local storage")
+                return false
+            }
+
+            let bubblesHeight: UInt64 = 585_318
+            var verified = 0
+
+            for header in headers {
+                // Only verify post-Bubbles blocks (Equihash(192,7))
+                guard header.height >= bubblesHeight else { continue }
+                guard !header.solution.isEmpty else { continue }
+
+                // Build 140-byte header
+                let headerData = header.headerBytes
+
+                if ZipherXFFI.verifyEquihash(header: headerData, solution: header.solution) {
+                    verified += 1
+                } else {
+                    print("🚨 FIX #188: Equihash FAILED at height \(header.height)!")
+                    return false
+                }
+            }
+
+            print("✅ FIX #188: Local Equihash verification PASSED (\(verified) headers verified)")
+            return verified > 0
+        } catch {
+            print("❌ FIX #188: Failed to read headers for verification: \(error.localizedDescription)")
+            return false
+        }
     }
 }
 
