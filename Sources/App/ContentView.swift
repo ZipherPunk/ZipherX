@@ -802,15 +802,16 @@ struct ContentView: View {
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Verifying blockchain height...")
                         }
-                        print("🔍 FIX #120: Set connecting status, now fetching network stats...")
+                        print("🔍 FIX #120: Set connecting status...")
                         var syncWaitCount = 0
                         let maxSyncWait = 300 // 30 seconds max wait for height sync
 
-                        // Fetch initial stats to get current heights
-                        print("🔍 FIX #120: Fetching network stats for height verification...")
-                        await networkManager.fetchNetworkStats()
-                        let targetHeight = networkManager.chainHeight
-                        print("🔍 FIX #120: Target height: \(targetHeight), wallet height: \(networkManager.walletHeight)")
+                        // FIX #198: Use CACHED chain height instead of waiting for Tor to reconnect
+                        // The cached height was set during import (networkManager.chainHeight is already set)
+                        // No need to call fetchNetworkStats() which waits for Tor + P2P (36 seconds!)
+                        let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                        let targetHeight = cachedHeight > 0 ? cachedHeight : networkManager.chainHeight
+                        print("🔍 FIX #198: Using cached height: \(targetHeight), wallet height: \(networkManager.walletHeight) (skipped 36s Tor wait!)")
 
                         while networkManager.chainHeight > 0 &&
                               networkManager.walletHeight < networkManager.chainHeight &&
@@ -834,22 +835,20 @@ struct ContentView: View {
                                 }
                             }
 
-                            // Re-fetch stats every 2 seconds to update heights
-                            if syncWaitCount % 20 == 0 {
-                                await networkManager.fetchNetworkStats()
-                            }
+                            // FIX #198: Don't re-fetch stats during loop - uses Tor which is slow
+                            // The wallet height updates automatically during backgroundSyncToHeight
                         }
 
                         // CATCH-UP: Check for blocks that arrived during setup
-                        // Re-fetch current chain height and sync any new blocks
+                        // FIX #198: Use cached values instead of fetchNetworkStats() which waits for Tor
                         print("🔍 FIX #120: Height verification complete, checking for new blocks...")
                         await MainActor.run {
                             walletManager.setConnecting(true, status: "Checking for new blocks...")
                         }
-                        await networkManager.fetchNetworkStats()
-                        let currentChainHeight = networkManager.chainHeight
+                        // FIX #198: Use existing networkManager values (already set during import)
+                        let currentChainHeight = targetHeight  // Use cached target from above
                         let currentWalletHeight = networkManager.walletHeight
-                        print("🔍 FIX #120: Chain height: \(currentChainHeight), wallet height: \(currentWalletHeight)")
+                        print("🔍 FIX #198: Chain height: \(currentChainHeight), wallet height: \(currentWalletHeight) (no Tor wait)")
 
                         // Only catch-up if wallet is actually synced (walletHeight > 0)
                         // and there are just a few missed blocks (not the entire chain)
