@@ -341,22 +341,24 @@ final class NetworkManager: ObservableObject {
         "dnsseed.zclnet.net"
     ]
 
-    // Hardcoded peers for reliable connectivity (IP addresses only)
-    private let hardcodedPeersZCL = [
-        "185.205.246.161:8033",  // Known ZCL peer
-        "140.174.189.3:8033",    // Known ZCL peer
-        "205.209.104.118:8033",
-        "74.50.74.102:8033",
-        "162.55.92.62:8033",
-        "157.90.223.151:8033",
-        "37.187.76.79:8033",
-        "51.178.179.75:8033",
-        "54.37.81.148:8033",
-        "67.183.29.123:8033",
-        "116.202.13.16:8033",
-        "188.165.24.209:8033",
-        "198.50.168.213:8033"
-    ]
+    // FIX #229: Trusted peers are now loaded from database table
+    // Use getTrustedPeersForBootstrap() instead of hardcoded array
+    // Legacy hardcoded list removed - see WalletDatabase.getTrustedPeers()
+
+    /// Get trusted peers from database for bootstrap (synchronous wrapper)
+    private func getTrustedPeersForBootstrap() -> [String] {
+        // Try to get trusted peers from database
+        if let db = WalletManager.shared.walletDatabase,
+           let peers = try? db.getTrustedPeers() {
+            return peers.map { "\($0.host):\($0.port)" }
+        }
+        // Fallback if database not available (shouldn't happen)
+        return [
+            "140.174.189.17:8033",
+            "205.209.104.118:8033",
+            "185.205.246.161:8033"
+        ]
+    }
 
     // .onion peers for Tor users (requires Tor to be enabled)
     // These are hidden service addresses that can only be reached via Tor
@@ -1590,8 +1592,8 @@ final class NetworkManager: ObservableObject {
         var discoveredPeers = await discoverPeers()
         print("📡 DNS discovery found \(discoveredPeers.count) peers")
 
-        // Add hardcoded peers for eclipse attack resistance
-        for peer in hardcodedPeersZCL {
+        // FIX #229: Add trusted peers from database for eclipse attack resistance
+        for peer in getTrustedPeersForBootstrap() {
             let components = peer.split(separator: ":")
             if components.count == 2,
                let port = UInt16(components[1]) {
@@ -1692,6 +1694,13 @@ final class NetworkManager: ObservableObject {
                                 await MainActor.run {
                                     self.banAddress(address.host, port: address.port, reason: .timeout)
                                 }
+                            } else if case .wrongChain(let host) = error {
+                                // FIX #229: Permanently ban Zcash peers - they're on wrong chain!
+                                // banPeerForSybilAttack also removes from knownAddresses
+                                await MainActor.run {
+                                    self.banPeerForSybilAttack(host)
+                                }
+                                print("🚫 [FIX #229] Banned Zcash peer \(host) - wrong chain (requires 170020+)")
                             }
                             print("❌ Failed: \(address.host) - \(error.localizedDescription)")
                             return (nil, address)
@@ -1779,14 +1788,14 @@ final class NetworkManager: ObservableObject {
                 consecutiveSybilRejections = 0
                 addressLock.unlock()
 
-                // Try connecting again without Tor - use hardcoded peers only
-                for peer in hardcodedPeersZCL {
+                // FIX #229: Try connecting again without Tor - use trusted peers from database
+                for peer in getTrustedPeersForBootstrap() {
                     let components = peer.split(separator: ":")
                     guard components.count == 2, let port = UInt16(components[1]) else { continue }
                     let address = PeerAddress(host: String(components[0]), port: port)
 
                     do {
-                        print("🔄 [FIX #173] Trying hardcoded peer \(address.host):\(address.port) (direct)...")
+                        print("🔄 [FIX #229] Trying trusted peer \(address.host):\(address.port) (direct)...")
                         let peer = try await connectToPeer(address)
                         peers.append(peer)
                         connectedCount += 1
@@ -5071,6 +5080,7 @@ enum NetworkError: LocalizedError {
     case transactionNotVerified
     case connectionFailed(String)
     case handshakeFailed
+    case wrongChain(String)  // FIX #229: Zcash peer detected (requires 170020+)
     case invalidMagicBytes  // For tolerant block listener - can retry
     case timeout
     case connectionTimeout
@@ -5096,6 +5106,8 @@ enum NetworkError: LocalizedError {
             return "Connection failed: \(message)"
         case .handshakeFailed:
             return "Peer handshake failed"
+        case .wrongChain(let host):
+            return "Wrong chain: \(host) is Zcash, not Zclassic"
         case .invalidMagicBytes:
             return "Invalid P2P magic bytes (Tor noise or protocol mismatch)"
         case .timeout:

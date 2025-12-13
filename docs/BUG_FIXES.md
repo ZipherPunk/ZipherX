@@ -8509,3 +8509,66 @@ for attempt in 1...maxRetries {
 
 **Files Modified**:
 - `Sources/Core/Network/FilterScanner.swift` - Added peer wait retry loop in `getChainHeight()`
+
+---
+
+## FIX #229: Trusted Peers Database + Zcash Peer Detection
+
+**Issue**: Import sync failing with "Equihash PoW verification failed" because most peers returned from DNS seeds were Zcash nodes (requiring protocol version 170020+) instead of Zclassic nodes.
+
+**Root Cause**:
+1. DNS seeds returning mixed Zcash/Zclassic peer addresses
+2. Hardcoded peer list contained outdated IP addresses
+3. Zcash peers reject ZCL connections but weren't being permanently banned
+4. Address book became contaminated with Zcash addresses
+
+**Solution**:
+
+### 1. Added `trusted_peers` Database Table
+New table to store verified Zclassic nodes for reliable bootstrap:
+```sql
+CREATE TABLE trusted_peers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL DEFAULT 16125,
+    last_connected INTEGER,
+    successes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    is_onion INTEGER NOT NULL DEFAULT 0,
+    notes TEXT,
+    added_at INTEGER NOT NULL,
+    UNIQUE(host, port)
+);
+```
+
+### 2. New `NetworkError.wrongChain` Error
+Added specific error type for Zcash peer detection:
+```swift
+case wrongChain(String)  // FIX #229: Zcash peer detected (requires 170020+)
+```
+
+### 3. Permanent Banning for Zcash Peers
+When a peer rejects with version 170020+ requirement:
+- Throws `NetworkError.wrongChain(host)`
+- NetworkManager catches and calls `banPeerForSybilAttack()`
+- Peer is permanently banned and removed from address book
+
+### 4. Trusted Peers Management UI
+New `TrustedPeersView.swift` allows users to:
+- View all trusted peers with success/failure stats
+- Add new verified Zclassic peers
+- Edit peer notes
+- Remove peers from trusted list
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - Throw `wrongChain` error for Zcash detection
+- `Sources/Core/Network/NetworkManager.swift` - Handle `wrongChain`, load trusted peers from DB
+- `Sources/Core/Network/Checkpoints.swift` - Removed hardcoded peers (now in DB)
+- `Sources/Core/Storage/WalletDatabase.swift` - Added `trusted_peers` table and CRUD functions
+- `Sources/Features/Settings/SettingsView.swift` - Added Trusted Peers button
+- `Sources/Features/Settings/TrustedPeersView.swift` - New UI for managing trusted peers
+
+**Initial Trusted Peers** (seeded on first launch):
+- 140.174.189.17:8033 - Primary confirmed ZCL node
+- 205.209.104.118:8033 - Primary confirmed ZCL node
+- 185.205.246.161:8033 - Secondary ZCL node

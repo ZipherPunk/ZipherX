@@ -1231,10 +1231,11 @@ final class Peer {
                     // Zclassic valid protocol versions: 170010, 170011 (Sapling), 170012 (BIP155)
                     // Zcash uses higher versions (170020+, 170100+ for NU5)
                     // Don't alarm about "Sybil" - these are legitimate nodes for different chain
-                    if let reason = lastRejectReason, reason.contains("170020") || reason.contains("170100") {
+                    // FIX #229: Throw specific error so NetworkManager can permanently ban
+                    if let reason = lastRejectReason, reason.contains("170020") || reason.contains("170100") || reason.contains("170019") {
                         print("⚠️ [\(host)] Wrong chain: Peer requires version 170020+ (likely Zcash, not Zclassic)")
-                        // Quietly ban - don't trigger Sybil counter, just skip these nodes
-                        throw NetworkError.handshakeFailed
+                        // Throw specific error for NetworkManager to ban this address permanently
+                        throw NetworkError.wrongChain(host)
                     }
 
                     // If peer explicitly rejected our version, no point in waiting for more messages

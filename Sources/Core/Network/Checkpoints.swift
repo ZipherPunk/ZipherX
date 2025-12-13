@@ -115,16 +115,11 @@ enum ZclassicCheckpoints {
         "dnsseed.rotorproject.org"
     ]
 
-    /// Hardcoded seed nodes (fallback)
-    static let seedNodes = [
-        "45.76.31.96",
-        "144.202.95.129",
-        "149.28.127.136",
-        "207.148.22.63",
-        "108.61.219.176",
-        "45.63.95.139",
-        "45.32.165.178",
-        "104.238.159.229"
+    /// Hardcoded seed nodes (fallback) - now only used as last resort
+    /// FIX #229: Trusted peers are now stored in database table instead
+    /// Use WalletDatabase.getTrustedPeers() for reliable Zclassic nodes
+    static let seedNodes: [String] = [
+        // Empty - trusted peers are now in database (see WalletDatabase.swift)
     ]
 
     /// Hardcoded .onion seed nodes (Tor hidden services)

@@ -102,6 +102,7 @@
 		90604ADFA09E5EB4C3ED5245 /* WalletDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */; };
 		913E7649F61DB6E86FEAC26A /* ExplorerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 426F735D18C658425E86F4D4 /* ExplorerViewModel.swift */; };
 		92A36FAFBBE9E6E5CE516875 /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD6AFDCA26B490632B50E6D /* BiometricAuthManager.swift */; };
+		948565E3E2A31DF16041E1ED /* TrustedPeersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8280EAC73D35BA3A4A0B84A0 /* TrustedPeersView.swift */; };
 		958D0FA84BF6E75FFBB20282 /* PrivacyReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74547F9B9CAADB70883CA615 /* PrivacyReportView.swift */; };
 		95B02CA9CFC2FF60EC40B1D4 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD7DF8498FFB4A339B11991 /* ThemedComponents.swift */; };
@@ -111,6 +112,7 @@
 		A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */; };
 		AB2AC0F817C3783CFA091D36 /* CommitmentTreeUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */; };
 		B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */; };
+		B28829492D42213157BF830C /* TrustedPeersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8280EAC73D35BA3A4A0B84A0 /* TrustedPeersView.swift */; };
 		B47ACDDA73150EED18D38C90 /* MnemonicGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */; };
 		B5432C123C1ECD9D24CA0466 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
@@ -196,6 +198,7 @@
 		79B539975C988B8093FB4106 /* System7Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = System7Components.swift; sourceTree = "<group>"; };
 		7B1E5E415323F1BA44C5E06E /* CypherpunkChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkChat.swift; sourceTree = "<group>"; };
 		7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletDatabase.swift; sourceTree = "<group>"; };
+		8280EAC73D35BA3A4A0B84A0 /* TrustedPeersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrustedPeersView.swift; sourceTree = "<group>"; };
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
@@ -408,6 +411,7 @@
 			children = (
 				E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */,
 				C6537E08D964E75E72B38163 /* SettingsView.swift */,
+				8280EAC73D35BA3A4A0B84A0 /* TrustedPeersView.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -775,6 +779,7 @@
 				988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */,
 				06809D718F601662F7E64D8B /* TorManager.swift in Sources */,
 				BF8EE052AC8321E11E9DC384 /* TransactionBuilder.swift in Sources */,
+				948565E3E2A31DF16041E1ED /* TrustedPeersView.swift in Sources */,
 				90604ADFA09E5EB4C3ED5245 /* WalletDatabase.swift in Sources */,
 				C0ED26F2F475F41511A2DDAB /* WalletHealthCheck.swift in Sources */,
 				DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */,
@@ -848,6 +853,7 @@
 				C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */,
 				099D7898F55101699514DC81 /* TorManager.swift in Sources */,
 				745902783803843898150674 /* TransactionBuilder.swift in Sources */,
+				B28829492D42213157BF830C /* TrustedPeersView.swift in Sources */,
 				416268C8206067F62AE5C1B4 /* WalletDatabase.swift in Sources */,
 				B5B246CE197ED4FFA22ECDDB /* WalletHealthCheck.swift in Sources */,
 				7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */,

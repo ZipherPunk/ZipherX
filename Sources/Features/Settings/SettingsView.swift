@@ -160,6 +160,10 @@ struct SettingsView: View {
     // Custom nodes management
     @State private var showCustomNodes = false
 
+    // FIX #229: Trusted peers management
+    @State private var showTrustedPeers = false
+    @State private var trustedPeersCount = 0
+
     // Delete wallet
     @State private var showDeleteWalletWarning = false
     @State private var showDeleteWalletConfirm = false
@@ -1199,6 +1203,34 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
+            // FIX #229: Trusted Peers button
+            Button(action: {
+                loadTrustedPeersCount()
+                showTrustedPeers = true
+            }) {
+                HStack {
+                    Image(systemName: "shield.checkered")
+                        .font(.system(size: 14))
+                    Text("Trusted Peers")
+                        .font(theme.bodyFont)
+                    Spacer()
+                    Text("\(trustedPeersCount)")
+                        .font(theme.monoFont)
+                        .foregroundColor(trustedPeersCount == 0 ? theme.textSecondary : .green)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+
             // Tor Privacy Mode
             torPrivacySection
 
@@ -1266,6 +1298,15 @@ Both binaries must be installed to /usr/local/bin:
         }
         .sheet(isPresented: $showCustomNodes) {
             CustomNodesView()
+                .environmentObject(themeManager)
+                #if os(macOS)
+                .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
+                       minHeight: 500, idealHeight: 600, maxHeight: 700)
+                #endif
+        }
+        // FIX #229: Trusted Peers sheet
+        .sheet(isPresented: $showTrustedPeers) {
+            TrustedPeersView()
                 .environmentObject(themeManager)
                 #if os(macOS)
                 .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
@@ -2592,6 +2633,14 @@ Both binaries must be installed to /usr/local/bin:
     }
 
     // MARK: - Actions
+
+    // FIX #229: Load trusted peers count for display
+    private func loadTrustedPeersCount() {
+        if let db = WalletManager.shared.walletDatabase,
+           let peers = try? db.getTrustedPeers() {
+            trustedPeersCount = peers.count
+        }
+    }
 
     private func exportReliablePeers() {
         let jsonString = networkManager.exportReliablePeersForBundling()

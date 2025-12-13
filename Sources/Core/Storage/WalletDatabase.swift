@@ -480,6 +480,23 @@ final class WalletDatabase {
             );
             """,
 
+            // FIX #229: Trusted peers table - stores verified Zclassic nodes
+            // These are used for initial bootstrap and fallback when DNS seeds return Zcash nodes
+            """
+            CREATE TABLE IF NOT EXISTS trusted_peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 16125,
+                last_connected INTEGER,
+                successes INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                is_onion INTEGER NOT NULL DEFAULT 0,
+                notes TEXT,
+                added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                UNIQUE(host, port)
+            );
+            """,
+
             // Indexes for performance
             "CREATE INDEX IF NOT EXISTS idx_notes_account ON notes(account_id);",
             "CREATE INDEX IF NOT EXISTS idx_notes_spent ON notes(is_spent);",
@@ -487,7 +504,8 @@ final class WalletDatabase {
             "CREATE INDEX IF NOT EXISTS idx_nullifiers_height ON nullifiers(block_height);",
             "CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);",
             "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);",
-            "CREATE INDEX IF NOT EXISTS idx_tree_checkpoints_height ON tree_checkpoints(height DESC);"
+            "CREATE INDEX IF NOT EXISTS idx_tree_checkpoints_height ON tree_checkpoints(height DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_trusted_peers_host ON trusted_peers(host);"
         ]
 
         for schema in schemas {
@@ -3782,6 +3800,193 @@ final class WalletDatabase {
     // populateSentTransactionsFromSpentNotes() was removed because it added SENT transactions
     // with incorrect values (note value instead of actual sent amount).
     // populateHistoryFromNotes() now correctly calculates: actualSent = input - change - fee
+
+    // MARK: - FIX #229: Trusted Peers Management
+
+    /// Trusted peer structure for reliable Zclassic bootstrap
+    struct TrustedPeer {
+        let host: String
+        let port: UInt16
+        let lastConnected: Date?
+        let successes: Int
+        let failures: Int
+        let isOnion: Bool
+        let notes: String?
+    }
+
+    /// Get all trusted peers from database, prioritized by success rate
+    func getTrustedPeers() throws -> [TrustedPeer] {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // Seed initial trusted peers if table is empty
+        try seedInitialTrustedPeersIfNeeded()
+
+        let sql = """
+            SELECT host, port, last_connected, successes, failures, is_onion, notes
+            FROM trusted_peers
+            ORDER BY (successes - failures) DESC, last_connected DESC
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var peers: [TrustedPeer] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let host = String(cString: sqlite3_column_text(stmt, 0))
+            let port = UInt16(sqlite3_column_int(stmt, 1))
+            let lastConnectedRaw = sqlite3_column_int64(stmt, 2)
+            let lastConnected = lastConnectedRaw > 0 ? Date(timeIntervalSince1970: TimeInterval(lastConnectedRaw)) : nil
+            let successes = Int(sqlite3_column_int(stmt, 3))
+            let failures = Int(sqlite3_column_int(stmt, 4))
+            let isOnion = sqlite3_column_int(stmt, 5) != 0
+            let notesPtr = sqlite3_column_text(stmt, 6)
+            let notes = notesPtr != nil ? String(cString: notesPtr!) : nil
+
+            peers.append(TrustedPeer(
+                host: host,
+                port: port,
+                lastConnected: lastConnected,
+                successes: successes,
+                failures: failures,
+                isOnion: isOnion,
+                notes: notes
+            ))
+        }
+
+        return peers
+    }
+
+    /// Add or update a trusted peer
+    func addTrustedPeer(host: String, port: UInt16 = 16125, isOnion: Bool = false, notes: String? = nil) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            INSERT INTO trusted_peers (host, port, is_onion, notes)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(host, port) DO UPDATE SET
+                notes = COALESCE(excluded.notes, notes)
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+        sqlite3_bind_int(stmt, 3, isOnion ? 1 : 0)
+        if let notes = notes {
+            sqlite3_bind_text(stmt, 4, notes, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            sqlite3_bind_null(stmt, 4)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Record successful connection to a trusted peer
+    func recordTrustedPeerSuccess(host: String, port: UInt16 = 16125) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            UPDATE trusted_peers
+            SET successes = successes + 1, last_connected = strftime('%s', 'now')
+            WHERE host = ? AND port = ?
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Record failed connection to a trusted peer
+    func recordTrustedPeerFailure(host: String, port: UInt16 = 16125) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            UPDATE trusted_peers
+            SET failures = failures + 1
+            WHERE host = ? AND port = ?
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Remove a peer from trusted list (e.g., if it's a Zcash node)
+    func removeTrustedPeer(host: String, port: UInt16 = 16125) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = "DELETE FROM trusted_peers WHERE host = ? AND port = ?"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Seed initial trusted peers if the table is empty
+    private func seedInitialTrustedPeersIfNeeded() throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // Check if table is empty
+        var countStmt: OpaquePointer?
+        let countSql = "SELECT COUNT(*) FROM trusted_peers"
+        guard sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(countStmt) }
+
+        var count: Int64 = 0
+        if sqlite3_step(countStmt) == SQLITE_ROW {
+            count = sqlite3_column_int64(countStmt, 0)
+        }
+
+        // Only seed if empty
+        guard count == 0 else { return }
+
+        print("📡 FIX #229: Seeding initial trusted Zclassic peers...")
+
+        // Known working Zclassic nodes (verified December 2025)
+        let initialPeers: [(host: String, port: UInt16, notes: String)] = [
+            ("140.174.189.17", 8033, "Primary - confirmed working ZCL node"),
+            ("205.209.104.118", 8033, "Primary - confirmed working ZCL node"),
+            ("185.205.246.161", 8033, "Secondary ZCL node"),
+        ]
+
+        for peer in initialPeers {
+            try addTrustedPeer(host: peer.host, port: peer.port, notes: peer.notes)
+        }
+
+        print("📡 FIX #229: Seeded \(initialPeers.count) trusted Zclassic peers")
+    }
 }
 
 // MARK: - Data Types
