@@ -2473,21 +2473,46 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
             }
         }
 
-        // Update existing witnesses with new node
-        for (_, _, witness) in &mut captured_witnesses {
-            if witness.tree().size() > 0 {
-                witness.append(node.clone()).ok();
-            }
-        }
-
         // Report progress every 10000 CMUs
         if i > 0 && i % 10000 == 0 {
             progress_callback(i, count);
         }
     }
 
-    // Final progress
+    // Final progress - tree building complete
     progress_callback(count, count);
+
+    debug_log!("⏱️ FIX #197: Tree built in {:.1}s, found {}/{} targets",
+               start_time.elapsed().as_secs_f64(), found_count, target_count);
+
+    // FIX #197 v2: Update witnesses with remaining CMUs using PARALLEL Rayon
+    // This is the bottleneck - each witness needs to be updated with CMUs after its position
+    if !captured_witnesses.is_empty() {
+        debug_log!("🔄 FIX #197: Updating {} witnesses with remaining CMUs (parallel)...", captured_witnesses.len());
+        let update_start = std::time::Instant::now();
+
+        // Get remaining CMUs as nodes for witness updates
+        // captured_witnesses already have position info, update in parallel
+        use rayon::prelude::*;
+
+        captured_witnesses.par_iter_mut().for_each(|(orig_idx, pos, witness)| {
+            // This witness was created at position *pos, needs updates from pos+1 to count-1
+            let mut local_offset = 8 + ((*pos as usize + 1) * 32);
+            let mut updates = 0u64;
+            while local_offset + 32 <= data_len {
+                let cmu_bytes = &bytes[local_offset..local_offset + 32];
+                local_offset += 32;
+                if let Ok(node) = zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+                    witness.append(node).ok();
+                    updates += 1;
+                }
+            }
+            debug_log!("📝 FIX #197: Witness {} updated with {} CMUs", orig_idx, updates);
+        });
+
+        debug_log!("⏱️ FIX #197: Witness updates took {:.1}s (parallel)",
+                   update_start.elapsed().as_secs_f64());
+    }
 
     // Store tree in global
     let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
