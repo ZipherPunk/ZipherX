@@ -912,12 +912,10 @@ final class FilterScanner {
 
                 // Merge results into cache
                 for batchData in batchResults {
-                    if let data = batchData {
-                        for (height, txData) in data {
-                            prefetchedBlocks[height] = txData
-                        }
-                        fetchedCount += data.count
+                    for (height, txData) in batchData {
+                        prefetchedBlocks[height] = txData
                     }
+                    fetchedCount += batchData.count
                 }
 
                 // Move to next set of parallel batches
