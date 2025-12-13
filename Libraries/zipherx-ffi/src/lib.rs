@@ -1491,6 +1491,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
 /// - note_rcm: Note randomness (32 bytes)
 /// - note_diversifier: Note diversifier (11 bytes)
 /// - tx_out: Output buffer for transaction (should be at least 10000 bytes)
+/// FIX #230: Now uses safe_slice and safe_lock! for bounds validation
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_build_transaction(
     sk: *const u8,
@@ -1507,8 +1508,14 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     tx_out: *mut u8,
     tx_out_len: *mut usize,
 ) -> bool {
-    // Get the prover
-    let prover_guard = PROVER.lock().unwrap();
+    // FIX #230: Use safe_lock! to avoid panic on poisoned mutex
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ Failed to acquire prover lock");
+            return false;
+        }
+    };
     let prover = match prover_guard.as_ref() {
         Some(p) => p,
         None => {
@@ -1517,12 +1524,47 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         }
     };
 
-    // Parse inputs
-    let sk_slice = slice::from_raw_parts(sk, 169);
-    let to_addr_slice = slice::from_raw_parts(to_address, 43);
-    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
-    let rcm_slice = slice::from_raw_parts(note_rcm, 32);
-    let div_slice = slice::from_raw_parts(note_diversifier, 11);
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return false;
+        }
+    };
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness data pointer");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(note_rcm, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcm pointer");
+            return false;
+        }
+    };
+    let div_slice = match safe_slice(note_diversifier, 11) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid diversifier pointer");
+            return false;
+        }
+    };
+
+    if tx_out.is_null() || tx_out_len.is_null() {
+        eprintln!("❌ Null output pointers");
+        return false;
+    }
 
     // Deserialize spending key
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
@@ -1533,8 +1575,15 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         }
     };
 
-    // Parse destination address
-    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+    // FIX #230: Parse destination address (replace .unwrap() with proper handling)
+    let to_addr_arr: [u8; 43] = match safe_try_into(to_addr_slice) {
+        Some(arr) => arr,
+        None => {
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
         Some(addr) => addr,
         None => {
             eprintln!("❌ Invalid destination address");
