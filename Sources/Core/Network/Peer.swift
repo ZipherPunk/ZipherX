@@ -121,6 +121,7 @@ final class Peer {
     // Protocol version
     // 170012 = BIP155 (addrv2) support for Tor v3 addresses
     // 170011 = Sapling support (backward compatible)
+    // WARNING: Sybil attackers send fake reject messages claiming 170020 - IGNORE THEM!
     private let protocolVersion: Int32 = 170012
     private let services: UInt64 = 1 // NODE_NETWORK
     private let userAgent = "/ZipherX:1.0.0/"
@@ -1179,27 +1180,62 @@ final class Peer {
         var receivedVersion = false
         var versionAttempts = 0
         let maxVersionAttempts = 5  // Max messages to check before giving up on version
+        var lastRejectReason: String?  // FIX #170: Track why peer rejected us
 
         while !receivedVersion && versionAttempts < maxVersionAttempts {
             // FIX #150: Use timeout to prevent hung connections during startup
             // NWConnection.receive() doesn't respond to Swift task cancellation
-            let (command, payload) = try await receiveMessageWithTimeout(seconds: 10)
-            versionAttempts += 1
+            do {
+                let (command, payload) = try await receiveMessageWithTimeout(seconds: 10)
+                versionAttempts += 1
 
-            if command == "version" {
-                parseVersionPayload(payload)
-                // Validate version - Zclassic peers should be at least version 70002
-                if peerVersion >= 70002 {
-                    receivedVersion = true
-                    print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
+                if command == "version" {
+                    parseVersionPayload(payload)
+                    // Validate version - Zclassic peers should be at least version 70002
+                    if peerVersion >= 70002 {
+                        receivedVersion = true
+                        print("📡 [\(host)] Peer version: \(peerVersion), user-agent: \(peerUserAgent)")
+                    } else {
+                        // Version 0 or very old version - likely parsing issue
+                        print("⚠️ [\(host)] Invalid peer version \(peerVersion) (payload: \(payload.count) bytes)")
+                        // Continue waiting for valid version
+                    }
+                } else if command == "reject" {
+                    // FIX #170: Parse reject message to understand WHY peer rejected our VERSION
+                    lastRejectReason = parseRejectMessage(payload)
+                    print("⚠️ [\(host)] Got REJECT: \(lastRejectReason ?? "unknown reason")")
+
+                    // FIX #172: SYBIL ATTACK DETECTION
+                    // Zclassic valid protocol versions are: 170011 (Sapling), 170012 (BIP155)
+                    // If a peer claims to require 170020+, they are a Sybil attacker!
+                    if let reason = lastRejectReason, reason.contains("170020") {
+                        print("🚨 [\(host)] SYBIL ATTACK DETECTED: Peer claims invalid version 170020 - BANNING!")
+                        Task {
+                            await NetworkManager.shared.banPeerForSybilAttack(self.host)
+                        }
+                        throw NetworkError.handshakeFailed
+                    }
+
+                    // If peer explicitly rejected our version, no point in waiting for more messages
+                    // The reject message indicates the peer won't send version
+                    if payload.count > 0 {
+                        let msgType = parseRejectMessageType(payload)
+                        if msgType == "version" {
+                            print("❌ [\(host)] Peer rejected our VERSION message - aborting handshake")
+                            throw NetworkError.handshakeFailed
+                        }
+                    }
                 } else {
-                    // Version 0 or very old version - likely parsing issue
-                    print("⚠️ [\(host)] Invalid peer version \(peerVersion) (payload: \(payload.count) bytes)")
-                    // Continue waiting for valid version
+                    // Got non-version message first - log and continue waiting
+                    print("📡 [\(host)] Got '\(command)' (\(payload.count) bytes) before version, waiting for version...")
                 }
-            } else {
-                // Got non-version message first - log and continue waiting
-                print("📡 [\(host)] Got '\(command)' (\(payload.count) bytes) before version, waiting for version...")
+            } catch NetworkError.timeout {
+                // FIX #170: Timeout fired - peer stopped responding after sending some messages
+                versionAttempts += 1
+                print("⚠️ [\(host)] Timeout waiting for version (attempt \(versionAttempts)/\(maxVersionAttempts))")
+                if versionAttempts >= maxVersionAttempts {
+                    break
+                }
             }
         }
 
@@ -1294,6 +1330,52 @@ final class Peer {
         if offset + 4 <= data.count {
             peerStartHeight = data.loadInt32(at: offset)
         }
+    }
+
+    // MARK: - FIX #170: Reject Message Parsing
+
+    /// Parse reject message to get the message type being rejected (e.g., "version", "tx")
+    /// Reject format: msgtype_len (1) + msgtype (var) + ccode (1) + reason_len (1) + reason (var) + [extra_data]
+    private func parseRejectMessageType(_ data: Data) -> String {
+        guard data.count >= 1 else { return "" }
+        let msgLen = Int(data[0])
+        guard msgLen > 0 && 1 + msgLen <= data.count else { return "" }
+        return String(data: data[1..<(1 + msgLen)], encoding: .utf8) ?? ""
+    }
+
+    /// Parse reject message to get the full reason string
+    /// Returns a formatted string: "REJECT [msgtype] ccode: [code] reason: [reason]"
+    private func parseRejectMessage(_ data: Data) -> String? {
+        guard data.count >= 2 else { return nil }
+
+        var offset = 0
+
+        // 1. Message type being rejected (compact size string)
+        let msgLen = Int(data[offset])
+        offset += 1
+        guard offset + msgLen <= data.count else { return "malformed (msgLen)" }
+        let msgType = String(data: data[offset..<(offset + msgLen)], encoding: .utf8) ?? "?"
+        offset += msgLen
+
+        // 2. Reject code (1 byte)
+        guard offset < data.count else { return "REJECT \(msgType) - no ccode" }
+        let ccode = data[offset]
+        offset += 1
+
+        let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
+        let codeName = ccode < codeNames.count ? codeNames[Int(ccode)] : "UNKNOWN(\(ccode))"
+
+        // 3. Reason string (compact size string)
+        var reason = ""
+        if offset < data.count {
+            let reasonLen = Int(data[offset])
+            offset += 1
+            if offset + reasonLen <= data.count {
+                reason = String(data: data[offset..<(offset + reasonLen)], encoding: .utf8) ?? ""
+            }
+        }
+
+        return "REJECT[\(msgType)] \(codeName): \(reason)"
     }
 
     // MARK: - Peer Discovery
@@ -1657,22 +1739,46 @@ final class Peer {
         return (command, payload)
     }
 
-    /// FIX #112: Receive P2P message with timeout to prevent infinite hangs
+    /// FIX #112 + FIX #170: Receive P2P message with timeout to prevent infinite hangs
     /// This is critical for block fetches where the peer may drop connection silently
+    /// FIX #170: NWConnection.receive() doesn't respond to Swift Task cancellation,
+    /// so we use a workaround: cancel the connection to force the receive to fail
+    /// FIX #181: Use class wrapper instead of UnsafeMutablePointer to prevent double-free crash
     func receiveMessageWithTimeout(seconds: TimeInterval = 15) async throws -> (String, Data) {
+        // FIX #181: Use class instead of UnsafeMutablePointer - ARC keeps it alive
+        // until all closures release their reference (prevents double-free crash)
+        final class TimeoutFlag: @unchecked Sendable {
+            var didTimeout = false
+        }
+        let flag = TimeoutFlag()
+
         return try await withThrowingTaskGroup(of: (String, Data).self) { group in
             group.addTask {
                 try await self.receiveMessage()
             }
 
-            group.addTask {
+            group.addTask { [weak self, flag] in
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                flag.didTimeout = true
+                // FIX #170: NWConnection doesn't respond to Swift cancellation
+                // Force-cancel the connection to unblock the receive
+                self?.connection?.forceCancel()
                 throw NetworkError.timeout
             }
 
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+            do {
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            } catch {
+                group.cancelAll()
+                // If we timed out, we force-cancelled the connection
+                // So we need to reconnect next time
+                if flag.didTimeout {
+                    connection = nil
+                }
+                throw error
+            }
         }
     }
 
@@ -1849,7 +1955,7 @@ final class Peer {
         // Build getheaders message with block locator
         var payload = Data()
 
-        // Protocol version (BIP155 support)
+        // Protocol version (170012 = BIP155 support)
         payload.append(contentsOf: withUnsafeBytes(of: UInt32(170012).littleEndian) { Array($0) })
 
         // Hash count = 1
