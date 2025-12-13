@@ -72,7 +72,9 @@ path = "src/bin/verify_balance.rs"
 
 [profile.release]
 lto = true
-opt-level = "z"
+# FIX #199: Use opt-level 3 for maximum speed (Groth16 proofs, witness computation)
+# Previous: "z" (size optimization) - ~30% slower for crypto operations
+opt-level = 3
 
 [patch.crates-io]
 # Override all zcash_primitives dependencies to use our local fork with Zclassic Buttercup support

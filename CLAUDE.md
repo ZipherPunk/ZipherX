@@ -182,6 +182,25 @@ Latest fixes:
     - WalletManager.swift line 1113: `syncHeaders(from: currentHeight + 1, maxHeaders: 100)`
     - WalletManager.swift line 1820: `syncHeaders(from: startHeight, maxHeaders: 100)`
   - **Result**: 100 blocks is enough for peer consensus verification - much faster sync
+- FIX #187: Cache InsightAPI timestamps during scan
+  - Bug: InsightAPI fallback path discarded block timestamps
+  - Fix: Added `BlockTimestampManager.shared.cacheTimestamp()` to InsightAPI paths
+  - Files: FilterScanner.swift `fetchBlockData()` and `fetchBlocksData()`
+- FIX #188: Unified header fetch with single-pass caching
+  - **Problem**: Headers fetched multiple times (sync, Equihash verification, timestamps)
+  - **Solution**: Single unified fetch that does everything:
+    1. Fetch headers in batches of 160 (P2P limit)
+    2. Verify Equihash immediately (fail fast)
+    3. Cache timestamps immediately
+    4. Store headers WITH solutions in HeaderStore
+    5. Keep only last 100 solutions (cleanup old ones)
+  - **New Functions**:
+    - `fetchAndCacheHeaders(from:to:verifyEquihash:)` - unified fetch
+    - `verifyEquihashFromLocalStorage(count:)` - verify from stored solutions (no P2P!)
+    - `HeaderStore.getHeadersWithSolutions(count:)` - get headers with solutions
+    - `HeaderStore.cleanupOldSolutions(keepCount:)` - keep only last N
+  - **Health Check**: Now tries local verification first, P2P fallback if no solutions
+  - **Storage**: Only ~40KB extra (100 solutions × 400 bytes)
 - FIX #169: Persistent .onion Address with Keypair Storage
   - **Feature**: Same .onion address persists across app restarts
   - **Architecture**:
@@ -203,6 +222,48 @@ Latest fixes:
     - `Libraries/zipherx-ffi/src/tor.rs` - Persistent keypair hidden service startup
     - `Sources/Core/Network/TorManager.swift` - Keypair generation and Keychain storage
     - `Sources/ZipherX-Bridging-Header.h` - FFI function declarations
+- FIX #185: Equihash Proof-of-Work Verification at Startup
+  - **Problem**: Boost file and block headers trusted without verifying actual PoW
+  - **Solution**: Two Equihash verification steps:
+    1. Boost file: Sample 10 headers from P2P, verify Equihash(192,7)
+    2. Latest 100 headers: Verify via health check (both FAST and FULL START)
+  - **Key Notes**:
+    - P2P `getheaders` limit is 160 headers per request
+    - Post-Bubbles (585,318+) uses Equihash(192,7) with 400-byte solutions
+    - HeaderStore doesn't store solutions, requires fresh P2P fetch
+  - **Files Modified**:
+    - `Sources/Core/Wallet/WalletManager.swift` - Added `verifyBoostFileEquihash()`, `verifyLatestEquihash()`
+    - `Sources/Core/Wallet/WalletHealthCheck.swift` - Real Equihash verification in health check
+    - `Sources/App/ContentView.swift` - Boost file verification in FULL START
+- FIX #186: Fresh import header sync was syncing 11,000+ headers instead of 100
+  - **Problem**: `ensureHeaderTimestamps()` used `headerStoreMaxHeight` for limiting
+  - For fresh imports, `headerStoreMaxHeight = 0`, so limiting was SKIPPED
+  - Result: Header sync fell back to checkpoint 2926122 and synced 11,000+ headers
+  - **Solution**: Use `max(headerStoreHeight, boostFileHeight, chainHeight)` as reference
+  - Now fresh imports sync only 100 headers (~10 seconds) instead of 11,000+ (~6 minutes)
+  - **Files Modified**: `Sources/Core/Wallet/WalletManager.swift`
+- FIX #197 v2: Parallel witness computation with Rayon
+  - PHASE 1.5 witness updates now use `par_iter_mut()` for parallel processing
+  - Previous: Sequential O(targets × remaining_CMUs) - 56 seconds
+  - Now: Parallel updates across all CPU cores - ~15-20 seconds
+  - **Files Modified**: `Libraries/zipherx-ffi/src/lib.rs`
+- FIX #198: Skip 36s Tor wait for height verification after import
+  - After import completes, FIX #120 height verification triggered `fetchNetworkStats()`
+  - This waited for Tor restore (~1.5s), onion warmup (10s), P2P connections (~10s)
+  - Now uses cached chain height from UserDefaults (set during import)
+  - **Files Modified**: `Sources/App/ContentView.swift`
+- FIX #199: Rust optimization level changed from "z" to "3"
+  - Previous: `opt-level = "z"` (size optimization) - ~30% slower crypto
+  - Now: `opt-level = 3` (maximum speed) - faster Groth16 proofs
+  - **Files Modified**: `Libraries/zipherx-ffi/Cargo.toml`
+- FIX #200: SQLite WAL mode + performance pragmas
+  - Added to both WalletDatabase and HeaderStore:
+    - `journal_mode = WAL` - 10-50x faster writes
+    - `synchronous = NORMAL` - safe with WAL
+    - `cache_size = 32MB` (wallet) / `16MB` (headers)
+    - `mmap_size = 256MB` / `128MB` - memory-mapped I/O
+    - `temp_store = MEMORY` - temp tables in RAM
+  - **Files Modified**: `Sources/Core/Storage/WalletDatabase.swift`, `Sources/Core/Storage/HeaderStore.swift`
 
 ## Security Score: 100/100
 

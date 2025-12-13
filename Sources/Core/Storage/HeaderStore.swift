@@ -37,6 +37,22 @@ final class HeaderStore {
             throw DatabaseError.openFailed(errorMsg)
         }
 
+        // FIX #200: SQLite performance optimizations (same as WalletDatabase)
+        let performancePragmas = [
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous = NORMAL;",
+            "PRAGMA cache_size = -16000;",   // 16MB for headers
+            "PRAGMA mmap_size = 134217728;", // 128MB
+            "PRAGMA temp_store = MEMORY;"
+        ]
+        for pragma in performancePragmas {
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, pragma, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+
         try createTables()
         print("📂 HeaderStore opened successfully")
     }
@@ -90,16 +106,22 @@ final class HeaderStore {
                 throw DatabaseError.schemaCreationFailed(String(cString: sqlite3_errmsg(db)))
             }
         }
+
+        // FIX #188: Add solution column for Equihash verification (stores only last 100)
+        // This is a migration - only runs if column doesn't exist
+        let migrationSQL = "ALTER TABLE headers ADD COLUMN solution BLOB;"
+        sqlite3_exec(db, migrationSQL, nil, nil, nil)  // Ignore error if column exists
     }
 
     // MARK: - Header Operations
 
     /// Insert or replace a block header
+    /// FIX #188: Now includes Equihash solution for local verification
     func insertHeader(_ header: ZclassicBlockHeader) throws {
         let sql = """
             INSERT OR REPLACE INTO headers
-            (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -129,6 +151,14 @@ final class HeaderStore {
             sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(header.nonce.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 9, Int64(header.version))
+        // FIX #188: Store solution for Equihash verification
+        if !header.solution.isEmpty {
+            header.solution.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 10, ptr.baseAddress, Int32(header.solution.count), SQLITE_TRANSIENT)
+            }
+        } else {
+            sqlite3_bind_null(stmt, 10)
+        }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
@@ -691,6 +721,136 @@ final class HeaderStore {
             height: height,
             blockHash: blockHash
         )
+    }
+
+    // MARK: - FIX #188: Equihash Verification Support
+
+    /// Get headers with solutions for local Equihash verification
+    /// Returns the last N headers that have solutions stored
+    /// - Parameter count: Number of headers to retrieve (default 100)
+    func getHeadersWithSolutions(count: Int = 100) throws -> [ZclassicBlockHeader] {
+        let sql = """
+            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution
+            FROM headers
+            WHERE solution IS NOT NULL AND length(solution) > 0
+            ORDER BY height DESC
+            LIMIT ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int(stmt, 1, Int32(count))
+
+        var headers: [ZclassicBlockHeader] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let height = UInt64(sqlite3_column_int64(stmt, 0))
+
+            let hashLength = sqlite3_column_bytes(stmt, 1)
+            let blockHash = Data(bytes: sqlite3_column_blob(stmt, 1), count: Int(hashLength))
+
+            let prevLength = sqlite3_column_bytes(stmt, 2)
+            let prevHash = Data(bytes: sqlite3_column_blob(stmt, 2), count: Int(prevLength))
+
+            let merkleLength = sqlite3_column_bytes(stmt, 3)
+            let merkleRoot = Data(bytes: sqlite3_column_blob(stmt, 3), count: Int(merkleLength))
+
+            let saplingLength = sqlite3_column_bytes(stmt, 4)
+            let saplingRoot = Data(bytes: sqlite3_column_blob(stmt, 4), count: Int(saplingLength))
+
+            let time = UInt32(sqlite3_column_int64(stmt, 5))
+            let bits = UInt32(sqlite3_column_int64(stmt, 6))
+
+            let nonceLength = sqlite3_column_bytes(stmt, 7)
+            let nonce = Data(bytes: sqlite3_column_blob(stmt, 7), count: Int(nonceLength))
+
+            let version = UInt32(sqlite3_column_int64(stmt, 8))
+
+            let solutionLength = sqlite3_column_bytes(stmt, 9)
+            let solution = Data(bytes: sqlite3_column_blob(stmt, 9), count: Int(solutionLength))
+
+            let header = ZclassicBlockHeader(
+                version: version,
+                hashPrevBlock: prevHash,
+                hashMerkleRoot: merkleRoot,
+                hashFinalSaplingRoot: saplingRoot,
+                time: time,
+                bits: bits,
+                nonce: nonce,
+                solution: solution,
+                height: height,
+                blockHash: blockHash
+            )
+            headers.append(header)
+        }
+
+        return headers.reversed()  // Return in ascending height order
+    }
+
+    /// Clean up old Equihash solutions, keeping only the most recent N blocks
+    /// This saves storage while maintaining verification capability for recent blocks
+    /// - Parameter keepCount: Number of recent solutions to keep (default 100)
+    func cleanupOldSolutions(keepCount: Int = 100) throws {
+        // First, find the cutoff height
+        let findCutoffSQL = """
+            SELECT MIN(height) FROM (
+                SELECT height FROM headers
+                WHERE solution IS NOT NULL AND length(solution) > 0
+                ORDER BY height DESC
+                LIMIT ?
+            );
+        """
+
+        var cutoffStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, findCutoffSQL, -1, &cutoffStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(cutoffStmt) }
+
+        sqlite3_bind_int(cutoffStmt, 1, Int32(keepCount))
+
+        guard sqlite3_step(cutoffStmt) == SQLITE_ROW else { return }
+
+        let cutoffHeight = sqlite3_column_int64(cutoffStmt, 0)
+        guard cutoffHeight > 0 else { return }
+
+        // Now clear solutions below the cutoff height
+        let clearSQL = "UPDATE headers SET solution = NULL WHERE height < ?;"
+        var clearStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, clearSQL, -1, &clearStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(clearStmt) }
+
+        sqlite3_bind_int64(clearStmt, 1, cutoffHeight)
+
+        guard sqlite3_step(clearStmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let clearedCount = sqlite3_changes(db)
+        if clearedCount > 0 {
+            print("🗑️ FIX #188: Cleaned up \(clearedCount) old Equihash solutions (keeping last \(keepCount))")
+        }
+    }
+
+    /// Get count of headers with Equihash solutions stored
+    func getSolutionCount() throws -> Int {
+        let sql = "SELECT COUNT(*) FROM headers WHERE solution IS NOT NULL AND length(solution) > 0;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 
     // MARK: - Statistics

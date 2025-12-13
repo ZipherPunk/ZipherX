@@ -232,6 +232,27 @@ final class WalletDatabase {
             }
         }
 
+        // FIX #200: SQLite performance optimizations
+        // WAL mode: 10-50x faster writes, concurrent reads during writes
+        // cache_size: 32MB (default 2MB) - faster repeated queries
+        // mmap_size: 256MB - memory-mapped I/O for faster large reads
+        let performancePragmas = [
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous = NORMAL;",  // Safe with WAL mode
+            "PRAGMA cache_size = -32000;",   // 32MB (negative = KB)
+            "PRAGMA mmap_size = 268435456;", // 256MB
+            "PRAGMA temp_store = MEMORY;"    // Temp tables in memory
+        ]
+
+        for pragma in performancePragmas {
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, pragma, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+        print("⚡ FIX #200: SQLite performance pragmas applied (WAL, 32MB cache, 256MB mmap)")
+
         // Create tables
         try createTables()
 
@@ -1316,6 +1337,33 @@ final class WalletDatabase {
         print("📜 Marked note spent at height \(spentHeight) with synthetic txid")
     }
 
+    /// FIX #174: Get note info by nullifier (for external wallet spend detection)
+    /// Returns (id: Int64, value: UInt64) if note exists and is unspent, nil otherwise
+    /// NOTE: This function expects an UNHASHED nullifier from the blockchain
+    func getNoteByNullifier(nullifier: Data) throws -> (id: Int64, value: UInt64)? {
+        // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
+        let hashedNullifier = hashNullifier(nullifier)
+
+        let sql = "SELECT id, value FROM notes WHERE nf = ? AND is_spent = 0;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let value = UInt64(sqlite3_column_int64(stmt, 1))
+            return (id: id, value: value)
+        }
+        return nil
+    }
+
     /// Mark note as unspent (recover from failed broadcast)
     func markNoteUnspent(nullifier: Data) throws {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
@@ -1520,12 +1568,52 @@ final class WalletDatabase {
     }
 
     /// Update last scanned height
-    /// FIX: Added validation to prevent writing corrupted values
+    /// FIX #166/#167: Added validation to prevent writing corrupted values
+    /// Requires peer consensus validation before accepting any height update
     func updateLastScannedHeight(_ height: UInt64, hash: Data) throws {
-        // FIX: Validate height before writing to prevent corruption
-        let maxReasonableHeight: UInt64 = 10_000_000
+        // FIX #166: Much stricter validation - block height should NEVER exceed ~3M on Zclassic
+        // Current chain height is ~2.94M (Dec 2025)
+        // Real max possible height by 2030: ~3.5M (at 150s/block)
+        let maxReasonableHeight: UInt64 = 3_500_000
+
+        // DEBUG: Always log when this function is called with stack trace info
+        debugLog(.wallet, "📝 updateLastScannedHeight called with height=\(height)")
+
+        // FIX #167: CRITICAL - Validate against multiple trusted sources
+        // 1. HeaderStore (P2P verified headers - Equihash validated)
+        // 2. Cached chain height (from peer consensus)
+        // 3. Checkpoint height (known good state)
+        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+        let checkpointHeight = (try? getVerifiedCheckpointHeight()) ?? 0
+
+        // The maximum trusted height is the highest from these validated sources
+        let maxTrustedHeight = max(headerStoreHeight, cachedChainHeight, checkpointHeight)
+
+        // FIX #167: Only allow heights up to 100 blocks ahead of trusted height
+        // This prevents Sybil attacks where malicious peers report fake heights
+        let maxAheadOfTrusted: UInt64 = 100
+        if maxTrustedHeight > 0 && height > maxTrustedHeight + maxAheadOfTrusted {
+            print("🚨 [FIX #167] Blocking suspicious lastScannedHeight: \(height)")
+            print("   Max trusted height: \(maxTrustedHeight) (Header: \(headerStoreHeight), Cache: \(cachedChainHeight), Checkpoint: \(checkpointHeight))")
+            print("   Max allowed: \(maxTrustedHeight + maxAheadOfTrusted)")
+            print("   BLOCKED - This looks like a Sybil attack!")
+            Thread.callStackSymbols.prefix(10).forEach { print("   \($0)") }
+            return
+        }
+
+        // Extra check: if height is more than 1000 ahead of current stored value, it's suspicious
+        if let currentHeight = try? getLastScannedHeight() {
+            let diff = height > currentHeight ? height - currentHeight : 0
+            if diff > 1000 {
+                print("⚠️ [FIX #167] Large height jump: \(currentHeight) -> \(height) (+\(diff) blocks)")
+                // Allow if still within trusted range (handled above)
+            }
+        }
+
         guard height <= maxReasonableHeight else {
             print("🚨 [DATABASE] Refusing to write invalid lastScannedHeight: \(height)")
+            print("   Max reasonable: \(maxReasonableHeight)")
             return  // Silently ignore invalid updates
         }
 
@@ -1997,6 +2085,123 @@ final class WalletDatabase {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("🗑️ Cleared transaction history from database (secure)")
+    }
+
+    /// VUL-002: Delete a specific phantom transaction by txid
+    /// Returns the value of the deleted transaction (for balance restoration)
+    func deletePhantomTransaction(txid: Data) throws -> UInt64? {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // First get the value before deleting
+        let selectSql = "SELECT value FROM transaction_history WHERE txid = ? AND tx_type IN ('sent', 'α');"
+        var selectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(selectStmt) }
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        var deletedValue: UInt64? = nil
+        if sqlite3_step(selectStmt) == SQLITE_ROW {
+            deletedValue = UInt64(sqlite3_column_int64(selectStmt, 0))
+        }
+
+        // Now delete the transaction
+        let deleteSql = "DELETE FROM transaction_history WHERE txid = ? AND tx_type IN ('sent', 'α');"
+        var deleteStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(deleteStmt) }
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(deleteStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let deleted = sqlite3_changes(db)
+        if deleted > 0 {
+            let txidHex = txid.map { String(format: "%02x", $0) }.joined()
+            print("🗑️ VUL-002: Deleted phantom transaction \(txidHex) (value: \(deletedValue ?? 0))")
+        }
+
+        return deletedValue
+    }
+
+    /// VUL-002: Unmark a note as spent (restore it after phantom TX removal)
+    /// This is needed when a phantom TX incorrectly marked a note as spent
+    func unmarkNoteAsSpent(nullifier: Data) throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // VUL-009: Nullifier may be stored hashed
+        let nullifierToUse = isNullifierHashed(nullifier) ? nullifier : hashNullifier(nullifier)
+
+        // FIX: Column is named 'nf' not 'nullifier' in the notes table schema
+        let sql = """
+            UPDATE notes
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            WHERE nf = ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        nullifierToUse.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(nullifierToUse.count), nil)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let updated = sqlite3_changes(db)
+        if updated > 0 {
+            let nullifierHex = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("✅ VUL-002: Unmarked note as unspent (nullifier: \(nullifierHex)...)")
+        }
+    }
+
+    /// VUL-002: Get nullifiers of notes marked as spent in a specific transaction
+    func getNullifiersSpentInTx(txid: Data) throws -> [Data] {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // FIX: Column is named 'nf' not 'nullifier' in the notes table schema
+        let sql = "SELECT nf FROM notes WHERE spent_in_tx = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        var nullifiers: [Data] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let nullifierPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let nullifierLen = sqlite3_column_bytes(stmt, 0)
+            let nullifier = Data(bytes: nullifierPtr, count: Int(nullifierLen))
+            nullifiers.append(nullifier)
+        }
+
+        return nullifiers
     }
 
     /// FIX #162 v3: Rebuild transaction history from ALL notes
@@ -2967,8 +3172,10 @@ final class WalletDatabase {
             // This ensures UNIQUE(txid, tx_type) constraint works correctly
             let encryptedSentType = encryptTxType(.sent)
             sqlite3_bind_text(spentStmt, 4, encryptedSentType, -1, SQLITE_TRANSIENT)
-            // Store totalBalanceImpact (recipient + fee) so history sum equals current balance
-            sqlite3_bind_int64(spentStmt, 5, Int64(totalBalanceImpact))
+            // FIX #169: Store amountToRecipient (actual sent amount WITHOUT fee), not totalBalanceImpact
+            // The fee is stored separately in the fee column
+            // History display should show what was SENT TO RECIPIENT, not total balance decrease
+            sqlite3_bind_int64(spentStmt, 5, Int64(amountToRecipient))
             sqlite3_bind_int64(spentStmt, 6, Int64(fee))
             sqlite3_bind_null(spentStmt, 7)
             sqlite3_bind_null(spentStmt, 8)
@@ -3450,6 +3657,71 @@ final class WalletDatabase {
 
         print("📜 DB: getTransactionHistory returning \(items.count) items")
 
+        return items
+    }
+
+    /// VUL-002: Get all SENT transactions for blockchain verification
+    /// Used by WalletHealthCheck to detect phantom transactions
+    func getSentTransactions() throws -> [TransactionHistoryItem] {
+        guard db != nil else {
+            print("⚠️ getSentTransactions: Database not open")
+            return []
+        }
+
+        // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
+        let sql = """
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history
+            WHERE tx_type IN ('sent', 'α')
+            ORDER BY block_height DESC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var items: [TransactionHistoryItem] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let txidLen = sqlite3_column_bytes(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            var blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+
+            // If blockTime is NULL, try to get actual timestamp from HeaderStore
+            if blockTime == nil && height > 0 {
+                if let header = try? HeaderStore.shared.getHeader(at: height) {
+                    blockTime = UInt64(header.time)
+                }
+            }
+            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let value = UInt64(sqlite3_column_int64(stmt, 4))
+            let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
+            let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = String(cString: sqlite3_column_text(stmt, 8))
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
+
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            let decodedType = decryptTxType(typeStr)
+
+            items.append(TransactionHistoryItem(
+                txid: txidData,
+                height: height,
+                blockTime: blockTime,
+                type: decodedType,
+                value: value,
+                fee: fee,
+                toAddress: toAddress,
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .confirmed,
+                confirmations: confirmations
+            ))
+        }
+
+        print("📜 VUL-002: Found \(items.count) SENT transactions to verify")
         return items
     }
 
