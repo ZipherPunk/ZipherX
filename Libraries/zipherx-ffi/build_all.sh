@@ -19,6 +19,14 @@ echo ""
 
 cd "$SCRIPT_DIR"
 
+# FIX #201: Set deployment targets to match Xcode project settings
+# This prevents "built for newer macOS" linker warnings
+export MACOSX_DEPLOYMENT_TARGET=12.0
+export IPHONEOS_DEPLOYMENT_TARGET=14.0
+
+echo "📱 Deployment targets: macOS $MACOSX_DEPLOYMENT_TARGET, iOS $IPHONEOS_DEPLOYMENT_TARGET"
+echo ""
+
 # Build all targets
 echo "═══════════════════════════════════════════════════════════════"
 echo "🔨 Building for macOS (arm64)..."
@@ -81,6 +89,11 @@ cp target/aarch64-apple-ios/release/libzipherx_ffi.a \
 echo "  → iOS Simulator (arm64)..."
 cp target/aarch64-apple-ios-sim/release/libzipherx_ffi.a \
    "$XCFRAMEWORK_DIR/ios-arm64-simulator/libzipherx_ffi.a"
+
+cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/macos-arm64_x86_64/Headers/
+cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/ios-arm64/Headers/
+cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/ios-arm64-simulator/Headers/
+
 
 # Verify libraries
 echo ""
