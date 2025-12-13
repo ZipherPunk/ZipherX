@@ -4517,26 +4517,18 @@ final class WalletManager: ObservableObject {
         let startHeight = max(bubblesHeight, chainHeight > UInt64(count) ? chainHeight - UInt64(count) + 1 : bubblesHeight)
         let actualCount = Int(chainHeight - startHeight + 1)
 
-        // FIX #231 v2: First try full consensus, then fall back to best-effort
+        // FIX #231 v2: For Equihash, 3+ verified ZCL peers (170011/170012) = full consensus
+        // Zclassic network is smaller than Zcash - 3 agreeing peers is trustworthy
+        let EQUIHASH_CONSENSUS_THRESHOLD = 3
+
+        // Get headers using best-effort (returns headers from most agreeing peers)
         var allHeaders: [BlockHeader] = []
         var peerAgreement: Int = 0
-        var hadFullConsensus = false
 
-        // Try full consensus first
-        do {
-            let headers = try await NetworkManager.shared.getBlockHeaders(from: startHeight, count: actualCount)
-            allHeaders = headers
-            peerAgreement = 5  // Full consensus achieved
-            hadFullConsensus = true
-            print("✅ FIX #231: Got headers with full consensus (5+ peers)")
-        } catch {
-            // Full consensus failed - try best-effort
-            print("⚠️ FIX #231: Full consensus failed, trying best-effort...")
-            if let result = await NetworkManager.shared.getBlockHeadersBestEffort(from: startHeight, count: actualCount) {
-                allHeaders = result.headers
-                peerAgreement = result.agreementCount
-                print("⚠️ FIX #231: Got headers with reduced consensus (\(peerAgreement) peer(s) agree)")
-            }
+        if let result = await NetworkManager.shared.getBlockHeadersBestEffort(from: startHeight, count: actualCount) {
+            allHeaders = result.headers
+            peerAgreement = result.agreementCount
+            print("📋 FIX #231: Got headers with \(peerAgreement) peer(s) agreeing")
         }
 
         guard !allHeaders.isEmpty else {
@@ -4544,22 +4536,23 @@ final class WalletManager: ObservableObject {
             return .networkError(reason: "No headers received from any peers")
         }
 
-        // Verify Equihash for all fetched headers (even with reduced consensus!)
+        // Verify Equihash for all fetched headers
         let passed = verifyEquihashProofOfWork(headers: allHeaders)
         let success = passed == allHeaders.count
 
         if success {
-            if hadFullConsensus {
-                print("✅ FIX #185: Equihash PASSED with full consensus (\(passed)/\(allHeaders.count) headers)")
+            // 3+ peers = full consensus for Zclassic (no warning needed)
+            if peerAgreement >= EQUIHASH_CONSENSUS_THRESHOLD {
+                print("✅ FIX #185: Equihash PASSED (\(passed) headers, \(peerAgreement) peers)")
                 return .verified(count: passed)
             } else {
-                // FIX #231 v2: Equihash passed but with reduced consensus - still verified!
+                // 1-2 peers - verified but warn about reduced consensus
                 print("⚠️ FIX #231: Equihash PASSED with reduced consensus (\(passed) headers, \(peerAgreement) peers)")
                 return .verifiedReducedConsensus(count: passed, peers: peerAgreement)
             }
         } else {
-            // FIX #231: This IS critical - headers were received but Equihash failed!
-            print("🚨 FIX #185: Equihash verification FAILED! Only \(passed)/\(allHeaders.count) headers passed")
+            // CRITICAL: Headers received but Equihash failed - possible attack!
+            print("🚨 FIX #185: Equihash FAILED! Only \(passed)/\(allHeaders.count) headers passed")
             return .failed(verified: passed, total: allHeaders.count)
         }
     }
