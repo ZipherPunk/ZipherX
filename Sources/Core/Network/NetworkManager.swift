@@ -167,6 +167,27 @@ final class NetworkManager: ObservableObject {
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
     @Published private(set) var sybilAttackDetected: (peer: String, fakeHeight: UInt64, realHeight: UInt64)? = nil
 
+    // MARK: - FIX #175: Sybil Attack User Notifications
+
+    /// FIX #175: Alert when version-based Sybil attack detected (fake 170020 requirement)
+    /// Contains: (attackerCount: Int, bypassedTor: Bool)
+    @Published private(set) var sybilVersionAttackAlert: (attackerCount: Int, bypassedTor: Bool)? = nil
+
+    /// FIX #175: Alert when Tor is bypassed due to Sybil attack
+    @Published private(set) var torBypassedForSybil: Bool = false
+
+    // MARK: - FIX #174: External Wallet Spend Detection
+
+    /// FIX #174: Alert when an external wallet spent our funds (same private key imported elsewhere)
+    /// Contains: (txid: String, amount: UInt64) - amount is the spent note value
+    @Published private(set) var externalWalletSpendDetected: (txid: String, amount: UInt64)? = nil
+
+    /// FIX #174: Flag indicating there's a pending transaction (ours or external) blocking new sends
+    @Published private(set) var hasPendingMempoolTransaction: Bool = false
+
+    /// FIX #174: Reason why send is blocked (for UI display)
+    @Published private(set) var pendingTransactionReason: String? = nil
+
     /// Set of pending outgoing transaction IDs (for synchronous change detection)
     /// This is updated alongside the actor's pendingOutgoingTxs for sync access
     private var pendingOutgoingTxidSet: Set<String> = []
@@ -302,6 +323,11 @@ final class NetworkManager: ObservableObject {
     private var newAddresses: Set<String> = [] // Addresses we haven't tried yet
     private let addressLock = NSLock() // Thread safety for address collections
     private var isConnecting = false // Prevent concurrent connection attempts
+
+    // FIX #173: Sybil attack detection - track consecutive fake 170020 rejections
+    private var consecutiveSybilRejections: Int = 0
+    private var sybilBypassActive: Bool = false
+    private let SYBIL_BYPASS_THRESHOLD: Int = 10 // After 10 Sybil rejections, bypass Tor
 
     // Known public Zclassic nodes (DNS seeds + hardcoded)
     private let dnsSeedsZCL = [
@@ -723,6 +749,95 @@ final class NetworkManager: ObservableObject {
         print("🚨 [SYBIL ATTACK] This peer is banned INDEFINITELY - manual unban required through Settings!")
     }
 
+    /// FIX #172: Ban peer for sending fake protocol version requirements (Sybil attack)
+    /// Zclassic only has versions 170011 (Sapling) and 170012 (BIP155)
+    /// Peers claiming to require 170020+ are Sybil attackers!
+    func banPeerForSybilAttack(_ host: String) {
+        addressLock.lock()
+
+        // Permanent ban for Sybil attackers
+        let ban = BannedPeer(
+            address: host,
+            banTime: Date(),
+            banDuration: -1,  // PERMANENT
+            reason: .corruptedData  // Using corruptedData as closest match
+        )
+        bannedPeers[host] = ban
+        let newCount = bannedPeers.count
+
+        // Remove from known addresses
+        for (key, addr) in knownAddresses where addr.address.host == host {
+            knownAddresses.removeValue(forKey: key)
+            triedAddresses.remove(key)
+            newAddresses.remove(key)
+        }
+
+        // FIX #173: Track consecutive Sybil rejections
+        consecutiveSybilRejections += 1
+        print("🚨 [SYBIL] Consecutive Sybil rejections: \(consecutiveSybilRejections)/\(SYBIL_BYPASS_THRESHOLD)")
+
+        addressLock.unlock()
+
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
+        }
+
+        print("🚨 [SYBIL] PERMANENTLY BANNED \(host) for fake version requirement (170020 is NOT valid Zclassic!)")
+    }
+
+    // FIX #173: Reset Sybil counter when a legitimate peer connects
+    func resetSybilCounter() {
+        addressLock.lock()
+        if consecutiveSybilRejections > 0 {
+            print("✅ [SYBIL] Reset Sybil counter (was \(consecutiveSybilRejections)) - legitimate peer connected!")
+        }
+        consecutiveSybilRejections = 0
+        addressLock.unlock()
+    }
+
+    // FIX #173: Check if we should bypass Tor due to Sybil attack
+    func shouldBypassTorForSybil() -> Bool {
+        addressLock.lock()
+        let shouldBypass = consecutiveSybilRejections >= SYBIL_BYPASS_THRESHOLD && connectedPeers == 0
+        let rejectionCount = consecutiveSybilRejections
+        addressLock.unlock()
+
+        if shouldBypass && !sybilBypassActive {
+            print("🚨🚨🚨 [SYBIL] CRITICAL: \(rejectionCount) consecutive Sybil rejections detected!")
+            print("🚨 [SYBIL] All Tor-reachable peers are attackers - BYPASSING TOR for direct P2P!")
+            sybilBypassActive = true
+
+            // FIX #175: Notify user about Sybil attack and Tor bypass
+            DispatchQueue.main.async {
+                self.sybilVersionAttackAlert = (attackerCount: rejectionCount, bypassedTor: true)
+                self.torBypassedForSybil = true
+            }
+        }
+        return shouldBypass
+    }
+
+    // FIX #173: Mark Sybil bypass as complete (for re-enabling Tor later)
+    func completeSybilBypass() {
+        addressLock.lock()
+        sybilBypassActive = false
+        consecutiveSybilRejections = 0
+        addressLock.unlock()
+        print("✅ [SYBIL] Bypass complete - legitimate peers connected via direct P2P")
+
+        // FIX #175: Clear the bypass flag (but keep alert for user to see)
+        DispatchQueue.main.async {
+            self.torBypassedForSybil = false
+        }
+    }
+
+    /// FIX #175: Clear Sybil attack alert (called from UI after user acknowledges)
+    func clearSybilAttackAlert() {
+        DispatchQueue.main.async {
+            self.sybilVersionAttackAlert = nil
+            self.sybilAttackDetected = nil
+        }
+    }
+
     /// Get list of all currently banned peers
     func getBannedPeers() -> [BannedPeer] {
         addressLock.lock()
@@ -784,6 +899,7 @@ final class NetworkManager: ObservableObject {
 
     /// Select best peer to connect to based on scoring
     /// Filters .onion addresses based on Tor availability
+    /// FIX #189: Thread-safe access to knownAddresses
     private func selectBestAddress() -> PeerAddress? {
         addressLock.lock()
         defer { addressLock.unlock() }
@@ -1000,6 +1116,15 @@ final class NetworkManager: ObservableObject {
         for peer in peers {
             // SECURITY: Skip banned peers and handle negative heights (malicious peers)
             guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+
+            // FIX #196: Skip peers with invalid peerVersion - their peerStartHeight is garbage!
+            // When VERSION parsing fails (e.g., "Duplicate version message"), peerVersion is 0 or negative
+            // and peerStartHeight contains random data that could trigger false Sybil detection
+            guard peer.peerVersion >= Peer.minPeerProtocolVersion else {
+                print("⚠️ FIX #196: Skipping peer \(peer.host) with invalid version \(peer.peerVersion) - height data unreliable")
+                continue
+            }
+
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
 
             // FIX #111: DETECT AND BAN SYBIL ATTACKERS reporting impossible heights
@@ -1413,8 +1538,10 @@ final class NetworkManager: ObservableObject {
 
         // CRITICAL: If Tor mode is enabled, WAIT for Tor to connect first
         // Otherwise IPv4 peers will fail and get banned before Tor is ready
+        // FIX: Skip Tor wait if Tor is bypassed for faster repair/sync
         let torMode = await TorManager.shared.mode
-        if torMode == .enabled {
+        let torBypassed = await TorManager.shared.isTorBypassed
+        if torMode == .enabled && !torBypassed {
             var torConnected = await TorManager.shared.connectionState.isConnected
             if !torConnected {
                 print("🧅 Tor mode enabled - waiting for Tor to connect (max 30s)...")
@@ -1564,6 +1691,9 @@ final class NetworkManager: ObservableObject {
                         peers.append(peer)
                         connectedCount += 1
 
+                        // FIX #173: Reset Sybil counter - legitimate peer connected!
+                        self.resetSybilCounter()
+
                         // Set up block announcement listener
                         self.setupBlockListener(for: peer)
 
@@ -1614,6 +1744,58 @@ final class NetworkManager: ObservableObject {
         // Persist after successful connections
         persistAddresses()
         print("📊 Final: Connected to \(connectedCount)/\(targetPeers) target peers")
+
+        // FIX #173: Check for Sybil attack - if 0 connections and many Sybil rejections, bypass Tor
+        if connectedCount == 0 && shouldBypassTorForSybil() {
+            print("🚨 [FIX #173] SYBIL ATTACK DETECTED - Bypassing Tor for direct P2P connection!")
+
+            // Temporarily bypass Tor to connect to legitimate peers
+            let torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
+
+            if torWasBypassed {
+                print("🔌 [FIX #173] Reconnecting WITHOUT Tor to reach legitimate peers...")
+
+                // Clear the banned Sybil attackers (they were Tor exit node-specific)
+                // Keep only permanent bans for truly bad actors
+                addressLock.lock()
+                // Reset Sybil tracking
+                consecutiveSybilRejections = 0
+                addressLock.unlock()
+
+                // Try connecting again without Tor - use hardcoded peers only
+                for peer in hardcodedPeersZCL {
+                    let components = peer.split(separator: ":")
+                    guard components.count == 2, let port = UInt16(components[1]) else { continue }
+                    let address = PeerAddress(host: String(components[0]), port: port)
+
+                    do {
+                        print("🔄 [FIX #173] Trying hardcoded peer \(address.host):\(address.port) (direct)...")
+                        let peer = try await connectToPeer(address)
+                        peers.append(peer)
+                        connectedCount += 1
+                        setupBlockListener(for: peer)
+                        resetSybilCounter()
+                        print("✅ [FIX #173] Connected to legitimate peer \(address.host)!")
+
+                        if connectedCount >= 3 {
+                            break // Got enough peers
+                        }
+                    } catch {
+                        print("❌ [FIX #173] Hardcoded peer \(address.host) failed: \(error.localizedDescription)")
+                    }
+                }
+
+                if connectedCount > 0 {
+                    completeSybilBypass()
+                    // Note: Tor will be restored automatically by the bypass mechanism after massive ops
+                }
+
+                await MainActor.run {
+                    self.connectedPeers = connectedCount
+                    self.isConnected = connectedCount > 0
+                }
+            }
+        }
 
         // We can work with fewer peers, just warn
         if connectedCount < MIN_PEERS {
@@ -1901,6 +2083,10 @@ final class NetworkManager: ObservableObject {
         self.mempoolOutgoing = amount
         self.mempoolOutgoingTxCount = 1
 
+        // FIX #174: Set pending flag to disable SEND button
+        self.hasPendingMempoolTransaction = true
+        self.pendingTransactionReason = "Awaiting confirmation for your transaction"
+
         // Track in the actor (async but non-blocking) so confirmation checking works
         Task {
             _ = await txTrackingState.trackOutgoing(txid: txid, amount: amount)
@@ -1945,6 +2131,10 @@ final class NetworkManager: ObservableObject {
         Task {
             await txTrackingState.clearAllOutgoing()
         }
+        // FIX #174: Clear pending transaction flags when TX confirms
+        hasPendingMempoolTransaction = false
+        pendingTransactionReason = nil
+        externalWalletSpendDetected = nil
         print("🧹 Pending broadcast cleared (all pending state reset)")
     }
 
@@ -2140,23 +2330,36 @@ final class NetworkManager: ObservableObject {
         var confirmedCount = 0
 
         for txid in pendingTxids {
-            // FIX #120: InsightAPI commented out - P2P only
-            // Check if transaction has confirmations via InsightAPI
-            // do {
-            //     let txInfo = try await InsightAPI.shared.getTransaction(txid: txid)
-            //     print("📤 Tx \(txid.prefix(16))... has \(txInfo.confirmations) confirmations")
-            //     if txInfo.confirmations > 0 {
-            //         print("📤 Tx \(txid.prefix(16))... CONFIRMED! Calling confirmOutgoingTx...")
-            //         await confirmOutgoingTx(txid: txid)
-            //         confirmedCount += 1
-            //     }
-            // } catch {
-            //     print("📤 Failed to check tx \(txid.prefix(16))...: \(error)")
-            //     // If we can't find the tx and we've been tracking it, it might be confirmed
-            //     // with a different txid format. Check if mempoolOutgoing should be cleared
-            //     // after multiple failed lookups.
-            // }
-            print("📤 Tx \(txid.prefix(16))... (InsightAPI disabled - using P2P only)")
+            // FIX #162: P2P-only confirmation detection
+            // Strategy: Check if tx is NO LONGER in mempool (meaning it was mined)
+            // We know the tx was broadcast successfully (it was in mempool earlier),
+            // so if it's no longer in mempool, it must have been confirmed.
+
+            var isStillInMempool = false
+
+            // Try to check mempool from a connected peer
+            if let peer = getConnectedPeer() {
+                do {
+                    let mempoolTxs = try await peer.getMempoolTransactions()
+                    let txidData = Data(hexString: txid)
+                    isStillInMempool = txidData != nil && mempoolTxs.contains(txidData!)
+
+                    if isStillInMempool {
+                        print("📤 Tx \(txid.prefix(16))... still in mempool (not confirmed yet)")
+                    } else {
+                        print("📤 Tx \(txid.prefix(16))... NOT in mempool - likely CONFIRMED!")
+                        // Additional verification: Check if we have the change note in database
+                        // If tx was broadcast and is no longer in mempool, it's confirmed
+                        await confirmOutgoingTx(txid: txid)
+                        confirmedCount += 1
+                    }
+                } catch {
+                    print("📤 Tx \(txid.prefix(16))... mempool check failed: \(error.localizedDescription)")
+                    // On error, don't change status - will retry next cycle
+                }
+            } else {
+                print("📤 Tx \(txid.prefix(16))... no connected peer for mempool check")
+            }
         }
 
         // Safety: If all pending txids were confirmed but mempoolOutgoing is still > 0,
@@ -2457,6 +2660,43 @@ final class NetworkManager: ObservableObject {
                 continue
             }
 
+            // FIX #174: Check for external wallet spends (nullifiers from our notes in this tx)
+            // This detects if the same private key was imported into another wallet that spent our notes
+            if let nullifiers = parseShieldedSpends(from: rawTx) {
+                for nullifier in nullifiers {
+                    // Check if this nullifier belongs to one of our unspent notes
+                    if let noteInfo = try? WalletDatabase.shared.getNoteByNullifier(nullifier: nullifier) {
+                        // This tx is spending one of our notes!
+                        // Check if this is from our own pending transaction
+                        let isOurPending = pendingOutgoingTxids.contains(txHashHex) || isPendingOutgoingSync(txid: txHashHex)
+
+                        if !isOurPending {
+                            // EXTERNAL WALLET SPEND DETECTED!
+                            print("🚨🚨🚨 [EXTERNAL SPEND] TX \(txHashHex.prefix(12))... is spending our note!")
+                            print("🚨 [EXTERNAL SPEND] Note value: \(noteInfo.value) zatoshis, nullifier: \(nullifier.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            print("🚨 [EXTERNAL SPEND] This transaction was NOT sent by ZipherX - another wallet with the same private key sent it!")
+
+                            // FIX #174: Track external spend like our own outgoing tx
+                            // This ensures:
+                            // 1. User is notified
+                            // 2. SEND button is disabled until 1 confirmation
+                            // 3. When confirmed, the normal sync will mark the note as spent
+                            await trackPendingOutgoing(txid: txHashHex, amount: noteInfo.value)
+
+                            // Notify user about external wallet spend
+                            await MainActor.run {
+                                self.externalWalletSpendDetected = (txid: txHashHex, amount: noteInfo.value)
+                                self.hasPendingMempoolTransaction = true
+                                self.pendingTransactionReason = "External wallet is spending your funds"
+                            }
+
+                            // Send push notification for external spend
+                            NotificationManager.shared.notifyExternalWalletSpend(amount: noteInfo.value, txid: txHashHex)
+                        }
+                    }
+                }
+            }
+
             // Parse transaction for shielded outputs
             if let outputs = parseShieldedOutputs(from: rawTx) {
                 var txIncomingAmount: UInt64 = 0
@@ -2668,6 +2908,93 @@ final class NetworkManager: ObservableObject {
         }
 
         return outputs.isEmpty ? nil : outputs
+    }
+
+    /// FIX #174: Parse shielded spends (nullifiers) from raw transaction data
+    /// Returns array of nullifier Data (32 bytes each) for detecting external wallet spends
+    private func parseShieldedSpends(from rawTx: Data) -> [Data]? {
+        // Zcash v4 overwintered Sapling transaction format
+        guard rawTx.count > 200 else { return nil }
+
+        var pos = 0
+        var nullifiers: [Data] = []
+
+        // Header (4 bytes): version and fOverwintered flag
+        guard pos + 4 <= rawTx.count else { return nil }
+        let header = rawTx.loadUInt32(at: pos)
+        let version = header & 0x7FFFFFFF
+        let fOverwintered = (header & 0x80000000) != 0
+        pos += 4
+
+        // Must be Sapling v4 overwintered transaction
+        guard fOverwintered && version >= 4 else { return nil }
+
+        // nVersionGroupId (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        let versionGroupId = rawTx.loadUInt32(at: pos)
+        pos += 4
+
+        // Verify Sapling version group ID (0x892F2085)
+        guard versionGroupId == 0x892F2085 else { return nil }
+
+        // Skip vin (transparent inputs)
+        let (vinCount, vinBytes) = readCompactSize(rawTx, at: pos)
+        pos += vinBytes
+        for _ in 0..<min(vinCount, 10000) {
+            guard pos < rawTx.count else { return nil }
+            pos = skipTransparentInput(rawTx, offset: pos)
+        }
+
+        // Skip vout (transparent outputs)
+        let (voutCount, voutBytes) = readCompactSize(rawTx, at: pos)
+        pos += voutBytes
+        for _ in 0..<min(voutCount, 10000) {
+            guard pos < rawTx.count else { return nil }
+            pos = skipTransparentOutput(rawTx, offset: pos)
+        }
+
+        // Skip nLockTime (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        pos += 4
+
+        // Skip nExpiryHeight (4 bytes)
+        guard pos + 4 <= rawTx.count else { return nil }
+        pos += 4
+
+        // Skip valueBalance (8 bytes)
+        guard pos + 8 <= rawTx.count else { return nil }
+        pos += 8
+
+        // vShieldedSpend - EXTRACT nullifiers (each SpendDescription is 384 bytes)
+        // SpendDescription: cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
+        let (spendCount, spendBytes) = readCompactSize(rawTx, at: pos)
+        pos += spendBytes
+
+        for _ in 0..<min(spendCount, 10000) {
+            guard pos + 384 <= rawTx.count else { return nil }
+
+            // cv (32 bytes) - skip
+            pos += 32
+
+            // anchor (32 bytes) - skip
+            pos += 32
+
+            // nullifier (32 bytes) - EXTRACT
+            let nullifier = rawTx.subdata(in: pos..<pos+32)
+            nullifiers.append(nullifier)
+            pos += 32
+
+            // rk (32 bytes) - skip
+            pos += 32
+
+            // zkproof (192 bytes) - skip
+            pos += 192
+
+            // spendAuthSig (64 bytes) - skip
+            pos += 64
+        }
+
+        return nullifiers.isEmpty ? nil : nullifiers
     }
 
     /// Helper: Read compact size (varint) from data
@@ -2985,13 +3312,51 @@ final class NetworkManager: ObservableObject {
     /// Broadcast progress callback type
     typealias BroadcastProgressCallback = (_ phase: String, _ detail: String?, _ progress: Double?) -> Void
 
+    /// VUL-002: Broadcast result struct - includes mempool verification status
+    /// CRITICAL: Database writes should ONLY happen when mempoolVerified is true
+    struct BroadcastResult {
+        let txId: String
+        let mempoolVerified: Bool
+        let peerCount: Int  // How many peers accepted
+    }
+
     /// Broadcast transaction with multi-peer propagation and progress reporting
     /// Primary: P2P broadcast to connected peers
     /// Fallback: InsightAPI broadcast if no P2P peers available
-    /// Success = at least one peer/API accepted + mempool confirms (FAST EXIT)
+    /// VUL-002: Returns BroadcastResult with mempoolVerified flag - CRITICAL for database writes
     /// NEW: Pass amount to enable instant UI feedback when first peer accepts
-    func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> String {
+    func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> BroadcastResult {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
+
+        // ============================================================================
+        // VUL-002 FIX: Validate Sapling proofs LOCALLY before broadcasting
+        // This prevents broadcasting invalid transactions that peers would relay but
+        // that the network mempool would ultimately reject. Without this validation,
+        // an invalid TX could cause the wallet to mark notes as spent incorrectly.
+        // ============================================================================
+        onProgress?("verify", "Validating zk-SNARK proofs...", 0.0)
+
+        // Get chain height for branch ID selection (Buttercup since height 707,000)
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await getChainHeight()
+        } catch {
+            // Fallback to cached chain height if network is unreliable
+            chainHeight = self.chainHeight > 0 ? self.chainHeight : 2_940_000  // Safe default above Buttercup
+            print("⚠️ Using cached chain height for TX validation: \(chainHeight)")
+        }
+
+        // Verify Sapling spend/output proofs and binding signature
+        let verifyResult = ZipherXFFI.isTransactionValid(txData: rawTx, chainHeight: chainHeight)
+        if !verifyResult.valid {
+            let errorDesc = verifyResult.error?.errorDescription ?? "Unknown verification error"
+            print("❌ VUL-002: Transaction verification FAILED: \(errorDesc)")
+            print("❌ VUL-002: This transaction would be rejected by the mempool!")
+            print("❌ VUL-002: Aborting broadcast to prevent invalid state")
+            throw NetworkError.transactionRejected
+        }
+        print("✅ VUL-002: Transaction verification PASSED - proofs valid, safe to broadcast")
+        onProgress?("verify", "Proofs validated ✓", 0.1)
 
         // FIX #160: Check if Tor is enabled - need longer timeouts
         let torEnabled = await TorManager.shared.mode == .enabled
@@ -3115,37 +3480,47 @@ final class NetworkManager: ObservableObject {
                     return
                 }
 
-                // FIX #120: InsightAPI mempool check commented out - P2P only
-                // If P2P peers accepted, assume success (mempool check via API disabled)
-                onProgress?("verify", "Propagating to miners...", 0.8)
+                // ============================================================================
+                // VUL-002: MANDATORY mempool verification before marking as verified
+                // This is CRITICAL - peers may relay invalid TXs but mempool rejects them
+                // Without this check, wallet records phantom TXs that never confirm
+                // ============================================================================
+                onProgress?("verify", "Verifying mempool acceptance...", 0.6)
 
-                // Check mempool - 5 attempts with 1 second between each (5 seconds total)
+                // Check mempool - 5 attempts with 2 seconds between each (10 seconds total)
                 // This gives time for transaction to propagate and be validated by the network
-                // for attempt in 1...5 {
-                //     onProgress?("verify", "Verifying mempool (attempt \(attempt)/5)...", 0.5 + Double(attempt) * 0.08)
-                //     if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
-                //         print("✅ Transaction VERIFIED in mempool: \(txId)")
-                //         onProgress?("verify", "In mempool - awaiting miners", 1.0)
-                //         await state.setVerified()
-                //         // Update UI state: mempool verified (for progressive messaging)
-                //         await MainActor.run {
-                //             self.setMempoolVerified()
-                //         }
-                //         return // Exit immediately!
-                //     }
-                //     print("⏳ Mempool check attempt \(attempt)/5: not yet visible")
-                //     if attempt < 5 {
-                //         try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second between checks
-                //     }
-                // }
-                // print("❌ Transaction NOT found in mempool after 5 attempts")
+                var mempoolVerified = false
+                for attempt in 1...5 {
+                    onProgress?("verify", "Verifying mempool (attempt \(attempt)/5)...", 0.5 + Double(attempt) * 0.08)
+                    do {
+                        if try await InsightAPI.shared.checkTransactionExists(txid: txId) {
+                            print("✅ VUL-002: Transaction VERIFIED in mempool: \(txId)")
+                            onProgress?("verify", "✅ In mempool - awaiting miners", 1.0)
+                            mempoolVerified = true
+                            await state.setVerified()
+                            // Update UI state: mempool verified (for progressive messaging)
+                            await MainActor.run {
+                                self.setMempoolVerified()
+                            }
+                            return // Exit immediately - mempool confirmed!
+                        }
+                    } catch {
+                        print("⚠️ Mempool check attempt \(attempt)/5 error: \(error.localizedDescription)")
+                    }
+                    print("⏳ Mempool check attempt \(attempt)/5: not yet visible")
+                    if attempt < 5 {
+                        try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds between checks
+                    }
+                }
 
-                // P2P only mode: If peers accepted, mark as verified
-                print("✅ P2P broadcast accepted - marking as verified (InsightAPI disabled)")
-                onProgress?("verify", "Accepted by network - awaiting miners", 1.0)
-                await state.setVerified()
-                await MainActor.run {
-                    self.setMempoolVerified()
+                // VUL-002: If mempool verification failed, DO NOT mark as verified
+                // The caller should NOT write to database without mempool confirmation
+                if !mempoolVerified {
+                    print("❌ VUL-002: Transaction NOT found in mempool after 5 attempts")
+                    print("⚠️ VUL-002: Peers accepted but mempool rejected - DO NOT record to database!")
+                    onProgress?("verify", "⚠️ NOT in mempool - may be rejected", 1.0)
+                    // DO NOT call state.setVerified() - this is intentional for VUL-002
+                    // The caller will receive mempoolVerified=false and should not write to DB
                 }
             }
 
@@ -3207,9 +3582,8 @@ final class NetworkManager: ObservableObject {
                 }
             }
 
-            // Return the computed txid - the TX was sent, just no explicit ACK received
-            // The receiver may still see it in mempool (as happened in the reported bug)
-            return computedTxId
+            // VUL-002: Return with mempoolVerified=false - caller should NOT write to database
+            return BroadcastResult(txId: computedTxId, mempoolVerified: false, peerCount: 0)
         }
 
         let successCount = await state.getSuccessCount()
@@ -3217,25 +3591,26 @@ final class NetworkManager: ObservableObject {
 
         print("📡 Transaction broadcast to \(successCount)/\(peerCount) peers: \(txId)")
 
-        // FIX #160: In P2P-only mode, if at least one peer accepted, consider it success
-        // The old InsightAPI mempool check is disabled, so !verified doesn't mean rejection
-        // P2P protocol: no reject message = transaction accepted into peer's mempool
-        if successCount > 0 {
-            print("✅ FIX #160: \(successCount) peer(s) accepted - broadcast successful")
-            onProgress?("verify", "Accepted by \(successCount) node(s) - awaiting miners", 1.0)
-        } else if !verified {
-            // No peer accepted AND not verified - but TX was still sent to network
-            // Don't throw error - we already returned computedTxId above in this case
-            print("⚠️ FIX #160: No explicit acceptance, but TX was sent to network")
+        // VUL-002: Return the actual mempool verification status
+        // Caller MUST check mempoolVerified before writing to database
+        if verified {
+            print("✅ VUL-002: Broadcast SUCCESS with mempool verification")
+            onProgress?("verify", "✅ In mempool - awaiting miners", 1.0)
+        } else if successCount > 0 {
+            // Peers accepted but mempool didn't confirm - POTENTIAL PHANTOM TX!
+            print("⚠️ VUL-002: Peers accepted but mempool NOT verified - DO NOT write to database!")
+            onProgress?("verify", "⚠️ Peers accepted but NOT in mempool", 1.0)
+        } else {
+            print("⚠️ VUL-002: No explicit acceptance, TX was sent to network")
             onProgress?("verify", "Sent to network - awaiting confirmation", 0.9)
         }
 
-        return txId
+        return BroadcastResult(txId: txId, mempoolVerified: verified, peerCount: successCount)
     }
 
     /// Broadcast transaction with multi-peer propagation (without progress)
-    /// Success = at least one peer accepted the transaction (returned txid)
-    func broadcastTransaction(_ rawTx: Data) async throws -> String {
+    /// VUL-002: Returns BroadcastResult with mempoolVerified status
+    func broadcastTransaction(_ rawTx: Data) async throws -> BroadcastResult {
         return try await broadcastTransactionWithProgress(rawTx, onProgress: nil)
     }
 
@@ -4299,10 +4674,13 @@ final class NetworkManager: ObservableObject {
                     // Set up block announcement listener
                     setupBlockListener(for: peer)
 
+                    // FIX #189: Thread-safe access to knownAddresses
                     let key = "\(address.host):\(address.port)"
+                    addressLock.lock()
                     knownAddresses[key]?.successes += 1
                     newAddresses.remove(key)
                     triedAddresses.insert(key)
+                    addressLock.unlock()
 
                     // Also update custom node stats if this is a custom node
                     recordCustomNodeConnection(host: address.host, port: address.port, success: true)
@@ -4314,8 +4692,11 @@ final class NetworkManager: ObservableObject {
                         }
                     }
                 } else {
+                    // FIX #189: Thread-safe access to knownAddresses
                     let key = "\(address.host):\(address.port)"
+                    addressLock.lock()
                     knownAddresses[key]?.attempts += 1
+                    addressLock.unlock()
                 }
             }
 
