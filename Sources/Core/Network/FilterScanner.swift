@@ -845,14 +845,15 @@ final class FilterScanner {
                 }
             }
 
-            // FIX #190 v4: PRE-FETCH ALL BLOCKS WITH FINE-GRAINED PROGRESS
-            // - Uses 160 blocks per batch (matching P2P getdata limit) for frequent progress
+            // FIX #190 v5: PRE-FETCH ALL BLOCKS WITH OPTIMIZED BATCH SIZE
+            // - Uses 500 blocks per batch (balance between progress updates and speed)
+            // - Fewer batches = less P2P overhead = faster sync
             // - Progress during FETCH phase: "📥 Fetching blocks X/Y"
             // - Progress during PROCESSING phase: "🔧 Processing blocks X/Y"
             let totalBlocksToFetch = Int(targetHeight - currentHeight + 1)
-            let prefetchBatchSize = 160  // Match P2P getdata limit for frequent progress updates
+            let prefetchBatchSize = 500  // 500 blocks per batch for speed (6721/500 = 14 batches vs 42)
 
-            print("🚀 FIX #190 v4: Pre-fetching \(totalBlocksToFetch) blocks (batch size: \(prefetchBatchSize))...")
+            print("🚀 FIX #190 v5: Pre-fetching \(totalBlocksToFetch) blocks (batch size: \(prefetchBatchSize))...")
             onStatusUpdate?("prefetch", "📥 Fetching 0/\(totalBlocksToFetch) blocks...")
             let prefetchStartTime = Date()
 
@@ -943,7 +944,7 @@ final class FilterScanner {
                     scannedBlocks += 1
                     processedCount += 1
 
-                    // FIX #190 v4: Report PROCESSING progress every 160 blocks (matching fetch batch)
+                    // FIX #190 v5: Report PROCESSING progress every 500 blocks (matching fetch batch)
                     // Progress is 50-100% of PHASE 2 (fetch was 0-50%)
                     if processedCount % prefetchBatchSize == 0 || processedCount == 1 {
                         let processProgress = Double(processedCount) / Double(totalBlocksToFetch)
