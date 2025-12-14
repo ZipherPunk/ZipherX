@@ -1181,6 +1181,13 @@ struct ContentView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
+                // FIX #242: Floating catch-up indicator when returning from background
+                // Shows in ORANGE when wallet is behind blockchain after app becomes active
+                if !isInitialSync && walletManager.isCatchingUp && !walletManager.isSyncing {
+                    floatingCatchUpIndicator
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
                 // FIX #144: Floating header sync progress indicator
                 // Shows when syncing block timestamps - NOW SHOWS DURING INITIAL SYNC TOO
                 // Removed !isInitialSync condition so progress bar appears immediately at startup
@@ -1247,6 +1254,13 @@ struct ContentView: View {
             recordUserActivity()
             // Start inactivity timer when app becomes active
             startInactivityTimer()
+
+            // FIX #242: Check if wallet is behind and catch up
+            if hasCompletedInitialSync {
+                Task {
+                    await walletManager.checkAndCatchUp()
+                }
+            }
 
         case .inactive:
             // Brief transition state - don't change lock status
@@ -1899,6 +1913,83 @@ struct ContentView: View {
             )
             .cornerRadius(8)
             .shadow(color: themeManager.currentTheme.shadowColor.opacity(0.3), radius: 5, x: 0, y: -2)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+            #if os(macOS)
+            .frame(maxWidth: 400)
+            #endif
+        }
+    }
+
+    // MARK: - FIX #242: Floating Catch-Up Indicator
+
+    /// Floating progress indicator shown when wallet is catching up after returning from background
+    /// Displays in ORANGE to distinguish from regular sync
+    private var floatingCatchUpIndicator: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 8) {
+                // Status text with warning icon
+                HStack(spacing: 8) {
+                    // Spinning sync icon
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 14))
+                        .foregroundColor(.orange)
+                        .rotationEffect(.degrees(walletManager.isCatchingUp ? 360 : 0))
+                        .animation(walletManager.isCatchingUp ? Animation.linear(duration: 1.0).repeatForever(autoreverses: false) : .default, value: walletManager.isCatchingUp)
+
+                    Text("Syncing...")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(.orange)
+
+                    Spacer()
+
+                    // Blocks behind count
+                    if walletManager.blocksBehind > 0 {
+                        Text("\(walletManager.blocksBehind) blocks behind")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.orange)
+                    }
+                }
+
+                // Progress bar in orange
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(Color.orange.opacity(0.2))
+                            .frame(height: 6)
+
+                        // Animated indeterminate progress
+                        Rectangle()
+                            .fill(Color.orange)
+                            .frame(width: geometry.size.width * 0.3, height: 6)
+                            .offset(x: walletManager.isCatchingUp ? geometry.size.width * 0.7 : 0)
+                            .animation(walletManager.isCatchingUp ? Animation.easeInOut(duration: 1.0).repeatForever(autoreverses: true) : .default, value: walletManager.isCatchingUp)
+                    }
+                    .cornerRadius(3)
+                }
+                .frame(height: 6)
+
+                // Warning about SEND disabled
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange.opacity(0.8))
+                    Text("SEND disabled until sync complete")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange.opacity(0.8))
+                    Spacer()
+                }
+            }
+            .padding(12)
+            .background(Color.black)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.orange.opacity(0.7), lineWidth: 2)
+            )
+            .cornerRadius(8)
+            .shadow(color: Color.orange.opacity(0.3), radius: 8, x: 0, y: -2)
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
             #if os(macOS)

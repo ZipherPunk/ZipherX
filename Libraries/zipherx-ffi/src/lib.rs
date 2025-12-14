@@ -949,8 +949,11 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
                 }
             };
 
-            // Copy to output buffer
-            let out_slice = slice::from_raw_parts_mut(output, 564);
+            // FIX #230: Copy to output buffer with safe slice validation
+            let out_slice = match safe_slice_mut(output, 564) {
+                Some(s) => s,
+                None => return 0,  // Invalid output buffer
+            };
             out_slice[0..11].copy_from_slice(&diversifier);
             out_slice[11..19].copy_from_slice(&value.to_le_bytes());
             out_slice[19..51].copy_from_slice(&rcm);
@@ -1187,7 +1190,19 @@ pub unsafe extern "C" fn zipherx_double_sha256(
 ) -> bool {
     use sha2::{Sha256, Digest};
 
-    let input = slice::from_raw_parts(data, len);
+    // FIX #230: Use safe_slice for bounds checking
+    let input = match safe_slice(data, len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ zipherx_double_sha256: Invalid input pointer or length");
+            return false;
+        }
+    };
+
+    if output.is_null() {
+        eprintln!("❌ zipherx_double_sha256: Output pointer is null");
+        return false;
+    }
 
     let hash1 = Sha256::digest(input);
     let hash2 = Sha256::digest(&hash1);
@@ -1219,7 +1234,14 @@ pub unsafe extern "C" fn zipherx_encode_spending_key(
         return 0;
     }
 
-    let sk_slice = slice::from_raw_parts(sk, 169);
+    // FIX #230: Use safe_slice for bounds checking
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ zipherx_encode_spending_key: Invalid spending key pointer");
+            return 0;
+        }
+    };
 
     // Parse the ExtendedSpendingKey
     let extsk = match ExtendedSpendingKey::read(&sk_slice[..]) {
@@ -1323,9 +1345,21 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
         return false;
     }
 
-    // Create slices from the raw pointers
-    let spend_bytes = std::slice::from_raw_parts(spend_data, spend_len);
-    let output_bytes = std::slice::from_raw_parts(output_data, output_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let spend_bytes = match safe_slice(spend_data, spend_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spend params pointer");
+            return false;
+        }
+    };
+    let output_bytes = match safe_slice(output_data, output_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid output params pointer");
+            return false;
+        }
+    };
 
     eprintln!("📂 Loading prover from memory...");
 
@@ -1690,19 +1724,37 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     }
     debug_log!("✅ Spend added successfully");
 
-    // Prepare memo
+    // FIX #230: Prepare memo with safe_slice
     let memo_bytes = if memo.is_null() {
         [0u8; 512]
     } else {
-        let memo_slice = slice::from_raw_parts(memo, 512);
+        let memo_slice = match safe_slice(memo, 512) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        };
         let mut m = [0u8; 512];
         m.copy_from_slice(memo_slice);
         m
     };
-    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
 
-    // Convert amount to Amount type
-    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    // FIX #230: Convert amount to Amount type (replace .unwrap())
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid amount: {}", amount);
+            return false;
+        }
+    };
 
     // Add output to recipient
     if let Err(e) = builder.add_sapling_output(
@@ -1715,11 +1767,17 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         return false;
     }
 
-    // Add change output if needed
+    // FIX #230: Add change output with safe Amount conversion
     let change = note_value - amount - fee;
     if change > 0 {
         let change_memo = MemoBytes::empty();
-        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("❌ Invalid change amount: {}", change);
+                return false;
+            }
+        };
         // Send change back to sender's default address
         let (_, change_addr) = extsk.default_address();
         if let Err(e) = builder.add_sapling_output(
@@ -1733,9 +1791,16 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         }
     }
 
-    // Build the transaction with proofs
+    // FIX #230: Build the transaction with proofs (safe fee conversion)
     debug_log!("🔨 Building transaction...");
-    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid fee amount: {}", fee);
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Failed to build transaction: {:?}", e);
@@ -1798,6 +1863,7 @@ pub struct SpendInfo {
 /// - nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
 ///
 /// Returns true on success, false on failure
+/// FIX #230: Now uses safe_slice and safe_lock! for bounds validation
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_build_transaction_multi(
     sk: *const u8,
@@ -1816,8 +1882,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         return false;
     }
 
-    // Get the prover
-    let prover_guard = PROVER.lock().unwrap();
+    // FIX #230: Use safe_lock! to avoid panic on poisoned mutex
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ Failed to acquire prover lock");
+            return false;
+        }
+    };
     let prover = match prover_guard.as_ref() {
         Some(p) => p,
         None => {
@@ -1826,9 +1898,26 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         }
     };
 
-    // Parse inputs
-    let sk_slice = slice::from_raw_parts(sk, 169);
-    let to_addr_slice = slice::from_raw_parts(to_address, 43);
+    // FIX #230: Validate input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return false;
+        }
+    };
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+
+    if tx_out.is_null() || tx_out_len.is_null() || nullifiers_out.is_null() {
+        eprintln!("❌ Null output pointers");
+        return false;
+    }
 
     // Deserialize spending key
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
@@ -1839,8 +1928,15 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         }
     };
 
-    // Parse destination address
-    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+    // FIX #230: Parse destination address (replace .unwrap())
+    let to_addr_arr: [u8; 43] = match safe_try_into(to_addr_slice) {
+        Some(arr) => arr,
+        None => {
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
         Some(addr) => addr,
         None => {
             eprintln!("❌ Invalid destination address");
@@ -1851,17 +1947,42 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     // Calculate fee (standard 10000 zatoshis)
     let fee = 10000u64;
 
-    // Parse all spends and calculate total input value
-    let spend_infos = slice::from_raw_parts(spends, spend_count);
+    // FIX #230: Parse all spends with safe pointer validation
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_count * std::mem::size_of::<*const SpendInfo>()) {
+        Some(_) => slice::from_raw_parts(spends, spend_count),
+        None => {
+            eprintln!("❌ Invalid spends pointer");
+            return false;
+        }
+    };
     let mut total_input: u64 = 0;
     let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
 
     for (i, spend_ptr) in spend_infos.iter().enumerate() {
         let spend = &**spend_ptr;
 
-        let witness_slice = slice::from_raw_parts(spend.witness_data, spend.witness_len);
-        let rcm_slice = slice::from_raw_parts(spend.note_rcm, 32);
-        let div_slice = slice::from_raw_parts(spend.note_diversifier, 11);
+        // FIX #230: Validate spend data pointers
+        let witness_slice = match safe_slice(spend.witness_data, spend.witness_len) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid witness pointer for spend {}", i);
+                return false;
+            }
+        };
+        let rcm_slice = match safe_slice(spend.note_rcm, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid rcm pointer for spend {}", i);
+                return false;
+            }
+        };
+        let div_slice = match safe_slice(spend.note_diversifier, 11) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid diversifier pointer for spend {}", i);
+                return false;
+            }
+        };
 
         // Parse note commitment randomness
         let mut rcm_bytes = [0u8; 32];
@@ -1958,19 +2079,37 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         debug_log!("✅ Spend {} added successfully", i);
     }
 
-    // Prepare memo
+    // FIX #230: Prepare memo with safe_slice
     let memo_bytes = if memo.is_null() {
         [0u8; 512]
     } else {
-        let memo_slice = slice::from_raw_parts(memo, 512);
+        let memo_slice = match safe_slice(memo, 512) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid memo pointer in multi-input tx");
+                return false;
+            }
+        };
         let mut m = [0u8; 512];
         m.copy_from_slice(memo_slice);
         m
     };
-    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("❌ Invalid memo bytes in multi-input tx: {:?}", e);
+            return false;
+        }
+    };
 
-    // Add output to recipient
-    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    // FIX #230: Add output to recipient (safe Amount conversion)
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid amount in multi-input tx: {}", amount);
+            return false;
+        }
+    };
     if let Err(e) = builder.add_sapling_output(
         Some(extsk.expsk.ovk),
         to_addr,
@@ -1981,11 +2120,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         return false;
     }
 
-    // Add change output if needed
+    // FIX #230: Add change output with safe Amount conversion
     let change = total_input - amount - fee;
     if change > 0 {
         let change_memo = MemoBytes::empty();
-        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("❌ Invalid change amount in multi-input tx: {}", change);
+                return false;
+            }
+        };
         let (_, change_addr) = extsk.default_address();
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
@@ -1999,9 +2144,16 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         debug_log!("💰 Change output: {} zatoshis", change);
     }
 
-    // Build the transaction with proofs
+    // FIX #230: Build transaction with safe fee conversion
     debug_log!("🔨 Building multi-input transaction...");
-    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid fee amount in multi-input tx: {}", fee);
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Failed to build transaction: {:?}", e);
@@ -2056,7 +2208,14 @@ pub unsafe extern "C" fn zipherx_compute_value_commitment(
     rcv: *const u8,
     cv_out: *mut u8,
 ) -> bool {
-    let rcv_slice = slice::from_raw_parts(rcv, 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let rcv_slice = match safe_slice(rcv, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcv pointer");
+            return false;
+        }
+    };
 
     let mut rcv_bytes = [0u8; 32];
     rcv_bytes.copy_from_slice(rcv_slice);
@@ -2097,10 +2256,35 @@ pub unsafe extern "C" fn zipherx_encrypt_note(
 ) -> bool {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
 
-    let div_slice = slice::from_raw_parts(diversifier, 11);
-    let pk_d_slice = slice::from_raw_parts(pk_d, 32);
-    let rcm_slice = slice::from_raw_parts(rcm, 32);
-    let memo_slice = slice::from_raw_parts(memo, 512);
+    // FIX #230: Use safe_slice for all input parameters
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid diversifier pointer in encrypt_note");
+            return false;
+        }
+    };
+    let pk_d_slice = match safe_slice(pk_d, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid pk_d pointer in encrypt_note");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcm pointer in encrypt_note");
+            return false;
+        }
+    };
+    let memo_slice = match safe_slice(memo, 512) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid memo pointer in encrypt_note");
+            return false;
+        }
+    };
 
     // Generate ephemeral secret key
     let esk = jubjub::Fr::random(&mut OsRng);
@@ -2191,9 +2375,20 @@ pub extern "C" fn zipherx_tree_init() -> bool {
 /// Returns the position of the added commitment
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
-    let cmu_slice = slice::from_raw_parts(cmu, 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in tree_append");
+            return u64::MAX;
+        }
+    };
 
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
     let tree = match tree_guard.as_mut() {
         Some(t) => t,
         None => return u64::MAX, // Tree not initialized
@@ -2238,15 +2433,29 @@ pub unsafe extern "C" fn zipherx_tree_append_batch(
         return u64::MAX;
     }
 
-    let data = slice::from_raw_parts(cmus_data, cmu_count * 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(cmus_data, cmu_count * 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMUs data pointer in tree_append_batch");
+            return u64::MAX;
+        }
+    };
 
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
     let tree = match tree_guard.as_mut() {
         Some(t) => t,
         None => return u64::MAX,
     };
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
     let start_position = *pos_guard;
 
     // Parse all CMUs first
@@ -2312,7 +2521,14 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
         return u64::MAX;
     }
 
-    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness pointer in tree_load_witness");
+            return u64::MAX;
+        }
+    };
 
     // Deserialize the IncrementalWitness directly
     // Format: serialized IncrementalWitness (variable length)
@@ -2326,7 +2542,11 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
         }
     };
 
-    let mut witnesses_guard = WITNESSES.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
     let index = witnesses_guard.len();
     witnesses_guard.push(witness);
 
@@ -2338,7 +2558,11 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
 /// root_out: 32-byte output buffer for the root
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
-    let tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
     let tree = match tree_guard.as_ref() {
         Some(t) => t,
         None => return false,
@@ -2346,7 +2570,10 @@ pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
 
     let root = tree.root();
     let mut root_bytes = Vec::new();
-    root.write(&mut root_bytes).unwrap();
+    if root.write(&mut root_bytes).is_err() {
+        eprintln!("❌ Failed to write root bytes");
+        return false;
+    }
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     true
@@ -2369,11 +2596,27 @@ pub unsafe extern "C" fn zipherx_witness_update(
         return false;
     }
 
-    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
-    let cmu_slice = slice::from_raw_parts(cmu, 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness pointer in witness_update");
+            return false;
+        }
+    };
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in witness_update");
+            return false;
+        }
+    };
 
-    // Parse position from witness
-    let position = u32::from_le_bytes(witness_slice[0..4].try_into().unwrap());
+    // FIX #230: Parse position from witness (safe conversion)
+    let position = match witness_slice[0..4].try_into() {
+        Ok(bytes) => u32::from_le_bytes(bytes),
+        Err(_) => return false,
+    };
 
     // Parse CMU as node
     let mut cmu_bytes = [0u8; 32];
@@ -2473,7 +2716,11 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
     tree_out: *mut u8,
     tree_out_len: *mut usize,
 ) -> bool {
-    let tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
     let tree = match tree_guard.as_ref() {
         Some(t) => t,
         None => return false,
@@ -2481,8 +2728,11 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
 
     let mut data = Vec::new();
 
-    // Write tree size first
-    let pos_guard = TREE_POSITION.lock().unwrap();
+    // FIX #230: Write tree size with safe_lock
+    let pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
     data.extend_from_slice(&pos_guard.to_le_bytes());
 
     // Serialize tree
@@ -2514,10 +2764,20 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
         return false;
     }
 
-    let data = slice::from_raw_parts(tree_data, tree_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(tree_data, tree_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid tree data pointer in tree_deserialize");
+            return false;
+        }
+    };
 
-    // Read position
-    let position = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    // FIX #230: Read position with safe conversion
+    let position = match data[0..8].try_into() {
+        Ok(bytes) => u64::from_le_bytes(bytes),
+        Err(_) => return false,
+    };
 
     // Deserialize tree
     let tree = match read_commitment_tree(&data[8..]) {
@@ -2528,10 +2788,17 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
         }
     };
 
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
     *tree_guard = Some(tree);
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
     *pos_guard = position;
 
     true
@@ -2549,10 +2816,20 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         return false;
     }
 
-    let bytes = slice::from_raw_parts(data, data_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_from_cmus");
+            return false;
+        }
+    };
 
-    // Read count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return false,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -2588,11 +2865,17 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         }
     }
 
-    // Store in global
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Store in global with safe_lock
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
     *tree_guard = Some(tree);
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
     *pos_guard = count;
 
     debug_log!("✅ Tree loaded with {} commitments", count);
@@ -2616,10 +2899,20 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
         return false;
     }
 
-    let bytes = slice::from_raw_parts(data, data_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_with_progress");
+            return false;
+        }
+    };
 
-    // Read count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return false,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow on 32-bit platforms
     // Max safe count = (usize::MAX - 8) / 32 to prevent overflow in expected_len calculation
@@ -2665,11 +2958,17 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
     // Final progress
     progress_callback(count, count);
 
-    // Store in global
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #230: Store in global with safe_lock
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
     *tree_guard = Some(tree);
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
     *pos_guard = count;
 
     debug_log!("✅ Tree loaded with {} commitments", count);
@@ -2704,10 +3003,20 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         return 0;
     }
 
-    let bytes = slice::from_raw_parts(data, data_len);
+    // FIX #230: Validate data pointer before creating slice
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_with_witnesses");
+            return 0;
+        }
+    };
 
-    // Read count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // Read count - use safe conversion instead of unwrap
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -2725,9 +3034,9 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
                count, target_count);
     let start_time = std::time::Instant::now();
 
-    // Build HashMap of target CMUs for O(1) lookup
-    let targets = if target_count > 0 && !target_cmus.is_null() {
-        Some(slice::from_raw_parts(target_cmus, target_count * 32))
+    // FIX #230: Build HashMap of target CMUs for O(1) lookup with safe slice
+    let targets = if target_count > 0 {
+        safe_slice(target_cmus, target_count * 32)
     } else {
         None
     };
@@ -2878,11 +3187,27 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
         return u64::MAX;
     }
 
-    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
-    let target_bytes = slice::from_raw_parts(target_cmu, 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in create_witness_for_cmu");
+            return u64::MAX;
+        }
+    };
+    let target_bytes = match safe_slice(target_cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target CMU pointer in create_witness_for_cmu");
+            return u64::MAX;
+        }
+    };
 
-    // Read count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return u64::MAX,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -2982,11 +3307,27 @@ pub unsafe extern "C" fn zipherx_find_cmu_position(
         return u64::MAX;
     }
 
-    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
-    let target_bytes = slice::from_raw_parts(target_cmu, 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in find_cmu_position");
+            return u64::MAX;
+        }
+    };
+    let target_bytes = match safe_slice(target_cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target CMU pointer in find_cmu_position");
+            return u64::MAX;
+        }
+    };
 
-    // Read count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return u64::MAX,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -3038,11 +3379,27 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         return 0;
     }
 
-    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
-    let targets = slice::from_raw_parts(target_cmus, target_count * 32);
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in create_witnesses_batch");
+            return 0;
+        }
+    };
+    let targets = match safe_slice(target_cmus, target_count * 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid targets pointer in create_witnesses_batch");
+            return 0;
+        }
+    };
 
-    // Read CMU count
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // FIX #230: Read CMU count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -3183,7 +3540,11 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
         return false;
     }
 
-    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
+    // FIX #230: Validate witness pointer with safe_slice
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => return false,
+    };
     let mut reader = std::io::Cursor::new(witness_slice);
 
     let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
@@ -3233,11 +3594,27 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
         return 0;
     }
 
-    let targets = slice::from_raw_parts(target_cmus, target_count * 32);
-    let bytes = slice::from_raw_parts(cmu_data, cmu_data_len);
+    // FIX #230: Validate pointers with safe_slice
+    let targets = match safe_slice(target_cmus, target_count * 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target_cmus pointer in create_witnesses_parallel");
+            return 0;
+        }
+    };
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid cmu_data pointer in create_witnesses_parallel");
+            return 0;
+        }
+    };
 
-    // Read CMU count from bundled data
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    // Read CMU count from bundled data - use safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
 
     // SECURITY FIX (NEW-001): Prevent integer overflow
     let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
@@ -3388,31 +3765,83 @@ pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
 ) -> usize {
     use zcash_primitives::sapling::value::ValueCommitment;
 
-    // Parse OVK
-    let ovk_bytes = slice::from_raw_parts(ovk, 32);
-    let ovk = OutgoingViewingKey(ovk_bytes.try_into().unwrap());
+    // FIX #230: Parse OVK with safe_slice
+    let ovk_slice = match safe_slice(ovk, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid OVK pointer");
+            return 0;
+        }
+    };
+    let ovk_arr: [u8; 32] = match ovk_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
+    let ovk = OutgoingViewingKey(ovk_arr);
 
-    // Parse value commitment (cv)
-    let cv_bytes: [u8; 32] = slice::from_raw_parts(cv, 32).try_into().unwrap();
+    // FIX #230: Parse value commitment (cv) with safe_slice
+    let cv_slice = match safe_slice(cv, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CV pointer");
+            return 0;
+        }
+    };
+    let cv_bytes: [u8; 32] = match cv_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
     let cv = match ValueCommitment::from_bytes_not_small_order(&cv_bytes).into() {
         Some(v) => v,
         None => return 0,
     };
 
-    // Parse cmu
-    let cmu_bytes: [u8; 32] = slice::from_raw_parts(cmu, 32).try_into().unwrap();
+    // FIX #230: Parse cmu with safe_slice
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in recover_output");
+            return 0;
+        }
+    };
+    let cmu_bytes: [u8; 32] = match cmu_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
     let cmu = match zcash_primitives::sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes).into() {
         Some(c) => c,
         None => return 0,
     };
 
-    // Parse EPK
-    let epk_bytes: [u8; 32] = slice::from_raw_parts(epk, 32).try_into().unwrap();
+    // FIX #230: Parse EPK with safe_slice
+    let epk_slice = match safe_slice(epk, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid EPK pointer");
+            return 0;
+        }
+    };
+    let epk_bytes: [u8; 32] = match epk_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
     let epk = EphemeralKeyBytes(epk_bytes);
 
-    // Get ciphertexts
-    let enc = slice::from_raw_parts(enc_ciphertext, 580);
-    let out = slice::from_raw_parts(out_ciphertext, 80);
+    // FIX #230: Get ciphertexts with safe_slice
+    let enc = match safe_slice(enc_ciphertext, 580) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid enc_ciphertext pointer");
+            return 0;
+        }
+    };
+    let out = match safe_slice(out_ciphertext, 80) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid out_ciphertext pointer");
+            return 0;
+        }
+    };
 
     let mut enc_arr = [0u8; 580];
     enc_arr.copy_from_slice(enc);
@@ -3517,7 +3946,14 @@ pub unsafe extern "C" fn zipherx_derive_ovk(
     sk: *const u8,
     ovk_out: *mut u8,
 ) -> bool {
-    let sk_bytes = slice::from_raw_parts(sk, 169);
+    // FIX #230: Use safe_slice for bounds checking
+    let sk_bytes = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer in derive_ovk");
+            return false;
+        }
+    };
 
     // Deserialize the extended spending key
     let extsk = match ExtendedSpendingKey::read(&sk_bytes[..]) {
@@ -3572,11 +4008,23 @@ pub unsafe extern "C" fn zipherx_verify_equihash(
                   solution_len, EXPECTED_SOLUTION_LEN, N, K);
     }
 
-    // Header is 140 bytes total:
+    // FIX #230: Header is 140 bytes total with safe_slice
     // - First 108 bytes: header data (input for Equihash)
     // - Last 32 bytes: nonce
-    let header = slice::from_raw_parts(header_bytes, 140);
-    let solution_slice = slice::from_raw_parts(solution, solution_len);
+    let header = match safe_slice(header_bytes, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer in verify_equihash");
+            return false;
+        }
+    };
+    let solution_slice = match safe_slice(solution, solution_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid solution pointer in verify_equihash");
+            return false;
+        }
+    };
 
     // Split header into input (108 bytes) and nonce (32 bytes)
     let input = &header[..108];
@@ -3615,8 +4063,21 @@ pub unsafe extern "C" fn zipherx_compute_block_hash(
 ) -> bool {
     use sha2::{Sha256, Digest};
 
-    let header = slice::from_raw_parts(header_bytes, 140);
-    let solution_slice = slice::from_raw_parts(solution, solution_len);
+    // FIX #230: Use safe_slice for bounds checking
+    let header = match safe_slice(header_bytes, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer in compute_block_hash");
+            return false;
+        }
+    };
+    let solution_slice = match safe_slice(solution, solution_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid solution pointer in compute_block_hash");
+            return false;
+        }
+    };
 
     // Build the data to hash: header + compact size + solution
     let mut data = Vec::with_capacity(140 + 5 + solution_len);
@@ -3674,14 +4135,33 @@ pub unsafe extern "C" fn zipherx_verify_header_chain(
         return true;
     }
 
-    let offsets = slice::from_raw_parts(header_offsets, headers_count);
-    let sizes = slice::from_raw_parts(header_sizes, headers_count);
+    // FIX #230: Validate all pointers with safe_slice
+    let offsets = match safe_slice(header_offsets, headers_count) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header_offsets pointer");
+            return false;
+        }
+    };
+    let sizes = match safe_slice(header_sizes, headers_count) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header_sizes pointer");
+            return false;
+        }
+    };
 
     let mut prev_hash: [u8; 32] = [0; 32];
     let has_expected_prev = !expected_prev_hash.is_null();
 
     if has_expected_prev {
-        let expected = slice::from_raw_parts(expected_prev_hash, 32);
+        let expected = match safe_slice(expected_prev_hash, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid expected_prev_hash pointer");
+                return false;
+            }
+        };
         prev_hash.copy_from_slice(expected);
     }
 
@@ -3695,7 +4175,13 @@ pub unsafe extern "C" fn zipherx_verify_header_chain(
         }
 
         let header_ptr = headers_data.add(offset);
-        let header = slice::from_raw_parts(header_ptr, 140);
+        let header = match safe_slice(header_ptr, 140) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid header pointer at index {}", i);
+                return false;
+            }
+        };
 
         // Extract prevHash from header (bytes 4-36)
         let header_prev_hash = &header[4..36];
@@ -3766,7 +4252,14 @@ pub unsafe extern "C" fn zipherx_verify_block_header(
         return false;
     }
 
-    let header = slice::from_raw_parts(header_and_solution, 140);
+    // FIX #230: Validate header pointer
+    let header = match safe_slice(header_and_solution, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer");
+            return false;
+        }
+    };
     let solution_data = header_and_solution.add(140);
 
     // Read compact size for solution length
@@ -3917,8 +4410,21 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         return false;
     }
 
-    let encrypted_slice = slice::from_raw_parts(encrypted_sk, 197);
-    let enc_key_slice = slice::from_raw_parts(encryption_key, 32);
+    // FIX #230: Use safe_slice for all inputs
+    let encrypted_slice = match safe_slice(encrypted_sk, 197) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encrypted key pointer");
+            return false;
+        }
+    };
+    let enc_key_slice = match safe_slice(encryption_key, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encryption key pointer");
+            return false;
+        }
+    };
 
     // Decrypt the spending key
     let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
@@ -3933,8 +4439,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
 
     // === Use the decrypted key ===
 
-    // Get the prover
-    let prover_guard = PROVER.lock().unwrap();
+    // FIX #230: Get the prover with safe_lock
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            return false;
+        }
+    };
     let prover = match prover_guard.as_ref() {
         Some(p) => p,
         None => {
@@ -3944,11 +4456,39 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         }
     };
 
-    // Parse inputs
-    let to_addr_slice = slice::from_raw_parts(to_address, 43);
-    let witness_slice = slice::from_raw_parts(witness_data, witness_len);
-    let rcm_slice = slice::from_raw_parts(note_rcm, 32);
-    let div_slice = slice::from_raw_parts(note_diversifier, 11);
+    // FIX #230: Parse inputs with safe_slice
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid witness data pointer");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(note_rcm, 32) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid rcm pointer");
+            return false;
+        }
+    };
+    let div_slice = match safe_slice(note_diversifier, 11) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid diversifier pointer");
+            return false;
+        }
+    };
 
     // Deserialize spending key from decrypted data
     let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
@@ -3960,8 +4500,16 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         }
     };
 
-    // Parse destination address
-    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+    // FIX #230: Parse destination address (safe conversion)
+    let to_addr_arr: [u8; 43] = match to_addr_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
         Some(addr) => addr,
         None => {
             secure_zero(&mut decrypted_sk);
@@ -4053,19 +4601,41 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         return false;
     }
 
-    // Prepare memo
+    // FIX #230: Prepare memo with safe slice validation
     let memo_bytes = if memo.is_null() {
         [0u8; 512]
     } else {
-        let memo_slice = slice::from_raw_parts(memo, 512);
-        let mut m = [0u8; 512];
-        m.copy_from_slice(memo_slice);
-        m
+        match safe_slice(memo, 512) {
+            Some(memo_slice) => {
+                let mut m = [0u8; 512];
+                m.copy_from_slice(memo_slice);
+                m
+            }
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        }
     };
-    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
 
-    // Convert amount to Amount type
-    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    // Convert amount to Amount type - use safe conversion
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid amount: {}", amount);
+            return false;
+        }
+    };
 
     // Add output to recipient
     if let Err(e) = builder.add_sapling_output(
@@ -4164,8 +4734,21 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         return false;
     }
 
-    let encrypted_slice = slice::from_raw_parts(encrypted_sk, 197);
-    let enc_key_slice = slice::from_raw_parts(encryption_key, 32);
+    // FIX #230: Use safe_slice for all inputs (multi-encrypted)
+    let encrypted_slice = match safe_slice(encrypted_sk, 197) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encrypted key pointer");
+            return false;
+        }
+    };
+    let enc_key_slice = match safe_slice(encryption_key, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encryption key pointer");
+            return false;
+        }
+    };
 
     // Decrypt the spending key
     let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
@@ -4178,8 +4761,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
 
     debug_log!("🔐 VUL-002: Spending key decrypted in Rust for multi-spend (will zero after use)");
 
-    // Get the prover
-    let prover_guard = PROVER.lock().unwrap();
+    // FIX #230: Get the prover with safe_lock
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            return false;
+        }
+    };
     let prover = match prover_guard.as_ref() {
         Some(p) => p,
         None => {
@@ -4189,8 +4778,15 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         }
     };
 
-    // Parse inputs
-    let to_addr_slice = slice::from_raw_parts(to_address, 43);
+    // FIX #230: Parse inputs with safe_slice
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
 
     // Deserialize spending key
     let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
@@ -4202,8 +4798,16 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         }
     };
 
-    // Parse destination address
-    let to_addr = match PaymentAddress::from_bytes(to_addr_slice.try_into().unwrap()) {
+    // FIX #230: Parse destination address (safe conversion)
+    let to_addr_arr: [u8; 43] = match to_addr_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
         Some(addr) => addr,
         None => {
             secure_zero(&mut decrypted_sk);
@@ -4215,17 +4819,46 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     // Calculate fee
     let fee = 10000u64;
 
-    // Parse all spends and calculate total input value
-    let spend_infos = slice::from_raw_parts(spends, spend_count);
+    // FIX #230: Parse all spends with safe pointer validation
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_count * std::mem::size_of::<*const SpendInfo>()) {
+        Some(_) => std::slice::from_raw_parts(spends, spend_count),
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid spends pointer");
+            return false;
+        }
+    };
     let mut total_input: u64 = 0;
     let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
 
     for (i, spend_ptr) in spend_infos.iter().enumerate() {
         let spend = &**spend_ptr;
 
-        let witness_slice = slice::from_raw_parts(spend.witness_data, spend.witness_len);
-        let rcm_slice = slice::from_raw_parts(spend.note_rcm, 32);
-        let div_slice = slice::from_raw_parts(spend.note_diversifier, 11);
+        // FIX #230: Validate spend data pointers
+        let witness_slice = match safe_slice(spend.witness_data, spend.witness_len) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid witness pointer for spend {}", i);
+                return false;
+            }
+        };
+        let rcm_slice = match safe_slice(spend.note_rcm, 32) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid rcm pointer for spend {}", i);
+                return false;
+            }
+        };
+        let div_slice = match safe_slice(spend.note_diversifier, 11) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid diversifier pointer for spend {}", i);
+                return false;
+            }
+        };
 
         // Parse note commitment randomness
         let mut rcm_bytes = [0u8; 32];
@@ -4312,19 +4945,41 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         }
     }
 
-    // Prepare memo
+    // FIX #230: Prepare memo with safe slice validation
     let memo_bytes = if memo.is_null() {
         [0u8; 512]
     } else {
-        let memo_slice = slice::from_raw_parts(memo, 512);
-        let mut m = [0u8; 512];
-        m.copy_from_slice(memo_slice);
-        m
+        match safe_slice(memo, 512) {
+            Some(memo_slice) => {
+                let mut m = [0u8; 512];
+                m.copy_from_slice(memo_slice);
+                m
+            }
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        }
     };
-    let memo_obj = MemoBytes::from_bytes(&memo_bytes).unwrap();
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
 
-    // Add output to recipient
-    let amount_val = Amount::from_i64(amount as i64).unwrap();
+    // Add output to recipient - use safe amount conversion
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid amount: {}", amount);
+            return false;
+        }
+    };
     if let Err(e) = builder.add_sapling_output(
         Some(extsk.expsk.ovk),
         to_addr,
@@ -4336,11 +4991,18 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         return false;
     }
 
-    // Add change output if needed
+    // Add change output if needed - use safe amount conversion
     let change = total_input - amount - fee;
     if change > 0 {
         let change_memo = MemoBytes::empty();
-        let change_amount = Amount::from_i64(change as i64).unwrap();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid change amount: {}", change);
+                return false;
+            }
+        };
         let (_, change_addr) = extsk.default_address();
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
@@ -4490,8 +5152,14 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         return 0;
     }
 
-    // Parse spending key
-    let sk_slice = slice::from_raw_parts(sk, 169);
+    // FIX #230: Parse spending key with safe slice validation
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return 0;
+        }
+    };
     let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
         Ok(key) => key,
         Err(e) => {
@@ -4507,10 +5175,16 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
     let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
     let nk = fvk.vk.nk;
 
-    // Parse spends into nullifier set for fast lookup
+    // FIX #230: Parse spends into nullifier set with safe slice validation
     let mut nullifier_set: HashSet<[u8; 32]> = HashSet::with_capacity(spend_count);
-    if spend_count > 0 && !spends_data.is_null() {
-        let spends_slice = slice::from_raw_parts(spends_data, spend_count * BOOST_SPEND_SIZE);
+    if spend_count > 0 {
+        let spends_slice = match safe_slice(spends_data, spend_count * BOOST_SPEND_SIZE) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid spends_data pointer");
+                return 0;
+            }
+        };
         for i in 0..spend_count {
             let offset = i * BOOST_SPEND_SIZE;
             let mut nullifier = [0u8; 32];
@@ -4521,8 +5195,14 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
     }
     eprintln!("📊 Indexed {} nullifiers for spend detection", nullifier_set.len());
 
-    // Parse outputs for parallel processing
-    let outputs_slice = slice::from_raw_parts(outputs_data, output_count * BOOST_OUTPUT_SIZE);
+    // FIX #230: Parse outputs for parallel processing with safe slice validation
+    let outputs_slice = match safe_slice(outputs_data, output_count * BOOST_OUTPUT_SIZE) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid outputs_data pointer");
+            return 0;
+        }
+    };
 
     // Parse into vector of (position, height, cmu, epk, ciphertext)
     // CRITICAL: position = enumerate index (outputs are in blockchain order)
@@ -4726,15 +5406,24 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
     use zcash_primitives::consensus::BranchId;
     use std::io::Cursor;
 
-    // Safety check
-    if tx_data.is_null() || tx_len == 0 {
+    // FIX #230: Safety check with safe slice validation
+    if tx_len == 0 {
         if !error_out.is_null() {
             *error_out = TxVerifyError::InvalidTransactionData as u32;
         }
         return false;
     }
 
-    let tx_bytes = slice::from_raw_parts(tx_data, tx_len);
+    let tx_bytes = match safe_slice(tx_data, tx_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid tx_data pointer");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::InvalidTransactionData as u32;
+            }
+            return false;
+        }
+    };
 
     // Get branch ID for current height (Zclassic uses Buttercup after block 707,000)
     let height = BlockHeight::from_u32(chain_height as u32);

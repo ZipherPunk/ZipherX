@@ -47,6 +47,10 @@ final class WalletManager: ObservableObject {
     @Published private(set) var isSyncing: Bool = false
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
+
+    // FIX #242: Track when wallet is catching up after returning from background
+    @Published private(set) var isCatchingUp: Bool = false
+    @Published private(set) var blocksBehind: UInt64 = 0
     @Published private(set) var syncPhase: String = ""  // "phase1", "phase1.5", "phase1.6", "phase2"
     @Published private(set) var lastError: WalletError?
     @Published var syncTasks: [SyncTask] = []  // FIX: Removed private(set) for FAST START task updates from ContentView
@@ -1052,6 +1056,59 @@ final class WalletManager: ObservableObject {
                     syncTasks[index].status = .failed(error.localizedDescription)
                     syncTasks[index].detail = "Sync failed"
                 }
+            }
+        }
+    }
+
+    // MARK: - FIX #242: Foreground Catch-Up
+
+    /// Check if wallet is behind blockchain and catch up if needed
+    /// Called when app returns to foreground after being in background
+    /// Updates isCatchingUp and blocksBehind properties for UI display
+    func checkAndCatchUp() async {
+        guard isTreeLoaded else { return }
+
+        // Get current wallet height
+        let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        guard walletHeight > 0 else { return }
+
+        // Get chain height from peers (bypass stale HeaderStore)
+        var peerHeights: [UInt64] = []
+        for peer in await NetworkManager.shared.getAllConnectedPeers().prefix(5) {
+            let height = UInt64(peer.peerStartHeight)
+            if height > 0 {
+                peerHeights.append(height)
+            }
+        }
+
+        guard !peerHeights.isEmpty else {
+            print("🔄 FIX #242: No peer heights available for catch-up check")
+            return
+        }
+
+        // Use median height for robustness
+        let sortedHeights = peerHeights.sorted()
+        let chainHeight = sortedHeights[sortedHeights.count / 2]
+
+        let behind = chainHeight > walletHeight ? chainHeight - walletHeight : 0
+
+        await MainActor.run {
+            self.blocksBehind = behind
+            if behind > 0 {
+                self.isCatchingUp = true
+                print("🔄 FIX #242: Catching up \(behind) blocks (wallet: \(walletHeight), chain: \(chainHeight))")
+            }
+        }
+
+        // Trigger background sync if behind
+        if behind > 0 {
+            await backgroundSyncToHeight(chainHeight)
+
+            // After sync, update status
+            await MainActor.run {
+                self.isCatchingUp = false
+                self.blocksBehind = 0
+                print("✅ FIX #242: Catch-up complete")
             }
         }
     }
@@ -4521,19 +4578,42 @@ final class WalletManager: ObservableObject {
         // Zclassic network is smaller than Zcash - 3 agreeing peers is trustworthy
         let EQUIHASH_CONSENSUS_THRESHOLD = 3
 
-        // Get headers using best-effort (returns headers from most agreeing peers)
+        // FIX #233: Get headers with 15-second timeout to prevent hanging
         var allHeaders: [BlockHeader] = []
         var peerAgreement: Int = 0
 
-        if let result = await NetworkManager.shared.getBlockHeadersBestEffort(from: startHeight, count: actualCount) {
-            allHeaders = result.headers
-            peerAgreement = result.agreementCount
-            print("📋 FIX #231: Got headers with \(peerAgreement) peer(s) agreeing")
+        do {
+            let result = try await withThrowingTaskGroup(of: (headers: [BlockHeader], agreementCount: Int)?.self) { group in
+                group.addTask {
+                    await NetworkManager.shared.getBlockHeadersBestEffort(from: startHeight, count: actualCount)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 15_000_000_000)  // 15 second timeout
+                    return nil
+                }
+
+                // Return first result (either headers or timeout)
+                for try await result in group {
+                    group.cancelAll()
+                    return result
+                }
+                return nil
+            }
+
+            if let result = result {
+                allHeaders = result.headers
+                peerAgreement = result.agreementCount
+                print("📋 FIX #231: Got headers with \(peerAgreement) peer(s) agreeing")
+            } else {
+                print("⏰ FIX #233: Header fetch timed out after 15 seconds")
+            }
+        } catch {
+            print("⚠️ FIX #233: Header fetch error: \(error)")
         }
 
         guard !allHeaders.isEmpty else {
             print("❌ FIX #185: No headers fetched for Equihash verification")
-            return .networkError(reason: "No headers received from any peers")
+            return .networkError(reason: "No headers received (timeout)")
         }
 
         // Verify Equihash for all fetched headers

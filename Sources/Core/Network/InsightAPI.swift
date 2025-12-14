@@ -10,24 +10,8 @@ final class InsightAPI: NSObject {
 
     private let baseURL = "https://explorer.zcl.zelcore.io"
 
-    /// Pinned SHA-256 hashes of allowed certificate public keys
-    /// These are the SPKI (Subject Public Key Info) hashes
-    /// SECURITY: Multiple pins for backup certificates during rotation
-    private static let pinnedPublicKeyHashes: Set<String> = [
-        // Primary: explorer.zcl.zelcore.io certificate (current)
-        // To get this hash, run:
-        // openssl s_client -connect explorer.zcl.zelcore.io:443 2>/dev/null | \
-        //   openssl x509 -pubkey -noout | \
-        //   openssl pkey -pubin -outform DER | \
-        //   openssl dgst -sha256 -binary | base64
-        "PLACEHOLDER_PRIMARY_PIN",  // Will be populated on first connection if in debug mode
-
-        // Backup pins for certificate rotation (Let's Encrypt intermediates)
-        // ISRG Root X1
-        "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",
-        // Let's Encrypt R3
-        "jQJTbIh0grw0/1TkHSumWb+Fs0Ggogr621gT3PvPKG0=",
-    ]
+    // NOTE: TLS pinning is handled by CertificatePinningDelegate.bundledHashes
+    // which contains real certificate hashes. No placeholders in production code.
 
     /// Track if pinning validation failed (for logging)
     @Published private(set) var pinningValidationFailed: Bool = false
@@ -76,7 +60,7 @@ final class InsightAPI: NSObject {
 
             if let httpResponse = response as? HTTPURLResponse {
                 print("📌 [TLS Pinning] Connected to \(baseURL), status: \(httpResponse.statusCode)")
-                print("📌 [TLS Pinning] Current pins configured: \(Self.pinnedPublicKeyHashes.count)")
+                print("📌 [TLS Pinning] Pins configured in CertificatePinningDelegate.bundledHashes")
             }
         } catch {
             print("⚠️ [TLS Pinning] Could not verify connection: \(error)")

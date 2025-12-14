@@ -353,7 +353,7 @@ final class WalletHealthCheck {
 
         case .networkError(let reason):
             // FIX #231: Could not fetch ANY headers - network issue
-            let peerCount = NetworkManager.shared.connectedPeers.count
+            let peerCount = NetworkManager.shared.connectedPeers
             print("⚠️ FIX #231: Equihash could not be verified - \(reason) (\(peerCount) peers)")
 
             // Set alert to warn user

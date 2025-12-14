@@ -16,7 +16,9 @@ import SwiftUI
 /// Main chat view with contact list and conversation
 struct ChatView: View {
     @EnvironmentObject private var themeManager: ThemeManager
+    @EnvironmentObject private var networkManager: NetworkManager
     @StateObject private var chatManager = ChatManager.shared
+    @StateObject private var torManager = TorManager.shared
 
     @State private var showAddContact = false
     @State private var showSettings = false
@@ -25,44 +27,181 @@ struct ChatView: View {
 
     private var theme: AppTheme { themeManager.currentTheme }
 
-    var body: some View {
-        #if os(iOS)
-        NavigationView {
-            iOSContactListView
-        }
-        .navigationViewStyle(.stack)
-        .sheet(isPresented: $showAddContact) {
-            AddContactSheet()
-        }
-        .sheet(isPresented: $showSettings) {
-            ChatSettingsSheet()
-        }
-        .onAppear {
-            autoStartChatIfNeeded()
-        }
-        #else
-        NavigationView {
-            contactListView
-                .frame(minWidth: 280, maxWidth: 320)
+    // FIX #243: Minimum peers required for stable chat
+    private let minimumPeersForChat = 4
 
-            if let contact = selectedContact {
-                ConversationView(contact: contact)
-            } else {
-                emptyStateView
+    /// Check if we have enough peers for stable chat
+    private var hasEnoughPeers: Bool {
+        networkManager.connectedPeers >= minimumPeersForChat
+    }
+
+    /// FIX #244: Check if Tor is enabled (required for chat)
+    private var isTorEnabled: Bool {
+        torManager.mode == .enabled
+    }
+
+    var body: some View {
+        // FIX #244: Show cypherpunk warning if Tor is disabled
+        if !isTorEnabled {
+            torRequiredView
+        } else {
+            #if os(iOS)
+            NavigationView {
+                iOSContactListView
             }
+            .navigationViewStyle(.stack)
+            .sheet(isPresented: $showAddContact) {
+                AddContactSheet()
+            }
+            .sheet(isPresented: $showSettings) {
+                ChatSettingsSheet()
+            }
+            .onAppear {
+                autoStartChatIfNeeded()
+            }
+            #else
+            NavigationView {
+                contactListView
+                    .frame(minWidth: 280, maxWidth: 320)
+
+                if let contact = selectedContact {
+                    ConversationView(contact: contact)
+                } else {
+                    emptyStateView
+                }
+            }
+            .sheet(isPresented: $showAddContact) {
+                AddContactSheet()
+                    .frame(minWidth: 420, idealWidth: 450, minHeight: 520, idealHeight: 560)
+            }
+            .sheet(isPresented: $showSettings) {
+                ChatSettingsSheet()
+                    .frame(minWidth: 450, idealWidth: 500, minHeight: 550, idealHeight: 600)
+            }
+            .onAppear {
+                autoStartChatIfNeeded()
+            }
+            #endif
         }
-        .sheet(isPresented: $showAddContact) {
-            AddContactSheet()
-                .frame(minWidth: 420, idealWidth: 450, minHeight: 520, idealHeight: 560)
+    }
+
+    // MARK: - FIX #244: Tor Required View
+
+    /// Cypherpunk-style warning when Tor is disabled
+    private var torRequiredView: some View {
+        VStack(spacing: 0) {
+            // Header
+            VStack(spacing: 8) {
+                HStack {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(theme.accentColor.opacity(0.5))
+                    Text("ENCRYPTED CHAT")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.accentColor)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.top, 16)
+
+                Divider()
+                    .background(theme.accentColor.opacity(0.3))
+            }
+
+            Spacer()
+
+            // Cypherpunk warning
+            VStack(spacing: 24) {
+                // Onion icon with lock
+                ZStack {
+                    Circle()
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 2)
+                        .frame(width: 120, height: 120)
+
+                    Circle()
+                        .stroke(Color.orange.opacity(0.15), lineWidth: 1)
+                        .frame(width: 150, height: 150)
+
+                    Image(systemName: "network.slash")
+                        .font(.system(size: 50))
+                        .foregroundColor(Color.orange.opacity(0.6))
+                }
+
+                VStack(spacing: 16) {
+                    Text("🧅 TOR REQUIRED")
+                        .font(.system(size: 22, weight: .bold, design: .monospaced))
+                        .foregroundColor(.orange)
+
+                    VStack(spacing: 12) {
+                        Text("Chat uses .onion addresses for\nend-to-end encrypted messaging.")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(4)
+
+                        Text("Without Tor, your identity and\nmessages cannot be protected.")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(Color.orange.opacity(0.8))
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(4)
+                    }
+                }
+
+                // Cypherpunk quote
+                VStack(spacing: 8) {
+                    Text("\"Privacy is necessary for an")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(theme.accentColor.opacity(0.6))
+                    Text("open society in the electronic age.\"")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(theme.accentColor.opacity(0.6))
+                    Text("— A Cypherpunk's Manifesto")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.4))
+                        .padding(.top, 4)
+                }
+                .padding(.top, 8)
+
+                // Enable Tor button
+                Button(action: {
+                    // Navigate to settings
+                    showSettings = true
+                }) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "network")
+                            .font(.system(size: 14))
+                        Text("ENABLE TOR IN SETTINGS")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.orange)
+                            .shadow(color: Color.orange.opacity(0.4), radius: 8)
+                    )
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+            }
+            .padding(.horizontal, 32)
+
+            Spacer()
         }
+        .background(
+            LinearGradient(
+                colors: [theme.backgroundColor, theme.backgroundColor.opacity(0.95)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
         .sheet(isPresented: $showSettings) {
             ChatSettingsSheet()
+                #if os(macOS)
                 .frame(minWidth: 450, idealWidth: 500, minHeight: 550, idealHeight: 600)
+                #endif
         }
-        .onAppear {
-            autoStartChatIfNeeded()
-        }
-        #endif
     }
 
     // MARK: - Auto-start Chat
@@ -268,56 +407,96 @@ struct ChatView: View {
     }
 
     private var statusBar: some View {
-        HStack(spacing: 12) {
-            // Online status with pulse animation
-            HStack(spacing: 6) {
-                ZStack {
-                    Circle()
-                        .fill(chatManager.isAvailable ? theme.accentColor : Color.red)
-                        .frame(width: 10, height: 10)
-
-                    if chatManager.isAvailable {
-                        Circle()
-                            .stroke(theme.accentColor, lineWidth: 2)
-                            .frame(width: 16, height: 16)
-                            .opacity(0.5)
-                            .scaleEffect(1.2)
-                    }
-                }
-
-                Text(chatManager.isAvailable ? "ONLINE" : "OFFLINE")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(chatManager.isAvailable ? theme.accentColor : Color.red)
-            }
-
-            Spacer()
-
-            // Unread badge
-            if chatManager.totalUnreadCount > 0 {
-                HStack(spacing: 4) {
-                    Image(systemName: "envelope.fill")
+        VStack(spacing: 0) {
+            // FIX #243: Warning when not enough peers for stable chat
+            if !hasEnoughPeers {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
-                    Text("\(chatManager.totalUnreadCount)")
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(.orange)
+                    Text("Unstable: Need \(minimumPeersForChat) peers, have \(networkManager.connectedPeers)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange)
+                    Spacer()
                 }
-                .foregroundColor(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule()
-                        .fill(Color.red)
-                        .shadow(color: Color.red.opacity(0.4), radius: 4)
-                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.15))
             }
 
-            // Contact count
-            Text("\(chatManager.contacts.count) contacts")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(theme.textPrimary.opacity(0.4))
+            HStack(spacing: 12) {
+                // Online status with pulse animation
+                HStack(spacing: 6) {
+                    ZStack {
+                        Circle()
+                            .fill(chatStatusColor)
+                            .frame(width: 10, height: 10)
+
+                        if chatManager.isAvailable && hasEnoughPeers {
+                            Circle()
+                                .stroke(theme.accentColor, lineWidth: 2)
+                                .frame(width: 16, height: 16)
+                                .opacity(0.5)
+                                .scaleEffect(1.2)
+                        }
+                    }
+
+                    Text(chatStatusText)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(chatStatusColor)
+                }
+
+                Spacer()
+
+                // Unread badge
+                if chatManager.totalUnreadCount > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "envelope.fill")
+                            .font(.system(size: 10))
+                        Text("\(chatManager.totalUnreadCount)")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(Color.red)
+                            .shadow(color: Color.red.opacity(0.4), radius: 4)
+                    )
+                }
+
+                // Peer count
+                Text("\(networkManager.connectedPeers) peers")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(hasEnoughPeers ? theme.textPrimary.opacity(0.4) : .orange)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.black.opacity(0.15))
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color.black.opacity(0.15))
+    }
+
+    // FIX #243: Chat status color based on peers and availability
+    private var chatStatusColor: Color {
+        if !chatManager.isAvailable {
+            return Color.red
+        } else if !hasEnoughPeers {
+            return Color.orange
+        } else {
+            return theme.accentColor
+        }
+    }
+
+    // FIX #243: Chat status text based on peers and availability
+    private var chatStatusText: String {
+        if !chatManager.isAvailable {
+            return "OFFLINE"
+        } else if !hasEnoughPeers {
+            return "UNSTABLE"
+        } else {
+            return "ONLINE"
+        }
     }
 
     private var noContactsView: some View {
@@ -596,6 +775,7 @@ struct ContactRow: View {
 
 struct ConversationView: View {
     @EnvironmentObject private var themeManager: ThemeManager
+    @EnvironmentObject private var networkManager: NetworkManager
     @StateObject private var chatManager = ChatManager.shared
 
     let contact: ChatContact
@@ -608,6 +788,10 @@ struct ConversationView: View {
     @FocusState private var isInputFocused: Bool
 
     private var theme: AppTheme { themeManager.currentTheme }
+
+    // FIX #243: Minimum peers required for stable chat
+    private let minimumPeersForChat = 4
+    private var hasEnoughPeers: Bool { networkManager.connectedPeers >= minimumPeersForChat }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -807,56 +991,75 @@ struct ConversationView: View {
     }
 
     private var inputBar: some View {
-        HStack(spacing: 12) {
-            // Attachment button (placeholder)
-            Button(action: { /* TODO: attachments */ }) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 26))
-                    .foregroundColor(theme.textPrimary.opacity(0.4))
+        VStack(spacing: 0) {
+            // FIX #243: Warning when not enough peers for stable chat
+            if !hasEnoughPeers {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                    Text("Chat unstable: Need \(minimumPeersForChat) peers (\(networkManager.connectedPeers) connected)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.1))
             }
-            .buttonStyle(.plain)
 
-            // Message input
-            HStack {
-                TextField("Type a message...", text: $messageText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 15, design: .monospaced))
-                    .foregroundColor(.white)
-                    .focused($isInputFocused)
-                    .onChange(of: messageText) { _ in
-                        Task {
-                            try? await chatManager.sendTypingIndicator(to: contact)
+            HStack(spacing: 12) {
+                // Attachment button (placeholder)
+                Button(action: { /* TODO: attachments */ }) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 26))
+                        .foregroundColor(theme.textPrimary.opacity(0.4))
+                }
+                .buttonStyle(.plain)
+
+                // Message input
+                HStack {
+                    TextField("Type a message...", text: $messageText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15, design: .monospaced))
+                        .foregroundColor(.white)
+                        .focused($isInputFocused)
+                        .onChange(of: messageText) { _ in
+                            Task {
+                                try? await chatManager.sendTypingIndicator(to: contact)
+                            }
                         }
-                    }
-                    .onSubmit {
-                        sendMessage()
-                    }
+                        .onSubmit {
+                            sendMessage()
+                        }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 20)
+                        .fill(Color.black.opacity(0.2))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(isInputFocused ? theme.accentColor.opacity(0.5) : theme.accentColor.opacity(0.2), lineWidth: 1)
+                )
+
+                // Send button
+                // FIX #243: Disable send when not enough peers for stable connection
+                Button(action: sendMessage) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundColor(canSendMessage ? theme.accentColor : Color.gray.opacity(0.5))
+                        .shadow(color: canSendMessage ? theme.accentColor.opacity(0.4) : .clear, radius: 4)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSendMessage)
+                .scaleEffect(canSendMessage ? 1.05 : 1.0)
+                .animation(.spring(response: 0.3), value: canSendMessage)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(Color.black.opacity(0.2))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 20)
-                    .stroke(isInputFocused ? theme.accentColor.opacity(0.5) : theme.accentColor.opacity(0.2), lineWidth: 1)
-            )
-
-            // Send button
-            Button(action: sendMessage) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundColor(messageText.isEmpty ? Color.gray.opacity(0.5) : theme.accentColor)
-                    .shadow(color: messageText.isEmpty ? .clear : theme.accentColor.opacity(0.4), radius: 4)
-            }
-            .buttonStyle(.plain)
-            .disabled(messageText.isEmpty)
-            .scaleEffect(messageText.isEmpty ? 1.0 : 1.05)
-            .animation(.spring(response: 0.3), value: messageText.isEmpty)
+            .padding(.vertical, 12)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
         .background(
             LinearGradient(
                 colors: [Color.black.opacity(0.25), Color.black.opacity(0.35)],
@@ -866,8 +1069,13 @@ struct ConversationView: View {
         )
     }
 
+    // FIX #243: Can send message only if text is not empty AND enough peers connected
+    private var canSendMessage: Bool {
+        !messageText.isEmpty && hasEnoughPeers
+    }
+
     private func sendMessage() {
-        guard !messageText.isEmpty else { return }
+        guard canSendMessage else { return }
 
         let text = messageText
         messageText = ""
@@ -1921,7 +2129,9 @@ struct PaymentRequestSheet: View {
     }
 
     private func sendRequest() {
-        guard let amountDouble = Double(amount) else { return }
+        // FIX #236: Handle both '.' and ',' decimal separators (locale-independent)
+        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
+        guard let amountDouble = Double(normalizedAmount) else { return }
         let zatoshis = UInt64(amountDouble * 100_000_000)
 
         isSending = true

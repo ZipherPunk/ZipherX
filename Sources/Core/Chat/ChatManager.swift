@@ -763,7 +763,7 @@ final class ChatManager: ObservableObject {
 
         await peer.connection.send(content: handshake, completion: .contentProcessed { _ in })
 
-        // Receive their public key
+        // Receive their public key AND onion address
         let response = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
             peer.connection.receive(minimumIncompleteLength: 32, maximumLength: 1024) { data, _, _, error in
                 if let error = error {
@@ -783,6 +783,25 @@ final class ChatManager: ObservableObject {
         let pubKeyData = response.prefix(32)
         let theirPublicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: pubKeyData)
         try await peer.setTheirPublicKey(theirPublicKey)
+
+        // FIX #238: Verify the returned onion address matches what we expected
+        // This prevents connecting to wrong hidden service (e.g., iOS→Sim going to macOS)
+        let expectedOnion = await peer.onionAddress
+        if response.count > 32 {
+            let onionData = response.dropFirst(32)
+            if let returnedOnion = String(data: onionData, encoding: .utf8) {
+                if returnedOnion != expectedOnion {
+                    print("🚨 FIX #238: ONION MISMATCH! Expected: \(expectedOnion.prefix(16))... Got: \(returnedOnion.prefix(16))...")
+                    print("🚨 FIX #238: Wrong hidden service! Check your contact's .onion address.")
+                    // Cancel connection - we're connected to the wrong peer!
+                    await peer.connection.cancel()
+                    throw ChatError.connectionFailed("Connected to wrong peer: expected \(expectedOnion.prefix(20))... but got \(returnedOnion.prefix(20))...")
+                } else {
+                    print("✅ FIX #238: Onion address verified: \(returnedOnion.prefix(16))...")
+                }
+            }
+        }
+
         await peer.setState(.connected)
 
         // Start receiving messages

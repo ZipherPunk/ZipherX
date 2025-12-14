@@ -115,11 +115,16 @@ enum ZclassicCheckpoints {
         "dnsseed.rotorproject.org"
     ]
 
-    /// Hardcoded seed nodes (fallback) - now only used as last resort
-    /// FIX #229: Trusted peers are now stored in database table instead
-    /// Use WalletDatabase.getTrustedPeers() for reliable Zclassic nodes
+    /// Hardcoded seed nodes (fallback) - used when DNS seeds return wrong chain nodes
+    /// FIX #229: Trusted peers are also stored in database table
+    /// FIX #234: Added known working Zclassic nodes (MagicBean) as DNS seeds often return Zcash nodes
     static let seedNodes: [String] = [
-        // Empty - trusted peers are now in database (see WalletDatabase.swift)
+        // Known working Zclassic nodes (MagicBean:2.1.1-10, protocol version 170011/170012)
+        "140.174.189.3",    // MagicBean node cluster
+        "140.174.189.17",   // MagicBean node cluster
+        "205.209.104.118",  // MagicBean node
+        "95.179.131.117",   // Additional Zclassic node
+        "45.77.216.198",    // Additional Zclassic node
     ]
 
     /// Hardcoded .onion seed nodes (Tor hidden services)

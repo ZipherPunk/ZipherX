@@ -269,8 +269,24 @@ final class NetworkManager: ObservableObject {
     /// FIX #122: Reduced from 5s to 2s for faster header sync
     private let CONNECTION_COOLDOWN: TimeInterval = 2.0  // 2 seconds between attempts to same address
 
+    // FIX #235: Hardcoded Zclassic seed nodes are EXEMPT from cooldown
+    // These are known-good nodes that should always be retried immediately
+    private let HARDCODED_SEEDS = Set<String>([
+        "140.174.189.3",
+        "140.174.189.17",
+        "205.209.104.118",
+        "95.179.131.117",
+        "45.77.216.198"
+    ])
+
     /// Check if an address is on cooldown (recently attempted)
+    /// FIX #235: Hardcoded seeds are NEVER on cooldown
     private func isOnCooldown(_ host: String, port: UInt16) -> Bool {
+        // FIX #235: Hardcoded Zclassic seeds are exempt from cooldown
+        if HARDCODED_SEEDS.contains(host) {
+            return false  // Always retry hardcoded seeds
+        }
+
         let key = "\(host):\(port)"
         connectionAttemptsLock.lock()
         defer { connectionAttemptsLock.unlock() }
@@ -2457,6 +2473,10 @@ final class NetworkManager: ObservableObject {
             return
         }
 
+        // FIX #240: Force sync when we have pending incoming TXs
+        // Don't rely on HeaderStore which can be stale - get real height from peers
+        await forceSyncIfNeeded()
+
         // Check pending incoming transactions silently
 
         var confirmedCount = 0
@@ -2503,6 +2523,37 @@ final class NetworkManager: ObservableObject {
                     self.mempoolTxCount = 0
                 }
             }
+        }
+    }
+
+    /// FIX #240: Force background sync by getting chain height directly from P2P peers
+    /// Bypasses stale HeaderStore to ensure we don't miss confirmations
+    private func forceSyncIfNeeded() async {
+        let dbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        guard dbHeight > 0 else { return }
+
+        // Get REAL chain height from connected peers (bypass HeaderStore)
+        var peerHeights: [UInt64] = []
+        for peer in getAllConnectedPeers().prefix(5) {
+            let height = UInt64(peer.peerStartHeight)
+            if height > 0 {
+                peerHeights.append(height)
+            }
+        }
+
+        guard !peerHeights.isEmpty else {
+            print("🔄 FIX #240: No peer heights available for force sync")
+            return
+        }
+
+        // Use median peer height for robustness against outliers
+        let sortedHeights = peerHeights.sorted()
+        let medianHeight = sortedHeights[sortedHeights.count / 2]
+
+        if medianHeight > dbHeight {
+            let blocksToSync = medianHeight - dbHeight
+            print("🔄 FIX #240: Force sync triggered! Peers report height \(medianHeight), wallet at \(dbHeight) (+\(blocksToSync) blocks)")
+            await WalletManager.shared.backgroundSyncToHeight(medianHeight)
         }
     }
 
@@ -2590,32 +2641,43 @@ final class NetworkManager: ObservableObject {
             }
         }
 
-        // Try each peer until one succeeds
-        var mempoolTxs: [Data] = []
-        var successfulPeer: Peer?
+        // FIX #239: Query MULTIPLE peers in parallel for robust mempool coverage
+        // Different peers may have different mempool contents due to propagation delays
+        var allMempoolTxs: Set<Data> = []
+        var successfulPeers: [Peer] = []
+        let maxPeersToQuery = min(3, connectedPeers.count)
 
-        for peer in connectedPeers {
-            do {
-                print("🔮 scanMempoolForIncoming: requesting mempool txs from peer \(peer.host)...")
-                // Ensure connection is fresh before requesting mempool
-                try await peer.ensureConnected()
-                mempoolTxs = try await peer.getMempoolTransactions()
-                successfulPeer = peer
-                print("🔮 scanMempoolForIncoming: got \(mempoolTxs.count) mempool txs from \(peer.host)")
-                break
-            } catch NetworkError.handshakeFailed {
-                // Connection is stale - try to reconnect using ensureConnected (has 5s cooldown)
-                print("🔮 scanMempoolForIncoming: peer \(peer.host) stale, will try next peer...")
-                // Don't attempt immediate reconnect - let ensureConnected handle it on next iteration
-                // This prevents infinite reconnection loops
-                continue
-            } catch {
-                print("⚠️ scanMempoolForIncoming: peer \(peer.host) failed: \(error.localizedDescription)")
-                continue
+        // Query up to 3 peers in parallel
+        await withTaskGroup(of: (Peer, [Data]?).self) { group in
+            for peer in connectedPeers.prefix(maxPeersToQuery) {
+                group.addTask {
+                    do {
+                        try await peer.ensureConnected()
+                        let txs = try await peer.getMempoolTransactions()
+                        print("🔮 FIX #239: Got \(txs.count) mempool txs from \(peer.host)")
+                        return (peer, txs)
+                    } catch {
+                        print("⚠️ FIX #239: Peer \(peer.host) mempool failed: \(error.localizedDescription)")
+                        return (peer, nil)
+                    }
+                }
+            }
+
+            // Collect all results
+            for await (peer, txs) in group {
+                if let txs = txs {
+                    successfulPeers.append(peer)
+                    for tx in txs {
+                        allMempoolTxs.insert(tx)
+                    }
+                }
             }
         }
 
-        guard let peer = successfulPeer else {
+        let mempoolTxs = Array(allMempoolTxs)
+        print("🔮 FIX #239: Merged mempool from \(successfulPeers.count) peers: \(mempoolTxs.count) unique txs")
+
+        guard let peer = successfulPeers.first else {
             print("⚠️ scanMempoolForIncoming: all peers failed")
             return
         }
@@ -3194,6 +3256,15 @@ final class NetworkManager: ObservableObject {
     private func discoverPeers() async -> [PeerAddress] {
         var addresses: [PeerAddress] = []
 
+        // FIX #234: Add hardcoded Zclassic seed nodes FIRST (DNS often returns Zcash nodes)
+        // These are known-good Zclassic nodes that will always work
+        for seedNode in ZclassicCheckpoints.seedNodes {
+            addresses.append(PeerAddress(host: seedNode, port: defaultPort))
+            print("🌱 Added hardcoded seed: \(seedNode)")
+        }
+        print("🌱 FIX #234: Added \(ZclassicCheckpoints.seedNodes.count) hardcoded Zclassic seed nodes")
+
+        // Then try DNS seeds (may return Zcash nodes which will be filtered by version check)
         for seed in dnsSeedsZCL {
             let resolved = await resolveDNSSeed(seed)
             addresses.append(contentsOf: resolved)
@@ -3697,18 +3768,51 @@ final class NetworkManager: ObservableObject {
             return nil
         }
 
+        // FIX #233: Add overall 20-second timeout - return best result we have
+        // This prevents hanging forever if some peers never respond
+        let overallTimeoutSeconds: UInt64 = 20
+        let startTime = Date()
+
         var responses: [[BlockHeader]: Int] = [:]
+        var receivedCount = 0
+        let totalPeers = peers.count
+
+        print("🔬 FIX #233: Requesting headers from \(totalPeers) peers (20s timeout)...")
 
         await withTaskGroup(of: [BlockHeader]?.self) { group in
+            // Add timeout task
+            group.addTask {
+                try? await Task.sleep(nanoseconds: overallTimeoutSeconds * 1_000_000_000)
+                return nil  // Sentinel for timeout
+            }
+
+            // Add peer tasks
             for peer in peers {
                 group.addTask {
                     try? await peer.getBlockHeaders(from: height, count: count)
                 }
             }
 
+            // Collect results until timeout or all peers respond
             for await result in group {
-                if let headers = result {
+                if let headers = result, !headers.isEmpty {
                     responses[headers, default: 0] += 1
+                    receivedCount += 1
+                    print("📋 FIX #233: Received headers (\(receivedCount)/\(totalPeers) peers)")
+
+                    // Early exit: If we have 3+ agreeing peers, that's enough consensus
+                    if let maxAgreement = responses.values.max(), maxAgreement >= 3 {
+                        print("✅ FIX #233: Got 3+ peer consensus, proceeding early")
+                        group.cancelAll()
+                        break
+                    }
+                }
+
+                // Check overall timeout
+                if Date().timeIntervalSince(startTime) > Double(overallTimeoutSeconds) {
+                    print("⏰ FIX #233: Overall timeout reached (\(receivedCount) responses)")
+                    group.cancelAll()
+                    break
                 }
             }
         }
@@ -3716,9 +3820,11 @@ final class NetworkManager: ObservableObject {
         // Return the headers with most peer agreement, even if below threshold
         guard let (headers, agreementCount) = responses.max(by: { $0.value < $1.value }),
               !headers.isEmpty else {
+            print("⚠️ FIX #233: No headers received from any peer (timeout or error)")
             return nil
         }
 
+        print("✅ FIX #233: Returning headers with \(agreementCount) peer agreement")
         return (headers, agreementCount)
     }
 
@@ -4710,6 +4816,45 @@ final class NetworkManager: ObservableObject {
             var consecutiveCooldownSkips = 0
             let maxCooldownSkips = 20  // Break after 20 consecutive cooldown skips
 
+            // FIX #235: Try hardcoded Zclassic seeds FIRST before DNS peers
+            // These are known-good nodes that should always be attempted
+            if peers.count < MIN_PEERS {
+                for seedHost in HARDCODED_SEEDS {
+                    let seedAddress = PeerAddress(host: seedHost, port: defaultPort)
+                    let addressKey = "\(seedAddress.host):\(seedAddress.port)"
+
+                    // Skip if already connected
+                    if peers.contains(where: { $0.host == seedHost }) {
+                        continue
+                    }
+
+                    // Skip if banned (but seeds are exempt from cooldown)
+                    if isBanned(seedAddress.host) {
+                        continue
+                    }
+
+                    // Skip if already tried in this rotation
+                    if triedInThisRotation.contains(addressKey) {
+                        continue
+                    }
+                    triedInThisRotation.insert(addressKey)
+
+                    print("🌱 FIX #235: Trying hardcoded seed \(seedHost)...")
+                    recordConnectionAttempt(seedAddress.host, port: seedAddress.port)
+
+                    if let peer = try? await connectToPeer(seedAddress) {
+                        peers.append(peer)
+                        setupBlockListener(for: peer)
+                        print("✅ FIX #235: Connected to hardcoded seed \(seedHost)")
+
+                        // Stop if we have enough peers
+                        if peers.count >= MIN_PEERS {
+                            break
+                        }
+                    }
+                }
+            }
+
             while peers.count < MIN_PEERS {
                 guard let address = selectBestAddress() else {
                     break
@@ -4842,37 +4987,68 @@ final class NetworkManager: ObservableObject {
         // Clear dead peer references
         peers.removeAll { !$0.isConnectionReady }
 
-        // Try bundled peers first (most reliable)
-        let bundledAddresses = knownAddresses.values
-            .filter { $0.source == "bundled" }
-            .map { $0.address }
-
         var recovered = 0
-        for address in bundledAddresses.prefix(5) {
-            // Skip if on cooldown or banned
-            if isBanned(address.host) || isOnCooldown(address.host, port: address.port) {
+
+        // FIX #235: Try hardcoded Zclassic seeds FIRST (highest priority)
+        print("🌱 FIX #235: Trying hardcoded seeds for recovery...")
+        for seedHost in HARDCODED_SEEDS {
+            let seedAddress = PeerAddress(host: seedHost, port: defaultPort)
+
+            // Skip if banned (seeds are exempt from cooldown)
+            if isBanned(seedAddress.host) {
                 continue
             }
 
-            recordConnectionAttempt(address.host, port: address.port)
+            recordConnectionAttempt(seedAddress.host, port: seedAddress.port)
 
             do {
-                let peer = try await connectToPeer(address)
+                let peer = try await connectToPeer(seedAddress)
                 peers.append(peer)
                 setupBlockListener(for: peer)
                 recovered += 1
-                print("✅ FIX #227: Recovered peer \(address.host)")
+                print("✅ FIX #235: Recovered hardcoded seed \(seedHost)")
 
                 if recovered >= 3 {
                     break  // Got enough peers
                 }
             } catch {
-                print("❌ FIX #227: Failed to connect to \(address.host): \(error.localizedDescription)")
+                print("❌ FIX #235: Failed to connect to seed \(seedHost): \(error.localizedDescription)")
+            }
+        }
 
-                // Track SOCKS5 failures specifically
-                if error.localizedDescription.contains("Socket is not connected") ||
-                   error.localizedDescription.contains("SOCKS") {
-                    consecutiveSOCKS5Failures += 1
+        // Get bundled addresses (needed for fallback below too)
+        let bundledAddresses = knownAddresses.values
+            .filter { $0.source == "bundled" }
+            .map { $0.address }
+
+        // If hardcoded seeds didn't work, try bundled peers
+        if recovered < 3 {
+            for address in bundledAddresses.prefix(5) {
+                // Skip if on cooldown or banned
+                if isBanned(address.host) || isOnCooldown(address.host, port: address.port) {
+                    continue
+                }
+
+                recordConnectionAttempt(address.host, port: address.port)
+
+                do {
+                    let peer = try await connectToPeer(address)
+                    peers.append(peer)
+                    setupBlockListener(for: peer)
+                    recovered += 1
+                    print("✅ FIX #227: Recovered peer \(address.host)")
+
+                    if recovered >= 3 {
+                        break  // Got enough peers
+                    }
+                } catch {
+                    print("❌ FIX #227: Failed to connect to \(address.host): \(error.localizedDescription)")
+
+                    // Track SOCKS5 failures specifically
+                    if error.localizedDescription.contains("Socket is not connected") ||
+                       error.localizedDescription.contains("SOCKS") {
+                        consecutiveSOCKS5Failures += 1
+                    }
                 }
             }
         }

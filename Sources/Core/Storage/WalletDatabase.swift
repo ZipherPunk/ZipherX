@@ -761,6 +761,19 @@ final class WalletDatabase {
                 print("⚠️ Migration 7: Failed to add verified_checkpoint_height: \(String(cString: sqlite3_errmsg(db)))")
             }
         }
+
+        // Migration 8: FIX #241 - Checkpoint history table (last 10 checkpoints)
+        let checkpointTableSql = """
+            CREATE TABLE IF NOT EXISTS checkpoint_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                height INTEGER NOT NULL,
+                tree_root BLOB,
+                timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+        """
+        if sqlite3_exec(db, checkpointTableSql, nil, nil, nil) == SQLITE_OK {
+            print("📂 Migration 8: Created checkpoint_history table (FIX #241)")
+        }
     }
 
     // MARK: - Account Operations
@@ -1680,11 +1693,19 @@ final class WalletDatabase {
     /// 1. App startup sync completes successfully (both incoming and spent tx detected)
     /// 2. Send transaction completes successfully (balance/history updated)
     /// 3. Any time balance/history is verified as correct
+    /// FIX #241: Also stores in checkpoint_history (last 10 kept)
     func updateVerifiedCheckpointHeight(_ height: UInt64) throws {
         // Validate height
         let maxReasonableHeight: UInt64 = 10_000_000
         guard height <= maxReasonableHeight else {
             print("🚨 [FIX #165] Refusing to write invalid checkpoint height: \(height)")
+            return
+        }
+
+        // Get current checkpoint to avoid duplicate entries
+        let currentCheckpoint = (try? getVerifiedCheckpointHeight()) ?? 0
+        guard height > currentCheckpoint else {
+            // Don't create duplicate or older checkpoint entries
             return
         }
 
@@ -1702,7 +1723,105 @@ final class WalletDatabase {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
 
-        print("✅ [FIX #165] Updated verified checkpoint to height \(height)")
+        // FIX #241: Add to checkpoint history
+        try addCheckpointToHistory(height: height)
+
+        print("✅ [FIX #241] Updated verified checkpoint to height \(height)")
+    }
+
+    // MARK: - FIX #241: Checkpoint History
+
+    /// Add a checkpoint to history, keeping only the last 10
+    private func addCheckpointToHistory(height: UInt64) throws {
+        // Insert new checkpoint
+        let insertSql = "INSERT INTO checkpoint_history (height) VALUES (?);"
+        var insertStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(insertStmt, 1, Int64(height))
+            sqlite3_step(insertStmt)
+            sqlite3_finalize(insertStmt)
+        }
+
+        // Prune to keep only last 10 checkpoints
+        let pruneSql = """
+            DELETE FROM checkpoint_history WHERE id NOT IN (
+                SELECT id FROM checkpoint_history ORDER BY id DESC LIMIT 10
+            );
+        """
+        sqlite3_exec(db, pruneSql, nil, nil, nil)
+
+        print("📍 [FIX #241] Added checkpoint at height \(height) to history")
+    }
+
+    /// Get checkpoint history (last 10 checkpoints, newest first)
+    func getCheckpointHistory() throws -> [(id: Int64, height: UInt64, timestamp: Int64)] {
+        let sql = "SELECT id, height, timestamp FROM checkpoint_history ORDER BY id DESC LIMIT 10;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var checkpoints: [(id: Int64, height: UInt64, timestamp: Int64)] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            let timestamp = sqlite3_column_int64(stmt, 2)
+            checkpoints.append((id: id, height: height, timestamp: timestamp))
+        }
+
+        return checkpoints
+    }
+
+    /// Rollback to a previous checkpoint
+    func rollbackToCheckpoint(_ checkpointId: Int64) throws -> UInt64 {
+        // Get the checkpoint height
+        let sql = "SELECT height FROM checkpoint_history WHERE id = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, checkpointId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.notFound("Checkpoint not found")
+        }
+
+        let height = UInt64(sqlite3_column_int64(stmt, 0))
+
+        // Update last scanned height directly (rollback doesn't have a block hash)
+        let heightUpdateSql = "UPDATE sync_state SET last_scanned_height = ? WHERE id = 1;"
+        var heightStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, heightUpdateSql, -1, &heightStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(heightStmt, 1, Int64(height))
+            sqlite3_step(heightStmt)
+            sqlite3_finalize(heightStmt)
+        }
+
+        // Update verified checkpoint
+        let updateSql = "UPDATE sync_state SET verified_checkpoint_height = ? WHERE id = 1;"
+        var updateStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(updateStmt, 1, Int64(height))
+            sqlite3_step(updateStmt)
+            sqlite3_finalize(updateStmt)
+        }
+
+        // Remove checkpoints newer than this one
+        let deleteSql = "DELETE FROM checkpoint_history WHERE id > ?;"
+        var deleteStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(deleteStmt, 1, checkpointId)
+            sqlite3_step(deleteStmt)
+            sqlite3_finalize(deleteStmt)
+        }
+
+        print("🔄 [FIX #241] Rolled back to checkpoint \(checkpointId) at height \(height)")
+        return height
     }
 
     // MARK: - Tree State
@@ -4130,6 +4249,7 @@ enum DatabaseError: LocalizedError {
     case deleteFailed(String)
     case queryFailed(String)
     case notOpened
+    case notFound(String)  // FIX #241: Checkpoint not found
 
     var errorDescription: String? {
         switch self {
@@ -4153,6 +4273,8 @@ enum DatabaseError: LocalizedError {
             return "Query failed: \(msg)"
         case .notOpened:
             return "Database not opened"
+        case .notFound(let msg):
+            return "Not found: \(msg)"
         }
     }
 }

@@ -155,11 +155,24 @@ struct SendView: View {
                         .padding(.vertical, 4)
                     }
 
+                    // FIX #242: Show catch-up warning when wallet is syncing after returning from background
+                    if walletManager.isCatchingUp {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .foregroundColor(.orange)
+                            Text("Wallet syncing - \(walletManager.blocksBehind) blocks behind")
+                                .font(theme.captionFont)
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
                     // Send button
                     System7Button(title: sendButtonTitle) {
                         validateAndConfirm()
                     }
-                    .disabled(isSending || !isValidInput || hasPendingTransaction)
+                    // FIX #242: Also disable during catch-up sync
+                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp)
                 }
                 .padding()
             }
@@ -326,6 +339,7 @@ struct SendView: View {
             Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
         }
         // FIX #218: Enhanced error alert with Copy TXID button for mempool rejections
+        // FIX #232: Error messages now include "Why" and "What to do" explanations
         .alert("Transaction Issue", isPresented: $showError) {
             if !failedTxId.isEmpty {
                 Button("Copy TXID") {
@@ -341,7 +355,7 @@ struct SendView: View {
                 failedTxId = ""  // Clear after dismissing
             }
         } message: {
-            Text(errorMessage)
+            Text(enhanceErrorMessage(errorMessage))
         }
         // FIX #210: Tor unavailable alert - offer to send without Tor
         .alert("Tor Connection Issue", isPresented: $showTorUnavailableAlert) {
@@ -724,6 +738,9 @@ struct SendView: View {
     private var sendButtonTitle: String {
         if isSending {
             return "Sending..."
+        } else if walletManager.isCatchingUp {
+            // FIX #242: Show syncing state
+            return "Syncing..."
         } else if hasPendingTransaction {
             return "Pending..."
         } else {
@@ -1188,6 +1205,85 @@ struct SendView: View {
             }
         }
         return ""
+    }
+
+    // MARK: - FIX #232: Error Explanation Helper
+
+    /// Enhance error messages with explanations and suggested actions
+    private func enhanceErrorMessage(_ message: String) -> String {
+        let lowerMessage = message.lowercased()
+
+        // Transaction rejected by mempool
+        if lowerMessage.contains("mempool") || lowerMessage.contains("rejected") {
+            return """
+            \(message)
+
+            Why: The network rejected your transaction. This can happen if:
+            • Another transaction spent your notes first
+            • Network congestion caused a timeout
+            • The transaction was malformed
+
+            What to do: Wait a few minutes and try again. Your funds are safe.
+            """
+        }
+
+        // Insufficient funds
+        if lowerMessage.contains("insufficient") || lowerMessage.contains("not enough") {
+            return """
+            \(message)
+
+            Why: You don't have enough confirmed ZCL for this amount plus the network fee (0.0001 ZCL).
+
+            What to do: Wait for pending transactions to confirm, or reduce the amount.
+            """
+        }
+
+        // Witness/anchor mismatch
+        if lowerMessage.contains("witness") || lowerMessage.contains("anchor") || lowerMessage.contains("merkle") {
+            return """
+            \(message)
+
+            Why: The cryptographic proof couldn't be generated. This usually means the blockchain state changed while building the transaction.
+
+            What to do: Go to Settings → Repair Database, then try again.
+            """
+        }
+
+        // Network/peer issues
+        if lowerMessage.contains("peer") || lowerMessage.contains("network") || lowerMessage.contains("connection") || lowerMessage.contains("timeout") {
+            return """
+            \(message)
+
+            Why: Could not connect to enough peers to broadcast your transaction securely.
+
+            What to do: Check your internet connection and wait for peer connections (shown in status bar).
+            """
+        }
+
+        // Proof generation failure
+        if lowerMessage.contains("proof") || lowerMessage.contains("groth16") || lowerMessage.contains("zk-snark") {
+            return """
+            \(message)
+
+            Why: The zero-knowledge proof generation failed. This is rare and usually indicates corrupted wallet state.
+
+            What to do: Go to Settings → Repair Database → Full Rescan.
+            """
+        }
+
+        // Authentication required
+        if lowerMessage.contains("authentication") || lowerMessage.contains("biometric") {
+            return """
+            \(message)
+
+            Why: Face ID / Touch ID is required to authorize transactions for your security.
+
+            What to do: Authenticate with Face ID, Touch ID, or your device passcode.
+            """
+        }
+
+        // Default: return original message
+        return message
     }
 
     // MARK: - Instant Send Preparation Functions
