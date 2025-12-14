@@ -83,3 +83,18 @@ docs/
 # Claude Code settings and docs (never commit)
 .claude/
 CLAUDE.md
+CLAUDE_FULL_BACKUP.md
+GPT.md
+
+# Private session/debug docs (never commit)
+SESSION_SUMMARY.md
+ANCHOR_MISMATCH_ANALYSIS.md
+TRANSACTION_DEBUGGING.md
+COMPACT_BLOCK_IMPLEMENTATION_PLAN.md
+HEADER_SYNC_IMPLEMENTATION_PLAN.md
+QUICK_FIX.md
+ZipherX-iOS-Wallet-Architecture.md
+
+# Test Rust target directories
+test_decrypt_rust/target/
+**/target/

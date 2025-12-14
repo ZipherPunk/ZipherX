@@ -1,4 +1,0 @@
-ShieldedOutput<SaplingDomain<P>, zcash_primitives::::transaction::components::sapling::{impl#17}::{constant#0}>
-ShieldedOutput<SaplingDomain<P>, zcash_primitives::::transaction::components::sapling::{impl#12}::{constant#0}>
-ShieldedOutput<orchard::note_encryption::OrchardDomain, orchard::::note_encryption::{impl#4}::{constant#0}>
-ShieldedOutput<orchard::note_encryption::OrchardDomain, orchard::::note_encryption::{impl#7}::{constant#0}>
