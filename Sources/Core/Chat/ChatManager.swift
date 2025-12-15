@@ -551,21 +551,21 @@ final class ChatManager: ObservableObject {
             updateMessageInConversation(message)
 
             // Persist with sent status
-            database.saveMessage(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
         } catch {
             // FIX #249: Queue message if recipient is offline instead of marking failed
             if isOfflineError(error) {
                 print("💬 FIX #249: Recipient offline, queueing message for \(contact.displayName)")
                 message.markQueued()
                 updateMessageInConversation(message)
-                database.saveMessage(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
                 queueMessage(message, for: contact.onionAddress)
                 // Don't throw - message is queued, will be sent when online
             } else {
                 // Other errors (encryption, protocol) - mark as failed
                 message.markFailed()
                 updateMessageInConversation(message)
-                database.saveMessage(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
                 throw error
             }
         }
@@ -604,7 +604,7 @@ final class ChatManager: ObservableObject {
 
         try await sendMessage(message, to: contact)
         addMessageToConversation(message)
-        database.saveMessage(message)
+        database.saveMessage(message, ourOnionAddress: ourOnionAddress)
     }
 
     /// Send payment confirmation back to the requester after completing a payment
@@ -631,7 +631,7 @@ final class ChatManager: ObservableObject {
 
         try await sendMessage(message, to: contact)
         addMessageToConversation(message)
-        database.saveMessage(message)
+        database.saveMessage(message, ourOnionAddress: ourOnionAddress)
 
         print("💸 Payment confirmation sent to \(contact.displayName) - txId: \(txId.prefix(16))...")
     }
@@ -661,6 +661,11 @@ final class ChatManager: ObservableObject {
             conversation = ChatConversation(contact: updatedContact)
             conversation.messages = conversations[contact.onionAddress]?.messages ?? []
             conversations[contact.onionAddress] = conversation
+
+            // FIX #265: Persist unread count reset to disk
+            // Previous bug: unreadCount was reset in memory but not saved
+            // After app restart, old unread count was loaded from disk
+            database.saveContact(updatedContact)
         }
 
         // Send read receipts for unread messages
@@ -941,7 +946,7 @@ final class ChatManager: ObservableObject {
         switch message.type {
         case .text, .paymentRequest, .paymentSent, .paymentReceived:
             addMessageToConversation(message)
-            database.saveMessage(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
 
             // Update unread count
             if selectedConversation != message.fromOnion {
@@ -1169,7 +1174,7 @@ final class ChatManager: ObservableObject {
                 conversations[onion] = conversation
 
                 // Update in database
-                database.saveMessage(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
                 break
             }
         }
@@ -1192,7 +1197,7 @@ final class ChatManager: ObservableObject {
                 conversations[onion] = conversation
 
                 // Update in database
-                database.saveMessage(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
                 break
             }
         }
@@ -1467,7 +1472,7 @@ final class ChatManager: ObservableObject {
                 // Success - update status to sent
                 message.markSent()
                 updateMessageInConversation(message)
-                database.saveMessage(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
                 successCount += 1
                 print("💬 FIX #249: Queued message sent successfully")
             } catch {
@@ -1590,8 +1595,17 @@ class ChatDatabase {
 
     // MARK: - Messages (Encrypted)
 
-    func saveMessage(_ message: ChatMessage) {
-        let onion = message.fromOnion.contains(".onion") ? message.fromOnion : message.toOnion
+    func saveMessage(_ message: ChatMessage, ourOnionAddress: String? = nil) {
+        // FIX #264: Store messages by conversation partner's address, not sender's
+        // Previous bug: used `fromOnion` if it contains ".onion" (always true!)
+        // Correct: use the OTHER party's address (same as addMessageToConversation)
+        let onion: String
+        if let ourAddress = ourOnionAddress {
+            onion = message.fromOnion == ourAddress ? message.toOnion : message.fromOnion
+        } else {
+            // Fallback if no ourOnionAddress yet - use non-empty address
+            onion = message.fromOnion.isEmpty ? message.toOnion : message.fromOnion
+        }
         var messages = loadMessages(for: onion)
 
         // Check if message already exists (update) or new (append)
