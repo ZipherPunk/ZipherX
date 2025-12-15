@@ -465,14 +465,16 @@ struct System7Alert: View {
 }
 
 // MARK: - QR Code View (for Receive)
+/// FIX #251: Enhanced QR Code with optional logo overlay and nickname support
 struct System7QRCode: View {
     @EnvironmentObject var themeManager: ThemeManager
     let data: String
+    var showLogo: Bool = false  // FIX #251: Optional ZipherX logo in center
 
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
-        if let qrImage = generateQRCode(from: data) {
+        if let qrImage = generateQRCode(from: data, withLogo: showLogo) {
             #if os(iOS)
             Image(uiImage: qrImage)
                 .interpolation(.none)
@@ -510,10 +512,12 @@ struct System7QRCode: View {
     }
 
     #if os(iOS)
-    private func generateQRCode(from string: String) -> UIImage? {
-        let data = string.data(using: .ascii)
+    private func generateQRCode(from string: String, withLogo: Bool) -> UIImage? {
+        // Use UTF-8 for nickname support (non-ASCII characters)
+        let data = string.data(using: .utf8)
         if let filter = CIFilter(name: "CIQRCodeGenerator") {
             filter.setValue(data, forKey: "inputMessage")
+            // FIX #251: Use "H" (high) error correction to allow logo overlay (~30% coverage)
             filter.setValue("H", forKey: "inputCorrectionLevel")
 
             if let output = filter.outputImage {
@@ -521,31 +525,178 @@ struct System7QRCode: View {
                 let scaledOutput = output.transformed(by: transform)
                 let context = CIContext()
                 if let cgImage = context.createCGImage(scaledOutput, from: scaledOutput.extent) {
-                    return UIImage(cgImage: cgImage)
+                    var finalImage = UIImage(cgImage: cgImage)
+
+                    // FIX #251: Add ZipherX logo to center if requested
+                    // FIX #260: Use "ZipherpunkLogo" - AppIcon not accessible via UIImage(named:) on iOS
+                    if withLogo, let logoImage = UIImage(named: "ZipherpunkLogo") {
+                        finalImage = addLogoToQRCode(qrImage: finalImage, logo: logoImage)
+                    }
+
+                    return finalImage
                 }
             }
         }
         return nil
     }
+
+    /// FIX #251: Overlay logo in center of QR code (max 20% of QR size for safe scanning)
+    private func addLogoToQRCode(qrImage: UIImage, logo: UIImage) -> UIImage {
+        let qrSize = qrImage.size
+        // Logo should be ~20% of QR code size (safe with H error correction)
+        let logoSize = CGSize(width: qrSize.width * 0.20, height: qrSize.height * 0.20)
+        let logoOrigin = CGPoint(
+            x: (qrSize.width - logoSize.width) / 2,
+            y: (qrSize.height - logoSize.height) / 2
+        )
+
+        UIGraphicsBeginImageContextWithOptions(qrSize, false, 0)
+        qrImage.draw(in: CGRect(origin: .zero, size: qrSize))
+
+        // Add white background circle behind logo for visibility
+        let circleRect = CGRect(
+            x: logoOrigin.x - 5,
+            y: logoOrigin.y - 5,
+            width: logoSize.width + 10,
+            height: logoSize.height + 10
+        )
+        UIColor.white.setFill()
+        UIBezierPath(ovalIn: circleRect).fill()
+
+        // Draw logo with rounded corners
+        let logoRect = CGRect(origin: logoOrigin, size: logoSize)
+        let path = UIBezierPath(roundedRect: logoRect, cornerRadius: logoSize.width * 0.15)
+        path.addClip()
+        logo.draw(in: logoRect)
+
+        let result = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        return result ?? qrImage
+    }
+
     #elseif os(macOS)
-    private func generateQRCode(from string: String) -> NSImage? {
-        let data = string.data(using: .ascii)
+    private func generateQRCode(from string: String, withLogo: Bool) -> NSImage? {
+        // Use UTF-8 for nickname support (non-ASCII characters)
+        let data = string.data(using: .utf8)
         if let filter = CIFilter(name: "CIQRCodeGenerator") {
             filter.setValue(data, forKey: "inputMessage")
+            // FIX #251: Use "H" (high) error correction to allow logo overlay (~30% coverage)
             filter.setValue("H", forKey: "inputCorrectionLevel")
 
             if let output = filter.outputImage {
                 let transform = CGAffineTransform(scaleX: 10, y: 10)
                 let scaledOutput = output.transformed(by: transform)
                 let rep = NSCIImageRep(ciImage: scaledOutput)
-                let nsImage = NSImage(size: rep.size)
+                var nsImage = NSImage(size: rep.size)
                 nsImage.addRepresentation(rep)
+
+                // FIX #251: Add ZipherX logo to center if requested
+                // FIX #260: Use "ZipherpunkLogo" for consistency with iOS
+                if withLogo, let logoImage = NSImage(named: "ZipherpunkLogo") {
+                    nsImage = addLogoToQRCode(qrImage: nsImage, logo: logoImage)
+                }
+
                 return nsImage
             }
         }
         return nil
     }
+
+    /// FIX #251: Overlay logo in center of QR code (max 20% of QR size for safe scanning)
+    private func addLogoToQRCode(qrImage: NSImage, logo: NSImage) -> NSImage {
+        let qrSize = qrImage.size
+        // Logo should be ~20% of QR code size (safe with H error correction)
+        let logoSize = CGSize(width: qrSize.width * 0.20, height: qrSize.height * 0.20)
+        let logoOrigin = CGPoint(
+            x: (qrSize.width - logoSize.width) / 2,
+            y: (qrSize.height - logoSize.height) / 2
+        )
+
+        let resultImage = NSImage(size: qrSize)
+        resultImage.lockFocus()
+
+        // Draw QR code
+        qrImage.draw(in: CGRect(origin: .zero, size: qrSize))
+
+        // Add white background circle behind logo for visibility
+        let circleRect = CGRect(
+            x: logoOrigin.x - 5,
+            y: logoOrigin.y - 5,
+            width: logoSize.width + 10,
+            height: logoSize.height + 10
+        )
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: circleRect).fill()
+
+        // Draw logo
+        let logoRect = CGRect(origin: logoOrigin, size: logoSize)
+        logo.draw(in: logoRect)
+
+        resultImage.unlockFocus()
+
+        return resultImage
+    }
     #endif
+}
+
+// MARK: - FIX #251: QR Code Data Format for Chat Contacts
+/// Format: "zipherx://chat?onion=ADDRESS&nickname=NAME"
+/// This allows embedding nickname in QR code for auto-fill on scan
+struct ChatQRCodeData {
+    let onionAddress: String
+    let nickname: String?
+
+    /// Create QR code data string
+    var qrString: String {
+        if let nick = nickname, !nick.isEmpty {
+            // URL encode nickname for special characters
+            let encodedNick = nick.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? nick
+            return "zipherx://chat?onion=\(onionAddress)&nickname=\(encodedNick)"
+        } else {
+            return "zipherx://chat?onion=\(onionAddress)"
+        }
+    }
+
+    /// Parse QR code data string (supports both new format and legacy plain .onion)
+    static func parse(_ string: String) -> ChatQRCodeData? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // New format: zipherx://chat?onion=...&nickname=...
+        if trimmed.hasPrefix("zipherx://chat?") {
+            var onion: String?
+            var nickname: String?
+
+            // Parse query parameters
+            if let queryStart = trimmed.range(of: "?") {
+                let queryString = String(trimmed[queryStart.upperBound...])
+                let pairs = queryString.split(separator: "&")
+                for pair in pairs {
+                    let parts = pair.split(separator: "=", maxSplits: 1)
+                    if parts.count == 2 {
+                        let key = String(parts[0])
+                        let value = String(parts[1]).removingPercentEncoding ?? String(parts[1])
+                        if key == "onion" {
+                            onion = value
+                        } else if key == "nickname" {
+                            nickname = value
+                        }
+                    }
+                }
+            }
+
+            if let onion = onion, onion.hasSuffix(".onion") {
+                return ChatQRCodeData(onionAddress: onion, nickname: nickname)
+            }
+        }
+
+        // Legacy format: plain .onion address
+        if trimmed.hasSuffix(".onion") {
+            return ChatQRCodeData(onionAddress: trimmed, nickname: nil)
+        }
+
+        return nil
+    }
 }
 
 // MARK: - Cypherpunk Loading Components
@@ -1839,39 +1990,9 @@ struct CypherpunkMainView: View {
     // MARK: - Top Bar
 
     private var topBar: some View {
-        HStack {
-            // Network indicator with Tor/onion breakdown
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(networkManager.isConnected ? matrixGreen : Color.red)
-                    .frame(width: 8, height: 8)
-                    .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
-
-                // Show peer counts with Tor breakdown - ALL ON ONE LINE
-                HStack(spacing: 4) {
-                    Text("\(networkManager.connectedPeers) PEERS")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(matrixGreenDark)
-
-                    // Tor/onion breakdown if connected via Tor - same line
-                    let torCount = networkManager.torConnectedPeersCount
-                    let onionCount = networkManager.onionConnectedPeersCount
-                    if torCount > 0 || onionCount > 0 {
-                        Text("·")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(matrixGreenDark)
-                        Text("🧅")
-                            .font(.system(size: 9))
-                        Text("\(torCount) Tor" + (onionCount > 0 ? " +\(onionCount) onion" : ""))
-                            .font(.system(size: 9, weight: .regular, design: .monospaced))
-                            .foregroundColor(matrixGreenDark)
-                    }
-                }
-            }
-
-            Spacer()
-
-            // App title with rotating logo - tap for cypherpunk quote
+        // FIX #256: Use ZStack to ensure title is perfectly centered regardless of side content width
+        ZStack {
+            // Center: App title with rotating logo - tap for cypherpunk quote
             Button(action: {
                 currentQuote = PrivacyQuotes.randomQuote()
                 showQuote = true
@@ -1897,16 +2018,48 @@ struct CypherpunkMainView: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            Spacer()
+            // Left and right elements overlaid
+            HStack {
+                // Network indicator with Tor/onion breakdown
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(networkManager.isConnected ? matrixGreen : Color.red)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
 
-            // Settings gear button
-            Button(action: { showSettings = true }) {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 22))
-                    .foregroundColor(matrixGreen)
-                    .shadow(color: matrixGreen.opacity(0.5), radius: 4)
+                    // Show peer counts with Tor breakdown - ALL ON ONE LINE
+                    HStack(spacing: 4) {
+                        Text("\(networkManager.connectedPeers) PEERS")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(matrixGreenDark)
+
+                        // Tor/onion breakdown if connected via Tor - same line
+                        let torCount = networkManager.torConnectedPeersCount
+                        let onionCount = networkManager.onionConnectedPeersCount
+                        if torCount > 0 || onionCount > 0 {
+                            Text("·")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(matrixGreenDark)
+                            Text("🧅")
+                                .font(.system(size: 9))
+                            Text("\(torCount) Tor" + (onionCount > 0 ? " +\(onionCount) onion" : ""))
+                                .font(.system(size: 9, weight: .regular, design: .monospaced))
+                                .foregroundColor(matrixGreenDark)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // Settings gear button
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 22))
+                        .foregroundColor(matrixGreen)
+                        .shadow(color: matrixGreen.opacity(0.5), radius: 4)
+                }
+                .buttonStyle(PlainButtonStyle())
             }
-            .buttonStyle(PlainButtonStyle())
         }
         .alert("Cypherpunk Wisdom", isPresented: $showQuote) {
             Button("OK", role: .cancel) {}

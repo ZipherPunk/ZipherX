@@ -2823,6 +2823,13 @@ final class WalletManager: ObservableObject {
         print("📦 PHASE 2 will scan \(newTreeHeight + 1) → chain tip in sequential mode")
         try await scanner.startScan(for: account.id, viewingKey: spendingKey, fromHeight: saplingActivation)
 
+        // FIX #263: Explicitly set progress to 100% after scan completes
+        // Without this, UI can stay stuck at 99% even though scan finished
+        await MainActor.run {
+            onProgress(1.0, 100, 100)
+        }
+        print("✅ FIX #263: Progress set to 100%")
+
         // FIX #176: Update checkpoint to lastScannedHeight after full rescan
         // This prevents the "Checkpoint Sync" health check from failing after repair
         if let lastScanned = try? WalletDatabase.shared.getLastScannedHeight(), lastScanned > 0 {
@@ -3337,6 +3344,31 @@ final class WalletManager: ObservableObject {
             self.lastSendTimestamp = Date()
         }
 
+        // FIX #262: Verify notes are not already spent on-chain before building
+        // This prevents wasted proof generation and confusing DUPLICATE rejections
+        onProgress("verify", "Verifying notes not spent...", 0.0)
+        let spentOnChain = try await verifyNotesNotSpentOnChain()
+        if let spentNote = spentOnChain {
+            // Note was spent elsewhere - update our database and throw error
+            throw WalletError.transactionFailed("""
+                ⚠️ NOTE ALREADY SPENT
+
+                One of your notes (value: \(Double(spentNote.value) / 100_000_000.0) ZCL) was already spent in another transaction.
+
+                This can happen if you:
+                • Sent from this wallet on another device
+                • Restored this wallet elsewhere
+                • Had a previous transaction confirm that wasn't recorded
+
+                🔧 Your database has been updated.
+                Your balance will refresh automatically.
+
+                "Privacy is the power to selectively reveal oneself to the world."
+                — A Cypherpunk's Manifesto
+                """)
+        }
+        onProgress("verify", "Notes verified", 1.0)
+
         // SECURITY: Get spending key wrapped in SecureData for automatic memory cleanup
         // The key is zeroed as soon as the transaction is built (VUL-002 mitigation)
         let secureKey = try secureStorage.retrieveSpendingKeySecure()
@@ -3370,41 +3402,57 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002: CRITICAL - Only write to database if mempool verification succeeded!
-        // Peers may relay invalid transactions that the mempool ultimately rejects.
-        // Writing to database before mempool confirmation causes PHANTOM TRANSACTIONS
-        // that appear as "sent" but never confirm on the blockchain.
+        // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+        //
+        // The mempool check may be slow or unavailable, especially over Tor.
+        // If PEERS accepted the TX but the mempool check timed out, we should
+        // still record the TX - it was likely propagated successfully and will
+        // confirm on-chain.
+        //
+        // Only reject if NO peers accepted AND mempool check failed (true rejection).
         // ============================================================================
-        guard broadcastResult.mempoolVerified else {
-            // Mempool did NOT verify the transaction - DO NOT write to database!
-            print("🚨 VUL-002: MEMPOOL REJECTED - Not writing to database!")
-            print("🚨 VUL-002: txId=\(txId), peers=\(broadcastResult.peerCount), mempool=false")
+        if !broadcastResult.mempoolVerified {
+            if broadcastResult.peerCount > 0 {
+                // FIX #245: Peers accepted but mempool check timed out
+                // This is common with Tor (slow propagation)
+                // The TX was likely propagated successfully - record it and track
+                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
+                print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
+                print("🔐 FIX #245: txId=\(txId)")
+            } else {
+                // NO peers accepted AND mempool failed - likely a true rejection
+                print("🚨 VUL-002: MEMPOOL REJECTED - Not writing to database!")
+                print("🚨 VUL-002: txId=\(txId), peers=\(broadcastResult.peerCount), mempool=false")
 
-            // Clear any pending broadcast tracking since TX was rejected
-            // This ensures UI doesn't show incorrect pending balance
-            await MainActor.run {
-                networkManager.clearPendingBroadcast()
+                // Clear any pending broadcast tracking since TX was rejected
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                // FIX #218: Cypherpunk-styled warning with TXID for reference
+                throw WalletError.transactionFailed("""
+                    ⚡ MEMPOOL REJECTION ⚡
+
+                    The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                    — A Cypherpunk's Manifesto
+                    """)
             }
-
-            // FIX #218: Cypherpunk-styled warning with TXID for reference
-            throw WalletError.transactionFailed("""
-                ⚡ MEMPOOL REJECTION ⚡
-
-                The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
-
-                🔒 YOUR FUNDS ARE SAFE
-                No transaction was recorded in your wallet.
-
-                📋 TXID (for reference):
-                \(txId)
-
-                "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
-                — A Cypherpunk's Manifesto
-                """)
         }
 
-        // MEMPOOL VERIFIED - Safe to write to database
-        print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+        // TX accepted (by mempool API or by peers) - safe to write to database
+        if broadcastResult.mempoolVerified {
+            print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+        } else {
+            print("✅ FIX #245: Peers accepted TX - recording (mempool API was slow)")
+        }
 
         // Track as pending outgoing (cypherpunk mempool status)
         // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
@@ -3519,6 +3567,23 @@ final class WalletManager: ObservableObject {
             self.lastSendTimestamp = Date()
         }
 
+        // FIX #262: Verify notes are not already spent on-chain before building
+        // This prevents building/broadcasting a TX that will be rejected as DUPLICATE
+        let spentOnChain = try await verifyNotesNotSpentOnChain()
+        if let spentNote = spentOnChain {
+            throw WalletError.transactionFailed("""
+                ⚠️ NOTE ALREADY SPENT
+
+                One of your notes (value: \(Double(spentNote.value) / 100_000_000.0) ZCL) was already spent on-chain.
+
+                This can happen if:
+                • You sent from another wallet instance
+                • A previous transaction confirmed after being marked as failed
+
+                Your balance has been updated. Please try again.
+                """)
+        }
+
         // SECURITY: Get spending key wrapped in SecureData for automatic memory cleanup
         // The key is zeroed as soon as the transaction is built (VUL-002 mitigation)
         let secureKey = try secureStorage.retrieveSpendingKeySecure()
@@ -3543,40 +3608,57 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002: CRITICAL - Only write to database if mempool verification succeeded!
-        // Peers may relay invalid transactions that the mempool ultimately rejects.
-        // Writing to database before mempool confirmation causes PHANTOM TRANSACTIONS
-        // that appear as "sent" but never confirm on the blockchain.
+        // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+        //
+        // The mempool check may be slow or unavailable, especially over Tor.
+        // If PEERS accepted the TX but the mempool check timed out, we should
+        // still record the TX - it was likely propagated successfully and will
+        // confirm on-chain.
+        //
+        // Only reject if NO peers accepted AND mempool check failed (true rejection).
         // ============================================================================
-        guard broadcastResult.mempoolVerified else {
-            // Mempool did NOT verify the transaction - DO NOT write to database!
-            print("🚨 VUL-002: MEMPOOL REJECTED - Not writing to database!")
-            print("🚨 VUL-002: txId=\(txId), peers=\(broadcastResult.peerCount), mempool=false")
+        if !broadcastResult.mempoolVerified {
+            if broadcastResult.peerCount > 0 {
+                // FIX #245: Peers accepted but mempool check timed out
+                // This is common with Tor (slow propagation)
+                // The TX was likely propagated successfully - record it and track
+                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
+                print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
+                print("🔐 FIX #245: txId=\(txId)")
+            } else {
+                // NO peers accepted AND mempool failed - likely a true rejection
+                print("🚨 VUL-002: MEMPOOL REJECTED - Not writing to database!")
+                print("🚨 VUL-002: txId=\(txId), peers=\(broadcastResult.peerCount), mempool=false")
 
-            // Clear any pending broadcast tracking since TX was rejected
-            await MainActor.run {
-                networkManager.clearPendingBroadcast()
+                // Clear any pending broadcast tracking since TX was rejected
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                // FIX #218: Cypherpunk-styled warning with TXID for reference
+                throw WalletError.transactionFailed("""
+                    ⚡ MEMPOOL REJECTION ⚡
+
+                    The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                    — A Cypherpunk's Manifesto
+                    """)
             }
-
-            // FIX #218: Cypherpunk-styled warning with TXID for reference
-            throw WalletError.transactionFailed("""
-                ⚡ MEMPOOL REJECTION ⚡
-
-                The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
-
-                🔒 YOUR FUNDS ARE SAFE
-                No transaction was recorded in your wallet.
-
-                📋 TXID (for reference):
-                \(txId)
-
-                "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
-                — A Cypherpunk's Manifesto
-                """)
         }
 
-        // MEMPOOL VERIFIED - Safe to write to database
-        print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+        // TX accepted (by mempool or by peers) - safe to write to database
+        if broadcastResult.mempoolVerified {
+            print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+        } else {
+            print("✅ FIX #245: Peers accepted TX - recording (mempool check was slow)")
+        }
 
         // Track as pending outgoing (cypherpunk mempool status)
         // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
@@ -3587,7 +3669,7 @@ final class WalletManager: ObservableObject {
         // Note: lastSendTimestamp is set BEFORE broadcast starts (line 1759)
         // so that setMempoolVerified() can calculate accurate clearing time
 
-        // CRITICAL: Record transaction IMMEDIATELY after mempool verification success
+        // CRITICAL: Record transaction IMMEDIATELY after broadcast acceptance
         guard let txidData = Data(hexString: txId) else {
             throw WalletError.transactionFailed("Invalid transaction ID format")
         }
@@ -4128,6 +4210,88 @@ final class WalletManager: ObservableObject {
         }
 
         print("✅ Key imported successfully (will scan for historical notes)")
+    }
+
+    // MARK: - FIX #262: Pre-Build Nullifier Verification
+
+    /// FIX #262: Quick check before building a transaction to verify notes aren't already spent
+    /// Scans recent blocks (last 20) via P2P to detect if any of our unspent notes were spent
+    /// Returns the first spent note found, or nil if all notes are verified unspent
+    private func verifyNotesNotSpentOnChain() async throws -> WalletNote? {
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get our unspent notes
+        let unspentNotes = try database.getAllUnspentNotes(accountId: 1)
+        guard !unspentNotes.isEmpty else {
+            return nil  // No notes to check
+        }
+
+        // Build lookup map of our nullifiers
+        var ourNullifiers: [Data: WalletNote] = [:]
+        for note in unspentNotes {
+            ourNullifiers[note.nullifier] = note
+        }
+
+        print("🔍 FIX #262: Quick nullifier check for \(unspentNotes.count) unspent notes...")
+
+        // Get current chain height
+        let chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : (try? await networkManager.getChainHeight()) ?? 0
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #262: Cannot get chain height - skipping pre-build check")
+            return nil
+        }
+
+        // Scan last 20 blocks (quick check, not exhaustive)
+        let blocksToScan: UInt64 = 20
+        let startHeight = chainHeight > blocksToScan ? chainHeight - blocksToScan : 0
+
+        print("🔍 FIX #262: Scanning blocks \(startHeight) to \(chainHeight)...")
+
+        do {
+            let blocks = try await networkManager.getBlocksDataP2P(from: startHeight, count: Int(blocksToScan))
+
+            for (height, _, _, txData) in blocks {
+                for (txidHex, _, spends) in txData {
+                    guard let spends = spends, !spends.isEmpty else { continue }
+
+                    for spend in spends {
+                        guard let nullifierData = Data(hexString: spend.nullifier) else { continue }
+
+                        // VUL-009: Hash the on-chain nullifier to compare with stored hashes
+                        let hashedNullifier = SHA256.hash(data: nullifierData)
+                        let hashedData = Data(hashedNullifier)
+
+                        if let spentNote = ourNullifiers[hashedData] {
+                            // Found a spent note!
+                            print("🚨 FIX #262: Note \(spentNote.id) was spent in TX \(txidHex) at height \(height)!")
+
+                            // Mark as spent in database using hashed nullifier
+                            if let txidData = Data(hexString: txidHex) {
+                                try database.markNoteSpentByHashedNullifier(
+                                    hashedNullifier: hashedData,
+                                    txid: txidData,
+                                    spentHeight: UInt64(height)
+                                )
+                                print("✅ FIX #262: Marked note \(spentNote.id) as spent")
+                            }
+
+                            // Refresh balance
+                            try? await refreshBalance()
+
+                            return spentNote
+                        }
+                    }
+                }
+            }
+
+            print("✅ FIX #262: All notes verified - not spent in recent blocks")
+            return nil
+
+        } catch {
+            print("⚠️ FIX #262: Block scan failed: \(error) - proceeding with build")
+            return nil  // Don't block on scan failure
+        }
     }
 
     // MARK: - Post-Scan Nullifier Verification

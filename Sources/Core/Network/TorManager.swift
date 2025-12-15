@@ -173,11 +173,16 @@ public final class TorManager: ObservableObject {
 
     /// Start Tor connection (if mode requires it)
     public func start() async {
+        // FIX #250: Add diagnostic logging for real iOS debugging
+        debugLog(.network, "🧅 TorManager.start() called - mode: \(mode)")
+
         guard mode == .enabled else {
+            debugLog(.network, "🧅 Tor disabled (mode=\(mode)), skipping start")
             print("🧅 Tor disabled, skipping start")
             return
         }
 
+        debugLog(.network, "🧅 Tor enabled, starting Arti...")
         await startArti()
     }
 
@@ -451,13 +456,21 @@ public final class TorManager: ObservableObject {
     // MARK: - Arti (Rust Tor) Integration
 
     private func startArti() async {
+        // FIX #250: Enhanced diagnostics for real iOS debugging
+        debugLog(.network, "🧅 startArti() called - isStartingTor: \(isStartingTor)")
+
         guard !isStartingTor else {
+            debugLog(.network, "🧅 Tor already starting, skipping...")
             print("🧅 Tor already starting...")
             return
         }
 
         // Check if Arti is available
-        guard zipherx_tor_is_available() else {
+        let artiAvailable = zipherx_tor_is_available()
+        debugLog(.network, "🧅 zipherx_tor_is_available() = \(artiAvailable)")
+
+        guard artiAvailable else {
+            debugLog(.network, "🧅 ERROR: Arti not available in this build!")
             connectionState = .error("Arti not available in this build")
             return
         }
@@ -465,9 +478,11 @@ public final class TorManager: ObservableObject {
         isStartingTor = true
         connectionState = .connecting
 
+        debugLog(.network, "🧅 Starting Arti (embedded Tor)...")
         print("🧅 Starting Arti (embedded Tor)...")
 
         // Start Arti in background thread
+        debugLog(.network, "🧅 Calling zipherx_tor_start()...")
         let result = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let result = zipherx_tor_start()
@@ -475,19 +490,24 @@ public final class TorManager: ObservableObject {
             }
         }
 
+        debugLog(.network, "🧅 zipherx_tor_start() returned: \(result)")
+
         if result != 0 {
             // Get error message
             if let errorPtr = zipherx_tor_get_error() {
                 let errorMsg = String(cString: errorPtr)
                 zipherx_tor_free_string(errorPtr)
+                debugLog(.network, "🧅 ERROR: Tor start failed: \(errorMsg)")
                 connectionState = .error(errorMsg)
             } else {
+                debugLog(.network, "🧅 ERROR: Tor start failed (no error message)")
                 connectionState = .error("Failed to start Tor")
             }
             isStartingTor = false
             return
         }
 
+        debugLog(.network, "🧅 Tor started successfully, starting status polling...")
         // Start polling for status updates
         startStatusPolling()
     }

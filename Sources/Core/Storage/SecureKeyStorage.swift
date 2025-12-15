@@ -529,10 +529,25 @@ final class SecureKeyStorage {
         }
 
         if existsStatus == errSecInteractionNotAllowed {
-            // Item exists but requires authentication - we can't check further without UI
-            print("🔐 hasSpendingKey: Entry exists but requires authentication")
-            // For now, return true and let the actual retrieval fail with proper error handling
-            return true
+            // Item exists but requires authentication
+            // FIX #248: Still need to verify Secure Enclave key exists before returning true
+            print("🔐 hasSpendingKey: Entry exists but requires authentication, checking SE key...")
+            let keyQuery: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
+                kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                kSecReturnRef as String: true,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+            ]
+            var keyRef: AnyObject?
+            let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
+            if keyStatus == errSecSuccess || keyStatus == errSecInteractionNotAllowed {
+                print("🔐 hasSpendingKey: SE key exists, returning true")
+                return true
+            } else {
+                print("⚠️ hasSpendingKey: Keychain entry exists but SE key is missing (status=\(keyStatus))")
+                return false
+            }
         }
 
         if existsStatus != errSecSuccess {
@@ -555,9 +570,25 @@ final class SecureKeyStorage {
         let status = SecItemCopyMatching(dataQuery as CFDictionary, &result)
 
         if status == errSecInteractionNotAllowed {
-            // Data exists but requires user interaction - assume valid
-            print("🔐 hasSpendingKey: Data requires authentication, assuming valid")
-            return true
+            // Data exists but requires user interaction
+            // FIX #248: Still need to verify Secure Enclave key exists before returning true
+            print("🔐 hasSpendingKey: Data requires authentication, checking SE key...")
+            let keyQuery: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
+                kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                kSecReturnRef as String: true,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+            ]
+            var keyRef: AnyObject?
+            let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
+            if keyStatus == errSecSuccess || keyStatus == errSecInteractionNotAllowed {
+                print("🔐 hasSpendingKey: SE key exists, returning true")
+                return true
+            } else {
+                print("⚠️ hasSpendingKey: Data exists but SE key is missing (status=\(keyStatus))")
+                return false
+            }
         }
 
         guard status == errSecSuccess, let data = result as? Data else {
@@ -630,9 +661,29 @@ final class SecureKeyStorage {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        guard status == errSecSuccess, let data = result as? Data else {
+        // FIX #248: Better diagnostics for key retrieval failures on real devices
+        if status != errSecSuccess {
+            print("🔐 retrieveSpendingKey: Keychain query failed with status: \(status)")
+            switch status {
+            case errSecItemNotFound:
+                print("🔐 retrieveSpendingKey: Key not found (errSecItemNotFound -25300)")
+                print("🔐 This can happen if: app was reinstalled, device was restored, or wallet was never created")
+            case errSecAuthFailed:
+                print("🔐 retrieveSpendingKey: Authentication failed (errSecAuthFailed -25293)")
+            case errSecInteractionNotAllowed:
+                print("🔐 retrieveSpendingKey: Interaction not allowed (device locked?) -25308")
+            default:
+                print("🔐 retrieveSpendingKey: Unknown error code: \(status)")
+            }
             throw SecureStorageError.keyNotFound
         }
+
+        guard let data = result as? Data else {
+            print("🔐 retrieveSpendingKey: Query succeeded but no data returned")
+            throw SecureStorageError.keyNotFound
+        }
+
+        print("🔐 retrieveSpendingKey: Found \(data.count) bytes in keychain")
 
         // Simulator: data is encrypted with AES-GCM, need to decrypt
         if isSimulator {

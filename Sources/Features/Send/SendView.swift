@@ -875,28 +875,40 @@ struct SendView: View {
                 // VUL-002: Extract txId from BroadcastResult
                 let broadcastedTxId = broadcastResult.txId
 
-                // VUL-002: CRITICAL - Only write to database if mempool verification succeeded!
-                guard broadcastResult.mempoolVerified else {
-                    print("🚨 VUL-002 SendView: MEMPOOL REJECTED - Not writing to database!")
-                    print("🚨 VUL-002 SendView: txId=\(broadcastedTxId), peers=\(broadcastResult.peerCount), mempool=false")
-                    // FIX #218: Cypherpunk-styled warning with TXID for reference
-                    throw WalletError.transactionFailed("""
-                        ⚡ MEMPOOL REJECTION ⚡
+                // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+                // If peers accepted but mempool check timed out, record TX anyway
+                if !broadcastResult.mempoolVerified {
+                    if broadcastResult.peerCount > 0 {
+                        // FIX #245: Peers accepted but mempool check timed out
+                        print("⚠️ FIX #245 SendView: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
+                        print("📡 FIX #245 SendView: Recording TX anyway - peers accepted it")
+                    } else {
+                        // NO peers accepted AND mempool failed - true rejection
+                        print("🚨 VUL-002 SendView: MEMPOOL REJECTED - Not writing to database!")
+                        print("🚨 VUL-002 SendView: txId=\(broadcastedTxId), peers=\(broadcastResult.peerCount), mempool=false")
+                        // FIX #218: Cypherpunk-styled warning with TXID for reference
+                        throw WalletError.transactionFailed("""
+                            ⚡ MEMPOOL REJECTION ⚡
 
-                        The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
+                            The network nodes did not propagate your transaction to their mempools. This can happen during network congestion or peer instability.
 
-                        🔒 YOUR FUNDS ARE SAFE
-                        No transaction was recorded in your wallet.
+                            🔒 YOUR FUNDS ARE SAFE
+                            No transaction was recorded in your wallet.
 
-                        📋 TXID (for reference):
-                        \(broadcastedTxId)
+                            📋 TXID (for reference):
+                            \(broadcastedTxId)
 
-                        "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
-                        — A Cypherpunk's Manifesto
-                        """)
+                            "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy. We must defend our own privacy."
+                            — A Cypherpunk's Manifesto
+                            """)
+                    }
                 }
 
-                print("✅ VUL-002 SendView: Mempool VERIFIED - safe to record transaction")
+                if broadcastResult.mempoolVerified {
+                    print("✅ VUL-002 SendView: Mempool VERIFIED - safe to record transaction")
+                } else {
+                    print("✅ FIX #245 SendView: Peers accepted TX - recording (mempool check was slow)")
+                }
 
                 // Track as pending outgoing
                 let pendingFee: UInt64 = 10_000

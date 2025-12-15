@@ -46,6 +46,7 @@ enum MessageStatus: String, Codable {
     case delivered = "delivered"    // 🔐 Peer received and decrypted
     case read = "read"              // 👁 Peer opened the message
     case failed = "failed"          // ❌ Failed to send
+    case queued = "queued"          // 🕐 FIX #249: Queued for offline recipient
 
     /// Cypherpunk-style status indicator
     var indicator: String {
@@ -55,6 +56,7 @@ enum MessageStatus: String, Codable {
         case .delivered: return "🔐"  // Decrypted by peer
         case .read:      return "👁"   // Eyes on message
         case .failed:    return "❌"  // Failed
+        case .queued:    return "🕐"  // FIX #249: Queued
         }
     }
 
@@ -66,6 +68,7 @@ enum MessageStatus: String, Codable {
         case .delivered: return "●"   // Filled circle
         case .read:      return "◉"   // Double circle (like double check)
         case .failed:    return "⊘"   // Prohibited
+        case .queued:    return "◔"   // FIX #249: Quarter filled (waiting)
         }
     }
 
@@ -77,6 +80,7 @@ enum MessageStatus: String, Codable {
         case .delivered: return "Delivered and decrypted"
         case .read:      return "Seen by recipient"
         case .failed:    return "Failed to send"
+        case .queued:    return "Queued - will send when online"  // FIX #249
         }
     }
 }
@@ -162,6 +166,11 @@ struct ChatMessage: Codable, Identifiable {
     /// Update status to failed
     mutating func markFailed() {
         status = .failed
+    }
+
+    /// FIX #249: Update status to queued (offline recipient)
+    mutating func markQueued() {
+        status = .queued
     }
 }
 

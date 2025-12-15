@@ -145,6 +145,30 @@ final class ChatManager: ObservableObject {
     /// Queue for network operations
     private let networkQueue = DispatchQueue(label: "chat.network", qos: .userInitiated)
 
+    // MARK: - FIX #249: Message Queue for Offline Recipients
+
+    /// Queued messages waiting to be sent when recipient comes online
+    /// Key: onionAddress, Value: array of queued messages
+    private var messageQueue: [String: [ChatMessage]] = [:]
+
+    /// UserDefaults key for persisting encrypted message queue
+    private let messageQueueKey = "chat_message_queue_encrypted"
+
+    /// Keychain key for queue encryption key
+    private let queueEncryptionKeyKeychainKey = "com.zipherx.chat-queue-key"
+
+    /// Task for periodic queue retry
+    private var queueRetryTask: Task<Void, Never>?
+
+    /// Retry interval for queued messages (30 seconds)
+    private let queueRetryInterval: TimeInterval = 30
+
+    /// FIX #249 v2: Maximum age for queued messages (180 days)
+    private let maxQueuedMessageAge: TimeInterval = 180 * 24 * 60 * 60  // 180 days in seconds
+
+    /// Cached encryption key for queue (loaded from Keychain)
+    private var queueEncryptionKey: SymmetricKey?
+
     // MARK: - Initialization
 
     private init() {
@@ -154,6 +178,8 @@ final class ChatManager: ObservableObject {
         // Load contacts and conversations from database
         Task {
             await loadPersistentData()
+            // FIX #249: Load queued messages
+            await loadMessageQueue()
         }
 
         print("💬 ChatManager initialized")
@@ -527,12 +553,36 @@ final class ChatManager: ObservableObject {
             // Persist with sent status
             database.saveMessage(message)
         } catch {
-            // Update status to failed
-            message.markFailed()
-            updateMessageInConversation(message)
-            database.saveMessage(message)
-            throw error
+            // FIX #249: Queue message if recipient is offline instead of marking failed
+            if isOfflineError(error) {
+                print("💬 FIX #249: Recipient offline, queueing message for \(contact.displayName)")
+                message.markQueued()
+                updateMessageInConversation(message)
+                database.saveMessage(message)
+                queueMessage(message, for: contact.onionAddress)
+                // Don't throw - message is queued, will be sent when online
+            } else {
+                // Other errors (encryption, protocol) - mark as failed
+                message.markFailed()
+                updateMessageInConversation(message)
+                database.saveMessage(message)
+                throw error
+            }
         }
+    }
+
+    /// FIX #249: Check if error indicates recipient is offline
+    private func isOfflineError(_ error: Error) -> Bool {
+        if case ChatError.notConnected = error { return true }
+        if case ChatError.connectionFailed(_) = error { return true }
+        if case ChatError.hiddenServiceNotRunning = error { return false }  // Our issue, not theirs
+        if case ChatError.torNotConnected = error { return false }  // Our issue, not theirs
+        // Check for NWError connection failures
+        let errorDescription = error.localizedDescription.lowercased()
+        return errorDescription.contains("connection") ||
+               errorDescription.contains("timeout") ||
+               errorDescription.contains("unreachable") ||
+               errorDescription.contains("refused")
     }
 
     /// Send a payment request
@@ -1073,12 +1123,20 @@ final class ChatManager: ObservableObject {
     private func updateContactOnlineStatus(_ onionAddress: String, isOnline: Bool) {
         if let index = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
             var contact = contacts[index]
+            let wasOffline = !contact.isOnline
             contact.isOnline = isOnline
             if isOnline {
                 contact.lastSeen = Date()
             }
             contacts[index] = contact
             database.saveContact(contact)
+
+            // FIX #249: Flush queued messages when contact comes online
+            if isOnline && wasOffline {
+                Task {
+                    await flushQueue(for: contact)
+                }
+            }
         }
     }
 
@@ -1182,6 +1240,9 @@ final class ChatManager: ObservableObject {
                         updateContactOnlineStatus(onion, isOnline: false)
                     }
                 }
+
+                // FIX #249: Retry queued messages periodically
+                await retryQueuedMessages()
             }
         }
     }
@@ -1196,6 +1257,263 @@ final class ChatManager: ObservableObject {
         }
 
         totalUnreadCount = contacts.reduce(0) { $0 + $1.unreadCount }
+    }
+
+    // MARK: - FIX #249: Message Queue Methods
+
+    /// Add a message to the queue for a specific contact
+    private func queueMessage(_ message: ChatMessage, for onionAddress: String) {
+        if messageQueue[onionAddress] == nil {
+            messageQueue[onionAddress] = []
+        }
+        messageQueue[onionAddress]?.append(message)
+        saveMessageQueue()
+        print("💬 FIX #249: Message queued for \(onionAddress.prefix(16))... (queue size: \(messageQueue[onionAddress]?.count ?? 0))")
+    }
+
+    /// FIX #249 v2: Load message queue from UserDefaults (encrypted + expiry filter)
+    private func loadMessageQueue() async {
+        // Ensure we have encryption key
+        guard let key = getOrCreateQueueEncryptionKey() else {
+            print("💬 FIX #249: Failed to get queue encryption key")
+            return
+        }
+
+        // Load encrypted data
+        guard let encryptedData = UserDefaults.standard.data(forKey: messageQueueKey) else {
+            print("💬 FIX #249: No message queue found")
+            return
+        }
+
+        // Decrypt
+        guard let decryptedData = decryptQueueData(encryptedData, using: key) else {
+            print("💬 FIX #249: Failed to decrypt message queue - may be corrupted or old format")
+            // Clear corrupted queue
+            UserDefaults.standard.removeObject(forKey: messageQueueKey)
+            return
+        }
+
+        // Decode
+        guard let queue = try? JSONDecoder().decode([String: [ChatMessage]].self, from: decryptedData) else {
+            print("💬 FIX #249: Failed to decode message queue")
+            return
+        }
+
+        // Filter out expired messages (older than 180 days)
+        let now = Date()
+        var filteredQueue: [String: [ChatMessage]] = [:]
+        var expiredCount = 0
+
+        for (onionAddress, messages) in queue {
+            let validMessages = messages.filter { message in
+                let age = now.timeIntervalSince(message.timestamp)
+                if age > maxQueuedMessageAge {
+                    expiredCount += 1
+                    return false
+                }
+                return true
+            }
+            if !validMessages.isEmpty {
+                filteredQueue[onionAddress] = validMessages
+            }
+        }
+
+        messageQueue = filteredQueue
+
+        if expiredCount > 0 {
+            print("💬 FIX #249 v2: Removed \(expiredCount) expired message(s) (>180 days)")
+            saveMessageQueue()  // Persist the filtered queue
+        }
+
+        let totalQueued = filteredQueue.values.reduce(0) { $0 + $1.count }
+        print("💬 FIX #249: Loaded message queue (\(totalQueued) messages for \(filteredQueue.keys.count) contacts)")
+    }
+
+    /// FIX #249 v2: Save message queue to UserDefaults (encrypted with ChaChaPoly)
+    private func saveMessageQueue() {
+        // Ensure we have encryption key
+        guard let key = getOrCreateQueueEncryptionKey() else {
+            print("💬 FIX #249: Failed to get queue encryption key - cannot save queue")
+            return
+        }
+
+        // Encode to JSON
+        guard let jsonData = try? JSONEncoder().encode(messageQueue) else {
+            print("💬 FIX #249: Failed to encode message queue")
+            return
+        }
+
+        // Encrypt with ChaChaPoly
+        guard let encryptedData = encryptQueueData(jsonData, using: key) else {
+            print("💬 FIX #249: Failed to encrypt message queue")
+            return
+        }
+
+        UserDefaults.standard.set(encryptedData, forKey: messageQueueKey)
+    }
+
+    // MARK: - FIX #249 v2: Queue Encryption Helpers
+
+    /// Get or create the queue encryption key from Keychain
+    private func getOrCreateQueueEncryptionKey() -> SymmetricKey? {
+        // Return cached key if available
+        if let cached = queueEncryptionKey {
+            return cached
+        }
+
+        // Try to load from Keychain
+        if let keyData = loadQueueKeyFromKeychain() {
+            let key = SymmetricKey(data: keyData)
+            queueEncryptionKey = key
+            return key
+        }
+
+        // Generate new 256-bit key
+        let newKey = SymmetricKey(size: .bits256)
+
+        // Save to Keychain
+        let keyData = newKey.withUnsafeBytes { Data($0) }
+        if saveQueueKeyToKeychain(keyData) {
+            queueEncryptionKey = newKey
+            print("💬 FIX #249 v2: Generated new queue encryption key")
+            return newKey
+        }
+
+        print("💬 FIX #249 v2: Failed to save queue encryption key to Keychain")
+        return nil
+    }
+
+    /// Encrypt queue data using ChaChaPoly
+    private func encryptQueueData(_ data: Data, using key: SymmetricKey) -> Data? {
+        do {
+            let sealedBox = try ChaChaPoly.seal(data, using: key)
+            return sealedBox.combined
+        } catch {
+            print("💬 FIX #249 v2: Encryption error: \(error)")
+            return nil
+        }
+    }
+
+    /// Decrypt queue data using ChaChaPoly
+    private func decryptQueueData(_ data: Data, using key: SymmetricKey) -> Data? {
+        do {
+            let sealedBox = try ChaChaPoly.SealedBox(combined: data)
+            return try ChaChaPoly.open(sealedBox, using: key)
+        } catch {
+            print("💬 FIX #249 v2: Decryption error: \(error)")
+            return nil
+        }
+    }
+
+    /// Save queue encryption key to Keychain
+    private func saveQueueKeyToKeychain(_ keyData: Data) -> Bool {
+        // Delete existing if any
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: queueEncryptionKeyKeychainKey
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new key
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: queueEncryptionKeyKeychainKey,
+            kSecValueData as String: keyData,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    /// Load queue encryption key from Keychain
+    private func loadQueueKeyFromKeychain() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: queueEncryptionKeyKeychainKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data, data.count == 32 {
+            return data
+        }
+        return nil
+    }
+
+    /// Flush all queued messages for a contact who just came online
+    private func flushQueue(for contact: ChatContact) async {
+        guard let queued = messageQueue[contact.onionAddress], !queued.isEmpty else {
+            return
+        }
+
+        print("💬 FIX #249: Flushing \(queued.count) queued message(s) for \(contact.displayName)")
+
+        var successCount = 0
+        var failCount = 0
+        var remainingMessages: [ChatMessage] = []
+
+        for var message in queued {
+            do {
+                // Try to send the message
+                try await sendMessage(message, to: contact)
+
+                // Success - update status to sent
+                message.markSent()
+                updateMessageInConversation(message)
+                database.saveMessage(message)
+                successCount += 1
+                print("💬 FIX #249: Queued message sent successfully")
+            } catch {
+                // Still offline or other error - keep in queue
+                failCount += 1
+                remainingMessages.append(message)
+                print("💬 FIX #249: Failed to send queued message: \(error.localizedDescription)")
+            }
+        }
+
+        // Update queue with any remaining messages
+        if remainingMessages.isEmpty {
+            messageQueue.removeValue(forKey: contact.onionAddress)
+        } else {
+            messageQueue[contact.onionAddress] = remainingMessages
+        }
+        saveMessageQueue()
+
+        print("💬 FIX #249: Queue flush complete - sent: \(successCount), remaining: \(failCount)")
+    }
+
+    /// Retry sending queued messages for all contacts (called periodically)
+    private func retryQueuedMessages() async {
+        guard !messageQueue.isEmpty else { return }
+
+        print("💬 FIX #249: Retrying queued messages for \(messageQueue.keys.count) contact(s)")
+
+        for onionAddress in messageQueue.keys {
+            // Find the contact
+            guard let contact = contacts.first(where: { $0.onionAddress == onionAddress }) else {
+                continue
+            }
+
+            // Try to flush queue for this contact
+            await flushQueue(for: contact)
+        }
+    }
+
+    /// Get the number of queued messages for a contact (for UI)
+    func getQueuedMessageCount(for onionAddress: String) -> Int {
+        return messageQueue[onionAddress]?.count ?? 0
+    }
+
+    /// Get total number of queued messages across all contacts
+    var totalQueuedMessages: Int {
+        return messageQueue.values.reduce(0) { $0 + $1.count }
     }
 
     private func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) async throws -> T {
@@ -1218,10 +1536,17 @@ final class ChatManager: ObservableObject {
 
 // MARK: - Chat Database
 
-/// Simple database for chat persistence
+/// FIX #249 v2: Encrypted database for chat persistence
+/// All data is encrypted at rest using ChaChaPoly with a Keychain-stored key
 class ChatDatabase {
-    private let contactsKey = "chat_contacts"
-    private let messagesPrefix = "chat_messages_"
+    private let contactsKey = "chat_contacts_encrypted"
+    private let messagesPrefix = "chat_messages_encrypted_"
+    private let encryptionKeyKeychainKey = "com.zipherx.chat-database-key"
+
+    /// Cached encryption key
+    private var encryptionKey: SymmetricKey?
+
+    // MARK: - Contacts (Encrypted)
 
     func saveContact(_ contact: ChatContact) {
         var contacts = loadContacts()
@@ -1231,14 +1556,14 @@ class ChatDatabase {
             contacts.append(contact)
         }
 
-        if let data = try? JSONEncoder().encode(contacts) {
-            UserDefaults.standard.set(data, forKey: contactsKey)
-        }
+        saveContactsEncrypted(contacts)
     }
 
     func loadContacts() -> [ChatContact] {
-        guard let data = UserDefaults.standard.data(forKey: contactsKey),
-              let contacts = try? JSONDecoder().decode([ChatContact].self, from: data) else {
+        guard let key = getOrCreateEncryptionKey(),
+              let encryptedData = UserDefaults.standard.data(forKey: contactsKey),
+              let decryptedData = decrypt(encryptedData, using: key),
+              let contacts = try? JSONDecoder().decode([ChatContact].self, from: decryptedData) else {
             return []
         }
         return contacts
@@ -1247,36 +1572,156 @@ class ChatDatabase {
     func deleteContact(_ contact: ChatContact) {
         var contacts = loadContacts()
         contacts.removeAll { $0.onionAddress == contact.onionAddress }
+        saveContactsEncrypted(contacts)
 
-        if let data = try? JSONEncoder().encode(contacts) {
-            UserDefaults.standard.set(data, forKey: contactsKey)
-        }
-
-        // Delete messages
+        // Delete encrypted messages
         UserDefaults.standard.removeObject(forKey: messagesPrefix + contact.onionAddress)
     }
+
+    private func saveContactsEncrypted(_ contacts: [ChatContact]) {
+        guard let key = getOrCreateEncryptionKey(),
+              let jsonData = try? JSONEncoder().encode(contacts),
+              let encryptedData = encrypt(jsonData, using: key) else {
+            print("💬 ChatDatabase: Failed to encrypt contacts")
+            return
+        }
+        UserDefaults.standard.set(encryptedData, forKey: contactsKey)
+    }
+
+    // MARK: - Messages (Encrypted)
 
     func saveMessage(_ message: ChatMessage) {
         let onion = message.fromOnion.contains(".onion") ? message.fromOnion : message.toOnion
         var messages = loadMessages(for: onion)
-        messages.append(message)
+
+        // Check if message already exists (update) or new (append)
+        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
 
         // Keep only last 1000 messages per conversation
         if messages.count > 1000 {
             messages = Array(messages.suffix(1000))
         }
 
-        if let data = try? JSONEncoder().encode(messages) {
-            UserDefaults.standard.set(data, forKey: messagesPrefix + onion)
-        }
+        saveMessagesEncrypted(messages, for: onion)
     }
 
     func loadMessages(for onionAddress: String) -> [ChatMessage] {
-        guard let data = UserDefaults.standard.data(forKey: messagesPrefix + onionAddress),
-              let messages = try? JSONDecoder().decode([ChatMessage].self, from: data) else {
+        guard let key = getOrCreateEncryptionKey(),
+              let encryptedData = UserDefaults.standard.data(forKey: messagesPrefix + onionAddress),
+              let decryptedData = decrypt(encryptedData, using: key),
+              let messages = try? JSONDecoder().decode([ChatMessage].self, from: decryptedData) else {
             return []
         }
         return messages
+    }
+
+    private func saveMessagesEncrypted(_ messages: [ChatMessage], for onionAddress: String) {
+        guard let key = getOrCreateEncryptionKey(),
+              let jsonData = try? JSONEncoder().encode(messages),
+              let encryptedData = encrypt(jsonData, using: key) else {
+            print("💬 ChatDatabase: Failed to encrypt messages")
+            return
+        }
+        UserDefaults.standard.set(encryptedData, forKey: messagesPrefix + onionAddress)
+    }
+
+    // MARK: - Encryption Helpers (ChaChaPoly + Keychain)
+
+    /// Get or create the database encryption key from Keychain
+    private func getOrCreateEncryptionKey() -> SymmetricKey? {
+        // Return cached key if available
+        if let cached = encryptionKey {
+            return cached
+        }
+
+        // Try to load from Keychain
+        if let keyData = loadKeyFromKeychain() {
+            let key = SymmetricKey(data: keyData)
+            encryptionKey = key
+            return key
+        }
+
+        // Generate new 256-bit key
+        let newKey = SymmetricKey(size: .bits256)
+
+        // Save to Keychain
+        let keyData = newKey.withUnsafeBytes { Data($0) }
+        if saveKeyToKeychain(keyData) {
+            encryptionKey = newKey
+            print("💬 ChatDatabase: Generated new encryption key")
+            return newKey
+        }
+
+        print("💬 ChatDatabase: Failed to save encryption key to Keychain")
+        return nil
+    }
+
+    /// Encrypt data using ChaChaPoly (AEAD - authenticated encryption)
+    private func encrypt(_ data: Data, using key: SymmetricKey) -> Data? {
+        do {
+            let sealedBox = try ChaChaPoly.seal(data, using: key)
+            return sealedBox.combined
+        } catch {
+            print("💬 ChatDatabase: Encryption error: \(error)")
+            return nil
+        }
+    }
+
+    /// Decrypt data using ChaChaPoly
+    private func decrypt(_ data: Data, using key: SymmetricKey) -> Data? {
+        do {
+            let sealedBox = try ChaChaPoly.SealedBox(combined: data)
+            return try ChaChaPoly.open(sealedBox, using: key)
+        } catch {
+            print("💬 ChatDatabase: Decryption error: \(error)")
+            return nil
+        }
+    }
+
+    /// Save encryption key to Keychain (device-only, when unlocked)
+    private func saveKeyToKeychain(_ keyData: Data) -> Bool {
+        // Delete existing if any
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: encryptionKeyKeychainKey
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new key with strict access control
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: encryptionKeyKeychainKey,
+            kSecValueData as String: keyData,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    /// Load encryption key from Keychain
+    private func loadKeyFromKeychain() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: encryptionKeyKeychainKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data, data.count == 32 {
+            return data
+        }
+        return nil
     }
 }
 

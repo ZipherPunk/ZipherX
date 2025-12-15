@@ -13,6 +13,8 @@ struct ContentView: View {
     @State private var isShowingLockScreen: Bool = false  // Don't show during initial sync
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
+    @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
+    @State private var hasAcceptedDisclaimer: Bool = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
     // Startup timing - uses walletCreationTime from WalletManager
     // This ensures timing starts from when user clicks create/import/restore, not app launch
@@ -57,6 +59,17 @@ struct ContentView: View {
     }
 
     var body: some View {
+        // Show disclaimer on first launch before anything else
+        if !hasAcceptedDisclaimer {
+            DisclaimerView(hasAcceptedDisclaimer: $hasAcceptedDisclaimer)
+        } else {
+            mainAppContent
+        }
+    }
+
+    // MARK: - Main App Content (after disclaimer accepted)
+
+    private var mainAppContent: some View {
         ZStack {
             // Themed background
             themeManager.currentTheme.backgroundColor
@@ -1227,6 +1240,8 @@ struct ContentView: View {
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         switch phase {
         case .background:
+            // FIX #258: Track that we went to background (for reconnection on return)
+            wasInBackground = true
             // Stop inactivity timer when going to background
             stopInactivityTimer()
             // Lock app when going to background (if biometric enabled)
@@ -1254,6 +1269,16 @@ struct ContentView: View {
             recordUserActivity()
             // Start inactivity timer when app becomes active
             startInactivityTimer()
+
+            // FIX #258: Force reconnect peers when returning from background
+            // iOS suspends network connections in background, so all sockets are dead
+            // Only trigger if we actually went to .background (not just .inactive from control center)
+            if wasInBackground {
+                wasInBackground = false  // Reset flag
+                Task {
+                    await networkManager.reconnectAfterBackground()
+                }
+            }
 
             // FIX #242: Check if wallet is behind and catch up
             if hasCompletedInitialSync {
@@ -1417,8 +1442,13 @@ struct ContentView: View {
         }
 
         // Tree loaded, network connected, sync complete
-        if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync {
+        // FIX #255: Don't show Ready when chain height is 0 (peers not yet synced)
+        if walletManager.isTreeLoaded && networkManager.isConnected && !isInitialSync && networkManager.chainHeight > 0 {
             return "Ready!"
+        }
+        // FIX #255: Show connecting status when chain height is 0
+        if networkManager.chainHeight == 0 && networkManager.isConnected {
+            return "Syncing with peers..."
         }
         // Waiting for sync to start
         return "Preparing sync..."
@@ -1513,7 +1543,9 @@ struct ContentView: View {
                 SettingsView()
             }
             #if os(macOS)
-            .frame(width: 500, height: 600)
+            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
+            .frame(minWidth: 480, idealWidth: 550, maxWidth: 650,
+                   minHeight: 550, idealHeight: 650, maxHeight: 800)
             #endif
             .environmentObject(walletManager)
             .environmentObject(networkManager)
@@ -1541,7 +1573,9 @@ struct ContentView: View {
                 })
             }
             #if os(macOS)
-            .frame(width: 480, height: 550)
+            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
+            .frame(minWidth: 450, idealWidth: 520, maxWidth: 600,
+                   minHeight: 500, idealHeight: 600, maxHeight: 700)
             #endif
             .environmentObject(walletManager)
             .environmentObject(networkManager)
@@ -1567,7 +1601,9 @@ struct ContentView: View {
                 ReceiveView()
             }
             #if os(macOS)
-            .frame(width: 420, height: 520)
+            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
+            .frame(minWidth: 380, idealWidth: 450, maxWidth: 550,
+                   minHeight: 480, idealHeight: 560, maxHeight: 650)
             #endif
             .environmentObject(walletManager)
             .environmentObject(networkManager)
@@ -1575,9 +1611,14 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showCypherpunkChat) {
             ZStack(alignment: .topTrailing) {
-                ChatView()
+                // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
+                ChatView(onShowAppSettings: {
+                    showCypherpunkChat = false
+                    showCypherpunkSettings = true
+                })
 
                 // Close button overlay
+                // FIX #252: Moved down to avoid overlapping with + button on iOS navigation bar
                 Button(action: { showCypherpunkChat = false }) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 24))
@@ -1586,12 +1627,18 @@ struct ContentView: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(PlainButtonStyle())
+                #if os(iOS)
+                .padding(.top, 52)  // FIX #252: Below navigation bar to avoid overlap with + button
+                #else
                 .padding(.top, 8)
+                #endif
                 .padding(.trailing, 8)
             }
             .background(Color.black)
             #if os(macOS)
-            .frame(width: 700, height: 600)
+            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
+            .frame(minWidth: 650, idealWidth: 750, maxWidth: 900,
+                   minHeight: 550, idealHeight: 650, maxHeight: 800)
             #endif
             .environmentObject(walletManager)
             .environmentObject(networkManager)
@@ -1730,7 +1777,10 @@ struct ContentView: View {
                         case .receive:
                             ReceiveView()
                         case .chat:
-                            ChatView()
+                            // FIX #252: Pass callback to navigate to settings when Tor is disabled
+                            ChatView(onShowAppSettings: {
+                                selectedTab = .settings
+                            })
                         case .settings:
                             SettingsView()
                         }

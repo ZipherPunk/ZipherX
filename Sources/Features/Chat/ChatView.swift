@@ -25,6 +25,9 @@ struct ChatView: View {
     @State private var selectedContact: ChatContact?
     @State private var noContactsQuote: String = ""  // Store quote to prevent loop
 
+    // FIX #252: Callback to navigate to main app settings (for enabling Tor)
+    var onShowAppSettings: (() -> Void)?
+
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #243: Minimum peers required for stable chat
@@ -163,9 +166,9 @@ struct ChatView: View {
                 .padding(.top, 8)
 
                 // Enable Tor button
+                // FIX #252: Navigate to main app settings (not chat settings)
                 Button(action: {
-                    // Navigate to settings
-                    showSettings = true
+                    onShowAppSettings?()
                 }) {
                     HStack(spacing: 10) {
                         Image(systemName: "network")
@@ -196,12 +199,7 @@ struct ChatView: View {
                 endPoint: .bottom
             )
         )
-        .sheet(isPresented: $showSettings) {
-            ChatSettingsSheet()
-                #if os(macOS)
-                .frame(minWidth: 450, idealWidth: 500, minHeight: 550, idealHeight: 600)
-                #endif
-        }
+        // FIX #252: Removed sheet - now uses onShowAppSettings callback to navigate to main app settings
     }
 
     // MARK: - Auto-start Chat
@@ -1434,6 +1432,12 @@ struct MessageStatusIndicator: View {
                 Image(systemName: "exclamationmark.circle.fill")
                     .font(.system(size: 12))
                     .foregroundColor(.red)
+
+            case .queued:
+                // FIX #249: Show clock icon for queued messages (offline recipient)
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11))
+                    .foregroundColor(.orange)
             }
         }
     }
@@ -1713,12 +1717,17 @@ struct AddContactSheet: View {
         .sheet(isPresented: $showQRScanner) {
             ChatQRScannerSheet { scannedAddress in
                 if let address = scannedAddress {
-                    // Extract .onion address from scanned QR code
-                    let cleaned = address.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if cleaned.hasSuffix(".onion") {
-                        onionAddress = cleaned
+                    // FIX #251: Parse new QR format with nickname
+                    if let qrData = ChatQRCodeData.parse(address) {
+                        onionAddress = qrData.onionAddress
+
+                        // FIX #251: Auto-fill nickname from QR code
+                        if let scannedNickname = qrData.nickname, !scannedNickname.isEmpty {
+                            // Check for duplicate nickname and add random suffix if needed
+                            nickname = generateUniqueNickname(scannedNickname)
+                        }
                     } else {
-                        errorMessage = "Invalid .onion address"
+                        errorMessage = "Invalid QR code format"
                     }
                 }
                 showQRScanner = false
@@ -1726,6 +1735,24 @@ struct AddContactSheet: View {
             .environmentObject(themeManager)
         }
         #endif
+    }
+
+    /// FIX #251: Generate unique nickname by adding random 5-digit suffix if duplicate exists
+    private func generateUniqueNickname(_ baseName: String) -> String {
+        let existingNicknames = chatManager.contacts.map { $0.nickname.lowercased() }
+
+        if !existingNicknames.contains(baseName.lowercased()) {
+            return baseName
+        }
+
+        // Nickname exists - add random 5-digit suffix
+        let suffix = String(format: "%05d", Int.random(in: 0...99999))
+        let newNickname = "\(baseName)_\(suffix)"
+
+        // Show warning to user
+        errorMessage = "Contact '\(baseName)' already exists. Renamed to '\(newNickname)'"
+
+        return newNickname
     }
 
     private func addContact() {
@@ -1799,6 +1826,7 @@ struct ChatSettingsSheet: View {
                             .cornerRadius(10)
 
                             // FIX #224: QR Code and .onion address with copy button
+                            // FIX #251: Include nickname in QR code + add ZipherX logo
                             if let onion = chatManager.ourOnionAddress {
                                 VStack(spacing: 16) {
                                     // QR Code
@@ -1808,8 +1836,12 @@ struct ChatSettingsSheet: View {
                                             .foregroundColor(theme.accentColor)
                                             .tracking(2)
 
-                                        // QR Code display
-                                        System7QRCode(data: onion)
+                                        // FIX #251: QR Code with nickname and ZipherX logo
+                                        let qrData = ChatQRCodeData(
+                                            onionAddress: onion,
+                                            nickname: chatManager.ourNickname.isEmpty ? nil : chatManager.ourNickname
+                                        )
+                                        System7QRCode(data: qrData.qrString, showLogo: true)
                                             .frame(width: 180, height: 180)
                                             .background(Color.white)
                                             .cornerRadius(12)

@@ -626,25 +626,28 @@ final class WalletHealthCheck {
                 continue
             }
 
-            do {
-                let (exists, confirmations) = try await InsightAPI.shared.verifyTransactionExists(txid: txidHex)
+            // FIX #247: Use P2P verification instead of InsightAPI (decentralized)
+            let (exists, confirmations) = await NetworkManager.shared.verifyTxExistsViaP2P(txid: txidHex)
 
-                if exists {
+            if exists {
+                verifiedCount += 1
+                if confirmations > 0 {
+                    print("✅ FIX #247: TX \(txidHex.prefix(16))... verified via P2P (\(confirmations) confirmations)")
+                } else {
+                    print("⏳ FIX #247: TX \(txidHex.prefix(16))... found via P2P (mempool/unconfirmed)")
+                }
+            } else {
+                // TX not found via P2P - could be phantom OR peers don't have it yet
+                // Try multiple peers before marking as phantom
+                let p2pVerified = await NetworkManager.shared.verifyTxViaP2P(txid: txidHex, maxAttempts: 5)
+                if p2pVerified {
                     verifiedCount += 1
-                    if confirmations > 0 {
-                        print("✅ VUL-002: TX \(txidHex.prefix(16))... verified (\(confirmations) confirmations)")
-                    } else {
-                        print("⏳ VUL-002: TX \(txidHex.prefix(16))... in mempool (0 confirmations)")
-                    }
+                    print("✅ FIX #247: TX \(txidHex.prefix(16))... verified via P2P (retry)")
                 } else {
                     // PHANTOM TRANSACTION DETECTED!
-                    print("🚨 VUL-002: PHANTOM TX DETECTED! \(txidHex) does NOT exist on blockchain!")
+                    print("🚨 FIX #247: PHANTOM TX DETECTED! \(txidHex) does NOT exist (P2P verified)")
                     phantomTxs.append((txid: txidHex, height: tx.height, value: tx.value))
                 }
-            } catch {
-                // Network error - can't verify, but don't mark as phantom
-                errorCount += 1
-                print("⚠️ VUL-002: Could not verify TX \(txidHex.prefix(16))...: \(error.localizedDescription)")
             }
         }
 

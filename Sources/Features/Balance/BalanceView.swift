@@ -56,9 +56,6 @@ struct BalanceView: View {
         let _ = print("📜 BALANCEVIEW: body being rendered")
         ZStack {
             VStack(spacing: 16) {
-                // TOP LEFT: Compact Tor/Privacy status indicator
-                topLeftTorIndicator
-
                 // Balance display
                 balanceCard
 
@@ -69,6 +66,9 @@ struct BalanceView: View {
                 networkStatus
 
                 Spacer()
+
+                // FIX #253: Moved status indicator from top left to bottom center
+                bottomCenterStatusIndicator
             }
             .padding()
 
@@ -863,7 +863,7 @@ struct BalanceView: View {
 
     private var networkStatus: some View {
         VStack(spacing: 0) {
-            // Note: Mode indicator merged into topLeftTorIndicator - ONE LINE for all info
+            // Note: Mode indicator merged into bottomCenterStatusIndicator - ONE LINE for all info
 
             // Network stats
             if networkManager.isConnected {
@@ -1117,13 +1117,13 @@ struct BalanceView: View {
         }
     }
 
-    // MARK: - Top Left Tor Indicator
+    // MARK: - Bottom Center Status Indicator
 
     /// MATRIX NEON GREEN color
     private var matrixGreen: Color { Color(red: 0.0, green: 1.0, blue: 0.0) }
 
-    /// Compact Tor/Privacy status indicator at top left corner - includes peer count
-    private var topLeftTorIndicator: some View {
+    /// FIX #253: Compact Tor/Privacy status indicator at bottom center - includes peer count
+    private var bottomCenterStatusIndicator: some View {
         HStack(spacing: 8) {
             // Privacy/Tor status with colored pill - MATRIX STYLE - ALL ON ONE LINE
             HStack(spacing: 6) {
@@ -1282,11 +1282,15 @@ struct BalanceView: View {
                 .buttonStyle(.plain)
             }
 
-            Spacer()
+            // FIX #254: ZCL version display
+            Text("v1.0.0")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(matrixGreen.opacity(0.5))
+            // FIX #253: Removed trailing Spacer to center the content
         }
     }
 
-    // MARK: - macOS Mode Helpers (used by topLeftTorIndicator)
+    // MARK: - macOS Mode Helpers (used by bottomCenterStatusIndicator)
 
     #if os(macOS)
     // Animated heart state for healthy daemon

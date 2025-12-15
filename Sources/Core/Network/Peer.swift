@@ -1384,8 +1384,20 @@ final class Peer {
         let ccode = data[offset]
         offset += 1
 
-        let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
-        let codeName = ccode < codeNames.count ? codeNames[Int(ccode)] : "UNKNOWN(\(ccode))"
+        // FIX #261: Bitcoin/Zcash reject codes are NOT sequential
+        // 0x01=MALFORMED, 0x10=INVALID, 0x11=OBSOLETE, 0x12=DUPLICATE
+        // 0x40=NONSTANDARD, 0x41=DUST, 0x42=INSUFFICIENTFEE, 0x43=CHECKPOINT
+        let codeMap: [UInt8: String] = [
+            0x01: "MALFORMED",
+            0x10: "INVALID",
+            0x11: "OBSOLETE",
+            0x12: "DUPLICATE",
+            0x40: "NONSTANDARD",
+            0x41: "DUST",
+            0x42: "INSUFFICIENTFEE",
+            0x43: "CHECKPOINT"
+        ]
+        let codeName = codeMap[ccode] ?? "UNKNOWN(\(ccode))"
 
         // 3. Reason string (compact size string)
         var reason = ""
@@ -1807,6 +1819,132 @@ final class Peer {
         }
     }
 
+    // MARK: - FIX #246: Keepalive Ping
+
+    /// Send a ping message and wait for pong response
+    /// Used for keepalive to detect dead connections early
+    /// Returns true if peer responded with pong, false if timed out or error
+    func sendPing(timeoutSeconds: TimeInterval = 10) async -> Bool {
+        guard isConnectionReady else {
+            return false
+        }
+
+        // Generate random nonce (8 bytes)
+        var nonce = Data(count: 8)
+        _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 8, $0.baseAddress!) }
+
+        do {
+            // Send ping with nonce
+            try await sendMessage(command: "ping", payload: nonce)
+
+            // Wait for pong response (should echo our nonce)
+            let (command, responseNonce) = try await receiveMessageWithTimeout(seconds: timeoutSeconds)
+
+            if command == "pong" && responseNonce == nonce {
+                // Update last activity timestamp
+                lastActivity = Date()
+                return true
+            }
+
+            // Peer sent unexpected response
+            print("⚠️ FIX #246: [\(host)] Unexpected ping response: \(command)")
+            return false
+        } catch {
+            // Connection error - peer may be dead
+            print("❌ FIX #246: [\(host)] Ping failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    // MARK: - FIX #247: P2P Transaction Verification
+
+    /// Request a transaction via P2P getdata message
+    /// Returns true if peer has the TX (responds with tx message), false if not found
+    func requestTransaction(txid: Data) async throws -> Bool {
+        guard isConnectionReady else {
+            throw NetworkError.notConnected
+        }
+
+        // Build getdata message for MSG_TX (type 1)
+        // Format: count (varint) + [type (4 bytes LE) + hash (32 bytes)]
+        var payload = Data()
+
+        // Count = 1
+        payload.append(0x01)
+
+        // Type = MSG_TX (1)
+        var txType: UInt32 = 1
+        payload.append(Data(bytes: &txType, count: 4))
+
+        // Hash (32 bytes, already in wire format - little endian)
+        payload.append(txid)
+
+        // Send getdata and wait for response
+        do {
+            try await sendMessage(command: "getdata", payload: payload)
+
+            // Wait for response (tx or notfound)
+            let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+
+            if command == "tx" && !responseData.isEmpty {
+                // Peer has the transaction
+                lastActivity = Date()
+                return true
+            } else if command == "notfound" {
+                // Peer doesn't have the transaction
+                return false
+            } else if command == "ping" {
+                // Auto-respond to ping
+                try await sendMessage(command: "pong", payload: responseData)
+                // Try to receive again
+                let (cmd2, data2) = try await receiveMessageWithTimeout(seconds: 5)
+                return cmd2 == "tx" && !data2.isEmpty
+            }
+
+            return false
+        } catch {
+            throw error
+        }
+    }
+
+    /// Get raw transaction data via P2P getdata message
+    /// Returns the raw transaction bytes, or nil if not found
+    func getRawTransaction(txid: Data) async throws -> Data? {
+        guard isConnectionReady else {
+            throw NetworkError.notConnected
+        }
+
+        // Build getdata message for MSG_TX (type 1)
+        var payload = Data()
+        payload.append(0x01)  // count = 1
+
+        var txType: UInt32 = 1  // MSG_TX
+        payload.append(Data(bytes: &txType, count: 4))
+        payload.append(txid)  // 32-byte hash
+
+        try await sendMessage(command: "getdata", payload: payload)
+
+        // Wait for response
+        let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+
+        if command == "tx" && !responseData.isEmpty {
+            lastActivity = Date()
+            return responseData
+        } else if command == "notfound" {
+            return nil
+        } else if command == "ping" {
+            // Handle ping, then try again
+            try await sendMessage(command: "pong", payload: responseData)
+            let (cmd2, data2) = try await receiveMessageWithTimeout(seconds: 5)
+            if cmd2 == "tx" && !data2.isEmpty {
+                lastActivity = Date()
+                return data2
+            }
+        }
+
+        return nil
+    }
+
     // MARK: - Network I/O
 
     private func send(_ data: Data) async throws {
@@ -1923,8 +2061,12 @@ final class Peer {
                     }
                     if offset < response.count {
                         let rejectCode = response[offset]
-                        let codeNames = ["MALFORMED", "INVALID", "OBSOLETE", "DUPLICATE", "NONSTANDARD", "DUST", "INSUFFICIENTFEE", "CHECKPOINT"]
-                        let codeName = rejectCode < codeNames.count ? codeNames[Int(rejectCode)] : "UNKNOWN(\(rejectCode))"
+                        // FIX #261: Bitcoin/Zcash reject codes are NOT sequential
+                        let codeMap: [UInt8: String] = [
+                            0x01: "MALFORMED", 0x10: "INVALID", 0x11: "OBSOLETE", 0x12: "DUPLICATE",
+                            0x40: "NONSTANDARD", 0x41: "DUST", 0x42: "INSUFFICIENTFEE", 0x43: "CHECKPOINT"
+                        ]
+                        let codeName = codeMap[rejectCode] ?? "UNKNOWN(\(rejectCode))"
 
                         var reason = ""
                         if offset + 1 < response.count {
