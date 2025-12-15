@@ -426,7 +426,17 @@ final class Peer {
         if torBypassed {
             print("📡 [\(host)] Connecting directly (Tor bypassed for speed)")
         }
-        let parameters = NWParameters.tcp
+
+        // FIX #267: Configure TCP-level keepalive to prevent iOS from killing idle connections
+        // iOS mobile networks are aggressive about dropping idle TCP connections
+        // TCP keepalive is more reliable than app-level keepalive on mobile
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveInterval = 30  // Send keepalive every 30 seconds
+        tcpOptions.keepaliveCount = 4      // Allow 4 missed probes before disconnect
+        tcpOptions.connectionTimeout = 15  // 15 second connection timeout
+
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         // Don't restrict to wifi - allow any network interface
         // parameters.requiredInterfaceType = .wifi
 
@@ -435,6 +445,16 @@ final class Peer {
         connection = nil
 
         connection = NWConnection(to: endpoint, using: parameters)
+
+        // FIX #267: Add viability handler to detect when iOS thinks connection is dead
+        connection?.viabilityUpdateHandler = { [weak self] isViable in
+            guard let self = self else { return }
+            if !isViable {
+                print("⚠️ FIX #267: [\(self.host)] Connection no longer viable - iOS network change detected")
+                // Disconnect so NetworkManager can reconnect
+                self.disconnect()
+            }
+        }
 
         // Add timeout for connection
         // FIX #152: Use withTaskCancellationHandler to ensure continuation resumes on cancellation
@@ -526,13 +546,30 @@ final class Peer {
             port: NWEndpoint.Port(integerLiteral: socksPort)
         )
 
-        let parameters = NWParameters.tcp
+        // FIX #267: Configure TCP-level keepalive for Tor connections too
+        // Even more important for Tor since circuits can become stale
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveInterval = 30  // Send keepalive every 30 seconds
+        tcpOptions.keepaliveCount = 4      // Allow 4 missed probes before disconnect
+        tcpOptions.connectionTimeout = 20  // Tor connections can be slower
+
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
 
         // CRITICAL: Cancel old connection to prevent file descriptor leak
         connection?.cancel()
         connection = nil
 
         connection = NWConnection(to: proxyEndpoint, using: parameters)
+
+        // FIX #267: Add viability handler for Tor connections
+        connection?.viabilityUpdateHandler = { [weak self] isViable in
+            guard let self = self else { return }
+            if !isViable {
+                print("⚠️ FIX #267: [\(self.host)] Tor connection no longer viable")
+                self.disconnect()
+            }
+        }
 
         // Wait for connection to proxy with proper continuation handling
         // Use a class-based lock for thread-safe flag (NSLock is Sendable)
