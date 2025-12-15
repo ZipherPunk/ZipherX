@@ -67,8 +67,11 @@ struct BalanceView: View {
 
                 Spacer()
 
-                // FIX #253: Moved status indicator from top left to bottom center
-                bottomCenterStatusIndicator
+                // FIX #266: Status indicator moved to bottom right with sync emoji
+                HStack {
+                    Spacer()
+                    bottomRightStatusIndicator
+                }
             }
             .padding()
 
@@ -412,9 +415,13 @@ struct BalanceView: View {
                         .font(.system(size: 24, weight: .bold, design: theme.hasRetroStyling ? .monospaced : .default))
                         .foregroundColor(theme.textPrimary)
 
+                    // FIX #266: Add Zclassic version next to ZCL
                     Text("ZCL")
                         .font(theme.bodyFont)
                         .foregroundColor(theme.textSecondary)
+                    Text("v2.1.2")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(theme.textSecondary.opacity(0.6))
                 }
 
                 // Debug: Always log the balance card state
@@ -1117,14 +1124,40 @@ struct BalanceView: View {
         }
     }
 
-    // MARK: - Bottom Center Status Indicator
+    // MARK: - Bottom Right Status Indicator
 
     /// MATRIX NEON GREEN color
     private var matrixGreen: Color { Color(red: 0.0, green: 1.0, blue: 0.0) }
 
-    /// FIX #253: Compact Tor/Privacy status indicator at bottom center - includes peer count
-    private var bottomCenterStatusIndicator: some View {
+    /// FIX #266: Blockchain sync status emoji
+    private var syncStatusEmoji: some View {
+        Group {
+            if walletManager.syncProgress >= 1.0 {
+                // Fully synced - green checkmark
+                Text("✅")
+                    .font(.system(size: 14))
+            } else if walletManager.syncProgress > 0 {
+                // Syncing in progress
+                Text("⏳")
+                    .font(.system(size: 14))
+            } else if !networkManager.isConnected {
+                // Not connected - warning
+                Text("⚠️")
+                    .font(.system(size: 14))
+            } else {
+                // Connected but not syncing yet
+                Text("🔄")
+                    .font(.system(size: 14))
+            }
+        }
+    }
+
+    /// FIX #266: Compact status indicator at bottom RIGHT - includes sync emoji, peers, tor
+    private var bottomRightStatusIndicator: some View {
         HStack(spacing: 8) {
+            // FIX #266: Blockchain sync status emoji FIRST
+            syncStatusEmoji
+
             // Privacy/Tor status with colored pill - MATRIX STYLE - ALL ON ONE LINE
             HStack(spacing: 6) {
                 if torManager.connectionState.isConnected {
