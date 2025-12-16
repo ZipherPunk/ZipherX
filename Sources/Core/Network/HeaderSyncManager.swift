@@ -225,7 +225,20 @@ final class HeaderSyncManager {
         var currentHeight = startHeight
         var failedPeers = Set<String>()
 
+        // FIX #274: Total timeout for header sync (45 seconds max)
+        // Headers are NOT critical for wallet operation - just for timestamps
+        let syncStartTime = Date()
+        let maxSyncDuration: TimeInterval = 45.0
+
         while currentHeight < chainTip {
+            // FIX #274: Check total sync timeout
+            let elapsed = Date().timeIntervalSince(syncStartTime)
+            if elapsed > maxSyncDuration {
+                print("⚠️ FIX #274: Header sync timeout (\(Int(elapsed))s) - continuing with existing headers")
+                print("⚠️ Note: Timestamps may be slightly outdated for recent transactions")
+                return  // Exit gracefully, don't throw - headers are not critical
+            }
+
             // CRITICAL FIX: Get FRESH peers list on each iteration
             let currentPeers = networkManager.peers.filter { $0.isConnectionReady && !failedPeers.contains($0.host) }
 
@@ -247,7 +260,7 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             do {
-                // FIX #157: Wrap entire peer operation in 20-second timeout
+                // FIX #274: Reduced timeout from 20s to 8s for faster peer rotation
                 // The inner receiveMessageWithTimeout doesn't actually cancel NWConnection.receive()
                 // This outer timeout ensures we fail fast and try another peer
                 let headers: [ZclassicBlockHeader] = try await withThrowingTaskGroup(of: [ZclassicBlockHeader].self) { group in
@@ -258,9 +271,11 @@ final class HeaderSyncManager {
                             var receivedHeaders: [ZclassicBlockHeader]?
                             var attempts = 0
 
-                            while receivedHeaders == nil && attempts < 3 {  // Reduced from 5 to 3 attempts
+                            // FIX #274: Reduced from 3 attempts to 2 for faster rotation
+                            while receivedHeaders == nil && attempts < 2 {
                                 attempts += 1
-                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 10)  // Reduced from 15s
+                                // FIX #274: Reduced from 10s to 5s per attempt
+                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
                                 if command == "headers" {
                                     // FIX #133: Use correct starting height from actual locator
                                     receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
@@ -271,9 +286,9 @@ final class HeaderSyncManager {
                         }
                     }
 
-                    // FIX #157: Outer timeout that actually works
+                    // FIX #274: Outer timeout reduced from 20s to 8s for faster peer rotation
                     group.addTask {
-                        try await Task.sleep(nanoseconds: 20_000_000_000)  // 20 seconds max per peer
+                        try await Task.sleep(nanoseconds: 8_000_000_000)  // 8 seconds max per peer
                         throw NetworkError.timeout
                     }
 
@@ -308,9 +323,9 @@ final class HeaderSyncManager {
                 print("✅ Synced \(headers.count) headers to \(actualEndHeight) (\(progress.percentComplete)%)")
 
             } catch {
-                // FIX #157: Log timeout specifically and disconnect peer to reset stuck receive
+                // FIX #274: Log timeout specifically and disconnect peer to reset stuck receive
                 if case NetworkError.timeout = error {
-                    print("⚠️ FIX #157: Peer \(peer.host) timed out (20s max), trying another peer...")
+                    print("⚠️ FIX #274: Peer \(peer.host) timed out (8s max), trying another peer...")
                     peer.disconnect()  // Reset stuck NWConnection
                 } else {
                     print("⚠️ Peer \(peer.host) failed: \(error.localizedDescription)")
