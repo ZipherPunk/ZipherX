@@ -2389,8 +2389,12 @@ struct CypherpunkMainView: View {
             let wHeight = networkManager.walletHeight
             let cHeight = networkManager.chainHeight
 
-            if cHeight > 0 && wHeight > 0 && wHeight >= cHeight {
-                // Wallet height = chain height - FULLY SYNCED
+            // FIX #277: Consider "Synced" if within 5 blocks of chain tip
+            // This prevents flip-flopping between Synced/Syncing as new blocks arrive
+            let syncTolerance: UInt64 = 5
+
+            if cHeight > 0 && wHeight > 0 && (wHeight >= cHeight || cHeight - wHeight <= syncTolerance) {
+                // Wallet height within tolerance - SYNCED
                 HStack(spacing: 2) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 8))
@@ -2399,7 +2403,7 @@ struct CypherpunkMainView: View {
                 }
                 .foregroundColor(matrixGreenDark)
             } else if walletManager.isSyncing || (cHeight > 0 && wHeight > 0 && wHeight < cHeight) {
-                // Syncing in progress OR wallet behind chain (only if both heights are known)
+                // Syncing in progress OR wallet more than 5 blocks behind (only if both heights are known)
                 HStack(spacing: 2) {
                     ProgressView()
                         .scaleEffect(0.4)
