@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 63;
+	objectVersion = 77;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -166,7 +166,7 @@
 		04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyQuotes.swift; sourceTree = "<group>"; };
 		04DC847050BBC7E852DE4F5F /* BlockTimestampManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockTimestampManager.swift; sourceTree = "<group>"; };
 		068F236B88339FCE75878F8B /* ZipherXFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipherXFFI.swift; sourceTree = "<group>"; };
-		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0837DEEA3809706DF9DC68F2 /* ZipherX.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ZipherX.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0B17227F05E1C4F3700D3EE8 /* SQLCipher.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = SQLCipher.xcframework; path = Libraries/SQLCipher.xcframework; sourceTree = "<group>"; };
 		0CD9AE42E2111119140BAC99 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		0D75DBA8AB67E579618328D1 /* ZipherXMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ZipherXMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -229,7 +229,7 @@
 		D114627F3AC22A9229292187 /* HeaderSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderSyncManager.swift; sourceTree = "<group>"; };
 		D769A0AE4089D10446BFBBCE /* WalletMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletMode.swift; sourceTree = "<group>"; };
 		D8734EC25838585488804B01 /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
-		DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ZipherXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		DAF3ECD69FFC3EB98AD1F086 /* ZipherXTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ZipherXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		DFCB4EE9BBE481DCD741022B /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomNodesView.swift; sourceTree = "<group>"; };
 		EC72BDE9C3E9D9CDC2536B80 /* TransactionBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionBuilder.swift; sourceTree = "<group>"; };
@@ -690,6 +690,7 @@
 			);
 			mainGroup = 1E0AB0F916282FFBD8E5F74E;
 			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -931,14 +932,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -965,7 +970,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -993,7 +1000,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1011,14 +1020,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";

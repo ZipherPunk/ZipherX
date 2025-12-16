@@ -2018,37 +2018,8 @@ struct CypherpunkMainView: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            // Left and right elements overlaid
+            // FIX #270: Top bar - only settings gear on right (peers/tor moved to bottom)
             HStack {
-                // Network indicator with Tor/onion breakdown
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(networkManager.isConnected ? matrixGreen : Color.red)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: networkManager.isConnected ? matrixGreen : Color.red, radius: 4)
-
-                    // Show peer counts with Tor breakdown - ALL ON ONE LINE
-                    HStack(spacing: 4) {
-                        Text("\(networkManager.connectedPeers) PEERS")
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundColor(matrixGreenDark)
-
-                        // Tor/onion breakdown if connected via Tor - same line
-                        let torCount = networkManager.torConnectedPeersCount
-                        let onionCount = networkManager.onionConnectedPeersCount
-                        if torCount > 0 || onionCount > 0 {
-                            Text("·")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(matrixGreenDark)
-                            Text("🧅")
-                                .font(.system(size: 9))
-                            Text("\(torCount) Tor" + (onionCount > 0 ? " +\(onionCount) onion" : ""))
-                                .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                .foregroundColor(matrixGreenDark)
-                        }
-                    }
-                }
-
                 Spacer()
 
                 // Settings gear button
@@ -2376,45 +2347,98 @@ struct CypherpunkMainView: View {
 
     private var networkStatusBar: some View {
         HStack(spacing: 8) {
-            // Zclassic network version
+            // FIX #270: Zclassic version (left)
             HStack(spacing: 2) {
-                Image(systemName: "network")
-                    .font(.system(size: 8))
                 Text("ZCL")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                Text("v2.1.2")
+                    .font(.system(size: 8, design: .monospaced))
             }
             .foregroundColor(matrixGreenDark)
 
-            // Sync status
-            if walletManager.isSyncing {
+            Spacer()
+
+            // FIX #270 + FIX #271: Peers/Tor info (center) - moved from top left
+            HStack(spacing: 4) {
+                // Peer count
+                let peerCount = networkManager.connectedPeers
+                Circle()
+                    .fill(networkManager.isConnected ? matrixGreen : Color.red)
+                    .frame(width: 6, height: 6)
+                Text("\(peerCount)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(peerCount < 3 ? .red : matrixGreenDark)
+
+                // FIX #271: Tor/onion status - show BOTH torCount and onionCount
+                let torCount = networkManager.torConnectedPeersCount
+                let onionCount = networkManager.onionConnectedPeersCount
+                if torCount > 0 || onionCount > 0 {
+                    Text("🧅")
+                        .font(.system(size: 8))
+                    // Show total Tor connections (SOCKS5 + .onion)
+                    let totalTor = torCount + onionCount
+                    Text("\(totalTor)")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundColor(matrixGreen)
+                }
+            }
+
+            // FIX #270 + FIX #271 + FIX #272: Sync status - stable display
+            // Priority: Synced > Syncing > Connecting > Error
+            // NOTE: walletHeight = 0 means "not loaded yet", not "at block 0"
+            let wHeight = networkManager.walletHeight
+            let cHeight = networkManager.chainHeight
+
+            if cHeight > 0 && wHeight > 0 && wHeight >= cHeight {
+                // Wallet height = chain height - FULLY SYNCED
+                HStack(spacing: 2) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 8))
+                    Text("Synced")
+                        .font(.system(size: 8, design: .monospaced))
+                }
+                .foregroundColor(matrixGreenDark)
+            } else if walletManager.isSyncing || (cHeight > 0 && wHeight > 0 && wHeight < cHeight) {
+                // Syncing in progress OR wallet behind chain (only if both heights are known)
                 HStack(spacing: 2) {
                     ProgressView()
                         .scaleEffect(0.4)
                         .tint(matrixGreen)
-                    Text("SYNC")
+                    Text("Syncing")
                         .font(.system(size: 8, design: .monospaced))
                 }
                 .foregroundColor(matrixGreen)
-            } else {
+            } else if cHeight == 0 && !networkManager.isConnected {
+                // Never connected - Error
                 HStack(spacing: 2) {
-                    Image(systemName: "checkmark.circle.fill")
+                    Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 8))
-                    Text("OK")
+                    Text("Error")
                         .font(.system(size: 8, design: .monospaced))
                 }
-                .foregroundColor(matrixGreenDark)
+                .foregroundColor(.red)
+            } else {
+                // Waiting for heights to be loaded (walletHeight or chainHeight = 0)
+                HStack(spacing: 2) {
+                    ProgressView()
+                        .scaleEffect(0.4)
+                        .tint(.orange)
+                    Text("Connecting")
+                        .font(.system(size: 8, design: .monospaced))
+                }
+                .foregroundColor(.orange)
             }
 
             Spacer()
 
-            // ZCL Price (compact)
+            // ZCL Price (right)
             if networkManager.zclPriceUSD > 0 {
                 Text(String(format: "$%.2f", networkManager.zclPriceUSD))
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(matrixGreenDark)
             }
 
-            // Block height
+            // Block height (right)
             HStack(spacing: 2) {
                 Image(systemName: "cube.fill")
                     .font(.system(size: 8))

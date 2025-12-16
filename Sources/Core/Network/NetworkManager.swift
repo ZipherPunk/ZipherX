@@ -337,6 +337,21 @@ final class NetworkManager: ObservableObject {
     private let STATS_REFRESH_INTERVAL: TimeInterval = 30 // Refresh chain height every 30 seconds
     private let queue = DispatchQueue(label: "com.zipherx.network", qos: .userInitiated)
 
+    // MARK: - FIX #268: NWPathMonitor for Network Transitions
+
+    /// NWPathMonitor to detect WiFi ↔ cellular transitions
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "com.zipherx.pathmonitor", qos: .utility)
+
+    /// Generation counter to invalidate stale reconnection callbacks
+    /// Incremented on every network change - reconnection tasks check this to abort if stale
+    private var networkGeneration: UInt64 = 0
+    private let networkGenerationLock = NSLock()
+
+    /// Debounce network change recovery (3 second cooldown like BitChat)
+    private var lastPathChangeTime: Date?
+    private let PATH_CHANGE_DEBOUNCE: TimeInterval = 3.0
+
     // Address Manager
     private var knownAddresses: [String: AddressInfo] = [:] // host:port -> info
     private var bannedPeers: [String: BannedPeer] = [:] // host -> ban info
@@ -569,9 +584,17 @@ final class NetworkManager: ObservableObject {
         setupStatsRefresh()
         setupPeerRecoveryWatchdog()  // FIX #227: Monitor for lost peers
         setupKeepaliveTimer()  // FIX #246: Keepalive ping + auto-reconnection
+        setupPathMonitor()  // FIX #268: Detect WiFi ↔ cellular transitions
         loadBundledPeers()      // Load bundled peers first (for fresh installs)
         loadPersistedAddresses() // Then override with persisted (for returning users)
         loadCustomNodes()        // Load user-added custom nodes
+
+        // FIX #272: Load walletHeight immediately at startup (not just every 30s)
+        // This prevents UI from showing "Syncing" when wallet is already synced
+        if let dbHeight = try? WalletDatabase.shared.getLastScannedHeight() {
+            self.walletHeight = dbHeight
+            print("📊 FIX #272: Loaded walletHeight at startup: \(dbHeight)")
+        }
     }
 
     // MARK: - Address Management
@@ -5311,6 +5334,142 @@ final class NetworkManager: ObservableObject {
         debugLog(.network, "🫀 FIX #246: Keepalive timer stopped")
     }
 
+    // MARK: - FIX #268: NWPathMonitor for Network Transitions
+
+    /// Setup NWPathMonitor to detect WiFi ↔ cellular transitions
+    /// Like BitChat: monitor path changes and trigger debounced recovery
+    private func setupPathMonitor() {
+        pathMonitor = NWPathMonitor()
+
+        pathMonitor?.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+
+            let pathStatus = path.status
+            let isExpensive = path.isExpensive  // true = cellular
+            let isConstrained = path.isConstrained
+
+            debugLog(.network, "📶 FIX #268: Network path changed - status=\(pathStatus), expensive=\(isExpensive), constrained=\(isConstrained)")
+
+            // Handle path change on main thread
+            Task { @MainActor in
+                await self.handleNetworkPathChange(path: path)
+            }
+        }
+
+        pathMonitor?.start(queue: pathMonitorQueue)
+        debugLog(.network, "📶 FIX #268: NWPathMonitor started - monitoring network transitions")
+    }
+
+    /// Stop the path monitor
+    func stopPathMonitor() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        debugLog(.network, "📶 FIX #268: NWPathMonitor stopped")
+    }
+
+    /// Handle network path change with debouncing (like BitChat's 3s cooldown)
+    private func handleNetworkPathChange(path: NWPath) async {
+        // Check if we're within the debounce window
+        if let lastChange = lastPathChangeTime {
+            let elapsed = Date().timeIntervalSince(lastChange)
+            if elapsed < PATH_CHANGE_DEBOUNCE {
+                debugLog(.network, "📶 FIX #268: Ignoring path change - within \(PATH_CHANGE_DEBOUNCE)s debounce window")
+                return
+            }
+        }
+
+        // Update debounce timestamp
+        lastPathChangeTime = Date()
+
+        // Increment network generation to invalidate stale reconnection callbacks
+        let newGeneration = incrementNetworkGeneration()
+        debugLog(.network, "📶 FIX #268: Network generation incremented to \(newGeneration)")
+
+        // If network is not satisfied, just update state and wait
+        if path.status != .satisfied {
+            debugLog(.network, "📶 FIX #268: Network not satisfied - waiting for connectivity")
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.connectedPeers = 0
+            }
+            return
+        }
+
+        // Network is back - trigger recovery
+        debugLog(.network, "📶 FIX #268: Network path satisfied - triggering peer recovery")
+
+        // Disconnect all existing peers (their sockets may be stale)
+        for peer in peers {
+            peer.disconnect()
+        }
+
+        // Clear the peers array and reset backoff state
+        peers.removeAll()
+        reconnectionAttemptsLock.lock()
+        reconnectionAttempts.removeAll()
+        reconnectionAttemptsLock.unlock()
+
+        // Clear connection cooldowns to allow immediate reconnection
+        connectionAttemptsLock.lock()
+        connectionAttempts.removeAll()
+        connectionAttemptsLock.unlock()
+
+        // Update UI
+        DispatchQueue.main.async {
+            self.connectedPeers = 0
+            self.isConnected = false
+        }
+
+        // If Tor is enabled, it may need to rebuild circuits
+        if await TorManager.shared.mode == .enabled {
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if !torConnected {
+                debugLog(.network, "📶 FIX #268: Tor not connected after network change - waiting...")
+                // Wait for Tor to reconnect (up to 15s)
+                for _ in 0..<30 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms
+                    if await TorManager.shared.connectionState.isConnected {
+                        debugLog(.network, "📶 FIX #268: Tor reconnected after network change")
+                        break
+                    }
+                }
+            }
+        }
+
+        // Reconnect to peers with generation check
+        let capturedGeneration = newGeneration
+        Task {
+            // Check if this generation is still current before connecting
+            if self.getNetworkGeneration() != capturedGeneration {
+                debugLog(.network, "📶 FIX #268: Stale generation \(capturedGeneration) - aborting reconnection")
+                return
+            }
+
+            do {
+                try await self.connect()
+                debugLog(.network, "📶 FIX #268: Successfully reconnected after network path change")
+            } catch {
+                debugLog(.network, "📶 FIX #268: Failed to reconnect after path change: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Get current network generation (thread-safe)
+    func getNetworkGeneration() -> UInt64 {
+        networkGenerationLock.lock()
+        defer { networkGenerationLock.unlock() }
+        return networkGeneration
+    }
+
+    /// Increment network generation and return new value (thread-safe)
+    @discardableResult
+    private func incrementNetworkGeneration() -> UInt64 {
+        networkGenerationLock.lock()
+        defer { networkGenerationLock.unlock() }
+        networkGeneration += 1
+        return networkGeneration
+    }
+
     /// Ping all connected peers to detect dead connections
     private func performKeepalivePing() async {
         // FIX #246: Don't run during header sync or active operations
@@ -5361,8 +5520,12 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Handle a dead peer with reconnection using exponential backoff
+    /// FIX #268: Uses generation tracking to abort if network changed during sleep
     private func handleDeadPeer(_ peer: Peer) async {
         let hostKey = "\(peer.host):\(peer.port)"
+
+        // FIX #268: Capture generation at start - if it changes, abort reconnection
+        let capturedGeneration = getNetworkGeneration()
 
         // Disconnect cleanly
         peer.disconnect()
@@ -5379,13 +5542,23 @@ final class NetworkManager: ObservableObject {
         // Calculate backoff with jitter
         let backoffSeconds = calculateBackoffWithJitter(attempts: attempts)
 
-        debugLog(.network, "🔄 FIX #246: [\(peer.host)] Dead - will retry in \(String(format: "%.1f", backoffSeconds))s (attempt \(attempts + 1))")
+        debugLog(.network, "🔄 FIX #246: [\(peer.host)] Dead - will retry in \(String(format: "%.1f", backoffSeconds))s (attempt \(attempts + 1), gen=\(capturedGeneration))")
 
         // Schedule reconnection with backoff
         Task { [weak self] in
             guard let self = self else { return }
 
             try? await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
+
+            // FIX #268: Check if network generation changed - abort if stale
+            if self.getNetworkGeneration() != capturedGeneration {
+                debugLog(.network, "📶 FIX #268: [\(peer.host)] Stale reconnection (gen \(capturedGeneration) → \(self.getNetworkGeneration())) - aborting")
+                // Reset attempt counter since this is a fresh network context
+                self.reconnectionAttemptsLock.lock()
+                self.reconnectionAttempts.removeValue(forKey: hostKey)
+                self.reconnectionAttemptsLock.unlock()
+                return
+            }
 
             // Check if peer is still dead (not reconnected by another mechanism)
             let existingPeer = self.peers.first { $0.host == peer.host && $0.port == peer.port }
@@ -5397,8 +5570,8 @@ final class NetworkManager: ObservableObject {
                 return
             }
 
-            // Attempt reconnection
-            await self.reconnectWithBackoff(host: peer.host, port: peer.port)
+            // Attempt reconnection with generation check
+            await self.reconnectWithBackoff(host: peer.host, port: peer.port, generation: capturedGeneration)
         }
     }
 
@@ -5415,8 +5588,18 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Attempt to reconnect to a peer with exponential backoff
-    private func reconnectWithBackoff(host: String, port: UInt16) async {
+    /// FIX #268: Optional generation parameter - if provided and stale, aborts reconnection
+    private func reconnectWithBackoff(host: String, port: UInt16, generation: UInt64? = nil) async {
         let hostKey = "\(host):\(port)"
+
+        // FIX #268: Check generation if provided - abort if network context changed
+        if let capturedGen = generation, getNetworkGeneration() != capturedGen {
+            debugLog(.network, "📶 FIX #268: [\(host)] Stale generation in reconnectWithBackoff - aborting")
+            reconnectionAttemptsLock.lock()
+            reconnectionAttempts.removeValue(forKey: hostKey)
+            reconnectionAttemptsLock.unlock()
+            return
+        }
 
         // Thread-safe read of attempts
         reconnectionAttemptsLock.lock()

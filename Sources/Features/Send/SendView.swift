@@ -146,11 +146,29 @@ struct SendView: View {
                     // FIX #174: Show why SEND is disabled when pending transaction exists
                     if hasPendingTransaction, let message = pendingTransactionMessage {
                         HStack(spacing: 6) {
-                            Image(systemName: networkManager.externalWalletSpendDetected != nil ? "exclamationmark.triangle.fill" : "clock.fill")
-                                .foregroundColor(networkManager.externalWalletSpendDetected != nil ? .orange : theme.warningColor)
+                            Image(systemName: "clock.fill")
+                                .foregroundColor(theme.warningColor)
                             Text(message)
                                 .font(theme.captionFont)
-                                .foregroundColor(networkManager.externalWalletSpendDetected != nil ? .orange : theme.warningColor)
+                                .foregroundColor(theme.warningColor)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
+                    // FIX #270: Show warning for external wallet spend (but don't disable SEND - cypherpunk ethos)
+                    if hasExternalWalletSpend {
+                        VStack(spacing: 4) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                Text("External wallet activity detected!")
+                                    .font(theme.captionFont)
+                                    .foregroundColor(.orange)
+                            }
+                            Text("Verify your balance is correct before sending. Move funds if needed.")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange.opacity(0.8))
+                                .multilineTextAlignment(.center)
                         }
                         .padding(.vertical, 4)
                     }
@@ -700,9 +718,16 @@ struct SendView: View {
     }
 
     /// Check if there's a pending outgoing transaction that hasn't confirmed yet
+    /// FIX #270: Cypherpunk ethos - Don't disable SEND for external wallet spends
+    /// External spends just show a warning, user can still choose to send
     private var hasPendingTransaction: Bool {
-        // FIX #174: Check for ANY pending mempool transaction (our tx OR external wallet spend)
-        if networkManager.hasPendingMempoolTransaction {
+        // FIX #270: External wallet spends show warning but don't disable SEND
+        // Only disable for OUR pending transactions
+        if networkManager.externalWalletSpendDetected != nil {
+            return false  // Show warning but allow sending (cypherpunk ethos)
+        }
+        // Check if WE have a pending outgoing transaction
+        if networkManager.hasPendingMempoolTransaction && networkManager.externalWalletSpendDetected == nil {
             return true
         }
         // Check both mempoolOutgoing and lastSendTimestamp with pending balance
@@ -716,6 +741,11 @@ struct SendView: View {
             return true
         }
         return false
+    }
+
+    /// FIX #270: Check if there's an external wallet spend to show warning
+    private var hasExternalWalletSpend: Bool {
+        return networkManager.externalWalletSpendDetected != nil
     }
 
     /// FIX #174: Reason why SEND is disabled (for user display)

@@ -626,6 +626,15 @@ final class WalletHealthCheck {
                 continue
             }
 
+            // FIX #269: Check if we have peers BEFORE verification
+            // If no peers available, don't mark as phantom - just skip this TX
+            let connectedPeers = NetworkManager.shared.peers.filter { $0.isConnectionReady }
+            if connectedPeers.isEmpty {
+                print("⚠️ FIX #269: No peers available for TX \(txidHex.prefix(16))... - skipping (NOT phantom)")
+                errorCount += 1  // Count as network error, not phantom
+                continue
+            }
+
             // FIX #247: Use P2P verification instead of InsightAPI (decentralized)
             let (exists, confirmations) = await NetworkManager.shared.verifyTxExistsViaP2P(txid: txidHex)
 
@@ -637,6 +646,15 @@ final class WalletHealthCheck {
                     print("⏳ FIX #247: TX \(txidHex.prefix(16))... found via P2P (mempool/unconfirmed)")
                 }
             } else {
+                // FIX #269: Re-check peers before declaring phantom
+                // Peers may have dropped during the verification attempt
+                let stillConnectedPeers = NetworkManager.shared.peers.filter { $0.isConnectionReady }
+                if stillConnectedPeers.isEmpty {
+                    print("⚠️ FIX #269: Peers dropped during TX \(txidHex.prefix(16))... check - skipping (NOT phantom)")
+                    errorCount += 1  // Count as network error, not phantom
+                    continue
+                }
+
                 // TX not found via P2P - could be phantom OR peers don't have it yet
                 // Try multiple peers before marking as phantom
                 let p2pVerified = await NetworkManager.shared.verifyTxViaP2P(txid: txidHex, maxAttempts: 5)
@@ -644,8 +662,16 @@ final class WalletHealthCheck {
                     verifiedCount += 1
                     print("✅ FIX #247: TX \(txidHex.prefix(16))... verified via P2P (retry)")
                 } else {
-                    // PHANTOM TRANSACTION DETECTED!
-                    print("🚨 FIX #247: PHANTOM TX DETECTED! \(txidHex) does NOT exist (P2P verified)")
+                    // FIX #269: Final peer check before marking phantom
+                    let finalPeerCheck = NetworkManager.shared.peers.filter { $0.isConnectionReady }
+                    if finalPeerCheck.isEmpty {
+                        print("⚠️ FIX #269: All peers lost during TX \(txidHex.prefix(16))... verification - skipping (NOT phantom)")
+                        errorCount += 1
+                        continue
+                    }
+
+                    // PHANTOM TRANSACTION DETECTED! (verified with peers still connected)
+                    print("🚨 FIX #247: PHANTOM TX DETECTED! \(txidHex) does NOT exist (P2P verified with \(finalPeerCheck.count) peers)")
                     phantomTxs.append((txid: txidHex, height: tx.height, value: tx.value))
                 }
             }
@@ -653,6 +679,29 @@ final class WalletHealthCheck {
 
         // Store phantom TXs for repair
         if !phantomTxs.isEmpty {
+            // FIX #269 v2: If we couldn't verify ANY transactions successfully, network is broken
+            // Don't mark as phantom - likely all verification attempts failed due to Tor/peer issues
+            // The log shows: all 5 peers "Peer handshake failed" but then "P2P verified with 5 peers"
+            // This means peers exist but can't actually be used - false phantom detection!
+            if verifiedCount == 0 {
+                print("⚠️ FIX #269 v2: Couldn't verify ANY transactions - network appears broken")
+                print("⚠️ FIX #269 v2: NOT marking \(phantomTxs.count) TX(s) as phantom (false positive risk too high)")
+                return .passed("Sent TX Verification",
+                              details: "⚠️ Network unstable - skipped verification of \(sentTxs.count) TXs (peer connections failing)")
+            }
+
+            // FIX #269 v2: If most TXs failed verification but a few were verified,
+            // the successful ones prove network works - phantom detection is valid
+            // Only mark as phantom if we verified at least 20% of non-phantom TXs
+            let nonPhantomChecked = verifiedCount + errorCount
+            let verificationRate = nonPhantomChecked > 0 ? Double(verifiedCount) / Double(nonPhantomChecked) : 0
+            if verificationRate < 0.2 && phantomTxs.count > 2 {
+                print("⚠️ FIX #269 v2: Low verification rate (\(Int(verificationRate * 100))%) with \(phantomTxs.count) phantoms")
+                print("⚠️ FIX #269 v2: Skipping phantom detection - likely network issues, not real phantoms")
+                return .passed("Sent TX Verification",
+                              details: "⚠️ Network unstable (\(Int(verificationRate * 100))% success) - verification incomplete")
+            }
+
             // Store in UserDefaults for the repair function to use
             let phantomData = phantomTxs.map { ["txid": $0.txid, "height": $0.height, "value": $0.value] as [String: Any] }
             UserDefaults.standard.set(phantomData, forKey: "phantomTransactions")

@@ -376,7 +376,7 @@ struct ChatView: View {
                     .foregroundColor(theme.accentColor)
                     .shadow(color: theme.accentColor.opacity(0.5), radius: 4)
 
-                Text("CYPHERPUNK CHAT")
+                Text("ZIPHERPUNK CHAT")
                     .font(.system(size: 14, weight: .black, design: .monospaced))
                     .foregroundColor(theme.accentColor)
                     .shadow(color: theme.accentColor.opacity(0.3), radius: 2)
@@ -1695,23 +1695,22 @@ struct AddContactSheet: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
+            #if os(macOS)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                         .foregroundColor(theme.accentColor)
                 }
-                #if os(macOS)
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                         .foregroundColor(theme.accentColor)
                 }
-                #endif
             }
+            // Ensure entire sheet has consistent background on macOS
+            .background(theme.backgroundColor.ignoresSafeArea())
+            #endif
         }
-        #if os(macOS)
-        // Ensure entire sheet has consistent background on macOS
-        .background(theme.backgroundColor.ignoresSafeArea())
-        #endif
         // FIX #225: QR Scanner sheet (iOS only)
         #if os(iOS)
         .sheet(isPresented: $showQRScanner) {
@@ -1999,23 +1998,22 @@ struct ChatSettingsSheet: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
+            #if os(macOS)
             .toolbar {
-                #if os(macOS)
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                         .foregroundColor(theme.accentColor)
                 }
-                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                         .foregroundColor(theme.accentColor)
                 }
             }
+            // Ensure entire sheet has consistent background on macOS
+            .background(theme.backgroundColor.ignoresSafeArea())
+            #endif
         }
-        #if os(macOS)
-        // Ensure entire sheet has consistent background on macOS
-        .background(theme.backgroundColor.ignoresSafeArea())
-        #endif
     }
 
     private func sectionHeader(_ title: String) -> some View {
@@ -2151,12 +2149,15 @@ struct PaymentRequestSheet: View {
             }
             .padding(.top, 24)
             .background(theme.backgroundColor)
+            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
+            #if os(macOS)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                         .foregroundColor(theme.accentColor)
                 }
             }
+            #endif
         }
     }
 
@@ -2262,6 +2263,8 @@ struct PayNowSheet: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
+            #if os(macOS)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -2271,10 +2274,9 @@ struct PayNowSheet: View {
                     .foregroundColor(theme.accentColor)
                 }
             }
+            .frame(minWidth: 500, idealWidth: 600, minHeight: 600, idealHeight: 700)
+            #endif
         }
-        #if os(macOS)
-        .frame(minWidth: 500, idealWidth: 600, minHeight: 600, idealHeight: 700)
-        #endif
     }
 
     private var paymentRequestHeader: some View {

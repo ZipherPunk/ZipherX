@@ -830,9 +830,10 @@ bool zipherx_tor_is_available(void);
 /// 0 = Stopped, 1 = Starting, 2 = Running, 3 = Error
 typedef uint8_t HiddenServiceState;
 
-/// Callback type for incoming connections
-/// Receives: client_id (unique), remote_addr (onion or IP)
-typedef void (*HiddenServiceConnectionCallback)(uint64_t client_id, const char *remote_addr);
+/// FIX #272: Callback type for incoming connections
+/// Receives: client_id (unique), host (source address), port (target port)
+/// Must match Rust signature: (connection_id: u64, host_ptr: *const c_char, port: u16)
+typedef void (*HiddenServiceConnectionCallback)(uint64_t client_id, const char *host, uint16_t port);
 
 /// Start the hidden service (Tor onion service)
 /// This makes ZipherX discoverable as a .onion address

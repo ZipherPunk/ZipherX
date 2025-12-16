@@ -322,10 +322,13 @@ struct AddNodeSheet: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // FIX #270: Hide Cancel on iOS - keep Add button for usability
             .toolbar {
+                #if os(macOS)
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { isPresented = false }
                 }
+                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") { addNode() }
                         .disabled(host.isEmpty)
@@ -454,10 +457,13 @@ struct EditNodeSheet: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            // FIX #270: Hide Cancel on iOS - keep Save button for usability
             .toolbar {
+                #if os(macOS)
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { isPresented = false }
                 }
+                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { saveNode() }
                 }

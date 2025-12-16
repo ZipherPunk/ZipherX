@@ -13,9 +13,10 @@ import Foundation
 
 // MARK: - Global Connection Callback
 
-/// Global callback function for C FFI - cannot capture context
+/// FIX #272: Global callback function for C FFI - cannot capture context
 /// Routes incoming connections to the HiddenServiceManager singleton
-private func hiddenServiceConnectionCallback(clientId: UInt64, remoteAddrPtr: UnsafePointer<CChar>?) {
+/// Rust signature: (connection_id: u64, host_ptr: *const c_char, port: u16)
+private func hiddenServiceConnectionCallback(clientId: UInt64, remoteAddrPtr: UnsafePointer<CChar>?, port: UInt16) {
     let remoteAddr: String
     if let ptr = remoteAddrPtr {
         remoteAddr = String(cString: ptr)
@@ -23,10 +24,12 @@ private func hiddenServiceConnectionCallback(clientId: UInt64, remoteAddrPtr: Un
         remoteAddr = "unknown"
     }
 
+    print("🧅 FIX #272: Incoming connection callback! Client: \(clientId), Host: \(remoteAddr), Port: \(port)")
+
     // Handle on main thread via singleton
     DispatchQueue.main.async {
         Task { @MainActor in
-            HiddenServiceManager.shared.handleIncomingConnection(clientId: clientId, remoteAddress: remoteAddr)
+            HiddenServiceManager.shared.handleIncomingConnection(clientId: clientId, remoteAddress: "\(remoteAddr):\(port)")
         }
     }
 }
