@@ -267,7 +267,7 @@ struct BoostDownloadProgressView: View {
             } else if walletManager.treeLoadStatus.lowercased().contains("failed") {
                 Button("Retry") {
                     Task {
-                        await walletManager.loadCommitmentTree()
+                        await walletManager.ensureTreeLoaded()
                     }
                 }
                 .buttonStyle(.borderedProminent)
