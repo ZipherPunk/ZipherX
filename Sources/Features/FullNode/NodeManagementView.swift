@@ -401,6 +401,12 @@ Your wallet.dat backup will be saved to:
 Continue?
 """)
         }
+        // FIX #276: Show bootstrap progress sheet
+        .sheet(isPresented: $viewModel.showBootstrapProgress) {
+            BootstrapProgressView()
+                .environmentObject(themeManager)
+                .frame(minWidth: 500, minHeight: 400)
+        }
     }
 
     // MARK: - Backup Section
@@ -1051,6 +1057,7 @@ class NodeManagementViewModel: ObservableObject {
     @Published var operationStatus = ""
     @Published var operationProgress: Double = 0.0  // 0.0 to 1.0
     @Published var showBootstrapConfirm = false
+    @Published var showBootstrapProgress = false  // FIX #276: Show progress view
 
     // Configuration Editor properties
     @Published var configHasUnsavedChanges = false
@@ -1535,10 +1542,12 @@ class NodeManagementViewModel: ObservableObject {
                 await MainActor.run {
                     operationStatus = "Starting bootstrap download..."
                     isOperationInProgress = false
+                    // FIX #276: Show the bootstrap progress view
+                    showBootstrapProgress = true
                 }
 
-                // Open bootstrap sheet
-                // Note: This would need to be connected to the BootstrapProgressView
+                // FIX #276: Actually start the bootstrap download
+                await BootstrapManager.shared.startBootstrap()
 
             } catch {
                 await MainActor.run {
