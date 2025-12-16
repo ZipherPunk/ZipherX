@@ -728,10 +728,6 @@ public class BootstrapManager: ObservableObject {
         dbcache=512
         maxconnections=32
 
-        # Sapling (shielded transactions)
-        experimentalfeatures=1
-        zmergetoaddress=1
-
         # Security
         checkblocks=24
         checklevel=3
