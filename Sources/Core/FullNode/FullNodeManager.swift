@@ -467,29 +467,48 @@ public class FullNodeManager: ObservableObject {
         let rpcUser = "zipherx\(randomString(length: 8))"
         let rpcPassword = randomString(length: 32)
 
+        // FIX #273: Complete config with all required settings
         let config = """
         # ZipherX Full Node Configuration
         # Generated: \(Date())
 
+        # RPC Settings
         rpcuser=\(rpcUser)
         rpcpassword=\(rpcPassword)
         rpcport=8023
         rpcallowip=127.0.0.1
 
         # Network
-        listen=1
         server=1
+        listen=1
+        daemon=1
+        port=8033
+
+        # CRITICAL: Indexes (required for wallet operations)
+        txindex=1
+        addressindex=1
+        timestampindex=1
+        spentindex=1
+
+        # Tor/Onion Support
+        # proxy=127.0.0.1:9250
+        listenonion=1
 
         # Performance
         dbcache=512
-        maxconnections=16
+        maxconnections=32
 
-        # Indexes
-        txindex=1
+        # Sapling (shielded transactions)
+        experimentalfeatures=1
+        zmergetoaddress=1
+
+        # Security
+        checkblocks=24
+        checklevel=3
         """
 
         try config.write(to: Self.configPath, atomically: true, encoding: .utf8)
-        print("✅ Created zclassic.conf")
+        print("✅ Created zclassic.conf with complete settings")
     }
 
     // MARK: - Daemon Installation

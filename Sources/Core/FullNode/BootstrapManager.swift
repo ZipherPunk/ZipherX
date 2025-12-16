@@ -666,7 +666,14 @@ public class BootstrapManager: ObservableObject {
     // MARK: - Configuration
 
     private func configureZclassicConf() throws {
-        let configPath = RPCClient.zclassicDataDir.appendingPathComponent("zclassic.conf")
+        let dataDir = RPCClient.zclassicDataDir
+        let configPath = dataDir.appendingPathComponent("zclassic.conf")
+
+        // FIX #273: Create data directory if it doesn't exist
+        if !FileManager.default.fileExists(atPath: dataDir.path) {
+            try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+            print("📁 Created Zclassic data directory: \(dataDir.path)")
+        }
 
         // NEVER overwrite existing config!
         if FileManager.default.fileExists(atPath: configPath.path) {
@@ -679,6 +686,7 @@ public class BootstrapManager: ObservableObject {
         let rpcUser = "zipherx_\(randomString(length: 8))"
         let rpcPassword = randomString(length: 32)
 
+        // FIX #273: Complete config with Tor/onion support
         let config = """
         # ZipherX Generated Configuration
         # Generated: \(ISO8601DateFormatter().string(from: Date()))
@@ -693,24 +701,33 @@ public class BootstrapManager: ObservableObject {
         server=1
         listen=1
         daemon=1
+        port=8033
 
-        # Indexes (required for explorer)
+        # CRITICAL: Indexes (required for wallet operations)
         txindex=1
         addressindex=1
         timestampindex=1
         spentindex=1
 
+        # Tor/Onion Support
+        # proxy=127.0.0.1:9250
+        listenonion=1
+
         # Performance
         dbcache=512
         maxconnections=32
 
-        # Sapling
+        # Sapling (shielded transactions)
         experimentalfeatures=1
         zmergetoaddress=1
+
+        # Security
+        checkblocks=24
+        checklevel=3
         """
 
         try config.write(to: configPath, atomically: true, encoding: .utf8)
-        print("✅ Generated new zclassic.conf with random credentials")
+        print("✅ Generated new zclassic.conf with random credentials and Tor support")
     }
 
     private func randomString(length: Int) -> String {
