@@ -1610,10 +1610,11 @@ Both binaries must be installed to /usr/local/bin:
                             HStack(spacing: 4) {
                                 Image(systemName: "antenna.radiowaves.left.and.right")
                                     .font(.system(size: 10))
-                                Text("P2P Port: \(HiddenServiceManager.shared.p2pPort)")
+                                // FIX #275: Use String() to avoid locale number formatting (8 033 → 8033)
+                                Text("P2P Port: \(String(HiddenServiceManager.shared.p2pPort))")
                                     .font(.system(size: 10, design: .monospaced))
                                 Text("•")
-                                Text("Active: \(HiddenServiceManager.shared.activeConnectionsCount)")
+                                Text("Active: \(String(HiddenServiceManager.shared.activeConnectionsCount))")
                                     .font(.system(size: 10, design: .monospaced))
                             }
                             .foregroundColor(theme.textSecondary)
