@@ -39,6 +39,7 @@ public class BootstrapManager: ObservableObject {
         case extracting
         case configuringDaemon
         case downloadingParams
+        case startingDaemon  // FIX #273: Added step to start daemon after bootstrap
         case complete
         case error(String)
         case cancelled
@@ -107,6 +108,16 @@ public class BootstrapManager: ObservableObject {
 
             // Clean up temp files
             try? FileManager.default.removeItem(at: downloadDir)
+
+            // Step 8: Start daemon and wait for sync
+            await updateStatus(.startingDaemon, task: "Starting zclassicd...")
+            do {
+                try await FullNodeManager.shared.startDaemon()
+                print("✅ Daemon started and synced successfully")
+            } catch {
+                print("⚠️ Daemon start failed (user can start manually): \(error)")
+                // Don't fail bootstrap - user can start daemon manually
+            }
 
             // Done!
             await updateStatus(.complete, task: "Bootstrap complete!")
