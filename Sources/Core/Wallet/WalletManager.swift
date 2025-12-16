@@ -533,6 +533,12 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
+    // FIX #278: Boost download stats for progress view (like BootstrapProgressView)
+    @Published private(set) var boostDownloadSpeed: String = ""
+    @Published private(set) var boostETA: String = ""
+    @Published private(set) var boostFileSize: Int64 = 0
+    @Published var showBoostDownloadSheet: Bool = false  // Show progress sheet during download
+
     // Tree height/count now come from GitHub via ZipherXConstants.effectiveTreeHeight/effectiveTreeCMUCount
 
     // Lock to prevent concurrent tree loading
@@ -638,9 +644,18 @@ final class WalletManager: ObservableObject {
 
         // Download boost file from GitHub (required - no bundled fallback)
         print("🚀 Downloading boost file from GitHub...")
+
+        // FIX #278: Show progress sheet and initialize download stats
+        var downloadStartTime = Date()
+        var lastProgressUpdate = Date()
+        var lastProgress: Double = 0
+
         await MainActor.run {
             self.treeLoadStatus = "Downloading boost data..."
             self.treeLoadProgress = 0.1
+            self.showBoostDownloadSheet = true  // FIX #278: Show progress sheet
+            self.boostDownloadSpeed = ""
+            self.boostETA = ""
         }
 
         // FIX #164: Bypass Tor for boost file download during import/initial sync
@@ -670,10 +685,48 @@ final class WalletManager: ObservableObject {
 
         do {
             // Download the unified boost file (contains tree, outputs, spends, etc.)
+            // FIX #278: Enhanced progress callback with speed/ETA calculation
             let (_, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
                 Task { @MainActor in
                     self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for download
                     self.treeLoadStatus = status
+
+                    // FIX #278: Calculate download speed and ETA
+                    let now = Date()
+                    let elapsed = now.timeIntervalSince(lastProgressUpdate)
+
+                    if elapsed >= 0.5 && progress > lastProgress {  // Update every 500ms
+                        let progressDelta = progress - lastProgress
+                        let totalElapsed = now.timeIntervalSince(downloadStartTime)
+
+                        // Speed based on recent progress (more responsive)
+                        // Assuming ~500MB file size for estimation
+                        let estimatedFileSize: Int64 = 500_000_000
+                        let bytesDownloaded = Int64(Double(estimatedFileSize) * progress)
+                        let recentBytesPerSec = Int64(Double(estimatedFileSize) * progressDelta / elapsed)
+
+                        if recentBytesPerSec > 0 {
+                            self.boostDownloadSpeed = ByteCountFormatter.string(fromByteCount: recentBytesPerSec, countStyle: .file) + "/s"
+                            self.boostFileSize = estimatedFileSize
+
+                            // ETA based on remaining progress and average speed
+                            let avgBytesPerSec = Double(bytesDownloaded) / totalElapsed
+                            let remainingBytes = Double(estimatedFileSize) * (1.0 - progress)
+                            let etaSeconds = Int(remainingBytes / avgBytesPerSec)
+
+                            if etaSeconds < 60 {
+                                self.boostETA = "\(etaSeconds)s"
+                            } else if etaSeconds < 3600 {
+                                self.boostETA = "\(etaSeconds / 60)m \(etaSeconds % 60)s"
+                            } else {
+                                self.boostETA = "\(etaSeconds / 3600)h \(etaSeconds % 3600 / 60)m"
+                            }
+                        }
+
+                        lastProgressUpdate = now
+                        lastProgress = progress
+                    }
+
                     // FIX #124: Update overall progress during download
                     self.updateOverallProgress(phase: .downloadingTree, phaseProgress: progress)
                 }
@@ -681,6 +734,12 @@ final class WalletManager: ObservableObject {
             downloadedTreeHeight = height
             downloadedCMUCount = cmuCount
             print("🚀 Downloaded boost file from GitHub: height \(height) (\(cmuCount) outputs)")
+
+            // FIX #278: Clear download stats after completion
+            await MainActor.run {
+                self.boostDownloadSpeed = ""
+                self.boostETA = ""
+            }
         } catch {
             print("❌ GitHub boost file download failed: \(error.localizedDescription)")
             await MainActor.run {
@@ -729,6 +788,10 @@ final class WalletManager: ObservableObject {
                 self.treeLoadProgress = 1.0
                 self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
                 self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
+                // FIX #278: Auto-dismiss sheet after 1 second
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    self.showBoostDownloadSheet = false
+                }
             }
             return
         }
@@ -738,6 +801,7 @@ final class WalletManager: ObservableObject {
         await MainActor.run {
             self.treeLoadStatus = "Failed to load commitment tree"
             self.treeLoadProgress = 0.0
+            // FIX #278: Keep sheet open on failure so user can retry
         }
 
         // Clear the corrupted boost file and try again next time

@@ -1644,6 +1644,14 @@ struct ContentView: View {
             .environmentObject(networkManager)
             .environmentObject(themeManager)
         }
+        // FIX #278: Boost file (CMU bundle) download progress sheet
+        #if os(macOS)
+        .sheet(isPresented: $walletManager.showBoostDownloadSheet) {
+            BoostDownloadProgressView(walletManager: walletManager)
+                .environmentObject(themeManager)
+                .frame(minWidth: 450, minHeight: 400)
+        }
+        #endif
         .contentShape(Rectangle())
         .onTapGesture {
             recordUserActivity()
