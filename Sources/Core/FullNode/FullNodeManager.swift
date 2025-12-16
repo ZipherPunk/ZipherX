@@ -67,24 +67,70 @@ public class FullNodeManager: ObservableObject {
         }
     }
 
-    // MARK: - Paths
+    // MARK: - Paths (Multi-Platform Support)
 
-    /// Path to zclassicd daemon
+    /// Path to zclassicd daemon - platform-specific
     public static var daemonPath: URL {
-        URL(fileURLWithPath: "/usr/local/bin/zclassicd")
+        #if os(macOS)
+        // macOS: /usr/local/bin or Homebrew
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/zclassicd") {
+            return URL(fileURLWithPath: "/opt/homebrew/bin/zclassicd")
+        }
+        return URL(fileURLWithPath: "/usr/local/bin/zclassicd")
+        #elseif os(Linux)
+        // Linux: /usr/bin or /usr/local/bin
+        if FileManager.default.fileExists(atPath: "/usr/bin/zclassicd") {
+            return URL(fileURLWithPath: "/usr/bin/zclassicd")
+        }
+        return URL(fileURLWithPath: "/usr/local/bin/zclassicd")
+        #elseif os(Windows)
+        // Windows: Program Files or user's PATH
+        let programFiles = ProcessInfo.processInfo.environment["ProgramFiles"] ?? "C:\\Program Files"
+        return URL(fileURLWithPath: "\(programFiles)\\Zclassic\\zclassicd.exe")
+        #else
+        return URL(fileURLWithPath: "/usr/local/bin/zclassicd")
+        #endif
     }
 
-    /// Path to zclassic-cli
+    /// Path to zclassic-cli - platform-specific
     public static var cliPath: URL {
-        URL(fileURLWithPath: "/usr/local/bin/zclassic-cli")
+        #if os(macOS)
+        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/zclassic-cli") {
+            return URL(fileURLWithPath: "/opt/homebrew/bin/zclassic-cli")
+        }
+        return URL(fileURLWithPath: "/usr/local/bin/zclassic-cli")
+        #elseif os(Linux)
+        if FileManager.default.fileExists(atPath: "/usr/bin/zclassic-cli") {
+            return URL(fileURLWithPath: "/usr/bin/zclassic-cli")
+        }
+        return URL(fileURLWithPath: "/usr/local/bin/zclassic-cli")
+        #elseif os(Windows)
+        let programFiles = ProcessInfo.processInfo.environment["ProgramFiles"] ?? "C:\\Program Files"
+        return URL(fileURLWithPath: "\(programFiles)\\Zclassic\\zclassic-cli.exe")
+        #else
+        return URL(fileURLWithPath: "/usr/local/bin/zclassic-cli")
+        #endif
     }
 
-    /// Zclassic data directory
+    /// Zclassic data directory - platform-specific
     public static var dataDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        #if os(macOS)
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library")
             .appendingPathComponent("Application Support")
-            .appendingPathComponent("ZClassic")
+            .appendingPathComponent("Zclassic")
+        #elseif os(Linux)
+        // Linux: ~/.zclassic
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zclassic")
+        #elseif os(Windows)
+        // Windows: %APPDATA%\Zclassic
+        let appData = ProcessInfo.processInfo.environment["APPDATA"] ?? "C:\\Users\\Default\\AppData\\Roaming"
+        return URL(fileURLWithPath: appData).appendingPathComponent("Zclassic")
+        #else
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zclassic")
+        #endif
     }
 
     /// Path to blocks directory
