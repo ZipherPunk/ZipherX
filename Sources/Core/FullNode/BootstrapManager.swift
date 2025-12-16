@@ -366,8 +366,9 @@ public class BootstrapManager: ObservableObject {
                 totalParts: totalParts
             )
 
-            // FIX #279: Use ephemeral session with longer timeout
-            let config = URLSessionConfiguration.ephemeral
+            // FIX #280: Use default session (NOT ephemeral - temp files get deleted too early)
+            // Ephemeral sessions don't persist downloaded files properly
+            let config = URLSessionConfiguration.default
             config.timeoutIntervalForResource = 1800  // 30 minutes for large file
             config.timeoutIntervalForRequest = 120    // 2 minutes per request
             config.waitsForConnectivity = true
