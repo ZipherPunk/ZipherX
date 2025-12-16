@@ -353,42 +353,74 @@ public class BootstrapManager: ObservableObject {
         lastBytesDownloaded = 0
         lastProgressUpdate = Date()
 
-        // Create download delegate
-        let delegate = PartDownloadDelegate(
-            manager: self,
-            partSize: part.size,
-            partIndex: partIndex,
-            totalParts: totalParts
-        )
+        // FIX #279: Retry logic for network failures
+        let maxRetries = 3
+        var lastError: Error?
 
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        var request = URLRequest(url: part.downloadURL)
-        request.setValue("ZipherX/1.0", forHTTPHeaderField: "User-Agent")
+        for attempt in 1...maxRetries {
+            // Create download delegate
+            let delegate = PartDownloadDelegate(
+                manager: self,
+                partSize: part.size,
+                partIndex: partIndex,
+                totalParts: totalParts
+            )
 
-        downloadTask = session.downloadTask(with: request)
-        downloadTask?.resume()
+            // FIX #279: Use ephemeral session with longer timeout
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForResource = 1800  // 30 minutes for large file
+            config.timeoutIntervalForRequest = 120    // 2 minutes per request
+            config.waitsForConnectivity = true
 
-        // Wait for completion
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            delegate.completion = { error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
+            let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+            var request = URLRequest(url: part.downloadURL)
+            request.setValue("ZipherX/1.0", forHTTPHeaderField: "User-Agent")
+
+            downloadTask = session.downloadTask(with: request)
+            downloadTask?.resume()
+
+            do {
+                // Wait for completion
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    delegate.completion = { error in
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                }
+
+                // Move to final location
+                if let tempURL = delegate.downloadedFileURL {
+                    if FileManager.default.fileExists(atPath: destinationPath.path) {
+                        try FileManager.default.removeItem(at: destinationPath)
+                    }
+                    try FileManager.default.moveItem(at: tempURL, to: destinationPath)
+                }
+
+                totalBytesDownloadedAllParts += part.size
+                print("✅ Downloaded part \(partIndex + 1)/\(totalParts): \(part.name)")
+                return  // Success - exit retry loop
+
+            } catch {
+                lastError = error
+                print("⚠️ FIX #279: Bootstrap download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+
+                if attempt < maxRetries {
+                    // Wait before retrying (exponential backoff)
+                    let delay = Double(attempt) * 3.0  // 3s, 6s, 9s
+                    print("⏳ Retrying in \(Int(delay))s...")
+                    await MainActor.run {
+                        self.currentTask = "Download failed, retrying in \(Int(delay))s..."
+                    }
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 }
             }
         }
 
-        // Move to final location
-        if let tempURL = delegate.downloadedFileURL {
-            if FileManager.default.fileExists(atPath: destinationPath.path) {
-                try FileManager.default.removeItem(at: destinationPath)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: destinationPath)
-        }
-
-        totalBytesDownloadedAllParts += part.size
-        print("✅ Downloaded part \(partIndex + 1)/\(totalParts): \(part.name)")
+        // All retries failed
+        throw lastError ?? BootstrapError.downloadFailed("Max retries exceeded for part \(partIndex + 1)")
     }
 
     private class PartDownloadDelegate: NSObject, URLSessionDownloadDelegate {
@@ -806,7 +838,7 @@ public class BootstrapManager: ObservableObject {
 public enum BootstrapError: Error, LocalizedError {
     case noAssetFound
     case releaseNotFound
-    case downloadFailed
+    case downloadFailed(String)  // FIX #279: Added message parameter
     case checksumMismatch
     case extractionFailed
     case configurationFailed
@@ -819,8 +851,8 @@ public enum BootstrapError: Error, LocalizedError {
             return "No bootstrap archive found in release"
         case .releaseNotFound:
             return "Could not find latest bootstrap release on GitHub"
-        case .downloadFailed:
-            return "Failed to download bootstrap"
+        case .downloadFailed(let message):
+            return "Failed to download bootstrap: \(message)"
         case .checksumMismatch:
             return "Downloaded file checksum does not match - file may be corrupted"
         case .extractionFailed:
