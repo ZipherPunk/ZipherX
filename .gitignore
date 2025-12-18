@@ -76,6 +76,7 @@ Libraries/zipherx-ffi/libzipherx_ffi_ios.a
 
 # Tools directory (private scripts, not for public repo)
 Tools/
+scripts/tools/
 
 # Security audit docs (never commit to public repo)
 docs/
@@ -98,3 +99,6 @@ ZipherX-iOS-Wallet-Architecture.md
 # Test Rust target directories
 test_decrypt_rust/target/
 **/target/
+
+# External Zclassic node (C++ fork of Zcash/Bitcoin - not ZipherX code)
+zclassic-fork/
