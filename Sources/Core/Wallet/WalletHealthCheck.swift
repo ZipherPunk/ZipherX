@@ -679,28 +679,16 @@ final class WalletHealthCheck {
 
         // Store phantom TXs for repair
         if !phantomTxs.isEmpty {
-            // FIX #269 v2: If we couldn't verify ANY transactions successfully, network is broken
-            // Don't mark as phantom - likely all verification attempts failed due to Tor/peer issues
-            // The log shows: all 5 peers "Peer handshake failed" but then "P2P verified with 5 peers"
-            // This means peers exist but can't actually be used - false phantom detection!
-            if verifiedCount == 0 {
-                print("⚠️ FIX #269 v2: Couldn't verify ANY transactions - network appears broken")
-                print("⚠️ FIX #269 v2: NOT marking \(phantomTxs.count) TX(s) as phantom (false positive risk too high)")
-                return .passed("Sent TX Verification",
-                              details: "⚠️ Network unstable - skipped verification of \(sentTxs.count) TXs (peer connections failing)")
-            }
-
-            // FIX #269 v2: If most TXs failed verification but a few were verified,
-            // the successful ones prove network works - phantom detection is valid
-            // Only mark as phantom if we verified at least 20% of non-phantom TXs
-            let nonPhantomChecked = verifiedCount + errorCount
-            let verificationRate = nonPhantomChecked > 0 ? Double(verifiedCount) / Double(nonPhantomChecked) : 0
-            if verificationRate < 0.2 && phantomTxs.count > 2 {
-                print("⚠️ FIX #269 v2: Low verification rate (\(Int(verificationRate * 100))%) with \(phantomTxs.count) phantoms")
-                print("⚠️ FIX #269 v2: Skipping phantom detection - likely network issues, not real phantoms")
-                return .passed("Sent TX Verification",
-                              details: "⚠️ Network unstable (\(Int(verificationRate * 100))% success) - verification incomplete")
-            }
+            // FIX #355: Removed overly conservative FIX #269 v2 checks
+            // The old logic blocked phantom detection when verifiedCount == 0, but this is wrong:
+            // - P2P getdata only returns TXs in mempool, not confirmed TXs
+            // - So verifiedCount will be 0 for old/confirmed TXs even if network works
+            // - If peers responded with "notfound", that's a VALID detection, not a network issue
+            //
+            // New logic: If we detected phantoms and had peers to query, trust the detection
+            // Only skip if ALL checks failed with errors (no phantoms detected at all would mean empty array)
+            // If we detected phantoms, that means peers responded - network worked!
+            print("🔍 FIX #355: Phantom detection - verified: \(verifiedCount), errors: \(errorCount), phantoms: \(phantomTxs.count)")
 
             // Store in UserDefaults for the repair function to use
             let phantomData = phantomTxs.map { ["txid": $0.txid, "height": $0.height, "value": $0.value] as [String: Any] }
