@@ -905,6 +905,20 @@ final class Peer {
         return Date().timeIntervalSince(activity) > maxIdleTime
     }
 
+    /// FIX #327: Check if peer had recent activity (for keepalive optimization)
+    /// If block listener is receiving messages, we don't need to send ping
+    public var hasRecentActivity: Bool {
+        guard let activity = lastActivity else { return false }
+        // If activity within last 60 seconds, peer is alive (no ping needed)
+        return Date().timeIntervalSince(activity) < 60
+    }
+
+    /// FIX #327: Get seconds since last activity (for debugging)
+    public var secondsSinceActivity: Int {
+        guard let activity = lastActivity else { return -1 }
+        return Int(Date().timeIntervalSince(activity))
+    }
+
     /// Reconnect if connection is not ready or stale
     /// Minimum time between reconnection attempts (seconds)
     /// FIX #122: Reduced from 5s to 2s for faster header sync
@@ -1902,45 +1916,51 @@ final class Peer {
             throw NetworkError.notConnected
         }
 
-        // Build getdata message for MSG_TX (type 1)
-        // Format: count (varint) + [type (4 bytes LE) + hash (32 bytes)]
-        var payload = Data()
+        // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
+        // Without this, the block listener can consume our TX response
+        return try await withExclusiveAccess {
+            // Build getdata message for MSG_TX (type 1)
+            // Format: count (varint) + [type (4 bytes LE) + hash (32 bytes)]
+            var payload = Data()
 
-        // Count = 1
-        payload.append(0x01)
+            // Count = 1
+            payload.append(0x01)
 
-        // Type = MSG_TX (1)
-        var txType: UInt32 = 1
-        payload.append(Data(bytes: &txType, count: 4))
+            // Type = MSG_TX (1)
+            var txType: UInt32 = 1
+            payload.append(Data(bytes: &txType, count: 4))
 
-        // Hash (32 bytes, already in wire format - little endian)
-        payload.append(txid)
+            // Hash (32 bytes, already in wire format - little endian)
+            payload.append(txid)
 
-        // Send getdata and wait for response
-        do {
             try await sendMessage(command: "getdata", payload: payload)
 
-            // Wait for response (tx or notfound)
-            let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+            // FIX #354: Loop to drain buffered messages until we get tx/notfound
+            var attempts = 0
+            let maxAttempts = 10
 
-            if command == "tx" && !responseData.isEmpty {
-                // Peer has the transaction
-                lastActivity = Date()
-                return true
-            } else if command == "notfound" {
-                // Peer doesn't have the transaction
-                return false
-            } else if command == "ping" {
-                // Auto-respond to ping
-                try await sendMessage(command: "pong", payload: responseData)
-                // Try to receive again
-                let (cmd2, data2) = try await receiveMessageWithTimeout(seconds: 5)
-                return cmd2 == "tx" && !data2.isEmpty
+            while attempts < maxAttempts {
+                attempts += 1
+
+                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+
+                if command == "tx" && !responseData.isEmpty {
+                    lastActivity = Date()
+                    return true
+                } else if command == "notfound" {
+                    return false
+                } else if command == "ping" {
+                    try await sendMessage(command: "pong", payload: responseData)
+                    continue
+                } else if command == "inv" || command == "addr" || command == "headers" || command == "block" {
+                    // Drain buffered messages
+                    continue
+                } else {
+                    continue
+                }
             }
 
             return false
-        } catch {
-            throw error
         }
     }
 
@@ -1951,35 +1971,44 @@ final class Peer {
             throw NetworkError.notConnected
         }
 
-        // Build getdata message for MSG_TX (type 1)
-        var payload = Data()
-        payload.append(0x01)  // count = 1
+        // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
+        return try await withExclusiveAccess {
+            // Build getdata message for MSG_TX (type 1)
+            var payload = Data()
+            payload.append(0x01)  // count = 1
 
-        var txType: UInt32 = 1  // MSG_TX
-        payload.append(Data(bytes: &txType, count: 4))
-        payload.append(txid)  // 32-byte hash
+            var txType: UInt32 = 1  // MSG_TX
+            payload.append(Data(bytes: &txType, count: 4))
+            payload.append(txid)  // 32-byte hash
 
-        try await sendMessage(command: "getdata", payload: payload)
+            try await sendMessage(command: "getdata", payload: payload)
 
-        // Wait for response
-        let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+            // FIX #354: Loop to drain buffered messages until we get tx/notfound
+            var attempts = 0
+            let maxAttempts = 10
 
-        if command == "tx" && !responseData.isEmpty {
-            lastActivity = Date()
-            return responseData
-        } else if command == "notfound" {
-            return nil
-        } else if command == "ping" {
-            // Handle ping, then try again
-            try await sendMessage(command: "pong", payload: responseData)
-            let (cmd2, data2) = try await receiveMessageWithTimeout(seconds: 5)
-            if cmd2 == "tx" && !data2.isEmpty {
-                lastActivity = Date()
-                return data2
+            while attempts < maxAttempts {
+                attempts += 1
+
+                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+
+                if command == "tx" && !responseData.isEmpty {
+                    lastActivity = Date()
+                    return responseData
+                } else if command == "notfound" {
+                    return nil
+                } else if command == "ping" {
+                    try await sendMessage(command: "pong", payload: responseData)
+                    continue
+                } else if command == "inv" || command == "addr" || command == "headers" || command == "block" {
+                    continue
+                } else {
+                    continue
+                }
             }
-        }
 
-        return nil
+            return nil
+        }
     }
 
     // MARK: - Network I/O
@@ -2112,7 +2141,19 @@ final class Peer {
                                 reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
                             }
                         }
+
+                        // FIX #333 REVERTED: DUPLICATE can be a SYBIL ATTACK lie!
+                        // Malicious peers return DUPLICATE to make user think TX was sent.
+                        // The mempool verification (VUL-002) is the FINAL gate - it will
+                        // correctly catch fake DUPLICATE responses by checking if TX is
+                        // actually in the network mempool.
+                        //
+                        // Evidence from zmac.log: All 3 peers returned DUPLICATE, but
+                        // mempool verification showed peers=0, mempool=false → SYBIL ATTACK!
                         print("❌ Transaction rejected: \(codeName) - \(reason)")
+                        if rejectCode == 0x12 {
+                            print("⚠️ FIX #333: DUPLICATE rejection - could be Sybil attack! Mempool verification will confirm.")
+                        }
                         throw NetworkError.transactionRejected
                     }
                 }
@@ -2483,7 +2524,8 @@ final class Peer {
         // - Equihash solution (compactSize + solution)
         // - Transaction count (compactSize)
         // - Transactions
-        debugLog(.network, "📦 P2P BLOCK: Parsing block data, size=\(data.count) bytes")
+        // FIX #325: Disabled verbose log (too much output)
+        // debugLog(.network, "📦 P2P BLOCK: Parsing block data, size=\(data.count) bytes")
         guard data.count >= 140 else {
             debugLog(.error, "❌ P2P BLOCK: Too small, need at least 140 bytes")
             return nil
@@ -2610,12 +2652,14 @@ final class Peer {
         let fOverwintered = (header & 0x80000000) != 0
         pos += 4
 
-        debugLog(.network, "📋 P2P TX: offset=\(offset) header=0x\(String(format: "%08X", header)) v\(version) overwinter=\(fOverwintered)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: offset=\(offset) header=0x\(String(format: "%08X", header)) v\(version) overwinter=\(fOverwintered)")
 
         // Check for Sapling transaction (v4 with overwintered)
         guard fOverwintered && version >= 4 else {
             // Not a Sapling transaction - skip it entirely
-            debugLog(.network, "⏭️ P2P TX: Not Sapling (v\(version), overwinter=\(fOverwintered)) - skipping")
+            // FIX #325: Disabled verbose log
+            // debugLog(.network, "⏭️ P2P TX: Not Sapling (v\(version), overwinter=\(fOverwintered)) - skipping")
             return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
         }
 
@@ -2627,14 +2671,16 @@ final class Peer {
         // Verify Sapling version group ID (0x892F2085)
         guard versionGroupId == 0x892F2085 else {
             // Not a Sapling transaction - could be Overwinter (0x03C48270) or other
-            debugLog(.network, "⏭️ P2P TX: Not Sapling versionGroupId=0x\(String(format: "%08X", versionGroupId)) - skipping")
+            // FIX #325: Disabled verbose log
+            // debugLog(.network, "⏭️ P2P TX: Not Sapling versionGroupId=0x\(String(format: "%08X", versionGroupId)) - skipping")
             return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
         }
 
         // vin (transparent inputs)
         let (vinCount, vinBytes) = readCompactSize(data, at: pos)
         pos += vinBytes
-        debugLog(.network, "📋 P2P TX: vinCount=\(vinCount) pos=\(pos)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: vinCount=\(vinCount) pos=\(pos)")
         // Sanity limit - transactions rarely have >1000 inputs
         let safeVinCount = min(vinCount, 10000)
         for _ in 0..<safeVinCount {
@@ -2645,7 +2691,8 @@ final class Peer {
         // vout (transparent outputs)
         let (voutCount, voutBytes) = readCompactSize(data, at: pos)
         pos += voutBytes
-        debugLog(.network, "📋 P2P TX: voutCount=\(voutCount) pos after vin=\(pos)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: voutCount=\(voutCount) pos after vin=\(pos)")
         // Sanity limit - transactions rarely have >1000 outputs
         let safeVoutCount = min(voutCount, 10000)
         for _ in 0..<safeVoutCount {
@@ -2665,12 +2712,14 @@ final class Peer {
         guard pos + 8 <= data.count else { return (Data(repeating: 0, count: 32), [], [], pos) }
         pos += 8
 
-        debugLog(.network, "📋 P2P TX: pos after locktime/expiry/valueBalance=\(pos)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: pos after locktime/expiry/valueBalance=\(pos)")
 
         // vShieldedSpend
         let (spendCount, spendBytes) = readCompactSize(data, at: pos)
         pos += spendBytes
-        debugLog(.network, "📋 P2P TX: spendCount=\(spendCount)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: spendCount=\(spendCount)")
         // Sanity limit - Sapling transactions rarely have >100 spends
         let safeSpendCount = min(spendCount, 10000)
 
@@ -2703,7 +2752,8 @@ final class Peer {
         // vShieldedOutput
         let (outputCount, outputBytes) = readCompactSize(data, at: pos)
         pos += outputBytes
-        debugLog(.network, "📋 P2P TX: outputCount=\(outputCount)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "📋 P2P TX: outputCount=\(outputCount)")
         // Sanity limit - Sapling transactions rarely have >100 outputs
         let safeOutputCount = min(outputCount, 10000)
 
@@ -2731,7 +2781,8 @@ final class Peer {
             pos += 580
 
             outputs.append(CompactOutput(cmu: cmu, epk: epk, ciphertext: ciphertext))
-            debugLog(.network, "📋 P2P TX: Output[\(i)] cmu=\(cmu.prefix(8).hexString)...")
+            // FIX #325: Disabled verbose log
+            // debugLog(.network, "📋 P2P TX: Output[\(i)] cmu=\(cmu.prefix(8).hexString)...")
 
             // outCiphertext (80 bytes) - skip
             pos += 80
@@ -2768,7 +2819,8 @@ final class Peer {
         let txData = data[txStart..<txEnd]
         let txHash = Data(txData).doubleSHA256()
 
-        debugLog(.network, "✅ P2P TX: Parsed successfully - \(spends.count) spends, \(outputs.count) outputs, txHash=\(txHash.reversedBytes().hexString)")
+        // FIX #325: Disabled verbose log
+        // debugLog(.network, "✅ P2P TX: Parsed successfully - \(spends.count) spends, \(outputs.count) outputs, txHash=\(txHash.reversedBytes().hexString)")
         return (txHash, spends, outputs, txEnd)
     }
 
@@ -3409,7 +3461,101 @@ enum BanReason: String {
     case lowSuccessRate = "Very low success rate"
     case invalidMessages = "Sent invalid messages"
     case protocolViolation = "Protocol violation"
-    case timeout = "Connection/response timeout"
     case corruptedData = "Sent corrupted or invalid data"
     case fakeChainHeight = "Reported fake chain height (Sybil attack detected)"
+    case wrongProtocol = "Wrong protocol version (Zcash node)"
+}
+
+// MARK: - FIX #284: Parked Peer (Connection Timeout - Exponential Backoff)
+
+/// Parked peer - temporarily unavailable due to connection timeout
+/// NOT a ban! Will retry with exponential backoff: 1s → 5min → 1h → 24h max
+struct ParkedPeer {
+    let address: String
+    let port: UInt16
+    let parkedTime: Date
+    var retryCount: Int
+    let wasPreferred: Bool  // Track if this was a preferred seed before parking
+    let isHardcodedSeed: Bool  // FIX #352: Track if this is a hardcoded seed
+
+    /// Backoff schedule (in seconds):
+    /// Phase 1: 1, 2, 4, 8, 16, 32, 64, 128, 256, 300 (5min cap)
+    /// Phase 2: 3600 (1h), 14400 (4h), 28800 (8h), 57600 (16h), 86400 (24h max)
+    private static let backoffPhase1: [TimeInterval] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 300]
+    private static let backoffPhase2: [TimeInterval] = [3600, 14400, 28800, 57600, 86400]
+
+    /// FIX #352: Hardcoded seeds known to be reliable Zclassic nodes
+    private static let hardcodedSeeds: Set<String> = [
+        "140.174.189.3",
+        "140.174.189.17",
+        "205.209.104.118",
+        "95.179.131.117",
+        "45.77.216.198"
+    ]
+
+    /// Get the next retry interval based on retry count
+    /// FIX #352: Hardcoded seeds cap at 5 minutes (300s) instead of 24h
+    var nextRetryInterval: TimeInterval {
+        if retryCount < ParkedPeer.backoffPhase1.count {
+            return ParkedPeer.backoffPhase1[retryCount]
+        }
+        // FIX #352: Hardcoded seeds should NOT wait hours - cap at 5 minutes
+        if isHardcodedSeed {
+            return 300  // 5 minute max for hardcoded seeds
+        }
+        let phase2Index = retryCount - ParkedPeer.backoffPhase1.count
+        if phase2Index < ParkedPeer.backoffPhase2.count {
+            return ParkedPeer.backoffPhase2[phase2Index]
+        }
+        // Max backoff: 24 hours
+        return 86400
+    }
+
+    /// Time when we should next attempt to connect
+    var nextRetryTime: Date {
+        return parkedTime.addingTimeInterval(nextRetryInterval)
+    }
+
+    /// Check if it's time to retry
+    var isReadyForRetry: Bool {
+        return Date() >= nextRetryTime
+    }
+
+    /// Time remaining until retry
+    var timeUntilRetry: TimeInterval {
+        return max(0, nextRetryTime.timeIntervalSinceNow)
+    }
+
+    /// Human-readable description of backoff status
+    var backoffDescription: String {
+        let interval = nextRetryInterval
+        if interval < 60 {
+            return "\(Int(interval))s"
+        } else if interval < 3600 {
+            return "\(Int(interval / 60))m"
+        } else {
+            return "\(Int(interval / 3600))h"
+        }
+    }
+
+    /// Create new parked peer
+    /// FIX #352: Auto-detect if address is a hardcoded seed
+    init(address: String, port: UInt16, wasPreferred: Bool = false) {
+        self.address = address
+        self.port = port
+        self.parkedTime = Date()
+        self.retryCount = 0
+        self.wasPreferred = wasPreferred
+        self.isHardcodedSeed = ParkedPeer.hardcodedSeeds.contains(address)
+    }
+
+    /// Increment retry count after failed retry
+    mutating func incrementRetry() {
+        retryCount += 1
+    }
+
+    /// Reset for fresh retry (new parking)
+    mutating func resetParking() {
+        retryCount = 0
+    }
 }
