@@ -318,6 +318,12 @@ final class FilterScanner {
 
         // Load known nullifiers from database for spend detection
         knownNullifiers = try database.getAllNullifiers()
+        // FIX #288: Debug - show loaded nullifiers
+        print("🔍 FIX #288: Loaded \(knownNullifiers.count) nullifiers from DB for spend detection")
+        for (idx, nf) in knownNullifiers.enumerated().prefix(5) {
+            let shortNf = nf.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("🔍 FIX #288: knownNullifier[\(idx)] = \(shortNf)...")
+        }
 
         // NOTE: Existing witnesses are loaded AFTER tree is ready (see below)
         // This is critical - witnesses must be loaded into an initialized tree
@@ -596,10 +602,15 @@ final class FilterScanner {
                 }
 
                 if !usedOptimizedPath {
+                    // FIX #294: Track and retry failed block fetches
+                    var failedHeights: Set<UInt64> = []
+                    let maxRetries = 3
+
                     // PRIORITY 2: Network fetch (P2P or InsightAPI)
                     do {
                         // Try P2P batch fetch first
-                        if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected {
+                        let isConnectedForBatch = await MainActor.run { networkManager.isConnected }
+                        if FilterScanner.p2pBlockFetchingWorks != false && isConnectedForBatch {
                             let results = try await networkManager.getBlocksDataP2P(from: currentHeight, count: thisBatchSize)
                             for (height, _, timestamp, txData) in results {
                                 blockDataMap[height] = txData
@@ -607,6 +618,14 @@ final class FilterScanner {
                                 BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: timestamp)
                             }
                             FilterScanner.p2pBlockFetchingWorks = true
+
+                            // FIX #294: Track any heights that weren't returned
+                            let fetchedHeights = Set(results.map { $0.0 })
+                            for height in currentHeight...endHeight {
+                                if !fetchedHeights.contains(height) {
+                                    failedHeights.insert(height)
+                                }
+                            }
                         } else {
                             throw ScanError.networkError
                         }
@@ -627,9 +646,65 @@ final class FilterScanner {
                                 for await (height, txData) in group {
                                     if let data = txData {
                                         blockDataMap[height] = data
+                                    } else {
+                                        // FIX #294: Track failed heights for retry
+                                        failedHeights.insert(height)
                                     }
                                 }
                             }
+                        } else {
+                            // P2P only mode - mark all as failed if P2P fails
+                            for height in currentHeight...endHeight {
+                                failedHeights.insert(height)
+                            }
+                        }
+                    }
+
+                    // FIX #294: Retry failed block fetches with exponential backoff
+                    if !failedHeights.isEmpty && isScanning {
+                        print("⚠️ FIX #294: \(failedHeights.count) blocks failed, retrying...")
+
+                        for attempt in 1...maxRetries {
+                            guard isScanning && !failedHeights.isEmpty else { break }
+
+                            // Exponential backoff: 1s, 2s, 4s
+                            try? await Task.sleep(nanoseconds: UInt64(1_000_000_000 * (1 << (attempt - 1))))
+
+                            var stillFailed: Set<UInt64> = []
+
+                            // Retry each failed height individually
+                            for height in failedHeights.sorted() {
+                                do {
+                                    let isConnectedForRetry = await MainActor.run { networkManager.isConnected }
+                                    if isConnectedForRetry {
+                                        let results = try await networkManager.getBlocksDataP2P(from: height, count: 1)
+                                        if let (h, _, timestamp, txData) = results.first, h == height {
+                                            blockDataMap[height] = txData
+                                            BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: timestamp)
+                                            continue // Success!
+                                        }
+                                    }
+                                    stillFailed.insert(height)
+                                } catch {
+                                    stillFailed.insert(height)
+                                }
+                            }
+
+                            failedHeights = stillFailed
+
+                            if failedHeights.isEmpty {
+                                print("✅ FIX #294: All blocks recovered on retry \(attempt)")
+                                break
+                            } else if attempt < maxRetries {
+                                print("⚠️ FIX #294: Retry \(attempt)/\(maxRetries) - \(failedHeights.count) blocks still failing")
+                            }
+                        }
+
+                        // Log permanently failed blocks (potential missed transactions!)
+                        if !failedHeights.isEmpty {
+                            let sortedFailed = failedHeights.sorted()
+                            print("❌ FIX #294: CRITICAL - \(failedHeights.count) blocks permanently failed: \(sortedFailed.prefix(10))...")
+                            print("   ⚠️ Transactions in these blocks may be MISSED! Consider repair database.")
                         }
                     }
                 }
@@ -708,7 +783,9 @@ final class FilterScanner {
                 for (height, txid, nullifierHex) in collectedSpends {
                     guard let nullifierDisplay = Data(hexString: nullifierHex) else { continue }
                     let nullifierWire = nullifierDisplay.reversedBytes()
-                    if knownNullifiers.contains(nullifierWire) {
+                    // FIX #367: Hash the blockchain nullifier before comparing
+                    let hashedNullifier = database.hashNullifier(nullifierWire)
+                    if knownNullifiers.contains(hashedNullifier) {
                         let txidData = Data(hexString: txid)
                         if let txidData = txidData {
                             try? database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
@@ -748,7 +825,14 @@ final class FilterScanner {
         // - We did PHASE 1 and there are more blocks after phase1EndHeight
         // - OR no custom start height was provided (normal auto-scan)
         // - OR custom start height is AFTER CMU data height (must use sequential for correct positions)
-        let continueAfterBundledRange = scanWithinDownloadedRange && currentHeight <= targetHeight
+
+        // FIX #362: Recalculate continueAfterBundledRange with CURRENT height (after PHASE 1 updated it)
+        // Previously this was calculated once at the start and didn't reflect PHASE 1's height update
+        let continueAfterBundledRange = currentHeight <= targetHeight && currentHeight > phase1EndHeight
+
+        // FIX #362: Log all conditions for debugging
+        print("🔍 FIX #362: PHASE 2 check - currentHeight=\(currentHeight), targetHeight=\(targetHeight), phase1EndHeight=\(phase1EndHeight)")
+        print("🔍 FIX #362: continueAfterBundledRange=\(continueAfterBundledRange), scanWithinDownloadedRange=\(scanWithinDownloadedRange)")
 
         // Quick scan is ONLY safe when scanning WITHIN CMU data range where positions are known
         // If starting AFTER CMU data, we MUST use sequential mode for correct nullifier computation
@@ -757,8 +841,13 @@ final class FilterScanner {
         // If custom start is AFTER CMU data height, force sequential mode
         let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > phase1EndHeight
 
+        print("🔍 FIX #362: isQuickScanOnly=\(isQuickScanOnly), forceSequentialAfterBundled=\(forceSequentialAfterBundled)")
+
         if continueAfterBundledRange || forceSequentialAfterBundled {
             print("⚡ PHASE 2: \(currentHeight) → \(targetHeight) (\(targetHeight - currentHeight + 1) blocks)")
+        } else if currentHeight <= targetHeight {
+            // FIX #362: Force PHASE 2 if there are still blocks to scan
+            print("⚡ FIX #362: Forcing PHASE 2 - still \(targetHeight - currentHeight + 1) blocks remaining")
         }
 
         if isQuickScanOnly {
@@ -818,7 +907,9 @@ final class FilterScanner {
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
                 currentHeight = endHeight + 1
             }
-        } else if !isQuickScanOnly || continueAfterBundledRange || forceSequentialAfterBundled {
+        } else if currentHeight <= targetHeight {
+            // FIX #362: Simplified condition - always run PHASE 2 if blocks remain
+            // Previous condition was complex and could miss cases
             // FIX #190: PARALLEL PRE-FETCH ALL BLOCKS for 5-6x speed improvement
             // Old approach: Fetch 500 blocks → process → repeat (13s fetch + 0.5s process per batch)
             // New approach: Fetch ALL blocks in parallel across all peers, then process sequentially
@@ -827,6 +918,64 @@ final class FilterScanner {
             // - Old: 14 batches × 13s = 182 seconds
             // - New: 6678/6 = 1113 blocks/peer in parallel = ~20-30 seconds total
 
+            // FIX #406: Ensure headers are synced BEFORE attempting block fetch
+            // P2P block fetch requires block hashes from HeaderStore. If HeaderStore is behind,
+            // blocks can't be fetched and notes will be MISSED!
+            var headerSyncAttempts = 0
+            let maxHeaderSyncAttempts = 3
+            var headersAvailable = false
+
+            while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
+                let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+
+                if headerStoreHeight >= targetHeight {
+                    headersAvailable = true
+                    print("✅ FIX #406: Headers available up to \(headerStoreHeight) (target: \(targetHeight))")
+                    break
+                }
+
+                headerSyncAttempts += 1
+                let headersBehind = targetHeight - headerStoreHeight
+                print("⚠️ FIX #406: HeaderStore (\(headerStoreHeight)) is \(headersBehind) blocks behind target (\(targetHeight))")
+                print("🔄 FIX #406: Syncing headers (attempt \(headerSyncAttempts)/\(maxHeaderSyncAttempts))...")
+                onStatusUpdate?("headers", "Syncing headers (attempt \(headerSyncAttempts))...")
+
+                // Sync headers with timeout
+                let headerSyncManager = HeaderSyncManager(
+                    headerStore: HeaderStore.shared,
+                    networkManager: networkManager
+                )
+
+                do {
+                    try await withTimeout(seconds: 45) {
+                        try await headerSyncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: min(headersBehind, 500))
+                    }
+                    let newHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                    print("✅ FIX #406: Header sync complete, now at height \(newHeaderHeight)")
+
+                    if newHeaderHeight >= targetHeight {
+                        headersAvailable = true
+                    } else if newHeaderHeight == headerStoreHeight {
+                        // No progress - likely stuck, try again
+                        print("⚠️ FIX #406: No header progress, will retry...")
+                    }
+                } catch {
+                    print("⚠️ FIX #406: Header sync failed (attempt \(headerSyncAttempts)): \(error.localizedDescription)")
+                }
+            }
+
+            // FIX #406: If headers still missing after all attempts, mark scan as incomplete
+            if !headersAvailable {
+                let finalHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                print("🚨 FIX #406: CRITICAL - Headers missing after \(maxHeaderSyncAttempts) attempts!")
+                print("🚨 FIX #406: HeaderStore at \(finalHeaderHeight), need \(targetHeight)")
+                print("🚨 FIX #406: Blocks \(finalHeaderHeight + 1) to \(targetHeight) may have MISSING NOTES!")
+                print("🚨 FIX #406: On-demand P2P fetch will be attempted as fallback...")
+                // Continue with on-demand fallback - it may work
+            }
+
+            // FIX #362: Explicit entry log to confirm PHASE 2 is running
+            print("✅ FIX #362: Entering PHASE 2 sequential mode (currentHeight=\(currentHeight), targetHeight=\(targetHeight))")
             print("🔧 PHASE 2: Building commitment tree (sequential mode)...")
             onStatusUpdate?("phase2", "Building commitment tree...")
             reportPhase2Progress(0.0, height: currentHeight, maxHeight: targetHeight)
@@ -1011,8 +1160,10 @@ final class FilterScanner {
                         reportPhase2Progress(0.5 + processProgress * 0.5, height: height, maxHeight: targetHeight)
                     }
 
-                    // Save checkpoint every 500 blocks (less frequent than progress updates)
-                    if scannedBlocks % 500 == 0 {
+                    // FIX #293: Save checkpoint every 10 blocks (was 500 - too risky!)
+                    // If app crashes/force-quits, at most 10 blocks need re-scan
+                    // 500 blocks = minutes of lost work on crash
+                    if scannedBlocks % 10 == 0 {
                         try? database.updateLastScannedHeight(height, hash: Data(count: 32))
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
@@ -1504,11 +1655,20 @@ final class FilterScanner {
         for tx in block.transactions {
             for spend in tx.spends {
                 // SECURITY: Check for nullifier match without logging sensitive data
-
-                if knownNullifiers.contains(spend.nullifier) {
+                // FIX #367: Hash the blockchain nullifier before comparing
+                let hashedNullifier = database.hashNullifier(spend.nullifier)
+                if knownNullifiers.contains(hashedNullifier) {
                     // One of our notes was spent! Include txid for history tracking
                     try database.markNoteSpent(nullifier: spend.nullifier, txid: tx.txHash, spentHeight: height)
                     debugLog(.wallet, "💸 Note spent @ height \(height)")
+
+                    // FIX #396: When our note is spent, check if this is our pending outgoing TX
+                    // If so, confirm it to clear the "awaiting confirmation" UI state
+                    let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
+                    if await NetworkManager.shared.isPendingOutgoingTx(txidHex) {
+                        print("📤 FIX #396: Our pending TX \(txidHex.prefix(16))... confirmed in block \(height)")
+                        await NetworkManager.shared.confirmOutgoingTx(txid: txidHex)
+                    }
                 }
             }
         }
@@ -1563,18 +1723,40 @@ final class FilterScanner {
         ivk: Data,
         height: UInt64
     ) throws {
-        // Check for spent notes (nullifier detection) FIRST
+        // FIX #288: Check for spent notes (nullifier detection) FIRST
+        // DEBUG: Log spend detection attempts
         if let spends = spends, !spends.isEmpty {
+            print("🔍 FIX #288: Processing \(spends.count) spends at height \(height), knownNullifiers=\(knownNullifiers.count)")
             let txidData = Data(hexString: txid)
             for spend in spends {
-                guard let nullifierDisplay = Data(hexString: spend.nullifier) else { continue }
+                guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
+                    print("⚠️ FIX #288: Failed to parse nullifier hex")
+                    continue
+                }
                 let nullifierWire = nullifierDisplay.reversedBytes()
-                if knownNullifiers.contains(nullifierWire) {
+                // FIX #367: Hash the blockchain nullifier before comparing
+                // knownNullifiers contains HASHED nullifiers (from getAllNullifiers() and insertions)
+                // VUL-009 stores hashed nullifiers to prevent spending pattern analysis
+                let hashedNullifier = database.hashNullifier(nullifierWire)
+                let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
+                if knownNullifiers.contains(hashedNullifier) {
+                    print("💸 FIX #367: MATCH! Nullifier \(shortNf)... found - marking note as spent")
                     if let txidData = txidData {
                         try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
                     } else {
                         try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     }
+
+                    // FIX #396: Confirm pending outgoing TX when nullifier found in block
+                    // This clears the "awaiting confirmation" UI state
+                    if NetworkManager.shared.isPendingOutgoingTx(txid) {
+                        print("📤 FIX #396: Pending TX \(txid.prefix(16))... confirmed in block \(height)")
+                        Task {
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txid)
+                        }
+                    }
+                } else {
+                    print("🔍 FIX #288: Nullifier \(shortNf)... NOT in knownNullifiers")
                 }
             }
         }
@@ -1651,7 +1833,8 @@ final class FilterScanner {
                 position: treePosition
             )
 
-            knownNullifiers.insert(nullifier)
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
+            knownNullifiers.insert(database.hashNullifier(nullifier))
 
             // Get witness
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
@@ -1825,8 +2008,9 @@ final class FilterScanner {
             )
 
             // Add to known nullifiers only if position is correct
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
             if !needsNullifierFix {
-                knownNullifiers.insert(nullifier)
+                knownNullifiers.insert(database.hashNullifier(nullifier))
             }
 
             // Store note
@@ -1935,7 +2119,8 @@ final class FilterScanner {
             )
 
             // Add to known nullifiers - position is always correct from boost file index
-            knownNullifiers.insert(nullifier)
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
+            knownNullifiers.insert(database.hashNullifier(nullifier))
 
             // Store note (noteId unused - witnesses computed in PHASE 1.5)
             _ = try database.insertNote(
@@ -2034,7 +2219,8 @@ final class FilterScanner {
             let txidData = "boost_\(note.height)".data(using: .utf8) ?? Data()
 
             // Add to known nullifiers for future spend detection
-            knownNullifiers.insert(note.nullifier)
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
+            knownNullifiers.insert(database.hashNullifier(note.nullifier))
 
             // Insert note into database
             _ = try database.insertNote(
@@ -2058,16 +2244,15 @@ final class FilterScanner {
                 memo: nil
             )
 
-            // If Rust already determined this note is spent, mark it
+            // If Rust already determined this note is spent, mark it with REAL txid
             if note.isSpent {
-                // Use a pseudo-txid for the spend (we don't have the actual spend txid from boost)
-                let spendTxid = "boost_spent_\(note.height)".data(using: .utf8) ?? Data()
+                // Use the REAL txid from boost file - no more placeholders!
                 try database.markNoteSpent(
                     nullifier: note.nullifier,
-                    txid: spendTxid,
-                    spentHeight: UInt64(note.height)
+                    txid: note.spentTxid,
+                    spentHeight: UInt64(note.spentHeight)
                 )
-                debugLog(.wallet, "💸 Note marked spent: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
+                debugLog(.wallet, "💸 Note spent: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height) (txid \(note.spentTxid.prefix(8).hexString)...)")
             } else {
                 debugLog(.wallet, "💰 Unspent note: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
             }
@@ -2111,7 +2296,9 @@ final class FilterScanner {
                 // but our knownNullifiers are stored in little-endian (wire format)
                 // Must reverse before comparison!
                 let nullifierWire = nullifierDisplay.reversedBytes()
-                if knownNullifiers.contains(nullifierWire) {
+                // FIX #367: Hash the blockchain nullifier before comparing
+                let hashedNullifier = database.hashNullifier(nullifierWire)
+                if knownNullifiers.contains(hashedNullifier) {
                     // One of our notes was spent! Include txid for history tracking
                     if let txidData = txidData {
                         try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
@@ -2119,6 +2306,14 @@ final class FilterScanner {
                         try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
                     }
                     debugLog(.wallet, "💸 Note spent @ height \(height)")
+
+                    // FIX #396: Confirm pending outgoing TX when nullifier found in block
+                    if NetworkManager.shared.isPendingOutgoingSync(txid: txid) {
+                        print("📤 FIX #396: Pending TX \(txid.prefix(16))... confirmed in block \(height)")
+                        Task {
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txid)
+                        }
+                    }
                 }
             }
         }
@@ -2195,8 +2390,9 @@ final class FilterScanner {
 
             // Only add to knownNullifiers if we're confident the nullifier is correct
             // Notes needing fix will have their nullifiers added after PHASE 2.5
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
             if !needsNullifierFix {
-                knownNullifiers.insert(nullifier)
+                knownNullifiers.insert(database.hashNullifier(nullifier))
             }
 
             // Store note with CMU and empty witness (will need to rebuild for spending)
@@ -2326,7 +2522,8 @@ final class FilterScanner {
             )
 
             // Track this nullifier for spend detection
-            knownNullifiers.insert(nullifier)
+            // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
+            knownNullifiers.insert(database.hashNullifier(nullifier))
 
             // Get current witness (will be updated at end of scan with final tree state)
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
@@ -2401,7 +2598,8 @@ final class FilterScanner {
         )
 
         // Track this nullifier for spend detection
-        knownNullifiers.insert(nullifier)
+        // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
+        knownNullifiers.insert(database.hashNullifier(nullifier))
 
         // Get witness for the note commitment
         let witness = try await getWitness(for: output.cmu, at: height)
@@ -2475,7 +2673,7 @@ final class FilterScanner {
         let retryDelay: UInt64 = 3_000_000_000 // 3 seconds
 
         for attempt in 1...maxRetries {
-            let connectedPeers = networkManager.connectedPeers
+            let connectedPeers = await MainActor.run { networkManager.connectedPeers }
             if connectedPeers >= minPeersForConsensus {
                 break
             }
@@ -2494,7 +2692,7 @@ final class FilterScanner {
             }
         }
 
-        let connectedPeers = networkManager.connectedPeers
+        let connectedPeers = await MainActor.run { networkManager.connectedPeers }
         guard connectedPeers >= minPeersForConsensus else {
             print("🚨 [FIX #167] Insufficient peers for consensus: \(connectedPeers)/\(minPeersForConsensus)")
             throw ScanError.networkError
@@ -2567,7 +2765,8 @@ final class FilterScanner {
 
     /// Test P2P block fetching by requesting a single recent block
     private func testP2PBlockFetching() async -> Bool {
-        guard networkManager.isConnected else { return false }
+        let isConnected = await MainActor.run { networkManager.isConnected }
+        guard isConnected else { return false }
 
         // Try to fetch a recent block via P2P
         guard let latestHeight = try? HeaderStore.shared.getLatestHeight(),
@@ -2576,7 +2775,9 @@ final class FilterScanner {
         }
 
         do {
-            guard let peer = networkManager.peers.first else { return false }
+            // FIX #384: Use PeerManager for centralized peer access
+            let maybePeer: Peer? = await MainActor.run { PeerManager.shared.getBestPeer() }
+            guard let peer = maybePeer else { return false }
             let block = try await peer.getBlockByHash(hash: header.blockHash)
             debugLog(.network, "P2P test: OK (\(block.transactions.count) txs @ \(latestHeight))")
             return true
@@ -2590,7 +2791,8 @@ final class FilterScanner {
     /// Returns: [(txid, [ShieldedOutput], [ShieldedSpend]?)]
     private func fetchBlockData(height: UInt64) async throws -> [(String, [ShieldedOutput], [ShieldedSpend]?)] {
         // Try P2P if it's known to work or hasn't been tested yet
-        if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected {
+        let isConnectedForP2P = await MainActor.run { networkManager.isConnected }
+        if FilterScanner.p2pBlockFetchingWorks != false && isConnectedForP2P {
             do {
                 let (_, txData) = try await networkManager.getBlockDataP2P(height: height)
                 FilterScanner.p2pBlockFetchingWorks = true
@@ -2631,7 +2833,8 @@ final class FilterScanner {
     /// Returns: [(height, [(txid, [ShieldedOutput], [ShieldedSpend]?)])]
     private func fetchBlocksData(heights: [UInt64]) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
         // Try P2P batch fetch if it's known to work or hasn't been tested
-        if FilterScanner.p2pBlockFetchingWorks != false && networkManager.isConnected && !heights.isEmpty {
+        let isConnected = await MainActor.run { networkManager.isConnected }
+        if FilterScanner.p2pBlockFetchingWorks != false && isConnected && !heights.isEmpty {
             do {
                 let startHeight = heights.min()!
                 let count = heights.count

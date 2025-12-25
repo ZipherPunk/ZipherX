@@ -783,6 +783,7 @@ struct ConversationView: View {
     @State private var showPaymentRequest = false
     @State private var paymentRequestToPay: ChatMessage? = nil  // Payment request being paid
     @State private var showPayNowSheet = false
+    @State private var copiedTxId: String? = nil  // FIX #405: Track copied txid for feedback
     @FocusState private var isInputFocused: Bool
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -1016,8 +1017,11 @@ struct ConversationView: View {
                 .buttonStyle(.plain)
 
                 // Message input
+                // FIX #343: Add visible placeholder styling for iOS
                 HStack {
-                    TextField("Type a message...", text: $messageText)
+                    TextField("", text: $messageText, prompt: Text("Type a message...")
+                        .font(.system(size: 15, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.5)))
                         .textFieldStyle(.plain)
                         .font(.system(size: 15, design: .monospaced))
                         .foregroundColor(.white)
@@ -1141,6 +1145,7 @@ struct MessageBubble: View {
     let isFromMe: Bool
     var isPaid: Bool = false  // FIX #219: True if this payment request has been paid
     var onPayNow: ((ChatMessage) -> Void)? = nil  // Callback for PAY NOW button
+    @State private var copiedTxId: String? = nil  // FIX #405: Track copied txid for feedback
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1305,6 +1310,42 @@ struct MessageBubble: View {
                     .font(.system(size: 16, weight: .medium, design: .monospaced))
                     .foregroundColor(theme.textPrimary)
             }
+
+            // FIX #405: Show TXID with copy button
+            if let txid = extractTxIdFromContent(message.content) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("TXID:")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.5))
+                    HStack(spacing: 6) {
+                        Text("\(txid.prefix(16))...\(txid.suffix(8))")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                        Button(action: {
+                            #if os(iOS)
+                            UIPasteboard.general.string = txid
+                            #else
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(txid, forType: .string)
+                            #endif
+                            // Show brief feedback
+                            withAnimation {
+                                copiedTxId = txid
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                withAnimation {
+                                    if copiedTxId == txid { copiedTxId = nil }
+                                }
+                            }
+                        }) {
+                            Image(systemName: copiedTxId == txid ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10))
+                                .foregroundColor(copiedTxId == txid ? .green : theme.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
         }
         .padding(12)
         .background(theme.accentColor.opacity(0.15))
@@ -1333,15 +1374,38 @@ struct MessageBubble: View {
                     .shadow(color: .orange.opacity(0.6), radius: 8)
             }
 
-            // TXID preview
+            // TXID preview with copy button (FIX #405)
             if let txid = extractTxIdFromContent(message.content) {
                 VStack(spacing: 4) {
                     Text("TXID:")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundColor(theme.textPrimary.opacity(0.5))
-                    Text("\(txid.prefix(16))...\(txid.suffix(8))")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(theme.accentColor)
+                    HStack(spacing: 6) {
+                        Text("\(txid.prefix(16))...\(txid.suffix(8))")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                        Button(action: {
+                            #if os(iOS)
+                            UIPasteboard.general.string = txid
+                            #else
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(txid, forType: .string)
+                            #endif
+                            withAnimation {
+                                copiedTxId = txid
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                withAnimation {
+                                    if copiedTxId == txid { copiedTxId = nil }
+                                }
+                            }
+                        }) {
+                            Image(systemName: copiedTxId == txid ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10))
+                                .foregroundColor(copiedTxId == txid ? .green : theme.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
 
@@ -1585,7 +1649,10 @@ struct AddContactSheet: View {
                             #endif
                         }
 
-                        TextField("xxxxxxxx...xxxxx.onion", text: $onionAddress)
+                        // FIX #343: Add visible placeholder styling for iOS
+                        TextField("", text: $onionAddress, prompt: Text("xxxxxxxx...xxxxx.onion")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5)))
                             .textFieldStyle(.plain)
                             .font(.system(size: 14, design: .monospaced))
                             .foregroundColor(.white)
@@ -1607,7 +1674,10 @@ struct AddContactSheet: View {
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(theme.accentColor)
 
-                        TextField("Enter a friendly name", text: $nickname)
+                        // FIX #343: Add visible placeholder styling for iOS
+                        TextField("", text: $nickname, prompt: Text("Enter a friendly name")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5)))
                             .textFieldStyle(.plain)
                             .font(.system(size: 14, design: .monospaced))
                             .foregroundColor(.white)
@@ -1814,7 +1884,10 @@ struct ChatSettingsSheet: View {
                                     .font(.system(size: 14, design: .monospaced))
                                     .foregroundColor(theme.textPrimary.opacity(0.7))
                                 Spacer()
-                                TextField("Enter nickname", text: $chatManager.ourNickname)
+                                // FIX #343: Add visible placeholder styling for iOS
+                                TextField("", text: $chatManager.ourNickname, prompt: Text("Enter nickname")
+                                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                    .foregroundColor(theme.accentColor.opacity(0.5)))
                                     .textFieldStyle(.plain)
                                     .multilineTextAlignment(.trailing)
                                     .font(.system(size: 14, weight: .medium, design: .monospaced))
@@ -2063,7 +2136,10 @@ struct PaymentRequestSheet: View {
                     .foregroundColor(theme.textPrimary.opacity(0.5))
 
                 VStack(spacing: 18) {
-                    TextField("0.00", text: $amount)
+                    // FIX #343: Add visible placeholder styling for iOS
+                    TextField("", text: $amount, prompt: Text("0.00")
+                        .font(.system(size: 36, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.accentColor.opacity(0.5)))
                         .textFieldStyle(.plain)
                         .font(.system(size: 36, weight: .bold, design: .monospaced))
                         .multilineTextAlignment(.center)
@@ -2079,12 +2155,18 @@ struct PaymentRequestSheet: View {
                         .font(.system(size: 16, weight: .medium, design: .monospaced))
                         .foregroundColor(theme.textPrimary.opacity(0.5))
 
-                    TextField("Add a memo (optional)", text: $memo)
+                    // FIX #334: Add foregroundColor to make memo text visible on dark background
+                    // FIX #343: Use prompt parameter with explicit styling for visible placeholder on iOS
+                    TextField("", text: $memo, prompt: Text("Add a memo (optional)")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(theme.textSecondary))
                         .textFieldStyle(.plain)
                         .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
                         .padding(14)
                         .background(Color.black.opacity(0.25))
                         .cornerRadius(10)
+                        .tint(theme.accentColor)  // Cursor color
                 }
                 .padding(.horizontal, 24)
 

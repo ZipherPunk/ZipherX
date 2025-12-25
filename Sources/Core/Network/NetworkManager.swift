@@ -154,7 +154,8 @@ func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) 
 
 /// Multi-Peer Network Manager for Zclassic
 /// Connects to multiple nodes and requires consensus for all queries
-final class NetworkManager: ObservableObject {
+@MainActor
+public final class NetworkManager: ObservableObject {
     static let shared = NetworkManager()
 
     // MARK: - Constants
@@ -232,12 +233,26 @@ final class NetworkManager: ObservableObject {
 
     /// Set of pending outgoing transaction IDs (for synchronous change detection)
     /// This is updated alongside the actor's pendingOutgoingTxs for sync access
-    private var pendingOutgoingTxidSet: Set<String> = []
-    private let pendingOutgoingLock = NSLock()
+    /// FIX #388: nonisolated(unsafe) - thread safety managed by pendingOutgoingLock
+    private nonisolated(unsafe) var pendingOutgoingTxidSet: Set<String> = []
+    private nonisolated(unsafe) let pendingOutgoingLock = NSLock()
+
+    /// FIX #388: Local network generation for synchronous access (network path handler)
+    /// Syncs with PeerManager asynchronously, but allows synchronous read/write for callbacks
+    private var localNetworkGeneration: UInt64 = 0
+    private let networkGenerationLock = NSLock()
 
     /// Synchronous check if a transaction is pending outgoing (our own send)
     /// Used by FilterScanner to detect change outputs without async
-    func isPendingOutgoingSync(txid: String) -> Bool {
+    /// FIX #388: nonisolated - uses lock for thread-safe access from any context
+    nonisolated func isPendingOutgoingSync(txid: String) -> Bool {
+        pendingOutgoingLock.lock()
+        defer { pendingOutgoingLock.unlock() }
+        return pendingOutgoingTxidSet.contains(txid)
+    }
+
+    /// FIX #396: Async version for FilterScanner block scan
+    func isPendingOutgoingTx(_ txid: String) -> Bool {
         pendingOutgoingLock.lock()
         defer { pendingOutgoingLock.unlock() }
         return pendingOutgoingTxidSet.contains(txid)
@@ -281,16 +296,21 @@ final class NetworkManager: ObservableObject {
 
         // FIX #139: Pause block listeners during header sync for 100x faster sync
         // FIX #140: Call synchronously - must happen BEFORE header sync starts
+        // FIX #383: Renamed to stopAllBlockListeners/resumeAllBlockListeners
         if syncing {
-            self.pauseAllBlockListeners()
+            self.stopAllBlockListeners()
         } else {
             self.resumeAllBlockListeners()
         }
     }
 
-    /// FIX #139: Pause all block listeners to free up peer locks for header sync
-    private func pauseAllBlockListeners() {
+    /// FIX #139/FIX #383: Stop all block listeners before header sync
+    /// FIX #384: Delegates to PeerManager (but also operates on local peers for sync)
+    public func stopAllBlockListeners() {
+        print("🛑 FIX #383: Stopping all block listeners...")
         debugLog(.network, "⏸️ FIX #140: Pausing \(peers.count) block listeners for header sync...")
+
+        // Stop local peers
         var stoppedCount = 0
         for peer in peers {
             if peer.isListening {
@@ -298,14 +318,29 @@ final class NetworkManager: ObservableObject {
                 stoppedCount += 1
             }
         }
+
+        // Also delegate to PeerManager (in case it has additional peers)
+        Task { @MainActor in
+            PeerManager.shared.stopAllBlockListeners()
+        }
+
         debugLog(.network, "⏸️ FIX #140: Stopped \(stoppedCount) block listeners")
     }
 
-    /// FIX #139: Resume all block listeners after header sync
-    private func resumeAllBlockListeners() {
+    /// FIX #139/FIX #383: Resume all block listeners after header sync
+    /// FIX #384: Delegates to PeerManager (but also operates on local peers for sync)
+    public func resumeAllBlockListeners() {
+        print("▶️ FIX #383: Resuming all block listeners...")
         debugLog(.network, "▶️ FIX #140: Resuming block listeners for \(peers.count) peers...")
+
+        // Resume local peers
         for peer in peers {
             peer.startBlockListener()
+        }
+
+        // Also delegate to PeerManager
+        Task { @MainActor in
+            PeerManager.shared.resumeAllBlockListeners()
         }
     }
 
@@ -357,15 +392,39 @@ final class NetworkManager: ObservableObject {
     // MARK: - Private Properties
     internal var peers: [Peer] = []  // internal so HeaderSyncManager can access
 
+    /// FIX #384: Sync peer list to PeerManager after modifications
+    private func syncPeersToPeerManager() {
+        Task { @MainActor in
+            PeerManager.shared.syncPeers(self.peers)
+        }
+    }
+
     /// Get a connected peer for block downloads
     /// Returns the first peer with a ready connection
     func getConnectedPeer() -> Peer? {
+        // Sync to PeerManager
+        syncPeersToPeerManager()
         return peers.first { $0.isConnectionReady }
     }
 
     /// Get all connected peers with ready connections
+    /// FIX #384: Delegates to PeerManager for centralized access
     func getAllConnectedPeers() -> [Peer] {
-        return peers.filter { $0.isConnectionReady }
+        // Sync to PeerManager
+        PeerManager.shared.syncPeers(self.peers)
+        return PeerManager.shared.getReadyPeers()
+    }
+
+    /// FIX #384: Get peers for consensus operations via PeerManager
+    func getPeersForConsensus(count: Int = 5) -> [Peer] {
+        PeerManager.shared.syncPeers(self.peers)
+        return PeerManager.shared.getPeersForConsensus(count: count)
+    }
+
+    /// FIX #384: Get peers with recent activity via PeerManager
+    func getPeersWithRecentActivity() -> [Peer] {
+        PeerManager.shared.syncPeers(self.peers)
+        return PeerManager.shared.getPeersWithRecentActivity()
     }
 
     /// Update wallet height directly (called after sync completes)
@@ -390,11 +449,6 @@ final class NetworkManager: ObservableObject {
     /// NWPathMonitor to detect WiFi ↔ cellular transitions
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.zipherx.pathmonitor", qos: .utility)
-
-    /// Generation counter to invalidate stale reconnection callbacks
-    /// Incremented on every network change - reconnection tasks check this to abort if stale
-    private var networkGeneration: UInt64 = 0
-    private let networkGenerationLock = NSLock()
 
     /// Debounce network change recovery (3 second cooldown like BitChat)
     private var lastPathChangeTime: Date?
@@ -702,11 +756,7 @@ final class NetworkManager: ObservableObject {
         if knownAddresses.count < MAX_KNOWN_ADDRESSES {
             knownAddresses[key] = AddressInfo(
                 address: normalizedAddress,
-                source: source,
-                firstSeen: Date(),
-                lastSeen: Date(),
-                attempts: 0,
-                successes: 0
+                source: source
             )
             newAddresses.insert(key)
 
@@ -726,180 +776,117 @@ final class NetworkManager: ObservableObject {
     ]
 
     /// Check if an address is banned (internal use)
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     private func isBanned(_ host: String) -> Bool {
-        // Check permanently banned list first (hardcoded, cannot be unbanned)
-        if permanentlyBannedPeers.contains(host) {
-            return true
-        }
-
-        guard let ban = bannedPeers[host] else {
-            return false
-        }
-
-        // Remove expired bans
-        if ban.isExpired {
-            bannedPeers.removeValue(forKey: host)
-            return false
-        }
-
-        return true
+        return PeerManager.shared.isBanned(host)
     }
 
     /// Public method to check if a peer is banned (for use by other managers)
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     func isPeerBanned(_ host: String) -> Bool {
-        return isBanned(host)
+        return PeerManager.shared.isBanned(host)
     }
 
     /// Ban a peer
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     func banPeer(_ peer: Peer, reason: BanReason) {
+        PeerManager.shared.banPeer(peer, reason: reason)
+
+        // Also update local state for address cleanup
         addressLock.lock()
-
-        // Clean up expired bans first
-        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
-
-        let ban = BannedPeer(
-            address: peer.host,
-            banTime: Date(),
-            banDuration: BAN_DURATION,
-            reason: reason
-        )
-        bannedPeers[peer.host] = ban
-        let newCount = bannedPeers.count
-
-        // Remove from known good addresses
         let key = "\(peer.host):\(peer.port)"
         knownAddresses.removeValue(forKey: key)
         triedAddresses.remove(key)
         newAddresses.remove(key)
         addressLock.unlock()
 
-        // Update published count on main thread
-        DispatchQueue.main.async {
-            self.bannedPeersCount = newCount
+        // Update published count
+        Task { @MainActor in
+            self.bannedPeersCount = PeerManager.shared.bannedPeerCount
         }
-
-        print("🚫 Banned peer \(peer.host): \(reason.rawValue)")
     }
 
     /// Ban a peer by address (for connection failures)
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     func banAddress(_ host: String, port: UInt16, reason: BanReason) {
+        PeerManager.shared.banAddress(host, port: port, reason: reason)
+
+        // Also update local state for address cleanup
         addressLock.lock()
-
-        // Clean up expired bans first
-        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
-
-        let ban = BannedPeer(
-            address: host,
-            banTime: Date(),
-            banDuration: BAN_DURATION,
-            reason: reason
-        )
-        bannedPeers[host] = ban
-        let newCount = bannedPeers.count
-
-        // Remove from known good addresses
         let key = "\(host):\(port)"
         knownAddresses.removeValue(forKey: key)
         triedAddresses.remove(key)
         newAddresses.remove(key)
         addressLock.unlock()
 
-        // Update published count on main thread
-        DispatchQueue.main.async {
-            self.bannedPeersCount = newCount
+        // Update published count
+        Task { @MainActor in
+            self.bannedPeersCount = PeerManager.shared.bannedPeerCount
         }
-
-        print("🚫 Banned address \(host): \(reason.rawValue)")
     }
 
     /// FIX #159: PERMANENTLY ban a peer for Sybil attacks
-    /// These bans do NOT expire automatically and require manual unbanning by the user
-    /// Use this for peers that report fake chain heights (Sybil attackers)
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     func banPeerPermanentlyForSybil(_ host: String, port: UInt16, fakeHeight: UInt64, realHeight: UInt64) {
+        PeerManager.shared.banPeerPermanentlyForSybil(host, port: port, fakeHeight: fakeHeight, realHeight: realHeight)
+
+        // Update local address state
         addressLock.lock()
-
-        // Use -1 as banDuration to indicate PERMANENT ban (FIX #159)
-        let ban = BannedPeer(
-            address: host,
-            banTime: Date(),
-            banDuration: -1,  // PERMANENT - will never expire
-            reason: .fakeChainHeight
-        )
-        bannedPeers[host] = ban
-        let newCount = bannedPeers.count
-
-        // Remove from known good addresses
         let key = "\(host):\(port)"
         knownAddresses.removeValue(forKey: key)
         triedAddresses.remove(key)
         newAddresses.remove(key)
         addressLock.unlock()
 
-        // Update published count and notify UI about Sybil attack
-        DispatchQueue.main.async {
-            self.bannedPeersCount = newCount
+        // Update UI
+        Task { @MainActor in
+            self.bannedPeersCount = PeerManager.shared.bannedPeerCount
             self.sybilAttackDetected = (peer: host, fakeHeight: fakeHeight, realHeight: realHeight)
         }
-
-        print("🚨 [SYBIL ATTACK] PERMANENTLY BANNED \(host) for reporting fake height \(fakeHeight) (real: ~\(realHeight))")
-        print("🚨 [SYBIL ATTACK] This peer is banned INDEFINITELY - manual unban required through Settings!")
     }
 
     /// FIX #172: Ban peer for sending fake protocol version requirements (Sybil attack)
-    /// Zclassic only has versions 170010, 170011 (Sapling) and 170012 (BIP155)
-    /// Peers claiming to require 170020+ are Sybil attackers!
+    /// FIX #384: Delegates to PeerManager for centralized ban management
     func banPeerForSybilAttack(_ host: String) {
+        PeerManager.shared.banPeerForSybilAttack(host)
+
+        // Update local address state
         addressLock.lock()
-
-        // Permanent ban for Sybil attackers
-        let ban = BannedPeer(
-            address: host,
-            banTime: Date(),
-            banDuration: -1,  // PERMANENT
-            reason: .corruptedData  // Using corruptedData as closest match
-        )
-        bannedPeers[host] = ban
-        let newCount = bannedPeers.count
-
-        // Remove from known addresses
         for (key, addr) in knownAddresses where addr.address.host == host {
             knownAddresses.removeValue(forKey: key)
             triedAddresses.remove(key)
             newAddresses.remove(key)
         }
 
-        // FIX #173: Track consecutive Sybil rejections
+        // FIX #173: Track consecutive Sybil rejections (still local for now)
         consecutiveSybilRejections += 1
         print("🚨 [SYBIL] Consecutive Sybil rejections: \(consecutiveSybilRejections)/\(SYBIL_BYPASS_THRESHOLD)")
-
         addressLock.unlock()
 
-        DispatchQueue.main.async {
-            self.bannedPeersCount = newCount
+        // Update UI
+        Task { @MainActor in
+            self.bannedPeersCount = PeerManager.shared.bannedPeerCount
         }
-
-        print("🚨 [SYBIL] PERMANENTLY BANNED \(host) for fake version requirement (170020 is NOT valid Zclassic!)")
     }
 
     // FIX #173: Reset Sybil counter when a legitimate peer connects
+    // FIX #384: Delegates to PeerManager
     func resetSybilCounter() {
+        PeerManager.shared.resetSybilCounter()
+        // Also reset local tracking for UI
         addressLock.lock()
-        if consecutiveSybilRejections > 0 {
-            print("✅ [SYBIL] Reset Sybil counter (was \(consecutiveSybilRejections)) - legitimate peer connected!")
-        }
         consecutiveSybilRejections = 0
         addressLock.unlock()
     }
 
     // FIX #173: Check if we should bypass Tor due to Sybil attack
+    // FIX #384: Uses PeerManager for threshold check
     func shouldBypassTorForSybil() -> Bool {
-        addressLock.lock()
-        let shouldBypass = consecutiveSybilRejections >= SYBIL_BYPASS_THRESHOLD && connectedPeers == 0
-        let rejectionCount = consecutiveSybilRejections
-        addressLock.unlock()
+        let shouldBypass = PeerManager.shared.shouldBypassTorForSybil()
 
         if shouldBypass && !sybilBypassActive {
-            print("🚨🚨🚨 [SYBIL] CRITICAL: \(rejectionCount) consecutive Sybil rejections detected!")
+            let rejectionCount = PeerManager.shared.getBannedPeers().filter { $0.reason == .wrongProtocol }.count
+            print("🚨🚨🚨 [SYBIL] CRITICAL: Sybil attack detected!")
             print("🚨 [SYBIL] All Tor-reachable peers are attackers - BYPASSING TOR for direct P2P!")
             sybilBypassActive = true
 
@@ -913,9 +900,11 @@ final class NetworkManager: ObservableObject {
     }
 
     // FIX #173: Mark Sybil bypass as complete (for re-enabling Tor later)
+    // FIX #384: Delegates to PeerManager
     func completeSybilBypass() {
-        addressLock.lock()
+        PeerManager.shared.completeSybilBypass()
         sybilBypassActive = false
+        addressLock.lock()
         consecutiveSybilRejections = 0
         addressLock.unlock()
         print("✅ [SYBIL] Bypass complete - legitimate peers connected via direct P2P")
@@ -927,7 +916,9 @@ final class NetworkManager: ObservableObject {
     }
 
     /// FIX #175: Clear Sybil attack alert (called from UI after user acknowledges)
+    /// FIX #384: Delegates to PeerManager
     func clearSybilAttackAlert() {
+        PeerManager.shared.clearSybilAttackAlert()
         DispatchQueue.main.async {
             self.sybilVersionAttackAlert = nil
             self.sybilAttackDetected = nil
@@ -935,45 +926,35 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get list of all currently banned peers
+    /// FIX #401: Delegate to PeerManager for centralized ban management
     func getBannedPeers() -> [BannedPeer] {
-        addressLock.lock()
-
-        // Clean up expired bans first
-        bannedPeers = bannedPeers.filter { !$0.value.isExpired }
-        let result = Array(bannedPeers.values).sorted { $0.banTime > $1.banTime }
-        let newCount = bannedPeers.count
-        addressLock.unlock()
+        let result = PeerManager.shared.getBannedPeers()
 
         // Update published count on main thread
         DispatchQueue.main.async {
-            self.bannedPeersCount = newCount
+            self.bannedPeersCount = result.count
         }
 
         return result
     }
 
     /// Unban a specific peer by address
+    /// FIX #401: Delegate to PeerManager for centralized ban management
     func unbanPeer(address: String) {
-        addressLock.lock()
-        let removed = bannedPeers.removeValue(forKey: address) != nil
-        let newCount = bannedPeers.count
-        addressLock.unlock()
+        PeerManager.shared.unbanPeer(address)
 
-        if removed {
-            print("✅ Unbanned peer: \(address)")
-            // Update published count on main thread
-            DispatchQueue.main.async {
-                self.bannedPeersCount = newCount
-            }
+        // Update published count on main thread
+        let newCount = PeerManager.shared.getBannedPeers().count
+        DispatchQueue.main.async {
+            self.bannedPeersCount = newCount
         }
     }
 
     /// Unban all peers
+    /// FIX #401: Delegate to PeerManager for centralized ban management
     func unbanAllPeers() {
-        addressLock.lock()
-        let count = bannedPeers.count
-        bannedPeers.removeAll()
-        addressLock.unlock()
+        let count = PeerManager.shared.getBannedPeers().count
+        PeerManager.shared.clearAllBannedPeers()
 
         print("✅ Unbanned all \(count) peers")
         // Update published count on main thread
@@ -983,137 +964,87 @@ final class NetworkManager: ObservableObject {
     }
 
     // MARK: - FIX #284: Parking (Connection Timeouts - NOT a Ban)
+    // FIX #384: Delegates to PeerManager for centralized parking management
 
     /// Park a peer due to connection timeout (exponential backoff retry)
-    /// This is NOT a ban - the peer will be retried after backoff period
+    /// FIX #384: Delegates to PeerManager
     func parkPeer(_ host: String, port: UInt16) {
-        addressLock.lock()
-
-        // Check if peer was a preferred seed
+        // Check if peer was a preferred seed (for database operations)
         let wasPreferred = WalletDatabase.shared.isPreferredSeed(host: host, port: port)
 
-        // If already parked, increment retry count
-        if var existingParked = parkedPeers[host] {
-            existingParked.incrementRetry()
-            parkedPeers[host] = existingParked
-            print("🅿️ FIX #284: Re-parked \(host) (retry #\(existingParked.retryCount), next in \(existingParked.backoffDescription))")
-        } else {
-            // New parking
-            let parked = ParkedPeer(address: host, port: port, wasPreferred: wasPreferred)
-            parkedPeers[host] = parked
-            print("🅿️ FIX #284: Parked \(host) (first timeout, retry in \(parked.backoffDescription))")
-        }
+        // Delegate to PeerManager
+        PeerManager.shared.parkPeer(host, port: port, wasPreferred: wasPreferred)
 
         // If this was a preferred seed, demote it temporarily
         if wasPreferred {
             try? WalletDatabase.shared.demoteFromPreferredSeed(host: host, port: port)
         }
-
-        addressLock.unlock()
     }
 
     /// Check if a peer is parked
+    /// FIX #384: Delegates to PeerManager
     func isParked(_ host: String) -> Bool {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-        return parkedPeers[host] != nil
+        return PeerManager.shared.isParked(host)
     }
 
     /// Check if a parked peer is ready for retry
+    /// FIX #384: Delegates to PeerManager
     func isParkedPeerReadyForRetry(_ host: String) -> Bool {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-
-        guard let parked = parkedPeers[host] else {
-            return true // Not parked = ready
-        }
-        return parked.isReadyForRetry
+        return PeerManager.shared.isParkedPeerReadyForRetry(host)
     }
 
     /// Unpark a peer (called on successful connection)
-    /// If it was a preferred seed, promote it back
+    /// FIX #384: Delegates to PeerManager
     func unparkPeer(_ host: String, port: UInt16) {
-        addressLock.lock()
-        let wasParked = parkedPeers[host]
-        parkedPeers.removeValue(forKey: host)
-        addressLock.unlock()
+        // Get parked info before removing (for preferred seed handling)
+        let parkedPeers = PeerManager.shared.getParkedPeers()
+        let wasParked = parkedPeers.first { $0.address == host }
 
-        if let parked = wasParked {
-            print("✅ FIX #284: Unparked \(host) after successful connection")
+        // Delegate to PeerManager
+        PeerManager.shared.unparkPeer(host, port: port)
 
-            // If this was a preferred seed before parking, promote it back
-            if parked.wasPreferred {
-                try? WalletDatabase.shared.promoteToPreferredSeed(host: host, port: port)
-            }
+        // If this was a preferred seed before parking, promote it back
+        if let parked = wasParked, parked.wasPreferred {
+            try? WalletDatabase.shared.promoteToPreferredSeed(host: host, port: port)
         }
     }
 
     /// Get all parked peers ready for retry
+    /// FIX #384: Delegates to PeerManager
     func getParkedPeersReadyForRetry() -> [ParkedPeer] {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-        return parkedPeers.values.filter { $0.isReadyForRetry }
+        return PeerManager.shared.getParkedPeersReadyForRetry()
     }
 
     /// Get all currently parked peers
+    /// FIX #384: Delegates to PeerManager
     func getParkedPeers() -> [ParkedPeer] {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-        return Array(parkedPeers.values).sorted { $0.parkedTime > $1.parkedTime }
+        return PeerManager.shared.getParkedPeers().sorted { $0.parkedTime > $1.parkedTime }
     }
 
     /// Clear all parked peers (for reset/repair)
+    /// FIX #384: Delegates to PeerManager
     func clearAllParkedPeers() {
-        addressLock.lock()
-        let count = parkedPeers.count
-        parkedPeers.removeAll()
-        addressLock.unlock()
-
-        if count > 0 {
-            print("✅ FIX #284: Cleared all \(count) parked peers")
-        }
+        PeerManager.shared.clearAllParkedPeers()
     }
 
     /// FIX #352: Clear parked hardcoded seeds for immediate retry
-    /// Called when we have 0 connected peers and need to recover
+    /// FIX #384: Delegates to PeerManager
     func clearParkedHardcodedSeeds() {
-        addressLock.lock()
-        var clearedCount = 0
-        for (host, parked) in parkedPeers {
-            if parked.isHardcodedSeed {
-                parkedPeers.removeValue(forKey: host)
-                clearedCount += 1
-            }
-        }
-        addressLock.unlock()
-
-        if clearedCount > 0 {
-            print("🌱 FIX #352: Cleared \(clearedCount) parked hardcoded seeds for immediate retry")
-        }
+        PeerManager.shared.clearParkedHardcodedSeeds()
     }
 
     // MARK: - FIX #284: Preferred Seeds
 
     /// Get preferred seeds from database
+    /// FIX #384: Delegate to PeerManager (nonisolated - only accesses WalletDatabase)
     func getPreferredSeeds() -> [WalletDatabase.TrustedPeer] {
-        return (try? WalletDatabase.shared.getPreferredSeeds()) ?? []
+        return PeerManager.shared.getPreferredSeeds()
     }
 
     /// Check if a peer should be skipped (banned OR parked and not ready for retry)
+    /// FIX #384: Delegate to PeerManager
     private func shouldSkipPeer(_ host: String) -> Bool {
-        // Banned peers are always skipped
-        if isBanned(host) {
-            return true
-        }
-
-        // Parked peers are skipped unless ready for retry
-        if let parked = parkedPeers[host] {
-            if !parked.isReadyForRetry {
-                return true
-            }
-        }
-
-        return false
+        return PeerManager.shared.shouldSkipPeer(host)
     }
 
     /// Calculate target number of peers based on known addresses
@@ -1128,77 +1059,10 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Select best peer to connect to based on scoring
-    /// Filters .onion addresses based on Tor availability
-    /// FIX #189: Thread-safe access to knownAddresses
+    /// FIX #384: Delegates to PeerManager for centralized selection
     private func selectBestAddress() -> PeerAddress? {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-
-        // Check if Tor is available for regular SOCKS connections
-        let torAvailable = torIsAvailable
-
-        // Check if .onion circuits are ready (requires warmup period)
-        // .onion addresses need rendezvous circuits; regular IPv4 via SOCKS works immediately
-        let onionReady = onionCircuitsReady
-
-        // Helper to check if address is .onion
-        func isOnion(_ host: String) -> Bool {
-            return host.hasSuffix(".onion")
-        }
-
-        // Helper to filter address based on Tor availability
-        func isAddressUsable(_ address: PeerAddress) -> Bool {
-            if isOnion(address.host) {
-                // .onion addresses require both Tor and circuit warmup
-                return onionReady
-            }
-            return true // Regular addresses always usable
-        }
-
-        // Prefer new addresses first
-        let usableNewAddresses = newAddresses.filter { key in
-            guard let info = knownAddresses[key] else { return false }
-            return isAddressUsable(info.address)
-        }
-
-        if let newKey = usableNewAddresses.randomElement(),
-           let info = knownAddresses[newKey] {
-            if isOnion(info.address.host) {
-                print("🧅 Selected new .onion peer: \(info.address.host)")
-            }
-            return info.address
-        }
-
-        // Otherwise select from tried addresses based on chance
-        var candidates: [(String, Double)] = []
-        for key in triedAddresses {
-            if let info = knownAddresses[key] {
-                guard isAddressUsable(info.address) else { continue }
-                let chance = info.getChance()
-                if chance > 0 {
-                    candidates.append((key, chance))
-                }
-            }
-        }
-
-        // Weighted random selection
-        let totalChance = candidates.reduce(0) { $0 + $1.1 }
-        if totalChance > 0 {
-            var random = Double.random(in: 0..<totalChance)
-            for (key, chance) in candidates {
-                random -= chance
-                if random <= 0 {
-                    if let address = knownAddresses[key]?.address {
-                        if isOnion(address.host) {
-                            print("🧅 Selected tried .onion peer: \(address.host)")
-                        }
-                        return address
-                    }
-                }
-            }
-        }
-
-        return nil
+        // FIX #384: Delegate to PeerManager
+        return PeerManager.shared.selectBestAddress()
     }
 
     /// Check if Tor is available for connections (cached for performance in sync operations)
@@ -1225,6 +1089,11 @@ final class NetworkManager: ObservableObject {
         // Check if .onion circuits are ready (requires warmup period after SOCKS connection)
         let wasOnionReady = _onionCircuitsReady
         _onionCircuitsReady = await TorManager.shared.isOnionCircuitsReady
+
+        // FIX #384: Sync Tor state to PeerManager for address selection
+        await MainActor.run {
+            PeerManager.shared.updateTorState(available: _torIsAvailable, onionReady: _onionCircuitsReady)
+        }
 
         // Log transition when .onion circuits become ready
         if !wasOnionReady && _onionCircuitsReady {
@@ -1448,8 +1317,12 @@ final class NetworkManager: ObservableObject {
         // FIX #111: ALWAYS use HeaderStore as ground truth to reject Sybil attack heights
         // FIX #120: Increase tolerance to 10000 blocks during header sync catch-up
         // FIX #290: Accept strong consensus (3+ peers) even above threshold - wallet was offline
+        // FIX #403: Increase threshold to 50000 blocks (~3 months) to handle stale HeaderStore
+        //   Bug: HeaderStore 14000 blocks behind caused SYBIL rejection of valid peer heights
+        //   A 10000 block threshold is too small when wallet has been offline for weeks
+        //   50000 blocks = ~3 months of blocks (210K/year), plenty of margin
         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-        let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 10000 : UInt64.max
+        let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 50000 : UInt64.max
 
         if torEnabled {
             // TOR MODE: P2P consensus is authoritative, BUT validate against HeaderStore
@@ -1501,8 +1374,10 @@ final class NetworkManager: ObservableObject {
             newHeight = headerStoreHeight > 0 ? headerStoreHeight : chainHeight
         }
 
-        // Only update and log if height changed
-        if newHeight > 0 && newHeight != chainHeight {
+        // Only update and log if height INCREASED
+        // FIX #400: NEVER downgrade chainHeight - this causes TX history to show "Pending"
+        // When peers disconnect, HeaderStore fallback may be stale (lower than actual chain)
+        if newHeight > 0 && newHeight > chainHeight {
             await MainActor.run {
                 self.chainHeight = newHeight
                 // Cache for fast start mode (consecutive app launches)
@@ -1676,14 +1551,15 @@ final class NetworkManager: ObservableObject {
             }
 
             let address = PeerAddress(host: peer.host, port: peer.port)
-            knownAddresses[key] = AddressInfo(
+            var info = AddressInfo(
                 address: address,
-                source: "bundled",
-                firstSeen: Date(),
-                lastSeen: Date(),
-                attempts: 0,
-                successes: peer.reliability > 0.5 ? 1 : 0  // Assume good if reliability > 50%
+                source: "bundled"
             )
+            // High reliability peers get a success count boost
+            if peer.reliability > 0.5 {
+                info.successes = 1
+            }
+            knownAddresses[key] = info
 
             // High reliability peers go to tried set
             if peer.reliability > 0.5 {
@@ -1831,6 +1707,10 @@ final class NetworkManager: ObservableObject {
         isConnecting = true
         defer { isConnecting = false }
 
+        // FIX #399: Clear any bans on hardcoded seeds at startup
+        // These are known-good ZCL nodes that should NEVER be banned
+        PeerManager.shared.clearHardcodedSeedBans()
+
         // CRITICAL: If Tor mode is enabled, WAIT for Tor to connect first
         // Otherwise IPv4 peers will fail and get banned before Tor is ready
         // FIX: Skip Tor wait if Tor is bypassed for faster repair/sync
@@ -1953,7 +1833,9 @@ final class NetworkManager: ObservableObject {
 
                     group.addTask {
                         // Record attempt BEFORE trying (cooldown starts now)
-                        self.recordConnectionAttempt(address.host, port: address.port)
+                        await MainActor.run {
+                            self.recordConnectionAttempt(address.host, port: address.port)
+                        }
 
                         do {
                             print("🔄 Trying \(address.host):\(address.port)...")
@@ -2159,11 +2041,17 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Disconnect from all peers
+    /// FIX #384: Also syncs to PeerManager
     func disconnect() {
         for peer in peers {
             peer.disconnect()
         }
         peers.removeAll()
+
+        // FIX #384: Sync to PeerManager
+        Task { @MainActor in
+            PeerManager.shared.removeAllPeers()
+        }
 
         DispatchQueue.main.async {
             self.connectedPeers = 0
@@ -2172,6 +2060,7 @@ final class NetworkManager: ObservableObject {
     }
 
     /// FIX #142: Disconnect all peers (alias for disconnect() used by TorManager bypass)
+    /// FIX #384: Also syncs to PeerManager
     func disconnectAllPeers() async {
         await MainActor.run {
             self.disconnect()
@@ -2195,6 +2084,11 @@ final class NetworkManager: ObservableObject {
             peer.disconnect()
         }
         peers.removeAll()
+
+        // FIX #384: Sync to PeerManager
+        await MainActor.run {
+            PeerManager.shared.removeAllPeers()
+        }
 
         // 3. Clear ALL cooldowns - iOS killed connections, not network failures
         // This allows immediate reconnection to all known addresses
@@ -2326,10 +2220,20 @@ final class NetworkManager: ObservableObject {
             }
 
             // SECURITY FIX #108: Don't trust max peer height without consensus
-            // Fallback to header store first (locally verified headers are trustworthy)
-            if currentChainHeight == 0, let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-                currentChainHeight = headerHeight
-                print("📊 Using HeaderStore height (no P2P consensus): \(headerHeight)")
+            // FIX #404: Use cached height if it's higher than stale HeaderStore
+            // At startup, peers may not be connected yet, but cached height from previous session is valid
+            if currentChainHeight == 0 {
+                let headerHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+
+                if cachedHeight > headerHeight {
+                    // Cached height is newer - HeaderStore is stale
+                    currentChainHeight = cachedHeight
+                    print("📊 FIX #404: Using cached height (HeaderStore stale): \(cachedHeight) vs headers \(headerHeight)")
+                } else if headerHeight > 0 {
+                    currentChainHeight = headerHeight
+                    print("📊 Using HeaderStore height (no P2P consensus): \(headerHeight)")
+                }
             }
 
             // Only use peer max height if it's within reasonable range of header store
@@ -2347,32 +2251,89 @@ final class NetworkManager: ObservableObject {
                 }
             }
         } else {
-            // FIX #120: P2P ONLY MODE - InsightAPI commented out
-            // NORMAL MODE: InsightAPI authoritative
-            // 1. First try InsightAPI (authoritative network source)
-            // if let status = try? await InsightAPI.shared.getStatus() {
-            //     currentChainHeight = status.height
-            //     await MainActor.run {
-            //         self.networkDifficulty = status.difficulty
-            //     }
-            // }
+            // ==========================================================================
+            // FIX #381: NORMAL MODE - Prefer P2P consensus over stale HeaderStore
+            // Bug: HeaderStore was used first, causing chain height oscillation:
+            //   - fetchNetworkStats() set height to HeaderStore (2952744)
+            //   - getChainHeight() corrected to peer consensus (2952978)
+            //   - fetchNetworkStats() reverted to HeaderStore (2952744)
+            //   - This caused UI to flip-flop between heights!
+            // Fix: Use same logic as Tor mode - P2P consensus first, HeaderStore fallback
+            // ==========================================================================
 
-            // 2. If API unavailable, fallback to header store (may be stale)
-            // if currentChainHeight == 0 {
-            if let headerHeight = try? HeaderStore.shared.getLatestHeight() {
-                currentChainHeight = headerHeight
-            }
-            // }
+            // 1. First try P2P peer consensus (most accurate)
+            var peerMaxHeight: UInt64 = 0
+            var peerHeights: [UInt64: Int] = [:]
 
-            // 3. If still no height, try P2P peer heights from version handshake
-            if currentChainHeight == 0 {
-                for peer in peers {
-                    // SECURITY: Skip banned peers and negative heights (malicious peers)
-                    guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
-                    let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
-                    if h > currentChainHeight {
-                        currentChainHeight = h
+            // FIX #402: Debug peer heights
+            let readyPeers = peers.filter { $0.isConnectionReady }
+            print("📊 FIX #402: \(readyPeers.count) ready peers, checking heights...")
+
+            for peer in peers {
+                // SECURITY: Skip banned peers and negative heights (malicious peers)
+                guard !isBanned(peer.host), peer.peerStartHeight > 0 else {
+                    if peer.isConnectionReady {
+                        print("📊 FIX #402: Skipping peer \(peer.host) - banned=\(isBanned(peer.host)), height=\(peer.peerStartHeight)")
                     }
+                    continue
+                }
+                let h = UInt64(peer.peerStartHeight)
+                print("📊 FIX #402: Peer \(peer.host) reports height \(h)")
+                peerHeights[h, default: 0] += 1
+                peerMaxHeight = max(peerMaxHeight, h)
+            }
+
+            // Find consensus (most peers within 10 blocks of max, need 2+ peers)
+            var peerConsensusHeight: UInt64 = 0
+            var consensusCount = 0
+            for (height, count) in peerHeights {
+                if peerMaxHeight > 0 && height >= peerMaxHeight - 10 && count >= 2 {
+                    if count > consensusCount || (count == consensusCount && height > peerConsensusHeight) {
+                        peerConsensusHeight = height
+                        consensusCount = count
+                    }
+                }
+            }
+
+            // 2. Use P2P consensus if available
+            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if peerConsensusHeight > 0 && consensusCount >= 2 {
+                // Validate against HeaderStore to prevent Sybil attacks
+                // FIX #403: Increase threshold to 50000 blocks (~3 months) to handle stale HeaderStore
+                let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 50000 : UInt64.max
+                if peerConsensusHeight <= maxReasonableHeight {
+                    currentChainHeight = peerConsensusHeight
+                    print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                } else {
+                    print("🚨 FIX #381: Rejecting suspicious consensus \(peerConsensusHeight) (HeaderStore: \(headerStoreHeight))")
+                    currentChainHeight = headerStoreHeight
+                }
+            } else if peerMaxHeight > 0 && peerMaxHeight > headerStoreHeight {
+                // FIX #402: Use peer height if HIGHER than HeaderStore
+                // HeaderStore may be stale - peer has newer chain tip
+                currentChainHeight = peerMaxHeight
+                print("📡 FIX #402: Using peer height (ahead of headers): \(currentChainHeight) (HeaderStore: \(headerStoreHeight))")
+            } else if headerStoreHeight > 0 {
+                // 3. Fallback to HeaderStore (peer height not higher)
+                // FIX #404: But prefer cached height if it's higher (HeaderStore is stale)
+                let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                if cachedHeight > headerStoreHeight {
+                    currentChainHeight = cachedHeight
+                    print("📡 FIX #404: Using cached height (HeaderStore stale): \(cachedHeight) vs headers \(headerStoreHeight)")
+                } else {
+                    currentChainHeight = headerStoreHeight
+                    print("📡 FIX #381: Using HeaderStore (no P2P consensus): \(currentChainHeight)")
+                }
+            } else if peerMaxHeight > 0 {
+                // 4. Last resort - single peer height (less secure)
+                currentChainHeight = peerMaxHeight
+                print("⚠️ FIX #381: Using single peer height (no consensus): \(currentChainHeight)")
+            } else {
+                // 5. FIX #404: Ultimate fallback - use cached height from previous session
+                let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                if cachedHeight > 0 {
+                    currentChainHeight = cachedHeight
+                    print("📡 FIX #404: Using cached height (no peers yet): \(cachedHeight)")
                 }
             }
         }
@@ -2384,12 +2345,11 @@ final class NetworkManager: ObservableObject {
             currentChainHeight = chainHeight > 0 ? chainHeight : 0
         }
 
-        // Update chain height (only log if changed)
-        if currentChainHeight > 0 {
+        // Update chain height (only if INCREASED)
+        // FIX #400: NEVER downgrade chainHeight - this causes TX history to show "Pending"
+        if currentChainHeight > 0 && currentChainHeight > chainHeight {
             await MainActor.run {
-                if self.chainHeight != currentChainHeight {
-                    print("📊 Chain height: \(currentChainHeight)")
-                }
+                print("📊 Chain height: \(currentChainHeight)")
                 self.chainHeight = currentChainHeight
                 // Cache for fast start mode (consecutive app launches)
                 UserDefaults.standard.set(Int(currentChainHeight), forKey: "cachedChainHeight")
@@ -2544,20 +2504,26 @@ final class NetworkManager: ObservableObject {
         // Also clear mempoolOutgoing so "awaiting confirmation" message disappears
         mempoolOutgoing = 0
         mempoolOutgoingTxCount = 0
-        // Clear the sync-accessible pending set
-        pendingOutgoingLock.lock()
-        pendingOutgoingTxidSet.removeAll()
-        pendingOutgoingLock.unlock()
-        // Clear the actor state in background
-        Task {
-            await txTrackingState.clearAllOutgoing()
-        }
+        // FIX #366: Do NOT clear pendingOutgoingTxidSet here!
+        // This set is used for change detection when scanning blocks.
+        // If a TX was "rejected" by VUL-002 but actually confirmed on-chain,
+        // we need to keep the txid so change outputs aren't counted as income.
+        // The set is only cleared in confirmOutgoingTxFull() after CONFIRMED TX.
+        // Old code that caused balance inflation:
+        // pendingOutgoingLock.lock()
+        // pendingOutgoingTxidSet.removeAll()
+        // pendingOutgoingLock.unlock()
+
+        // FIX #366: Also don't clear actor state - only clear on confirmation
+        // Old code:
+        // Task { await txTrackingState.clearAllOutgoing() }
+
         // FIX #174: Clear pending transaction flags when TX confirms
         hasPendingMempoolTransaction = false
         hasOurPendingOutgoing = false  // FIX #301
         pendingTransactionReason = nil
         externalWalletSpendDetected = nil
-        print("🧹 Pending broadcast cleared (all pending state reset)")
+        print("🧹 Pending broadcast cleared (UI state reset, txid tracking preserved for change detection)")
     }
 
     /// FIX #350: Track pending outgoing with FULL info for database write on confirmation
@@ -2684,8 +2650,16 @@ final class NetworkManager: ObservableObject {
             print("📤 confirmOutgoingTx: txid not found in pending list (already confirmed or never tracked)")
         }
 
-        // FIX #286 v19: REMOVED checkpoint update from here!
-        // Checkpoint should ONLY be updated in backgroundSyncToHeight() after actual scanning.
+        // FIX #286 v19: REMOVED verified_checkpoint update from here!
+        // verified_checkpoint should ONLY be updated in backgroundSyncToHeight() after actual scanning.
+
+        // FIX #370: Update TX-CONFIRMED checkpoint (separate from verified_checkpoint)
+        // This checkpoint ONLY advances on actual TX confirmations.
+        // Used by periodic deep verification to catch missed transactions.
+        if let chainHeight = try? await getChainHeight() {
+            try? WalletDatabase.shared.updateTxConfirmedCheckpoint(chainHeight)
+            print("📍 FIX #370: tx_confirmed_checkpoint updated to \(chainHeight) after outgoing TX")
+        }
     }
 
     /// Called when an incoming transaction is confirmed (found in a block during scanning)
@@ -2763,11 +2737,19 @@ final class NetworkManager: ObservableObject {
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
         }
 
-        // FIX #286 v19: REMOVED checkpoint update from here!
-        // BUG: This was updating checkpoint to chain height WITHOUT scanning blocks.
+        // FIX #286 v19: REMOVED verified_checkpoint update from here!
+        // BUG: This was updating verified_checkpoint to chain height WITHOUT scanning blocks.
         // If app was closed during TX, blocks between old checkpoint and chain height
         // were never scanned for notes - causing missed transactions!
-        // Checkpoint should ONLY be updated in backgroundSyncToHeight() after actual scanning.
+        // verified_checkpoint should ONLY be updated in backgroundSyncToHeight() after actual scanning.
+
+        // FIX #370: Update TX-CONFIRMED checkpoint (separate from verified_checkpoint)
+        // This checkpoint ONLY advances on actual TX confirmations.
+        // Used by periodic deep verification to catch missed transactions.
+        if let chainHeight = try? await getChainHeight() {
+            try? WalletDatabase.shared.updateTxConfirmedCheckpoint(chainHeight)
+            print("📍 FIX #370: tx_confirmed_checkpoint updated to \(chainHeight) after incoming TX")
+        }
     }
 
     /// Check if any pending outgoing transactions have been confirmed
@@ -2804,6 +2786,7 @@ final class NetworkManager: ObservableObject {
             // so if it's no longer in mempool, it must have been confirmed.
 
             var isStillInMempool = false
+            var mempoolCheckFailed = false
 
             // Try to check mempool from a connected peer
             if let peer = getConnectedPeer() {
@@ -2823,10 +2806,25 @@ final class NetworkManager: ObservableObject {
                     }
                 } catch {
                     print("📤 Tx \(txid.prefix(16))... mempool check failed: \(error.localizedDescription)")
-                    // On error, don't change status - will retry next cycle
+                    mempoolCheckFailed = true
                 }
             } else {
                 print("📤 Tx \(txid.prefix(16))... no connected peer for mempool check")
+                mempoolCheckFailed = true
+            }
+
+            // FIX #393: When mempool check fails, check database for confirmation
+            // If block scan found our TX and recorded it as "sent", the TX is confirmed
+            // This prevents "waiting for confirmation" message persisting when peers disconnect
+            if mempoolCheckFailed {
+                if let txidData = Data(hexString: txid) {
+                    let existsInDb = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
+                    if existsInDb {
+                        print("📤 FIX #393: Tx \(txid.prefix(16))... found in database as SENT - CONFIRMED!")
+                        await confirmOutgoingTx(txid: txid)
+                        confirmedCount += 1
+                    }
+                }
             }
         }
 
@@ -3150,25 +3148,22 @@ final class NetworkManager: ObservableObject {
                 continue
             }
 
-            // FIX #120: P2P only - InsightAPI fallback commented out
-            // Try to get raw tx from P2P peer first, then InsightAPI fallback
+            // FIX #391: Try ALL successful peers for getMempoolTransaction, not just the first one
+            // The first peer might have disconnected between inventory fetch and raw tx fetch
             var rawTx: Data?
-            do {
-                rawTx = try await peer.getMempoolTransaction(txid: txHashData)
-                print("🔮 Got raw tx \(txHashHex.prefix(12))... from P2P peer")
-            } catch {
-                print("⚠️ P2P getMempoolTransaction failed for \(txHashHex.prefix(12))...: \(error.localizedDescription)")
-                // Fallback to InsightAPI - use getRawTransaction endpoint
-                // do {
-                //     rawTx = try await InsightAPI.shared.getRawTransaction(txid: txHashHex)
-                //     print("🔮 Got raw tx \(txHashHex.prefix(12))... from InsightAPI fallback")
-                // } catch {
-                //     print("⚠️ InsightAPI fallback also failed for \(txHashHex.prefix(12))...")
-                // }
+            for tryPeer in successfulPeers {
+                do {
+                    rawTx = try await tryPeer.getMempoolTransaction(txid: txHashData)
+                    print("🔮 Got raw tx \(txHashHex.prefix(12))... from P2P peer \(tryPeer.host)")
+                    break // Success! Exit the loop
+                } catch {
+                    print("⚠️ FIX #391: Peer \(tryPeer.host) failed for \(txHashHex.prefix(12))...: \(error.localizedDescription)")
+                    // Try next peer
+                }
             }
 
             guard let rawTx = rawTx else {
-                print("⚠️ Could not get raw tx for \(txHashHex.prefix(12))... - skipping")
+                print("⚠️ FIX #391: All \(successfulPeers.count) peers failed for \(txHashHex.prefix(12))... - skipping")
                 continue
             }
 
@@ -3977,27 +3972,98 @@ final class NetworkManager: ObservableObject {
         let broadcastPeers = healthyPeers.isEmpty ? validPeers : healthyPeers
         print("📡 FIX #335: Broadcasting to \(broadcastPeers.count) peers (\(healthyPeers.count) healthy, \(unhealthyCount) may be stale)")
 
-        // FIX #120: InsightAPI commented out - P2P only
-        // If no P2P peers, fall back to InsightAPI broadcast
-        if !isConnected || broadcastPeers.isEmpty {
-            print("⚠️ No P2P peers available - cannot broadcast (P2P only mode)")
-            // onProgress?("api", "Submitting to blockchain...", 0.3)
-            //
-            // do {
-            //     let txid = try await InsightAPI.shared.broadcastTransaction(rawTx)
-            //     print("✅ InsightAPI broadcast successful: \(txid)")
-            //     onProgress?("api", "Submitted - awaiting miners", 1.0)
-            //     return txid
-            // } catch {
-            //     print("❌ InsightAPI broadcast failed: \(error)")
-            //     throw NetworkError.broadcastFailed
-            // }
-            throw NetworkError.connectionFailed("No P2P peers available for broadcast (all peers banned or disconnected)")
+        // FIX #378: Wait for peers to connect before failing
+        // Problem: User tries to send but peers haven't connected yet
+        // Solution: Wait up to 30 seconds for peers, with active recovery attempts
+        var finalBroadcastPeers = broadcastPeers
+        if !isConnected || finalBroadcastPeers.isEmpty {
+            print("⚠️ FIX #378: No peers available - waiting for connection...")
+            onProgress?("network", "Connecting to peers...", 0.1)
+
+            let maxWaitTime: TimeInterval = 30.0
+            let checkInterval: TimeInterval = 2.0
+            var elapsed: TimeInterval = 0
+
+            while elapsed < maxWaitTime {
+                // Trigger peer recovery
+                if elapsed == 0 || Int(elapsed) % 10 == 0 {
+                    print("🔄 FIX #378: Triggering peer recovery (elapsed: \(Int(elapsed))s)...")
+                    await attemptPeerRecovery()
+                }
+
+                // Wait a bit
+                try await Task.sleep(nanoseconds: UInt64(checkInterval * 1_000_000_000))
+                elapsed += checkInterval
+
+                // Check for connected peers
+                let currentPeers = peers.filter { !isBanned($0.host) && $0.isConnectionReady }
+                if !currentPeers.isEmpty {
+                    finalBroadcastPeers = currentPeers
+                    print("✅ FIX #378: \(currentPeers.count) peer(s) connected after \(Int(elapsed))s")
+                    break
+                }
+
+                let progress = min(0.25, 0.1 + (elapsed / maxWaitTime) * 0.15)
+                onProgress?("network", "Waiting for peers (\(Int(maxWaitTime - elapsed))s)...", progress)
+            }
+
+            // Final check
+            if finalBroadcastPeers.isEmpty {
+                print("❌ FIX #378: No peers available after \(Int(maxWaitTime))s wait")
+                throw NetworkError.connectionFailed("No P2P peers available for broadcast (waited \(Int(maxWaitTime))s)")
+            }
         }
 
-        let peerCount = broadcastPeers.count
-        print("📡 Broadcasting to \(peerCount) peers (FIX #335: \(healthyPeers.count) healthy)...")
-        onProgress?("peers", "Propagating to network (\(peerCount) peers)...", 0.0)
+        // ==========================================================================
+        // FIX #380 v2: INSTANT broadcast using recently active peers
+        // Problem: Ping verification was slow (3s+ timeout) and had race condition
+        //          with block listeners consuming PONG responses
+        // Solution: Use hasRecentActivity check instead of ping
+        //          - If peer communicated within 60s, it's verified alive
+        //          - Only do recovery if ALL peers are stale (no recent activity)
+        // ==========================================================================
+
+        // Separate peers by activity
+        let activePeers = finalBroadcastPeers.filter { $0.hasRecentActivity }
+        let stalePeers = finalBroadcastPeers.filter { !$0.hasRecentActivity }
+
+        print("⚡ FIX #380 v2: \(activePeers.count) recently active, \(stalePeers.count) stale peers")
+
+        var verifiedPeers: [Peer] = activePeers  // Active peers are verified by definition
+
+        // If we have active peers, use them immediately (INSTANT!)
+        if !activePeers.isEmpty {
+            for peer in activePeers {
+                print("✅ FIX #380 v2: Peer \(peer.host) has recent activity (\(peer.secondsSinceActivity)s ago)")
+            }
+        } else if !stalePeers.isEmpty {
+            // All peers are stale - need to verify/recover
+            print("⚠️ FIX #380 v2: All peers stale - attempting quick recovery...")
+            onProgress?("network", "Reconnecting to peers...", 0.2)
+
+            // Try recovery
+            await attemptPeerRecovery()
+            try await Task.sleep(nanoseconds: 2_000_000_000) // Wait 2s for reconnection
+
+            // Check for any newly active peers
+            let recoveredPeers = peers.filter { !isBanned($0.host) && $0.isConnectionReady && $0.hasRecentActivity }
+            verifiedPeers = recoveredPeers
+
+            for peer in recoveredPeers {
+                print("✅ FIX #380 v2: Recovered peer \(peer.host) is active")
+            }
+        }
+
+        // If still no verified peers, throw error
+        if verifiedPeers.isEmpty {
+            print("❌ FIX #380 v2: No active peers available")
+            throw NetworkError.connectionFailed("No active peers available for broadcast")
+        }
+
+        // Use only verified peers for broadcast
+        finalBroadcastPeers = verifiedPeers
+        print("📡 FIX #380 v2: \(verifiedPeers.count) peer(s) verified for broadcast")
+        onProgress?("peers", "Preparing broadcast...", 0.0)
 
         // Use actor for thread-safe state
         actor BroadcastState {
@@ -4012,6 +4078,14 @@ final class NetworkManager: ObservableObject {
                 successCount += 1
                 txId = id
                 return (successCount, isFirst)
+            }
+
+            // FIX #364: Set txId from fallback (pre-computed) without counting as peer success
+            // Used when peers timeout but we still need to track the txid for verification
+            func setFallbackTxId(_ id: String) {
+                if txId == nil {
+                    txId = id
+                }
             }
 
             // FIX #349: Track when peers explicitly reject the transaction
@@ -4029,13 +4103,45 @@ final class NetworkManager: ObservableObject {
         let state = BroadcastState()
         let broadcastAmount = amount  // Capture for use in closures
 
+        // ==========================================================================
+        // FIX #387: Centralized verified peer retrieval in PeerManager
+        // Replaces inline FIX #385/386 - PeerManager now handles:
+        // 1. Fresh peer list retrieval
+        // 2. Ping verification to detect zombie connections
+        // 3. Recovery fallback if no responsive peers
+        // ==========================================================================
+        onProgress?("verify", "Verifying peer connections...", 0.3)
+
+        // FIX #387: Get verified peers from PeerManager (async method)
+        var actualBroadcastPeers = await PeerManager.shared.getVerifiedPeersForBroadcast()
+
+        // If no responsive peers, trigger recovery
+        if actualBroadcastPeers.isEmpty {
+            print("🔄 FIX #387: No responsive peers - triggering recovery...")
+            onProgress?("network", "Reconnecting to network...", 0.2)
+            await attemptPeerRecovery()
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+
+            actualBroadcastPeers = await PeerManager.shared.getVerifiedPeersForBroadcast()
+            print("🔄 FIX #387: After recovery: \(actualBroadcastPeers.count) peers available")
+        }
+
+        guard !actualBroadcastPeers.isEmpty else {
+            print("❌ FIX #387: No peers available even after recovery!")
+            throw NetworkError.connectionFailed("No responsive peers available for broadcast")
+        }
+
+        let peerCount = actualBroadcastPeers.count
+        print("📡 FIX #387: Broadcasting to \(peerCount) verified-responsive peers")
+
         // Broadcast to all peers - but check mempool after FIRST success
         // Use short timeout (5s) to avoid waiting for slow/dead peers
         await withThrowingTaskGroup(of: Void.self) { group in
             // Add broadcast tasks for all healthy/valid peers with fast timeout
             // FIX #158: Exclude banned Sybil attackers
             // FIX #335: Prefer healthy peers (recent activity)
-            for peer in broadcastPeers {
+            // FIX #387: Use actualBroadcastPeers (verified-responsive from PeerManager)
+            for peer in actualBroadcastPeers {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
                     do {
@@ -4083,6 +4189,8 @@ final class NetworkManager: ObservableObject {
             // Add mempool verification task - runs in parallel, exits early on success
             // FIX #211: Capture torEnabled for longer wait time through Tor
             let useTorTimeouts = torEnabled
+            // FIX #364: Capture computedTxId for fallback P2P verification when no peer explicitly accepts
+            let fallbackTxId = computedTxId
             group.addTask {
                 // FIX #211: Wait for at least one peer to accept
                 // Tor broadcasts take 30-65 seconds per peer, so wait up to 90s
@@ -4094,10 +4202,27 @@ final class NetworkManager: ObservableObject {
                     waitAttempts += 1
                 }
 
-                guard let txId = await state.getTxId() else {
-                    print("⚠️ No peer accepted transaction within \(maxAttempts / 10)s timeout")
-                    return
+                // FIX #364: Use peer-provided txId if available, otherwise use pre-computed fallback
+                // This ensures P2P verification runs even when peers timeout without explicit accept
+                let txId: String
+                if let peerTxId = await state.getTxId() {
+                    txId = peerTxId
+                } else {
+                    // No peer explicitly accepted - use pre-computed txid for verification
+                    print("⚠️ FIX #364: No peer explicitly accepted - using pre-computed txid for P2P verification")
+                    txId = fallbackTxId
+                    // Set fallback txId in state so main function guard doesn't return early
+                    await state.setFallbackTxId(fallbackTxId)
+                    // Still attempt P2P verification - TX may have propagated despite timeout
                 }
+
+                // ============================================================================
+                // FIX #392: Wait 500ms after first acceptance to allow all peers to respond
+                // Race condition: Verification task reads successCount as 2 when 6 peers accepted
+                // because it runs immediately after first txId is set, before other peers respond
+                // This short delay ensures we see the true acceptance count before deciding
+                // ============================================================================
+                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
 
                 // ============================================================================
                 // FIX #247: P2P-based mempool verification (replaced InsightAPI)
@@ -4110,15 +4235,74 @@ final class NetworkManager: ObservableObject {
                 // If peers accepted (no reject), TX is propagating through the network
                 var mempoolVerified = false
                 let currentSuccessCount = await state.getSuccessCount()
+                print("📊 FIX #392: After 500ms wait, successCount=\(currentSuccessCount)")
 
-                if currentSuccessCount >= 2 {
-                    // Multiple peers accepted without reject - TX is valid and propagating
-                    print("✅ FIX #247: TX accepted by \(currentSuccessCount) peers - P2P verified")
+                // FIX #390: Trust high peer acceptance (4+), only require P2P verify for low counts (2-3)
+                // Rationale: If 4+ independent peers accept with 0 rejections, TX is valid
+                // P2P getdata can fail due to propagation timing, but 4+ accepts is strong signal
+                let rejectCount = await state.getRejectCount()
+
+                if currentSuccessCount >= 4 && rejectCount == 0 {
+                    // FIX #390: High acceptance (4+ peers, 0 rejections) - trust the broadcast!
+                    // Don't require P2P verify - getdata can fail due to propagation timing
+                    print("✅ FIX #390: TX accepted by \(currentSuccessCount) peers with 0 rejections - broadcast SUCCESS")
                     onProgress?("verify", "✅ Accepted by \(currentSuccessCount) peers", 1.0)
                     mempoolVerified = true
                     await state.setVerified()
                     await MainActor.run {
                         self.setMempoolVerified()
+                    }
+                } else if currentSuccessCount >= 2 {
+                    // FIX #389 v2: Low acceptance (2-3 peers) - verify via P2P getdata
+                    // Could be partial propagation, need to confirm TX is actually in mempool
+                    print("📡 FIX #389 v2: \(currentSuccessCount) peers accepted - verifying TX in mempool...")
+                    onProgress?("verify", "Verifying with \(currentSuccessCount) accepting peers...", 0.7)
+
+                    // FIX #389 v2: Do actual P2P getdata verification for low acceptance counts
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                    if p2pVerified {
+                        print("✅ FIX #389 v2: TX verified via P2P getdata after \(currentSuccessCount) peer accepts")
+                        onProgress?("verify", "✅ Verified in network mempool", 1.0)
+                        mempoolVerified = true
+                        await state.setVerified()
+                        await MainActor.run {
+                            self.setMempoolVerified()
+                        }
+                    } else {
+                        // FIX #389 v2: Multiple accepts but P2P verify FAILED - wait and retry
+                        print("⚠️ FIX #389 v2: \(currentSuccessCount) peers accepted but TX not found in mempool - waiting...")
+                        onProgress?("verify", "Waiting for network propagation...", 0.8)
+
+                        // Wait 3 seconds for TX to propagate through network
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+                        let retryVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                        if retryVerified {
+                            print("✅ FIX #389 v2: TX verified on retry after propagation delay")
+                            onProgress?("verify", "✅ Transaction verified in network", 1.0)
+                            mempoolVerified = true
+                            await state.setVerified()
+                            await MainActor.run {
+                                self.setMempoolVerified()
+                            }
+                        } else {
+                            // FIX #390: Even with failed P2P verify, if 2-3 peers accepted with 0 rejections,
+                            // trust the broadcast - P2P getdata is unreliable for fresh TXs
+                            if rejectCount == 0 {
+                                print("⚠️ FIX #390: P2P verify failed but \(currentSuccessCount) peers accepted with 0 rejections - trusting broadcast")
+                                onProgress?("verify", "✅ Accepted by \(currentSuccessCount) peers", 1.0)
+                                mempoolVerified = true
+                                await state.setVerified()
+                                await MainActor.run {
+                                    self.setMempoolVerified()
+                                }
+                            } else {
+                                // Some peers rejected - this is a real failure
+                                print("🚨 FIX #389 v2: \(currentSuccessCount) accepts but \(rejectCount) rejections + P2P verify failed")
+                                onProgress?("error", "⚠️ Transaction may have failed (\(rejectCount) rejections)", 1.0)
+                                // mempoolVerified remains false
+                            }
+                        }
                     }
                 } else if currentSuccessCount == 1 {
                     // Only 1 peer accepted - try P2P getdata verification with other peers
@@ -4144,21 +4328,62 @@ final class NetworkManager: ObservableObject {
                         onProgress?("error", "🚨 Transaction rejected by network (\(rejectCount) peers rejected)", 1.0)
                         // mempoolVerified remains false - will cause caller to reject
                     } else {
-                        // 1 peer accepted, no explicit rejections, but couldn't verify with others
-                        // This is ambiguous - could be slow network. Trust cautiously.
-                        print("⚠️ FIX #247: 1 peer accepted, P2P verify inconclusive (no rejections) - trusting peer")
-                        onProgress?("verify", "⚠️ 1 peer accepted - propagating", 1.0)
+                        // FIX #389: 1 peer accepted, no rejections, but P2P verify FAILED
+                        // This means TX was NOT found in any peer's mempool - DON'T trust single peer!
+                        // Peer may have ACK'd but dropped the TX. Wait and retry with extended timeout.
+                        print("⚠️ FIX #389: 1 peer accepted but TX not found in mempool - retrying verification...")
+                        onProgress?("verify", "Waiting for network propagation...", 0.8)
+
+                        // FIX #389: Wait 3 seconds for TX to propagate, then retry P2P verification
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+                        let retryP2PVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                        if retryP2PVerified {
+                            print("✅ FIX #389: TX verified on retry after propagation delay")
+                            onProgress?("verify", "✅ Transaction verified in network", 1.0)
+                            mempoolVerified = true
+                            await state.setVerified()
+                            await MainActor.run {
+                                self.setMempoolVerified()
+                            }
+                        } else {
+                            // FIX #389: Still not found - TX likely NOT propagating
+                            // Do NOT mark as verified - let caller handle potential broadcast failure
+                            print("🚨 FIX #389: TX STILL not found after retry - broadcast may have failed!")
+                            print("🚨 FIX #389: Single peer acceptance but TX not in network mempool")
+                            onProgress?("error", "⚠️ Transaction not confirmed in network - may need to resend", 1.0)
+                            // mempoolVerified remains false
+                        }
+                    }
+                } else {
+                    // FIX #364: No peers explicitly accepted - but TX was broadcast and we have txid
+                    // Try P2P verification as last resort before giving up
+                    print("⚠️ FIX #364: No explicit peer acceptance - attempting P2P verification with computed txid")
+                    onProgress?("verify", "Verifying transaction propagation...", 0.7)
+
+                    // Try to verify TX exists via P2P getdata from connected peers
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                    if p2pVerified {
+                        print("✅ FIX #364: TX verified via P2P - propagated despite no explicit accept!")
+                        onProgress?("verify", "✅ Transaction verified in network", 1.0)
                         mempoolVerified = true
                         await state.setVerified()
                         await MainActor.run {
                             self.setMempoolVerified()
                         }
+                    } else {
+                        // P2P verify failed - check if any peers rejected
+                        let rejectCount = await state.getRejectCount()
+                        if rejectCount > 0 {
+                            print("🚨 FIX #364: TX likely rejected - \(rejectCount) peers rejected, P2P verify failed")
+                            onProgress?("error", "🚨 Transaction rejected by \(rejectCount) peers", 1.0)
+                        } else {
+                            // No accepts, no rejects, P2P verify failed - network issues likely
+                            // TX may still propagate - don't mark as verified but don't panic either
+                            print("⚠️ FIX #364: Cannot verify TX - network issues. TX may still propagate.")
+                            onProgress?("verify", "⚠️ Verification inconclusive - monitoring...", 1.0)
+                        }
                     }
-                } else {
-                    // No peers explicitly accepted - TX may still be propagating
-                    // Don't mark as verified, let caller decide based on peerCount
-                    print("⚠️ FIX #247: No explicit peer acceptance - TX status unknown")
-                    onProgress?("verify", "⚠️ No peer confirmation", 1.0)
                 }
             }
 
@@ -5209,6 +5434,15 @@ final class NetworkManager: ObservableObject {
 
                     results.append((block.blockHeight, finalBlockHash, blockTimestamp, txDataList))
                 }
+
+                // FIX #406: Log success with shielded output count
+                let totalOutputs = results.reduce(0) { $0 + $1.3.reduce(0) { $0 + $1.1.count } }
+                let totalSpends = results.reduce(0) { $0 + $1.3.reduce(0) { $0 + ($1.2?.count ?? 0) } }
+                print("✅ [\(peer.host)] On-demand P2P: \(results.count) blocks, \(totalOutputs) outputs, \(totalSpends) spends")
+
+                if results.isEmpty {
+                    print("⚠️ FIX #406: [\(peer.host)] On-demand fetch returned 0 blocks!")
+                }
                 return results.isEmpty ? nil : results
             } catch {
                 print("⚠️ [\(peer.host)] On-demand P2P fetch failed: \(error.localizedDescription)")
@@ -5526,13 +5760,10 @@ final class NetworkManager: ObservableObject {
                     // Set up block announcement listener
                     setupBlockListener(for: peer)
 
-                    // FIX #189: Thread-safe access to knownAddresses
-                    let key = "\(address.host):\(address.port)"
-                    addressLock.lock()
-                    knownAddresses[key]?.successes += 1
-                    newAddresses.remove(key)
-                    triedAddresses.insert(key)
-                    addressLock.unlock()
+                    // FIX #384: Sync connection success to PeerManager
+                    await MainActor.run {
+                        PeerManager.shared.recordConnectionSuccess(address.host, port: address.port)
+                    }
 
                     // Also update custom node stats if this is a custom node
                     recordCustomNodeConnection(host: address.host, port: address.port, success: true)
@@ -5544,12 +5775,16 @@ final class NetworkManager: ObservableObject {
                         }
                     }
                 } else {
-                    // FIX #189: Thread-safe access to knownAddresses
-                    let key = "\(address.host):\(address.port)"
-                    addressLock.lock()
-                    knownAddresses[key]?.attempts += 1
-                    addressLock.unlock()
+                    // FIX #384: Sync connection failure to PeerManager
+                    await MainActor.run {
+                        PeerManager.shared.recordConnectionFailure(address.host, port: address.port)
+                    }
                 }
+            }
+
+            // FIX #384: Sync peer list to PeerManager
+            await MainActor.run {
+                PeerManager.shared.syncPeers(self.peers)
             }
 
             DispatchQueue.main.async {
@@ -5610,7 +5845,7 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Attempt to recover peer connections
-    private func attemptPeerRecovery() async {
+    public func attemptPeerRecovery() async {
         print("🔄 FIX #227: Attempting peer recovery...")
 
         // FIX #250: Diagnostic logging for real iOS debugging
@@ -5641,74 +5876,97 @@ final class NetworkManager: ObservableObject {
         // Clear dead peer references
         peers.removeAll { !$0.isConnectionReady }
 
-        var recovered = 0
+        // ==========================================================================
+        // FIX #394: PARALLEL peer recovery - connect to all peers simultaneously
+        // Previous bug: Serial connections took 24+ seconds (each Tor connection ~2-5s)
+        // Solution: Use TaskGroup to connect to all candidates in parallel
+        // ==========================================================================
 
-        // FIX #284: Try PREFERRED SEEDS first (from database, highest priority)
-        print("⭐ FIX #284: Trying preferred seeds for recovery...")
+        // Collect all candidate addresses
+        var candidateAddresses: [(address: PeerAddress, source: String)] = []
+
+        // 1. Preferred seeds (highest priority)
         for seed in preferredSeeds {
             let seedAddress = PeerAddress(host: seed.host, port: seed.port)
-
-            // Preferred seeds skip parking check - they're trusted
-            // Only skip if BANNED (security issue)
-            if isBanned(seedAddress.host) {
+            if !isBanned(seedAddress.host) {
+                candidateAddresses.append((seedAddress, "preferred"))
+            } else {
                 print("⚠️ FIX #284: Preferred seed \(seed.host) is BANNED - skipping")
-                continue
-            }
-
-            recordConnectionAttempt(seedAddress.host, port: seedAddress.port)
-
-            do {
-                let peer = try await connectToPeer(seedAddress)
-                peers.append(peer)
-                setupBlockListener(for: peer)
-                recovered += 1
-                // Unpark on success (promotes back to preferred if was demoted)
-                unparkPeer(seed.host, port: seed.port)
-                print("✅ FIX #284: Recovered preferred seed \(seed.host)")
-
-                if recovered >= 3 {
-                    break  // Got enough peers
-                }
-            } catch {
-                print("❌ FIX #284: Failed to connect to preferred seed \(seed.host): \(error.localizedDescription)")
-                // Park the seed (will be demoted temporarily)
-                parkPeer(seed.host, port: seed.port)
             }
         }
 
-        // FIX #284: Try parked peers that are ready for retry
-        if recovered < 3 {
-            let readyParked = getParkedPeersReadyForRetry()
-            print("🅿️ FIX #284: Trying \(readyParked.count) parked peers ready for retry...")
-            for parked in readyParked.prefix(5) {
-                if recovered >= 3 { break }
-
-                let address = PeerAddress(host: parked.address, port: parked.port)
-                recordConnectionAttempt(parked.address, port: parked.port)
-
-                do {
-                    let peer = try await connectToPeer(address)
-                    peers.append(peer)
-                    setupBlockListener(for: peer)
-                    recovered += 1
-                    // Success! Unpark (and promote if was preferred)
-                    unparkPeer(parked.address, port: parked.port)
-                    print("✅ FIX #284: Recovered parked peer \(parked.address)")
-                } catch {
-                    print("❌ FIX #284: Parked peer \(parked.address) still failing - re-parking")
-                    parkPeer(parked.address, port: parked.port)
-                }
-            }
+        // 2. Parked peers ready for retry
+        let readyParked = getParkedPeersReadyForRetry()
+        for parked in readyParked.prefix(5) {
+            let address = PeerAddress(host: parked.address, port: parked.port)
+            candidateAddresses.append((address, "parked"))
         }
 
-        // Get bundled addresses for additional fallback
+        // 3. Bundled addresses as fallback
         let bundledAddresses = knownAddresses.values
             .filter { $0.source == "bundled" }
             .map { $0.address }
+        for address in bundledAddresses.prefix(5) {
+            if !shouldSkipPeer(address.host) && !isOnCooldown(address.host, port: address.port) {
+                candidateAddresses.append((address, "bundled"))
+            }
+        }
 
-        // If preferred/parked didn't work, try bundled peers
+        print("⚡ FIX #394: Attempting PARALLEL recovery with \(candidateAddresses.count) candidates...")
+
+        // Connect to all candidates in parallel
+        var recovered = 0
+        let maxPeers = 5  // Limit to avoid overwhelming network
+
+        await withTaskGroup(of: (Peer?, PeerAddress, String).self) { group in
+            for (address, source) in candidateAddresses.prefix(8) {
+                group.addTask { [weak self] in
+                    guard let self = self else { return (nil, address, source) }
+
+                    await MainActor.run {
+                        self.recordConnectionAttempt(address.host, port: address.port)
+                    }
+
+                    do {
+                        let peer = try await self.connectToPeer(address)
+                        return (peer, address, source)
+                    } catch {
+                        print("❌ FIX #394: Failed \(source) peer \(address.host): \(error.localizedDescription)")
+                        return (nil, address, source)
+                    }
+                }
+            }
+
+            // Collect results as they complete
+            for await (peer, address, source) in group {
+                if let peer = peer {
+                    if recovered < maxPeers {
+                        peers.append(peer)
+                        setupBlockListener(for: peer)
+                        recovered += 1
+                        unparkPeer(address.host, port: address.port)
+                        print("✅ FIX #394: Recovered \(source) peer \(address.host) (\(recovered)/\(maxPeers))")
+                    } else {
+                        // Already have enough peers, disconnect this one
+                        peer.disconnect()
+                    }
+                } else {
+                    // Failed - park the peer
+                    parkPeer(address.host, port: address.port)
+                }
+            }
+        }
+
+        print("⚡ FIX #394: Parallel recovery complete - \(recovered) peers connected")
+
+        // Legacy fallback if parallel didn't get enough (should rarely happen)
         if recovered < 3 {
-            for address in bundledAddresses.prefix(5) {
+            // Get bundled addresses for additional fallback
+            let remainingBundled = knownAddresses.values
+                .filter { $0.source == "bundled" }
+                .map { $0.address }
+
+            for address in remainingBundled.prefix(5) {
                 // FIX #284: Use shouldSkipPeer (checks banned + parked)
                 if shouldSkipPeer(address.host) || isOnCooldown(address.host, port: address.port) {
                     continue
@@ -5769,6 +6027,11 @@ final class NetworkManager: ObservableObject {
             }
         } else {
             print("✅ FIX #227: Recovered \(recovered) peer(s)")
+        }
+
+        // FIX #384: Sync peer list to PeerManager
+        await MainActor.run {
+            PeerManager.shared.syncPeers(self.peers)
         }
 
         // Update UI
@@ -5935,19 +6198,28 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Get current network generation (thread-safe)
+    /// FIX #388: Uses local counter for synchronous access
     func getNetworkGeneration() -> UInt64 {
         networkGenerationLock.lock()
         defer { networkGenerationLock.unlock() }
-        return networkGeneration
+        return localNetworkGeneration
     }
 
     /// Increment network generation and return new value (thread-safe)
+    /// FIX #388: Updates local counter synchronously, syncs with PeerManager asynchronously
     @discardableResult
     private func incrementNetworkGeneration() -> UInt64 {
         networkGenerationLock.lock()
-        defer { networkGenerationLock.unlock() }
-        networkGeneration += 1
-        return networkGeneration
+        localNetworkGeneration += 1
+        let newValue = localNetworkGeneration
+        networkGenerationLock.unlock()
+
+        // Sync with PeerManager asynchronously (fire and forget)
+        Task { @MainActor in
+            PeerManager.shared.incrementNetworkGeneration()
+        }
+
+        return newValue
     }
 
     /// Ping all connected peers to detect dead connections
@@ -6060,10 +6332,10 @@ final class NetworkManager: ObservableObject {
 
     /// Handle a dead peer with reconnection using exponential backoff
     /// FIX #268: Uses generation tracking to abort if network changed during sleep
+    /// FIX #384: Uses PeerManager for backoff tracking
     private func handleDeadPeer(_ peer: Peer) async {
-        let hostKey = "\(peer.host):\(peer.port)"
-
         // FIX #268: Capture generation at start - if it changes, abort reconnection
+        // FIX #388: Use local synchronous generation counter
         let capturedGeneration = getNetworkGeneration()
 
         // Disconnect cleanly
@@ -6072,14 +6344,17 @@ final class NetworkManager: ObservableObject {
         // Remove from peers list
         peers.removeAll { $0.id == peer.id }
 
-        // Get current attempt count for backoff calculation (thread-safe)
-        reconnectionAttemptsLock.lock()
-        let attempts = reconnectionAttempts[hostKey] ?? 0
-        reconnectionAttempts[hostKey] = attempts + 1
-        reconnectionAttemptsLock.unlock()
+        // FIX #384: Sync peer removal to PeerManager
+        await MainActor.run {
+            PeerManager.shared.syncPeers(self.peers)
+        }
 
-        // Calculate backoff with jitter
-        let backoffSeconds = calculateBackoffWithJitter(attempts: attempts)
+        // FIX #384: Get current attempt count and increment using PeerManager
+        let attempts = await MainActor.run { PeerManager.shared.getReconnectionAttempts(peer.host, port: peer.port) }
+        await MainActor.run { PeerManager.shared.incrementReconnectionAttempts(peer.host, port: peer.port) }
+
+        // FIX #388: Calculate backoff - nonisolated method, no MainActor.run needed
+        let backoffSeconds = PeerManager.shared.calculateBackoffWithJitter(attempts: attempts)
 
         debugLog(.network, "🔄 FIX #246: [\(peer.host)] Dead - will retry in \(String(format: "%.1f", backoffSeconds))s (attempt \(attempts + 1), gen=\(capturedGeneration))")
 
@@ -6090,22 +6365,19 @@ final class NetworkManager: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
 
             // FIX #268: Check if network generation changed - abort if stale
-            if self.getNetworkGeneration() != capturedGeneration {
-                debugLog(.network, "📶 FIX #268: [\(peer.host)] Stale reconnection (gen \(capturedGeneration) → \(self.getNetworkGeneration())) - aborting")
-                // Reset attempt counter since this is a fresh network context
-                self.reconnectionAttemptsLock.lock()
-                self.reconnectionAttempts.removeValue(forKey: hostKey)
-                self.reconnectionAttemptsLock.unlock()
+            // FIX #388: Use local generation counter for synchronous check
+            let currentGen = self.getNetworkGeneration()
+            let isStale = currentGen != capturedGeneration
+            if isStale {
+                debugLog(.network, "📶 FIX #268: [\(peer.host)] Stale reconnection (gen \(capturedGeneration) → \(currentGen)) - aborting")
+                await MainActor.run { PeerManager.shared.resetReconnectionAttempts(peer.host, port: peer.port) }
                 return
             }
 
             // Check if peer is still dead (not reconnected by another mechanism)
-            let existingPeer = self.peers.first { $0.host == peer.host && $0.port == peer.port }
-            if existingPeer?.isConnectionReady == true {
-                // Already reconnected, reset counter (thread-safe)
-                self.reconnectionAttemptsLock.lock()
-                self.reconnectionAttempts.removeValue(forKey: hostKey)
-                self.reconnectionAttemptsLock.unlock()
+            let isAlreadyConnected = await MainActor.run { PeerManager.shared.isAlreadyConnected(peer.host) }
+            if isAlreadyConnected {
+                await MainActor.run { PeerManager.shared.resetReconnectionAttempts(peer.host, port: peer.port) }
                 return
             }
 
@@ -6115,53 +6387,43 @@ final class NetworkManager: ObservableObject {
     }
 
     /// Calculate exponential backoff with jitter
-    /// Formula: min(maxBackoff, base * 2^attempts) + random(0, base/2)
+    /// FIX #384: Delegates to PeerManager
     private func calculateBackoffWithJitter(attempts: Int) -> TimeInterval {
-        let exponentialBackoff = BASE_BACKOFF_SECONDS * pow(2.0, Double(min(attempts, 7)))  // Cap at 2^7 = 128x
-        let cappedBackoff = min(MAX_BACKOFF_SECONDS, exponentialBackoff)
-
-        // Add jitter (0 to base/2 seconds)
-        let jitter = Double.random(in: 0...(BASE_BACKOFF_SECONDS / 2))
-
-        return cappedBackoff + jitter
+        return PeerManager.shared.calculateBackoffWithJitter(attempts: attempts)
     }
 
     /// Attempt to reconnect to a peer with exponential backoff
     /// FIX #268: Optional generation parameter - if provided and stale, aborts reconnection
+    /// FIX #384: Uses PeerManager for backoff and SOCKS5 failure tracking
     private func reconnectWithBackoff(host: String, port: UInt16, generation: UInt64? = nil) async {
-        let hostKey = "\(host):\(port)"
-
         // FIX #268: Check generation if provided - abort if network context changed
-        if let capturedGen = generation, getNetworkGeneration() != capturedGen {
-            debugLog(.network, "📶 FIX #268: [\(host)] Stale generation in reconnectWithBackoff - aborting")
-            reconnectionAttemptsLock.lock()
-            reconnectionAttempts.removeValue(forKey: hostKey)
-            reconnectionAttemptsLock.unlock()
-            return
+        // FIX #388: Use local generation counter for synchronous check
+        if let capturedGen = generation {
+            let currentGen = getNetworkGeneration()
+            let isStale = currentGen != capturedGen
+            if isStale {
+                debugLog(.network, "📶 FIX #268: [\(host)] Stale generation in reconnectWithBackoff - aborting")
+                await MainActor.run { PeerManager.shared.resetReconnectionAttempts(host, port: port) }
+                return
+            }
         }
 
-        // Thread-safe read of attempts
-        reconnectionAttemptsLock.lock()
-        let attempts = reconnectionAttempts[hostKey] ?? 0
-        reconnectionAttemptsLock.unlock()
+        // FIX #384: Get attempt count from PeerManager
+        let attempts = await MainActor.run { PeerManager.shared.getReconnectionAttempts(host, port: port) }
 
         // Give up after too many attempts
         if attempts >= 10 {
             debugLog(.network, "🛑 FIX #246: [\(host)] Giving up after \(attempts) failed reconnection attempts")
-            reconnectionAttemptsLock.lock()
-            reconnectionAttempts.removeValue(forKey: hostKey)
-            reconnectionAttemptsLock.unlock()
+            await MainActor.run { PeerManager.shared.resetReconnectionAttempts(host, port: port) }
             return
         }
 
         let address = PeerAddress(host: host, port: port)
 
-        // Check if banned
+        // Check if banned (already delegates to PeerManager)
         if isBanned(host) {
             debugLog(.network, "🚫 FIX #246: [\(host)] Banned - not reconnecting")
-            reconnectionAttemptsLock.lock()
-            reconnectionAttempts.removeValue(forKey: hostKey)
-            reconnectionAttemptsLock.unlock()
+            await MainActor.run { PeerManager.shared.resetReconnectionAttempts(host, port: port) }
             return
         }
 
@@ -6170,10 +6432,12 @@ final class NetworkManager: ObservableObject {
             peers.append(peer)
             setupBlockListener(for: peer)
 
-            // Reset attempt counter on success (thread-safe)
-            reconnectionAttemptsLock.lock()
-            reconnectionAttempts.removeValue(forKey: hostKey)
-            reconnectionAttemptsLock.unlock()
+            // FIX #384: Sync success to PeerManager
+            await MainActor.run {
+                PeerManager.shared.resetReconnectionAttempts(host, port: port)
+                PeerManager.shared.recordConnectionSuccess(host, port: port)
+                PeerManager.shared.syncPeers(self.peers)
+            }
             debugLog(.network, "✅ FIX #246: [\(host)] Reconnected successfully")
 
             // Update UI
@@ -6185,13 +6449,15 @@ final class NetworkManager: ObservableObject {
             debugLog(.network, "❌ FIX #246: [\(host)] Reconnection failed: \(error.localizedDescription)")
 
             // Check for specific error types that indicate Tor issues
+            // FIX #384: Track SOCKS5 failures in PeerManager
             let errorDesc = error.localizedDescription.lowercased()
             if errorDesc.contains("socks") || errorDesc.contains("socket") ||
                errorDesc.contains("reset") || errorDesc.contains("broken pipe") {
-                consecutiveSOCKS5Failures += 1
+                await MainActor.run { PeerManager.shared.recordSOCKS5Failure() }
 
                 // If too many SOCKS failures, consider Tor health check
-                if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD {
+                let shouldCheck = await MainActor.run { PeerManager.shared.shouldCheckTorHealth() }
+                if shouldCheck {
                     debugLog(.network, "🧅 FIX #246: Too many SOCKS5 failures - checking Tor health")
                     await checkAndRestartTorIfNeeded()
                 }
@@ -6231,86 +6497,7 @@ final class NetworkManager: ObservableObject {
 }
 
 // MARK: - Supporting Types
-
-struct PeerAddress {
-    let host: String
-    let port: UInt16
-}
-
-/// Information about a known peer address
-struct AddressInfo {
-    let address: PeerAddress
-    let source: String // Where we learned about this address
-    let firstSeen: Date
-    var lastSeen: Date
-    var attempts: Int
-    var successes: Int
-
-    /// Calculate selection probability based on history
-    func getChance() -> Double {
-        var chance = 1.0
-
-        // Reduce chance based on failed attempts
-        if attempts > successes {
-            let failures = attempts - successes
-            chance *= pow(0.66, Double(min(failures, 8)))
-        }
-
-        // Boost for recent success
-        if successes > 0 {
-            let hoursSinceSuccess = Date().timeIntervalSince(lastSeen) / 3600
-            if hoursSinceSuccess < 1 {
-                chance *= 1.5
-            } else if hoursSinceSuccess > 168 { // 1 week
-                chance *= 0.3
-            }
-        }
-
-        // Reduce chance for untried addresses with old timestamps
-        if successes == 0 && attempts == 0 {
-            let daysSinceFirst = Date().timeIntervalSince(firstSeen) / 86400
-            if daysSinceFirst > 7 {
-                chance *= 0.5
-            }
-        }
-
-        return chance
-    }
-
-    /// Check if this address should be removed
-    func isTerrible() -> Bool {
-        // Never succeeded and many failures
-        if successes == 0 && attempts >= 3 {
-            return true
-        }
-
-        // Very low success rate
-        if attempts >= 10 {
-            let successRate = Double(successes) / Double(attempts)
-            if successRate < 0.05 {
-                return true
-            }
-        }
-
-        // Not seen in 30 days
-        let daysSinceSeen = Date().timeIntervalSince(lastSeen) / 86400
-        if daysSinceSeen > 30 {
-            return true
-        }
-
-        return false
-    }
-}
-
-/// Codable version of AddressInfo for persistence
-struct PersistedAddress: Codable {
-    let host: String
-    let port: UInt16
-    let firstSeen: Date
-    let lastSeen: Date
-    let attempts: Int
-    let successes: Int
-}
+// NOTE: PeerAddress, AddressInfo, PersistedAddress are now defined in PeerManager.swift
 
 /// User-added custom node for manual peer management
 /// Supports IPv4, IPv6, and .onion addresses
