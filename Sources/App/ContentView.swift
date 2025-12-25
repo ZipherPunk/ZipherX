@@ -453,6 +453,8 @@ struct ContentView: View {
                                 let hasBalanceIssues = fixableIssues.contains { $0.checkName == "Balance Reconciliation" }
                                 // FIX #177: Handle Checkpoint Sync issues - repair updates checkpoint via FIX #176
                                 let hasCheckpointIssues = fixableIssues.contains { $0.checkName == "Checkpoint Sync" }
+                                // FIX #411: Handle Tree Root Validation issues - headers not synced to lastScannedHeight
+                                let hasTreeRootIssues = fixableIssues.contains { $0.checkName == "Tree Root Validation" }
 
                                 // FIX #120: Handle Hash Accuracy issues - clear and resync headers
                                 if hasHashIssues {
@@ -485,9 +487,28 @@ struct ContentView: View {
                                     }
                                 }
 
-                                // FIX #120: Handle Timestamp issues OR Hash issues (both need header sync)
-                                if hasTimestampIssues || hasHashIssues {
-                                    print("🔧 FIX #120: Syncing headers and timestamps...")
+                                // FIX #120/411: Handle Timestamp, Hash, or Tree Root issues (all need header sync)
+                                if hasTimestampIssues || hasHashIssues || hasTreeRootIssues {
+                                    if hasTreeRootIssues {
+                                        // FIX #411: Tree Root Validation needs headers at lastScannedHeight
+                                        // ensureHeaderTimestamps() only syncs 100 blocks, not enough!
+                                        // Sync headers from current HeaderStore height to lastScannedHeight
+                                        print("🔧 FIX #411: Tree Root Validation failed - syncing headers to lastScannedHeight...")
+                                        await MainActor.run {
+                                            walletManager.setConnecting(true, status: "Syncing headers to lastScanned height...")
+                                        }
+                                        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                                        let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                                        if lastScanned > headerStoreHeight {
+                                            let gap = lastScanned - headerStoreHeight
+                                            print("🔧 FIX #411: HeaderStore at \(headerStoreHeight), need \(lastScanned), gap=\(gap)")
+                                            // Sync headers from headerStoreHeight to at least lastScanned
+                                            // maxHeaders = gap + some buffer to ensure we reach lastScanned
+                                            try? await HeaderSyncManager.shared.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
+                                        }
+                                    } else {
+                                        print("🔧 FIX #120: Syncing headers and timestamps...")
+                                    }
                                     await MainActor.run {
                                         walletManager.setConnecting(true, status: "Syncing headers...")
                                     }
