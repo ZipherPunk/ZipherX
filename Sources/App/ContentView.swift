@@ -54,6 +54,9 @@ struct ContentView: View {
     // FIX #231: Reduced verification warning (insufficient peers for consensus)
     @State private var showReducedVerificationAlert = false
 
+    // FIX #409: Critical health alert
+    @State private var showCriticalHealthAlert = false
+
     enum Tab {
         case balance, send, receive, chat, settings
     }
@@ -1752,6 +1755,35 @@ struct ContentView: View {
         .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
             if hasAlert {
                 showReducedVerificationAlert = true
+            }
+        }
+        // FIX #409: Critical health alert with action buttons
+        .alert(networkManager.criticalHealthAlert?.severity.rawValue ?? "⚠️" + " " + (networkManager.criticalHealthAlert?.title ?? "Health Issue"), isPresented: $showCriticalHealthAlert) {
+            if let alert = networkManager.criticalHealthAlert {
+                ForEach(alert.solutions) { solution in
+                    Button(solution.title, role: solution.action == .dismiss ? .cancel : nil) {
+                        Task {
+                            if solution.action == .repairDatabase {
+                                // Trigger database repair via WalletManager
+                                try? await walletManager.repairNotesAfterDownloadedTree()
+                            } else {
+                                await networkManager.handleHealthAlertAction(solution.action)
+                            }
+                        }
+                    }
+                }
+            }
+        } message: {
+            if let alert = networkManager.criticalHealthAlert {
+                Text(alert.message)
+            } else {
+                Text("A health issue was detected.")
+            }
+        }
+        // FIX #409: Watch for critical health alerts
+        .onChange(of: networkManager.criticalHealthAlert != nil) { hasAlert in
+            if hasAlert {
+                showCriticalHealthAlert = true
             }
         }
     }

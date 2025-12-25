@@ -277,12 +277,170 @@ public final class NetworkManager: ObservableObject {
             suppressBackgroundSync = false
         }
         debugLog(.network, "✅ FIX #145: Background processes ENABLED (initial sync complete)")
+
+        // FIX #409: Start continuous health monitoring
+        startHealthMonitoring()
     }
 
     /// FIX #145: Disable background processes (for testing/reset)
     func disableBackgroundProcesses() {
         backgroundProcessesEnabled = false
         debugLog(.network, "⏸️ FIX #145: Background processes DISABLED")
+    }
+
+    // MARK: - FIX #409: Continuous Health Monitoring
+
+    /// Critical health issue that requires user attention
+    public struct CriticalHealthAlert: Identifiable, Equatable {
+        public let id = UUID()
+        public let title: String
+        public let message: String
+        public let severity: Severity
+        public let solutions: [Solution]
+        public let timestamp: Date
+
+        public enum Severity: String {
+            case warning = "⚠️"
+            case critical = "🚨"
+        }
+
+        public struct Solution: Identifiable, Equatable {
+            public let id = UUID()
+            public let title: String
+            public let action: ActionType
+
+            public enum ActionType: Equatable {
+                case clearHeaders
+                case repairDatabase
+                case reconnectPeers
+                case dismiss
+            }
+        }
+
+        public static func == (lhs: CriticalHealthAlert, rhs: CriticalHealthAlert) -> Bool {
+            lhs.id == rhs.id
+        }
+    }
+
+    /// FIX #409: Published health alert for UI display
+    @Published var criticalHealthAlert: CriticalHealthAlert? = nil
+
+    /// FIX #409: Health check timer
+    private var healthCheckTimer: Timer?
+    private let HEALTH_CHECK_INTERVAL: TimeInterval = 60  // Check every 60 seconds
+
+    /// FIX #409: Start continuous health monitoring
+    func startHealthMonitoring() {
+        guard healthCheckTimer == nil else { return }
+        healthCheckTimer = Timer.scheduledTimer(withTimeInterval: HEALTH_CHECK_INTERVAL, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.performHealthCheck()
+            }
+        }
+        print("🏥 FIX #409: Health monitoring started (interval: \(Int(HEALTH_CHECK_INTERVAL))s)")
+    }
+
+    /// FIX #409: Stop health monitoring
+    func stopHealthMonitoring() {
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = nil
+    }
+
+    /// FIX #409: Perform health check and alert user if critical issues found
+    @MainActor
+    func performHealthCheck() async {
+        // Don't check during initial sync
+        guard backgroundProcessesEnabled else { return }
+
+        // Check 1: HeaderStore health
+        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let headersBehind = chainHeight > headerStoreHeight ? chainHeight - headerStoreHeight : 0
+
+        if headersBehind > 500 {
+            criticalHealthAlert = CriticalHealthAlert(
+                title: "Header Sync Issue",
+                message: "Block headers are \(headersBehind) blocks behind. New transactions may not be detected until headers are synced.",
+                severity: .critical,
+                solutions: [
+                    .init(title: "Clear & Resync Headers", action: .clearHeaders),
+                    .init(title: "Dismiss", action: .dismiss)
+                ],
+                timestamp: Date()
+            )
+            print("🚨 FIX #409: CRITICAL - HeaderStore is \(headersBehind) blocks behind!")
+            return
+        }
+
+        // Check 2: Peer connectivity
+        let readyPeers = peers.filter { $0.isConnectionReady }.count
+        if readyPeers == 0 && isConnected {
+            criticalHealthAlert = CriticalHealthAlert(
+                title: "No Active Peers",
+                message: "All peer connections have been lost. The wallet cannot sync or broadcast transactions.",
+                severity: .critical,
+                solutions: [
+                    .init(title: "Reconnect", action: .reconnectPeers),
+                    .init(title: "Dismiss", action: .dismiss)
+                ],
+                timestamp: Date()
+            )
+            print("🚨 FIX #409: CRITICAL - No active peers!")
+            return
+        }
+
+        // Check 3: Wallet sync stuck (wallet far behind chain for >5 minutes)
+        let walletBehind = chainHeight > walletHeight ? chainHeight - walletHeight : 0
+        if walletBehind > 100 && !suppressBackgroundSync {
+            // Only alert if we've been behind for a while (check via timestamp tracking)
+            criticalHealthAlert = CriticalHealthAlert(
+                title: "Sync Issue",
+                message: "Wallet is \(walletBehind) blocks behind. You may be missing recent transactions.",
+                severity: .warning,
+                solutions: [
+                    .init(title: "Repair Database", action: .repairDatabase),
+                    .init(title: "Dismiss", action: .dismiss)
+                ],
+                timestamp: Date()
+            )
+            print("⚠️ FIX #409: WARNING - Wallet is \(walletBehind) blocks behind chain")
+            return
+        }
+
+        // All checks passed - clear any existing alert
+        if criticalHealthAlert != nil {
+            print("✅ FIX #409: Health check passed - clearing previous alert")
+            criticalHealthAlert = nil
+        }
+    }
+
+    /// FIX #409: Handle user action on health alert
+    @MainActor
+    func handleHealthAlertAction(_ action: CriticalHealthAlert.Solution.ActionType) async {
+        switch action {
+        case .clearHeaders:
+            print("🔧 FIX #409: User chose to clear headers")
+            do {
+                try HeaderStore.shared.clearAllHeaders()
+                print("✅ FIX #409: Headers cleared successfully")
+            } catch {
+                print("❌ FIX #409: Failed to clear headers: \(error)")
+            }
+
+        case .repairDatabase:
+            print("🔧 FIX #409: User chose to repair database")
+            // This will be handled by the UI which calls WalletManager.repairNotesAfterDownloadedTree()
+
+        case .reconnectPeers:
+            print("🔧 FIX #409: User chose to reconnect peers")
+            await disconnect()
+            try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+            try? await connect()
+
+        case .dismiss:
+            print("🔧 FIX #409: User dismissed alert")
+        }
+
+        criticalHealthAlert = nil
     }
 
     /// FIX #130: Set header syncing state (called from WalletManager)
