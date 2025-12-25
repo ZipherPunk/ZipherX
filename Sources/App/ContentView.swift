@@ -57,6 +57,12 @@ struct ContentView: View {
     // FIX #409: Critical health alert
     @State private var showCriticalHealthAlert = false
 
+    // FIX #409: Computed property to avoid complex type-check expression
+    private var healthAlertTitle: String {
+        guard let alert = networkManager.criticalHealthAlert else { return "⚠️ Health Issue" }
+        return "\(alert.severity.rawValue) \(alert.title)"
+    }
+
     enum Tab {
         case balance, send, receive, chat, settings
     }
@@ -190,12 +196,32 @@ struct ContentView: View {
                             if isCheckpointValid && isHeaderStoreHealthy {
                                 print("⚡ FIX #168: INSTANT START - checkpoint valid (gap=\(checkpointGap))")
                                 print("⚡ FIX #408: HeaderStore healthy (within \(headersBehind) blocks)")
-                                print("⚡ FIX #168: Skipping peer wait, header sync, and health checks!")
+
+                                // FIX #409: Run QUICK health check before showing UI
+                                // User expects wallet state to be validated at startup
+                                print("🏥 FIX #409: Running quick health check before INSTANT START...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Validating wallet...")
+                                }
 
                                 // Load cached balance immediately
                                 walletManager.loadCachedBalance()
 
-                                // Show UI INSTANTLY - no tasks, no waiting
+                                // Quick health check - only critical checks
+                                let healthResults = await WalletHealthCheck.shared.runAllChecks()
+                                let criticalIssues = healthResults.filter { !$0.passed && $0.details.contains("REPAIR") }
+
+                                if !criticalIssues.isEmpty {
+                                    print("⚠️ FIX #409: INSTANT START detected issues - need repair")
+                                    await MainActor.run {
+                                        if let firstIssue = criticalIssues.first {
+                                            repairNeededReason = firstIssue.details
+                                            showRepairNeededAlert = true
+                                        }
+                                    }
+                                }
+
+                                // Show UI after health check completes
                                 await MainActor.run {
                                     walletManager.setRepairingHistory(false)
                                     walletManager.setConnecting(false, status: nil)
@@ -204,7 +230,7 @@ struct ContentView: View {
                                     walletManager.completeProgress()
                                 }
 
-                                print("⚡ FIX #168: INSTANT START COMPLETE in <1 second!")
+                                print("⚡ FIX #168: INSTANT START COMPLETE (with health check)!")
 
                                 // Start network and background sync asynchronously (non-blocking)
                                 Task {
@@ -356,79 +382,15 @@ struct ContentView: View {
                                 }
                             }
 
-                            // FIX #167: INSTANT FAST START - Show UI immediately, health checks in background
-                            // User gets instant wallet access with cached balance
-                            // Health checks run asynchronously and notify only if critical issues found
+                            // FIX #409: Run health checks BEFORE showing UI (not in background)
+                            // User expects wallet state to be fully validated at startup
                             await MainActor.run {
-                                walletManager.updateSyncTask(id: "fast_health", status: .completed, detail: "Background check")
+                                walletManager.updateSyncTask(id: "fast_health", status: .inProgress, detail: "Validating...")
                             }
 
-                            // FIX #167: SKIP blocking health checks entirely for instant startup
-                            // Health checks will run in background after UI is shown
-                            // Critical issues will show an alert, but user can still see their balance
-                            let skipBlockingHealthChecks = true  // FIX #167: Enable instant startup
+                            print("🏥 FIX #409: Running health checks before FAST START completes...")
 
-                            if skipBlockingHealthChecks {
-                                print("⚡ FIX #167: INSTANT FAST START - skipping blocking health checks")
-                                print("⚡ Health checks will run in background after UI is shown")
-
-                                // Mark initial sync as complete NOW - show UI immediately!
-                                print("⚡ FAST START COMPLETE: UI ready! (health checks in background)")
-
-                                await MainActor.run {
-                                    walletManager.setRepairingHistory(false)
-                                    walletManager.setConnecting(false, status: nil)
-                                    isInitialSync = false
-                                    hasCompletedInitialSync = true
-                                    walletManager.completeProgress()
-                                }
-
-                                // FIX #167: Run health checks in BACKGROUND Task (non-blocking)
-                                Task {
-                                    // Wait a moment for UI to stabilize
-                                    try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-
-                                    print("🔍 FIX #167: Starting background health checks...")
-                                    let healthResults = await WalletHealthCheck.shared.runAllChecks()
-                                    WalletHealthCheck.shared.printSummary(healthResults)
-
-                                    let hasCritical = WalletHealthCheck.shared.hasCriticalFailures(healthResults)
-                                    if hasCritical {
-                                        print("❌ FIX #167: Critical health issue detected in background!")
-                                        // Could show an alert here if needed
-                                    }
-
-                                    // FIX #164 v4: Check for repair needed (checkpoint gap)
-                                    let repairNeededCheck = healthResults.first {
-                                        $0.checkName == "Checkpoint Sync" && !$0.passed && $0.details.contains("REPAIR NEEDED")
-                                    }
-                                    if let repair = repairNeededCheck {
-                                        print("⚠️ FIX #167: Repair needed detected in background")
-                                        await MainActor.run {
-                                            repairNeededReason = repair.details
-                                            showRepairNeededAlert = true
-                                        }
-                                    }
-
-                                    print("✅ FIX #167: Background health checks complete")
-                                }
-
-                                // Start background sync for any missed blocks (non-blocking)
-                                networkManager.suppressBackgroundSync = false
-                                Task {
-                                    do {
-                                        try await networkManager.connect()
-                                        networkManager.enableBackgroundProcesses()
-                                        await networkManager.fetchNetworkStats()
-                                    } catch {
-                                        print("⚠️ Background connect error: \(error.localizedDescription)")
-                                        networkManager.enableBackgroundProcesses()
-                                    }
-                                }
-                                return  // Exit FAST START - UI is now shown
-                            }
-
-                            // OLD PATH (kept for reference but not used with skipBlockingHealthChecks = true)
+                            // FIX #409: Health checks now run BEFORE showing UI (mandatory)
                             let healthResults = await WalletHealthCheck.shared.runAllChecks()
 
                             // Update task: health checks complete
@@ -1677,115 +1639,21 @@ struct ContentView: View {
         .onTapGesture {
             recordUserActivity()
         }
-        .alert("Insufficient Disk Space", isPresented: $showInsufficientDiskSpaceAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.")
-        }
-        // FIX #164: Repair needed alert - shown when blocks were skipped and spent notes may be missed
-        .alert("⚠️ Database Repair Recommended", isPresented: $showRepairNeededAlert) {
-            Button("Later", role: .cancel) { }
-            Button("Open Settings") {
-                // Navigate to settings tab
-                selectedTab = .settings
-                showCypherpunkSettings = true
-            }
-        } message: {
-            Text("Your wallet may show an incorrect balance.\n\n\(repairNeededReason)\n\nTo fix this:\n1. Go to Settings\n2. Tap 'Repair Database'\n3. Wait for repair to complete\n\nNote: Tor will be temporarily disabled during repair for faster scanning.\n\nSend is disabled until repair is complete to prevent errors.")
-        }
-        // FIX #175: Sybil attack alert
-        .alert("🚨 Security Alert: Sybil Attack Detected", isPresented: $showSybilAttackAlert) {
-            Button("OK", role: .cancel) {
-                networkManager.clearSybilAttackAlert()
-            }
-        } message: {
-            if let alert = networkManager.sybilVersionAttackAlert {
-                Text("Detected \(alert.attackerCount) suspicious peer(s) reporting fake blockchain data.\n\n\(alert.bypassedTor ? "Tor has been temporarily bypassed to connect directly to trusted peers." : "Malicious peers have been banned.")\n\nYour funds are safe. The wallet is using verified peer consensus.\n\n\"Privacy is necessary for an open society in the electronic age.\"\n— A Cypherpunk's Manifesto")
-            } else {
-                Text("Suspicious network activity detected. Malicious peers have been blocked.")
-            }
-        }
-        // FIX #174: External wallet spend alert
-        .alert("⚠️ External Wallet Activity Detected", isPresented: $showExternalWalletSpendAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            if let spend = networkManager.externalWalletSpendDetected {
-                let zcl = Double(spend.amount) / 100_000_000.0
-                Text("Another wallet is spending your funds!\n\nAmount: \(String(format: "%.8f", zcl)) ZCL\nTxID: \(spend.txid.prefix(16))...\n\nThis transaction was NOT initiated by ZipherX. If you did not authorize this, your private key may be compromised.\n\nSend is temporarily disabled until this transaction confirms.")
-            } else {
-                Text("External wallet activity detected on your address.")
-            }
-        }
-        // FIX #175: Watch for Sybil attack alerts
-        .onChange(of: networkManager.sybilVersionAttackAlert != nil) { hasAlert in
-            if hasAlert {
-                showSybilAttackAlert = true
-            }
-        }
-        // FIX #174: Watch for external wallet spend detection
-        .onChange(of: networkManager.externalWalletSpendDetected != nil) { hasSpend in
-            if hasSpend {
-                showExternalWalletSpendAlert = true
-            }
-        }
-        // FIX #231: Reduced verification warning (cypherpunk-style)
-        .alert("⚠️ Reduced Blockchain Verification", isPresented: $showReducedVerificationAlert) {
-            Button("I Accept the Risk", role: .cancel) {
-                walletManager.clearReducedVerificationAlert()
-            }
-        } message: {
-            if let info = walletManager.reducedVerificationAlert {
-                Text("""
-                    Only \(info.peerCount) peer(s) connected - insufficient for full consensus verification.
-
-                    Reason: \(info.reason)
-
-                    Your wallet will operate with reduced proof-of-work verification. This is acceptable for most use cases, but provides less protection against sophisticated chain-level attacks.
-
-                    For maximum security, wait for more peers to connect or add trusted peers in Settings.
-
-                    "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy out of their beneficence."
-                    — A Cypherpunk's Manifesto
-                    """)
-            } else {
-                Text("Insufficient peers for full blockchain verification.")
-            }
-        }
-        // FIX #231: Watch for reduced verification alerts
-        .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
-            if hasAlert {
-                showReducedVerificationAlert = true
-            }
-        }
-        // FIX #409: Critical health alert with action buttons
-        .alert(networkManager.criticalHealthAlert?.severity.rawValue ?? "⚠️" + " " + (networkManager.criticalHealthAlert?.title ?? "Health Issue"), isPresented: $showCriticalHealthAlert) {
-            if let alert = networkManager.criticalHealthAlert {
-                ForEach(alert.solutions) { solution in
-                    Button(solution.title, role: solution.action == .dismiss ? .cancel : nil) {
-                        Task {
-                            if solution.action == .repairDatabase {
-                                // Trigger database repair via WalletManager
-                                try? await walletManager.repairNotesAfterDownloadedTree()
-                            } else {
-                                await networkManager.handleHealthAlertAction(solution.action)
-                            }
-                        }
-                    }
-                }
-            }
-        } message: {
-            if let alert = networkManager.criticalHealthAlert {
-                Text(alert.message)
-            } else {
-                Text("A health issue was detected.")
-            }
-        }
-        // FIX #409: Watch for critical health alerts
-        .onChange(of: networkManager.criticalHealthAlert != nil) { hasAlert in
-            if hasAlert {
-                showCriticalHealthAlert = true
-            }
-        }
+        .modifier(CypherpunkAlertsModifier(
+            showInsufficientDiskSpaceAlert: $showInsufficientDiskSpaceAlert,
+            showRepairNeededAlert: $showRepairNeededAlert,
+            showSybilAttackAlert: $showSybilAttackAlert,
+            showExternalWalletSpendAlert: $showExternalWalletSpendAlert,
+            showReducedVerificationAlert: $showReducedVerificationAlert,
+            showCriticalHealthAlert: $showCriticalHealthAlert,
+            selectedTab: $selectedTab,
+            showCypherpunkSettings: $showCypherpunkSettings,
+            availableDiskSpace: availableDiskSpace,
+            repairNeededReason: repairNeededReason,
+            healthAlertTitle: healthAlertTitle,
+            walletManager: walletManager,
+            networkManager: networkManager
+        ))
     }
 
     // MARK: - Classic Wallet View (Tab-based)
@@ -2103,6 +1971,347 @@ struct ContentView: View {
             #if os(macOS)
             .frame(maxWidth: 400)
             #endif
+        }
+    }
+}
+
+// MARK: - Cypherpunk Alerts Modifier (breaks up complex type-check expression)
+struct CypherpunkAlertsModifier: ViewModifier {
+    @Binding var showInsufficientDiskSpaceAlert: Bool
+    @Binding var showRepairNeededAlert: Bool
+    @Binding var showSybilAttackAlert: Bool
+    @Binding var showExternalWalletSpendAlert: Bool
+    @Binding var showReducedVerificationAlert: Bool
+    @Binding var showCriticalHealthAlert: Bool
+    @Binding var selectedTab: ContentView.Tab
+    @Binding var showCypherpunkSettings: Bool
+    let availableDiskSpace: String
+    let repairNeededReason: String
+    let healthAlertTitle: String
+    @ObservedObject var walletManager: WalletManager
+    @ObservedObject var networkManager: NetworkManager
+
+    func body(content: Content) -> some View {
+        content
+            .modifier(DiskSpaceAlertModifier(
+                showAlert: $showInsufficientDiskSpaceAlert,
+                availableDiskSpace: availableDiskSpace
+            ))
+            .modifier(RepairNeededAlertModifier(
+                showAlert: $showRepairNeededAlert,
+                selectedTab: $selectedTab,
+                showSettings: $showCypherpunkSettings,
+                repairNeededReason: repairNeededReason
+            ))
+            .modifier(SybilAlertModifier(
+                showAlert: $showSybilAttackAlert,
+                networkManager: networkManager
+            ))
+            .modifier(ExternalSpendAlertModifier(
+                showAlert: $showExternalWalletSpendAlert,
+                networkManager: networkManager
+            ))
+            .modifier(ReducedVerificationAlertModifier(
+                showAlert: $showReducedVerificationAlert,
+                walletManager: walletManager
+            ))
+            .modifier(CriticalHealthAlertModifier(
+                showAlert: $showCriticalHealthAlert,
+                healthAlertTitle: healthAlertTitle,
+                walletManager: walletManager,
+                networkManager: networkManager
+            ))
+            // FIX #409: Watch for critical health alerts
+            .onChange(of: networkManager.criticalHealthAlert != nil) { hasAlert in
+                if hasAlert {
+                    showCriticalHealthAlert = true
+                }
+            }
+    }
+}
+
+// MARK: - Individual Alert Modifiers
+
+struct DiskSpaceAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    let availableDiskSpace: String
+
+    func body(content: Content) -> some View {
+        content
+            .alert("Insufficient Disk Space", isPresented: $showAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.")
+            }
+    }
+}
+
+struct RepairNeededAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    @Binding var selectedTab: ContentView.Tab
+    @Binding var showSettings: Bool
+    let repairNeededReason: String
+
+    func body(content: Content) -> some View {
+        content
+            .alert("⚠️ Database Repair Recommended", isPresented: $showAlert) {
+                Button("Later", role: .cancel) { }
+                Button("Open Settings") {
+                    selectedTab = .settings
+                    showSettings = true
+                }
+            } message: {
+                Text("Your wallet may show an incorrect balance.\n\n\(repairNeededReason)\n\nTo fix this:\n1. Go to Settings\n2. Tap 'Repair Database'\n3. Wait for repair to complete\n\nNote: Tor will be temporarily disabled during repair for faster scanning.\n\nSend is disabled until repair is complete to prevent errors.")
+            }
+    }
+}
+
+struct SybilAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    @ObservedObject var networkManager: NetworkManager
+
+    func body(content: Content) -> some View {
+        content
+            .alert("🚨 Security Alert: Sybil Attack Detected", isPresented: $showAlert) {
+                Button("OK", role: .cancel) {
+                    networkManager.clearSybilAttackAlert()
+                }
+            } message: {
+                if let alert = networkManager.sybilVersionAttackAlert {
+                    Text("Detected \(alert.attackerCount) suspicious peer(s) reporting fake blockchain data.\n\n\(alert.bypassedTor ? "Tor has been temporarily bypassed to connect directly to trusted peers." : "Malicious peers have been banned.")\n\nYour funds are safe. The wallet is using verified peer consensus.\n\n\"Privacy is necessary for an open society in the electronic age.\"\n— A Cypherpunk's Manifesto")
+                } else {
+                    Text("Suspicious network activity detected. Malicious peers have been blocked.")
+                }
+            }
+            .onChange(of: networkManager.sybilVersionAttackAlert != nil) { hasAlert in
+                if hasAlert {
+                    showAlert = true
+                }
+            }
+    }
+}
+
+struct ExternalSpendAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    @ObservedObject var networkManager: NetworkManager
+
+    func body(content: Content) -> some View {
+        content
+            .alert("⚠️ External Wallet Activity Detected", isPresented: $showAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                if let spend = networkManager.externalWalletSpendDetected {
+                    let zcl = Double(spend.amount) / 100_000_000.0
+                    Text("Another wallet is spending your funds!\n\nAmount: \(String(format: "%.8f", zcl)) ZCL\nTxID: \(spend.txid.prefix(16))...\n\nThis transaction was NOT initiated by ZipherX. If you did not authorize this, your private key may be compromised.\n\nSend is temporarily disabled until this transaction confirms.")
+                } else {
+                    Text("External wallet activity detected on your address.")
+                }
+            }
+            .onChange(of: networkManager.externalWalletSpendDetected != nil) { hasSpend in
+                if hasSpend {
+                    showAlert = true
+                }
+            }
+    }
+}
+
+struct ReducedVerificationAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    @ObservedObject var walletManager: WalletManager
+
+    func body(content: Content) -> some View {
+        content
+            .alert("⚠️ Reduced Blockchain Verification", isPresented: $showAlert) {
+                Button("I Accept the Risk", role: .cancel) {
+                    walletManager.clearReducedVerificationAlert()
+                }
+            } message: {
+                if let info = walletManager.reducedVerificationAlert {
+                    Text("""
+                        Only \(info.peerCount) peer(s) connected - insufficient for full consensus verification.
+
+                        Reason: \(info.reason)
+
+                        Your wallet will operate with reduced proof-of-work verification. This is acceptable for most use cases, but provides less protection against sophisticated chain-level attacks.
+
+                        For maximum security, wait for more peers to connect or add trusted peers in Settings.
+
+                        "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy out of their beneficence."
+                        — A Cypherpunk's Manifesto
+                        """)
+                } else {
+                    Text("Insufficient peers for full blockchain verification.")
+                }
+            }
+            .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
+                if hasAlert {
+                    showAlert = true
+                }
+            }
+    }
+}
+
+struct CriticalHealthAlertModifier: ViewModifier {
+    @Binding var showAlert: Bool
+    let healthAlertTitle: String
+    let walletManager: WalletManager
+    let networkManager: NetworkManager
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $showAlert) {
+                HealthAlertSheet(
+                    walletManager: walletManager,
+                    networkManager: networkManager,
+                    isPresented: $showAlert
+                )
+            }
+    }
+}
+
+// MARK: - Health Alert Sheet View
+struct HealthAlertSheet: View {
+    let walletManager: WalletManager
+    let networkManager: NetworkManager
+    @Binding var isPresented: Bool
+    @State private var isProcessing = false
+
+    private var alert: NetworkManager.CriticalHealthAlert? {
+        networkManager.criticalHealthAlert
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header with severity icon
+            headerView
+
+            Divider()
+
+            // Content
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Message
+                    Text(alert?.message ?? "A health issue was detected.")
+                        .font(.body)
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // Reassurance
+                    reassuranceView
+                }
+                .padding()
+            }
+
+            Divider()
+
+            // Action buttons
+            actionButtonsView
+        }
+        #if os(iOS)
+        .background(Color(UIColor.systemBackground))
+        #else
+        .background(Color(NSColor.windowBackgroundColor))
+        #endif
+        #if os(macOS)
+        .frame(minWidth: 400, minHeight: 350)
+        #endif
+    }
+
+    private var headerView: some View {
+        VStack(spacing: 8) {
+            // Severity icon
+            Text(alert?.severity.rawValue ?? "⚠️")
+                .font(.system(size: 50))
+
+            // Title
+            Text(alert?.title ?? "Health Issue")
+                .font(.title2)
+                .fontWeight(.bold)
+                .multilineTextAlignment(.center)
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+        .background(alert?.severity == .critical ? Color.red.opacity(0.1) : Color.orange.opacity(0.1))
+    }
+
+    private var reassuranceView: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "lock.shield.fill")
+                .font(.title2)
+                .foregroundColor(.green)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Your funds are safe")
+                    .font(.headline)
+                    .foregroundColor(.primary)
+                Text("This is a sync issue, not a security problem.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.green.opacity(0.1))
+        .cornerRadius(12)
+    }
+
+    private var actionButtonsView: some View {
+        VStack(spacing: 12) {
+            // Primary action button
+            if let primarySolution = alert?.solutions.first(where: { $0.action != .dismiss }) {
+                Button(action: {
+                    handleAction(primarySolution.action)
+                }) {
+                    HStack {
+                        if isProcessing {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                .scaleEffect(0.8)
+                        }
+                        Text(primarySolution.title)
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+                .disabled(isProcessing)
+            }
+
+            // Dismiss button
+            Button(action: {
+                Task {
+                    await networkManager.handleHealthAlertAction(.dismiss)
+                }
+                isPresented = false
+            }) {
+                Text("Remind Me Later")
+                    .foregroundColor(.secondary)
+            }
+            .disabled(isProcessing)
+        }
+        .padding()
+    }
+
+    private func handleAction(_ action: NetworkManager.CriticalHealthAlert.Solution.ActionType) {
+        isProcessing = true
+        Task {
+            switch action {
+            case .clearHeaders:
+                await networkManager.handleHealthAlertAction(.clearHeaders)
+            case .repairDatabase:
+                try? await walletManager.repairNotesAfterDownloadedTree(onProgress: { _, _, _ in })
+            case .reconnectPeers:
+                await networkManager.handleHealthAlertAction(.reconnectPeers)
+            case .dismiss:
+                break
+            }
+            await MainActor.run {
+                isProcessing = false
+                isPresented = false
+            }
         }
     }
 }

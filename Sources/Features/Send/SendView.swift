@@ -185,12 +185,26 @@ struct SendView: View {
                         .padding(.vertical, 4)
                     }
 
+                    // FIX #410: Show blocked feature warning
+                    if networkManager.isFeatureBlocked(.send) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.red)
+                            Text(networkManager.transactionBlockedReason ?? "Send temporarily disabled")
+                                .font(theme.captionFont)
+                                .foregroundColor(.red)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
                     // Send button
                     System7Button(title: sendButtonTitle) {
                         validateAndConfirm()
                     }
                     // FIX #242: Also disable during catch-up sync
-                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp)
+                    // FIX #360: Also disable during database repair
+                    // FIX #410: Also disable when health check blocks send
+                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send))
                 }
                 .padding()
             }
@@ -572,13 +586,19 @@ struct SendView: View {
     @ViewBuilder
     private var addressValidationText: some View {
         if isAddressTransparent {
-            HStack(spacing: 4) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundColor(theme.errorColor)
-                Text("t-addresses not allowed! ZipherX is z-only.")
-                    .foregroundColor(theme.errorColor)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: "shield.slash")
+                        .foregroundColor(theme.warningColor)
+                    Text("Transparent addresses not yet supported")
+                        .foregroundColor(theme.warningColor)
+                }
+                .font(theme.captionFont)
+                Text("\"Privacy is a right, not a feature.\" — ZipherX is shielded-only.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .italic()
             }
-            .font(theme.captionFont)
         } else if isAddressValid {
             HStack(spacing: 4) {
                 Image(systemName: "checkmark.circle.fill")
@@ -721,14 +741,10 @@ struct SendView: View {
     /// FIX #270: Cypherpunk ethos - Don't disable SEND for external wallet spends
     /// External spends just show a warning, user can still choose to send
     private var hasPendingTransaction: Bool {
-        // FIX #270: External wallet spends show warning but don't disable SEND
-        // Only disable for OUR pending transactions
-        if networkManager.externalWalletSpendDetected != nil {
-            return false  // Show warning but allow sending (cypherpunk ethos)
-        }
-        // Check if WE have a pending outgoing transaction
-        if networkManager.hasPendingMempoolTransaction && networkManager.externalWalletSpendDetected == nil {
-            return true
+        // FIX #301: Only disable SEND for OUR pending transactions, NOT external wallet spends
+        // External spends show a warning but user must be able to quickly move remaining funds
+        if networkManager.hasOurPendingOutgoing {
+            return true  // Disable SEND only for OUR pending transactions
         }
         // Check both mempoolOutgoing and lastSendTimestamp with pending balance
         if networkManager.mempoolOutgoing > 0 {
@@ -748,12 +764,14 @@ struct SendView: View {
         return networkManager.externalWalletSpendDetected != nil
     }
 
-    /// FIX #174: Reason why SEND is disabled (for user display)
+    /// FIX #301: Reason why SEND is disabled (for user display)
+    /// Only shown for OUR pending transactions, not external wallet spends
     private var pendingTransactionMessage: String? {
-        if let reason = networkManager.pendingTransactionReason {
-            return reason
+        // FIX #301: Only show blocking message for OUR pending transactions
+        if networkManager.hasOurPendingOutgoing {
+            return networkManager.pendingTransactionReason ?? "Awaiting confirmation for your transaction"
         }
-        if networkManager.mempoolOutgoing > 0 {
+        if networkManager.mempoolOutgoing > 0 && networkManager.externalWalletSpendDetected == nil {
             return "Awaiting confirmation for your transaction"
         }
         if let lastSend = walletManager.lastSendTimestamp,
@@ -768,6 +786,12 @@ struct SendView: View {
     private var sendButtonTitle: String {
         if isSending {
             return "Sending..."
+        } else if networkManager.isFeatureBlocked(.send) {
+            // FIX #410: Show blocked state
+            return "Unavailable"
+        } else if walletManager.isRepairingHistory {
+            // FIX #360: Show repair state
+            return "Repairing..."
         } else if walletManager.isCatchingUp {
             // FIX #242: Show syncing state
             return "Syncing..."
@@ -789,7 +813,7 @@ struct SendView: View {
         }
 
         guard !isAddressTransparent else {
-            errorMessage = "t-addresses are not supported! ZipherX is fully shielded (z-addresses only)."
+            errorMessage = "Transparent addresses (t-addresses) are not yet supported. ZipherX prioritizes privacy — only shielded z-addresses are currently available.\n\n\"Privacy is necessary for an open society.\" — A Cypherpunk's Manifesto"
             showError = true
             return
         }
@@ -905,13 +929,87 @@ struct SendView: View {
                 // VUL-002: Extract txId from BroadcastResult
                 let broadcastedTxId = broadcastResult.txId
 
-                // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+                // VUL-002 + FIX #245 + FIX #349: Handle mempool verification with peer acceptance fallback
+                // FIX #349: If peers EXPLICITLY rejected, do NOT fallback to peer acceptance!
                 // If peers accepted but mempool check timed out, record TX anyway
                 if !broadcastResult.mempoolVerified {
-                    if broadcastResult.peerCount > 0 {
-                        // FIX #245: Peers accepted but mempool check timed out
-                        print("⚠️ FIX #245 SendView: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
-                        print("📡 FIX #245 SendView: Recording TX anyway - peers accepted it")
+                    if broadcastResult.rejectCount > 0 {
+                        // FIX #349: Peers EXPLICITLY rejected - this is NOT a slow network issue!
+                        print("🚨 FIX #349 SendView: \(broadcastResult.rejectCount) peers REJECTED transaction!")
+                        print("🚨 FIX #349 SendView: txId=\(broadcastedTxId), accepts=\(broadcastResult.peerCount), rejects=\(broadcastResult.rejectCount)")
+                        throw WalletError.transactionFailed("""
+                            🚨 TRANSACTION REJECTED 🚨
+
+                            Your transaction was explicitly rejected by \(broadcastResult.rejectCount) network peer(s). This typically means:
+                            • The transaction anchor is invalid (blockchain state changed)
+                            • A previous transaction already spent these notes
+                            • Network consensus rejected the proof
+
+                            🔒 YOUR FUNDS ARE SAFE
+                            No transaction was recorded in your wallet.
+
+                            💡 WHAT TO DO:
+                            Go to Settings → Repair Database, then try again.
+
+                            📋 TXID (for reference):
+                            \(broadcastedTxId)
+
+                            "Privacy is necessary for an open society."
+                            — A Cypherpunk's Manifesto
+                            """)
+                    } else if broadcastResult.peerCount >= 2 {
+                        // FIX #389 v2: Multiple peers accepted but P2P mempool verification FAILED
+                        // This is a critical error - peers ACK'd but TX is NOT in network mempool
+                        // DO NOT trust peer ACKs - they may have dropped the TX after acknowledging
+                        print("🚨 FIX #389 v2 SendView: \(broadcastResult.peerCount) peers accepted but TX NOT in mempool!")
+                        print("🚨 FIX #389 v2 SendView: txId=\(broadcastedTxId) - broadcast may have failed despite peer ACKs")
+                        throw WalletError.transactionFailed("""
+                            ⚠️ BROADCAST NOT CONFIRMED ⚠️
+
+                            Your transaction was accepted by \(broadcastResult.peerCount) peers but could NOT be verified in the network mempool.
+
+                            Peers may have acknowledged your transaction but dropped it before adding to their mempool. This can happen due to:
+                            • Network propagation issues
+                            • Peers with full mempools
+                            • Temporary network congestion
+
+                            🔒 YOUR FUNDS ARE SAFE
+                            No transaction was recorded in your wallet.
+
+                            💡 WHAT TO DO:
+                            Wait 1-2 minutes, check your balance. If unchanged, try sending again.
+
+                            📋 TXID (for reference):
+                            \(broadcastedTxId)
+
+                            "Privacy is necessary for an open society in the electronic age."
+                            — A Cypherpunk's Manifesto
+                            """)
+                    } else if broadcastResult.peerCount == 1 {
+                        // FIX #389: Only 1 peer accepted AND mempool verification failed
+                        // Single peer may have ACK'd but not actually propagated the TX
+                        print("🚨 FIX #389 SendView: Only 1 peer accepted but TX NOT found in network!")
+                        print("🚨 FIX #389 SendView: txId=\(broadcastedTxId) - single peer acceptance is NOT reliable")
+                        throw WalletError.transactionFailed("""
+                            ⚠️ BROADCAST UNCONFIRMED ⚠️
+
+                            Your transaction was accepted by 1 peer but could NOT be verified in the network mempool. This may indicate:
+                            • The peer acknowledged but dropped the transaction
+                            • Network propagation issues
+                            • The transaction may not have been broadcast successfully
+
+                            🔒 YOUR FUNDS ARE SAFE
+                            No transaction was recorded in your wallet.
+
+                            💡 WHAT TO DO:
+                            Wait a few minutes and check your balance. If unchanged, try sending again.
+
+                            📋 TXID (for reference):
+                            \(broadcastedTxId)
+
+                            "We the Cypherpunks are dedicated to building anonymous systems."
+                            — A Cypherpunk's Manifesto
+                            """)
                     } else {
                         // NO peers accepted AND mempool failed - true rejection
                         print("🚨 VUL-002 SendView: MEMPOOL REJECTED - Not writing to database!")
@@ -935,50 +1033,26 @@ struct SendView: View {
                 }
 
                 if broadcastResult.mempoolVerified {
-                    print("✅ VUL-002 SendView: Mempool VERIFIED - safe to record transaction")
+                    print("✅ VUL-002 SendView: Mempool VERIFIED - TX will be recorded on confirmation")
                 } else {
-                    print("✅ FIX #245 SendView: Peers accepted TX - recording (mempool check was slow)")
+                    print("✅ FIX #245 SendView: Peers accepted TX - will be recorded on confirmation")
                 }
 
-                // Track as pending outgoing
+                // FIX #350: Track as pending outgoing with FULL info for database write on CONFIRMATION
+                // DO NOT write to database here - only when TX is confirmed in a block!
                 let pendingFee: UInt64 = 10_000
-                await networkMgr.trackPendingOutgoing(txid: broadcastedTxId, amount: prepared.amount + pendingFee)
-
-                // Record transaction in database
-                guard let txidData = Data(hexString: broadcastedTxId) else {
-                    throw WalletError.transactionFailed("Invalid transaction ID format")
-                }
-
-                // Mark spent note
-                try WalletDatabase.shared.markNoteSpentByHashedNullifier(
-                    hashedNullifier: prepared.spentNullifier,
-                    txid: txidData,
-                    spentHeight: currentHeight
-                )
-
-                // Record in history
-                _ = try WalletDatabase.shared.insertTransactionHistory(
-                    txid: txidData,
-                    height: currentHeight,
-                    blockTime: UInt64(Date().timeIntervalSince1970),
-                    type: .sent,
-                    value: prepared.amount,
-                    fee: 10_000,
+                let pendingTx = PendingOutgoingTx(
+                    txid: broadcastedTxId,
+                    amount: prepared.amount,
+                    fee: pendingFee,
                     toAddress: prepared.toAddress,
-                    fromDiversifier: nil,
-                    memo: prepared.memo
+                    memo: prepared.memo,
+                    hashedNullifier: prepared.spentNullifier,
+                    rawTxData: prepared.rawTx,
+                    timestamp: Date()
                 )
-
-                // Verify saved
-                let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
-                guard txWasSaved else {
-                    throw WalletError.transactionFailed("Failed to save transaction to database")
-                }
-
-                // Notify UI
-                await MainActor.run {
-                    walletManager.incrementHistoryVersion()
-                }
+                await networkMgr.trackPendingOutgoingFull(pendingTx)
+                print("📤 FIX #350: TX tracked as pending - database write DEFERRED until confirmation")
 
                 // Send notification
                 NotificationManager.shared.notifySent(amount: prepared.amount, txid: broadcastedTxId, memo: prepared.memo)

@@ -285,6 +285,8 @@ public final class NetworkManager: ObservableObject {
     /// FIX #145: Disable background processes (for testing/reset)
     func disableBackgroundProcesses() {
         backgroundProcessesEnabled = false
+        // FIX #409: Stop health monitoring
+        stopHealthMonitoring()
         debugLog(.network, "⏸️ FIX #145: Background processes DISABLED")
     }
 
@@ -325,6 +327,43 @@ public final class NetworkManager: ObservableObject {
     /// FIX #409: Published health alert for UI display
     @Published var criticalHealthAlert: CriticalHealthAlert? = nil
 
+    /// FIX #410: Critical process safety - blocks Send/Receive/Chat when wallet is unsafe
+    @Published public var isSafeToTransact: Bool = true
+    @Published public var transactionBlockedReason: String? = nil
+    @Published public var blockedFeatures: Set<BlockedFeature> = []
+
+    public enum BlockedFeature: String, CaseIterable {
+        case send = "Send"
+        case receive = "Receive"
+        case chat = "Chat"
+    }
+
+    /// FIX #410: Block features with reason
+    @MainActor
+    public func blockFeatures(_ features: Set<BlockedFeature>, reason: String) {
+        blockedFeatures = features
+        transactionBlockedReason = reason
+        isSafeToTransact = features.isEmpty
+        if !features.isEmpty {
+            let featureNames = features.map { $0.rawValue }.joined(separator: ", ")
+            print("🚫 FIX #410: Blocked features [\(featureNames)]: \(reason)")
+        }
+    }
+
+    /// FIX #410: Unblock all features
+    @MainActor
+    public func unblockAllFeatures() {
+        blockedFeatures = []
+        transactionBlockedReason = nil
+        isSafeToTransact = true
+        print("✅ FIX #410: All features unblocked - wallet is safe to transact")
+    }
+
+    /// FIX #410: Check if a specific feature is blocked
+    public func isFeatureBlocked(_ feature: BlockedFeature) -> Bool {
+        blockedFeatures.contains(feature)
+    }
+
     /// FIX #409: Health check timer
     private var healthCheckTimer: Timer?
     private let HEALTH_CHECK_INTERVAL: TimeInterval = 60  // Check every 60 seconds
@@ -338,6 +377,11 @@ public final class NetworkManager: ObservableObject {
             }
         }
         print("🏥 FIX #409: Health monitoring started (interval: \(Int(HEALTH_CHECK_INTERVAL))s)")
+
+        // FIX #410: Run immediate health check on startup
+        Task { @MainActor in
+            await performHealthCheck()
+        }
     }
 
     /// FIX #409: Stop health monitoring
@@ -357,13 +401,23 @@ public final class NetworkManager: ObservableObject {
         let headersBehind = chainHeight > headerStoreHeight ? chainHeight - headerStoreHeight : 0
 
         if headersBehind > 500 {
+            // FIX #410: Block SEND - could cause anchor mismatch or failed proofs
+            blockFeatures([.send], reason: "Wallet sync is behind - transactions may fail")
             criticalHealthAlert = CriticalHealthAlert(
-                title: "Header Sync Issue",
-                message: "Block headers are \(headersBehind) blocks behind. New transactions may not be detected until headers are synced.",
+                title: "Sync Problem Detected",
+                message: """
+                    Your wallet is having trouble staying up to date with the network.
+
+                    What this means:
+                    • You might not see new payments right away
+                    • Sending ZCL is temporarily disabled
+
+                    This is usually caused by a temporary network issue and can be fixed quickly.
+                    """,
                 severity: .critical,
                 solutions: [
-                    .init(title: "Clear & Resync Headers", action: .clearHeaders),
-                    .init(title: "Dismiss", action: .dismiss)
+                    .init(title: "Fix Now (Recommended)", action: .clearHeaders),
+                    .init(title: "Remind Me Later", action: .dismiss)
                 ],
                 timestamp: Date()
             )
@@ -374,13 +428,24 @@ public final class NetworkManager: ObservableObject {
         // Check 2: Peer connectivity
         let readyPeers = peers.filter { $0.isConnectionReady }.count
         if readyPeers == 0 && isConnected {
+            // FIX #410: Block ALL features - no network = no transactions
+            blockFeatures([.send, .receive, .chat], reason: "No network connection")
             criticalHealthAlert = CriticalHealthAlert(
-                title: "No Active Peers",
-                message: "All peer connections have been lost. The wallet cannot sync or broadcast transactions.",
+                title: "Connection Lost",
+                message: """
+                    Your wallet lost its connection to the ZCL network.
+
+                    What this means:
+                    • You cannot send or receive ZCL right now
+                    • Chat is temporarily unavailable
+                    • Your balance is safe - this is just a connection issue
+
+                    Tap "Reconnect" to restore your connection.
+                    """,
                 severity: .critical,
                 solutions: [
-                    .init(title: "Reconnect", action: .reconnectPeers),
-                    .init(title: "Dismiss", action: .dismiss)
+                    .init(title: "Reconnect Now", action: .reconnectPeers),
+                    .init(title: "Remind Me Later", action: .dismiss)
                 ],
                 timestamp: Date()
             )
@@ -391,14 +456,24 @@ public final class NetworkManager: ObservableObject {
         // Check 3: Wallet sync stuck (wallet far behind chain for >5 minutes)
         let walletBehind = chainHeight > walletHeight ? chainHeight - walletHeight : 0
         if walletBehind > 100 && !suppressBackgroundSync {
-            // Only alert if we've been behind for a while (check via timestamp tracking)
+            // FIX #410: Block SEND only - balance may be wrong, could overspend
+            blockFeatures([.send], reason: "Wallet behind network - balance may be outdated")
             criticalHealthAlert = CriticalHealthAlert(
-                title: "Sync Issue",
-                message: "Wallet is \(walletBehind) blocks behind. You may be missing recent transactions.",
+                title: "Wallet Needs Update",
+                message: """
+                    Your wallet fell behind the network by \(walletBehind) blocks.
+
+                    What this means:
+                    • Recent transactions may not appear yet
+                    • Your balance might be outdated
+                    • Sending ZCL is temporarily disabled
+
+                    A quick repair will get everything back in sync.
+                    """,
                 severity: .warning,
                 solutions: [
-                    .init(title: "Repair Database", action: .repairDatabase),
-                    .init(title: "Dismiss", action: .dismiss)
+                    .init(title: "Repair Now (Recommended)", action: .repairDatabase),
+                    .init(title: "Remind Me Later", action: .dismiss)
                 ],
                 timestamp: Date()
             )
@@ -406,10 +481,11 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        // All checks passed - clear any existing alert
-        if criticalHealthAlert != nil {
-            print("✅ FIX #409: Health check passed - clearing previous alert")
+        // All checks passed - clear any existing alert and unblock features
+        if criticalHealthAlert != nil || !blockedFeatures.isEmpty {
+            print("✅ FIX #409/410: Health check passed - clearing alerts and unblocking features")
             criticalHealthAlert = nil
+            unblockAllFeatures()
         }
     }
 

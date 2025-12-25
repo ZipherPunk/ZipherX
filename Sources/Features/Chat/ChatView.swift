@@ -991,8 +991,24 @@ struct ConversationView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
+            // FIX #410: Warning when chat is blocked by health check
+            if networkManager.isFeatureBlocked(.chat) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.red)
+                    Text(networkManager.transactionBlockedReason ?? "Chat temporarily unavailable")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.red)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.red.opacity(0.1))
+            }
+
             // FIX #243: Warning when not enough peers for stable chat
-            if !hasEnoughPeers {
+            if !hasEnoughPeers && !networkManager.isFeatureBlocked(.chat) {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
@@ -1072,8 +1088,9 @@ struct ConversationView: View {
     }
 
     // FIX #243: Can send message only if text is not empty AND enough peers connected
+    // FIX #410: Also check if chat is blocked by health check
     private var canSendMessage: Bool {
-        !messageText.isEmpty && hasEnoughPeers
+        !messageText.isEmpty && hasEnoughPeers && !networkManager.isFeatureBlocked(.chat)
     }
 
     private func sendMessage() {
@@ -2533,8 +2550,22 @@ struct SendViewForPayment: View {
                         .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
                     }
                     .buttonStyle(.plain)
-                    .disabled(isSending || !hasEnoughBalance)
-                    .opacity(isSending || !hasEnoughBalance ? 0.6 : 1.0)
+                    // FIX #410: Also disable when send is blocked by health check
+                    .disabled(isSending || !hasEnoughBalance || networkManager.isFeatureBlocked(.send))
+                    .opacity(isSending || !hasEnoughBalance || networkManager.isFeatureBlocked(.send) ? 0.6 : 1.0)
+
+                    // FIX #410: Show warning when send is blocked
+                    if networkManager.isFeatureBlocked(.send) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.red)
+                            Text(networkManager.transactionBlockedReason ?? "Send temporarily unavailable")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.red)
+                        }
+                        .padding(.top, 8)
+                    }
                 }
                 .padding(20)
             }
