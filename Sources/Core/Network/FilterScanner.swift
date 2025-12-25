@@ -947,8 +947,12 @@ final class FilterScanner {
                 )
 
                 do {
-                    try await withTimeout(seconds: 45) {
-                        try await headerSyncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: min(headersBehind, 500))
+                    // FIX #411: REMOVED limit - sync ALL missing headers
+                    // Headers MUST be 100% synced before processing blocks
+                    // Dynamic timeout: 1 second per 100 headers, minimum 60s, maximum 600s
+                    let dynamicTimeout = max(60, min(600, Int(headersBehind / 100) + 60))
+                    try await withTimeout(seconds: dynamicTimeout) {
+                        try await headerSyncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headersBehind)
                     }
                     let newHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
                     print("✅ FIX #406: Header sync complete, now at height \(newHeaderHeight)")

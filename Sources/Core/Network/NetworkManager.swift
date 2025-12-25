@@ -313,6 +313,7 @@ public final class NetworkManager: ObservableObject {
 
             public enum ActionType: Equatable {
                 case clearHeaders
+                case syncHeaders  // FIX #411: Sync headers instead of clearing (for Tree Root issues)
                 case repairDatabase
                 case reconnectPeers
                 case dismiss
@@ -416,7 +417,8 @@ public final class NetworkManager: ObservableObject {
                     """,
                 severity: .critical,
                 solutions: [
-                    .init(title: "Fix Now (Recommended)", action: .clearHeaders),
+                    // FIX #411: Use syncHeaders instead of clearHeaders - clearing makes it worse!
+                    .init(title: "Sync Now (Recommended)", action: .syncHeaders),
                     .init(title: "Remind Me Later", action: .dismiss)
                 ],
                 timestamp: Date()
@@ -500,6 +502,24 @@ public final class NetworkManager: ObservableObject {
                 print("✅ FIX #409: Headers cleared successfully")
             } catch {
                 print("❌ FIX #409: Failed to clear headers: \(error)")
+            }
+
+        case .syncHeaders:
+            // FIX #411: Sync headers to catch up instead of clearing
+            print("🔧 FIX #411: User chose to sync headers")
+            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            let targetHeight = UInt64(chainHeight)
+            if targetHeight > headerStoreHeight {
+                let gap = targetHeight - headerStoreHeight
+                print("🔧 FIX #411: Syncing \(gap) headers (from \(headerStoreHeight) to \(targetHeight))")
+                let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: self)
+                // Sync ALL missing headers, not just 100
+                do {
+                    try await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
+                    print("✅ FIX #411: Header sync completed")
+                } catch {
+                    print("❌ FIX #411: Header sync failed: \(error)")
+                }
             }
 
         case .repairDatabase:

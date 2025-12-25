@@ -1006,6 +1006,8 @@ struct ContentView: View {
                             let fullStartHasTimestampIssues = fullStartFixableIssues.contains { $0.checkName == "Timestamps" }
                             let fullStartHasHashIssues = fullStartFixableIssues.contains { $0.checkName == "Hash Accuracy" }
                             let fullStartHasBalanceIssues = fullStartFixableIssues.contains { $0.checkName == "Balance Reconciliation" }
+                            // FIX #411: Handle Tree Root Validation issues - headers not synced to lastScannedHeight
+                            let fullStartHasTreeRootIssues = fullStartFixableIssues.contains { $0.checkName == "Tree Root Validation" }
 
                             // FIX #120: Handle Hash Accuracy issues - clear and resync headers
                             if fullStartHasHashIssues {
@@ -1037,9 +1039,26 @@ struct ContentView: View {
                                 }
                             }
 
-                            // FIX #120: Handle Timestamp issues OR Hash issues (both need header sync)
-                            if fullStartHasTimestampIssues || fullStartHasHashIssues {
-                                print("🔧 FIX #120: Syncing headers and timestamps...")
+                            // FIX #120/411: Handle Timestamp, Hash, or Tree Root issues (all need header sync)
+                            if fullStartHasTimestampIssues || fullStartHasHashIssues || fullStartHasTreeRootIssues {
+                                if fullStartHasTreeRootIssues {
+                                    // FIX #411: Tree Root Validation needs headers at lastScannedHeight
+                                    // ensureHeaderTimestamps() only syncs 100 blocks, not enough!
+                                    print("🔧 FIX #411: Tree Root Validation failed - syncing headers to lastScannedHeight...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Syncing headers to lastScanned height...")
+                                    }
+                                    let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                                    let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                                    if lastScanned > headerStoreHeight {
+                                        let gap = lastScanned - headerStoreHeight
+                                        print("🔧 FIX #411: HeaderStore at \(headerStoreHeight), need \(lastScanned), gap=\(gap)")
+                                        let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+                                        try? await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
+                                    }
+                                } else {
+                                    print("🔧 FIX #120: Syncing headers and timestamps...")
+                                }
                                 await MainActor.run {
                                     walletManager.setConnecting(true, status: "Syncing headers...")
                                 }
@@ -1067,10 +1086,23 @@ struct ContentView: View {
                             WalletHealthCheck.shared.printSummary(fullStartVerifyResults)
 
                             let fullStartStillHasIssues = WalletHealthCheck.shared.getFixableIssues(fullStartVerifyResults)
-                            if !fullStartStillHasIssues.isEmpty {
-                                print("⚠️ FULL START: Some issues remain after repair - proceeding anyway")
+                            // FIX #411: FULL START must also block on critical issues like FAST START
+                            let fullStartNonBlockingChecks = ["P2P Connectivity", "Hash Accuracy"]
+                            let fullStartBlockingIssues = fullStartStillHasIssues.filter { !fullStartNonBlockingChecks.contains($0.checkName) }
+
+                            if !fullStartBlockingIssues.isEmpty {
+                                // FIX #411: Stay on sync screen if critical issues remain
+                                print("❌ FULL START: \(fullStartBlockingIssues.count) blocking issues remain after repair!")
+                                for issue in fullStartBlockingIssues {
+                                    print("❌ Remaining issue: \(issue.checkName) - \(issue.details)")
+                                }
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Repair incomplete - please restart app")
+                                }
+                                // Keep showing sync screen - don't proceed to main UI
+                                return
                             } else {
-                                print("✅ FULL START: All issues fixed!")
+                                print("✅ FULL START: All critical issues fixed!")
                             }
                         } else {
                             print("✅ FULL START: All health checks passed!")
@@ -2323,6 +2355,9 @@ struct HealthAlertSheet: View {
             switch action {
             case .clearHeaders:
                 await networkManager.handleHealthAlertAction(.clearHeaders)
+            case .syncHeaders:
+                // FIX #411: Sync headers instead of clearing
+                await networkManager.handleHealthAlertAction(.syncHeaders)
             case .repairDatabase:
                 try? await walletManager.repairNotesAfterDownloadedTree(onProgress: { _, _, _ in })
             case .reconnectPeers:
