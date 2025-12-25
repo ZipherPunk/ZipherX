@@ -174,8 +174,19 @@ struct ContentView: View {
                             // If checkpoint is valid (within 10 blocks of lastScanned), wallet
                             // state is fully verified - skip ALL blocking operations!
                             // ================================================================
-                            if isCheckpointValid {
+
+                            // FIX #408: Verify HeaderStore is healthy before INSTANT START
+                            // Checkpoint proves PAST state was valid, but HeaderStore may have
+                            // become stale. Without healthy headers, new blocks can't be fetched.
+                            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                            let headersBehind = cachedChainHeight > headerStoreHeight ? cachedChainHeight - headerStoreHeight : 0
+                            let isHeaderStoreHealthy = headerStoreHeight > 0 && headersBehind <= 100  // Within 100 blocks
+
+                            print("📍 FIX #408: HeaderStore=\(headerStoreHeight), CachedChain=\(cachedChainHeight), Behind=\(headersBehind)")
+
+                            if isCheckpointValid && isHeaderStoreHealthy {
                                 print("⚡ FIX #168: INSTANT START - checkpoint valid (gap=\(checkpointGap))")
+                                print("⚡ FIX #408: HeaderStore healthy (within \(headersBehind) blocks)")
                                 print("⚡ FIX #168: Skipping peer wait, header sync, and health checks!")
 
                                 // Load cached balance immediately
@@ -204,13 +215,20 @@ struct ContentView: View {
                                     }
                                 }
                                 return  // EXIT - UI is now showing!
+                            } else if isCheckpointValid && !isHeaderStoreHealthy {
+                                // FIX #408: Checkpoint is valid but HeaderStore is stale
+                                // Fall through to REGULAR FAST START which will sync headers
+                                print("⚠️ FIX #408: Checkpoint valid but HeaderStore is \(headersBehind) blocks behind!")
+                                print("⚠️ FIX #408: Falling back to REGULAR FAST START for header sync")
                             }
 
                             // ================================================================
-                            // REGULAR FAST START (checkpoint gap > 10 blocks)
+                            // REGULAR FAST START (checkpoint gap > 10 blocks OR HeaderStore stale)
                             // Need to verify wallet state before showing UI
                             // ================================================================
-                            print("📍 FIX #168: Checkpoint gap >\(checkpointGap) - running verification...")
+                            if !isCheckpointValid {
+                                print("📍 FIX #168: Checkpoint gap >\(checkpointGap) - running verification...")
+                            }
 
                             // FIX #162: Set flag to prevent Views from calling populateHistoryFromNotes()
                             // during FAST START - it would undo any repairs we make
