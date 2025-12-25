@@ -950,7 +950,7 @@ final class FilterScanner {
                     // FIX #411: REMOVED limit - sync ALL missing headers
                     // Headers MUST be 100% synced before processing blocks
                     // Dynamic timeout: 1 second per 100 headers, minimum 60s, maximum 600s
-                    let dynamicTimeout = max(60, min(600, Int(headersBehind / 100) + 60))
+                    let dynamicTimeout = Double(max(60, min(600, Int(headersBehind / 100) + 60)))
                     try await withTimeout(seconds: dynamicTimeout) {
                         try await headerSyncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headersBehind)
                     }
