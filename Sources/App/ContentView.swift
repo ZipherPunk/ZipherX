@@ -504,7 +504,8 @@ struct ContentView: View {
                                             print("🔧 FIX #411: HeaderStore at \(headerStoreHeight), need \(lastScanned), gap=\(gap)")
                                             // Sync headers from headerStoreHeight to at least lastScanned
                                             // maxHeaders = gap + some buffer to ensure we reach lastScanned
-                                            try? await HeaderSyncManager.shared.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
+                                            let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+                                            try? await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
                                         }
                                     } else {
                                         print("🔧 FIX #120: Syncing headers and timestamps...")
