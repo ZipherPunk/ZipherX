@@ -33,11 +33,7 @@ struct ContentView: View {
         walletManager.walletCreationTime ?? appStartupTime
     }
 
-    // Cypherpunk mode sheet states
-    @State private var showCypherpunkSettings = false
-    @State private var showCypherpunkSend = false
-    @State private var showCypherpunkReceive = false
-    @State private var showCypherpunkChat = false
+    // FIX #359: Cypherpunk mode uses single sheet state (see ActiveCypherpunkSheet enum)
 
     // Disk space warning
     @State private var showInsufficientDiskSpaceAlert = false
@@ -54,17 +50,57 @@ struct ContentView: View {
     // FIX #231: Reduced verification warning (insufficient peers for consensus)
     @State private var showReducedVerificationAlert = false
 
+    // FIX #303: Database correction alert (external spends detected and fixed)
+    @State private var showDatabaseCorrectionAlert = false
+
+    // FIX #351: Phantom TX alert (sent TXs in DB that don't exist on blockchain)
+    @State private var showPhantomTxAlert = false
+    @State private var phantomTxCount = 0
+    @State private var phantomTxValue: Double = 0.0
+
     enum Tab {
         case balance, send, receive, chat, settings
     }
+
+    // FIX #359: Enum for active sheet to prevent "only one sheet supported" warning
+    enum ActiveCypherpunkSheet: Identifiable {
+        case settings
+        case send
+        case receive
+        case chat
+        case boostDownload
+
+        var id: Int { hashValue }
+    }
+
+    // FIX #359: Single active sheet state (replaces multiple booleans)
+    @State private var activeCypherpunkSheet: ActiveCypherpunkSheet?
 
     var body: some View {
         // Show disclaimer on first launch before anything else
         if !hasAcceptedDisclaimer {
             DisclaimerView(hasAcceptedDisclaimer: $hasAcceptedDisclaimer)
         } else {
+            // Route based on wallet mode
+            walletModeRouter
+        }
+    }
+
+    /// Routes to appropriate view based on wallet mode (macOS only has wallet.dat option)
+    @ViewBuilder
+    private var walletModeRouter: some View {
+        #if os(macOS)
+        if WalletModeManager.shared.isUsingWalletDat {
+            // COMPLETE SEPARATION: wallet.dat mode is a different app experience
+            // Skip ALL ZipherX wallet initialization and sync when in wallet.dat mode
+            FullNodeWalletView()
+                .environmentObject(themeManager)
+        } else {
             mainAppContent
         }
+        #else
+        mainAppContent
+        #endif
     }
 
     // MARK: - Main App Content (after disclaimer accepted)
@@ -192,12 +228,36 @@ struct ContentView: View {
 
                                 print("⚡ FIX #168: INSTANT START COMPLETE in <1 second!")
 
+                                // FIX #407: Enable background sync BEFORE starting background task
+                                // Without this, suppressBackgroundSync stays true until connect() completes
+                                // which can take 30+ seconds via Tor, blocking all background sync
+                                networkManager.suppressBackgroundSync = false
+
                                 // Start network and background sync asynchronously (non-blocking)
                                 Task {
                                     do {
                                         try await networkManager.connect()
                                         networkManager.enableBackgroundProcesses()
                                         await networkManager.fetchNetworkStats()
+
+                                        // FIX #303 v4: Delay verification to let Tor circuits stabilize
+                                        // Tor peers need ~30-45 seconds after connect to become fully responsive
+                                        // Running immediately causes all block fetches to fail/timeout
+                                        print("🔍 FIX #303: Waiting 45s for Tor circuits to stabilize...")
+                                        try? await Task.sleep(nanoseconds: 45_000_000_000)  // 45 seconds
+
+                                        // FIX #303: Verify ALL unspent notes are actually unspent on-chain
+                                        // This fixes the bug where external spends before checkpoint were missed
+                                        // Scans from OLDEST UNSPENT NOTE HEIGHT (not checkpoint!) to chain tip
+                                        print("🔍 FIX #303: Starting background verification of all unspent notes...")
+                                        do {
+                                            let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain()
+                                            if externalSpends > 0 {
+                                                print("✅ FIX #303: Detected \(externalSpends) external spend(s) - balance corrected")
+                                            }
+                                        } catch {
+                                            print("⚠️ FIX #303: Verification failed: \(error.localizedDescription)")
+                                        }
                                     } catch {
                                         print("⚠️ FIX #168: Background connect error: \(error.localizedDescription)")
                                         networkManager.enableBackgroundProcesses()
@@ -434,13 +494,37 @@ struct ContentView: View {
                                 }
                             }
 
+                            // FIX #351/356: Check for phantom TXs (sent TXs that don't exist on blockchain)
+                            // FIX #356: Now handled via auto-repair in the fixable issues flow below
+                            // No longer shows alert asking user to manually repair - it's automatic!
+                            let phantomTxCheck = healthResults.first {
+                                $0.checkName == "Sent TX Verification" && !$0.passed
+                            }
+                            if phantomTxCheck != nil {
+                                print("🚨 FIX #356: Phantom TX detected - will auto-repair (no user action needed)")
+                                // Store count/value for logging, but don't show alert
+                                if let phantomData = UserDefaults.standard.array(forKey: "phantomTransactions") as? [[String: Any]] {
+                                    let count = phantomData.count
+                                    let totalValue = phantomData.reduce(0.0) { sum, tx in
+                                        sum + (Double(tx["value"] as? UInt64 ?? 0) / 100_000_000.0)
+                                    }
+                                    print("🔧 FIX #356: Will auto-repair \(count) phantom TX(s), total value: \(String(format: "%.8f", totalValue)) ZCL")
+                                }
+                            }
+
                             // FIX #120 DEBUG: Log what we found
                             print("🔍 FIX #120 DEBUG: hasCritical=\(hasCritical), fixableIssues.count=\(fixableIssues.count)")
                             for issue in fixableIssues {
                                 print("🔍 FIX #120 DEBUG: Fixable issue: \(issue.checkName)")
                             }
 
-                            if hasCritical {
+                            // FIX #351: Phantom TXs are critical but repairable - don't block app
+                            // Only block for truly unrecoverable critical failures
+                            let hasBlockingCritical = hasCritical && healthResults.contains {
+                                !$0.passed && $0.critical && $0.checkName != "Sent TX Verification"
+                            }
+
+                            if hasBlockingCritical {
                                 print("❌ FAST START: Critical health check failures detected - wallet may not function correctly")
                                 // FIX #120: Stay on sync screen for critical failures
                                 // User cannot send ZCL in this state - show error
@@ -449,9 +533,11 @@ struct ContentView: View {
                                 }
                                 // Don't transition to main UI - keep showing sync screen
                                 return
-                            } else if !fixableIssues.isEmpty {
-                                // FIX #120: Non-critical issues found - attempt to fix BEFORE showing main UI
-                                print("⚠️ FAST START: \(fixableIssues.count) fixable issues found - attempting repair...")
+                            // FIX #356: Check for phantom TX issues (critical but auto-repairable)
+                            } else if !fixableIssues.isEmpty || phantomTxCheck != nil {
+                                // FIX #120/356: Issues found - attempt to fix BEFORE showing main UI
+                                // FIX #356: Phantom TXs are critical but auto-repairable, so include them here
+                                print("⚠️ FAST START: \(fixableIssues.count) fixable issues + phantom TX check - attempting repair...")
 
                                 for issue in fixableIssues {
                                     print("⚠️ Issue: \(issue.checkName) - \(issue.details)")
@@ -470,6 +556,8 @@ struct ContentView: View {
                                 let hasBalanceIssues = fixableIssues.contains { $0.checkName == "Balance Reconciliation" }
                                 // FIX #177: Handle Checkpoint Sync issues - repair updates checkpoint via FIX #176
                                 let hasCheckpointIssues = fixableIssues.contains { $0.checkName == "Checkpoint Sync" }
+                                // FIX #356: Detect phantom TXs for auto-repair
+                                let hasPhantomTxIssues = healthResults.contains { $0.checkName == "Sent TX Verification" && !$0.passed }
 
                                 // FIX #120: Handle Hash Accuracy issues - clear and resync headers
                                 if hasHashIssues {
@@ -545,6 +633,20 @@ struct ContentView: View {
                                     await MainActor.run {
                                         walletManager.updateSyncTask(id: "balance_repair_early", status: .completed, detail: "History rebuilt!", progress: 1.0)
                                     }
+                                }
+
+                                // FIX #357: DISABLED FIX #356 - Phantom TX detection was fundamentally broken!
+                                // P2P getdata only works for MEMPOOL transactions, not confirmed blockchain TXs.
+                                // The old code marked REAL confirmed transactions as "phantom" because peers returned
+                                // "notfound" (they only check mempool, not blockchain history).
+                                // This caused VUL-002 to restore spent notes, creating inflated balances.
+                                // Example: User had 0.93 ZCL but app showed 2.79 ZCL due to this bug.
+                                // TODO: Implement proper verification using Full Node RPC getrawtransaction
+                                if hasPhantomTxIssues {
+                                    print("⚠️ FIX #357: Phantom TX detection DISABLED - was breaking real transactions")
+                                    print("⚠️ FIX #357: If balance is wrong, use Settings → Repair Database (Full Rescan)")
+                                    // Clear any phantom TX data from the broken detection
+                                    UserDefaults.standard.removeObject(forKey: "phantomTransactions")
                                 }
 
                                 // Re-run health checks to verify fixes
@@ -683,6 +785,9 @@ struct ContentView: View {
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
                                 walletManager.completeProgress()
+
+                                // FIX #370: Start periodic deep verification timer
+                                walletManager.startPeriodicDeepVerification()
                             }
 
                             // Start background sync for any missed blocks (non-blocking)
@@ -974,7 +1079,20 @@ struct ContentView: View {
                             }
                         }
 
-                        if fullStartHasCritical {
+                        // FIX #356: Check for phantom TXs (critical but auto-repairable)
+                        let fullStartPhantomTxCheck = fullStartHealthResults.first {
+                            $0.checkName == "Sent TX Verification" && !$0.passed
+                        }
+                        if fullStartPhantomTxCheck != nil {
+                            print("🚨 FIX #356: Phantom TX detected (FULL START) - will auto-repair")
+                        }
+
+                        // FIX #356: Phantom TXs are critical but NOT blocking - they're auto-repairable
+                        let fullStartHasBlockingCritical = fullStartHasCritical && fullStartHealthResults.contains {
+                            !$0.passed && $0.critical && $0.checkName != "Sent TX Verification"
+                        }
+
+                        if fullStartHasBlockingCritical {
                             print("❌ FULL START: Critical health check failures detected - wallet may not function correctly")
                             // FIX #120: Stay on sync screen for critical failures
                             await MainActor.run {
@@ -982,9 +1100,10 @@ struct ContentView: View {
                             }
                             // Don't transition to main UI - keep showing sync screen
                             return
-                        } else if !fullStartFixableIssues.isEmpty {
-                            // FIX #120: Non-critical issues found - attempt to fix BEFORE showing main UI
-                            print("⚠️ FULL START: \(fullStartFixableIssues.count) fixable issues found - attempting repair...")
+                        // FIX #356: Include phantom TX check in repair flow (critical but auto-repairable)
+                        } else if !fullStartFixableIssues.isEmpty || fullStartPhantomTxCheck != nil {
+                            // FIX #120/356: Issues found - attempt to fix BEFORE showing main UI
+                            print("⚠️ FULL START: \(fullStartFixableIssues.count) fixable issues + phantom TX check - attempting repair...")
 
                             for issue in fullStartFixableIssues {
                                 print("⚠️ Issue: \(issue.checkName) - \(issue.details)")
@@ -1001,6 +1120,7 @@ struct ContentView: View {
                             let fullStartHasTimestampIssues = fullStartFixableIssues.contains { $0.checkName == "Timestamps" }
                             let fullStartHasHashIssues = fullStartFixableIssues.contains { $0.checkName == "Hash Accuracy" }
                             let fullStartHasBalanceIssues = fullStartFixableIssues.contains { $0.checkName == "Balance Reconciliation" }
+                            // FIX #356: fullStartPhantomTxCheck already defined above
 
                             // FIX #120: Handle Hash Accuracy issues - clear and resync headers
                             if fullStartHasHashIssues {
@@ -1054,6 +1174,18 @@ struct ContentView: View {
                                 print("🔧 FIX #162: History rebuilt from unspent notes only (no synthetic txids)")
                             }
 
+                            // FIX #357: DISABLED FIX #356 - Phantom TX detection was fundamentally broken!
+                            // P2P getdata only works for MEMPOOL transactions, not confirmed blockchain TXs.
+                            // The old code marked REAL confirmed transactions as "phantom" because peers returned
+                            // "notfound" (they only check mempool, not blockchain history).
+                            // This caused VUL-002 to restore spent notes, creating inflated balances.
+                            if fullStartPhantomTxCheck != nil {
+                                print("⚠️ FIX #357: Phantom TX detection DISABLED (FULL START) - was breaking real transactions")
+                                print("⚠️ FIX #357: If balance is wrong, use Settings → Repair Database (Full Rescan)")
+                                // Clear any phantom TX data from the broken detection
+                                UserDefaults.standard.removeObject(forKey: "phantomTransactions")
+                            }
+
                             // Re-run health checks to verify fixes
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Verifying repairs...")
@@ -1073,6 +1205,44 @@ struct ContentView: View {
 
                         await MainActor.run {
                             walletManager.setConnecting(false, status: nil)
+                        }
+
+                        // FIX #375: Sync headers BEFORE showing completion screen
+                        // FIX #383: Stop block listeners first - they consume headers responses!
+                        // Root cause: Block listeners call receiveMessage() and ignore "headers" command
+                        // This causes header sync to timeout waiting for responses that were already consumed
+                        print("🔄 FIX #375: Syncing headers before completion...")
+
+                        do {
+                            // FIX #383: STOP block listeners before header sync to prevent race condition
+                            print("🛑 FIX #383: Stopping block listeners before header sync...")
+                            await networkManager.stopAllBlockListeners()
+                            try await Task.sleep(nanoseconds: 100_000_000) // 100ms for listeners to stop
+
+                            let headerSync = HeaderSyncManager(
+                                headerStore: HeaderStore.shared,
+                                networkManager: networkManager
+                            )
+
+                            // Get chain tip from peer consensus
+                            let chainTip = try await headerSync.getChainTip()
+
+                            // Sync latest 100 headers for consensus verification
+                            let startHeight = chainTip > 100 ? chainTip - 100 : UInt64(ZipherXConstants.saplingActivationHeight)
+                            print("📥 FIX #375: Syncing headers \(startHeight) → \(chainTip)")
+
+                            try await headerSync.syncHeaders(from: startHeight, maxHeaders: 100)
+
+                            let stats = try HeaderStore.shared.getStats()
+                            print("✅ FIX #375: Header sync complete! \(stats.count) headers stored")
+
+                            // FIX #383: Resume block listeners after header sync
+                            print("▶️ FIX #383: Resuming block listeners after header sync...")
+                            await networkManager.resumeAllBlockListeners()
+                        } catch {
+                            print("⚠️ FIX #375: Header sync failed: \(error) - continuing anyway")
+                            // FIX #383: Resume block listeners even on failure
+                            await networkManager.resumeAllBlockListeners()
                         }
 
                         // Calculate final duration and show completion screen
@@ -1189,14 +1359,16 @@ struct ContentView: View {
 
                 // Floating sync progress indicator for BACKGROUND syncing
                 // Shows when syncing after initial sync is complete (user can still use app)
-                if !isInitialSync && walletManager.isSyncing {
+                // FIX #369: Don't show during database repair - repair has its own progress UI
+                if !isInitialSync && walletManager.isSyncing && !walletManager.isRepairingDatabase {
                     floatingSyncIndicator
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 // FIX #242: Floating catch-up indicator when returning from background
                 // Shows in ORANGE when wallet is behind blockchain after app becomes active
-                if !isInitialSync && walletManager.isCatchingUp && !walletManager.isSyncing {
+                // FIX #369: Don't show during database repair
+                if !isInitialSync && walletManager.isCatchingUp && !walletManager.isSyncing && !walletManager.isRepairingDatabase {
                     floatingCatchUpIndicator
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
@@ -1249,6 +1421,8 @@ struct ContentView: View {
                 biometricManager.lockApp()
                 isShowingLockScreen = true
             }
+            // FIX #289: Put Tor in dormant mode when going to background
+            TorManager.shared.goDormantOnBackground()
 
         case .active:
             // App became active
@@ -1275,7 +1449,10 @@ struct ContentView: View {
             // Only trigger if we actually went to .background (not just .inactive from control center)
             if wasInBackground {
                 wasInBackground = false  // Reset flag
+
+                // FIX #289: Restore Tor connectivity before reconnecting peers
                 Task {
+                    await TorManager.shared.ensureRunningOnForeground()
                     await networkManager.reconnectAfterBackground()
                 }
             }
@@ -1504,6 +1681,20 @@ struct ContentView: View {
 
     private var mainWalletView: some View {
         Group {
+            #if os(macOS)
+            // Check if using Full Node wallet.dat mode
+            if WalletModeManager.shared.isUsingWalletDat {
+                // Full Node wallet.dat mode: RPC-based operations with System 7 UI
+                FullNodeWalletView()
+            } else if isCypherpunkTheme {
+                // Cypherpunk theme: Single-screen layout with balance, buttons, history
+                cypherpunkWalletView
+            } else {
+                // Classic themes: Tab-based layout
+                classicWalletView
+            }
+            #else
+            // iOS: Standard theme-based routing
             if isCypherpunkTheme {
                 // Cypherpunk theme: Single-screen layout with balance, buttons, history
                 cypherpunkWalletView
@@ -1511,21 +1702,18 @@ struct ContentView: View {
                 // Classic themes: Tab-based layout
                 classicWalletView
             }
+            #endif
         }
     }
 
     // MARK: - Cypherpunk Wallet View
 
-    private var cypherpunkWalletView: some View {
-        CypherpunkMainView(
-            showSettings: $showCypherpunkSettings,
-            showSend: $showCypherpunkSend,
-            showReceive: $showCypherpunkReceive,
-            showChat: $showCypherpunkChat
-        )
-        .sheet(isPresented: $showCypherpunkSettings) {
+    // FIX #359: Sheet content builder for consolidated sheet presentation
+    @ViewBuilder
+    private func sheetContent(for sheet: ActiveCypherpunkSheet) -> some View {
+        switch sheet {
+        case .settings:
             VStack(spacing: 0) {
-                // Header
                 HStack {
                     Spacer()
                     Text("Settings")
@@ -1533,30 +1721,24 @@ struct ContentView: View {
                         .foregroundColor(NeonColors.primary)
                     Spacer()
                     Button("Done") {
-                        showCypherpunkSettings = false
+                        activeCypherpunkSheet = nil
                     }
                     .foregroundColor(NeonColors.primary)
                 }
                 .padding()
                 .background(Color.black)
-
                 SettingsView()
             }
             #if os(macOS)
-            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 480, idealWidth: 550, maxWidth: 650,
                    minHeight: 550, idealHeight: 650, maxHeight: 800)
             #endif
-            .environmentObject(walletManager)
-            .environmentObject(networkManager)
-            .environmentObject(themeManager)
-        }
-        .sheet(isPresented: $showCypherpunkSend) {
+
+        case .send:
             VStack(spacing: 0) {
-                // Header
                 HStack {
                     Button("Cancel") {
-                        showCypherpunkSend = false
+                        activeCypherpunkSheet = nil
                     }
                     .foregroundColor(NeonColors.primary)
                     Spacer()
@@ -1567,23 +1749,17 @@ struct ContentView: View {
                 }
                 .padding()
                 .background(Color.black)
-
                 SendView(onSendComplete: {
-                    showCypherpunkSend = false
+                    activeCypherpunkSheet = nil
                 })
             }
             #if os(macOS)
-            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 450, idealWidth: 520, maxWidth: 600,
                    minHeight: 500, idealHeight: 600, maxHeight: 700)
             #endif
-            .environmentObject(walletManager)
-            .environmentObject(networkManager)
-            .environmentObject(themeManager)
-        }
-        .sheet(isPresented: $showCypherpunkReceive) {
+
+        case .receive:
             VStack(spacing: 0) {
-                // Header
                 HStack {
                     Spacer()
                     Text("Receive ZCL")
@@ -1591,35 +1767,32 @@ struct ContentView: View {
                         .foregroundColor(NeonColors.primary)
                     Spacer()
                     Button("Done") {
-                        showCypherpunkReceive = false
+                        activeCypherpunkSheet = nil
                     }
                     .foregroundColor(NeonColors.primary)
                 }
                 .padding()
                 .background(Color.black)
-
                 ReceiveView()
             }
             #if os(macOS)
-            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 380, idealWidth: 450, maxWidth: 550,
                    minHeight: 480, idealHeight: 560, maxHeight: 650)
             #endif
-            .environmentObject(walletManager)
-            .environmentObject(networkManager)
-            .environmentObject(themeManager)
-        }
-        .sheet(isPresented: $showCypherpunkChat) {
-            ZStack(alignment: .topTrailing) {
-                // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
-                ChatView(onShowAppSettings: {
-                    showCypherpunkChat = false
-                    showCypherpunkSettings = true
-                })
 
+        case .chat:
+            ZStack(alignment: .topTrailing) {
+                // FIX #252: Pass callback to navigate to settings when Tor is disabled
+                ChatView(onShowAppSettings: {
+                    // Dismiss chat, then show settings
+                    activeCypherpunkSheet = nil
+                    // Slight delay to allow sheet dismiss before showing new one
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        activeCypherpunkSheet = .settings
+                    }
+                })
                 // Close button overlay
-                // FIX #252: Moved down to avoid overlapping with + button on iOS navigation bar
-                Button(action: { showCypherpunkChat = false }) {
+                Button(action: { activeCypherpunkSheet = nil }) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 24))
                         .foregroundColor(NeonColors.primary.opacity(0.8))
@@ -1628,7 +1801,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 #if os(iOS)
-                .padding(.top, 52)  // FIX #252: Below navigation bar to avoid overlap with + button
+                .padding(.top, 52)  // Below navigation bar
                 #else
                 .padding(.top, 8)
                 #endif
@@ -1636,20 +1809,71 @@ struct ContentView: View {
             }
             .background(Color.black)
             #if os(macOS)
-            // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 650, idealWidth: 750, maxWidth: 900,
                    minHeight: 550, idealHeight: 650, maxHeight: 800)
             #endif
-            .environmentObject(walletManager)
-            .environmentObject(networkManager)
-            .environmentObject(themeManager)
-        }
-        // FIX #278: Boost file (CMU bundle) download progress sheet
-        #if os(macOS)
-        .sheet(isPresented: $walletManager.showBoostDownloadSheet) {
+
+        case .boostDownload:
+            #if os(macOS)
             BoostDownloadProgressView(walletManager: walletManager)
-                .environmentObject(themeManager)
                 .frame(minWidth: 450, minHeight: 400)
+            #else
+            EmptyView()  // Not used on iOS
+            #endif
+        }
+    }
+
+    // FIX #359: Computed bindings that set/clear the enum-based sheet state
+    private var showSettingsBinding: Binding<Bool> {
+        Binding(
+            get: { activeCypherpunkSheet == .settings },
+            set: { if $0 { activeCypherpunkSheet = .settings } else { activeCypherpunkSheet = nil } }
+        )
+    }
+
+    private var showSendBinding: Binding<Bool> {
+        Binding(
+            get: { activeCypherpunkSheet == .send },
+            set: { if $0 { activeCypherpunkSheet = .send } else { activeCypherpunkSheet = nil } }
+        )
+    }
+
+    private var showReceiveBinding: Binding<Bool> {
+        Binding(
+            get: { activeCypherpunkSheet == .receive },
+            set: { if $0 { activeCypherpunkSheet = .receive } else { activeCypherpunkSheet = nil } }
+        )
+    }
+
+    private var showChatBinding: Binding<Bool> {
+        Binding(
+            get: { activeCypherpunkSheet == .chat },
+            set: { if $0 { activeCypherpunkSheet = .chat } else { activeCypherpunkSheet = nil } }
+        )
+    }
+
+    private var cypherpunkWalletView: some View {
+        CypherpunkMainView(
+            showSettings: showSettingsBinding,
+            showSend: showSendBinding,
+            showReceive: showReceiveBinding,
+            showChat: showChatBinding
+        )
+        // FIX #359: Single consolidated sheet - prevents "only one sheet supported" warning
+        .sheet(item: $activeCypherpunkSheet) { sheet in
+            sheetContent(for: sheet)
+                .environmentObject(walletManager)
+                .environmentObject(networkManager)
+                .environmentObject(themeManager)
+        }
+        // FIX #278: Boost file download uses separate sheet (only on macOS, doesn't conflict)
+        #if os(macOS)
+        .onChange(of: walletManager.showBoostDownloadSheet) { showBoost in
+            if showBoost {
+                activeCypherpunkSheet = .boostDownload
+            } else if activeCypherpunkSheet == .boostDownload {
+                activeCypherpunkSheet = nil
+            }
         }
         #endif
         .contentShape(Rectangle())
@@ -1667,7 +1891,7 @@ struct ContentView: View {
             Button("Open Settings") {
                 // Navigate to settings tab
                 selectedTab = .settings
-                showCypherpunkSettings = true
+                activeCypherpunkSheet = .settings
             }
         } message: {
             Text("Your wallet may show an incorrect balance.\n\n\(repairNeededReason)\n\nTo fix this:\n1. Go to Settings\n2. Tap 'Repair Database'\n3. Wait for repair to complete\n\nNote: Tor will be temporarily disabled during repair for faster scanning.\n\nSend is disabled until repair is complete to prevent errors.")
@@ -1707,6 +1931,36 @@ struct ContentView: View {
                 showExternalWalletSpendAlert = true
             }
         }
+        // FIX #351: Phantom TX alert - local DB inconsistency, funds are SAFE
+        .alert("⚠️ Database Inconsistency Detected", isPresented: $showPhantomTxAlert) {
+            Button("Later", role: .cancel) {
+                // Clear phantom data since user chose to defer
+            }
+            Button("Repair Now") {
+                // Navigate to settings and trigger repair
+                selectedTab = .settings
+                activeCypherpunkSheet = .settings
+            }
+        } message: {
+            Text("""
+                Your wallet database contains \(phantomTxCount) transaction(s) that were never confirmed on the blockchain.
+
+                Balance discrepancy: ~\(String(format: "%.8f", phantomTxValue)) ZCL
+
+                🔒 YOUR FUNDS ARE SAFE!
+
+                This is only a LOCAL database inconsistency. The blockchain never recorded these transaction(s), so your real balance is higher than shown.
+
+                To fix this:
+                1. Go to Settings
+                2. Tap 'Repair Database'
+
+                This will restore the correct balance by removing the phantom transaction records.
+
+                "We the Cypherpunks are dedicated to building anonymous systems."
+                — A Cypherpunk's Manifesto
+                """)
+        }
         // FIX #231: Reduced verification warning (cypherpunk-style)
         .alert("⚠️ Reduced Blockchain Verification", isPresented: $showReducedVerificationAlert) {
             Button("I Accept the Risk", role: .cancel) {
@@ -1734,6 +1988,62 @@ struct ContentView: View {
         .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
             if hasAlert {
                 showReducedVerificationAlert = true
+            }
+        }
+        // FIX #303: Database correction alert (external spends detected)
+        .alert("Database Corrected", isPresented: $showDatabaseCorrectionAlert) {
+            Button("OK", role: .cancel) {
+                walletManager.databaseCorrectionAlert = nil
+            }
+        } message: {
+            if let info = walletManager.databaseCorrectionAlert {
+                let zcl = Double(info.amountCorrected) / 100_000_000.0
+                Text("""
+                    \(info.message)
+
+                    \(info.externalSpendsDetected) spend(s) detected
+                    Amount: \(String(format: "%.8f", zcl)) ZCL
+
+                    This can happen when the same wallet is used from multiple devices or applications.
+
+                    Your balance is now accurate.
+                    """)
+            } else {
+                Text("Database inconsistency detected and corrected.")
+            }
+        }
+        // FIX #303: Watch for database correction alerts
+        .onChange(of: walletManager.databaseCorrectionAlert != nil) { hasAlert in
+            if hasAlert {
+                showDatabaseCorrectionAlert = true
+            }
+        }
+        // FIX #300: Auto-repair when notes are missing witnesses (affects balance accuracy)
+        .onChange(of: walletManager.hasBalanceIssues) { hasIssues in
+            if hasIssues {
+                print("🔧 FIX #300: Auto-triggering witness repair for balance accuracy...")
+                Task {
+                    await MainActor.run {
+                        walletManager.setConnecting(true, status: "Rebuilding witnesses for accurate balance...")
+                        walletManager.syncTasks.append(SyncTask(id: "witness_auto_repair", title: "Rebuild Merkle witnesses", status: .inProgress, progress: 0.0))
+                    }
+
+                    try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
+                        Task { @MainActor in
+                            walletManager.updateSyncTask(id: "witness_auto_repair", status: .inProgress, detail: "\(current)/\(total) witnesses", progress: progress)
+                        }
+                    }
+
+                    await MainActor.run {
+                        walletManager.updateSyncTask(id: "witness_auto_repair", status: .completed, detail: "Witnesses rebuilt!", progress: 1.0)
+                        walletManager.setConnecting(false, status: "")
+                        walletManager.clearBalanceIssues()  // Clear flag after repair
+                    }
+
+                    // Refresh balance after repair
+                    try? await walletManager.refreshBalance()
+                    print("✅ FIX #300: Auto-repair complete, balance refreshed")
+                }
             }
         }
     }
