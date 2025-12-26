@@ -28,7 +28,8 @@ final class WalletDatabase {
     // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
     // WARNING: Only set to true for debugging purposes! Set back to false before release!
     // FIX #226: Re-enabled field-level encryption - AES-GCM-256 active for sensitive fields
-    private static let DEBUG_DISABLE_ENCRYPTION = false
+    // TEMPORARY: Disabled for debugging FIX #375
+    private static let DEBUG_DISABLE_ENCRYPTION = true
 
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
@@ -774,6 +775,74 @@ final class WalletDatabase {
         if sqlite3_exec(db, checkpointTableSql, nil, nil, nil) == SQLITE_OK {
             print("📂 Migration 8: Created checkpoint_history table (FIX #241)")
         }
+
+        // Migration 9: FIX #284 - Add is_preferred column to trusted_peers for Preferred Seeds
+        // Preferred seeds get priority connection and are exempt from parking (not bans)
+        var trustedPeersStmt: OpaquePointer?
+        let trustedPeersPragma = "PRAGMA table_info(trusted_peers);"
+        if sqlite3_prepare_v2(db, trustedPeersPragma, -1, &trustedPeersStmt, nil) == SQLITE_OK {
+            var hasPreferredColumn = false
+            while sqlite3_step(trustedPeersStmt) == SQLITE_ROW {
+                if let columnName = sqlite3_column_text(trustedPeersStmt, 1) {
+                    if String(cString: columnName) == "is_preferred" {
+                        hasPreferredColumn = true
+                        break
+                    }
+                }
+            }
+            sqlite3_finalize(trustedPeersStmt)
+
+            if !hasPreferredColumn {
+                let alterSql = "ALTER TABLE trusted_peers ADD COLUMN is_preferred INTEGER NOT NULL DEFAULT 0;"
+                if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                    print("📂 Migration 9: Added is_preferred column to trusted_peers (FIX #284)")
+
+                    // Seed the preferred seeds table with known good Zclassic nodes
+                    let seedSql = """
+                        INSERT OR IGNORE INTO trusted_peers (host, port, is_preferred, notes)
+                        VALUES
+                        ('140.174.189.3', 8033, 1, 'Preferred seed'),
+                        ('140.174.189.17', 8033, 1, 'Preferred seed'),
+                        ('205.209.104.118', 8033, 1, 'Preferred seed'),
+                        ('95.179.131.117', 8033, 1, 'Preferred seed'),
+                        ('45.77.216.198', 8033, 1, 'Preferred seed');
+                    """
+                    if sqlite3_exec(db, seedSql, nil, nil, nil) == SQLITE_OK {
+                        print("📂 Migration 9: Seeded 5 preferred seeds")
+                    }
+                } else {
+                    print("⚠️ Migration 9: Failed to add is_preferred: \(String(cString: sqlite3_errmsg(db)))")
+                }
+            }
+        }
+
+        // Migration 10: FIX #370 - Add tx_confirmed_checkpoint column to sync_state
+        // This checkpoint ONLY updates when a TX is confirmed (incoming or outgoing).
+        // Used by periodic deep verification to catch missed transactions.
+        // Different from verified_checkpoint_height which updates on every scan.
+        if !syncStateColumns.contains("tx_confirmed_checkpoint") {
+            let alterSql = "ALTER TABLE sync_state ADD COLUMN tx_confirmed_checkpoint INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 10: Added tx_confirmed_checkpoint column to sync_state (FIX #370)")
+
+                // Initialize to current verified_checkpoint if available
+                let initSql = "UPDATE sync_state SET tx_confirmed_checkpoint = verified_checkpoint_height WHERE id = 1;"
+                sqlite3_exec(db, initSql, nil, nil, nil)
+            } else {
+                print("⚠️ Migration 10: Failed to add tx_confirmed_checkpoint: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        // Migration 11: FIX #370 - Add last_deep_verification timestamp to sync_state
+        // Tracks when the last deep verification scan was run
+        if !syncStateColumns.contains("last_deep_verification") {
+            let alterSql = "ALTER TABLE sync_state ADD COLUMN last_deep_verification INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 11: Added last_deep_verification column to sync_state (FIX #370)")
+            } else {
+                print("⚠️ Migration 11: Failed to add last_deep_verification: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
     }
 
     // MARK: - Account Operations
@@ -1370,6 +1439,156 @@ final class WalletDatabase {
         print("📜 Marked note spent at height \(spentHeight) with synthetic txid")
     }
 
+    // MARK: - FIX #291: Atomic Spend + History Recording
+
+    /// FIX #291: ATOMIC transaction for recording sent transactions
+    /// This function wraps both note marking AND history insertion in a single database transaction.
+    /// If either operation fails, BOTH are rolled back - preventing orphaned spent notes or missing history.
+    ///
+    /// CRITICAL: This solves the bug where app crash between markNoteSpent and insertHistory
+    /// would leave notes marked as spent but no history record (lost transaction).
+    ///
+    /// - Parameters:
+    ///   - hashedNullifier: The already-hashed nullifier of the spent note
+    ///   - txid: Transaction ID (32 bytes)
+    ///   - spentHeight: Block height where spend was recorded (may be updated later on confirmation)
+    ///   - amount: Amount sent to recipient (excluding fee)
+    ///   - fee: Transaction fee in zatoshis
+    ///   - toAddress: Recipient z-address
+    ///   - memo: Optional encrypted memo
+    /// - Returns: History record ID if successful
+    /// - Throws: DatabaseError if transaction fails (both operations rolled back)
+    func recordSentTransactionAtomic(
+        hashedNullifier: Data,
+        txid: Data,
+        spentHeight: UInt64,
+        amount: UInt64,
+        fee: UInt64,
+        toAddress: String,
+        memo: String?
+    ) throws -> Int64 {
+        // BEGIN TRANSACTION - both operations must succeed or both fail
+        let beginResult = sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION;", nil, nil, nil)
+        guard beginResult == SQLITE_OK else {
+            throw DatabaseError.transactionFailed("Failed to begin transaction: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        do {
+            // STEP 1: Mark note as spent
+            let updateSql = "UPDATE notes SET is_spent = 1, spent_in_tx = ?, spent_height = ? WHERE nf = ?;"
+
+            var updateStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(updateStmt) }
+
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+            }
+            sqlite3_bind_int64(updateStmt, 2, Int64(spentHeight))
+            hashedNullifier.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+            }
+
+            guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+                throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            let changedRows = sqlite3_changes(db)
+            if changedRows == 0 {
+                throw DatabaseError.updateFailed("No note found with given nullifier")
+            }
+
+            // STEP 2: Insert transaction history
+            let insertSql = """
+                INSERT OR REPLACE INTO transaction_history
+                (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 'pending');
+            """
+
+            var insertStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(insertStmt) }
+
+            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+            txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(insertStmt, 2, Int64(spentHeight))
+            // FIX #291: Use NULL for block_time - will be set when TX is confirmed
+            // Using current time was WRONG because TX isn't mined yet
+            sqlite3_bind_null(insertStmt, 3)
+
+            // VUL-015: Use obfuscated type code
+            let encryptedType = encryptTxType(.sent)
+            sqlite3_bind_text(insertStmt, 4, encryptedType, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(insertStmt, 5, Int64(amount))
+            sqlite3_bind_int64(insertStmt, 6, Int64(fee))
+            sqlite3_bind_text(insertStmt, 7, toAddress, -1, SQLITE_TRANSIENT)
+            if let memo = memo {
+                sqlite3_bind_text(insertStmt, 8, memo, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(insertStmt, 8)
+            }
+
+            guard sqlite3_step(insertStmt) == SQLITE_DONE else {
+                throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            let historyId = sqlite3_last_insert_rowid(db)
+
+            // COMMIT - both operations succeeded
+            let commitResult = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+            guard commitResult == SQLITE_OK else {
+                throw DatabaseError.transactionFailed("Failed to commit: \(String(cString: sqlite3_errmsg(db)))")
+            }
+
+            print("✅ FIX #291: Atomic transaction recorded - note marked spent + history inserted (id=\(historyId))")
+            return historyId
+
+        } catch {
+            // ROLLBACK - something failed, undo everything
+            _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            print("❌ FIX #291: Transaction rolled back due to error: \(error)")
+            throw error
+        }
+    }
+
+    /// FIX #291: Update sent transaction when confirmed in a block
+    /// Updates block_height, block_time, and status from 'pending' to 'confirmed'
+    func updateSentTransactionOnConfirmation(txid: Data, confirmedHeight: UInt64, blockTime: UInt64) throws {
+        let sql = """
+            UPDATE transaction_history
+            SET block_height = ?, block_time = ?, status = 'confirmed'
+            WHERE txid = ? AND tx_type IN ('sent', 'α');
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(confirmedHeight))
+        sqlite3_bind_int64(stmt, 2, Int64(blockTime))
+        txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let changedRows = sqlite3_changes(db)
+        if changedRows > 0 {
+            print("✅ FIX #291: Updated sent TX to confirmed at height \(confirmedHeight)")
+        }
+    }
+
     /// FIX #174: Get note info by nullifier (for external wallet spend detection)
     /// Returns (id: Int64, value: UInt64) if note exists and is unspent, nil otherwise
     /// NOTE: This function expects an UNHASHED nullifier from the blockchain
@@ -1538,8 +1757,37 @@ final class WalletDatabase {
 
     // MARK: - Balance
 
-    /// Get total unspent balance for account
+    /// Get total SPENDABLE balance for account
+    /// FIX #292: Only count notes with valid witnesses (1028 bytes, not all zeros)
+    /// Notes without valid witnesses cannot be spent - don't show them as balance!
     func getBalance(accountId: Int64) throws -> UInt64 {
+        let sql = """
+            SELECT COALESCE(SUM(value), 0) FROM notes
+            WHERE account_id = ?
+            AND is_spent = 0
+            AND witness IS NOT NULL
+            AND LENGTH(witness) >= 1028
+            AND witness != ZEROBLOB(1028);
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// FIX #292: Get total unspent balance INCLUDING notes without witnesses (for diagnostics)
+    /// This shows what balance COULD be available after witness rebuild
+    func getTotalUnspentBalance(accountId: Int64) throws -> UInt64 {
         let sql = "SELECT COALESCE(SUM(value), 0) FROM notes WHERE account_id = ? AND is_spent = 0;"
 
         var stmt: OpaquePointer?
@@ -1555,6 +1803,33 @@ final class WalletDatabase {
         }
 
         return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// FIX #292: Get count and value of notes needing witness rebuild
+    /// Returns (count, totalValue) of notes that exist but cannot be spent yet
+    func getNotesNeedingWitness(accountId: Int64) throws -> (count: Int, value: UInt64) {
+        let sql = """
+            SELECT COUNT(*), COALESCE(SUM(value), 0) FROM notes
+            WHERE account_id = ?
+            AND is_spent = 0
+            AND (witness IS NULL OR LENGTH(witness) < 1028 OR witness = ZEROBLOB(1028));
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return (0, 0)
+        }
+
+        let count = Int(sqlite3_column_int(stmt, 0))
+        let value = UInt64(sqlite3_column_int64(stmt, 1))
+        return (count, value)
     }
 
     // MARK: - Sync State
@@ -1822,6 +2097,87 @@ final class WalletDatabase {
 
         print("🔄 [FIX #241] Rolled back to checkpoint \(checkpointId) at height \(height)")
         return height
+    }
+
+    // MARK: - FIX #370: TX-Confirmed Checkpoint (Deep Verification)
+
+    /// Get the last block height where a transaction was confirmed.
+    /// This is the starting point for periodic deep verification scans.
+    /// Unlike verified_checkpoint_height, this ONLY updates on actual TX confirmations.
+    func getTxConfirmedCheckpoint() throws -> UInt64 {
+        let sql = "SELECT tx_confirmed_checkpoint FROM sync_state WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Update the TX-confirmed checkpoint. Called ONLY when a transaction is confirmed.
+    /// This ensures deep verification catches any missed transactions between confirmations.
+    func updateTxConfirmedCheckpoint(_ height: UInt64) throws {
+        let maxReasonableHeight: UInt64 = 10_000_000
+        guard height <= maxReasonableHeight else {
+            print("🚨 [FIX #370] Refusing to write invalid tx_confirmed_checkpoint: \(height)")
+            return
+        }
+
+        let sql = "UPDATE sync_state SET tx_confirmed_checkpoint = ? WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("✅ [FIX #370] Updated tx_confirmed_checkpoint to height \(height)")
+    }
+
+    /// Get the timestamp of the last deep verification scan
+    func getLastDeepVerificationTime() throws -> Int64 {
+        let sql = "SELECT last_deep_verification FROM sync_state WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return sqlite3_column_int64(stmt, 0)
+    }
+
+    /// Update the last deep verification timestamp
+    func updateLastDeepVerificationTime() throws {
+        let sql = "UPDATE sync_state SET last_deep_verification = strftime('%s', 'now') WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("✅ [FIX #370] Updated last_deep_verification timestamp")
     }
 
     // MARK: - Tree State
@@ -2313,6 +2669,122 @@ final class WalletDatabase {
         }
     }
 
+    /// FIX #360: Unmark ALL notes that were marked spent with boost placeholder txids
+    /// The boost file incorrectly marks some notes as spent. This function restores them.
+    /// Returns the number of notes unmarked and their total value.
+    func unmarkBoostPlaceholderSpentNotes() throws -> (count: Int, totalValue: UInt64) {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // First, get the count and total value of affected notes
+        let countSql = """
+            SELECT COUNT(*), COALESCE(SUM(value), 0) FROM notes
+            WHERE is_spent = 1 AND hex(spent_in_tx) LIKE '626F6F7374%';
+        """
+        // 626F6F7374 = hex for "boost"
+
+        var countStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(countStmt) }
+
+        var count = 0
+        var totalValue: UInt64 = 0
+        if sqlite3_step(countStmt) == SQLITE_ROW {
+            count = Int(sqlite3_column_int(countStmt, 0))
+            totalValue = UInt64(sqlite3_column_int64(countStmt, 1))
+        }
+
+        if count == 0 {
+            return (0, 0)
+        }
+
+        // Now unmark all boost placeholder spent notes
+        let updateSql = """
+            UPDATE notes
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            WHERE is_spent = 1 AND hex(spent_in_tx) LIKE '626F6F7374%';
+        """
+
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+
+        guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let updated = Int(sqlite3_changes(db))
+        print("🔧 FIX #360: Unmarked \(updated) notes with boost placeholder txids (total value: \(Double(totalValue) / 100_000_000) ZCL)")
+
+        return (updated, totalValue)
+    }
+
+    /// FIX #371: Get notes with boost placeholder txids that need real txid resolution
+    /// Returns: [(hashedNullifier, spentHeight)]
+    func getNotesWithBoostPlaceholderTxids() throws -> [(Data, UInt64)] {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // 626F6F7374 = hex for "boost"
+        let sql = """
+            SELECT nf, spent_height FROM notes
+            WHERE is_spent = 1
+            AND hex(spent_in_tx) LIKE '626F6F7374%'
+            AND spent_height IS NOT NULL;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [(Data, UInt64)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let nfPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let nfLen = sqlite3_column_bytes(stmt, 0)
+            let hashedNullifier = Data(bytes: nfPtr, count: Int(nfLen))
+            let spentHeight = UInt64(sqlite3_column_int64(stmt, 1))
+
+            results.append((hashedNullifier, spentHeight))
+        }
+
+        return results
+    }
+
+    /// FIX #371: Update a note's spent_in_tx with the real transaction ID
+    /// Uses hashed nullifier (as stored in database) for lookup
+    func updateNoteSpentTxid(hashedNullifier: Data, realTxid: Data) throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        let sql = "UPDATE notes SET spent_in_tx = ? WHERE nf = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        realTxid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(realTxid.count), nil)
+        }
+        hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     /// VUL-002: Get nullifiers of notes marked as spent in a specific transaction
     func getNullifiersSpentInTx(txid: Data) throws -> [Data] {
         guard db != nil else {
@@ -2392,7 +2864,15 @@ final class WalletDatabase {
                 sqlite3_bind_blob(insertReceivedStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertReceivedStmt, 2, Int64(note.height))
-            sqlite3_bind_null(insertReceivedStmt, 3)
+
+            // FIX #299: Get real block timestamp instead of NULL
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: note.height) {
+                sqlite3_bind_int64(insertReceivedStmt, 3, Int64(timestamp))
+            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: note.height) {
+                sqlite3_bind_int64(insertReceivedStmt, 3, Int64(headerTime))
+            } else {
+                sqlite3_bind_null(insertReceivedStmt, 3)
+            }
 
             let receivedType = encryptTxType(.received)
             sqlite3_bind_text(insertReceivedStmt, 4, receivedType, -1, SQLITE_TRANSIENT)
@@ -2462,16 +2942,19 @@ final class WalletDatabase {
         let defaultFee: UInt64 = 10000
 
         for spentTx in spentTxs {
-            // Look for change outputs (notes received at the same height)
-            // Change notes typically have the same diversifier or received_height == spent_height
+            // FIX #295: Look for change outputs by TXID, not height
+            // Change notes are in the SAME transaction (received_in_tx == spentTx.txid)
+            // Old method using height was fragile - other unrelated notes at same height were counted
             let changeSql = """
                 SELECT COALESCE(SUM(value), 0) FROM notes
-                WHERE received_height = ? AND is_spent = 0;
+                WHERE received_in_tx = ?;
             """
             var changeStmt: OpaquePointer?
             var changeAmount: UInt64 = 0
             if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
-                sqlite3_bind_int64(changeStmt, 1, Int64(spentTx.height))
+                spentTx.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(changeStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
+                }
                 if sqlite3_step(changeStmt) == SQLITE_ROW {
                     changeAmount = UInt64(sqlite3_column_int64(changeStmt, 0))
                 }
@@ -2491,7 +2974,15 @@ final class WalletDatabase {
                 sqlite3_bind_blob(insertSentStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertSentStmt, 2, Int64(spentTx.height))
-            sqlite3_bind_null(insertSentStmt, 3)
+
+            // FIX #299: Get real block timestamp instead of NULL
+            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: spentTx.height) {
+                sqlite3_bind_int64(insertSentStmt, 3, Int64(timestamp))
+            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: spentTx.height) {
+                sqlite3_bind_int64(insertSentStmt, 3, Int64(headerTime))
+            } else {
+                sqlite3_bind_null(insertSentStmt, 3)
+            }
 
             let sentType = encryptTxType(.sent)
             sqlite3_bind_text(insertSentStmt, 4, sentType, -1, SQLITE_TRANSIENT)
@@ -3289,6 +3780,11 @@ final class WalletDatabase {
         }
 
         for (spentTxid, txInfo) in sentTxData {
+            // FIX #373: DO NOT skip boost placeholders - these ARE real spent transactions!
+            // The boost file marks notes as spent at specific heights - these are real spends
+            // Placeholder txid "boost_spent_HEIGHT" will be resolved to real txid by FIX #371
+            // Even before resolution, we should show SENT transactions (amount is correct)
+
             // Find all change outputs: notes received in the same tx (note.txid == spentTxid)
             let changeOutputs = allNotes.filter { $0.txid == spentTxid }
             let totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
@@ -3350,10 +3846,33 @@ final class WalletDatabase {
             sqlite3_finalize(spentStmt)
         }
 
+        // FIX #441: Build a set of spent heights for height-based change detection
+        // Boost file notes have mismatched txids:
+        // - received_in_tx = "boost_2943239" (placeholder)
+        // - spent_in_tx = "B6D7A3..." (real txid from blockchain)
+        // So we need to detect change by HEIGHT when txid contains "boost_"
+        var spentHeights: Set<UInt64> = []
+        for note in allNotes where note.isSpent {
+            if let height = note.spentHeight {
+                spentHeights.insert(height)
+            }
+        }
+
         // PASS 2: Insert RECEIVED and CHANGE transactions for each note
         for note in allNotes {
             // Determine if this is a CHANGE output (received in a tx that we initiated)
-            let isChange = sentTxids.contains(note.txid)
+            // Method 1: Direct txid match (works for real transactions recorded by WalletManager)
+            var isChange = sentTxids.contains(note.txid)
+
+            // FIX #441: Method 2: Height-based match for boost file placeholders
+            // If received_in_tx starts with "boost_", check if received_height matches any spent_height
+            if !isChange && note.txid.starts(with: Data("boost_".utf8)) {
+                isChange = spentHeights.contains(note.receivedHeight)
+                if isChange {
+                    print("📜 FIX #441: Detected change via height match at \(note.receivedHeight)")
+                }
+            }
+
             let txType = isChange ? TransactionType.change : TransactionType.received
 
             var insertStmt: OpaquePointer?
@@ -3877,6 +4396,61 @@ final class WalletDatabase {
         return items
     }
 
+    /// FIX #353: Get the last confirmed transaction (for checkpoint reset after phantom TX removal)
+    /// Returns the most recent transaction that is confirmed (status = 'confirmed')
+    func getLastConfirmedTransaction() throws -> TransactionHistoryItem? {
+        guard db != nil else {
+            print("⚠️ getLastConfirmedTransaction: Database not open")
+            return nil
+        }
+
+        let sql = """
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history
+            WHERE status = 'confirmed' AND block_height > 0
+            ORDER BY block_height DESC
+            LIMIT 1;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else { return nil }
+            let txidLen = sqlite3_column_bytes(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let value = UInt64(sqlite3_column_int64(stmt, 4))
+            let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
+            let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = String(cString: sqlite3_column_text(stmt, 8))
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
+
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            let decodedType = decryptTxType(typeStr)
+
+            return TransactionHistoryItem(
+                txid: txidData,
+                height: height,
+                blockTime: blockTime,
+                type: decodedType,
+                value: value,
+                fee: fee,
+                toAddress: toAddress,
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .confirmed,
+                confirmations: confirmations
+            )
+        }
+
+        return nil
+    }
+
     /// Update confirmations for all transactions based on current chain height
     func updateAllConfirmations(chainHeight: UInt64) throws {
         // For confirmed transactions, calculate confirmations = chainHeight - block_height + 1
@@ -3931,9 +4505,10 @@ final class WalletDatabase {
         let failures: Int
         let isOnion: Bool
         let notes: String?
+        let isPreferred: Bool  // FIX #284: Preferred seeds get priority and are exempt from parking
     }
 
-    /// Get all trusted peers from database, prioritized by success rate
+    /// Get all trusted peers from database, prioritized by preferred status then success rate
     func getTrustedPeers() throws -> [TrustedPeer] {
         guard let db = db else { throw DatabaseError.notOpened }
 
@@ -3941,9 +4516,10 @@ final class WalletDatabase {
         try seedInitialTrustedPeersIfNeeded()
 
         let sql = """
-            SELECT host, port, last_connected, successes, failures, is_onion, notes
+            SELECT host, port, last_connected, successes, failures, is_onion, notes,
+                   COALESCE(is_preferred, 0) as is_preferred
             FROM trusted_peers
-            ORDER BY (successes - failures) DESC, last_connected DESC
+            ORDER BY is_preferred DESC, (successes - failures) DESC, last_connected DESC
         """
 
         var stmt: OpaquePointer?
@@ -3963,6 +4539,7 @@ final class WalletDatabase {
             let isOnion = sqlite3_column_int(stmt, 5) != 0
             let notesPtr = sqlite3_column_text(stmt, 6)
             let notes = notesPtr != nil ? String(cString: notesPtr!) : nil
+            let isPreferred = sqlite3_column_int(stmt, 7) != 0
 
             peers.append(TrustedPeer(
                 host: host,
@@ -3971,7 +4548,8 @@ final class WalletDatabase {
                 successes: successes,
                 failures: failures,
                 isOnion: isOnion,
-                notes: notes
+                notes: notes,
+                isPreferred: isPreferred
             ))
         }
 
@@ -4069,6 +4647,152 @@ final class WalletDatabase {
         sqlite3_bind_int(stmt, 2, Int32(port))
 
         _ = sqlite3_step(stmt)
+    }
+
+    // MARK: - FIX #284: Preferred Seeds Management
+
+    /// Get only preferred seeds (priority connection, exempt from parking)
+    func getPreferredSeeds() throws -> [TrustedPeer] {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            SELECT host, port, last_connected, successes, failures, is_onion, notes, is_preferred
+            FROM trusted_peers
+            WHERE is_preferred = 1
+            ORDER BY (successes - failures) DESC, last_connected DESC
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var peers: [TrustedPeer] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let host = String(cString: sqlite3_column_text(stmt, 0))
+            let port = UInt16(sqlite3_column_int(stmt, 1))
+            let lastConnectedRaw = sqlite3_column_int64(stmt, 2)
+            let lastConnected = lastConnectedRaw > 0 ? Date(timeIntervalSince1970: TimeInterval(lastConnectedRaw)) : nil
+            let successes = Int(sqlite3_column_int(stmt, 3))
+            let failures = Int(sqlite3_column_int(stmt, 4))
+            let isOnion = sqlite3_column_int(stmt, 5) != 0
+            let notesPtr = sqlite3_column_text(stmt, 6)
+            let notes = notesPtr != nil ? String(cString: notesPtr!) : nil
+            let isPreferred = sqlite3_column_int(stmt, 7) != 0
+
+            peers.append(TrustedPeer(
+                host: host,
+                port: port,
+                lastConnected: lastConnected,
+                successes: successes,
+                failures: failures,
+                isOnion: isOnion,
+                notes: notes,
+                isPreferred: isPreferred
+            ))
+        }
+
+        return peers
+    }
+
+    /// Check if a peer is a preferred seed
+    func isPreferredSeed(host: String, port: UInt16 = 8033) -> Bool {
+        guard let db = db else { return false }
+
+        let sql = "SELECT is_preferred FROM trusted_peers WHERE host = ? AND port = ?"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return sqlite3_column_int(stmt, 0) != 0
+        }
+
+        return false
+    }
+
+    /// Promote a peer to preferred seed (called when a parked peer responds OK)
+    func promoteToPreferredSeed(host: String, port: UInt16 = 8033) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // First ensure the peer exists, then update
+        let sql = """
+            INSERT INTO trusted_peers (host, port, is_preferred, notes)
+            VALUES (?, ?, 1, 'Promoted from parked')
+            ON CONFLICT(host, port) DO UPDATE SET
+                is_preferred = 1,
+                notes = COALESCE(notes, 'Promoted from parked')
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("⭐ FIX #284: Promoted \(host):\(port) to preferred seed")
+    }
+
+    /// Demote a peer from preferred to regular (before parking)
+    func demoteFromPreferredSeed(host: String, port: UInt16 = 8033) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            UPDATE trusted_peers
+            SET is_preferred = 0
+            WHERE host = ? AND port = ?
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+
+        _ = sqlite3_step(stmt)
+        print("📉 FIX #284: Demoted \(host):\(port) from preferred seed")
+    }
+
+    /// Set preferred status for a peer
+    func setPreferredSeed(host: String, port: UInt16 = 8033, isPreferred: Bool) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            INSERT INTO trusted_peers (host, port, is_preferred)
+            VALUES (?, ?, ?)
+            ON CONFLICT(host, port) DO UPDATE SET is_preferred = excluded.is_preferred
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(port))
+        sqlite3_bind_int(stmt, 3, isPreferred ? 1 : 0)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
     }
 
     /// Seed initial trusted peers if the table is empty
@@ -4250,6 +4974,7 @@ enum DatabaseError: LocalizedError {
     case queryFailed(String)
     case notOpened
     case notFound(String)  // FIX #241: Checkpoint not found
+    case transactionFailed(String)  // FIX #291: Atomic transaction failed
 
     var errorDescription: String? {
         switch self {
@@ -4275,6 +5000,8 @@ enum DatabaseError: LocalizedError {
             return "Database not opened"
         case .notFound(let msg):
             return "Not found: \(msg)"
+        case .transactionFailed(let msg):
+            return "Transaction failed: \(msg)"
         }
     }
 }
