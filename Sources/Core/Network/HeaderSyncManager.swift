@@ -225,10 +225,22 @@ final class HeaderSyncManager {
         var currentHeight = startHeight
         var failedPeers = Set<String>()
 
-        // FIX #274: Total timeout for header sync (45 seconds max)
-        // Headers are NOT critical for wallet operation - just for timestamps
+        // FIX #377: Dynamic timeout based on headers needed
+        // - Small sync (< 500): 45 seconds (quick catch-up)
+        // - Large sync (500-5000): 120 seconds (more time over Tor)
+        // - Huge sync (> 5000): 300 seconds (first install/reset scenario)
+        // This is critical for SYBIL protection which relies on HeaderStore height
         let syncStartTime = Date()
-        let maxSyncDuration: TimeInterval = 45.0
+        let headersNeeded = chainTip - currentHeight
+        let maxSyncDuration: TimeInterval
+        if headersNeeded < 500 {
+            maxSyncDuration = 45.0
+        } else if headersNeeded < 5000 {
+            maxSyncDuration = 120.0
+        } else {
+            maxSyncDuration = 300.0  // 5 minutes for massive catch-up
+        }
+        print("📊 FIX #377: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
 
         while currentHeight < chainTip {
             // FIX #274: Check total sync timeout
@@ -240,14 +252,17 @@ final class HeaderSyncManager {
             }
 
             // CRITICAL FIX: Get FRESH peers list on each iteration
-            let currentPeers = networkManager.peers.filter { $0.isConnectionReady && !failedPeers.contains($0.host) }
+            // FIX #384: Use PeerManager for centralized peer access
+            let currentPeers = await MainActor.run {
+                PeerManager.shared.getReadyPeers().filter { !failedPeers.contains($0.host) }
+            }
 
             guard let peer = currentPeers.first else {
                 // Wait and retry with refreshed peer list
                 print("⚠️ No ready peers, waiting 2s for reconnection...")
                 try await Task.sleep(nanoseconds: 2_000_000_000)
                 failedPeers.removeAll() // Reset failed peers to retry all
-                let retryPeers = networkManager.peers.filter { $0.isConnectionReady }
+                let retryPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
                 guard !retryPeers.isEmpty else {
                     throw SyncError.insufficientPeers(got: 0, need: 1)
                 }
@@ -260,42 +275,27 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             do {
-                // FIX #274: Reduced timeout from 20s to 8s for faster peer rotation
-                // The inner receiveMessageWithTimeout doesn't actually cancel NWConnection.receive()
-                // This outer timeout ensures we fail fast and try another peer
-                let headers: [ZclassicBlockHeader] = try await withThrowingTaskGroup(of: [ZclassicBlockHeader].self) { group in
-                    group.addTask {
-                        try await peer.withExclusiveAccess {
-                            try await peer.sendMessage(command: "getheaders", payload: payload)
+                // FIX #419: Use withExclusiveAccessTimeout to prevent indefinite hangs
+                // The lock acquisition itself can now timeout, preventing deadlocks
+                // when block listeners are holding the lock for too long
+                let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: 8.0) {
+                    try await peer.sendMessage(command: "getheaders", payload: payload)
 
-                            var receivedHeaders: [ZclassicBlockHeader]?
-                            var attempts = 0
+                    var receivedHeaders: [ZclassicBlockHeader]?
+                    var attempts = 0
 
-                            // FIX #274: Reduced from 3 attempts to 2 for faster rotation
-                            while receivedHeaders == nil && attempts < 2 {
-                                attempts += 1
-                                // FIX #274: Reduced from 10s to 5s per attempt
-                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
-                                if command == "headers" {
-                                    // FIX #133: Use correct starting height from actual locator
-                                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
-                                }
-                            }
-
-                            return receivedHeaders ?? []
+                    // FIX #274: Reduced from 3 attempts to 2 for faster rotation
+                    while receivedHeaders == nil && attempts < 2 {
+                        attempts += 1
+                        // FIX #274: Reduced from 10s to 5s per attempt
+                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
+                        if command == "headers" {
+                            // FIX #133: Use correct starting height from actual locator
+                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
                         }
                     }
 
-                    // FIX #274: Outer timeout reduced from 20s to 8s for faster peer rotation
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: 8_000_000_000)  // 8 seconds max per peer
-                        throw NetworkError.timeout
-                    }
-
-                    // Take first result (either headers or timeout)
-                    let result = try await group.next()!
-                    group.cancelAll()
-                    return result
+                    return receivedHeaders ?? []
                 }
 
                 guard !headers.isEmpty else {
@@ -343,7 +343,8 @@ final class HeaderSyncManager {
     private func syncHeadersParallel(from startHeight: UInt64, to chainTip: UInt64) async throws {
         print("🚀 FIX #141: Using PARALLEL header requests for \(chainTip - startHeight) headers")
 
-        let peers = networkManager.peers.filter { $0.isConnectionReady }
+        // FIX #384: Use PeerManager for centralized peer access
+        let peers = await MainActor.run { PeerManager.shared.getReadyPeers() }
         guard !peers.isEmpty else {
             throw SyncError.insufficientPeers(got: 0, need: 1)
         }
@@ -372,7 +373,8 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             // Get fresh peer list for each batch
-            let currentPeers = networkManager.peers.filter { $0.isConnectionReady }
+            // FIX #384: Use PeerManager for centralized peer access
+            let currentPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
             guard !currentPeers.isEmpty else {
                 print("⚠️ No connected peers, waiting 1s...")
                 try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -574,7 +576,8 @@ final class HeaderSyncManager {
             let peers = try await networkManager.getConnectedPeers(min: minPeers)
             for peer in peers {
                 // SECURITY: Skip banned peers and handle negative heights (malicious peers send Int32 that wraps to negative)
-                guard !networkManager.isPeerBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                let isBanned = await MainActor.run { networkManager.isPeerBanned(peer.host) }
+                guard !isBanned, peer.peerStartHeight > 0 else { continue }
                 let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > 0 {
                     peerHeights.append(h)
@@ -655,7 +658,8 @@ final class HeaderSyncManager {
         let minPeersToTry = 10  // Try at least 10 peers before giving up
 
         // Get ALL available peers for resilience
-        var allPeers = networkManager.peers
+        // FIX #384: Use PeerManager for centralized peer access
+        var allPeers = await MainActor.run { PeerManager.shared.allPeers }
 
         // If we don't have enough peers, try to connect more
         if allPeers.count < minPeersToTry {
@@ -666,15 +670,17 @@ final class HeaderSyncManager {
             // The connect() call initiates connections but they may not be ready yet
             var waitAttempts = 0
             let maxWaitAttempts = 30 // 30 * 0.5s = 15 seconds max
-            while networkManager.peers.count < minPeers && waitAttempts < maxWaitAttempts {
+            var peerCount = await MainActor.run { PeerManager.shared.connectedPeerCount }
+            while peerCount < minPeers && waitAttempts < maxWaitAttempts {
                 try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
                 waitAttempts += 1
+                peerCount = await MainActor.run { PeerManager.shared.connectedPeerCount }
                 if waitAttempts % 4 == 0 { // Log every 2 seconds
-                    print("⏳ Waiting for peers to connect... (\(networkManager.peers.count)/\(minPeers) ready, waited \(waitAttempts / 2)s)")
+                    print("⏳ Waiting for peers to connect... (\(peerCount)/\(minPeers) ready, waited \(waitAttempts / 2)s)")
                 }
             }
 
-            allPeers = networkManager.peers
+            allPeers = await MainActor.run { PeerManager.shared.allPeers }
             print("📡 After waiting: \(allPeers.count) peers connected")
         }
 
@@ -855,44 +861,61 @@ final class HeaderSyncManager {
         var locatorHash: Data?
         var actualLocatorHeight = locatorHeight  // FIX #133: Track actual height used
 
-        // First try: Get from HeaderStore (cached headers)
-        if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
-            locatorHash = lastHeader.blockHash
-            print("📋 Using HeaderStore hash for locator at height \(locatorHeight)")
-        }
+        // FIX #436: CRITICAL - HeaderStore block hashes from boost file are WRONG!
+        // Boost file headers only have 140-byte data, but block hash = SHA256(SHA256(header + varint + solution))
+        // The hash computed from 140 bytes doesn't match any real block, causing peers to return genesis!
+        //
+        // Priority order (SAFEST to least safe):
+        // 1. Checkpoints (hardcoded, verified)
+        // 2. BundledBlockHashes (downloaded from GitHub, contains correct P2P-synced hashes)
+        // 3. HeaderStore (ONLY if synced via P2P with Equihash verification, NOT from boost file)
 
-        // Second try: Get from checkpoints if HeaderStore doesn't have it
-        if locatorHash == nil, let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
-            // Convert checkpoint hex (big-endian display format) to wire format (little-endian)
+        // First try: Checkpoints (most trusted - hardcoded in app)
+        if let checkpointHex = ZclassicCheckpoints.mainnet[locatorHeight] {
             if let hashData = Data(hexString: checkpointHex) {
                 locatorHash = Data(hashData.reversed()) // Reverse to wire format
-                print("📋 Using checkpoint hash for locator at height \(locatorHeight)")
+                print("📋 FIX #436: Using checkpoint hash for locator at height \(locatorHeight)")
             }
         }
 
-        // Third try: Get from BundledBlockHashes (downloaded from GitHub)
+        // Second try: BundledBlockHashes (correct hashes from GitHub)
         if locatorHash == nil {
             let bundledHashes = BundledBlockHashes.shared
             if bundledHashes.isLoaded, let hash = bundledHashes.getBlockHash(at: locatorHeight) {
                 locatorHash = hash  // Already in wire format
-                print("📋 Using BundledBlockHashes hash for locator at height \(locatorHeight)")
+                print("📋 FIX #436: Using BundledBlockHashes for locator at height \(locatorHeight)")
             }
         }
 
-        // FIX #141: Fourth try - Use HIGHEST available header from HeaderStore as locator
-        // This prevents re-syncing thousands of headers we already have!
-        // Only do this if the max height is BEFORE the requested locatorHeight (otherwise First try would have worked)
+        // Third try: HeaderStore - ONLY for heights ABOVE BundledBlockHashes range
+        // FIX #438: Headers above bundled range were P2P-synced with Equihash verification = CORRECT hashes
+        // Headers AT or BELOW bundled range might be from boost file = WRONG hashes (140 bytes only)
         if locatorHash == nil {
-            if let maxStoredHeight = try? headerStore.getLatestHeight(),
-               maxStoredHeight > 0 && maxStoredHeight < locatorHeight {
-                // Check if we have headers close to what we need (within 10000 blocks)
-                // If HeaderStore has height 2938000 and we need 2939409, use 2938000
-                if locatorHeight - maxStoredHeight < 10000 {
-                    if let nearestHeader = try? headerStore.getHeader(at: maxStoredHeight) {
-                        locatorHash = nearestHeader.blockHash
-                        actualLocatorHeight = maxStoredHeight
-                        print("📋 FIX #141: Using HeaderStore MAX height \(maxStoredHeight) as locator (requested \(locatorHeight))")
-                        print("📋 This saves syncing \(locatorHeight - maxStoredHeight) headers we don't have yet")
+            let bundledHashes = BundledBlockHashes.shared
+            let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : 0
+
+            // Only use HeaderStore if locatorHeight is ABOVE the bundled range
+            // These headers were synced via P2P with full Equihash solutions = correct hashes
+            if locatorHeight > bundledEndHeight {
+                if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
+                    locatorHash = lastHeader.blockHash
+                    print("📋 FIX #438: Using HeaderStore for locator at height \(locatorHeight) (above bundled range \(bundledEndHeight))")
+                }
+            }
+        }
+
+        // Fourth try: Find nearest checkpoint or BundledBlockHash BELOW requested height
+        if locatorHash == nil {
+            // Try BundledBlockHashes for nearest available
+            let bundledHashes = BundledBlockHashes.shared
+            if bundledHashes.isLoaded {
+                // BundledBlockHashes has heights up to boost file height
+                let bundledEndHeight = bundledHashes.endHeight
+                if bundledEndHeight > 0 && bundledEndHeight < locatorHeight {
+                    if let hash = bundledHashes.getBlockHash(at: bundledEndHeight) {
+                        locatorHash = hash
+                        actualLocatorHeight = bundledEndHeight
+                        print("📋 FIX #436: Using BundledBlockHashes end height \(bundledEndHeight) as locator")
                     }
                 }
             }
@@ -1104,9 +1127,23 @@ final class HeaderSyncManager {
         var currentHeight = height
         var prevHash: Data?
 
-        // Get previous header's hash if we have it
-        if currentHeight > 0, let prevHeader = try? headerStore.getHeader(at: currentHeight - 1) {
-            prevHash = prevHeader.blockHash
+        // FIX #437 + #438: Use correct hash sources for chain continuity
+        // - BundledBlockHashes: For heights within bundled range (correct hashes from GitHub)
+        // - HeaderStore: For heights ABOVE bundled range (P2P-synced with Equihash = correct hashes)
+        // - NEVER use HeaderStore for heights within bundled range (boost file has wrong hashes)
+        if currentHeight > 0 {
+            let prevHeight = currentHeight - 1
+            let bundledHashes = BundledBlockHashes.shared
+            let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : 0
+
+            if bundledHashes.isLoaded, let bundledHash = bundledHashes.getBlockHash(at: prevHeight) {
+                prevHash = bundledHash
+                print("📋 FIX #437: Using BundledBlockHashes for chain continuity at height \(prevHeight)")
+            } else if prevHeight > bundledEndHeight, let prevHeader = try? headerStore.getHeader(at: prevHeight) {
+                // FIX #438: Only use HeaderStore for heights ABOVE bundled range (P2P synced = correct)
+                prevHash = prevHeader.blockHash
+                print("📋 FIX #438: Using HeaderStore for chain continuity at height \(prevHeight) (above bundled \(bundledEndHeight))")
+            }
         }
 
         let totalHeaders = headers.count
