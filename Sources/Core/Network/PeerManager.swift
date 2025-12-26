@@ -631,13 +631,17 @@ public final class PeerManager: ObservableObject {
     /// FIX #435: Safe access to peers array to prevent EXC_BAD_ACCESS crash
     /// FIX #445: Debounce @Published updates to prevent main thread hang
     public func updatePeerCounts() {
+        // FIX #447: Take a SNAPSHOT of peers array to prevent EXC_BAD_ACCESS
+        // The array can be modified by other threads while we iterate
+        let peerSnapshot = Array(peers)
+
         // Take a snapshot of peer states to avoid race conditions
         // Peer.isConnectionReady accesses NWConnection.state which can change from background threads
         var readyCount = 0
         var torCount = 0
         var onionCount = 0
 
-        for peer in peers {
+        for peer in peerSnapshot {
             // Use try? to safely access connection state (may be nil/deallocated)
             let isReady = peer.isConnectionReady
             if isReady {
