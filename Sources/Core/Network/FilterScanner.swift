@@ -925,6 +925,12 @@ final class FilterScanner {
             let maxHeaderSyncAttempts = 3
             var headersAvailable = false
 
+            // FIX #440: CRITICAL - When HeaderStore is empty (Full Rescan), don't sync from height 1!
+            // Height 1 has PRE-Bubbles Equihash (1344 bytes), we expect POST-Bubbles (400 bytes)
+            // Instead, use BundledBlockHashes end height as the starting point
+            let bundledHashes = BundledBlockHashes.shared
+            let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : UInt64(0)
+
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
                 let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
 
@@ -934,8 +940,20 @@ final class FilterScanner {
                     break
                 }
 
+                // FIX #440: Determine the effective starting height for header sync
+                // If HeaderStore is empty/below bundled range AND BundledBlockHashes is loaded,
+                // start from bundledEndHeight + 1 (post-Bubbles heights only!)
+                let effectiveHeaderHeight: UInt64
+                if headerStoreHeight <= bundledEndHeight && bundledEndHeight > 0 {
+                    effectiveHeaderHeight = bundledEndHeight
+                    print("📋 FIX #440: HeaderStore (\(headerStoreHeight)) <= bundled end (\(bundledEndHeight))")
+                    print("📋 FIX #440: Will sync headers from bundled end + 1 = \(bundledEndHeight + 1)")
+                } else {
+                    effectiveHeaderHeight = headerStoreHeight
+                }
+
                 headerSyncAttempts += 1
-                let headersBehind = targetHeight - headerStoreHeight
+                let headersBehind = targetHeight - effectiveHeaderHeight
                 print("⚠️ FIX #406: HeaderStore (\(headerStoreHeight)) is \(headersBehind) blocks behind target (\(targetHeight))")
                 print("🔄 FIX #406: Syncing headers (attempt \(headerSyncAttempts)/\(maxHeaderSyncAttempts))...")
                 onStatusUpdate?("headers", "Syncing headers (attempt \(headerSyncAttempts))...")
@@ -952,7 +970,8 @@ final class FilterScanner {
                     // Dynamic timeout: 1 second per 100 headers, minimum 60s, maximum 600s
                     let dynamicTimeout = Double(max(60, min(600, Int(headersBehind / 100) + 60)))
                     try await withTimeout(seconds: dynamicTimeout) {
-                        try await headerSyncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headersBehind)
+                        // FIX #440: Use effectiveHeaderHeight + 1 as start, NOT headerStoreHeight + 1
+                        try await headerSyncManager.syncHeaders(from: effectiveHeaderHeight + 1, maxHeaders: headersBehind)
                     }
                     let newHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
                     print("✅ FIX #406: Header sync complete, now at height \(newHeaderHeight)")
@@ -986,18 +1005,18 @@ final class FilterScanner {
 
             // DELTA BUNDLE: Enable collection for outputs AFTER the bundled/downloaded range
             // These outputs will be saved locally for instant witness generation
-            let bundledEndHeight = cmuDataHeight > 0 ? cmuDataHeight : ZipherXConstants.bundledTreeHeight
-            if currentHeight > bundledEndHeight {
+            let deltaBundledEndHeight = cmuDataHeight > 0 ? cmuDataHeight : ZipherXConstants.bundledTreeHeight
+            if currentHeight > deltaBundledEndHeight {
                 deltaCollectionEnabled = true
                 // SMART START: Continue from existing delta if valid, otherwise from boost end
-                if let manifest = DeltaCMUManager.shared.getManifest(), manifest.endHeight >= bundledEndHeight {
+                if let manifest = DeltaCMUManager.shared.getManifest(), manifest.endHeight >= deltaBundledEndHeight {
                     // Delta exists and is valid - continue from where it left off
                     deltaCollectionStartHeight = manifest.endHeight + 1
                     print("📦 DeltaCMU: Continuing from existing delta (height \(manifest.endHeight) → \(currentHeight))")
                 } else {
                     // No delta or invalid - start fresh from boost end
-                    deltaCollectionStartHeight = bundledEndHeight + 1
-                    print("📦 DeltaCMU: Starting fresh from boost end (height \(bundledEndHeight + 1))")
+                    deltaCollectionStartHeight = deltaBundledEndHeight + 1
+                    print("📦 DeltaCMU: Starting fresh from boost end (height \(deltaBundledEndHeight + 1))")
                 }
                 deltaOutputsCollected.removeAll()
 

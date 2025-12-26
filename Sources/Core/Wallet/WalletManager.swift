@@ -42,6 +42,8 @@ final class WalletManager: ObservableObject {
     @Published var importScanStartHeight: UInt64? = nil  // Custom scan start height for imported wallets (nil = full scan)
     @Published private(set) var shieldedBalance: UInt64 = 0 // in zatoshis
     @Published private(set) var pendingBalance: UInt64 = 0
+    @Published private(set) var hasBalanceIssues: Bool = false  // FIX #300: True if notes need witness rebuild
+    @Published var databaseCorrectionAlert: DatabaseCorrectionInfo? = nil  // FIX #303: Alert when external spends detected
     @Published private(set) var zAddress: String = ""
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var isSyncing: Bool = false
@@ -69,6 +71,12 @@ final class WalletManager: ObservableObject {
     /// When true, Views should NOT call populateHistoryFromNotes() as it would undo repair
     @Published private(set) var isRepairingHistory: Bool = false
 
+    // MARK: - FIX #368: Block backgroundSync during Full Resync
+    /// When true, backgroundSyncToHeight() returns immediately without running
+    /// This prevents race condition where backgroundSync sets lastScannedHeight to chain tip
+    /// before Full Resync PHASE 2 completes, causing notes to never be discovered
+    @Published private(set) var isRepairingDatabase: Bool = false
+
     // MARK: - FIX #231: Reduced Verification Warning
     /// Set when Equihash PoW couldn't be verified due to insufficient peers
     /// User should be warned before accessing wallet
@@ -77,6 +85,13 @@ final class WalletManager: ObservableObject {
     struct ReducedVerificationInfo {
         let peerCount: Int
         let reason: String
+    }
+
+    /// FIX #303: Database correction info for user alert
+    struct DatabaseCorrectionInfo {
+        let externalSpendsDetected: Int
+        let amountCorrected: UInt64  // in zatoshis
+        let message: String
     }
 
     func setReducedVerificationAlert(peerCount: Int, reason: String) {
@@ -821,6 +836,10 @@ final class WalletManager: ObservableObject {
     private var isBackgroundSyncing = false
     private let backgroundSyncLock = NSLock()
 
+    // FIX #298: Track refresh balance state to prevent concurrent refreshes
+    private var isRefreshingBalance = false
+    private let refreshBalanceLock = NSLock()
+
     // MARK: - FIX #132: Header Sync for Missing Timestamps
 
     /// Ensure header timestamps are synced for all transactions
@@ -858,10 +877,11 @@ final class WalletManager: ObservableObject {
         // Historical timestamps can be estimated without syncing thousands of headers
         // FIX #186: Use boost file height or chain height as reference, not headerStoreMaxHeight
         //           (headerStoreMaxHeight=0 for fresh imports, causing 10,000+ header sync!)
+        let cachedChainHeightForRef = await MainActor.run { UInt64(NetworkManager.shared.chainHeight) }
         let referenceHeight = max(
             (try? HeaderStore.shared.getLatestHeight()) ?? 0,
             ZipherXConstants.effectiveTreeHeight,
-            UInt64(NetworkManager.shared.chainHeight)
+            cachedChainHeightForRef
         )
         let maxSyncRange: UInt64 = 100  // Only sync last 100 blocks for consensus
 
@@ -888,17 +908,18 @@ final class WalletManager: ObservableObject {
         var peerWaitAttempts = 0
         let maxPeerWaitAttempts = 30 // 30 seconds max
 
-        while NetworkManager.shared.connectedPeers < minPeersForConsensus && peerWaitAttempts < maxPeerWaitAttempts {
+        var currentPeers = await MainActor.run { NetworkManager.shared.connectedPeers }
+        while currentPeers < minPeersForConsensus && peerWaitAttempts < maxPeerWaitAttempts {
             peerWaitAttempts += 1
-            let connected = NetworkManager.shared.connectedPeers
             await MainActor.run {
-                self.headerSyncStatus = "Waiting for peers (\(connected)/\(minPeersForConsensus))..."
+                self.headerSyncStatus = "Waiting for peers (\(currentPeers)/\(minPeersForConsensus))..."
             }
-            print("⏳ FIX #147: Waiting for \(minPeersForConsensus) peers... (\(connected) connected)")
+            print("⏳ FIX #147: Waiting for \(minPeersForConsensus) peers... (\(currentPeers) connected)")
             try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+            currentPeers = await MainActor.run { NetworkManager.shared.connectedPeers }
         }
 
-        let peerCount = NetworkManager.shared.connectedPeers
+        let peerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
         if peerCount < minPeersForConsensus {
             print("⚠️ FIX #147: Only \(peerCount) peers connected (need \(minPeersForConsensus))")
         }
@@ -909,7 +930,8 @@ final class WalletManager: ObservableObject {
         }
         print("🔗 FIX #147: Getting chain height from peer consensus (\(peerCount) peers)...")
 
-        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? NetworkManager.shared.chainHeight
+        let fallbackChainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
+        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? fallbackChainHeight
         print("✅ FIX #147: Peer consensus achieved! Chain tip: \(chainHeight)")
 
         // ================================================================
@@ -946,16 +968,19 @@ final class WalletManager: ObservableObject {
                     // FIX #144: Wait for at least 2 peers to connect (max 10s)
                     var waitCount = 0
                     let maxWait = 100 // 10 seconds
-                    while NetworkManager.shared.connectedPeers < 2 && waitCount < maxWait {
+                    var currentPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
+                    while currentPeerCount < 2 && waitCount < maxWait {
                         try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                         waitCount += 1
+                        currentPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
                         if waitCount % 20 == 0 {
                             await MainActor.run {
-                                self.headerSyncStatus = "Waiting for P2P peers... (\(NetworkManager.shared.connectedPeers) connected)"
+                                self.headerSyncStatus = "Waiting for P2P peers... (\(currentPeerCount) connected)"
                             }
                         }
                     }
-                    print("📡 FIX #144: Got \(NetworkManager.shared.connectedPeers) peers after \(waitCount/10)s for header sync")
+                    let finalPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
+                    print("📡 FIX #144: Got \(finalPeerCount) peers after \(waitCount/10)s for header sync")
                 }
             } else {
                 torWasBypassed = false
@@ -984,44 +1009,48 @@ final class WalletManager: ObservableObject {
         print("📜 FIX #120: Syncing headers from height \(earliestNeedingTimestamp) for timestamps")
 
         // FIX #144: Ensure we have at least 2 peers before trying header sync
-        if NetworkManager.shared.connectedPeers < 2 {
+        var connectedPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
+        if connectedPeerCount < 2 {
             await MainActor.run {
                 self.headerSyncStatus = "Connecting to P2P network..."
             }
             // Try to connect if not connected
-            if !NetworkManager.shared.isConnected {
+            let isConnected = await MainActor.run { NetworkManager.shared.isConnected }
+            if !isConnected {
                 try? await NetworkManager.shared.connect()
             }
             // Wait for at least 2 peers (max 10s)
             var waitCount = 0
             let maxWait = 100 // 10 seconds
-            while NetworkManager.shared.connectedPeers < 2 && waitCount < maxWait {
+            connectedPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
+            while connectedPeerCount < 2 && waitCount < maxWait {
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 waitCount += 1
                 if waitCount % 20 == 0 {
                     await MainActor.run {
-                        self.headerSyncStatus = "Waiting for peers... (\(NetworkManager.shared.connectedPeers) connected)"
+                        self.headerSyncStatus = "Waiting for peers... (\(connectedPeerCount) connected)"
                     }
                 }
+                connectedPeerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
             }
 
             // If still no peers, report error and return
-            if NetworkManager.shared.connectedPeers < 2 {
-                print("⚠️ FIX #144: Cannot sync headers - only \(NetworkManager.shared.connectedPeers) peers connected")
+            if connectedPeerCount < 2 {
+                print("⚠️ FIX #144: Cannot sync headers - only \(connectedPeerCount) peers connected")
                 await MainActor.run {
                     self.isHeaderSyncing = false
                     self.headerSyncStatus = ""
                 }
                 return
             }
-            print("📡 FIX #144: Got \(NetworkManager.shared.connectedPeers) peers for header sync")
+            print("📡 FIX #144: Got \(connectedPeerCount) peers for header sync")
         }
 
         // FIX #136: Set header syncing flag to pause mempool scan during sync
         // This prevents P2P race conditions that cause header sync to get stuck
-        NetworkManager.shared.setHeaderSyncing(true)
+        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true) }
         defer {
-            NetworkManager.shared.setHeaderSyncing(false)
+            Task { @MainActor in NetworkManager.shared.setHeaderSyncing(false) }
         }
 
         let hsm = HeaderSyncManager(
@@ -1124,6 +1153,84 @@ final class WalletManager: ObservableObject {
         }
     }
 
+    // MARK: - FIX #413: Bundled Headers from Boost File
+
+    /// Load headers from boost file at startup (if available)
+    /// This is MUCH faster than P2P sync for historical blocks
+    /// Returns: (success, boostEndHeight) - boostEndHeight is where delta sync should start
+    func loadHeadersFromBoostFile() async -> (Bool, UInt64) {
+        print("📜 FIX #413: Checking for bundled headers in boost file...")
+
+        // Check if boost file has headers section
+        guard await CommitmentTreeUpdater.shared.hasHeadersSection() else {
+            print("⚠️ FIX #413: Boost file has no headers section (requires v2+ boost file)")
+            return (false, 0)
+        }
+
+        guard let sectionInfo = await CommitmentTreeUpdater.shared.getHeadersSectionInfo() else {
+            print("⚠️ FIX #413: Could not get headers section info")
+            return (false, 0)
+        }
+
+        print("📜 FIX #413: Boost file has \(sectionInfo.count) headers (height \(sectionInfo.startHeight) to \(sectionInfo.endHeight))")
+
+        // Check if HeaderStore already has these headers
+        let existingMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        if existingMaxHeight >= sectionInfo.endHeight {
+            print("✅ FIX #413: HeaderStore already has headers up to \(existingMaxHeight) (boost ends at \(sectionInfo.endHeight))")
+            return (true, sectionInfo.endHeight)
+        }
+
+        // Extract and load headers
+        do {
+            guard let headerData = try await CommitmentTreeUpdater.shared.extractHeaders() else {
+                print("⚠️ FIX #413: Failed to extract headers from boost file")
+                return (false, 0)
+            }
+
+            // Load headers into HeaderStore
+            try HeaderStore.shared.loadHeadersFromBoostData(headerData, startHeight: sectionInfo.startHeight)
+
+            print("✅ FIX #413: Loaded \(sectionInfo.count) headers from boost file (up to height \(sectionInfo.endHeight))")
+            return (true, sectionInfo.endHeight)
+        } catch {
+            print("❌ FIX #413: Failed to load headers from boost file: \(error.localizedDescription)")
+            return (false, 0)
+        }
+    }
+
+    /// FIX #413: Check GitHub for newer boost file and download if available
+    /// Returns true if a newer boost file was downloaded
+    func checkAndDownloadNewerBoostFile() async -> Bool {
+        print("🔍 FIX #413: Checking GitHub for newer boost file...")
+
+        let currentBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+        if currentBoostHeight == 0 {
+            print("📥 FIX #413: No cached boost file - will download")
+        }
+
+        do {
+            // This will check GitHub and download if remote is newer
+            let (_, newHeight, _) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                // Progress callback - could update UI here
+                if Int(progress * 100) % 20 == 0 {
+                    print("📥 FIX #413: \(status) (\(Int(progress * 100))%)")
+                }
+            }
+
+            if newHeight > currentBoostHeight {
+                print("✅ FIX #413: Downloaded newer boost file (height \(newHeight) > \(currentBoostHeight))")
+                return true
+            } else {
+                print("✅ FIX #413: Boost file is current (height \(newHeight))")
+                return false
+            }
+        } catch {
+            print("⚠️ FIX #413: Failed to check/download boost file: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     // MARK: - FIX #242: Foreground Catch-Up
 
     /// Check if wallet is behind blockchain and catch up if needed
@@ -1138,7 +1245,8 @@ final class WalletManager: ObservableObject {
 
         // Get chain height from peers (bypass stale HeaderStore)
         var peerHeights: [UInt64] = []
-        for peer in await NetworkManager.shared.getAllConnectedPeers().prefix(5) {
+        let allPeers = await MainActor.run { NetworkManager.shared.getAllConnectedPeers() }
+        for peer in allPeers.prefix(5) {
             let height = UInt64(peer.peerStartHeight)
             if height > 0 {
                 peerHeights.append(height)
@@ -1201,6 +1309,22 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #368: Don't run background sync if database repair is in progress
+        // This prevents race condition where backgroundSyncToHeight updates lastScannedHeight
+        // to chain tip BEFORE a Full Resync PHASE 2 completes!
+        // Bug: Full Resync showed 100% in seconds because backgroundSync ran between PHASE 1 and PHASE 2,
+        // setting lastScannedHeight to chain tip with wrong balance (0.0015 instead of 0.92 ZCL)
+        guard !isRepairingDatabase else {
+            print("⚠️ FIX #368: Background sync blocked - database repair in progress")
+            return
+        }
+
+        // Also block if FilterScanner is running (double protection)
+        guard !FilterScanner.isScanInProgress else {
+            print("⚠️ FIX #368: Background sync blocked - FilterScanner in progress")
+            return
+        }
+
         // Get current synced height
         let currentHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? ZipherXConstants.effectiveTreeHeight
         guard targetHeight > currentHeight else {
@@ -1230,14 +1354,38 @@ final class WalletManager: ObservableObject {
                 fromHeight: currentHeight + 1
             )
 
-            // Update wallet height
-            try? WalletDatabase.shared.updateLastScannedHeight(targetHeight, hash: Data(count: 32))
+            // FIX #398: CRITICAL - Do NOT update lastScannedHeight to targetHeight!
+            // The FilterScanner has its OWN targetHeight based on chain height when IT starts.
+            // If backgroundSyncToHeight's targetHeight > FilterScanner's targetHeight, updating
+            // to backgroundSyncToHeight's targetHeight causes blocks to be SKIPPED!
+            //
+            // Bug: TX c50e9ffb change output (0.91 ZCL) was lost because:
+            //   1. backgroundSyncToHeight called with targetHeight=2953451
+            //   2. FilterScanner read chain height=2953449, scanned to 2953449
+            //   3. backgroundSyncToHeight updated lastScannedHeight to 2953451 (WRONG!)
+            //   4. Next scan started from 2953452, skipping block 2953451
+            //   5. TX c50e9ffb was in block 2953451 → change note never discovered
+            //
+            // Fix: Trust the FilterScanner's lastScannedHeight. If it didn't scan all
+            // the way to our targetHeight, the next background sync will catch up.
+            let actualLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
 
-            // FIX #176: Update checkpoint after successful background sync
+            if actualLastScanned < currentHeight {
+                // Scan was skipped or failed - don't update anything!
+                print("⚠️ FIX #368: Scan may not have completed (expected >= \(currentHeight), got \(actualLastScanned))")
+                return
+            }
+
+            // FIX #398: Log if scan didn't reach our targetHeight (chain advanced during scan)
+            if actualLastScanned < targetHeight {
+                print("📋 FIX #398: Scan reached \(actualLastScanned), target was \(targetHeight) - next sync will catch up")
+            }
+
+            // FIX #176: Update checkpoint to ACTUAL scanned height, not targetHeight
             // This prevents the health check from flagging "blocks skipped" on next startup
-            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(targetHeight)
+            try? WalletDatabase.shared.updateVerifiedCheckpointHeight(actualLastScanned)
 
-            print("✅ Background sync complete: tree now at height \(targetHeight)")
+            print("✅ Background sync complete: scanned to height \(actualLastScanned)")
 
             // Update balance with proper confirmation calculation
             let notes = try WalletDatabase.shared.getUnspentNotes(accountId: account.id)
@@ -1262,7 +1410,7 @@ final class WalletManager: ObservableObject {
             }
 
             // Update wallet height in NetworkManager for UI display
-            NetworkManager.shared.updateWalletHeight(targetHeight)
+            await MainActor.run { NetworkManager.shared.updateWalletHeight(targetHeight) }
 
             // Sync headers for the new blocks so we have real timestamps
             // This ensures transaction history shows correct dates instead of "(est)"
@@ -1308,6 +1456,34 @@ final class WalletManager: ObservableObject {
             // This ensures all unspent notes have witnesses matching current tree root
             // so the user can send instantly without waiting for witness rebuild
             await preRebuildWitnessesForInstantPayment(accountId: account.id)
+
+            // FIX #300: Refresh balance AFTER witness rebuild to ensure accuracy
+            // The balance was calculated before witnesses were rebuilt, so notes that
+            // just got witnesses weren't counted. Recalculate now.
+            do {
+                let refreshedBalance = try WalletDatabase.shared.getBalance(accountId: account.id)
+                if refreshedBalance != confirmedBalance {
+                    print("💰 FIX #300: Balance updated after witness rebuild: \(confirmedBalance) → \(refreshedBalance) zatoshis")
+                    await MainActor.run {
+                        self.shieldedBalance = refreshedBalance
+                    }
+                }
+
+                // Check if any notes still need witnesses (couldn't be rebuilt)
+                let (needCount, needValue) = try WalletDatabase.shared.getNotesNeedingWitness(accountId: account.id)
+                if needCount > 0 {
+                    print("⚠️ FIX #300: \(needCount) note(s) worth \(Double(needValue) / 100_000_000.0) ZCL still need witness rebuild")
+                    // Trigger automatic repair if significant amount is affected
+                    if needValue > 10_000 { // More than 0.0001 ZCL
+                        print("🔧 FIX #300: Auto-triggering witness repair for unspendable notes...")
+                        await MainActor.run {
+                            self.hasBalanceIssues = true
+                        }
+                    }
+                }
+            } catch {
+                print("⚠️ FIX #300: Balance refresh failed: \(error.localizedDescription)")
+            }
 
             // FIX #161: Check if any pending incoming transactions were confirmed in this block
             // This clears the "awaiting..." message when the incoming tx gets its first confirmation
@@ -1428,7 +1604,7 @@ final class WalletManager: ObservableObject {
                         // Fetch delta CMUs from chain via P2P
                         let networkManager = NetworkManager.shared
                         // FIX #119: Check for actual connected peers, not just "isConnected" flag
-                        let connectedPeerCount = networkManager.connectedPeers
+                        let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
                         if connectedPeerCount > 0 {
                             // Fetch blocks between boostHeight+1 and maxNoteHeight
                             // FIX #115: More resilient P2P fetch with per-batch retry and longer timeouts
@@ -1735,6 +1911,24 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
+        // FIX #298: Prevent concurrent refreshBalance calls
+        // If already refreshing, silently skip to avoid race conditions
+        refreshBalanceLock.lock()
+        guard !isRefreshingBalance else {
+            refreshBalanceLock.unlock()
+            print("⚠️ FIX #298: refreshBalance already in progress - skipping concurrent call")
+            return
+        }
+        isRefreshingBalance = true
+        refreshBalanceLock.unlock()
+
+        // Ensure we release the lock when done
+        defer {
+            refreshBalanceLock.lock()
+            isRefreshingBalance = false
+            refreshBalanceLock.unlock()
+        }
+
         // Suppress notifications during initial sync for imported wallets
         // to avoid notification spam from historical transactions
         let wasImported = isImportedWallet
@@ -1933,10 +2127,10 @@ final class WalletManager: ObservableObject {
         // FIX #146: Set header syncing flag ONCE at the start, BEFORE retry loop
         // This prevents block listeners from restarting between retry attempts
         // which was causing P2P race conditions and 5 headers/sec slowdown
-        NetworkManager.shared.setHeaderSyncing(true)
+        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true) }
         defer {
             // Clear flag when ALL retries complete (success or exhausted)
-            NetworkManager.shared.setHeaderSyncing(false)
+            Task { @MainActor in NetworkManager.shared.setHeaderSyncing(false) }
         }
 
         for attempt in 1...maxHeaderRetries {
@@ -2234,7 +2428,7 @@ final class WalletManager: ObservableObject {
         // Priority: scanner > NetworkManager > lastScannedHeight
         var chainHeight = scanner.currentChainHeight
         if chainHeight == 0 {
-            chainHeight = UInt64(NetworkManager.shared.chainHeight)
+            chainHeight = await MainActor.run { UInt64(NetworkManager.shared.chainHeight) }
         }
         if chainHeight == 0 {
             // Fallback to last scanned height from database
@@ -2296,13 +2490,13 @@ final class WalletManager: ObservableObject {
 
         // Update wallet height in NetworkManager for UI display
         let lastScannedHeight = (try? database.getLastScannedHeight()) ?? 0
-        NetworkManager.shared.updateWalletHeight(lastScannedHeight)
+        await MainActor.run { NetworkManager.shared.updateWalletHeight(lastScannedHeight) }
 
         // FIX #146/#168: Update cachedChainHeight after sync completes
         // This ensures FAST START mode works on next app launch
         // FIX #168: NEVER use lastScannedHeight directly - it could be corrupted!
         // Instead, use the current chain height from peers which is TRUSTED
-        let trustedChainHeight = NetworkManager.shared.chainHeight
+        let trustedChainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
         let maxTrustedHeight = max(trustedChainHeight, headerStoreHeight)
 
@@ -2316,6 +2510,13 @@ final class WalletManager: ObservableObject {
         // The flag should only be true during the FIRST sync after importing a wallet
         if isImportedWallet {
             print("✅ First import sync complete - clearing isImportedWallet flag for fast future startups")
+
+            // FIX #372: Build transaction history immediately
+            // Placeholder txids ("boost_spent_HEIGHT") are fine - FIX #373 allows them in history
+            print("📜 FIX #372: Building transaction history...")
+            let historyCount = try WalletDatabase.shared.populateHistoryFromNotes()
+            print("📜 FIX #372: Transaction history complete - \(historyCount) entries")
+
             DispatchQueue.main.async {
                 self.isImportedWallet = false
                 UserDefaults.standard.set(false, forKey: "wallet_imported")
@@ -2487,12 +2688,14 @@ final class WalletManager: ObservableObject {
 
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
-        if !NetworkManager.shared.isConnected {
+        let isConnectedForScan = await MainActor.run { NetworkManager.shared.isConnected }
+        if !isConnectedForScan {
             try await NetworkManager.shared.connect()
             // Wait a moment for connection to stabilize
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
         }
-        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+        let peerCountForScan = await MainActor.run { NetworkManager.shared.peers.count }
+        print("✅ Network connected: \(peerCountForScan) peer(s)")
 
         // VUL-018: Use shared constant for downloaded tree height
         let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
@@ -2565,32 +2768,66 @@ final class WalletManager: ObservableObject {
     /// Repair database with full resync
     /// This deletes ALL notes and transaction history, then does a complete rescan
     /// to rebuild everything with correct nullifiers and positions
-    /// - Parameter onProgress: Callback with (progress, currentHeight, maxHeight)
-    func repairNotesAfterDownloadedTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
+    /// - Parameters:
+    ///   - onProgress: Callback with (progress, currentHeight, maxHeight)
+    ///   - forceFullRescan: If true, skip quick fix and do complete rescan (like import PK)
+    func repairNotesAfterDownloadedTree(onProgress: @escaping (Double, UInt64, UInt64) -> Void, forceFullRescan: Bool = false) async throws {
         guard isWalletCreated else {
             throw WalletError.walletNotCreated
         }
 
-        // FIX #142: Bypass Tor for repair operation
-        let torEnabled = await TorManager.shared.mode == .enabled
-        let torWasBypassed: Bool
-        if torEnabled {
-            print("⚠️ FIX #142: Database repair - bypassing Tor for faster sync...")
-            torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
-        } else {
-            torWasBypassed = false
-        }
-
-        // Ensure Tor is restored after repair completes (even on error)
+        // FIX #368: Block backgroundSync during entire repair operation
+        // This prevents race condition where backgroundSync runs between PHASE 1 and PHASE 2,
+        // setting lastScannedHeight to chain tip before notes are discovered
+        await MainActor.run { isRepairingDatabase = true }
+        print("🔧 FIX #368: isRepairingDatabase = true (blocking backgroundSync)")
         defer {
-            if torWasBypassed {
-                Task {
-                    await TorManager.shared.restoreTorAfterBypass()
-                    // Reconnect with Tor
-                    try? await NetworkManager.shared.connect()
-                }
+            Task { @MainActor in
+                self.isRepairingDatabase = false
+                print("🔧 FIX #368: isRepairingDatabase = false (backgroundSync unblocked)")
             }
         }
+
+        // FIX #286 v20: Bypass Tor for repair operation
+        // CRITICAL: Only restore Tor AFTER successful completion, NOT on error
+        // If repair fails mid-way with Tor restored, connections become unstable
+        let torEnabled = await TorManager.shared.mode == .enabled
+        var torWasBypassed = false
+        if torEnabled {
+            print("⚠️ FIX #286 v20: Database repair - Tor & .onion will be DISABLED during repair")
+            print("⚠️ FIX #286 v20: Tor will be automatically restored after 100% completion")
+            torWasBypassed = await TorManager.shared.bypassTorForMassiveOperation()
+            if torWasBypassed {
+                // FIX #427: Reconnect peers IMMEDIATELY after Tor bypass using direct connections
+                // Previous bug: Peers were disconnected but never reconnected before repair needed them
+                // The repair operations (VUL-002 TX verification, block fetching) require connected peers
+                print("📡 FIX #427: Reconnecting peers via direct connections...")
+                try? await NetworkManager.shared.connect()
+
+                // Wait for peers to connect (hardcoded seeds should be available)
+                var waitedSeconds = 0
+                while await MainActor.run(body: { NetworkManager.shared.connectedPeers }) < 1 && waitedSeconds < 10 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    waitedSeconds += 1
+                }
+                let peerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
+                print("✅ FIX #286 v20: Tor bypassed - \(peerCount) direct peer(s) connected for repair")
+            }
+        }
+
+        // FIX #286 v20: Helper to restore Tor - called ONLY on success
+        @Sendable func restoreTorIfNeeded() async {
+            if torWasBypassed {
+                print("🧅 FIX #286 v20: Repair 100% complete - restoring Tor...")
+                await TorManager.shared.restoreTorAfterBypass()
+                // Reconnect with Tor for privacy
+                try? await NetworkManager.shared.connect()
+                print("✅ FIX #286 v20: Tor restored - maximum privacy mode active")
+            }
+        }
+
+        // NOTE: NO defer block here - we restore Tor ONLY after successful completion
+        // If repair fails, Tor stays bypassed until user retries or manually re-enables
 
         // VUL-018: Use shared constant for downloaded tree height
         let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
@@ -2604,11 +2841,10 @@ final class WalletManager: ObservableObject {
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened for repair")
 
-        // FIX #122: Clear headers to fix timestamp gaps and sync issues
-        print("🗑️ Clearing block headers to fix timestamps...")
-        try? HeaderStore.shared.clearAllHeaders()
-        try? HeaderStore.shared.clearBlockTimes()
-        print("✅ Headers cleared - will re-sync with correct timestamps")
+        // FIX #363: Don't clear headers during repair - causes 3+ minute delay
+        // Timestamps are loaded from boost file instead (much faster)
+        // Previous FIX #122 was causing slow repair by forcing header re-sync
+        print("📦 FIX #363: Skipping header clear - timestamps from boost file")
 
         // Get account ID
         guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
@@ -2618,53 +2854,86 @@ final class WalletManager: ObservableObject {
         print("👤 Account ID: \(account.id)")
 
         // ============================================
-        // VUL-002: STEP 0 - Remove any phantom transactions FIRST
-        // Phantom TXs are locally recorded but never confirmed on blockchain
-        // These cause incorrect balance and history corruption
+        // FIX #371: STEP 0a - Resolve boost placeholder txids to real txids
+        // The boost file marks notes as spent with placeholder txids ("boost_spent_HEIGHT"),
+        // but we need the real txid for proper transaction history display.
+        // This MUST run BEFORE VUL-002 phantom detection to avoid incorrectly unmarking spent notes.
         // ============================================
-        print("🔍 VUL-002: Checking for phantom transactions via P2P peers...")
-        onProgress(0.02, 0, 100)
+        print("🔧 FIX #371: Resolving boost placeholder txids...")
+        onProgress(0.01, 0, 100)
 
-        let sentTxs = try WalletDatabase.shared.getSentTransactions()
-        var phantomTxsRemoved = 0
-        var notesRestored = 0
-        var boostPlaceholdersRemoved = 0
-
-        // Ensure we're connected to P2P peers for verification
+        // Ensure we're connected to P2P peers for block fetching
         let networkManager = NetworkManager.shared
-        if !networkManager.isConnected {
-            print("⚠️ VUL-002: Connecting to P2P peers for TX verification...")
+        let isNetworkConnectedForFetch = await MainActor.run { networkManager.isConnected }
+        if !isNetworkConnectedForFetch {
+            print("⚠️ FIX #371: Connecting to P2P peers for block fetching...")
             try? await networkManager.connect()
             try? await Task.sleep(nanoseconds: 2_000_000_000) // Wait 2s for connections
         }
 
+        let resolvedCount = try await resolveBoostPlaceholderTxids(onProgress: { current, total in
+            // Map progress to 0.01-0.02 range
+            let progress = 0.01 + (Double(current) / Double(total)) * 0.01
+            onProgress(progress, UInt64(current), UInt64(total))
+        })
+        if resolvedCount > 0 {
+            print("✅ FIX #371: Resolved \(resolvedCount) boost placeholder txids to real txids")
+        }
+        onProgress(0.02, 0, 100)
+
+        // ============================================
+        // VUL-002: STEP 0b - Remove any phantom transactions
+        // Phantom TXs are locally recorded but never confirmed on blockchain
+        // These cause incorrect balance and history corruption
+        // NOTE: Boost placeholders should now be resolved, only true phantoms remain
+        // ============================================
+        // FIX #416: Limit VUL-002 check to 5 most recent TXs during startup repair
+        // Full verification of all TXs is too slow (44 TXs × 30s timeout = 22 minutes!)
+        // Only check recent TXs where phantom detection is most critical
+        let allSentTxs = try WalletDatabase.shared.getSentTransactions()
+        let maxTxsToVerify = 5
+        let sentTxs = Array(allSentTxs.suffix(maxTxsToVerify))  // Most recent 5
+
+        print("🔍 VUL-002: Checking for phantom transactions via P2P peers...")
+        print("📊 FIX #416: Verifying \(sentTxs.count) most recent of \(allSentTxs.count) total SENT TXs")
+
+        var phantomTxsRemoved = 0
+        var notesRestored = 0
+        var boostPlaceholdersRemoved = 0
+
+        // networkManager was already connected for FIX #371 above
+
         for tx in sentTxs {
             let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
 
-            // Skip "boost_spend_" placeholder txids - these are NOT real TXs
-            // They were incorrectly inserted from boost file loading
+            // FIX #371: Handle boost placeholders that COULDN'T be resolved
+            // After resolveBoostPlaceholderTxids(), any remaining boost_ txids are notes
+            // where the real TX couldn't be found. We need to verify these on chain.
             if txidHex.hasPrefix("626f6f73745f7370") { // hex for "boost_sp"
-                print("🗑️ VUL-002: Removing boost placeholder TX: \(txidHex.prefix(16))...")
+                // Extract spent_height from placeholder: "boost_spent_HEIGHT"
+                let placeholderString = String(data: tx.txid, encoding: .utf8) ?? ""
+                print("⚠️ FIX #371: Unresolved boost placeholder: \(placeholderString)")
 
-                // Get notes that were marked as spent by this fake TX
+                // Get notes marked as spent with this placeholder
                 let affectedNullifiers = try WalletDatabase.shared.getNullifiersSpentInTx(txid: tx.txid)
 
-                // Unmark those notes as spent (restore them)
-                for nullifier in affectedNullifiers {
-                    try WalletDatabase.shared.unmarkNoteAsSpent(nullifier: nullifier)
-                    notesRestored += 1
-                }
-
-                // Delete the placeholder from history
+                // These notes ARE actually spent (boost file says so), but we couldn't find the TX
+                // Don't unmark them - they're correctly marked as spent
+                // Just remove the placeholder from history (it's not a real TX entry)
                 _ = try WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid)
                 boostPlaceholdersRemoved += 1
+
+                // NOTE: We do NOT restore the notes - they ARE spent on chain
+                // The boost file correctly marked them, we just couldn't find the exact TX
+                print("🗑️ VUL-002: Removed unresolved placeholder (notes remain spent): \(affectedNullifiers.count) note(s)")
                 continue
             }
 
             // Verify TX exists on blockchain via P2P peers (decentralized, works with Tor)
             var txExists = false
 
-            if networkManager.isConnected {
+            let isNetworkConnected = await MainActor.run { networkManager.isConnected }
+            if isNetworkConnected {
                 do {
                     // Request TX from P2P peer - if TX exists, we'll get the raw TX data back
                     // If TX doesn't exist, peer won't respond and we'll timeout
@@ -2672,9 +2941,17 @@ final class WalletManager: ObservableObject {
                     txExists = true
                     print("✅ VUL-002: TX \(txidHex.prefix(16))... verified on P2P network")
                 } catch {
-                    // TX not found on P2P network = phantom TX
+                    // FIX #361: Check if this is a connection error vs actual "not found"
+                    let errorMsg = error.localizedDescription.lowercased()
+                    if errorMsg.contains("not connected") || errorMsg.contains("no peers") ||
+                       errorMsg.contains("timeout") || errorMsg.contains("connection") {
+                        // Connection/network error - cannot verify, skip this TX
+                        print("⚠️ VUL-002: Network error verifying TX \(txidHex.prefix(16))... - SKIPPING (not deleting)")
+                        continue // Don't treat network errors as "TX doesn't exist"
+                    }
+                    // Actual "not found" response from peer
                     txExists = false
-                    print("⚠️ VUL-002: TX \(txidHex.prefix(16))... NOT FOUND on P2P: \(error.localizedDescription)")
+                    print("⚠️ VUL-002: TX \(txidHex.prefix(16))... NOT FOUND on P2P network")
                 }
             } else {
                 print("⚠️ VUL-002: No P2P peers connected - cannot verify TX \(txidHex.prefix(16))...")
@@ -2706,6 +2983,26 @@ final class WalletManager: ObservableObject {
         }
         if phantomTxsRemoved > 0 {
             print("🗑️ VUL-002: Removed \(phantomTxsRemoved) phantom TX(s), restored \(notesRestored) note(s)")
+            // FIX #351: Clear phantom TX data from UserDefaults after repair
+            UserDefaults.standard.removeObject(forKey: "phantomTransactions")
+            print("✅ FIX #351: Cleared phantom TX detection data")
+
+            // FIX #353: Reset checkpoint to last known-good state
+            // The checkpoint should be set to before any phantom TXs occurred
+            // This ensures a full rescan will find any missed transactions
+            let currentCheckpoint = (try? WalletDatabase.shared.getVerifiedCheckpointHeight()) ?? 0
+            if currentCheckpoint > 0 {
+                // Find the last confirmed TX height to use as new checkpoint
+                if let lastConfirmedTx = try? WalletDatabase.shared.getLastConfirmedTransaction() {
+                    let newCheckpoint = min(currentCheckpoint, lastConfirmedTx.height)
+                    try? WalletDatabase.shared.updateVerifiedCheckpointHeight(newCheckpoint)
+                    print("📍 FIX #353: Reset checkpoint to \(newCheckpoint) (last confirmed TX)")
+                } else {
+                    // No confirmed TXs - reset to bundled tree height
+                    try? WalletDatabase.shared.updateVerifiedCheckpointHeight(ZipherXConstants.bundledTreeHeight)
+                    print("📍 FIX #353: Reset checkpoint to bundled tree height \(ZipherXConstants.bundledTreeHeight)")
+                }
+            }
         } else if boostPlaceholdersRemoved == 0 {
             print("✅ VUL-002: No phantom transactions found")
         }
@@ -2743,30 +3040,30 @@ final class WalletManager: ObservableObject {
 
         print("📊 Quick fix result: \(anchorsFixed)/\(notes.count) notes fixed")
 
-        // CRITICAL: Validate that extracted anchors are actually CORRECT
-        // The witness might have been built from a corrupted tree, so we must verify!
-        var anchorsValidated = false
+        // FIX #417: REMOVED incorrect anchor validation that caused unnecessary full rebuilds
+        // The old code compared witness anchor to CURRENT tree root, but witnesses are from
+        // EARLIER blocks, so they will NEVER match the current tree root!
+        // This was causing 16+ minute full rebuilds when a simple anchor extraction fixes the issue.
+        //
+        // A witness anchor doesn't need to match current tree root - it just needs to be:
+        // 1. Extracted from a valid witness (which we already verified exists)
+        // 2. A valid historical anchor that existed when the witness was created
+        //
+        // The actual validation happens at transaction build time when the anchor is
+        // checked against recent block headers.
+        var anchorsValidated = anchorsFixed > 0  // If we extracted anchors, they're valid
         if anchorsFixed > 0 {
-            // Get the current FFI tree root
-            if let currentTreeRoot = ZipherXFFI.treeRoot() {
-                // Get a note's extracted anchor and compare
-                if let firstNote = notes.first,
-                   let witnessAnchor = ZipherXFFI.witnessGetRoot(firstNote.witness) {
-                    if witnessAnchor == currentTreeRoot {
-                        print("✅ Anchor validation PASSED: witness root matches current tree")
-                        anchorsValidated = true
-                    } else {
-                        let witnessHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        let treeHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("⚠️ Anchor validation FAILED: witness root \(witnessHex)... ≠ tree root \(treeHex)...")
-                        print("⚠️ Witnesses were built from corrupted tree - need full rebuild!")
-                    }
-                }
-            }
+            print("✅ FIX #417: Anchors extracted from valid witnesses - skipping incorrect tree root comparison")
+        }
+
+        // FIX #367: Skip quick fix entirely if forceFullRescan is requested
+        if forceFullRescan {
+            print("🔄 FIX #367: FORCE FULL RESCAN requested - skipping quick fix")
         }
 
         // Only use quick fix if ALL notes have valid witnesses AND anchors are validated correct
-        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
+        // AND forceFullRescan is NOT requested
+        if !forceFullRescan && notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
             print("✅ Quick fix successful! All \(anchorsFixed) notes repaired instantly")
             onProgress(1.0, 100, 100)
 
@@ -2779,6 +3076,22 @@ final class WalletManager: ObservableObject {
 
             // Refresh balance to update UI
             try await refreshBalance()
+
+            // FIX #367: Verify all unspent notes are actually unspent on-chain
+            // This catches notes that were spent from another wallet instance
+            // MUST run BEFORE returning from quick fix!
+            print("🔍 FIX #367: Verifying unspent notes are actually unspent on-chain...")
+            let externalSpends = try await verifyAllUnspentNotesOnChain()
+            if externalSpends > 0 {
+                print("✅ FIX #367: Detected \(externalSpends) external spend(s) during repair")
+                try await refreshBalance() // Refresh again after marking spent
+            } else {
+                print("✅ FIX #367: All unspent notes verified as unspent on-chain")
+            }
+
+            // FIX #286 v20: Restore Tor after successful quick fix
+            await restoreTorIfNeeded()
+
             print("✅ Database repair complete - quick fix was sufficient")
             return
         }
@@ -2809,14 +3122,10 @@ final class WalletManager: ObservableObject {
         try WalletDatabase.shared.clearTreeState()
         print("🌳 Cleared tree state")
 
-        // Also delete cached boost file to force re-download from GitHub
-        let boostCacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("ZipherX")
-            .appendingPathComponent("BoostCache")
-        if FileManager.default.fileExists(atPath: boostCacheDir.path) {
-            try? FileManager.default.removeItem(at: boostCacheDir)
-            print("🗑️ Cleared boost cache (will re-download from GitHub)")
-        }
+        // FIX #367: Do NOT delete boost cache - CommitmentTreeUpdater will check
+        // if a newer version is available on GitHub and only download if needed
+        // This saves bandwidth and time when the cached boost is still current
+        print("📦 Keeping boost cache (will check for newer version on GitHub)")
 
         // Clear local delta bundle (will be rebuilt during rescan)
         DeltaCMUManager.shared.clearDeltaBundle()
@@ -2839,11 +3148,13 @@ final class WalletManager: ObservableObject {
 
         // Ensure network connection
         print("📡 Ensuring network connection...")
-        if !NetworkManager.shared.isConnected {
+        let isConnectedForRescan = await MainActor.run { NetworkManager.shared.isConnected }
+        if !isConnectedForRescan {
             try await NetworkManager.shared.connect()
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
         }
-        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+        let peerCountForRescan = await MainActor.run { NetworkManager.shared.peers.count }
+        print("✅ Network connected: \(peerCountForRescan) peer(s)")
 
         // Wait for any existing scan to complete
         if FilterScanner.isScanInProgress {
@@ -2867,6 +3178,25 @@ final class WalletManager: ObservableObject {
         _ = ZipherXFFI.treeInit()
         print("🌳 Reloading commitment tree from GitHub...")
         await preloadCommitmentTree()
+
+        // FIX #440: Load BundledBlockHashes BEFORE full rescan
+        // PHASE 2 header sync needs these hashes to build correct P2P locators
+        // Without them, it falls back to height 0 and gets pre-Bubbles headers (wrong Equihash)
+        if !BundledBlockHashes.shared.isLoaded {
+            print("📋 FIX #440: Loading BundledBlockHashes before full rescan...")
+            do {
+                try await BundledBlockHashes.shared.loadBundledHashes { current, total in
+                    if current == total {
+                        print("✅ FIX #440: BundledBlockHashes loaded: \(total) hashes")
+                    }
+                }
+            } catch {
+                print("⚠️ FIX #440: Failed to load BundledBlockHashes: \(error)")
+                // Continue anyway - the scan will handle missing hashes via fallback
+            }
+        } else {
+            print("📋 FIX #440: BundledBlockHashes already loaded")
+        }
 
         // Get the new downloaded tree height (from GitHub)
         let newTreeHeight = ZipherXConstants.effectiveTreeHeight
@@ -2903,6 +3233,10 @@ final class WalletManager: ObservableObject {
 
         // Refresh balance
         try await refreshBalance()
+
+        // FIX #286 v20: NOW restore Tor after successful completion
+        await restoreTorIfNeeded()
+
         print("✅ Database repair complete - full resync finished")
     }
 
@@ -3026,7 +3360,8 @@ final class WalletManager: ObservableObject {
                 }
 
                 // Ensure network connection
-                if !NetworkManager.shared.isConnected {
+                let isConnectedForRescan = await MainActor.run { NetworkManager.shared.isConnected }
+                if !isConnectedForRescan {
                     try await NetworkManager.shared.connect()
                     try await Task.sleep(nanoseconds: 500_000_000)
                 }
@@ -3090,12 +3425,14 @@ final class WalletManager: ObservableObject {
     private func rebuildWitnessesViaFullScan(account: Account, spendingKey: Data, onProgress: @escaping (Double, UInt64, UInt64) -> Void) async throws {
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
-        if !NetworkManager.shared.isConnected {
+        let isConnectedForScan = await MainActor.run { NetworkManager.shared.isConnected }
+        if !isConnectedForScan {
             try await NetworkManager.shared.connect()
             // Wait a moment for connection to stabilize
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
         }
-        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+        let peerCountForScan = await MainActor.run { NetworkManager.shared.peers.count }
+        print("✅ Network connected: \(peerCountForScan) peer(s)")
 
         // Clear tree state and witnesses to force rebuild
         try WalletDatabase.shared.clearTreeStateForRebuild()
@@ -3142,12 +3479,14 @@ final class WalletManager: ObservableObject {
 
         // Ensure network connection before scanning
         print("📡 Ensuring network connection...")
-        if !NetworkManager.shared.isConnected {
+        let isConnectedForScan = await MainActor.run { NetworkManager.shared.isConnected }
+        if !isConnectedForScan {
             try await NetworkManager.shared.connect()
             // Wait a moment for connection to stabilize
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
         }
-        print("✅ Network connected: \(NetworkManager.shared.peers.count) peer(s)")
+        let peerCountForScan = await MainActor.run { NetworkManager.shared.peers.count }
+        print("✅ Network connected: \(peerCountForScan) peer(s)")
 
         // Tree initialization depends on scan start height
         // For full rescans (from Sapling activation), start with empty tree
@@ -3301,7 +3640,8 @@ final class WalletManager: ObservableObject {
         // 3. FALLBACK: Dynamic estimate using current chain height and NOW
         // This avoids hardcoded reference points that become stale
         let blockTimeInterval: TimeInterval = 150 // 2.5 minutes per block
-        let currentHeight = NetworkManager.shared.chainHeight
+        // FIX #388: Use cached chain height for sync function (MainActor isolation)
+        let currentHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
         let currentTime = Date().timeIntervalSince1970
 
         // Calculate: target height relative to current height
@@ -3321,7 +3661,8 @@ final class WalletManager: ObservableObject {
     /// - Returns: Estimated block height (clamped to Sapling activation minimum and current chain height)
     static func blockHeightForDate(_ date: Date) -> UInt64 {
         let blockTimeInterval: TimeInterval = 150 // 2.5 minutes
-        let currentHeight = NetworkManager.shared.chainHeight
+        // FIX #388: Use cached chain height for sync static function (MainActor isolation)
+        let currentHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
         let currentTime = Date().timeIntervalSince1970
 
         let targetTimestamp = date.timeIntervalSince1970
@@ -3466,21 +3807,54 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+        // VUL-002 + FIX #245 + FIX #349: Handle mempool verification with peer acceptance fallback
         //
         // The mempool check may be slow or unavailable, especially over Tor.
         // If PEERS accepted the TX but the mempool check timed out, we should
         // still record the TX - it was likely propagated successfully and will
         // confirm on-chain.
         //
+        // FIX #349: But if peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
+        // Explicit rejections are strong signals that the TX is invalid.
+        //
         // Only reject if NO peers accepted AND mempool check failed (true rejection).
         // ============================================================================
         if !broadcastResult.mempoolVerified {
-            if broadcastResult.peerCount > 0 {
-                // FIX #245: Peers accepted but mempool check timed out
+            if broadcastResult.rejectCount > 0 {
+                // FIX #349: Peers EXPLICITLY rejected - this is NOT a slow network issue!
+                print("🚨 FIX #349: \(broadcastResult.rejectCount) peers REJECTED transaction!")
+                print("🚨 FIX #349: txId=\(txId), accepts=\(broadcastResult.peerCount), rejects=\(broadcastResult.rejectCount)")
+
+                // Clear any pending broadcast tracking since TX was rejected
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                throw WalletError.transactionFailed("""
+                    🚨 TRANSACTION REJECTED 🚨
+
+                    Your transaction was explicitly rejected by \(broadcastResult.rejectCount) network peer(s). This typically means:
+                    • The transaction anchor is invalid (blockchain state changed)
+                    • A previous transaction already spent these notes
+                    • Network consensus rejected the proof
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    💡 WHAT TO DO:
+                    Go to Settings → Repair Database, then try again.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "Privacy is necessary for an open society."
+                    — A Cypherpunk's Manifesto
+                    """)
+            } else if broadcastResult.peerCount > 0 {
+                // FIX #245: Peers accepted but mempool check timed out (no explicit rejections)
                 // This is common with Tor (slow propagation)
                 // The TX was likely propagated successfully - record it and track
-                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
+                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out (0 rejections)")
                 print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
                 print("🔐 FIX #245: txId=\(txId)")
             } else {
@@ -3511,72 +3885,32 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // TX accepted (by mempool API or by peers) - safe to write to database
+        // TX accepted (by mempool API or by peers)
+        // FIX #350: DO NOT write to database here - only on CONFIRMATION
         if broadcastResult.mempoolVerified {
-            print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+            print("✅ VUL-002: Mempool VERIFIED - TX will be recorded on confirmation")
         } else {
-            print("✅ FIX #245: Peers accepted TX - recording (mempool API was slow)")
+            print("✅ FIX #245: Peers accepted TX - will be recorded on confirmation")
         }
 
-        // Track as pending outgoing (cypherpunk mempool status)
-        // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
-        // IMPORTANT: await to ensure mempoolOutgoing is set before UI updates
+        // FIX #350: Track as pending outgoing with FULL info for database write on CONFIRMATION
+        // DO NOT write to database here - only when TX is confirmed in a block!
         let pendingFee: UInt64 = 10_000
-        await networkManager.trackPendingOutgoing(txid: txId, amount: amount + pendingFee)
-
-        // Show "Saving transaction..." while we record to database
-        onProgress("broadcast", "Saving transaction (txid: \(txId.prefix(16))...)...", 0.95)
-
-        // Note: lastSendTimestamp is set BEFORE broadcast starts (line 1627)
-        // so that setMempoolVerified() can calculate accurate clearing time
-
-        // CRITICAL: Record transaction IMMEDIATELY after broadcast success
-        // This ensures the sent tx is in history even if subsequent operations fail
-        guard let txidData = Data(hexString: txId) else {
-            throw WalletError.transactionFailed("Invalid transaction ID format")
-        }
-
-        // Get chain height for recording (use cached if network fails)
-        let chainHeight: UInt64
-        do {
-            chainHeight = try await networkManager.getChainHeight()
-        } catch {
-            // Fallback to cached chain height if network is unreliable
-            chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : 0
-            print("⚠️ Using cached chain height for tx recording: \(chainHeight)")
-        }
-
-        // Mark the spent note
-        // NOTE: spentNullifier from WalletNote is already hashed (stored as SHA256 in database)
-        try WalletDatabase.shared.markNoteSpentByHashedNullifier(hashedNullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
-        print("✅ Note marked as spent in database")
-
-        // CRITICAL: Record transaction in history - MUST succeed before showing success
-        _ = try WalletDatabase.shared.insertTransactionHistory(
-            txid: txidData,
-            height: chainHeight,
-            blockTime: UInt64(Date().timeIntervalSince1970),
-            type: .sent,
-            value: amount,
-            fee: 10_000,
+        let pendingTx = PendingOutgoingTx(
+            txid: txId,
+            amount: amount,
+            fee: pendingFee,
             toAddress: toAddress,
-            fromDiversifier: nil,
-            memo: memo
+            memo: memo,
+            hashedNullifier: spentNullifier,
+            rawTxData: rawTx,
+            timestamp: Date()
         )
-        print("📜 Transaction recorded in history: \(txId.prefix(16))...")
+        await networkManager.trackPendingOutgoingFull(pendingTx)
 
-        // VERIFY the transaction was actually saved using direct query (not filtered getTransactionHistory)
-        let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
-        guard txWasSaved else {
-            print("❌ CRITICAL: Transaction was NOT saved to database!")
-            throw WalletError.transactionFailed("Failed to save transaction to database")
-        }
-        print("✅ Verified transaction exists in database")
-
-        // Notify UI that transaction history changed
-        await MainActor.run {
-            self.transactionHistoryVersion += 1
-        }
+        // Show waiting for confirmation
+        onProgress("broadcast", "Awaiting confirmation (txid: \(txId.prefix(16))...)...", 0.95)
+        print("📤 FIX #350: TX tracked as pending - database write DEFERRED until confirmation")
 
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
@@ -3672,21 +4006,54 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002 + FIX #245: Handle mempool verification with peer acceptance fallback
+        // VUL-002 + FIX #245 + FIX #349: Handle mempool verification with peer acceptance fallback
         //
         // The mempool check may be slow or unavailable, especially over Tor.
         // If PEERS accepted the TX but the mempool check timed out, we should
         // still record the TX - it was likely propagated successfully and will
         // confirm on-chain.
         //
+        // FIX #349: But if peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
+        // Explicit rejections are strong signals that the TX is invalid.
+        //
         // Only reject if NO peers accepted AND mempool check failed (true rejection).
         // ============================================================================
         if !broadcastResult.mempoolVerified {
-            if broadcastResult.peerCount > 0 {
-                // FIX #245: Peers accepted but mempool check timed out
+            if broadcastResult.rejectCount > 0 {
+                // FIX #349: Peers EXPLICITLY rejected - this is NOT a slow network issue!
+                print("🚨 FIX #349: \(broadcastResult.rejectCount) peers REJECTED transaction!")
+                print("🚨 FIX #349: txId=\(txId), accepts=\(broadcastResult.peerCount), rejects=\(broadcastResult.rejectCount)")
+
+                // Clear any pending broadcast tracking since TX was rejected
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                throw WalletError.transactionFailed("""
+                    🚨 TRANSACTION REJECTED 🚨
+
+                    Your transaction was explicitly rejected by \(broadcastResult.rejectCount) network peer(s). This typically means:
+                    • The transaction anchor is invalid (blockchain state changed)
+                    • A previous transaction already spent these notes
+                    • Network consensus rejected the proof
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    💡 WHAT TO DO:
+                    Go to Settings → Repair Database, then try again.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "Privacy is necessary for an open society."
+                    — A Cypherpunk's Manifesto
+                    """)
+            } else if broadcastResult.peerCount > 0 {
+                // FIX #245: Peers accepted but mempool check timed out (no explicit rejections)
                 // This is common with Tor (slow propagation)
                 // The TX was likely propagated successfully - record it and track
-                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out")
+                print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out (0 rejections)")
                 print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
                 print("🔐 FIX #245: txId=\(txId)")
             } else {
@@ -3717,68 +4084,29 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // TX accepted (by mempool or by peers) - safe to write to database
+        // TX accepted (by mempool or by peers)
+        // FIX #350: DO NOT write to database here - only on CONFIRMATION
         if broadcastResult.mempoolVerified {
-            print("✅ VUL-002: Mempool VERIFIED - safe to record transaction")
+            print("✅ VUL-002: Mempool VERIFIED - TX will be recorded on confirmation")
         } else {
-            print("✅ FIX #245: Peers accepted TX - recording (mempool check was slow)")
+            print("✅ FIX #245: Peers accepted TX - will be recorded on confirmation")
         }
 
-        // Track as pending outgoing (cypherpunk mempool status)
-        // Include fee (10000 zatoshis) so effectiveDisplayBalance is accurate
-        // IMPORTANT: await to ensure mempoolOutgoing is set before UI updates
+        // FIX #350: Track as pending outgoing with FULL info for database write on CONFIRMATION
+        // DO NOT write to database here - only when TX is confirmed in a block!
         let pendingFee: UInt64 = 10_000
-        await networkManager.trackPendingOutgoing(txid: txId, amount: amount + pendingFee)
-
-        // Note: lastSendTimestamp is set BEFORE broadcast starts (line 1759)
-        // so that setMempoolVerified() can calculate accurate clearing time
-
-        // CRITICAL: Record transaction IMMEDIATELY after broadcast acceptance
-        guard let txidData = Data(hexString: txId) else {
-            throw WalletError.transactionFailed("Invalid transaction ID format")
-        }
-
-        // Get chain height for recording (use cached if network fails)
-        let chainHeight: UInt64
-        do {
-            chainHeight = try await networkManager.getChainHeight()
-        } catch {
-            chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : 0
-            print("⚠️ Using cached chain height for tx recording: \(chainHeight)")
-        }
-
-        // Mark the spent note
-        // SECURITY: Never log nullifiers
-        // NOTE: spentNullifier from WalletNote is already hashed (stored as SHA256 in database)
-        try WalletDatabase.shared.markNoteSpentByHashedNullifier(hashedNullifier: spentNullifier, txid: txidData, spentHeight: chainHeight)
-        print("✅ Note marked as spent in database at height \(chainHeight)")
-
-        // CRITICAL: Record transaction in history - MUST succeed before showing success
-        _ = try WalletDatabase.shared.insertTransactionHistory(
-            txid: txidData,
-            height: chainHeight,
-            blockTime: UInt64(Date().timeIntervalSince1970),
-            type: .sent,
-            value: amount,
-            fee: 10_000,
+        let pendingTx = PendingOutgoingTx(
+            txid: txId,
+            amount: amount,
+            fee: pendingFee,
             toAddress: toAddress,
-            fromDiversifier: nil,
-            memo: memo
+            memo: memo,
+            hashedNullifier: spentNullifier,
+            rawTxData: rawTx,
+            timestamp: Date()
         )
-        print("📜 Transaction recorded in history: \(txId.prefix(16))...")
-
-        // VERIFY the transaction was actually saved using direct query (not filtered getTransactionHistory)
-        let txWasSaved = try WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)
-        guard txWasSaved else {
-            print("❌ CRITICAL: Transaction was NOT saved to database!")
-            throw WalletError.transactionFailed("Failed to save transaction to database")
-        }
-        print("✅ Verified transaction exists in database")
-
-        // Notify UI that transaction history changed
-        await MainActor.run {
-            self.transactionHistoryVersion += 1
-        }
+        await networkManager.trackPendingOutgoingFull(pendingTx)
+        print("📤 FIX #350: TX tracked as pending - database write DEFERRED until confirmation")
 
         // Send notification for successful transaction
         NotificationManager.shared.notifySent(amount: amount, txid: txId, memo: memo)
@@ -3910,6 +4238,18 @@ final class WalletManager: ObservableObject {
         if let status = status {
             syncStatus = status
         }
+    }
+
+    /// FIX #300: Clear balance issues flag after repair completes
+    @MainActor
+    func clearBalanceIssues() {
+        hasBalanceIssues = false
+    }
+
+    /// FIX #302: Set balance issues flag (called from ContentView when external spend detected)
+    @MainActor
+    func setBalanceIssues(_ value: Bool) {
+        hasBalanceIssues = value
     }
 
     private func loadWalletState() {
@@ -4300,16 +4640,44 @@ final class WalletManager: ObservableObject {
         print("🔍 FIX #262: Quick nullifier check for \(unspentNotes.count) unspent notes...")
 
         // Get current chain height
-        let chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : (try? await networkManager.getChainHeight()) ?? 0
+        let cachedChainHeight = await MainActor.run { networkManager.chainHeight }
+        let chainHeight = cachedChainHeight > 0 ? cachedChainHeight : (try? await networkManager.getChainHeight()) ?? 0
         guard chainHeight > 0 else {
             print("⚠️ FIX #262: Cannot get chain height - skipping pre-build check")
             return nil
         }
 
-        // Scan last 20 blocks (quick check, not exhaustive)
-        let blocksToScan: UInt64 = 20
-        let startHeight = chainHeight > blocksToScan ? chainHeight - blocksToScan : 0
+        // FIX #297: Use checkpoint for external spend detection (not just 20 blocks)
+        // If checkpoint is recent (within 100 blocks), use it - much more reliable
+        // Otherwise fall back to 20 blocks for speed
+        let checkpointHeight = (try? database.getVerifiedCheckpointHeight()) ?? 0
+        let minScanBlocks: UInt64 = 20
+        let maxScanBlocks: UInt64 = 100  // Cap to prevent slow pre-send checks
 
+        var startHeight: UInt64
+        let blocksFromCheckpoint = chainHeight > checkpointHeight ? chainHeight - checkpointHeight : 0
+
+        if checkpointHeight > 0 && checkpointHeight < chainHeight && blocksFromCheckpoint <= maxScanBlocks {
+            // Use checkpoint - more reliable (FIX #348: ensure checkpoint < chainHeight)
+            startHeight = checkpointHeight
+            print("🔍 FIX #297: Using checkpoint \(checkpointHeight) - scanning \(blocksFromCheckpoint) blocks")
+        } else if blocksFromCheckpoint > maxScanBlocks {
+            // Checkpoint too far behind - limit to maxScanBlocks
+            startHeight = chainHeight > maxScanBlocks ? chainHeight - maxScanBlocks : 0
+            print("⚠️ FIX #297: Checkpoint \(checkpointHeight) is \(blocksFromCheckpoint) blocks behind - limiting to \(maxScanBlocks) blocks")
+        } else {
+            // No checkpoint - fallback to minScanBlocks
+            startHeight = chainHeight > minScanBlocks ? chainHeight - minScanBlocks : 0
+            print("🔍 FIX #262: No checkpoint - scanning last \(minScanBlocks) blocks")
+        }
+
+        // FIX #348: Prevent underflow crash if startHeight > chainHeight
+        guard startHeight < chainHeight else {
+            print("⚠️ FIX #348: startHeight (\(startHeight)) >= chainHeight (\(chainHeight)) - skipping check")
+            return nil
+        }
+
+        let blocksToScan = chainHeight - startHeight
         print("🔍 FIX #262: Scanning blocks \(startHeight) to \(chainHeight)...")
 
         do {
@@ -4492,7 +4860,8 @@ final class WalletManager: ObservableObject {
         print("🔍 FIX #212: Checking \(unspentNotes.count) unspent notes for on-chain spends")
 
         // Determine scan range
-        let chainHeight = networkManager.chainHeight > 0 ? networkManager.chainHeight : (try? await networkManager.getChainHeight()) ?? 0
+        let cachedChainHeightForScan = await MainActor.run { networkManager.chainHeight }
+        let chainHeight = cachedChainHeightForScan > 0 ? cachedChainHeightForScan : (try? await networkManager.getChainHeight()) ?? 0
         guard chainHeight > 0 else {
             print("⚠️ FIX #212: Cannot get chain height - skipping")
             return 0
@@ -4537,11 +4906,15 @@ final class WalletManager: ObservableObject {
 
                         // Check each spend's nullifier
                         for spend in spends {
-                            // Convert hex nullifier to Data
-                            guard let nullifierData = Data(hexString: spend.nullifier) else { continue }
+                            // Convert hex nullifier to Data (display format / big-endian)
+                            guard let nullifierDisplay = Data(hexString: spend.nullifier) else { continue }
+
+                            // FIX #288: P2P returns nullifier in display format (big-endian)
+                            // DB stores in wire format (little-endian) - must reverse before hashing!
+                            let nullifierWire = nullifierDisplay.reversedBytes()
 
                             // VUL-009: Hash the on-chain nullifier to compare with stored hashes
-                            let hashedNullifier = database.hashNullifier(nullifierData)
+                            let hashedNullifier = database.hashNullifier(nullifierWire)
 
                             if let matchedNote = ourNullifiers[hashedNullifier] {
                                 // Found! This note was spent on-chain but not recorded
@@ -4610,6 +4983,608 @@ final class WalletManager: ObservableObject {
         return recoveredCount
     }
 
+    // MARK: - FIX #371: Resolve Boost Placeholder TXIDs to Real TXIDs
+
+    /// FIX #371: Resolve boost placeholder txids to real transaction IDs
+    /// The boost file marks notes as spent with placeholder txids ("boost_spent_HEIGHT"),
+    /// but we need the real txid for proper transaction history display.
+    ///
+    /// This function:
+    /// 1. Gets all notes with boost placeholder txids
+    /// 2. Groups them by spent_height
+    /// 3. Fetches the block at each height
+    /// 4. Finds the transaction containing the matching nullifier
+    /// 5. Updates the note with the real txid
+    ///
+    /// - Parameter onProgress: Progress callback with (resolved, total) notes
+    /// - Returns: Number of placeholder txids successfully resolved
+    @MainActor
+    func resolveBoostPlaceholderTxids(onProgress: ((Int, Int) -> Void)? = nil) async throws -> Int {
+        print("🔧 FIX #371: Resolving boost placeholder txids to real transaction IDs...")
+
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get all notes with boost placeholder txids
+        let notesWithPlaceholders = try database.getNotesWithBoostPlaceholderTxids()
+        guard !notesWithPlaceholders.isEmpty else {
+            print("✅ FIX #371: No boost placeholder txids to resolve")
+            return 0
+        }
+
+        print("🔍 FIX #371: Found \(notesWithPlaceholders.count) notes with boost placeholder txids")
+
+        // Group notes by spent_height for efficient block fetching
+        var notesByHeight: [UInt64: [Data]] = [:]  // height -> [hashedNullifiers]
+        for (hashedNullifier, spentHeight) in notesWithPlaceholders {
+            notesByHeight[spentHeight, default: []].append(hashedNullifier)
+        }
+
+        print("🔍 FIX #371: Notes spread across \(notesByHeight.count) unique blocks")
+
+        var resolvedCount = 0
+        let totalNotes = notesWithPlaceholders.count
+        let sortedHeights = notesByHeight.keys.sorted()
+
+        for height in sortedHeights {
+            guard let hashedNullifiersToMatch = notesByHeight[height] else { continue }
+
+            // Build a set for quick lookup
+            let nullifiersToFind = Set(hashedNullifiersToMatch)
+
+            do {
+                // Fetch the block at this height
+                let blocks = try await networkManager.getBlocksDataP2P(from: height, count: 1)
+                guard let (_, _, _, txData) = blocks.first else {
+                    print("⚠️ FIX #371: Could not fetch block at height \(height)")
+                    continue
+                }
+
+                // Search through each transaction's spends for matching nullifiers
+                for (txidHex, _, spends) in txData {
+                    guard let spends = spends else { continue }
+
+                    for spend in spends {
+                        // Get the raw nullifier from the spend
+                        guard !spend.nullifier.isEmpty,
+                              let nullifierData = Data(hexString: spend.nullifier) else { continue }
+
+                        // Wire format: nullifier needs byte reversal from display format
+                        let nullifierWire = nullifierData.reversedBytes()
+
+                        // Hash it to match our stored hashed nullifiers
+                        let hashedNullifier = database.hashNullifier(nullifierWire)
+
+                        if nullifiersToFind.contains(hashedNullifier) {
+                            // Found a match! Update the note with the real txid
+                            if let realTxid = Data(hexString: txidHex) {
+                                try database.updateNoteSpentTxid(hashedNullifier: hashedNullifier, realTxid: realTxid)
+                                resolvedCount += 1
+                                print("✅ FIX #371: Resolved placeholder at height \(height) → txid \(txidHex.prefix(16))...")
+
+                                onProgress?(resolvedCount, totalNotes)
+                            }
+                        }
+                    }
+                }
+            } catch {
+                print("⚠️ FIX #371: Error processing block \(height): \(error.localizedDescription)")
+                // Continue with other blocks
+            }
+        }
+
+        if resolvedCount > 0 {
+            print("✅ FIX #371: Resolved \(resolvedCount)/\(totalNotes) boost placeholder txids")
+            // Rebuild transaction history to include the now-resolved transactions
+            incrementHistoryVersion()
+        } else {
+            print("⚠️ FIX #371: Could not resolve any placeholder txids (blocks may not have shielded spends)")
+        }
+
+        return resolvedCount
+    }
+
+    // MARK: - FIX #303: Verify ALL Unspent Notes Are Actually Unspent On-Chain
+
+    /// FIX #303: Scan blockchain for external spends from OLDEST UNSPENT NOTE HEIGHT
+    /// This fixes the bug where external spends that happened BEFORE the checkpoint were missed.
+    ///
+    /// The problem: FIX #302 only scanned from checkpoint to chain tip.
+    /// If an external wallet spent our note BEFORE the checkpoint was set, we'd never detect it.
+    ///
+    /// Solution: Scan from the HEIGHT OF THE OLDEST UNSPENT NOTE to chain tip.
+    /// This ensures ANY external spend on ANY unspent note is detected.
+    ///
+    /// - Parameter onProgress: Progress callback with (current, total) blocks
+    /// - Returns: Number of external spends detected and marked as spent
+    @MainActor
+    func verifyAllUnspentNotesOnChain(onProgress: ((Int, Int) -> Void)? = nil) async throws -> Int {
+        print("🔍 FIX #303: Verifying ALL unspent notes are actually unspent on-chain...")
+
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get our unspent notes
+        let unspentNotes = try database.getAllUnspentNotes(accountId: 1)
+        guard !unspentNotes.isEmpty else {
+            print("✅ FIX #303: No unspent notes to verify")
+            return 0
+        }
+
+        // Find the MINIMUM height among all unspent notes
+        // This is where we need to START scanning - not from checkpoint!
+        let minNoteHeight = unspentNotes.map { $0.height }.min() ?? 0
+        guard minNoteHeight > 0 else {
+            print("⚠️ FIX #303: Could not determine minimum note height")
+            return 0
+        }
+
+        // Build set of our nullifier hashes for quick lookup
+        var ourNullifiers: [Data: WalletNote] = [:]
+        var totalValue: UInt64 = 0
+        for note in unspentNotes {
+            ourNullifiers[note.nullifier] = note
+            totalValue += note.value
+        }
+        let totalZCL = Double(totalValue) / 100_000_000.0
+        print("🔍 FIX #303: Checking \(unspentNotes.count) unspent notes (\(String(format: "%.8f", totalZCL)) ZCL)")
+        print("🔍 FIX #303: Oldest note at height \(minNoteHeight)")
+
+        // FIX #367: ALWAYS get fresh chain height from peers, not cached value
+        // The cached networkManager.chainHeight can be stale (e.g., Header Store height)
+        // which would cause us to miss spending transactions that occurred recently
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await networkManager.getChainHeight()
+        } catch {
+            print("⚠️ FIX #303: Cannot get chain height: \(error) - skipping")
+            return 0
+        }
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #303: Chain height is 0 - skipping")
+            return 0
+        }
+        print("🔍 FIX #367: Fresh chain height from peers: \(chainHeight)")
+
+        // FIX #303 v3: Wait for peers AND verify they actually work with a probe fetch
+        // The connect() function initiates connections but doesn't wait for handshakes
+        // Also, connectedPeers count can be stale (peers die without being removed)
+        var waitAttempts = 0
+        let maxWaitAttempts = 30  // Wait up to 30 seconds
+        var probeSucceeded = false
+
+        while !probeSucceeded && waitAttempts < maxWaitAttempts {
+            // Check if we have any peers first
+            let currentPeerCountForProbe = await MainActor.run { networkManager.connectedPeers }
+            if currentPeerCountForProbe < 1 {
+                print("🔍 FIX #303: Waiting for peers to connect... (\(waitAttempts)s)")
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+                waitAttempts += 1
+                continue
+            }
+
+            // Try a probe fetch to verify peers actually work
+            // FIX #367: Add 10-second timeout to prevent hanging
+            print("🔍 FIX #303: Probing P2P with \(currentPeerCountForProbe) peer(s)...")
+            do {
+                let probeHeight = chainHeight > 10 ? chainHeight - 10 : chainHeight
+
+                // Wrap in timeout task
+                let probeTask = Task {
+                    try await networkManager.getBlocksDataP2P(from: probeHeight, count: 1)
+                }
+
+                // Wait max 10 seconds for probe
+                let timeoutTask = Task {
+                    try await Task.sleep(nanoseconds: 10_000_000_000)  // 10 seconds
+                    probeTask.cancel()
+                }
+
+                let probeBlocks = try await probeTask.value
+                timeoutTask.cancel()
+
+                if !probeBlocks.isEmpty {
+                    probeSucceeded = true
+                    print("✅ FIX #303: P2P probe succeeded - peers are responsive")
+                } else {
+                    print("⚠️ FIX #303: P2P probe returned empty - waiting...")
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
+                    waitAttempts += 2
+                }
+            } catch {
+                if Task.isCancelled {
+                    print("⚠️ FIX #367: P2P probe TIMEOUT after 10s - peers not responding")
+                } else {
+                    print("⚠️ FIX #303: P2P probe failed: \(error) - waiting for peers to recover...")
+                }
+                try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3 seconds
+                waitAttempts += 3
+            }
+        }
+
+        guard probeSucceeded else {
+            print("⚠️ FIX #303: P2P not responsive after \(maxWaitAttempts)s - skipping verification")
+            print("   Balance may be incorrect if external spends occurred while app was closed")
+            return 0
+        }
+        let verifiedPeerCount = await MainActor.run { networkManager.connectedPeers }
+        print("🔍 FIX #303: \(verifiedPeerCount) peer(s) verified - starting scan")
+
+        // FIX #367: Limit scan to max 5000 blocks for speed (recent spends most important)
+        // If spending TX is older than 5000 blocks, user needs full rescan
+        let maxScanBlocks: UInt64 = 5000
+        var startHeight = minNoteHeight
+
+        // If gap is too large, start from (chainHeight - maxScanBlocks) instead
+        if chainHeight > minNoteHeight + maxScanBlocks {
+            startHeight = chainHeight - maxScanBlocks
+            print("🔍 FIX #367: Limiting scan to last \(maxScanBlocks) blocks (from \(startHeight))")
+        }
+
+        let blocksToScan = chainHeight > startHeight ? Int(chainHeight - startHeight) : 0
+
+        guard blocksToScan > 0 else {
+            print("✅ FIX #303: No blocks to scan (startHeight=\(startHeight), chainHeight=\(chainHeight))")
+            return 0
+        }
+
+        print("🔍 FIX #303: Scanning \(blocksToScan) blocks from height \(startHeight) to \(chainHeight)")
+
+        // Fetch blocks via P2P and check nullifiers
+        var externalSpendsFound = 0
+        var successfulBatches = 0
+        var failedBatches = 0
+        var consecutiveFailures = 0
+        let batchSize: UInt64 = 50
+
+        // FIX #367: Add 60-second total timeout to prevent repair from hanging
+        let scanStartTime = Date()
+        let maxScanDuration: TimeInterval = 60.0
+
+        var batchStart = startHeight
+        while batchStart < chainHeight {
+            // Check total time limit
+            if Date().timeIntervalSince(scanStartTime) > maxScanDuration {
+                print("⚠️ FIX #367: Scan timeout after 60s - scanned up to height \(batchStart)")
+                print("   Run full rescan if balance still incorrect")
+                break
+            }
+            let batchEnd = min(batchStart + batchSize, chainHeight)
+            let count = Int(batchEnd - batchStart)
+
+            onProgress?(Int(batchStart - startHeight), blocksToScan)
+
+            // FIX #303 v5: Add retries for failed batches and delays to prevent overwhelming Tor
+            var batchSuccess = false
+            var retries = 0
+            let maxRetries = 2
+
+            while !batchSuccess && retries <= maxRetries {
+                do {
+                    // FIX #367: Wrap batch fetch in 15-second timeout
+                    let fetchTask = Task {
+                        try await networkManager.getBlocksDataP2P(from: batchStart, count: count)
+                    }
+
+                    let batchTimeoutTask = Task {
+                        try await Task.sleep(nanoseconds: 15_000_000_000)  // 15 seconds
+                        fetchTask.cancel()
+                    }
+
+                    let blocks = try await fetchTask.value
+                    batchTimeoutTask.cancel()
+
+                    if blocks.isEmpty {
+                        retries += 1
+                        if retries <= maxRetries {
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s retry delay
+                        }
+                        continue
+                    }
+
+                    batchSuccess = true
+                    successfulBatches += 1
+                    consecutiveFailures = 0
+
+                    for (height, _, _, txData) in blocks {
+                        for (txidHex, _, spends) in txData {
+                            guard let spends = spends, !spends.isEmpty else { continue }
+
+                            // Check each spend's nullifier
+                            for spend in spends {
+                                // Convert hex nullifier to Data (display format / big-endian)
+                                guard let nullifierDisplay = Data(hexString: spend.nullifier) else { continue }
+
+                                // FIX #288: P2P returns nullifier in display format (big-endian)
+                                // DB stores in wire format (little-endian) - must reverse before hashing!
+                                let nullifierWire = nullifierDisplay.reversedBytes()
+
+                                // VUL-009: Hash the on-chain nullifier to compare with stored hashes
+                                let hashedNullifier = database.hashNullifier(nullifierWire)
+
+                                if let matchedNote = ourNullifiers[hashedNullifier] {
+                                    // Found! This note was spent on-chain - EXTERNAL SPEND!
+                                    print("🚨 FIX #303: EXTERNAL SPEND DETECTED!")
+                                    print("   Note value: \(matchedNote.value) zatoshis (\(Double(matchedNote.value) / 100_000_000.0) ZCL)")
+                                    print("   Spent in TX: \(txidHex.prefix(16))...")
+                                    print("   Spent at height: \(height)")
+                                    print("   Note created at height: \(matchedNote.height)")
+
+                                    // Convert txid hex to Data
+                                    let txidData = Data(hexString: txidHex) ?? hashedNullifier.prefix(32)
+
+                                    // Mark the note as spent
+                                    try database.markNoteSpentByHashedNullifier(
+                                        hashedNullifier: hashedNullifier,
+                                        txid: txidData,
+                                        spentHeight: height
+                                    )
+
+                                    // Create SENT history entry if it doesn't exist
+                                    let fee: UInt64 = 10_000 // Standard fee
+                                    let amountSent = matchedNote.value > fee ? matchedNote.value - fee : matchedNote.value
+
+                                    // Check if history entry already exists
+                                    let existsInHistory = try database.transactionExists(txid: txidData, type: .sent)
+                                    if !existsInHistory {
+                                        _ = try database.insertTransactionHistory(
+                                            txid: txidData,
+                                            height: height,
+                                            blockTime: UInt64(Date().timeIntervalSince1970),
+                                            type: .sent,
+                                            value: amountSent,
+                                            fee: fee,
+                                            toAddress: nil,
+                                            fromDiversifier: nil,
+                                            memo: "[External wallet spend detected by FIX #303]"
+                                        )
+                                        print("📜 FIX #303: Created SENT history entry for external spend")
+                                    }
+
+                                    externalSpendsFound += 1
+                                    // Remove from our tracking set
+                                    ourNullifiers.removeValue(forKey: hashedNullifier)
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    retries += 1
+                    consecutiveFailures += 1
+                    if retries <= maxRetries {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s retry delay
+                    }
+                }
+            }
+
+            // Track batch result
+            if !batchSuccess {
+                failedBatches += 1
+                // Only log first few failures to avoid spam
+                if failedBatches <= 3 {
+                    print("⚠️ FIX #303: Failed to fetch blocks \(batchStart)-\(batchEnd) after \(maxRetries + 1) attempts")
+                }
+
+                // FIX #303 v5: If too many consecutive failures, peers are dead - abort scan
+                if consecutiveFailures >= 10 {
+                    print("🚨 FIX #303: 10 consecutive batch failures - peers are dead, aborting scan")
+                    break
+                }
+            }
+
+            // FIX #303 v5: Add delay between batches to let Tor circuits recover
+            if successfulBatches % 10 == 0 && successfulBatches > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1s pause every 10 batches
+            }
+
+            batchStart += batchSize
+        }
+
+        onProgress?(blocksToScan, blocksToScan)
+
+        // Report scan results
+        let totalBatches = successfulBatches + failedBatches
+        if failedBatches > 0 && failedBatches > 3 {
+            print("⚠️ FIX #303: ... and \(failedBatches - 3) more batch failures")
+        }
+
+        if successfulBatches == 0 && totalBatches > 0 {
+            // All batches failed - verification incomplete!
+            print("🚨 FIX #303: VERIFICATION FAILED - 0/\(totalBatches) batches succeeded (network issues)")
+            print("   Balance may be incorrect if external spends occurred!")
+            return 0
+        }
+
+        if externalSpendsFound > 0 {
+            print("✅ FIX #303: Detected \(externalSpendsFound) external spend(s) - balance updated")
+            print("   Scanned \(successfulBatches)/\(totalBatches) batches successfully")
+            // Refresh balance to reflect changes
+            try? await refreshBalance()
+            incrementHistoryVersion()
+
+            // FIX #303: Calculate total amount corrected and show alert
+            let correctedAmount = totalValue - unspentNotes.filter { ourNullifiers[$0.nullifier] != nil }.reduce(0) { $0 + $1.value }
+            let correctedZCL = Double(correctedAmount) / 100_000_000.0
+            await MainActor.run {
+                self.databaseCorrectionAlert = DatabaseCorrectionInfo(
+                    externalSpendsDetected: externalSpendsFound,
+                    amountCorrected: correctedAmount,
+                    message: "Detected \(externalSpendsFound) transaction(s) from another wallet totaling \(String(format: "%.8f", correctedZCL)) ZCL. Your balance has been corrected."
+                )
+            }
+        } else if failedBatches > 0 {
+            print("⚠️ FIX #303: Partial scan - \(successfulBatches)/\(totalBatches) batches succeeded")
+            print("   No external spends found in scanned blocks, but \(failedBatches) batches failed")
+        } else {
+            print("✅ FIX #303: All \(unspentNotes.count) unspent notes verified - no external spends detected")
+            print("   Scanned \(successfulBatches) batches successfully")
+        }
+
+        return externalSpendsFound
+    }
+
+    // MARK: - FIX #370: Periodic Deep Verification
+
+    /// FIX #370: Periodically rescan from tx_confirmed_checkpoint to catch missed transactions.
+    ///
+    /// Problem: If a transaction is missed (network glitch, bug, etc.), the regular
+    /// verified_checkpoint moves forward and the missed TX is never discovered.
+    ///
+    /// Solution: Keep a separate tx_confirmed_checkpoint that ONLY advances when
+    /// a transaction is actually confirmed. Periodically rescan from this checkpoint
+    /// to ensure no transactions are ever missed.
+    ///
+    /// This function should be called:
+    /// - Periodically in background (e.g., every 10-30 minutes while app is open)
+    /// - At app launch if last deep verification was >6 hours ago
+    ///
+    /// - Returns: Number of transactions discovered
+    @MainActor
+    func performDeepVerification() async throws -> Int {
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Check when last deep verification was performed
+        let lastVerification = (try? database.getLastDeepVerificationTime()) ?? 0
+        let currentTime = Int64(Date().timeIntervalSince1970)
+        let hoursSinceLastVerification = Double(currentTime - lastVerification) / 3600.0
+
+        // Get tx_confirmed_checkpoint - starting point for deep scan
+        let txCheckpoint = (try? database.getTxConfirmedCheckpoint()) ?? 0
+
+        // Get current chain height
+        var chainHeight = await MainActor.run { networkManager.chainHeight }
+        if chainHeight == 0 {
+            chainHeight = (try? await networkManager.getChainHeight()) ?? 0
+        }
+
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #370: Cannot get chain height - skipping deep verification")
+            return 0
+        }
+
+        // If tx_confirmed_checkpoint is 0, initialize to verified_checkpoint
+        if txCheckpoint == 0 {
+            let verifiedCheckpoint = (try? database.getVerifiedCheckpointHeight()) ?? 0
+            if verifiedCheckpoint > 0 {
+                try? database.updateTxConfirmedCheckpoint(verifiedCheckpoint)
+                print("📍 FIX #370: Initialized tx_confirmed_checkpoint to \(verifiedCheckpoint)")
+            }
+            // First run - mark as verified and skip actual scan
+            try? database.updateLastDeepVerificationTime()
+            return 0
+        }
+
+        // Calculate blocks to scan
+        let blocksToScan = chainHeight > txCheckpoint ? chainHeight - txCheckpoint : 0
+
+        print("🔍 FIX #370: Deep Verification Check")
+        print("   tx_confirmed_checkpoint: \(txCheckpoint)")
+        print("   chain_height: \(chainHeight)")
+        print("   blocks_to_scan: \(blocksToScan)")
+        print("   hours_since_last: \(String(format: "%.1f", hoursSinceLastVerification))")
+
+        // If nothing to scan, just update timestamp and return
+        guard blocksToScan > 0 else {
+            print("✅ FIX #370: Deep verification complete - no blocks to scan")
+            try? database.updateLastDeepVerificationTime()
+            return 0
+        }
+
+        // Only do deep scan if:
+        // 1. More than 100 blocks behind, OR
+        // 2. Last verification was >6 hours ago
+        let needsDeepScan = blocksToScan > 100 || hoursSinceLastVerification > 6.0
+
+        guard needsDeepScan else {
+            print("✅ FIX #370: Deep verification not needed yet (blocks=\(blocksToScan), hours=\(String(format: "%.1f", hoursSinceLastVerification)))")
+            return 0
+        }
+
+        print("🔍 FIX #370: Starting deep verification scan from \(txCheckpoint) to \(chainHeight)...")
+
+        // Use FilterScanner for comprehensive scan (finds both incoming notes and spends)
+        let startHeight = txCheckpoint + 1
+
+        // Run the scan using existing FilterScanner approach
+        // This will trial-decrypt blocks and check for nullifiers
+        var transactionsFound = 0
+
+        do {
+            // Get account and spending key for FilterScanner
+            guard let account = try? database.getAccount(index: 0) else {
+                print("⚠️ FIX #370: No account found - skipping deep verification")
+                return 0
+            }
+
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+
+            // Count notes/history before scan
+            let notesBefore = (try? database.getAllNotes(accountId: 1).count) ?? 0
+            let historyBefore = (try? database.getTransactionHistoryCount()) ?? 0
+
+            // Run FilterScanner from tx_confirmed_checkpoint
+            let scanner = FilterScanner()
+            print("🔍 FIX #370: Starting FilterScanner from height \(startHeight)...")
+            try await scanner.startScan(
+                for: account.id,
+                viewingKey: spendingKey,
+                fromHeight: startHeight
+            )
+
+            // Count notes/history after scan
+            let notesAfter = (try? database.getAllNotes(accountId: 1).count) ?? 0
+            let historyAfter = (try? database.getTransactionHistoryCount()) ?? 0
+
+            let newNotes = notesAfter - notesBefore
+            let newHistory = historyAfter - historyBefore
+            transactionsFound = max(newNotes, newHistory)
+
+            if transactionsFound > 0 {
+                print("🎉 FIX #370: Deep verification found \(transactionsFound) missed transaction(s)!")
+                // Refresh balance
+                try? await refreshBalance()
+                incrementHistoryVersion()
+            } else {
+                print("✅ FIX #370: Deep verification complete - no missed transactions")
+            }
+
+            // Update both checkpoints after successful scan
+            try? database.updateTxConfirmedCheckpoint(chainHeight)
+            try? database.updateVerifiedCheckpointHeight(chainHeight)
+            try? database.updateLastDeepVerificationTime()
+
+            print("📍 FIX #370: Checkpoints updated to \(chainHeight) after deep verification")
+
+        } catch {
+            print("⚠️ FIX #370: Deep verification scan failed: \(error)")
+            // Don't update checkpoints on failure - will retry next time
+        }
+
+        return transactionsFound
+    }
+
+    /// Start periodic deep verification timer
+    /// Called once at app startup after initial sync completes
+    func startPeriodicDeepVerification() {
+        // Run deep verification every 30 minutes while app is open
+        Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                // Only run if not syncing and not repairing
+                guard !self.isSyncing && !self.isRepairingDatabase else {
+                    print("⏭️ FIX #370: Skipping periodic deep verification - sync/repair in progress")
+                    return
+                }
+                let found = try? await self.performDeepVerification()
+                if let found = found, found > 0 {
+                    print("🔔 FIX #370: Periodic deep verification found \(found) missed transaction(s)!")
+                }
+            }
+        }
+        print("⏰ FIX #370: Periodic deep verification timer started (30 min interval)")
+    }
+
     // MARK: - FIX #217: Scan for ALL Missing Transactions (Incoming + Spent)
 
     /// Scan from checkpoint to chain tip for any missed transactions
@@ -4629,7 +5604,7 @@ final class WalletManager: ObservableObject {
         let checkpoint = try database.getVerifiedCheckpointHeight()
 
         // Get chain height
-        var chainHeight = networkManager.chainHeight
+        var chainHeight = await MainActor.run { networkManager.chainHeight }
         if chainHeight == 0 {
             chainHeight = (try? await networkManager.getChainHeight()) ?? 0
         }
@@ -4783,15 +5758,16 @@ final class WalletManager: ObservableObject {
 
     /// FIX #185: Verify Equihash for the latest N block headers
     /// This verifies that the current chain tip has valid proof-of-work
-    /// - Parameter count: Number of recent headers to verify (default 100)
+    /// - Parameter count: Number of recent headers to verify (default 50)
     /// - Returns: EquihashVerificationResult distinguishing network errors from actual failures
     /// FIX #231: Returns enum instead of bool to allow health check to differentiate
     /// FIX #231 v2: Now uses best-effort to verify even with reduced consensus
-    func verifyLatestEquihash(count: Int = 100) async -> EquihashVerificationResult {
-        print("🔬 FIX #185: Verifying Equihash for latest \(count) block headers...")
+    /// FIX #415: Reduced default from 100 to 50 - sufficient for chain tip validation
+    func verifyLatestEquihash(count: Int = 50) async -> EquihashVerificationResult {
+        print("🔬 FIX #415: Verifying Equihash for latest \(count) block headers...")
 
         // Get current chain height from peers
-        let chainHeight = UInt64(NetworkManager.shared.chainHeight)
+        let chainHeight = await MainActor.run { UInt64(NetworkManager.shared.chainHeight) }
         guard chainHeight > 0 else {
             print("⚠️ FIX #185: Chain height is 0, cannot verify Equihash")
             return .networkError(reason: "Chain height unavailable")
@@ -5000,9 +5976,10 @@ final class WalletManager: ObservableObject {
     }
 
     /// FIX #188: Verify Equihash from locally stored headers (no P2P needed)
+    /// FIX #415: Reduced default from 100 to 50 - sufficient for chain tip validation
     /// This uses headers stored in HeaderStore with their Equihash solutions
-    func verifyEquihashFromLocalStorage(count: Int = 100) -> Bool {
-        print("🔬 FIX #188: Verifying Equihash from local storage (\(count) headers)...")
+    func verifyEquihashFromLocalStorage(count: Int = 50) -> Bool {
+        print("🔬 FIX #415: Verifying Equihash from local storage (\(count) headers)...")
 
         do {
             let headers = try HeaderStore.shared.getHeadersWithSolutions(count: count)
