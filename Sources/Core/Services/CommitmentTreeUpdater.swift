@@ -1,5 +1,6 @@
 import Foundation
 import CommonCrypto
+import Compression
 
 /// Handles downloading the unified ZipherX Boost file from GitHub
 /// The boost file contains all data needed for wallet sync:
@@ -1067,17 +1068,45 @@ actor CommitmentTreeUpdater {
         throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
-    /// Decompress a .zst file using zstd command-line tool
+    /// Decompress a .zst file using libcompression (built into macOS/iOS)
+    /// Uses COMPRESSION_ZSTD frame format for decompression
     private func decompressZstFile(source: URL, target: URL) async throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["zstd", "-d", source.path, "-o", target.path, "-f"]
+        // Read compressed data
+        let compressedData = try Data(contentsOf: source)
 
-        try process.run()
-        process.waitUntilExit()
+        // Allocate output buffer (zstd typically expands to ~2-3x, but our boost file is already compressed)
+        // For safety, allocate 4x the compressed size
+        let outputBufferSize = compressedData.count * 4
+        let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: outputBufferSize)
+        defer { outputBuffer.deallocate() }
 
-        guard process.terminationStatus == 0 else {
-            throw BoostFileError.networkError("zstd decompression failed with code \(process.terminationStatus)")
+        // Decompress using libcompression
+        compressedData.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                throw BoostFileError.networkError("Failed to get compressed data pointer")
+            }
+
+            let inputPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
+            let inputSize = compressedData.count
+
+            let decompressedSize = compression_decode_buffer(
+                outputBuffer,
+                outputBufferSize,
+                inputPtr,
+                inputSize,
+                nil,
+                COMPRESSION_ZSTD
+            )
+
+            guard decompressedSize > 0 else {
+                throw BoostFileError.networkError("zstd decompression failed - returned 0 bytes")
+            }
+
+            // Write decompressed data
+            let decompressedData = Data(bytes: outputBuffer, count: Int(decompressedSize))
+            try decompressedData.write(to: target)
+
+            print("✅ Decompressed \(compressedData.count) bytes → \(decompressedSize) bytes")
         }
     }
 
