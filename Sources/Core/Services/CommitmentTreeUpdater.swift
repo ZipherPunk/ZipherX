@@ -1,5 +1,6 @@
 import Foundation
 import CommonCrypto
+import Compression
 
 /// Handles downloading the unified ZipherX Boost file from GitHub
 /// The boost file contains all data needed for wallet sync:
@@ -1067,14 +1068,14 @@ actor CommitmentTreeUpdater {
         throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
-    /// Decompress a .zst file using pure Swift ZSTD decoder
-    /// No external dependencies required
+    /// Decompress a .zst file using libcompression
+    /// Attempts multiple compression algorithms (LZFSE, ZLIB, LZ4, LZMA) to find the right one
     private func decompressZstFile(source: URL, target: URL) async throws {
         // Read compressed data
         let compressedData = try Data(contentsOf: source)
         print("📦 Reading \(compressedData.count) bytes of compressed data...")
 
-        // Decompress using pure Swift ZSTD decoder
+        // Decompress using ZSTDDecoder (which tries libcompression algorithms)
         let decompressedData = try ZSTDDecoder.decompress(data: compressedData)
 
         print("✅ Decompressed \(compressedData.count) bytes → \(decompressedData.count) bytes")
