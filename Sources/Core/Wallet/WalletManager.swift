@@ -1251,12 +1251,13 @@ final class WalletManager: ObservableObject {
         }
 
         // FIX #452: Sanity check - reject impossible header counts (corrupted boost file metadata)
-        // Current chain is ~3M blocks, anything over 5M is definitely corrupted
-        let maxReasonableHeaders: UInt64 = 5_000_000
-        if sectionInfo.count > maxReasonableHeaders || sectionInfo.endHeight > 5_000_000 {
+        // Current chain is ~3M blocks, anything over 10M is definitely corrupted
+        // NOTE: After fixing generate_boost_file.py to use actual header heights, this should rarely trigger
+        let maxReasonableHeaders: UInt64 = 10_000_000
+        if sectionInfo.count > maxReasonableHeaders || sectionInfo.endHeight > 10_000_000 {
             print("🚨 FIX #452: CRITICAL - Boost file headers metadata is CORRUPTED!")
             print("🚨 FIX #452: Claims \(sectionInfo.count) headers to height \(sectionInfo.endHeight)")
-            print("🚨 FIX #452: Maximum reasonable is ~5M - boost file needs to be regenerated")
+            print("🚨 FIX #452: Maximum reasonable is ~10M - boost file needs to be regenerated with fixed script")
             print("⚠️ FIX #452: Falling back to P2P header sync")
             return (false, 0)
         }
