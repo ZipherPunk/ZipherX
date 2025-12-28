@@ -233,7 +233,7 @@ enum ZSTDDecoder {
             }
 
             // Match
-            let offsetLow = try readByte()
+            let offsetLow = UInt32(try readByte())
             let offsetHigh = UInt32(token & 0x0F)
             var offset = offsetLow | (offsetHigh << 8)
 
@@ -254,14 +254,14 @@ enum ZSTDDecoder {
             }
             matchLength += 4 // Minimum match length is 4
 
-            // Copy from output (L77 backreference)
+            // Copy from output (LZ77 backreference)
             let startPos = output.count - Int(offset)
             guard startPos >= 0 else {
                 throw ZSTDError.invalidFormat
             }
 
-            for _ in 0..<matchLength {
-                let byte = output[startPos + Int(matchLength - 1)]
+            for i in 0..<Int(matchLength) {
+                let byte = output[startPos + i]
                 output.append(byte)
             }
         }
