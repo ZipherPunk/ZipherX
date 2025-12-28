@@ -83,9 +83,9 @@ actor CommitmentTreeUpdater {
         let files: ManifestFiles
         let sections: [SectionInfo]
 
-        /// Check if this is a three-file format (v3+)
+        /// Check if this is a three-file format (v3+) or core-only format (v4+)
         var isThreePartFormat: Bool {
-            format == "zipherx_boost_v2_three_part" || version >= 3
+            format == "zipherx_boost_v2_three_part" || format == "zipherx_boost_v2_core_only" || version >= 3
         }
 
         struct ManifestFiles: Codable {
