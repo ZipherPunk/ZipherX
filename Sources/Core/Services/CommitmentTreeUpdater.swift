@@ -29,6 +29,7 @@ actor CommitmentTreeUpdater {
         case timestamps = 4   // Block timestamps (4 bytes each)
         case serializedTree = 5  // Serialized commitment tree (~414 bytes)
         case peerAddresses = 6   // Peer addresses for bootstrap
+        case headers = 7      // FIX #413: Full block headers (140 bytes each, includes sapling_root)
     }
 
     // MARK: - File Header Constants
@@ -47,9 +48,24 @@ actor CommitmentTreeUpdater {
         boostCacheDirectory.appendingPathComponent("zipherx_boost_manifest.json")
     }
 
-    /// Path to cached boost file
+    /// Path to cached boost file (single-file format v1/v2 - for backward compatibility)
     private var cachedBoostPath: URL {
         boostCacheDirectory.appendingPathComponent("zipherx_boost_v1.bin")
+    }
+
+    /// Path to cached core boost file (three-file format v3+)
+    private var cachedCorePath: URL {
+        boostCacheDirectory.appendingPathComponent("zipherx_boost_core.bin")
+    }
+
+    /// Path to cached equihash file (three-file format v3+)
+    private var cachedEquihashPath: URL {
+        boostCacheDirectory.appendingPathComponent("zipherx_boost_equihash.bin")
+    }
+
+    /// Get the active boost file path based on manifest format
+    private func getActiveBoostPath(for manifest: BoostManifest) -> URL {
+        return manifest.isThreePartFormat ? cachedCorePath : cachedBoostPath
     }
 
     // MARK: - Manifest Model
@@ -67,14 +83,88 @@ actor CommitmentTreeUpdater {
         let files: ManifestFiles
         let sections: [SectionInfo]
 
+        /// Check if this is a three-file format (v3+)
+        var isThreePartFormat: Bool {
+            format == "zipherx_boost_v2_three_part" || version >= 3
+        }
+
         struct ManifestFiles: Codable {
             let uncompressed: FileInfo
+            // Three-part format (v3+)
+            let core: FileInfo?
+            let equihash: FileInfo?
+
+            // For backward compatibility with single-file format
+            private enum CodingKeys: String, CodingKey {
+                case uncompressed
+                case core
+                case equihash
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                // Try three-part format first
+                if let core = try? container.decode(FileInfo.self, forKey: .core),
+                   let equihash = try? container.decode(FileInfo.self, forKey: .equihash) {
+                    self.core = core
+                    self.equihash = equihash
+                    // Create synthetic uncompressed for compatibility
+                    self.uncompressed = FileInfo(
+                        name: core.name,
+                        size: core.size + equihash.size,
+                        sha256: ""
+                    )
+                } else {
+                    // Single-file format (v1/v2)
+                    self.uncompressed = try container.decode(FileInfo.self, forKey: .uncompressed)
+                    self.core = nil
+                    self.equihash = nil
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                if let core = core, let equihash = equihash {
+                    try container.encode(core, forKey: .core)
+                    try container.encode(equihash, forKey: .equihash)
+                } else {
+                    try container.encode(uncompressed, forKey: .uncompressed)
+                }
+            }
         }
 
         struct FileInfo: Codable {
             let name: String
             let size: Int
             let sha256: String
+            let description: String?
+            let required: Bool?
+
+            // For backward compatibility
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                size = try container.decode(Int.self, forKey: .size)
+                sha256 = try container.decode(String.self, forKey: .sha256)
+                description = try container.decodeIfPresent(String.self, forKey: .description)
+                required = try container.decodeIfPresent(Bool.self, forKey: .required)
+            }
+
+            init(name: String, size: Int, sha256: String) {
+                self.name = name
+                self.size = size
+                self.sha256 = sha256
+                self.description = nil
+                self.required = nil
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case name
+                case size
+                case sha256
+                case description
+                case required
+            }
         }
 
         struct SectionInfo: Codable {
@@ -106,12 +196,17 @@ actor CommitmentTreeUpdater {
         // Check for valid cached boost file first
         let cachedManifest = loadCachedManifest()
         if let cachedManifest = cachedManifest {
-            if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
+            let activePath = getActiveBoostPath(for: cachedManifest)
+            let expectedSize = cachedManifest.isThreePartFormat
+                ? cachedManifest.files.core?.size ?? cachedManifest.files.uncompressed.size
+                : cachedManifest.files.uncompressed.size
+
+            if FileManager.default.fileExists(atPath: activePath.path) {
                 // Verify checksum (can be slow for 500MB file, so skip if file size matches)
-                let attrs = try? FileManager.default.attributesOfItem(atPath: cachedBoostPath.path)
+                let attrs = try? FileManager.default.attributesOfItem(atPath: activePath.path)
                 let fileSize = attrs?[.size] as? Int ?? 0
 
-                if fileSize == cachedManifest.files.uncompressed.size {
+                if fileSize == expectedSize {
                     // FIX #178: Check if remote has NEWER version before downloading
                     // Only fetch remote manifest if cache is valid - compare heights
                     onProgress?(0.02, "Checking for updates...")
@@ -124,13 +219,13 @@ actor CommitmentTreeUpdater {
                             // Cached version is same or newer - use it
                             print("🚀 FIX #178: Using cached boost file at height \(cachedManifest.chain_height) (remote=\(remoteManifest.chain_height), no update needed)")
                             onProgress?(1.0, "Using cached data")
-                            return (cachedBoostPath, cachedManifest.chain_height, cachedManifest.output_count)
+                            return (activePath, cachedManifest.chain_height, cachedManifest.output_count)
                         }
                     } else {
                         // Can't reach GitHub - use cached version
                         print("🚀 Using cached boost file at height \(cachedManifest.chain_height) (GitHub unreachable)")
                         onProgress?(1.0, "Using cached data")
-                        return (cachedBoostPath, cachedManifest.chain_height, cachedManifest.output_count)
+                        return (activePath, cachedManifest.chain_height, cachedManifest.output_count)
                     }
                 }
             }
@@ -140,8 +235,12 @@ actor CommitmentTreeUpdater {
         onProgress?(0.05, "Fetching manifest from GitHub...")
         let remoteManifest = try await fetchRemoteManifest()
 
-        print("🚀 Downloading boost file from GitHub (height \(remoteManifest.chain_height))...")
-        let fileSizeMB = remoteManifest.files.uncompressed.size / 1024 / 1024
+        let activePath = getActiveBoostPath(for: remoteManifest)
+        let isThreePart = remoteManifest.isThreePartFormat
+        let coreSize = isThreePart ? (remoteManifest.files.core?.size ?? remoteManifest.files.uncompressed.size) : remoteManifest.files.uncompressed.size
+        let fileSizeMB = coreSize / 1024 / 1024
+
+        print("🚀 Downloading boost file from GitHub (height \(remoteManifest.chain_height), three-part: \(isThreePart))...")
         onProgress?(0.1, "Downloading \(fileSizeMB) MB...")
 
         try await downloadBoostFile(manifest: remoteManifest) { progress in
@@ -156,10 +255,10 @@ actor CommitmentTreeUpdater {
         onProgress?(0.95, "Verifying checksum...")
 
         // Verify file size (checksum verification is slow for 500MB)
-        let attrs = try? FileManager.default.attributesOfItem(atPath: cachedBoostPath.path)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: activePath.path)
         let fileSize = attrs?[.size] as? Int ?? 0
-        guard fileSize == remoteManifest.files.uncompressed.size else {
-            try? FileManager.default.removeItem(at: cachedBoostPath)
+        guard fileSize == coreSize else {
+            try? FileManager.default.removeItem(at: activePath)
             throw BoostFileError.checksumMismatch
         }
 
@@ -175,10 +274,10 @@ actor CommitmentTreeUpdater {
             )
         }
 
-        print("🚀 Successfully downloaded boost file at height \(remoteManifest.chain_height)")
+        print("🚀 Successfully downloaded boost file at height \(remoteManifest.chain_height) (three-part: \(isThreePart))")
         onProgress?(1.0, "Boost data ready!")
 
-        return (cachedBoostPath, remoteManifest.chain_height, remoteManifest.output_count)
+        return (activePath, remoteManifest.chain_height, remoteManifest.output_count)
     }
 
     /// Extract serialized tree data from the boost file
@@ -192,12 +291,13 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("serialized tree")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
         // Read just the tree section from the boost file
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: treeSection.offset)
@@ -221,7 +321,8 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("outputs")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
@@ -248,7 +349,7 @@ actor CommitmentTreeUpdater {
         }
 
         // Read and extract CMUs
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: outputSection.offset)
@@ -288,12 +389,13 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("outputs")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
         // Read the outputs section
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: outputSection.offset)
@@ -315,11 +417,12 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("spends")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: spendSection.offset)
@@ -341,11 +444,12 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("timestamps")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: timestampSection.offset)
@@ -367,11 +471,12 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("block hashes")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: hashSection.offset)
@@ -393,11 +498,12 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("peer addresses")
         }
 
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else {
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
         }
 
-        let fileHandle = try FileHandle(forReadingFrom: cachedBoostPath)
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
         defer { try? fileHandle.close() }
 
         try fileHandle.seek(toOffset: peerSection.offset)
@@ -409,22 +515,80 @@ actor CommitmentTreeUpdater {
         return data
     }
 
+    /// FIX #413: Extract block headers from boost file for Tree Root Validation
+    /// Header format (140 bytes each):
+    /// - version: 4 bytes (UInt32 LE)
+    /// - hashPrevBlock: 32 bytes
+    /// - hashMerkleRoot: 32 bytes
+    /// - hashFinalSaplingRoot: 32 bytes (CRITICAL for anchor validation!)
+    /// - time: 4 bytes (UInt32 LE)
+    /// - bits: 4 bytes (UInt32 LE)
+    /// - nonce: 32 bytes
+    func extractHeaders(onProgress: ((Double) -> Void)? = nil) async throws -> Data? {
+        guard let manifest = loadCachedManifest() else {
+            throw BoostFileError.noManifest
+        }
+
+        guard let headerSection = manifest.sections.first(where: { $0.type == SectionType.headers.rawValue }) else {
+            // FIX #413: Headers section is optional - older boost files may not have it
+            print("⚠️ FIX #413: No headers section in boost file (requires boost file v2+)")
+            return nil
+        }
+
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
+            throw BoostFileError.fileNotFound
+        }
+
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
+        defer { try? fileHandle.close() }
+
+        try fileHandle.seek(toOffset: headerSection.offset)
+        guard let data = try fileHandle.read(upToCount: Int(headerSection.size)) else {
+            throw BoostFileError.readError
+        }
+
+        print("📜 FIX #413: Extracted \(headerSection.count) block headers (\(data.count) bytes)")
+        return data
+    }
+
+    /// FIX #413: Check if boost file has headers section
+    func hasHeadersSection() -> Bool {
+        guard let manifest = loadCachedManifest() else { return false }
+        return manifest.sections.contains(where: { $0.type == SectionType.headers.rawValue })
+    }
+
+    /// FIX #413: Get headers section info (for delta calculation)
+    func getHeadersSectionInfo() -> (startHeight: UInt64, endHeight: UInt64, count: UInt64)? {
+        guard let manifest = loadCachedManifest() else { return nil }
+        guard let section = manifest.sections.first(where: { $0.type == SectionType.headers.rawValue }) else { return nil }
+        return (section.start_height, section.end_height, section.count)
+    }
+
     // MARK: - Cache Status
 
     /// Check if we have a valid cached boost file
     func hasCachedBoostFile() -> Bool {
         guard let manifest = loadCachedManifest() else { return false }
-        guard FileManager.default.fileExists(atPath: cachedBoostPath.path) else { return false }
 
-        let attrs = try? FileManager.default.attributesOfItem(atPath: cachedBoostPath.path)
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else { return false }
+
+        let expectedSize = manifest.isThreePartFormat
+            ? manifest.files.core?.size ?? manifest.files.uncompressed.size
+            : manifest.files.uncompressed.size
+
+        let attrs = try? FileManager.default.attributesOfItem(atPath: activePath.path)
         let fileSize = attrs?[.size] as? Int ?? 0
-        return fileSize == manifest.files.uncompressed.size
+        return fileSize == expectedSize
     }
 
     /// Get the cached boost file path if available
     func getCachedBoostFilePath() -> URL? {
-        guard hasCachedBoostFile() else { return nil }
-        return cachedBoostPath
+        guard let manifest = loadCachedManifest() else { return nil }
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else { return nil }
+        return activePath
     }
 
     /// Get cached manifest info
@@ -600,6 +764,8 @@ actor CommitmentTreeUpdater {
             do {
                 var request = URLRequest(url: url)
                 request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+                // FIX #360: Short timeout for version check - fall back to cache quickly if GitHub unreachable
+                request.timeoutInterval = 10
 
                 let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -655,7 +821,10 @@ actor CommitmentTreeUpdater {
                     throw BoostFileError.invalidURL
                 }
 
-                let (data, response) = try await URLSession.shared.data(from: url)
+                // FIX #360: Short timeout for manifest fetch - fall back to cache quickly if GitHub unreachable
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 10
+                let (data, response) = try await URLSession.shared.data(for: request)
 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw BoostFileError.networkError("No HTTP response")
@@ -711,17 +880,79 @@ actor CommitmentTreeUpdater {
         // Get latest release from GitHub to find boost file URL
         let release = try await fetchLatestRelease()
 
-        guard let boostAsset = release.assets.first(where: { $0.name == Self.boostFileName }) else {
-            throw BoostFileError.networkError("Boost file '\(Self.boostFileName)' not found in release \(release.tag_name)")
-        }
+        let isThreePart = manifest.isThreePartFormat
 
-        guard let url = URL(string: boostAsset.browser_download_url) else {
+        if isThreePart {
+            // Three-file format: download core file (required) + optionally equihash
+            guard let coreFileInfo = manifest.files.core else {
+                throw BoostFileError.networkError("Three-part format manifest missing 'core' file info")
+            }
+
+            let coreFileName = coreFileInfo.name.hasSuffix(".zst")
+                ? coreFileInfo.name
+                : coreFileInfo.name + ".zst"
+
+            guard let coreAsset = release.assets.first(where: { $0.name == coreFileName }) else {
+                throw BoostFileError.networkError("Core file '\(coreFileName)' not found in release \(release.tag_name)")
+            }
+
+            // Download core file (required)
+            print("🚀 Three-part format: Downloading CORE file from release \(release.tag_name)")
+            try await downloadSingleFile(
+                asset: coreAsset,
+                targetPath: cachedCorePath,
+                onProgress: onProgress
+            )
+
+            // Optionally download equihash file (if user wants full verification)
+            if let equihashFileInfo = manifest.files.equihash {
+                let equihashFileName = equihashFileInfo.name.hasSuffix(".zst")
+                    ? equihashFileInfo.name
+                    : equihashFileInfo.name + ".zst"
+
+                if let equihashAsset = release.assets.first(where: { $0.name == equihashFileName }) {
+                    print("🚀 Three-part format: Downloading EQUIHASH file (optional) from release \(release.tag_name)")
+                    do {
+                        try await downloadSingleFile(
+                            asset: equihashAsset,
+                            targetPath: cachedEquihashPath,
+                            onProgress: { _ in } // No progress for optional file
+                        )
+                        print("✅ Three-part format: Downloaded both core and equihash files")
+                    } catch {
+                        print("⚠️ Three-part format: Failed to download equihash file (non-critical): \(error.localizedDescription)")
+                        // Don't throw - equihash is optional
+                    }
+                } else {
+                    print("⚠️ Three-part format: Equihash file '\(equihashFileName)' not found in release (non-critical)")
+                }
+            } else {
+                print("ℹ️ Three-part format: No equihash file in manifest (optional)")
+            }
+
+        } else {
+            // Single-file format (v1/v2)
+            guard let boostAsset = release.assets.first(where: { $0.name == Self.boostFileName || $0.name == Self.boostFileName + ".zst" }) else {
+                throw BoostFileError.networkError("Boost file '\(Self.boostFileName)' not found in release \(release.tag_name)")
+            }
+
+            print("🚀 Single-file format: Downloading from release \(release.tag_name)")
+            try await downloadSingleFile(
+                asset: boostAsset,
+                targetPath: cachedBoostPath,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    /// Download a single file with retry logic
+    private func downloadSingleFile(asset: GitHubAsset, targetPath: URL, onProgress: ((Double) -> Void)?) async throws {
+        guard let url = URL(string: asset.browser_download_url) else {
             throw BoostFileError.invalidURL
         }
 
-        print("🚀 Downloading boost file from release \(release.tag_name)")
-        print("📥 URL: \(boostAsset.browser_download_url)")
-        print("📦 Expected size: \(boostAsset.size) bytes")
+        print("📥 URL: \(asset.browser_download_url)")
+        print("📦 Expected size: \(asset.size) bytes")
 
         // FIX #194 v2: Retry on transient GitHub errors (502, 503, 504)
         // FIX #195: Use ephemeral session to avoid stale network cache after Tor bypass
@@ -754,35 +985,60 @@ actor CommitmentTreeUpdater {
                 if [502, 503, 504].contains(statusCode) {
                     // FIX #195: Longer delay on first attempts to let network stabilize after Tor bypass
                     let delaySeconds = attempt <= 2 ? 5 : 3
-                    print("⚠️ FIX #194: Boost download returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in \(delaySeconds)s...")
+                    print("⚠️ FIX #194: Download returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in \(delaySeconds)s...")
                     try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
-                    lastError = BoostFileError.networkError("HTTP \(statusCode) downloading boost file")
+                    lastError = BoostFileError.networkError("HTTP \(statusCode) downloading file")
                     continue
                 }
 
                 guard statusCode == 200 else {
-                    throw BoostFileError.networkError("HTTP \(statusCode) downloading boost file")
+                    throw BoostFileError.networkError("HTTP \(statusCode) downloading file")
                 }
 
                 // Move to cache
-                if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
-                    try FileManager.default.removeItem(at: cachedBoostPath)
+                if FileManager.default.fileExists(atPath: targetPath.path) {
+                    try FileManager.default.removeItem(at: targetPath)
                 }
-                try FileManager.default.moveItem(at: tempURL, to: cachedBoostPath)
+                try FileManager.default.moveItem(at: tempURL, to: targetPath)
 
-                print("✅ Downloaded boost file: \(boostAsset.size) bytes")
+                print("✅ Downloaded file: \(asset.size) bytes -> \(targetPath.lastPathComponent)")
+
+                // Decompress if .zst
+                if targetPath.path.hasSuffix(".zst") || asset.name.hasSuffix(".zst") {
+                    let uncompressedPath = URL(fileURLWithPath: targetPath.path.replacingOccurrences(of: ".zst", with: ""))
+                    print("📦 Decompressing .zst file...")
+                    try await decompressZstFile(source: targetPath, target: uncompressedPath)
+                    // Remove compressed file after successful decompression
+                    try? FileManager.default.removeItem(at: targetPath)
+                    print("✅ Decompressed to: \(uncompressedPath.lastPathComponent)")
+                }
+
                 return
             } catch {
                 lastError = error
                 if attempt < maxRetries {
                     let delaySeconds = attempt <= 2 ? 5 : 3
-                    print("⚠️ FIX #194: Boost download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription), retrying in \(delaySeconds)s...")
+                    print("⚠️ FIX #194: Download failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription), retrying in \(delaySeconds)s...")
                     try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
                 }
             }
         }
 
         throw lastError ?? BoostFileError.networkError("Max retries exceeded")
+    }
+
+    /// Decompress a .zst file using zstd command-line tool
+    private func decompressZstFile(source: URL, target: URL) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["zstd", "-d", source.path, "-o", target.path, "-f"]
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            throw BoostFileError.networkError("zstd decompression failed with code \(process.terminationStatus)")
+        }
     }
 
     private func verifySHA256(file: URL, expected: String) -> Bool {
