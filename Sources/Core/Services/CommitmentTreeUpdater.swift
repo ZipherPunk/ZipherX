@@ -103,15 +103,16 @@ actor CommitmentTreeUpdater {
 
             init(from decoder: Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
-                // Try three-part format first
-                if let core = try? container.decode(FileInfo.self, forKey: .core),
-                   let equihash = try? container.decode(FileInfo.self, forKey: .equihash) {
+
+                // Check if core exists (three-part or core-only format v3+)
+                if let core = try? container.decode(FileInfo.self, forKey: .core) {
                     self.core = core
-                    self.equihash = equihash
+                    // Try to decode equihash (optional)
+                    self.equihash = try? container.decode(FileInfo.self, forKey: .equihash)
                     // Create synthetic uncompressed for compatibility
                     self.uncompressed = FileInfo(
                         name: core.name,
-                        size: core.size + equihash.size,
+                        size: core.size + (self.equihash?.size ?? 0),
                         sha256: ""
                     )
                 } else {
