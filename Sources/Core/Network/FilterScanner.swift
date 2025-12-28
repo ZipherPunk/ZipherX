@@ -931,6 +931,24 @@ final class FilterScanner {
             let bundledHashes = BundledBlockHashes.shared
             let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : UInt64(0)
 
+            // FIX #413: Load bundled headers from boost file FIRST (instant vs P2P timeout!)
+            // The boost file contains 2.4M+ pre-verified headers - loading them is instant
+            // This avoids P2P sync timeout issues with block listeners consuming responses
+            print("📜 FIX #413: Loading bundled headers from boost file before PHASE 2...")
+            let (loadedBundledHeaders, boostHeaderEndHeight) = await WalletManager.shared.loadHeadersFromBoostFile()
+            if loadedBundledHeaders {
+                print("✅ FIX #413: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load!")
+            } else {
+                print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
+            }
+
+            // FIX #383: Stop block listeners BEFORE header sync to prevent race condition
+            // Block listeners consume "headers" responses, causing header sync to timeout!
+            // After sync completes, we'll resume block listeners.
+            print("🛑 FIX #383: Stopping block listeners before header sync (prevents response consumption)...")
+            await PeerManager.shared.stopAllBlockListeners()
+            print("🛑 FIX #383: Block listeners stopped, starting header sync...")
+
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
                 let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
 
@@ -996,6 +1014,12 @@ final class FilterScanner {
                 print("🚨 FIX #406: On-demand P2P fetch will be attempted as fallback...")
                 // Continue with on-demand fallback - it may work
             }
+
+            // FIX #383: Resume block listeners after header sync completes
+            // Header sync is done, now block listeners can safely consume messages again
+            print("▶️ FIX #383: Resuming block listeners after header sync...")
+            await PeerManager.shared.resumeAllBlockListeners()
+            print("▶️ FIX #383: Block listeners resumed")
 
             // FIX #362: Explicit entry log to confirm PHASE 2 is running
             print("✅ FIX #362: Entering PHASE 2 sequential mode (currentHeight=\(currentHeight), targetHeight=\(targetHeight))")

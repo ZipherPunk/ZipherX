@@ -1766,6 +1766,7 @@ enum ZipherXFFI {
     // MARK: - Boost File Scanning (Rust-native, matching benchmark)
 
     /// Result for a discovered note from boost file scanning
+    /// PRODUCTION: Now includes receivedTxid - no more placeholders!
     struct BoostNote {
         let height: UInt32
         let position: UInt64
@@ -1775,6 +1776,9 @@ enum ZipherXFFI {
         let cmu: Data          // 32 bytes
         let nullifier: Data    // 32 bytes
         let isSpent: Bool
+        let spentHeight: UInt32  // Block height where note was spent (0 if unspent)
+        let spentTxid: Data      // Real txid of spending transaction (32 bytes)
+        let receivedTxid: Data   // PRODUCTION: Real txid that created this output (32 bytes)
     }
 
     /// Summary result from boost scan
@@ -1792,9 +1796,9 @@ enum ZipherXFFI {
     ///
     /// - Parameters:
     ///   - spendingKey: 169-byte extended spending key
-    ///   - outputsData: Raw outputs section from boost file (652 bytes per output)
+    ///   - outputsData: Raw outputs section from boost file (684 bytes per output - PRODUCTION v2 includes txid)
     ///   - outputCount: Number of outputs
-    ///   - spendsData: Raw spends section from boost file (36 bytes per spend)
+    ///   - spendsData: Raw spends section from boost file (68 bytes per spend: height + nullifier + txid)
     ///   - spendCount: Number of spends
     /// - Returns: (notes, summary) or nil on failure
     static func scanBoostOutputs(
@@ -1805,15 +1809,15 @@ enum ZipherXFFI {
         spendCount: Int
     ) -> (notes: [BoostNote], summary: BoostScanSummary)? {
         guard spendingKey.count == 169,
-              outputsData.count >= outputCount * 652,
-              spendsData.count >= spendCount * 36 else {
+              outputsData.count >= outputCount * 684,
+              spendsData.count >= spendCount * 68 else {
             print("❌ scanBoostOutputs: invalid input sizes")
             return nil
         }
 
         let maxNotes = 1000  // Buffer for up to 1000 notes
 
-        // Allocate output buffers
+        // Allocate output buffers - includes spent_txid and received_txid fields (PRODUCTION v2)
         var notesBuffer = [BoostScanNote](repeating: BoostScanNote(
             height: 0,
             position: 0,
@@ -1823,7 +1827,10 @@ enum ZipherXFFI {
             cmu: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
             nullifier: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
             is_spent: 0,
-            _padding: (0,0,0,0)
+            spent_height: 0,
+            spent_txid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+            received_txid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+            _padding: (0,0,0)
         ), count: maxNotes)
 
         var resultSummary = BoostScanResult(
@@ -1866,7 +1873,10 @@ enum ZipherXFFI {
             let rcmData = withUnsafeBytes(of: cNote.rcm) { Data($0) }
             let cmuData = withUnsafeBytes(of: cNote.cmu) { Data($0) }
             let nfData = withUnsafeBytes(of: cNote.nullifier) { Data($0) }
+            let spentTxidData = withUnsafeBytes(of: cNote.spent_txid) { Data($0) }
+            let receivedTxidData = withUnsafeBytes(of: cNote.received_txid) { Data($0) }
 
+            // PRODUCTION: Include both spent_txid and received_txid - no more placeholders!
             let note = BoostNote(
                 height: cNote.height,
                 position: cNote.position,
@@ -1875,7 +1885,10 @@ enum ZipherXFFI {
                 rcm: rcmData,
                 cmu: cmuData,
                 nullifier: nfData,
-                isSpent: cNote.is_spent != 0
+                isSpent: cNote.is_spent != 0,
+                spentHeight: cNote.spent_height,
+                spentTxid: spentTxidData,
+                receivedTxid: receivedTxidData  // PRODUCTION: Real txid from boost file!
             )
             notes.append(note)
         }
@@ -1890,5 +1903,106 @@ enum ZipherXFFI {
         )
 
         return (notes, summary)
+    }
+
+    // MARK: - FIX #342: Fast HTTP Downloads using Rust reqwest
+
+    /// Download a file with resume support using Rust reqwest (60-100+ MB/s)
+    /// Much faster than Swift URLSession for large files
+    /// - Parameters:
+    ///   - url: URL to download from
+    ///   - destPath: Destination file path
+    ///   - resumeFrom: Byte offset to resume from (0 for fresh download)
+    ///   - expectedSize: Expected total file size in bytes
+    /// - Returns: 0 on success, error code on failure
+    @discardableResult
+    static func downloadFile(
+        url: String,
+        destPath: String,
+        resumeFrom: UInt64 = 0,
+        expectedSize: UInt64
+    ) -> Int32 {
+        return url.withCString { urlPtr in
+            destPath.withCString { destPtr in
+                zipherx_download_file(
+                    urlPtr,
+                    url.utf8.count,
+                    destPtr,
+                    destPath.utf8.count,
+                    resumeFrom,
+                    expectedSize
+                )
+            }
+        }
+    }
+
+    /// Get current download progress (thread-safe)
+    /// - Returns: Tuple of (bytesDownloaded, totalBytes, speedBps)
+    static func getDownloadProgress() -> (bytes: UInt64, total: UInt64, speed: Double) {
+        var bytes: UInt64 = 0
+        var total: UInt64 = 0
+        var speed: Double = 0
+
+        zipherx_download_get_progress(&bytes, &total, &speed)
+
+        return (bytes, total, speed)
+    }
+
+    /// Cancel the current download
+    static func cancelDownload() {
+        zipherx_download_cancel()
+    }
+
+    // MARK: - ZSTD Decompression
+
+    /// Decompress .zst data using Rust zstd (self-contained, fast)
+    /// - Parameter data: Compressed .zst data
+    /// - Returns: Decompressed data, or nil if decompression fails
+    static func decompressZstData(_ data: Data) -> Data? {
+        return data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) -> Data? in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return nil
+            }
+
+            let compressedPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
+            var outPtr: UnsafeMutablePointer<UInt8>?
+            var outLen: Int = 0
+
+            let result = zipherx_zstd_decompress(
+                compressedPtr,
+                data.count,
+                &outPtr,
+                &outLen
+            )
+
+            guard result == 1, let ptr = outPtr else {
+                return nil
+            }
+
+            let decompressed = Data(bytes: ptr, count: outLen)
+            zipherx_free_buffer(ptr)
+            return decompressed
+        }
+    }
+
+    /// Decompress a .zst file using Rust zstd (convenience wrapper)
+    /// - Parameters:
+    ///   - source: Path to compressed .zst file
+    ///   - target: Path for decompressed output
+    /// - Returns: true if successful, false otherwise
+    static func decompressZst(source: String, target: String) -> Bool {
+        let sourceURL = URL(fileURLWithPath: source)
+        guard let compressedData = try? Data(contentsOf: sourceURL),
+              let decompressedData = decompressZstData(compressedData) else {
+            return false
+        }
+
+        let targetURL = URL(fileURLWithPath: target)
+        do {
+            try decompressedData.write(to: targetURL)
+            return true
+        } catch {
+            return false
+        }
     }
 }

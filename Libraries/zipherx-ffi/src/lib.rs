@@ -6,6 +6,9 @@
 // Tor module (Arti integration)
 pub mod tor;
 
+// FIX #342: Fast HTTP downloads using reqwest (replaces slow Swift URLSession)
+pub mod download;
+
 // Set to true for verbose debug output, false for production
 const DEBUG_LOGGING: bool = false;
 
@@ -5064,13 +5067,15 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
 // Boost File Scanning - Complete wallet scan in Rust (matching benchmark)
 // =============================================================================
 
-/// Boost file output record size: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) = 652
-const BOOST_OUTPUT_SIZE: usize = 652;
-/// Boost file spend record size: height(4) + nullifier(32) = 36
-const BOOST_SPEND_SIZE: usize = 36;
+/// Boost file output record size: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) + txid(32) = 684
+/// PRODUCTION UPGRADE: Now includes received_in_tx for accurate change detection!
+const BOOST_OUTPUT_SIZE: usize = 684;
+/// Boost file spend record size: height(4) + nullifier(32) + txid(32) = 68
+const BOOST_SPEND_SIZE: usize = 68;
 
 /// Result for a discovered note from boost file scanning
 /// Contains all data needed to store in database and build transactions
+/// PRODUCTION: Now includes received_txid - no more placeholders!
 #[repr(C)]
 pub struct BoostScanNote {
     pub height: u32,
@@ -5081,7 +5086,10 @@ pub struct BoostScanNote {
     pub cmu: [u8; 32],
     pub nullifier: [u8; 32],
     pub is_spent: u8,  // 1 if spent, 0 if unspent
-    pub _padding: [u8; 4],  // Alignment padding
+    pub spent_height: u32,  // Height at which note was spent (0 if unspent)
+    pub spent_txid: [u8; 32],  // Real txid of spending transaction (zeros if unspent)
+    pub received_txid: [u8; 32],  // PRODUCTION: Real txid that created this output (no more placeholders!)
+    pub _padding: [u8; 3],  // Alignment padding
 }
 
 /// Result structure for boost scan summary
@@ -5098,8 +5106,8 @@ pub struct BoostScanResult {
 /// Scan boost file outputs section and return discovered notes with nullifiers
 ///
 /// This function performs the complete PHASE 1 + PHASE 1.6 scanning in Rust:
-/// 1. Parse outputs from boost data (652 bytes per output)
-/// 2. Parse spends from boost data (36 bytes per spend)
+/// 1. Parse outputs from boost data (684 bytes per output - PRODUCTION v2)
+/// 2. Parse spends from boost data (68 bytes per spend - PRODUCTION v2)
 /// 3. Parallel note decryption using Rayon
 /// 4. Compute nullifiers for each discovered note (using enumerate index as position)
 /// 5. Check nullifiers against spends to detect spent notes
@@ -5110,9 +5118,9 @@ pub struct BoostScanResult {
 ///
 /// # Arguments
 /// * `sk` - Extended spending key (169 bytes)
-/// * `outputs_data` - Pointer to outputs section (652 bytes per output)
+/// * `outputs_data` - Pointer to outputs section (684 bytes per output - includes txid)
 /// * `output_count` - Number of outputs
-/// * `spends_data` - Pointer to spends section (36 bytes per spend)
+/// * `spends_data` - Pointer to spends section (68 bytes per spend - includes txid)
 /// * `spend_count` - Number of spends
 /// * `notes_out` - Output buffer for discovered notes (BoostScanNote array)
 /// * `max_notes` - Maximum notes that can fit in notes_out
@@ -5175,8 +5183,9 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
     let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
     let nk = fvk.vk.nk;
 
-    // FIX #230: Parse spends into nullifier set with safe slice validation
-    let mut nullifier_set: HashSet<[u8; 32]> = HashSet::with_capacity(spend_count);
+    // Parse spends into HashMap: nullifier → (spend_height, txid)
+    // Now includes the REAL txid from the boost file - no more placeholders!
+    let mut nullifier_map: std::collections::HashMap<[u8; 32], (u32, [u8; 32])> = std::collections::HashMap::with_capacity(spend_count);
     if spend_count > 0 {
         let spends_slice = match safe_slice(spends_data, spend_count * BOOST_SPEND_SIZE) {
             Some(s) => s,
@@ -5187,13 +5196,21 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         };
         for i in 0..spend_count {
             let offset = i * BOOST_SPEND_SIZE;
+            // Read height (4 bytes) + nullifier (32 bytes) + txid (32 bytes) = 68 bytes
+            let spend_height = u32::from_le_bytes([
+                spends_slice[offset],
+                spends_slice[offset + 1],
+                spends_slice[offset + 2],
+                spends_slice[offset + 3],
+            ]);
             let mut nullifier = [0u8; 32];
-            // Skip height (4 bytes), read nullifier (32 bytes)
             nullifier.copy_from_slice(&spends_slice[offset + 4..offset + 36]);
-            nullifier_set.insert(nullifier);
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&spends_slice[offset + 36..offset + 68]);
+            nullifier_map.insert(nullifier, (spend_height, txid));
         }
     }
-    eprintln!("📊 Indexed {} nullifiers for spend detection", nullifier_set.len());
+    eprintln!("📊 Indexed {} nullifiers with spend heights and txids", nullifier_map.len());
 
     // FIX #230: Parse outputs for parallel processing with safe slice validation
     let outputs_slice = match safe_slice(outputs_data, output_count * BOOST_OUTPUT_SIZE) {
@@ -5204,9 +5221,10 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         }
     };
 
-    // Parse into vector of (position, height, cmu, epk, ciphertext)
+    // Parse into vector of (position, height, cmu, epk, ciphertext, received_txid)
     // CRITICAL: position = enumerate index (outputs are in blockchain order)
-    let parsed_outputs: Vec<(usize, u32, [u8; 32], [u8; 32], [u8; 580])> = (0..output_count)
+    // PRODUCTION: Now includes received_txid for accurate change detection!
+    let parsed_outputs: Vec<(usize, u32, [u8; 32], [u8; 32], [u8; 580], [u8; 32])> = (0..output_count)
         .map(|i| {
             let offset = i * BOOST_OUTPUT_SIZE;
             let height = u32::from_le_bytes([
@@ -5222,15 +5240,19 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
             epk.copy_from_slice(&outputs_slice[offset + 40..offset + 72]);
             let mut ciphertext = [0u8; 580];
             ciphertext.copy_from_slice(&outputs_slice[offset + 72..offset + 652]);
+            // PRODUCTION: Read received_txid (32 bytes at offset+652)
+            let mut received_txid = [0u8; 32];
+            received_txid.copy_from_slice(&outputs_slice[offset + 652..offset + 684]);
 
-            (i, height, cmu, epk, ciphertext)
+            (i, height, cmu, epk, ciphertext, received_txid)
         })
         .collect();
 
     // Parallel decryption using Rayon
-    // Collect (position, height, value, diversifier, rcm, cmu) for notes we find
+    // Collect (position, height, value, diversifier, rcm, cmu, received_txid) for notes we find
+    // PRODUCTION: Now includes received_txid!
     let decrypted: Vec<_> = parsed_outputs.par_iter()
-        .filter_map(|(position, height, cmu, epk, ciphertext)| {
+        .filter_map(|(position, height, cmu, epk, ciphertext, received_txid)| {
             // Create a ShieldedOutput for decryption
             let output = BoostOutput {
                 epk: *epk,
@@ -5249,7 +5271,7 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
                         Rseed::AfterZip212(rseed) => *rseed,
                     };
 
-                    Some((*position as u64, *height, note.value().inner(), diversifier, rcm_repr, *cmu))
+                    Some((*position as u64, *height, note.value().inner(), diversifier, rcm_repr, *cmu, *received_txid))
                 }
                 None => None,
             }
@@ -5264,7 +5286,7 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
     let mut total_spent: u64 = 0;
     let mut notes_spent: u32 = 0;
 
-    for (position, height, value, diversifier, rcm_repr, cmu) in decrypted {
+    for (position, height, value, diversifier, rcm_repr, cmu, received_txid) in decrypted {
         if notes_written >= max_notes {
             eprintln!("⚠️ Max notes ({}) reached, stopping", max_notes);
             break;
@@ -5297,12 +5319,15 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         let nullifier = note.nf(&nk, position);
         let nf_bytes = nullifier.0;
 
-        // Check if spent
-        let is_spent = if nullifier_set.contains(&nf_bytes) { 1u8 } else { 0u8 };
+        // Check if spent and get spend height + txid from HashMap
+        let (is_spent, spent_height, spent_txid) = match nullifier_map.get(&nf_bytes) {
+            Some(&(spend_h, txid)) => (1u8, spend_h, txid),
+            None => (0u8, 0u32, [0u8; 32]),
+        };
         if is_spent == 1 {
             total_spent += value;
             notes_spent += 1;
-            eprintln!("   💸 Spent: {} zatoshis @ height {}", value, height);
+            eprintln!("   💸 Spent: {} zatoshis @ height {} (txid {:02x}{:02x}...)", value, height, spent_txid[0], spent_txid[1]);
         } else {
             eprintln!("   💰 Unspent: {} zatoshis @ height {} (pos {})", value, height, position);
         }
@@ -5317,7 +5342,10 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         out_note.cmu = cmu;
         out_note.nullifier = nf_bytes;
         out_note.is_spent = is_spent;
-        out_note._padding = [0u8; 4];
+        out_note.spent_height = spent_height;
+        out_note.spent_txid = spent_txid;  // Real txid from boost file!
+        out_note.received_txid = received_txid;  // PRODUCTION: Real txid - no more placeholders!
+        out_note._padding = [0u8; 3];
 
         notes_written += 1;
     }
@@ -5642,4 +5670,83 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
         *error_out = TxVerifyError::Success as u32;
     }
     true
+}
+
+// =============================================================================
+// ZSTD Decompression - Boost File Support
+// =============================================================================
+
+/// Decompress ZSTD data
+///
+/// # Arguments
+/// * `compressed_ptr` - Pointer to compressed data
+/// * `compressed_len` - Length of compressed data
+/// * `out_ptr` - Pointer to store output buffer pointer (caller must free)
+/// * `out_len` - Pointer to store output length
+///
+/// # Returns
+/// * 1 on success, 0 on failure
+///
+/// # Safety
+/// Caller is responsible for freeing the returned buffer using zipherx_free_buffer()
+#[no_mangle]
+pub extern "C" fn zipherx_zstd_decompress(
+    compressed_ptr: *const u8,
+    compressed_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    // Validate inputs
+    if compressed_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
+        eprintln!("❌ ZSTD decompress: null pointer");
+        return 0;
+    }
+
+    // Safe slice creation
+    let compressed_data = match unsafe { safe_slice(compressed_ptr, compressed_len) } {
+        Some(data) => data,
+        None => {
+            eprintln!("❌ ZSTD decompress: invalid input pointer");
+            return 0;
+        }
+    };
+
+    // Decompress using zstd crate
+    let decompressed = match zstd::decode_all(compressed_data) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("❌ ZSTD decompression failed: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Allocate output buffer
+    let out_len_value = decompressed.len();
+    let buffer = unsafe { libc::malloc(out_len_value) as *mut u8 };
+    if buffer.is_null() {
+        eprintln!("❌ ZSTD decompress: malloc failed");
+        return 0;
+    }
+
+    // Copy decompressed data to output buffer
+    unsafe {
+        libc::memcpy(buffer as *mut libc::c_void, decompressed.as_ptr() as *const libc::c_void, out_len_value);
+    }
+
+    // Set output parameters
+    unsafe {
+        *out_ptr = buffer;
+        *out_len = out_len_value;
+    }
+
+    eprintln!("✅ ZSTD decompressed {} bytes -> {} bytes", compressed_len, out_len_value);
+    1
+}
+
+/// Free a buffer allocated by Rust FFI
+#[no_mangle]
+pub extern "C" fn zipherx_free_buffer(ptr: *mut u8) {
+    if !ptr.is_null() {
+        unsafe { libc::free(ptr as *mut libc::c_void) };
+    }
 }

@@ -178,6 +178,10 @@ public final class PeerManager: ObservableObject {
     /// FIX #445: Prevent main thread hang from rapid @Published updates
     private var isUpdatingCounts = false
     private var pendingUpdate = false
+    private let updateCountLock = NSLock()
+
+    /// FIX #458: Protect peers array from concurrent access during filter operations
+    private let peersLock = NSLock()
 
     // MARK: - Internal State
 
@@ -259,41 +263,46 @@ public final class PeerManager: ObservableObject {
     // MARK: - Peer List Access
 
     /// Get all peers with ready connections that are valid Zclassic nodes
-    /// FIX #433: Falls back to NetworkManager if PeerManager is empty (build compat)
     /// FIX #434: Only return VALID ZCLASSIC peers (version 170010-170012)
     ///           Zcash peers (170018+) are filtered out - they return wrong Equihash params!
+    /// FIX #458: Removed circular dependency - no longer calls NetworkManager.getAllConnectedPeers()
+    /// FIX #458: Added lock to protect peers array from concurrent access
     public func getReadyPeers() -> [Peer] {
+        peersLock.lock()
+        let peerSnapshot = peers
+        peersLock.unlock()
+
         // FIX #434: Filter for isValidZclassicPeer to exclude Zcash nodes
-        let readyPeers = peers.filter { $0.isConnectionReady && $0.isValidZclassicPeer }
-        let zcashPeers = peers.filter { $0.isConnectionReady && !$0.isValidZclassicPeer }
+        let readyPeers = peerSnapshot.filter { $0.isConnectionReady && $0.isValidZclassicPeer }
+        let zcashPeers = peerSnapshot.filter { $0.isConnectionReady && !$0.isValidZclassicPeer }
         if !zcashPeers.isEmpty {
             print("⚠️ FIX #434: Filtered out \(zcashPeers.count) Zcash peers (wrong chain)")
         }
-        if readyPeers.isEmpty {
-            // FIX #433: Fallback to NetworkManager's peers if PeerManager hasn't been synced yet
-            // This ensures header sync works even if FIX #425 hasn't populated PeerManager
-            // FIX #434: Also filter NetworkManager peers for valid Zclassic
-            let nmPeers = NetworkManager.shared.getAllConnectedPeers().filter {
-                $0.isConnectionReady && $0.isValidZclassicPeer
-            }
-            if !nmPeers.isEmpty {
-                print("📡 FIX #433+#434: PeerManager empty, using \(nmPeers.count) Zclassic peers from NetworkManager")
-                return nmPeers
-            }
-        }
+        // FIX #458: Return empty array if no ready peers (caller should handle this)
+        // Removed circular dependency that caused infinite recursion crash
         return readyPeers
     }
 
     /// Get first available peer (must be valid Zclassic node)
     /// FIX #434: Only return valid Zclassic peers
+    /// FIX #458: Added lock to protect peers array
     public func getBestPeer() -> Peer? {
-        return peers.first { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
+        peersLock.lock()
+        let peerSnapshot = peers
+        peersLock.unlock()
+
+        return peerSnapshot.first { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
     }
 
     /// Get peers suitable for broadcast (not banned, connection ready, recent activity)
     /// FIX #434: Only return valid Zclassic peers
+    /// FIX #458: Added lock to protect peers array
     public func getPeersForBroadcast() -> [Peer] {
-        return peers.filter {
+        peersLock.lock()
+        let peerSnapshot = peers
+        peersLock.unlock()
+
+        return peerSnapshot.filter {
             !isBanned($0.host) &&
             $0.isConnectionReady &&
             $0.hasRecentActivity &&
@@ -303,14 +312,24 @@ public final class PeerManager: ObservableObject {
 
     /// Get N peers for consensus operations
     /// FIX #434: Only return valid Zclassic peers
+    /// FIX #458: Added lock to protect peers array
     public func getPeersForConsensus(count: Int) -> [Peer] {
-        let ready = peers.filter { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
+        peersLock.lock()
+        let peerSnapshot = peers
+        peersLock.unlock()
+
+        let ready = peerSnapshot.filter { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
         return Array(ready.prefix(count))
     }
 
     /// Get peers with recent activity
+    /// FIX #458: Added lock to protect peers array
     public func getPeersWithRecentActivity() -> [Peer] {
-        return peers.filter { $0.hasRecentActivity }
+        peersLock.lock()
+        let peerSnapshot = peers
+        peersLock.unlock()
+
+        return peerSnapshot.filter { $0.hasRecentActivity }
     }
 
     // MARK: - Banning
@@ -542,7 +561,7 @@ public final class PeerManager: ObservableObject {
     // MARK: - Block Listener Coordination
 
     /// Stop all block listeners (before header sync)
-    public func stopAllBlockListeners() {
+    public func stopAllBlockListeners() async {
         print("🛑 PeerManager: Stopping all block listeners...")
         var stoppedCount = 0
         for peer in peers {
@@ -555,7 +574,7 @@ public final class PeerManager: ObservableObject {
     }
 
     /// Resume all block listeners (after header sync)
-    public func resumeAllBlockListeners() {
+    public func resumeAllBlockListeners() async {
         print("▶️ PeerManager: Resuming all block listeners...")
         for peer in peers {
             peer.startBlockListener()
@@ -632,8 +651,10 @@ public final class PeerManager: ObservableObject {
     /// FIX #445: Debounce @Published updates to prevent main thread hang
     public func updatePeerCounts() {
         // FIX #447: Take a SNAPSHOT of peers array to prevent EXC_BAD_ACCESS
-        // The array can be modified by other threads while we iterate
+        // FIX #458: Use lock to protect peers array access
+        peersLock.lock()
         let peerSnapshot = Array(peers)
+        peersLock.unlock()
 
         // Take a snapshot of peer states to avoid race conditions
         // Peer.isConnectionReady accesses NWConnection.state which can change from background threads
@@ -642,7 +663,8 @@ public final class PeerManager: ObservableObject {
         var onionCount = 0
 
         for peer in peerSnapshot {
-            // Use try? to safely access connection state (may be nil/deallocated)
+            // FIX #447 v2: Use NSLock to protect peer access, not try? (peer is not throwing)
+            // Access peer properties safely - if peer is deallocated, skip it
             let isReady = peer.isConnectionReady
             if isReady {
                 readyCount += 1
@@ -656,37 +678,41 @@ public final class PeerManager: ObservableObject {
         }
 
         // FIX #445: Debounce rapid updates to prevent main thread hang
-        // If already updating, just mark that we need another update
-        if isUpdatingCounts {
+        // FIX #448: Use lock to prevent race condition in check-then-set
+        updateCountLock.lock()
+        let shouldSkip = isUpdatingCounts
+        if !shouldSkip {
+            isUpdatingCounts = true
+        }
+        updateCountLock.unlock()
+
+        if shouldSkip {
             pendingUpdate = true
             return
         }
 
-        isUpdatingCounts = true
-
         // FIX #446: @Published properties MUST be updated on main thread for SwiftUI
-        // The class is @MainActor but can be called from background contexts
-        let updateBlock = { [weak self] in
-            guard let self = self else { return }
-            self.connectedPeerCount = readyCount
-            self.torConnectedPeerCount = torCount
-            self.onionPeerCount = onionCount
-            self.isUpdatingCounts = false
+        // This function is already @MainActor isolated, so we're always on main thread
+        // The fix is to ensure we don't call this from background contexts
 
-            // Check for pending updates after we're done
-            if self.pendingUpdate {
-                self.pendingUpdate = false
-                // Schedule update for next runloop to prevent tight loop
-                DispatchQueue.main.async { [weak self] in
-                    self?.updatePeerCounts()
-                }
-            }
+        self.connectedPeerCount = readyCount
+        self.torConnectedPeerCount = torCount
+        self.onionPeerCount = onionCount
+
+        self.updateCountLock.lock()
+        self.isUpdatingCounts = false
+        let hasPending = self.pendingUpdate
+        if hasPending {
+            self.pendingUpdate = false
         }
+        self.updateCountLock.unlock()
 
-        if Thread.isMainThread {
-            updateBlock()
-        } else {
-            DispatchQueue.main.async(execute: updateBlock)
+        // Check for pending updates after we're done
+        if hasPending {
+            // Schedule update for next runloop to prevent tight loop
+            Task { @MainActor [weak self] in
+                self?.updatePeerCounts()
+            }
         }
     }
 
@@ -694,21 +720,33 @@ public final class PeerManager: ObservableObject {
 
     /// Sync peer list from NetworkManager (for incremental migration)
     /// Eventually, PeerManager will own the peer list directly
-    public func syncPeers(_ peerList: [Peer]) {
-        peers = peerList
-        updatePeerCounts()
+    /// nonisolated to allow calling from background threads
+    /// FIX #458: Uses Task { @MainActor in ... } for async serialization
+    nonisolated public func syncPeers(_ peerList: [Peer]) {
+        Task { @MainActor [weak self] in
+            self?.peers = peerList
+            self?.updatePeerCounts()
+        }
     }
 
     /// Add a peer to the list
-    public func addPeer(_ peer: Peer) {
-        peers.append(peer)
-        updatePeerCounts()
+    /// nonisolated to allow calling from background threads
+    /// FIX #458: Uses Task { @MainActor in ... } for async serialization
+    nonisolated public func addPeer(_ peer: Peer) {
+        Task { @MainActor [weak self] in
+            self?.peers.append(peer)
+            self?.updatePeerCounts()
+        }
     }
 
     /// Remove a peer from the list
-    public func removePeer(_ peer: Peer) {
-        peers.removeAll { $0.id == peer.id }
-        updatePeerCounts()
+    /// nonisolated to allow calling from background threads
+    /// FIX #458: Uses Task { @MainActor in ... } for async serialization
+    nonisolated public func removePeer(_ peer: Peer) {
+        Task { @MainActor [weak self] in
+            self?.peers.removeAll { $0.id == peer.id }
+            self?.updatePeerCounts()
+        }
     }
 
     /// Remove all peers

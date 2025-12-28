@@ -703,6 +703,7 @@ bool zipherx_build_transaction_multi_encrypted(
 
 /// Result for a discovered note from boost file scanning
 /// Contains all data needed to store in database and build transactions
+/// PRODUCTION: Now includes received_txid - no more placeholders!
 typedef struct {
     uint32_t height;           // Block height where note was received
     uint64_t position;         // Position in commitment tree (for nullifier)
@@ -712,7 +713,10 @@ typedef struct {
     uint8_t cmu[32];           // Note commitment
     uint8_t nullifier[32];     // Computed nullifier
     uint8_t is_spent;          // 1 if spent, 0 if unspent
-    uint8_t _padding[4];       // Alignment padding
+    uint32_t spent_height;     // Block height where note was spent (0 if unspent)
+    uint8_t spent_txid[32];    // Real txid of spending transaction (zeros if unspent)
+    uint8_t received_txid[32]; // PRODUCTION: Real txid that created this output (no more placeholders!)
+    uint8_t _padding[3];       // Alignment padding
 } BoostScanNote;
 
 /// Summary result from boost scan
@@ -727,8 +731,8 @@ typedef struct {
 
 /// Scan boost file outputs section and return discovered notes with nullifiers
 /// Performs complete PHASE 1 + PHASE 1.6 scanning in Rust:
-/// 1. Parse outputs from boost data (652 bytes per output)
-/// 2. Parse spends from boost data (36 bytes per spend)
+/// 1. Parse outputs from boost data (684 bytes per output - PRODUCTION v2 includes txid)
+/// 2. Parse spends from boost data (68 bytes per spend: height + nullifier + txid)
 /// 3. Parallel note decryption using Rayon
 /// 4. Compute nullifiers for each discovered note
 /// 5. Check nullifiers against spends to detect spent notes
@@ -736,9 +740,9 @@ typedef struct {
 /// Returns: Number of notes written to notes_out
 size_t zipherx_scan_boost_outputs(
     const uint8_t *sk,              // Extended spending key (169 bytes)
-    const uint8_t *outputs_data,    // Outputs section (652 bytes per output)
+    const uint8_t *outputs_data,    // Outputs section (684 bytes per output - includes txid)
     size_t output_count,            // Number of outputs
-    const uint8_t *spends_data,     // Spends section (36 bytes per spend)
+    const uint8_t *spends_data,     // Spends section (68 bytes per spend)
     size_t spend_count,             // Number of spends
     BoostScanNote *notes_out,       // Output buffer for discovered notes
     size_t max_notes,               // Maximum notes that can fit
@@ -912,5 +916,73 @@ uint16_t zipherx_tor_chat_get_port(void);
 /// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
 /// Returns 0 on success, 1 on error
 int32_t zipherx_tor_chat_send(const char *onion_address, const uint8_t *data, size_t data_len);
+
+// =============================================================================
+// MARK: - FIX #342: Fast HTTP Downloads (Rust reqwest - replaces slow Swift URLSession)
+// =============================================================================
+
+/// Download a file with resume support using Rust reqwest (much faster than Swift URLSession)
+/// @param url_ptr URL string bytes
+/// @param url_len URL string length
+/// @param dest_path_ptr Destination file path bytes
+/// @param dest_path_len Destination file path length
+/// @param resume_from Byte offset to resume from (0 for fresh download)
+/// @param expected_size Expected total file size (for progress calculation)
+/// @return 0=success, 1=network error, 2=file error, 3=cancelled, 4=other error
+int32_t zipherx_download_file(
+    const uint8_t *url_ptr,
+    size_t url_len,
+    const uint8_t *dest_path_ptr,
+    size_t dest_path_len,
+    uint64_t resume_from,
+    uint64_t expected_size
+);
+
+/// Get current download progress (thread-safe, call from Swift timer)
+/// @param bytes_downloaded Output for bytes downloaded so far
+/// @param total_bytes Output for total expected bytes
+/// @param speed_bps Output for current speed in bytes per second
+void zipherx_download_get_progress(
+    uint64_t *bytes_downloaded,
+    uint64_t *total_bytes,
+    double *speed_bps
+);
+
+/// Cancel the current download
+void zipherx_download_cancel(void);
+
+/// Verify SHA256 checksum of a file
+/// @param file_path_ptr File path bytes
+/// @param file_path_len File path length
+/// @param expected_hash_ptr Expected hash hex string bytes
+/// @param expected_hash_len Expected hash hex string length
+/// @return 1=match, 0=mismatch, -1=error
+int32_t zipherx_verify_sha256(
+    const uint8_t *file_path_ptr,
+    size_t file_path_len,
+    const uint8_t *expected_hash_ptr,
+    size_t expected_hash_len
+);
+
+// =============================================================================
+// ZSTD Decompression - Boost File Support
+// =============================================================================
+
+/// Decompress ZSTD data
+/// @param compressed_ptr Pointer to compressed data
+/// @param compressed_len Length of compressed data
+/// @param out_ptr Pointer to store output buffer pointer (caller must free with zipherx_free_buffer)
+/// @param out_len Pointer to store output length
+/// @return 1 on success, 0 on failure
+uint32_t zipherx_zstd_decompress(
+    const uint8_t *compressed_ptr,
+    size_t compressed_len,
+    uint8_t **out_ptr,
+    size_t *out_len
+);
+
+/// Free a buffer allocated by zipherx_zstd_decompress
+/// @param ptr Pointer to free
+void zipherx_free_buffer(uint8_t *ptr);
 
 #endif /* ZipherX_Bridging_Header_h */

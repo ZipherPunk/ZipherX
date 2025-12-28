@@ -185,6 +185,12 @@ public final class NetworkManager: ObservableObject {
     @Published private(set) var bannedPeersCount: Int = 0
     @Published private(set) var onionPeersCount: Int = 0  // .onion addresses discovered
 
+    // FIX #455: Add @Published properties for Settings/Network display
+    // These counts need to be reactive so the UI updates automatically
+    @Published private(set) var parkedPeersCount: Int = 0
+    @Published private(set) var reliablePeersDisplayCount: Int = 0  // Renamed to avoid conflict with computed property
+    @Published private(set) var preferredSeedsCount: Int = 0
+
     /// Public accessor for known addresses count (for privacy report)
     var knownAddressesCount: Int {
         addressLock.lock()
@@ -575,7 +581,7 @@ public final class NetworkManager: ObservableObject {
 
         // Also delegate to PeerManager (in case it has additional peers)
         Task { @MainActor in
-            PeerManager.shared.stopAllBlockListeners()
+            await PeerManager.shared.stopAllBlockListeners()
         }
 
         debugLog(.network, "⏸️ FIX #140: Stopped \(stoppedCount) block listeners")
@@ -594,7 +600,7 @@ public final class NetworkManager: ObservableObject {
 
         // Also delegate to PeerManager
         Task { @MainActor in
-            PeerManager.shared.resumeAllBlockListeners()
+            await PeerManager.shared.resumeAllBlockListeners()
         }
     }
 
@@ -606,14 +612,17 @@ public final class NetworkManager: ObservableObject {
     /// FIX #122: Reduced from 5s to 2s for faster header sync
     private let CONNECTION_COOLDOWN: TimeInterval = 2.0  // 2 seconds between attempts to same address
 
-    // FIX #235: Hardcoded Zclassic seed nodes are EXEMPT from cooldown
+    // FIX #235, FIX #423: Hardcoded Zclassic seed nodes are EXEMPT from cooldown
     // These are known-good nodes that should always be retried immediately
+    // NOTE: Keep in sync with PeerManager.shared.HARDCODED_SEEDS
     private let HARDCODED_SEEDS = Set<String>([
         "140.174.189.3",
         "140.174.189.17",
         "205.209.104.118",
         "95.179.131.117",
-        "45.77.216.198"
+        "45.77.216.198",
+        "212.23.222.231",   // FIX #423: Verified ZCL node
+        "157.90.223.151"    // FIX #423: Verified ZCL node
     ])
 
     /// Check if an address is on cooldown (recently attempted)
@@ -942,6 +951,7 @@ public final class NetworkManager: ObservableObject {
         setupPeerRecoveryWatchdog()  // FIX #227: Monitor for lost peers
         setupKeepaliveTimer()  // FIX #246: Keepalive ping + auto-reconnection
         setupPathMonitor()  // FIX #268: Detect WiFi ↔ cellular transitions
+        setupConnectionHealthMonitoring()  // FIX: Enhanced connection health monitoring
         loadBundledPeers()      // Load bundled peers first (for fresh installs)
         loadPersistedAddresses() // Then override with persisted (for returning users)
         loadCustomNodes()        // Load user-added custom nodes
@@ -1033,6 +1043,46 @@ public final class NetworkManager: ObservableObject {
     /// FIX #384: Delegates to PeerManager for centralized ban management
     private func isBanned(_ host: String) -> Bool {
         return PeerManager.shared.isBanned(host)
+    }
+
+    /// FIX #427: Check if IP address is in reserved/invalid ranges
+    /// These IPs cannot be routed on the public internet and should never be used for P2P
+    /// See IANA IPv4 Special-Purpose Address Registry
+    private func isReservedIPAddress(_ host: String) -> Bool {
+        // Skip .onion addresses
+        if host.hasSuffix(".onion") {
+            return false
+        }
+
+        // Parse IPv4 octets
+        let parts = host.split(separator: ".").compactMap { UInt8($0) }
+        guard parts.count == 4 else { return false }
+
+        let first = parts[0]
+
+        // Reserved ranges:
+        // 0.x.x.x - Current network (only valid as source address)
+        // 10.x.x.x - Private network
+        // 127.x.x.x - Loopback
+        // 169.254.x.x - Link-local
+        // 172.16-31.x.x - Private network
+        // 192.168.x.x - Private network
+        // 224-239.x.x.x - Multicast
+        // 240-255.x.x.x - Reserved/Broadcast (includes 254.x.x.x)
+        switch first {
+        case 0, 10, 127:
+            return true
+        case 169:
+            return parts[1] == 254
+        case 172:
+            return parts[1] >= 16 && parts[1] <= 31
+        case 192:
+            return parts[1] == 168
+        case 224...255:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Public method to check if a peer is banned (for use by other managers)
@@ -1214,6 +1264,23 @@ public final class NetworkManager: ObservableObject {
         // Update published count on main thread
         DispatchQueue.main.async {
             self.bannedPeersCount = 0
+        }
+    }
+
+    // MARK: - FIX #455: Update reactive counts for Settings/Network display
+
+    /// Update all reactive peer counts for Settings/Network UI
+    /// This should be called whenever peer states change to keep the UI in sync
+    func updatePeerCountsForSettings() {
+        DispatchQueue.main.async {
+            // Parked peers count
+            self.parkedPeersCount = PeerManager.shared.getParkedPeers().count
+
+            // Reliable peers count (use computed property)
+            self.reliablePeersDisplayCount = self.reliablePeerCount
+
+            // Preferred seeds count (from database)
+            self.preferredSeedsCount = (try? WalletDatabase.shared.getPreferredSeeds().count) ?? 0
         }
     }
 
@@ -1477,8 +1544,9 @@ public final class NetworkManager: ObservableObject {
             guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
 
             // FIX #196: Skip peers with invalid peerVersion - their peerStartHeight is garbage!
-            guard peer.peerVersion >= 170002 else {
-                print("⚠️ FIX #196: Skipping peer \(peer.host) with invalid version \(peer.peerVersion) - height data unreliable")
+            // FIX #434: Only use valid Zclassic peers (version 170002-170012), not Zcash (170018+)
+            guard peer.isValidZclassicPeer else {
+                print("⚠️ FIX #434: Skipping peer \(peer.host) with version \(peer.peerVersion) - not valid Zclassic")
                 continue
             }
 
@@ -1760,10 +1828,16 @@ public final class NetworkManager: ObservableObject {
 
     private func persistAddresses() {
         addressLock.lock()
-        let addresses = knownAddresses.values
+        let candidateAddresses = knownAddresses.values
             .filter { $0.successes > 0 || $0.attempts < 3 } // Only save good or untried addresses
             .filter { !$0.address.host.hasPrefix("255.255.") && !$0.address.host.hasPrefix("0.") } // Filter invalid
             .sorted { $0.successes > $1.successes } // Best first
+        addressLock.unlock()
+
+        // FIX #422: NEVER persist banned peers (Zcash nodes, Sybil attackers)
+        // This prevents bad addresses from being re-loaded on next startup
+        let addresses = candidateAddresses
+            .filter { !isBanned($0.address.host) }
             .prefix(maxPersistedAddresses)
             .map { info in
                 PersistedAddress(
@@ -1775,7 +1849,11 @@ public final class NetworkManager: ObservableObject {
                     successes: info.successes
                 )
             }
-        addressLock.unlock()
+
+        let bannedCount = candidateAddresses.count - addresses.count
+        if bannedCount > 0 {
+            print("🚫 FIX #422: Excluded \(bannedCount) banned peers from persistence")
+        }
 
         if let data = try? JSONEncoder().encode(Array(addresses)) {
             UserDefaults.standard.set(data, forKey: persistedAddressesKey)
@@ -2044,8 +2122,15 @@ public final class NetworkManager: ObservableObject {
         }
         addressLock.unlock()
 
-        // Add fresh DNS discoveries to the front (prioritize fresh data)
-        allCandidates = discoveredPeers + allCandidates
+        // FIX #421: Add hardcoded Zclassic seeds FIRST - these are guaranteed good nodes
+        // They must be in allCandidates before any filtering/prioritization can work
+        var hardcodedPeers: [PeerAddress] = []
+        for seedHost in PeerManager.shared.HARDCODED_SEEDS {
+            hardcodedPeers.append(PeerAddress(host: seedHost, port: 16125))
+        }
+
+        // Add fresh DNS discoveries, then persisted addresses
+        allCandidates = hardcodedPeers + discoveredPeers + allCandidates
 
         // Deduplicate and filter banned peers
         var seenPeers = Set<String>()
@@ -2060,8 +2145,19 @@ public final class NetworkManager: ObservableObject {
 
         print("📋 Valid candidates after dedup: \(validPeers.count)")
 
-        // Shuffle to avoid always connecting to same peers
-        validPeers.shuffle()
+        // FIX #421: Hardcoded seeds are ALREADY at front (added first, dedup preserves order)
+        // Count how many we have for logging
+        let hardcodedSeeds = PeerManager.shared.HARDCODED_SEEDS
+        let hardcodedCount = validPeers.prefix(10).filter { hardcodedSeeds.contains($0.host) }.count
+        if hardcodedCount > 0 {
+            print("⭐ FIX #421: \(hardcodedCount) hardcoded Zclassic seeds at front of connection list")
+        }
+
+        // Shuffle the NON-hardcoded peers only (preserve hardcoded at front)
+        let hardcodedInList = validPeers.filter { hardcodedSeeds.contains($0.host) }
+        var otherPeers = validPeers.filter { !hardcodedSeeds.contains($0.host) }
+        otherPeers.shuffle()
+        validPeers = hardcodedInList + otherPeers
 
         // Connect to peers in batches until we reach target
         var connectedCount = 0
@@ -2069,7 +2165,20 @@ public final class NetworkManager: ObservableObject {
         var peerIndex = 0
         var attemptedThisBatch = Set<String>()
 
+        // FIX #429: Add timeout to connect() - return after 20s even if target not met
+        // This prevents FAST START from getting stuck waiting for slow peer connections
+        // After initial connection, background processes will continue adding peers
+        let connectStartTime = Date()
+        let maxConnectDuration: TimeInterval = 20.0 // 20 seconds max for initial connection
+        let minPeersForEarlyReturn = 3 // Return early if we have at least 3 peers
+
         while connectedCount < targetPeers && peerIndex < validPeers.count {
+            // FIX #429: Check if we've exceeded the connection timeout
+            let elapsed = Date().timeIntervalSince(connectStartTime)
+            if elapsed > maxConnectDuration && connectedCount >= minPeersForEarlyReturn {
+                print("⏱️ FIX #429: connect() timeout (\(String(format: "%.1f", elapsed))s) - returning with \(connectedCount) peers (will continue in background)")
+                break
+            }
             let batchEnd = min(peerIndex + maxConcurrent, validPeers.count)
             let batch = Array(validPeers[peerIndex..<batchEnd])
             peerIndex = batchEnd
@@ -2187,6 +2296,20 @@ public final class NetworkManager: ObservableObject {
         persistAddresses()
         print("📊 Final: Connected to \(connectedCount)/\(targetPeers) target peers")
 
+        // FIX #429: If we exited early due to timeout, continue connecting in background
+        let remainingPeers = Array(validPeers[peerIndex...])
+        if !remainingPeers.isEmpty && connectedCount < targetPeers {
+            Task { [weak self] in
+                guard let self = self else { return }
+                print("🔄 FIX #429: Continuing peer discovery in background (\(remainingPeers.count) candidates remaining)...")
+                await self.connectToRemainingPeersInBackground(
+                    remainingPeers: remainingPeers,
+                    targetPeers: targetPeers,
+                    currentConnected: connectedCount
+                )
+            }
+        }
+
         // FIX #173: Check for Sybil attack - if 0 connections and many Sybil rejections, bypass Tor
         if connectedCount == 0 && shouldBypassTorForSybil() {
             print("🚨 [FIX #173] SYBIL ATTACK DETECTED - Bypassing Tor for direct P2P connection!")
@@ -2255,6 +2378,31 @@ public final class NetworkManager: ObservableObject {
 
         // Persist good addresses for next launch
         persistAddresses()
+
+        // FIX #425: Sync peers to PeerManager so HeaderSyncManager can find them
+        // HeaderSyncManager calls PeerManager.shared.getReadyPeers() directly
+        syncPeersToPeerManager()
+
+        // FIX #431: Update chainHeight from connected peers IMMEDIATELY after connect()
+        // This fixes "Chain height unavailable" during FAST START because:
+        //   1. refreshChainHeight() is skipped when suppressBackgroundSync=true
+        //   2. FAST START waits for chainHeight > 0 before proceeding
+        //   3. But chainHeight stays 0 if we don't update it from peer handshakes
+        // Get consensus chain height from connected peers' peerStartHeight values
+        // FIX #434: Only use valid Zclassic peers (170002-170012), not Zcash (170018+)
+        var peerHeights: [UInt64] = []
+        for peer in peers {
+            guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else { continue }
+            peerHeights.append(UInt64(peer.peerStartHeight))
+        }
+        if !peerHeights.isEmpty {
+            peerHeights.sort()
+            let consensusHeight = peerHeights[peerHeights.count / 2] // Median
+            await MainActor.run {
+                self.chainHeight = consensusHeight
+            }
+            print("📊 FIX #431+#434: Updated chainHeight to \(consensusHeight) from \(peerHeights.count) valid Zclassic peers")
+        }
 
         // Advertise our .onion address to peers (if hidden service is running)
         await advertiseOnionAddressToPeers()
@@ -2452,11 +2600,12 @@ public final class NetworkManager: ObservableObject {
         if torEnabled {
             // TOR MODE: P2P consensus is authoritative
             // 1. Get P2P peer consensus height (skip banned peers, handle negative heights)
+            // FIX #434: Only use valid Zclassic peers (170002-170012), not Zcash (170018+)
             var peerHeights: [UInt64: Int] = [:]
             var peerMaxHeight: UInt64 = 0
             for peer in peers {
-                // SECURITY: Skip banned peers and negative heights (malicious peers)
-                guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                // SECURITY: Skip banned peers, negative heights, and non-Zclassic peers
+                guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else { continue }
                 let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > 0 {
                     peerHeights[h, default: 0] += 1
@@ -2520,14 +2669,15 @@ public final class NetworkManager: ObservableObject {
             var peerHeights: [UInt64: Int] = [:]
 
             // FIX #402: Debug peer heights
-            let readyPeers = peers.filter { $0.isConnectionReady }
-            print("📊 FIX #402: \(readyPeers.count) ready peers, checking heights...")
+            // FIX #434: Only use valid Zclassic peers (170002-170012)
+            let readyPeers = peers.filter { $0.isConnectionReady && $0.isValidZclassicPeer }
+            print("📊 FIX #402+#434: \(readyPeers.count) valid Zclassic peers, checking heights...")
 
             for peer in peers {
-                // SECURITY: Skip banned peers and negative heights (malicious peers)
-                guard !isBanned(peer.host), peer.peerStartHeight > 0 else {
-                    if peer.isConnectionReady {
-                        print("📊 FIX #402: Skipping peer \(peer.host) - banned=\(isBanned(peer.host)), height=\(peer.peerStartHeight)")
+                // SECURITY: Skip banned peers, negative heights, and non-Zclassic peers
+                guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else {
+                    if peer.isConnectionReady && !peer.isValidZclassicPeer {
+                        print("⚠️ FIX #434: Skipping non-Zclassic peer \(peer.host) version \(peer.peerVersion)")
                     }
                     continue
                 }
@@ -3998,6 +4148,67 @@ public final class NetworkManager: ObservableObject {
         }
     }
 
+    /// FIX #429: Continue connecting to peers in background after initial connect() returns
+    /// This allows the UI to proceed while we establish more connections for resilience
+    private func connectToRemainingPeersInBackground(
+        remainingPeers: [PeerAddress],
+        targetPeers: Int,
+        currentConnected: Int
+    ) async {
+        var connectedCount = currentConnected
+        var peerIndex = 0
+        let maxConcurrent = 5 // Slower in background to not overwhelm network
+
+        while connectedCount < targetPeers && peerIndex < remainingPeers.count {
+            let batchEnd = min(peerIndex + maxConcurrent, remainingPeers.count)
+            let batch = Array(remainingPeers[peerIndex..<batchEnd])
+            peerIndex = batchEnd
+
+            await withTaskGroup(of: (Peer?, PeerAddress).self) { group in
+                for address in batch {
+                    if self.isBanned(address.host) || self.isOnCooldown(address.host, port: address.port) {
+                        continue
+                    }
+
+                    group.addTask {
+                        do {
+                            let peer = try await self.connectToPeer(address)
+                            return (peer, address)
+                        } catch {
+                            return (nil, address)
+                        }
+                    }
+                }
+
+                for await (peer, _) in group {
+                    if let peer = peer {
+                        peers.append(peer)
+                        connectedCount += 1
+                        self.resetSybilCounter()
+                        self.setupBlockListener(for: peer)
+
+                        await MainActor.run {
+                            self.connectedPeers = connectedCount
+                        }
+
+                        if connectedCount >= targetPeers {
+                            group.cancelAll()
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Small delay between batches to be gentle on the network
+            try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+        }
+
+        if connectedCount > currentConnected {
+            print("✅ FIX #429: Background connection added \(connectedCount - currentConnected) more peers (total: \(connectedCount))")
+            PeerManager.shared.syncPeers(self.peers)
+        }
+    }
+
     private func connectToPeer(_ address: PeerAddress) async throws -> Peer {
         let peer = Peer(host: address.host, port: address.port, networkMagic: networkMagic)
 
@@ -4966,12 +5177,13 @@ public final class NetworkManager: ObservableObject {
 
         // 3. PEER CONSENSUS - The most trustworthy source for chain height
         // Collect heights from all connected peers and find consensus (skip banned peers)
+        // FIX #434: Only use valid Zclassic peers (170002-170012), not Zcash (170018+)
         var peerHeights: [UInt64: Int] = [:]  // height -> count of peers reporting it
         var peerMaxHeight: UInt64 = 0
 
         for peer in peers {
-            // SECURITY: Skip banned peers and negative heights (malicious peers)
-            guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            // SECURITY: Skip banned peers, negative heights, and non-Zclassic peers
+            guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else { continue }
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 peerHeights[h, default: 0] += 1
@@ -4997,11 +5209,12 @@ public final class NetworkManager: ObservableObject {
         }
 
         // SECURITY: Detect and ban peers reporting heights VERY far from consensus
+        // FIX #434: Only check valid Zclassic peers
         let maxOutlierTolerance: UInt64 = 500
         if peerConsensusHeight > 0 {
             for peer in peers {
-                // Skip already banned peers, skip negative heights
-                guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+                // Skip already banned peers, skip negative heights, skip non-Zclassic
+                guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else { continue }
                 let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
                 if h > peerConsensusHeight + maxOutlierTolerance {
                     print("""
@@ -5313,9 +5526,10 @@ public final class NetworkManager: ObservableObject {
         }
 
         // 2. Peer version heights (may be fake) - skip banned peers and negative heights
+        // FIX #434: Only use valid Zclassic peers (170002-170012), not Zcash (170018+)
         for peer in peers {
-            // SECURITY: Skip banned peers and negative heights (malicious peers)
-            guard !isBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            // SECURITY: Skip banned peers, negative heights, and non-Zclassic peers
+            guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else { continue }
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 // Validate against trusted source
@@ -6139,19 +6353,38 @@ public final class NetworkManager: ObservableObject {
         // Collect all candidate addresses
         var candidateAddresses: [(address: PeerAddress, source: String)] = []
 
-        // 1. Preferred seeds (highest priority)
+        // FIX #427: Add hardcoded seeds FIRST - they are the most reliable
+        // Previous bug: Recovery only used parked peers because hardcoded seeds
+        // weren't in knownAddresses. This caused 0 peers when all parked peers failed.
+        for seedHost in HARDCODED_SEEDS {
+            if !isBanned(seedHost) && !peers.contains(where: { $0.host == seedHost }) {
+                candidateAddresses.append((PeerAddress(host: seedHost, port: defaultPort), "hardcoded"))
+            }
+        }
+        print("⭐ FIX #427: Added \(candidateAddresses.count) hardcoded seeds to recovery candidates")
+
+        // 1. Preferred seeds (user-configured, highest priority after hardcoded)
         for seed in preferredSeeds {
             let seedAddress = PeerAddress(host: seed.host, port: seed.port)
-            if !isBanned(seedAddress.host) {
+            if !isBanned(seedAddress.host) && !candidateAddresses.contains(where: { $0.address.host == seed.host }) {
                 candidateAddresses.append((seedAddress, "preferred"))
-            } else {
+            } else if isBanned(seedAddress.host) {
                 print("⚠️ FIX #284: Preferred seed \(seed.host) is BANNED - skipping")
             }
         }
 
-        // 2. Parked peers ready for retry
+        // 2. Parked peers ready for retry (lower priority than hardcoded seeds)
         let readyParked = getParkedPeersReadyForRetry()
         for parked in readyParked.prefix(5) {
+            // FIX #427: Skip parked peers that are already in candidates
+            if candidateAddresses.contains(where: { $0.address.host == parked.address }) {
+                continue
+            }
+            // FIX #427: Skip invalid IP addresses (reserved ranges)
+            if isReservedIPAddress(parked.address) {
+                print("⚠️ FIX #427: Skipping reserved IP \(parked.address)")
+                continue
+            }
             let address = PeerAddress(host: parked.address, port: parked.port)
             candidateAddresses.append((address, "parked"))
         }
@@ -6161,6 +6394,10 @@ public final class NetworkManager: ObservableObject {
             .filter { $0.source == "bundled" }
             .map { $0.address }
         for address in bundledAddresses.prefix(5) {
+            // Skip if already in candidates
+            if candidateAddresses.contains(where: { $0.address.host == address.host }) {
+                continue
+            }
             if !shouldSkipPeer(address.host) && !isOnCooldown(address.host, port: address.port) {
                 candidateAddresses.append((address, "bundled"))
             }
@@ -6364,6 +6601,105 @@ public final class NetworkManager: ObservableObject {
         debugLog(.network, "📶 FIX #268: NWPathMonitor stopped")
     }
 
+    // MARK: - FIX: Connection Health Monitoring
+
+    /// Setup enhanced connection health monitoring
+    /// Monitors peer connectivity and triggers recovery when needed
+    /// Uses Task-based timer instead of Timer.scheduledTimer for reliability
+    private var connectionHealthTimerTask: Task<Void, Never>?
+    private let CONNECTION_HEALTH_CHECK_INTERVAL: TimeInterval = 30  // Every 30 seconds
+
+    private func setupConnectionHealthMonitoring() {
+        // Cancel any existing timer task
+        connectionHealthTimerTask?.cancel()
+
+        print("🔍 [HEALTH] Starting connection health timer (interval: \(CONNECTION_HEALTH_CHECK_INTERVAL)s)")
+
+        // Create new Task-based timer (more reliable than Timer.scheduledTimer)
+        connectionHealthTimerTask = Task { @MainActor in
+            print("🔍 [HEALTH] Timer task started, will run every \(CONNECTION_HEALTH_CHECK_INTERVAL)s")
+            var iteration = 0
+            while !Task.isCancelled {
+                iteration += 1
+                print("🔍 [HEALTH] Timer iteration \(iteration) about to sleep...")
+                try? await Task.sleep(nanoseconds: UInt64(CONNECTION_HEALTH_CHECK_INTERVAL * 1_000_000_000))
+                print("🔍 [HEALTH] Timer iteration \(iteration) woke up, cancelled=\(Task.isCancelled)")
+                if !Task.isCancelled {
+                    print("🔍 [HEALTH] Calling checkConnectionHealth()...")
+                    await checkConnectionHealth()
+                }
+            }
+            print("🔍 [HEALTH] Timer task ended (cancelled)")
+        }
+        debugLog(.network, "💓 Connection health monitoring started (every \(CONNECTION_HEALTH_CHECK_INTERVAL)s)")
+    }
+
+    /// Stop connection health monitoring
+    private func stopConnectionHealthMonitoring() {
+        connectionHealthTimerTask?.cancel()
+        connectionHealthTimerTask = nil
+    }
+
+    /// Check connection health and trigger recovery if needed
+    private func checkConnectionHealth() async {
+        print("🔍 [HEALTH] checkConnectionHealth() called at \(Date())")
+
+        let connectedCount = connectedPeers
+        let aliveCount = await countAlivePeers()
+
+        print("💓 Connection health: \(connectedCount) connected, \(aliveCount) alive")
+
+        // FIX #455: Update reactive peer counts for Settings UI
+        updatePeerCountsForSettings()
+
+        // If not enough alive peers, trigger recovery
+        if aliveCount < CONSENSUS_THRESHOLD {
+            print("⚠️ Not enough alive peers (\(aliveCount) < \(CONSENSUS_THRESHOLD)) - triggering recovery")
+            await attemptPeerRecovery()
+        }
+
+        // Also check Tor SOCKS5 health if Tor is enabled
+        let torMode = await TorManager.shared.mode
+        print("🔍 [HEALTH] Tor mode: \(torMode.rawValue)")
+        if torMode == .enabled {
+            print("🔍 [HEALTH] Tor enabled - calling SOCKS5 health check...")
+            let torHealthy = await TorManager.shared.checkSOCKS5Health()
+            if !torHealthy {
+                print("⚠️ Tor SOCKS5 health check failed - will trigger restart if continues")
+            } else {
+                print("✅ Tor SOCKS5 health check PASSED")
+            }
+        } else {
+            print("🔍 [HEALTH] Tor NOT enabled - skipping SOCKS5 health check")
+        }
+    }
+
+    /// Count how many peers are actually alive (respond to ping)
+    /// FIX #449: Use hasRecentActivity to avoid unnecessary pings (like keepalive does)
+    private func countAlivePeers() async -> Int {
+        var alive = 0
+        let readyPeers = peers.filter { $0.isConnectionReady }
+
+        for peer in readyPeers {
+            // FIX #449: Check recent activity FIRST before pinging (reduces false positives)
+            // If peer had activity in last 60 seconds, consider it alive without ping
+            if peer.hasRecentActivity {
+                alive += 1
+            } else {
+                // Only ping if no recent activity
+                // Use 10 second timeout for health check (was 3s - too aggressive)
+                if await peer.sendPing(timeoutSeconds: 10) {
+                    alive += 1
+                } else {
+                    // Peer didn't respond - mark for potential reconnection
+                    debugLog(.network, "💓 Peer \(peer.host) not responding to health check")
+                }
+            }
+        }
+
+        return alive
+    }
+
     /// Handle network path change with debouncing (like BitChat's 3s cooldown)
     private func handleNetworkPathChange(path: NWPath) async {
         // Check if we're within the debounce window
@@ -6530,6 +6866,32 @@ public final class NetworkManager: ObservableObject {
         if !deadPeers.isEmpty {
             debugLog(.network, "🫀 FIX #246: \(deadPeers.count) dead peer(s) detected via keepalive")
 
+            // CRITICAL FIX: Detect "all peers dead" pattern (Tor SOCKS5 proxy failure)
+            // If ALL peers died simultaneously, this is Tor issue, not peer issue
+            // Threshold: 3+ peers (consensus threshold) to avoid false positives
+            let allPeersDiedSimultaneously = (deadPeers.count == readyPeers.count) && (readyPeers.count >= 3)
+            if allPeersDiedSimultaneously {
+                print("🚨 CRITICAL: All \(readyPeers.count) peers died simultaneously!")
+                print("   This indicates Tor SOCKS5 proxy failure, not peer failure")
+                print("   Blocking peer reconnection and restarting Tor...")
+
+                // Block peer reconnection attempts (they'll all fail anyway)
+                // Reset all reconnection attempts
+                for peer in deadPeers {
+                    await MainActor.run { PeerManager.shared.resetReconnectionAttempts(peer.host, port: peer.port) }
+                }
+
+                // Restart Tor instead of trying to reconnect peers
+                await TorManager.shared.restartTor()
+
+                // After Tor restart, then reconnect peers
+                try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
+                await attemptPeerRecovery()
+
+                return  // Skip normal dead peer handling
+            }
+
+            // Normal dead peer handling
             for deadPeer in deadPeers {
                 await handleDeadPeer(deadPeer)
             }
