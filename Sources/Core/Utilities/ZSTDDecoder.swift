@@ -47,8 +47,8 @@ enum ZSTDDecoder {
             }
             let windowDescriptor = input[index]
             index += 1
-            let exponent = (windowDescriptor & 0xF8) >> 3
-            let mantissa = windowDescriptor & 0x07
+            let exponent = Int((windowDescriptor & 0xF8) >> 3)
+            let mantissa = Int(windowDescriptor & 0x07)
             windowSize = (1 << (exponent + 10)) + (mantissa << (exponent + 7))
         }
 
@@ -68,7 +68,7 @@ enum ZSTDDecoder {
             guard index + 8 <= input.count else {
                 throw ZSTDError.invalidFormat
             }
-            frameContentSize = input[index..<index+8].withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+            frameContentSize = Int(input[index..<index+8].withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
             index += 8
         }
 
@@ -98,7 +98,7 @@ enum ZSTDDecoder {
             index += 3
 
             lastBlock = (blockHeader & 0x01) != 0
-            let blockType = (blockHeader >> 1) & 0x03
+            let blockType = Int((blockHeader >> 1) & 0x03)
             let blockSize = Int(blockHeader >> 3)
 
             switch blockType {
@@ -106,22 +106,19 @@ enum ZSTDDecoder {
                 guard index + blockSize <= input.count else {
                     throw ZSTDError.invalidFormat
                 }
-                output.append(input[index..<index+blockSize])
+                let blockData = input[index..<index+blockSize]
+                output.append(blockData)
                 index += blockSize
                 outputSize += blockSize
 
-                // Update history
-                let copySize = min(blockSize, windowSize)
-                if historySize + copySize <= windowSize {
-                    historyBuffer.advanced(by: historySize).copyMemory(from: input[index-blockSize..<index], count: copySize)
-                } else {
-                    let overlap = historySize + copySize - windowSize
-                    let offset = blockSize - overlap
-                    memmove(historyBuffer, historyBuffer.advanced(by: offset), windowSize - copySize)
-                    historyBuffer.advanced(by: windowSize - copySize).copyMemory(from: input[index-blockSize+overlap..<index], count: copySize)
+                // Update history (simplified - just append to history, wrap if needed)
+                for byte in blockData {
+                    historyBuffer[historyOffset] = byte
+                    historyOffset = (historyOffset + 1) % windowSize
+                    if historySize < windowSize {
+                        historySize += 1
+                    }
                 }
-                historySize = min(windowSize, historySize + copySize)
-                historyOffset = (historyOffset + blockSize) % windowSize
 
             case 1: // RLE block
                 guard index < input.count else {
@@ -145,6 +142,8 @@ enum ZSTDDecoder {
 
             case 3: // Reserved
                 throw ZSTDError.reservedBlockType
+            default:
+                throw ZSTDError.invalidFormat
             }
         }
 
@@ -170,24 +169,6 @@ enum ZSTDDecoder {
     private static func decompressBlock(_ block: Data, history: UnsafeMutablePointer<UInt8>, historySize: inout Int, historyOffset: inout Int, windowSize: Int) throws -> Data {
         var output = Data()
         var inputIndex = 0
-        var bitStream = UInt32(0)
-        var bitCount = 0
-
-        func readBits(_ count: Int) throws -> UInt32 {
-            while bitCount < count {
-                guard inputIndex < block.count else {
-                    throw ZSTDError.invalidFormat
-                }
-                let byte = block[inputIndex]
-                inputIndex += 1
-                bitStream |= UInt32(byte) << bitCount
-                bitCount += 8
-            }
-            let value = bitStream & ((1 << count) - 1)
-            bitStream >>= count
-            bitCount -= count
-            return value
-        }
 
         func readByte() throws -> UInt8 {
             guard inputIndex < block.count else {
@@ -198,71 +179,70 @@ enum ZSTDDecoder {
             return byte
         }
 
-        // Block header (1 bit: last_block, 2 bits: block_type, 21 bits: block_size)
-        let isLastBlock = try readBits(1) != 0
-        let blockType = try readBits(2)
-        let blockSize = Int(try readBits(21))
-
-        guard blockType == 2 else {
-            throw ZSTDError.invalidFormat
-        }
-
-        // Decompress using simple LZ decoder
+        // Simple LZ decoder for sequence commands
         while inputIndex < block.count {
             let token = try readByte()
-            let literals = UInt32(token >> 4)
+            let literalCount = Int(token >> 4)
+            let matchCount = Int((token & 0x0F))
 
             // Read literals
-            var literalLength = literals
-            if literals == 15 {
-                var extra: UInt32 = 0
+            var totalLiterals = literalCount
+            if literalCount == 15 {
+                // Extended length
                 while true {
                     let b = try readByte()
-                    extra += UInt32(b)
+                    totalLiterals += Int(b)
                     if b < 255 { break }
                 }
-                literalLength = 15 + extra
             }
 
-            for _ in 0..<literalLength {
+            // Copy literal bytes
+            for _ in 0..<totalLiterals {
                 output.append(try readByte())
             }
 
+            // Check if there's a match
             if inputIndex >= block.count {
                 break
             }
 
-            // Match
+            // Read offset (little endian)
             let offsetLow = UInt32(try readByte())
-            let offsetHigh = UInt32(token & 0x0F)
-            var offset = offsetLow | (offsetHigh << 8)
+            let offsetHigh = UInt32(try readByte())
+            let offset = UInt32(offsetLow) | (offsetHigh << 8)
 
-            if offset == 0 {
-                // This shouldn't happen - offset must be >= 1
+            guard offset > 0 else {
                 throw ZSTDError.invalidFormat
             }
 
-            var matchLength = UInt32(token >> 4)
-            if matchLength == 15 {
-                var extra: UInt32 = 0
+            // Read match length
+            var totalMatch = matchCount
+            if matchCount == 15 {
+                // Extended length
                 while true {
                     let b = try readByte()
-                    extra += UInt32(b)
+                    totalMatch += Int(b)
                     if b < 255 { break }
                 }
-                matchLength = 15 + extra
             }
-            matchLength += 4 // Minimum match length is 4
+            totalMatch += 4 // Minimum match length
 
-            // Copy from output (LZ77 backreference)
+            // Copy from history/output (LZ backreference)
             let startPos = output.count - Int(offset)
             guard startPos >= 0 else {
                 throw ZSTDError.invalidFormat
             }
 
-            for i in 0..<Int(matchLength) {
+            for i in 0..<totalMatch {
                 let byte = output[startPos + i]
                 output.append(byte)
+
+                // Update history
+                history[historyOffset] = byte
+                historyOffset = (historyOffset + 1) % windowSize
+                if historySize < windowSize {
+                    historySize += 1
+                }
             }
         }
 
