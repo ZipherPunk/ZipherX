@@ -812,8 +812,16 @@ actor CommitmentTreeUpdater {
                 // Get latest release from GitHub
                 let release = try await fetchLatestRelease()
 
+                // DEBUG: Log all available assets
+                print("🔍 DEBUG [Manifest Fetch]: Release has \(release.assets.count) assets:")
+                for asset in release.assets {
+                    print("  - \(asset.name) (\(asset.size) bytes)")
+                }
+                print("🔍 DEBUG [Manifest Fetch]: Looking for manifest named: \(Self.manifestFileName)")
+
                 // Find manifest asset
                 guard let manifestAsset = release.assets.first(where: { $0.name == Self.manifestFileName }) else {
+                    print("🔍 DEBUG [Manifest Fetch]: ERROR - Manifest asset not found!")
                     throw BoostFileError.networkError("Manifest not found in latest release")
                 }
 
@@ -821,34 +829,65 @@ actor CommitmentTreeUpdater {
                     throw BoostFileError.invalidURL
                 }
 
+                // DEBUG: Log URL construction details
+                print("🔍 DEBUG [Manifest Fetch]: Attempt \(attempt)/\(maxRetries)")
+                print("🔍 DEBUG [Manifest Fetch]: Release tag: \(release.tag_name)")
+                print("🔍 DEBUG [Manifest Fetch]: Asset name: \(manifestAsset.name)")
+                print("🔍 DEBUG [Manifest Fetch]: Asset size: \(manifestAsset.size) bytes")
+                print("🔍 DEBUG [Manifest Fetch]: Download URL: \(manifestAsset.browser_download_url)")
+
                 // FIX #360: Short timeout for manifest fetch - fall back to cache quickly if GitHub unreachable
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 10
-                let (data, response) = try await URLSession.shared.data(for: request)
+                print("🔍 DEBUG [Manifest Fetch]: Request timeout: \(request.timeoutInterval)s")
 
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw BoostFileError.networkError("No HTTP response")
+                print("🔍 DEBUG [Manifest Fetch]: Starting URLSession.data() call...")
+                do {
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    print("🔍 DEBUG [Manifest Fetch]: URLSession.data() completed")
+                    print("🔍 DEBUG [Manifest Fetch]: Received \(data.count) bytes of data")
+
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        print("🔍 DEBUG [Manifest Fetch]: ERROR - No HTTP response")
+                        throw BoostFileError.networkError("No HTTP response")
+                    }
+
+                    // FIX #194: Check for transient errors that should trigger retry
+                    let statusCode = httpResponse.statusCode
+                    print("🔍 DEBUG [Manifest Fetch]: HTTP status code: \(statusCode)")
+                    print("🔍 DEBUG [Manifest Fetch]: Response headers: \(httpResponse.allHeaderFields)")
+
+                    if [502, 503, 504].contains(statusCode) {
+                        print("⚠️ FIX #194: GitHub returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 3s...")
+                        try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second delay
+                        lastError = BoostFileError.networkError("HTTP \(statusCode)")
+                        continue
+                    }
+
+                    guard statusCode == 200 else {
+                        print("🔍 DEBUG [Manifest Fetch]: ERROR - Non-200 status code")
+                        throw BoostFileError.networkError("HTTP \(statusCode)")
+                    }
+
+                    print("🔍 DEBUG [Manifest Fetch]: Decoding JSON manifest...")
+                    let manifest = try JSONDecoder().decode(BoostManifest.self, from: data)
+                    print("🔍 DEBUG [Manifest Fetch]: Successfully decoded manifest, format: \(manifest.format)")
+                    return manifest
+                } catch let urlError as URLError {
+                    print("🔍 DEBUG [Manifest Fetch]: URLError caught: \(urlError.localizedDescription)")
+                    print("🔍 DEBUG [Manifest Fetch]: URLError code: \(urlError.code.rawValue)")
+                    print("🔍 DEBUG [Manifest Fetch]: URLError failing URL: \(urlError.failureURLString ?? "none")")
+                    throw urlError
+                } catch let decodingError as DecodingError {
+                    print("🔍 DEBUG [Manifest Fetch]: JSON decoding error: \(decodingError)")
+                    throw decodingError
                 }
-
-                // FIX #194: Check for transient errors that should trigger retry
-                let statusCode = httpResponse.statusCode
-                if [502, 503, 504].contains(statusCode) {
-                    print("⚠️ FIX #194: GitHub returned HTTP \(statusCode) (attempt \(attempt)/\(maxRetries)), retrying in 3s...")
-                    try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second delay
-                    lastError = BoostFileError.networkError("HTTP \(statusCode)")
-                    continue
-                }
-
-                guard statusCode == 200 else {
-                    throw BoostFileError.networkError("HTTP \(statusCode)")
-                }
-
-                let manifest = try JSONDecoder().decode(BoostManifest.self, from: data)
-                return manifest
             } catch {
                 lastError = error
                 if attempt < maxRetries {
                     print("⚠️ FIX #194: Fetch manifest failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                    print("🔍 DEBUG [Manifest Fetch]: Error type: \(type(of: error))")
+                    print("🔍 DEBUG [Manifest Fetch]: Error details: \(error)")
                     try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second delay
                 }
             }
