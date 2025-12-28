@@ -18,7 +18,7 @@ enum ZSTDDecoder {
         }
 
         // Magic Number: 0xFD2FB528 (little endian)
-        let magic = input[index..<index+4].withUnsafeBytes { $0.load(as: UInt32.self) }
+        let magic = UInt32(input[index]) | (UInt32(input[index+1]) << 8) | (UInt32(input[index+2]) << 16) | (UInt32(input[index+3]) << 24)
         index += 4
 
         guard magic == 0xFD2FB528 else {
@@ -68,7 +68,12 @@ enum ZSTDDecoder {
             guard index + 8 <= input.count else {
                 throw ZSTDError.invalidFormat
             }
-            frameContentSize = Int(input[index..<index+8].withUnsafeBytes { $0.load(as: UInt64.self).bigEndian })
+            // Read 8 bytes as big-endian UInt64
+            var size: UInt64 = 0
+            for i in 0..<8 {
+                size = (size << 8) | UInt64(input[index + i])
+            }
+            frameContentSize = Int(size)
             index += 8
         }
 
@@ -90,10 +95,8 @@ enum ZSTDDecoder {
                 throw ZSTDError.invalidFormat
             }
 
-            let blockHeader = input[index..<index+3].withUnsafeBytes { rawPtr -> UInt32 in
-                let ptr = rawPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                return UInt32(ptr[0]) | (UInt32(ptr[1]) << 8) | (UInt32(ptr[2]) << 16)
-            }
+            // Read 3-byte little-endian block header
+            let blockHeader = UInt32(input[index]) | (UInt32(input[index+1]) << 8) | (UInt32(input[index+2]) << 16)
 
             index += 3
 
