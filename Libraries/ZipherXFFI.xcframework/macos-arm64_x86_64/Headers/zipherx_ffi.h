@@ -528,4 +528,38 @@ int32_t zipherx_tor_chat_send(
     size_t data_len
 );
 
+// =============================================================================
+// FIX #342: Fast HTTP Downloads (Rust reqwest - replaces slow Swift URLSession)
+// =============================================================================
+
+// Download a file with resume support
+// Returns: 0=success, 1=network error, 2=file error, 3=cancelled, 4=other error
+int32_t zipherx_download_file(
+    const uint8_t *url_ptr,
+    size_t url_len,
+    const uint8_t *dest_path_ptr,
+    size_t dest_path_len,
+    uint64_t resume_from,
+    uint64_t expected_size
+);
+
+// Get current download progress (thread-safe, call from Swift timer)
+void zipherx_download_get_progress(
+    uint64_t *bytes_downloaded,
+    uint64_t *total_bytes,
+    double *speed_bps
+);
+
+// Cancel current download
+void zipherx_download_cancel(void);
+
+// Verify SHA256 checksum of a file
+// Returns: 1=match, 0=mismatch, -1=error
+int32_t zipherx_verify_sha256(
+    const uint8_t *file_path_ptr,
+    size_t file_path_len,
+    const uint8_t *expected_hash_ptr,
+    size_t expected_hash_len
+);
+
 #endif // ZIPHERX_FFI_H

@@ -361,6 +361,8 @@ enum ChatError: Error, LocalizedError {
     case hiddenServiceNotRunning
     case torNotConnected
     case connectionFailed(String)
+    // FIX #332: Specific error for wrong hidden service
+    case wrongHiddenService(expected: String, got: String)
 
     var errorDescription: String? {
         switch self {
@@ -378,6 +380,24 @@ enum ChatError: Error, LocalizedError {
             return "Tor not connected"
         case .connectionFailed(let reason):
             return "Connection failed: \(reason)"
+        case .wrongHiddenService(let expected, let got):
+            // FIX #332: User-friendly error message with debugging info
+            return """
+            Wrong hidden service detected!
+
+            You tried to connect to:
+            \(expected.prefix(24))...
+
+            But connected to:
+            \(got.prefix(24))...
+
+            This can happen when:
+            • Your contact shared the wrong .onion address
+            • Tor connected to a cached circuit
+            • Network routing issue
+
+            Try: Delete this contact and re-add with the correct .onion address.
+            """
         }
     }
 }

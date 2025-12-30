@@ -211,10 +211,13 @@ final class InsightAPI: NSObject {
         }
 
         // 2. P2P peer heights (version handshake)
-        let p2pPeers = networkManager.peers
+        // FIX #384: Use PeerManager for centralized peer access
+        let p2pPeers = await MainActor.run { PeerManager.shared.allPeers }
         for (index, peer) in p2pPeers.enumerated() {
             // SECURITY: Skip banned peers and handle negative heights (malicious peers send Int32 that wraps to negative)
-            guard !networkManager.isPeerBanned(peer.host), peer.peerStartHeight > 0 else { continue }
+            // FIX #384: Use PeerManager for ban checking
+            let isBanned = await MainActor.run { PeerManager.shared.isBanned(peer.host) }
+            guard !isBanned, peer.peerStartHeight > 0 else { continue }
             let h = UInt64(peer.peerStartHeight)  // Safe: checked > 0 above
             if h > 0 {
                 heights.append(("P2P-\(index):\(peer.host)", h, peer))
@@ -246,7 +249,7 @@ final class InsightAPI: NSObject {
             }
 
             // 3d. Cached chain height from NetworkManager (last successful fetch)
-            let cachedHeight = networkManager.chainHeight
+            let cachedHeight = await MainActor.run { networkManager.chainHeight }
             if cachedHeight > 0 {
                 heights.append(("CachedHeight", cachedHeight, nil))
                 print("📡 [Consensus] Cached height: \(cachedHeight)")
@@ -291,11 +294,12 @@ final class InsightAPI: NSObject {
         print("✅ [Consensus] Using MINIMUM height: \(minHeight)")
 
         // 4. SECURITY: BAN peers reporting fake heights (Sybil attack detection)
+        // FIX #384: Use PeerManager for centralized ban management
         for entry in heights {
             if let peer = entry.peer {
                 if entry.height > minHeight + banThreshold {
                     print("🚫 [SECURITY] Banning peer \(peer.host) for fake height \(entry.height) (consensus: \(minHeight))")
-                    networkManager.banPeer(peer, reason: .fakeChainHeight)
+                    await MainActor.run { PeerManager.shared.banPeer(peer, reason: .fakeChainHeight) }
                 }
             }
         }

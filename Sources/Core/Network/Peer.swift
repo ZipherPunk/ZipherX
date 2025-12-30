@@ -19,6 +19,42 @@ actor PeerMessageLock {
         }
     }
 
+    /// FIX #419: Acquire lock with timeout to prevent indefinite hangs
+    /// Returns true if lock acquired, false if timed out
+    func acquireWithTimeout(seconds: Double) async -> Bool {
+        if !isLocked {
+            isLocked = true
+            return true
+        }
+
+        // Race between lock acquisition and timeout
+        return await withTaskGroup(of: Bool.self) { group in
+            // Task 1: Wait for lock
+            group.addTask {
+                await withCheckedContinuation { continuation in
+                    Task { await self.addWaiter(continuation) }
+                }
+                return true  // Lock acquired
+            }
+
+            // Task 2: Timeout
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return false  // Timed out
+            }
+
+            // Take first result
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Helper for acquireWithTimeout to add waiter from async context
+    private func addWaiter(_ continuation: CheckedContinuation<Void, Never>) {
+        waiters.append(continuation)
+    }
+
     func release() {
         if let next = waiters.first {
             waiters.removeFirst()
@@ -103,7 +139,7 @@ actor PeerRateLimiter {
 }
 
 /// Individual peer connection for Zclassic P2P network
-final class Peer {
+public final class Peer {
     let id: String
     let host: String
     let port: UInt16
@@ -133,6 +169,11 @@ final class Peer {
     /// FIX #182: Minimum peer protocol version (matching Zclassic MIN_PEER_PROTO_VERSION)
     /// Peers below this version are rejected - they don't support required features
     private static let minPeerProtocolVersion: Int32 = 170002
+
+    /// FIX #434: Maximum valid Zclassic protocol version
+    /// Zclassic uses 170010-170012 (Sapling + BIP155)
+    /// Zcash uses 170018+ (NU upgrades) - these are WRONG CHAIN and must be rejected
+    private static let maxZclassicProtocolVersion: Int32 = 170012
     private let services: UInt64 = 1 // NODE_NETWORK
     private let userAgent = "/ZipherX:1.0.0/"
 
@@ -300,6 +341,25 @@ final class Peer {
         }
     }
 
+    /// FIX #419: Execute operation with exclusive access, but with lock acquisition timeout
+    /// This prevents indefinite hangs when block listeners are holding the lock
+    /// Throws NetworkError.timeout if lock cannot be acquired within the timeout
+    func withExclusiveAccessTimeout<T>(seconds: Double, _ operation: () async throws -> T) async throws -> T {
+        let acquired = await messageLock.acquireWithTimeout(seconds: seconds)
+        guard acquired else {
+            print("⚠️ FIX #419: Lock acquisition timed out after \(seconds)s for peer \(host)")
+            throw NetworkError.timeout
+        }
+        do {
+            let result = try await operation()
+            await messageLock.release()
+            return result
+        } catch {
+            await messageLock.release()
+            throw error
+        }
+    }
+
     /// Send a request and wait for a specific response command
     /// Handles the common pattern of send -> receive with exclusive access
     func requestResponse(command: String, payload: Data, expectedResponse: String, maxAttempts: Int = 20) async throws -> Data {
@@ -347,6 +407,11 @@ final class Peer {
             print("⏳ [\(host)] Connection already in progress, waiting...")
             var waited = 0
             while isConnecting && waited < 100 { // Max 10 seconds (100 * 100ms)
+                // FIX #426: Check for cancellation BEFORE sleeping
+                // The previous try? swallowed CancellationError, causing withTaskGroup to hang
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 waited += 1
             }
@@ -430,10 +495,12 @@ final class Peer {
         // FIX #267: Configure TCP-level keepalive to prevent iOS from killing idle connections
         // iOS mobile networks are aggressive about dropping idle TCP connections
         // TCP keepalive is more reliable than app-level keepalive on mobile
+        // UPDATED: More aggressive keepalive (15s interval, 2 probes) for better connection stability
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveInterval = 30  // Send keepalive every 30 seconds
-        tcpOptions.keepaliveCount = 4      // Allow 4 missed probes before disconnect
+        tcpOptions.keepaliveInterval = 15  // Send keepalive every 15 seconds (was 30)
+        tcpOptions.keepaliveCount = 2      // Allow 2 missed probes before disconnect (was 4)
+        // Total timeout before disconnect: 15s * 2 = 30s (down from 120s)
         tcpOptions.connectionTimeout = 15  // 15 second connection timeout
 
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
@@ -548,10 +615,12 @@ final class Peer {
 
         // FIX #267: Configure TCP-level keepalive for Tor connections too
         // Even more important for Tor since circuits can become stale
+        // UPDATED: More aggressive keepalive (15s interval, 2 probes) for better stability
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveInterval = 30  // Send keepalive every 30 seconds
-        tcpOptions.keepaliveCount = 4      // Allow 4 missed probes before disconnect
+        tcpOptions.keepaliveInterval = 15  // Send keepalive every 15 seconds (was 30)
+        tcpOptions.keepaliveCount = 2      // Allow 2 missed probes before disconnect (was 4)
+        // Total timeout: 15s * 2 = 30s (down from 120s)
         tcpOptions.connectionTimeout = 20  // Tor connections can be slower
 
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
@@ -894,6 +963,13 @@ final class Peer {
         default:
             return false
         }
+    }
+
+    /// FIX #434: Check if peer is a valid Zclassic node (not Zcash or other chain)
+    /// Zclassic uses protocol versions 170010-170012
+    /// Zcash uses 170018+ (NU5 upgrades) - these return wrong Equihash params!
+    var isValidZclassicPeer: Bool {
+        return peerVersion >= Peer.minPeerProtocolVersion && peerVersion <= Peer.maxZclassicProtocolVersion
     }
 
     /// Check if connection is stale (idle for too long)
@@ -1280,12 +1356,24 @@ final class Peer {
 
                     // FIX #172: Wrong-chain detection (likely Zcash nodes on same port)
                     // Zclassic valid protocol versions: 170010, 170011 (Sapling), 170012 (BIP155)
-                    // Zcash uses higher versions (170020+, 170100+ for NU5)
+                    // Zcash uses higher versions (170018+, 170020+, 170100+ for NU5)
                     // Don't alarm about "Sybil" - these are legitimate nodes for different chain
                     // FIX #229: Throw specific error so NetworkManager can permanently ban
-                    if let reason = lastRejectReason, reason.contains("170020") || reason.contains("170100") || reason.contains("170019") {
-                        print("⚠️ [\(host)] Wrong chain: Peer requires version 170020+ (likely Zcash, not Zclassic)")
-                        // Throw specific error for NetworkManager to ban this address permanently
+                    // FIX #379: ALSO ban directly here - callers may not handle the error!
+                    // FIX #428: Added 170018 detection - Zcash nodes demanding 170018+ are wrong chain
+                    // FIX #455: Added 170016+170017 - these versions don't exist in Zclassic (max is 170012)
+                    //         They're below Zcash's 170018 but still invalid for Zclassic
+                    if let reason = lastRejectReason,
+                       reason.contains("170016") || reason.contains("170017") ||
+                       reason.contains("170018") || reason.contains("170019") ||
+                       reason.contains("170020") || reason.contains("170100") {
+                        print("⚠️ [\(host)] Wrong chain: Peer requires version 170016+ (Zclassic max is 170012)")
+                        // FIX #379: Ban directly - don't rely on caller to do it
+                        print("🚫 FIX #379: Banning Zcash peer \(host) directly from handshake")
+                        await MainActor.run {
+                            NetworkManager.shared.banPeerForSybilAttack(host)
+                        }
+                        // Still throw so caller knows connection failed
                         throw NetworkError.wrongChain(host)
                     }
 
@@ -3077,7 +3165,11 @@ final class Peer {
             throw PeerError.invalidData
         }
 
-        return try await withExclusiveAccess {
+        // FIX #453 v2: Use timeout version to prevent deadlock with block listeners
+        // Block listeners hold the message lock indefinitely while processing network messages
+        // If getTransaction waits forever for the lock, VUL-002 verification hangs
+        // 30 second timeout gives enough time for block listeners to release the lock
+        return try await withExclusiveAccessTimeout(seconds: 30) {
             // Build getdata message for single transaction
             var payload = Data()
             payload.append(1) // count = 1
@@ -3086,11 +3178,15 @@ final class Peer {
 
             try await sendMessage(command: "getdata", payload: payload)
 
-            // Wait for tx response
+            // FIX #453 v2: Use receiveMessageWithTimeout to prevent infinite wait for peer response
+            // If peer doesn't respond with "tx", the receiveMessage() call would hang forever
+            // Even though we have lock acquisition timeout, once lock is acquired we still need timeout here
             var attempts = 0
             while attempts < 10 {
                 attempts += 1
-                let (command, response) = try await receiveMessage()
+                // FIX #453 v2: Use 10-second timeout for each receive attempt
+                // This allows 10 attempts × 10 seconds = 100 seconds max total wait
+                let (command, response) = try await receiveMessageWithTimeout(seconds: 10)
 
                 // Handle ping automatically
                 if command == "ping" {
@@ -3426,19 +3522,26 @@ struct PeerScore {
 
 // MARK: - Banned Peer
 
-struct BannedPeer {
-    let address: String
-    let banTime: Date
-    let banDuration: TimeInterval // Default 24 hours, -1 means PERMANENT (FIX #159)
-    let reason: BanReason
+public struct BannedPeer {
+    public let address: String
+    public let banTime: Date
+    public let banDuration: TimeInterval // Default 24 hours, -1 means PERMANENT (FIX #159)
+    public let reason: BanReason
+
+    public init(address: String, banDuration: TimeInterval, reason: BanReason) {
+        self.address = address
+        self.banTime = Date()
+        self.banDuration = banDuration
+        self.reason = reason
+    }
 
     /// FIX #159: Indicates if this is a permanent ban (Sybil attackers)
     /// Permanent bans do NOT expire automatically and require manual unbanning
-    var isPermanent: Bool {
+    public var isPermanent: Bool {
         banDuration < 0
     }
 
-    var isExpired: Bool {
+    public var isExpired: Bool {
         // FIX #159: Permanent bans (duration < 0) NEVER expire
         if isPermanent {
             return false
@@ -3447,7 +3550,7 @@ struct BannedPeer {
     }
 
     /// Time remaining for temporary bans, nil for permanent bans
-    var timeRemaining: TimeInterval? {
+    public var timeRemaining: TimeInterval? {
         if isPermanent {
             return nil
         }
@@ -3456,7 +3559,7 @@ struct BannedPeer {
     }
 }
 
-enum BanReason: String {
+public enum BanReason: String {
     case tooManyFailures = "Too many consecutive failures"
     case lowSuccessRate = "Very low success rate"
     case invalidMessages = "Sent invalid messages"
@@ -3470,13 +3573,13 @@ enum BanReason: String {
 
 /// Parked peer - temporarily unavailable due to connection timeout
 /// NOT a ban! Will retry with exponential backoff: 1s → 5min → 1h → 24h max
-struct ParkedPeer {
-    let address: String
-    let port: UInt16
-    let parkedTime: Date
-    var retryCount: Int
-    let wasPreferred: Bool  // Track if this was a preferred seed before parking
-    let isHardcodedSeed: Bool  // FIX #352: Track if this is a hardcoded seed
+public struct ParkedPeer {
+    public let address: String
+    public let port: UInt16
+    public let parkedTime: Date
+    public var retryCount: Int
+    public let wasPreferred: Bool  // Track if this was a preferred seed before parking
+    public let isHardcodedSeed: Bool  // FIX #352: Track if this is a hardcoded seed
 
     /// Backoff schedule (in seconds):
     /// Phase 1: 1, 2, 4, 8, 16, 32, 64, 128, 256, 300 (5min cap)
@@ -3495,7 +3598,7 @@ struct ParkedPeer {
 
     /// Get the next retry interval based on retry count
     /// FIX #352: Hardcoded seeds cap at 5 minutes (300s) instead of 24h
-    var nextRetryInterval: TimeInterval {
+    public var nextRetryInterval: TimeInterval {
         if retryCount < ParkedPeer.backoffPhase1.count {
             return ParkedPeer.backoffPhase1[retryCount]
         }
@@ -3512,22 +3615,22 @@ struct ParkedPeer {
     }
 
     /// Time when we should next attempt to connect
-    var nextRetryTime: Date {
+    public var nextRetryTime: Date {
         return parkedTime.addingTimeInterval(nextRetryInterval)
     }
 
     /// Check if it's time to retry
-    var isReadyForRetry: Bool {
+    public var isReadyForRetry: Bool {
         return Date() >= nextRetryTime
     }
 
     /// Time remaining until retry
-    var timeUntilRetry: TimeInterval {
+    public var timeUntilRetry: TimeInterval {
         return max(0, nextRetryTime.timeIntervalSinceNow)
     }
 
     /// Human-readable description of backoff status
-    var backoffDescription: String {
+    public var backoffDescription: String {
         let interval = nextRetryInterval
         if interval < 60 {
             return "\(Int(interval))s"
@@ -3540,7 +3643,7 @@ struct ParkedPeer {
 
     /// Create new parked peer
     /// FIX #352: Auto-detect if address is a hardcoded seed
-    init(address: String, port: UInt16, wasPreferred: Bool = false) {
+    public init(address: String, port: UInt16, wasPreferred: Bool = false) {
         self.address = address
         self.port = port
         self.parkedTime = Date()
@@ -3550,12 +3653,12 @@ struct ParkedPeer {
     }
 
     /// Increment retry count after failed retry
-    mutating func incrementRetry() {
+    public mutating func incrementRetry() {
         retryCount += 1
     }
 
     /// Reset for fresh retry (new parking)
-    mutating func resetParking() {
+    public mutating func resetParking() {
         retryCount = 0
     }
 }

@@ -102,7 +102,14 @@ final class ThemeManager: ObservableObject {
     @Published private(set) var currentTheme: AppTheme
     @Published private(set) var currentThemeType: ThemeType
 
+    /// The theme saved before wallet.dat mode auto-switched
+    private var savedThemeBeforeWalletDat: ThemeType?
+
     private let userDefaultsKey = "selectedTheme"
+    private var walletSourceObserver: NSObjectProtocol?
+
+    /// Key for storing the user's preferred theme (before wallet.dat auto-switch)
+    private let preferredThemeKey = "preferredTheme"
 
     private init() {
         // Load saved theme or default to cypherpunk
@@ -110,12 +117,86 @@ final class ThemeManager: ObservableObject {
         let themeType = ThemeType(rawValue: savedTheme) ?? .cypherpunk
         self.currentThemeType = themeType
         self.currentTheme = themeType.theme
+
+        print("🎨 FIX #286 v3: ThemeManager init - loaded theme: \(themeType.displayName)")
+
+        // FIX #286: Load user's preferred theme (the theme they chose, not the auto-switched one)
+        if let preferredTheme = UserDefaults.standard.string(forKey: preferredThemeKey),
+           let preferred = ThemeType(rawValue: preferredTheme) {
+            self.savedThemeBeforeWalletDat = preferred
+            print("🎨 FIX #286 v3: Loaded saved preferred theme: \(preferred.displayName)")
+        } else {
+            print("🎨 FIX #286 v3: No saved preferred theme found")
+        }
+
+        // Listen for wallet source changes
+        setupWalletSourceBinding()
+    }
+
+    deinit {
+        if let observer = walletSourceObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     func setTheme(_ type: ThemeType) {
         currentThemeType = type
         currentTheme = type.theme
         UserDefaults.standard.set(type.rawValue, forKey: userDefaultsKey)
+    }
+
+    // MARK: - Wallet Source Theme Binding
+
+    private func setupWalletSourceBinding() {
+        walletSourceObserver = NotificationCenter.default.addObserver(
+            forName: .walletSourceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let source = notification.userInfo?["source"] as? WalletSource else { return }
+
+            self.bindThemeToWalletSource(source)
+        }
+    }
+
+    /// Bind theme to wallet source - auto-switch to System 7 for wallet.dat mode
+    func bindThemeToWalletSource(_ source: WalletSource) {
+        print("🎨 FIX #286 v3: bindThemeToWalletSource called with source=\(source.rawValue)")
+        print("🎨 FIX #286 v3: Current state: currentThemeType=\(currentThemeType.rawValue), savedThemeBeforeWalletDat=\(savedThemeBeforeWalletDat?.rawValue ?? "nil")")
+
+        switch source {
+        case .zipherx:
+            // FIX #286: Restore previous theme if we switched for wallet.dat
+            if let savedTheme = savedThemeBeforeWalletDat {
+                print("🎨 FIX #286 v3: Restoring theme to: \(savedTheme.displayName)")
+                setTheme(savedTheme)
+                // Clear saved and persist
+                savedThemeBeforeWalletDat = nil
+                UserDefaults.standard.removeObject(forKey: preferredThemeKey)
+            } else if currentThemeType == .mac7 {
+                // FIX #286 v3: If we're on System 7 but no saved theme, go to cypherpunk
+                // This handles the case where app was restarted in wallet.dat mode then switched back
+                print("🎨 FIX #286 v3: On System 7 but no saved theme, switching to Cypherpunk")
+                setTheme(.cypherpunk)
+            } else {
+                // Already on a non-System 7 theme, keep it
+                print("🎨 FIX #286 v3: Already on \(currentThemeType.displayName), keeping current theme")
+            }
+
+        case .walletDat:
+            // Only switch if not already on System 7
+            if currentThemeType != .mac7 {
+                // FIX #286: Save current theme before switching
+                savedThemeBeforeWalletDat = currentThemeType
+                // Persist the preferred theme so we can restore it after app restart
+                UserDefaults.standard.set(currentThemeType.rawValue, forKey: preferredThemeKey)
+                print("🎨 FIX #286 v3: Auto-switching to System 7 for wallet.dat mode (saving: \(currentThemeType.displayName))")
+                setTheme(.mac7)
+            } else {
+                print("🎨 FIX #286 v3: Already on System 7 for wallet.dat mode")
+            }
+        }
     }
 }
 

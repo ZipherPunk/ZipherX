@@ -9,18 +9,73 @@ struct NodeManagementView: View {
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var viewModel = NodeManagementViewModel()
     @ObservedObject private var fullNodeManager = FullNodeManager.shared
+    @ObservedObject private var bootstrapManager = BootstrapManager.shared  // FIX #316: Watch bootstrap status
     @Environment(\.dismiss) private var dismiss
 
     private var theme: AppTheme { themeManager.currentTheme }
 
     /// Check if daemon is in a startup/syncing state (prevents duplicate starts)
+    /// FIX #316: Also check if bootstrap is starting/syncing the daemon
     private var isDaemonBusy: Bool {
+        // Check FullNodeManager status
         switch fullNodeManager.daemonStatus {
         case .starting, .syncing:
             return true
         default:
-            return viewModel.isOperationInProgress
+            break
         }
+
+        // FIX #316: Check if bootstrap is starting or syncing the daemon
+        switch bootstrapManager.status {
+        case .startingDaemon, .syncingBlocks:
+            return true
+        default:
+            break
+        }
+
+        return viewModel.isOperationInProgress
+    }
+
+    /// FIX #316: Check if daemon is actually running (from any source)
+    private var isDaemonRunning: Bool {
+        // Check FullNodeManager
+        if fullNodeManager.daemonStatus.isRunning {
+            return true
+        }
+
+        // Check if bootstrap completed with daemon running
+        switch bootstrapManager.status {
+        case .complete, .syncingBlocks:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// FIX #316: Get status text when daemon is busy
+    private var daemonBusyStatusText: String {
+        // Check bootstrap status first (more specific)
+        switch bootstrapManager.status {
+        case .startingDaemon:
+            return "Starting daemon..."
+        case .syncingBlocks(let progress, _):
+            return "Syncing blocks (\(Int(progress * 100))%)..."
+        default:
+            break
+        }
+
+        // Check FullNodeManager status
+        switch fullNodeManager.daemonStatus {
+        case .starting:
+            return "Starting daemon..."
+        case .syncing(let progress):
+            return "Syncing (\(Int(progress * 100))%)..."
+        default:
+            break
+        }
+
+        // Fallback
+        return "Daemon busy..."
     }
 
     var body: some View {
@@ -29,10 +84,15 @@ struct NodeManagementView: View {
                 // Header
                 headerSection
 
+                // FIX #306: Prerequisites warning section (shows only when something is missing)
+                if !viewModel.prerequisitesStatus.allMet {
+                    prerequisitesWarningSection
+                }
+
                 // Daemon Status & Control
                 daemonControlSection
 
-                // Node Info
+                // Node Info (with N/A values when prerequisites missing)
                 nodeInfoSection
 
                 // Bootstrap Management
@@ -60,7 +120,20 @@ struct NodeManagementView: View {
         .frame(minWidth: 600, minHeight: 700)
         .background(theme.backgroundColor)
         .onAppear {
+            // FIX #320: Always refresh prerequisites and state on appear
+            viewModel.checkPrerequisites()
             viewModel.refresh()
+        }
+        // FIX #320: Refresh when bootstrap status changes
+        .onChange(of: bootstrapManager.status) { newStatus in
+            // Refresh when bootstrap completes or changes
+            switch newStatus {
+            case .complete, .completeNeedsDaemon, .completeDaemonStopped, .syncingBlocks:
+                viewModel.checkPrerequisites()
+                viewModel.refresh()
+            default:
+                break
+            }
         }
     }
 
@@ -91,6 +164,123 @@ struct NodeManagementView: View {
         .padding(.bottom, 10)
     }
 
+    // MARK: - Prerequisites Warning Section (FIX #306)
+
+    private var prerequisitesWarningSection: some View {
+        VStack(spacing: 12) {
+            sectionHeader(icon: "exclamationmark.triangle.fill", title: "PREREQUISITES MISSING")
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("The following components are required to run a Full Node:")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+
+                ForEach(viewModel.prerequisitesStatus.missingItems, id: \.self) { item in
+                    HStack(spacing: 8) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.red)
+                            .font(.system(size: 14))
+                        Text(item)
+                            .font(theme.captionFont)
+                            .foregroundColor(.red)
+                    }
+                }
+
+                Divider()
+
+                // Show what IS installed (green checkmarks)
+                if viewModel.prerequisitesStatus.daemonInstalled {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 14))
+                        Text("Zclassic daemon (zclassicd)")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    }
+                }
+                if viewModel.prerequisitesStatus.blockchainExists {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 14))
+                        Text("Blockchain data")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    }
+                }
+                if viewModel.prerequisitesStatus.zcashParamsExist {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 14))
+                        Text("Zcash parameters")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    }
+                }
+                if viewModel.prerequisitesStatus.zstdInstalled {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 14))
+                        Text("zstd")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    }
+                }
+
+                Divider()
+
+                // Installation instructions
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("How to Install:")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(theme.textPrimary)
+
+                    if !viewModel.prerequisitesStatus.zstdInstalled {
+                        // zstd must be installed first (required for bootstrap)
+                        installInstructionRow(
+                            title: "Step 1 - Install zstd (required):",
+                            command: "brew install zstd"
+                        )
+                        installInstructionRow(
+                            title: "Step 2 - Install everything else:",
+                            command: "Use 'Install Fresh Bootstrap' button below"
+                        )
+                    } else {
+                        // zstd is installed, bootstrap will handle everything
+                        installInstructionRow(
+                            title: "One-click install:",
+                            command: "Use 'Install Fresh Bootstrap' button below"
+                        )
+                        Text("This will automatically install the daemon, Zcash parameters, and blockchain data.")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary)
+                            .padding(.top, 4)
+                    }
+                }
+                .padding(10)
+                .background(theme.backgroundColor)
+                .cornerRadius(6)
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+            .overlay(Rectangle().stroke(Color.orange, lineWidth: 2))
+        }
+    }
+
+    private func installInstructionRow(title: String, command: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
+            Text(command)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(theme.primaryColor)
+        }
+    }
+
     // MARK: - Daemon Control
 
     private var daemonControlSection: some View {
@@ -112,7 +302,35 @@ struct NodeManagementView: View {
                 Spacer()
 
                 // Control buttons - disabled when daemon is busy (starting/syncing)
-                if fullNodeManager.daemonStatus.isRunning {
+                // FIX #316: Show warning if daemon not installed instead of Start button
+                // FIX #316: Also handle bootstrap starting daemon
+                if !viewModel.prerequisitesStatus.daemonInstalled {
+                    // No daemon installed - show warning
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text("Daemon not installed")
+                            .font(theme.bodyFont)
+                            .foregroundColor(.orange)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.15))
+                    .cornerRadius(theme.cornerRadius)
+                } else if isDaemonBusy {
+                    // FIX #316: Daemon is starting/syncing - show status
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                        Text(daemonBusyStatusText)
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                } else if isDaemonRunning {
                     Button(action: { viewModel.stopDaemon() }) {
                         HStack {
                             Image(systemName: "stop.fill")
@@ -925,19 +1143,34 @@ Continue?
             .background(theme.surfaceColor)
             .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
         }
-        .alert("Encrypt Wallet", isPresented: $viewModel.showEncryptWalletAlert) {
-            Button("Cancel", role: .cancel) {}
-            Button("Open Daemon") {
-                viewModel.showEncryptInstructions()
-            }
+        .alert("⚠️ Wallet Encryption - Experimental", isPresented: $viewModel.showEncryptWalletAlert) {
+            Button("I Understand", role: .cancel) {}
         } message: {
             Text("""
-            Wallet encryption must be done via zclassic-cli.
+            ╔═══════════════════════════════════════════════╗
+            ║  "Privacy is necessary for an open society   ║
+            ║   in the electronic age."                    ║
+            ║        — A Cypherpunk's Manifesto, 1993      ║
+            ╚═══════════════════════════════════════════════╝
 
-            Run: zclassic-cli encryptwallet "your-passphrase"
+            🔧 DEVELOPMENT STATUS:
 
-            ⚠️ WARNING: Make a backup BEFORE encrypting!
-            The daemon will shut down after encryption.
+            Wallet encryption via encryptwallet RPC is currently experimental and NOT fully tested with Zclassic shielded (z-addresses).
+
+            Known limitations:
+            • z_sendmany may fail with encrypted wallets
+            • z-address key encryption is complex
+            • Passphrase recovery is IMPOSSIBLE
+
+            RECOMMENDATION:
+            For now, protect your wallet.dat by:
+            1. Storing it on an encrypted disk
+            2. Using FileVault (macOS)
+            3. Keeping secure offline backups
+
+            Full wallet encryption support for z-addresses is planned for a future release.
+
+            "We the Cypherpunks are dedicated to building anonymous systems."
             """)
         }
     }
@@ -1043,6 +1276,9 @@ Continue?
 
 @MainActor
 class NodeManagementViewModel: ObservableObject {
+    // FIX #320: Reference to bootstrap manager to check daemon status
+    private let bootstrapManager = BootstrapManager.shared
+
     @Published var isDaemonRunning = false
     @Published var daemonVersion: String?
     @Published var blockHeight: UInt64 = 0
@@ -1058,6 +1294,30 @@ class NodeManagementViewModel: ObservableObject {
     @Published var operationProgress: Double = 0.0  // 0.0 to 1.0
     @Published var showBootstrapConfirm = false
     @Published var showBootstrapProgress = false  // FIX #276: Show progress view
+
+    // FIX #306: Prerequisites check state
+    @Published var prerequisitesStatus: PrerequisitesStatus = PrerequisitesStatus()
+
+    struct PrerequisitesStatus {
+        var daemonInstalled: Bool = false
+        var blockchainExists: Bool = false
+        var zcashParamsExist: Bool = false
+        var zstdInstalled: Bool = false
+        var configExists: Bool = false
+
+        var allMet: Bool {
+            daemonInstalled && blockchainExists && zcashParamsExist && zstdInstalled
+        }
+
+        var missingItems: [String] {
+            var items: [String] = []
+            if !daemonInstalled { items.append("Zclassic daemon (zclassicd)") }
+            if !blockchainExists { items.append("Blockchain data") }
+            if !zcashParamsExist { items.append("Zcash parameters (sapling-spend.params, sapling-output.params)") }
+            if !zstdInstalled { items.append("zstd (required for bootstrap)") }
+            return items
+        }
+    }
 
     // Configuration Editor properties
     @Published var configHasUnsavedChanges = false
@@ -1099,17 +1359,76 @@ class NodeManagementViewModel: ObservableObject {
         loadSettings()
         loadConfig()
         refreshWalletSecurity()
+        checkPrerequisites()  // FIX #306: Check prerequisites on init
     }
 
     func refresh() {
+        checkPrerequisites()  // FIX #306: Check prerequisites on every refresh
         Task {
             await refreshAsync()
+        }
+    }
+
+    // FIX #306: Check all Full Node prerequisites
+    func checkPrerequisites() {
+        var status = PrerequisitesStatus()
+
+        // Check 1: Is zclassicd installed?
+        let daemonPaths = ["/usr/local/bin/zclassicd", "/opt/homebrew/bin/zclassicd"]
+        status.daemonInstalled = daemonPaths.contains { FileManager.default.fileExists(atPath: $0) }
+
+        // Check 2: Is blockchain data present?
+        let dataDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Zclassic")
+        let blocksDir = dataDir.appendingPathComponent("blocks")
+        status.blockchainExists = FileManager.default.fileExists(atPath: blocksDir.path)
+
+        // Check 3: Is zclassic.conf present?
+        let configPath = dataDir.appendingPathComponent("zclassic.conf")
+        status.configExists = FileManager.default.fileExists(atPath: configPath.path)
+
+        // Check 4: Are Zcash params present?
+        let paramsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/ZcashParams")
+        let spendParams = paramsDir.appendingPathComponent("sapling-spend.params")
+        let outputParams = paramsDir.appendingPathComponent("sapling-output.params")
+        status.zcashParamsExist = FileManager.default.fileExists(atPath: spendParams.path) &&
+                                   FileManager.default.fileExists(atPath: outputParams.path)
+
+        // Check 5: Is zstd installed?
+        let zstdPaths = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
+        status.zstdInstalled = zstdPaths.contains { FileManager.default.fileExists(atPath: $0) }
+
+        prerequisitesStatus = status
+
+        // FIX #315: Removed verbose logging
+    }
+
+    // FIX #320: Check if zclassicd process is actually running (not just RPC)
+    func isZclassicdProcessRunning() -> Bool {
+        let task = Process()
+        task.launchPath = "/usr/bin/pgrep"
+        task.arguments = ["-x", "zclassicd"]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
         }
     }
 
     private func refreshAsync() async {
         // First, tell FullNodeManager to refresh its status
         fullNodeManager.checkNodeStatus()
+
+        // FIX #320: Also check prerequisites on every refresh
+        checkPrerequisites()
 
         // Wait briefly for the status check to complete
         try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
@@ -1120,12 +1439,15 @@ class NodeManagementViewModel: ObservableObject {
         // Check wallet.dat
         walletDatExists = FileManager.default.fileExists(atPath: FullNodeManager.walletPath.path)
 
+        // FIX #320: Check if process is running first
+        let processRunning = isZclassicdProcessRunning()
+
         // Try to load RPC config and check connection directly
         do {
             try RPCClient.shared.loadConfig()
             let connected = await RPCClient.shared.checkConnection()
-            isDaemonRunning = connected
-            print("🔄 NodeManagement: RPC connection = \(connected)")
+            // FIX #320: Daemon is running if RPC works OR if process exists
+            isDaemonRunning = connected || processRunning
 
             if connected {
                 // Get blockchain info (has verificationprogress)
@@ -1135,7 +1457,7 @@ class NodeManagementViewModel: ObservableObject {
                     // Block height from getblockchaininfo
                     if let blocks = blockchainInfo["blocks"] as? Int {
                         blockHeight = UInt64(blocks)
-                        print("🔄 NodeManagement: blockHeight = \(blocks)")
+                        // blockHeight updated
                     }
 
                     // Sync progress from getblockchaininfo
@@ -1148,16 +1470,16 @@ class NodeManagementViewModel: ObservableObject {
                     if headers > 0 && blocks > 0 && headers == blocks {
                         // All blocks downloaded - fully synced
                         syncProgress = 1.0
-                        print("🔄 NodeManagement: syncProgress = 1.0 (headers == blocks == \(blocks))")
+                        // syncProgress = 1.0
                     } else if let progress = blockchainInfo["verificationprogress"] as? Double {
                         // Still syncing/verifying - use verification progress
                         syncProgress = progress
-                        print("🔄 NodeManagement: syncProgress = \(progress) (headers=\(headers), blocks=\(blocks))")
+                        // syncProgress updated
                     } else {
                         syncProgress = 1.0 // Assume fully synced if no progress reported
                     }
                 } catch {
-                    print("⚠️ NodeManagement: getblockchaininfo failed, trying getinfo - \(error.localizedDescription)")
+                    // getblockchaininfo failed, trying getinfo
                     // Fallback to getinfo
                     let info = try await RPCClient.shared.getInfoDict()
                     if let blocks = info["blocks"] as? Int {
@@ -1173,12 +1495,12 @@ class NodeManagementViewModel: ObservableObject {
                     // Connection count from getnetworkinfo
                     if let connections = networkInfo["connections"] as? Int {
                         connectionCount = connections
-                        print("🔄 NodeManagement: connections = \(connections)")
+                        // connections updated
                     } else {
                         connectionCount = 0
                     }
                 } catch {
-                    print("⚠️ NodeManagement: getnetworkinfo failed, trying getinfo - \(error.localizedDescription)")
+                    // getnetworkinfo failed, trying getinfo
                     // Fallback to getinfo for connections
                     do {
                         let info = try await RPCClient.shared.getInfoDict()
@@ -1196,11 +1518,14 @@ class NodeManagementViewModel: ObservableObject {
                 connectionCount = 0
             }
         } catch {
-            print("⚠️ NodeManagement: RPC error - \(error.localizedDescription)")
-            isDaemonRunning = false
-            blockHeight = 0
-            syncProgress = 0
-            connectionCount = 0
+            // RPC error - but daemon might still be running (just starting up)
+            // FIX #320: Check process status even if RPC fails
+            isDaemonRunning = processRunning
+            if !processRunning {
+                blockHeight = 0
+                syncProgress = 0
+                connectionCount = 0
+            }
         }
 
         // Get version (if installed)
@@ -1218,21 +1543,36 @@ class NodeManagementViewModel: ObservableObject {
         // GUARD: Prevent starting if daemon is already starting/syncing/running
         switch fullNodeManager.daemonStatus {
         case .starting:
-            print("⚠️ Daemon is already starting, ignoring duplicate start request")
+            // Daemon is already starting
             return
         case .syncing(let progress):
-            print("⚠️ Daemon is syncing (\(Int(progress * 100))%), ignoring start request")
+            // Daemon is syncing
             return
         case .running:
-            print("⚠️ Daemon is already running, ignoring start request")
+            // Daemon is already running
             return
         default:
             break
         }
 
+        // FIX #320: Also check if bootstrap is running/completed with daemon
+        switch bootstrapManager.status {
+        case .startingDaemon, .syncingBlocks, .complete:
+            print("⚠️ FIX #320: Daemon already started by bootstrap - ignoring start request")
+            return
+        default:
+            break
+        }
+
+        // FIX #320: Check if zclassicd process is actually running
+        if isZclassicdProcessRunning() {
+            print("⚠️ FIX #320: zclassicd process already running - ignoring start request")
+            return
+        }
+
         // Also check if an operation is already in progress
         guard !isOperationInProgress else {
-            print("⚠️ Operation already in progress, ignoring start request")
+            // Operation already in progress
             return
         }
 
@@ -1340,7 +1680,7 @@ class NodeManagementViewModel: ObservableObject {
 
                         // Log progress every 30 seconds (15 attempts × 2s)
                         if attempt % 15 == 0 {
-                            print("🔄 Daemon sync: \(syncPercent)% (block \(blocks)/\(headers))")
+                            // Daemon sync progress logged every 30s
                         }
 
                         // Check if fully synced: headers > 0 AND blocks == headers
@@ -1359,7 +1699,7 @@ class NodeManagementViewModel: ObservableObject {
 
                     } catch {
                         // Error checking sync - might still be loading block index
-                        print("⚠️ Error checking sync status: \(error.localizedDescription)")
+                        // Error checking sync status
                         await MainActor.run {
                             operationStatus = "Loading block index..."
                         }
@@ -1535,7 +1875,7 @@ class NodeManagementViewModel: ObservableObject {
 
                     let walletBackup = backupDir.appendingPathComponent("wallet_\(timestamp).dat")
                     try FileManager.default.copyItem(at: FullNodeManager.walletPath, to: walletBackup)
-                    print("✅ Backed up wallet.dat to \(walletBackup.path)")
+                    // Backed up wallet.dat
                 }
 
                 // 3. Start bootstrap download via BootstrapManager
@@ -1630,7 +1970,7 @@ class NodeManagementViewModel: ObservableObject {
             config = lines.joined(separator: "\n")
             try config.write(to: configPath, atomically: true, encoding: .utf8)
         } catch {
-            print("⚠️ Failed to update config: \(error)")
+            // Failed to update config
         }
     }
 
@@ -1707,7 +2047,7 @@ class NodeManagementViewModel: ObservableObject {
 
             configHasUnsavedChanges = false
         } catch {
-            print("⚠️ Failed to load config: \(error)")
+            // Failed to load config
         }
     }
 
@@ -1755,7 +2095,7 @@ class NodeManagementViewModel: ObservableObject {
 
             let backupPath = backupDir.appendingPathComponent("zclassic_\(timestamp).conf")
             try FileManager.default.copyItem(at: configPath, to: backupPath)
-            print("✅ Config backup saved to \(backupPath.path)")
+            // Config backup saved
 
             // Read existing config
             var config = try String(contentsOf: configPath, encoding: .utf8)
@@ -1872,7 +2212,7 @@ class NodeManagementViewModel: ObservableObject {
                 generateSecurityWarnings()
 
             } catch {
-                print("⚠️ Failed to get wallet.dat attributes: \(error)")
+                // Failed to get wallet.dat attributes
             }
         } else {
             walletDatSize = "N/A"

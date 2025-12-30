@@ -32,6 +32,8 @@ public enum RPCError: Error, LocalizedError {
     case insufficientFunds
     case invalidAddress
     case operationFailed(String)
+    case serverError(Int, String)  // FIX #286 v10: RPC server error with code and message
+    case keyAlreadyExists(String)  // FIX #286 v10: Key already in wallet.dat
 
     public var errorDescription: String? {
         switch self {
@@ -55,6 +57,10 @@ public enum RPCError: Error, LocalizedError {
             return "Invalid address"
         case .operationFailed(let detail):
             return "Operation failed: \(detail)"
+        case .serverError(_, let message):
+            return "Server error: \(message)"
+        case .keyAlreadyExists(let detail):
+            return detail
         }
     }
 }
@@ -388,24 +394,177 @@ public class RPCClient: ObservableObject {
     }
 
     /// Import private key
-    public func importPrivateKey(_ key: String, rescan: Bool = false) async throws -> String {
+    /// FIX #286 v9: Use async operation for rescan with progress callback
+    /// FIX #286 v10: Check for duplicate keys before importing
+    public func importPrivateKey(_ key: String, rescan: Bool = false, progressCallback: ((Double, String) -> Void)? = nil) async throws -> String {
         let isZKey = key.hasPrefix("secret-extended-key")
-        let method = isZKey ? "z_importkey" : "importprivkey"
-        let params: [Any] = isZKey ? [key, rescan ? "yes" : "no"] : [key, "", rescan]
 
-        let result = try await call(method: method, params: params)
+        // FIX #286 v10: Check if key already exists BEFORE importing
+        progressCallback?(0.05, "Checking for duplicate key...")
 
-        if let address = result as? String {
-            return address
-        }
-
-        // For z_importkey, get the address from z_listaddresses
         if isZKey {
-            let addresses = try await getZAddresses()
-            return addresses.last ?? "Import successful"
+            // Get existing z-addresses before attempting import
+            let existingAddresses = try await getZAddresses()
+
+            // Try a quick import with no rescan to check if key exists
+            do {
+                let checkResult = try await call(method: "z_importkey", params: [key, "no"])
+
+                // If we get here without error, key was imported (new key)
+                // Now check if address count changed
+                let newAddresses = try await getZAddresses()
+                let newAddress = newAddresses.first { !existingAddresses.contains($0) }
+
+                if newAddress == nil && newAddresses.count == existingAddresses.count {
+                    // Key already existed - daemon accepted but no new address
+                    throw RPCError.keyAlreadyExists("This z-address private key is already in your wallet.dat")
+                }
+
+                // New key was added successfully
+                if !rescan {
+                    progressCallback?(1.0, "Import complete")
+                    return newAddress ?? newAddresses.last ?? "Import successful"
+                }
+
+                // User wants rescan - need to trigger it
+                progressCallback?(0.1, "Key imported, starting rescan...")
+                let rescanResult = try await call(method: "z_importkey", params: [key, "yes"])
+
+                if let opid = rescanResult as? String, opid.hasPrefix("opid-") {
+                    print("📥 FIX #286 v9: z_importkey rescan started: \(opid)")
+                    let address = try await waitForImportOperation(opid, progressCallback: progressCallback)
+                    return address
+                }
+
+                progressCallback?(1.0, "Import complete")
+                return newAddress ?? newAddresses.last ?? "Import successful"
+
+            } catch let error as RPCError {
+                // Check if error indicates key already exists
+                if case .requestFailed(let message) = error {
+                    let lowerMessage = message.lowercased()
+                    if lowerMessage.contains("already") || lowerMessage.contains("exists") || lowerMessage.contains("duplicate") {
+                        throw RPCError.keyAlreadyExists("This z-address private key is already in your wallet.dat")
+                    }
+                }
+                // Re-throw keyAlreadyExists as-is
+                if case .keyAlreadyExists = error {
+                    throw error
+                }
+                throw error
+            }
+
+        } else {
+            // T-address import
+            // Get existing t-addresses before attempting import
+            let existingAddresses = try await getTAddresses()
+
+            // Try a quick import with no rescan first
+            do {
+                progressCallback?(0.1, "Verifying key...")
+                let _ = try await call(method: "importprivkey", params: [key, "", false])
+
+                // Check if a new address was added
+                let newAddresses = try await getTAddresses()
+                let newAddress = newAddresses.first { !existingAddresses.contains($0) }
+
+                if newAddress == nil && newAddresses.count == existingAddresses.count {
+                    // Key already existed
+                    throw RPCError.keyAlreadyExists("This t-address private key is already in your wallet.dat")
+                }
+
+                // New key was added
+                if !rescan {
+                    progressCallback?(1.0, "Import complete")
+                    return newAddress ?? newAddresses.last ?? "Import successful"
+                }
+
+                // User wants rescan - need to trigger it
+                progressCallback?(0.2, "Key imported, starting rescan (this may take hours)...")
+
+                // Note: importprivkey rescan is synchronous and blocking
+                // We re-import with rescan=true (key exists, so just triggers rescan)
+                let _ = try await call(method: "importprivkey", params: [key, "", true])
+
+                progressCallback?(1.0, "Import and rescan complete")
+                return newAddress ?? newAddresses.last ?? "Import successful"
+
+            } catch let error as RPCError {
+                // Check if error indicates key already exists
+                if case .requestFailed(let message) = error {
+                    let lowerMessage = message.lowercased()
+                    if lowerMessage.contains("already") || lowerMessage.contains("exists") || lowerMessage.contains("duplicate") {
+                        throw RPCError.keyAlreadyExists("This t-address private key is already in your wallet.dat")
+                    }
+                }
+                // Re-throw keyAlreadyExists as-is
+                if case .keyAlreadyExists = error {
+                    throw error
+                }
+                throw error
+            }
+        }
+    }
+
+    /// FIX #286 v9: Wait for z_importkey operation with progress
+    private func waitForImportOperation(_ opid: String, progressCallback: ((Double, String) -> Void)?) async throws -> String {
+        let startTime = Date()
+        let maxWait: TimeInterval = 86400  // 24 hours max for rescan
+
+        var lastProgress: Double = 0.1
+
+        while Date().timeIntervalSince(startTime) < maxWait {
+            let statusResult = try await call(method: "z_getoperationstatus", params: [[opid]])
+
+            guard let statusArray = statusResult as? [[String: Any]],
+                  let status = statusArray.first else {
+                try await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
+                continue
+            }
+
+            let state = status["status"] as? String ?? ""
+            let method = status["method"] as? String ?? ""
+
+            // Check for progress info
+            if let executionSecs = status["execution_secs"] as? Double {
+                // Estimate progress based on typical rescan time (rough estimate)
+                let estimatedTotal: Double = 7200  // 2 hours typical
+                let progress = min(0.95, 0.1 + (executionSecs / estimatedTotal) * 0.85)
+                if progress > lastProgress {
+                    lastProgress = progress
+                    let elapsed = Int(executionSecs)
+                    let mins = elapsed / 60
+                    let secs = elapsed % 60
+                    progressCallback?(progress, "Rescanning... (\(mins)m \(secs)s elapsed)")
+                }
+            }
+
+            switch state {
+            case "success":
+                progressCallback?(1.0, "Import complete!")
+                // Get the result and clean up
+                _ = try? await call(method: "z_getoperationresult", params: [[opid]])
+
+                // Return the imported address
+                let addresses = try await getZAddresses()
+                return addresses.last ?? "Import successful"
+
+            case "failed":
+                let error = status["error"] as? [String: Any]
+                let message = error?["message"] as? String ?? "Import failed"
+                throw RPCError.operationFailed(message)
+
+            case "executing":
+                progressCallback?(lastProgress, "Rescan in progress...")
+
+            default:
+                break
+            }
+
+            try await Task.sleep(nanoseconds: 3_000_000_000)  // 3 seconds between polls
         }
 
-        return "Import successful"
+        throw RPCError.operationFailed("Import operation timed out after 24 hours")
     }
 
     // MARK: - Explorer Methods
@@ -487,6 +646,161 @@ public class RPCClient: ObservableObject {
         return info["unlocked_until"] != nil
     }
 
+    // MARK: - FIX #286 v12: Rescan Detection
+
+    /// Rescan status information
+    public struct RescanStatus {
+        public let isScanning: Bool
+        public let progress: Double  // 0.0 to 1.0
+        public let duration: Int     // seconds elapsed
+        public let source: String    // "wallet" or "z_importkey" or "none"
+    }
+
+    // MARK: - FIX #286 v13: Detailed Sync Status
+
+    /// Detailed sync status for UI display
+    public struct DetailedSyncStatus {
+        public let blocks: Int           // Current block height
+        public let headers: Int          // Known header height
+        public let progress: Double      // 0.0 to 1.0 verification progress
+        public let isSyncing: Bool       // Is blockchain syncing
+        public let isRescanning: Bool    // Is wallet rescanning
+        public let rescanProgress: Double // Rescan progress if rescanning
+        public let rescanBlock: Int      // Current rescan block
+        public let connections: Int      // Number of peer connections
+        public let statusMessage: String // Human-readable status
+    }
+
+    /// Get detailed sync status including blockchain and wallet scan
+    public func getDetailedSyncStatus() async throws -> DetailedSyncStatus {
+        // Get blockchain info
+        let blockchainInfo = try await getBlockchainInfo()
+        let blocks = blockchainInfo["blocks"] as? Int ?? 0
+        let headers = blockchainInfo["headers"] as? Int ?? 0
+        let verificationProgress = blockchainInfo["verificationprogress"] as? Double ?? 0
+        let initialBlockDownload = blockchainInfo["initialblockdownload"] as? Bool ?? false
+
+        // Get network info for connections
+        var connections = 0
+        if let networkInfo = try? await getNetworkInfo() {
+            connections = networkInfo["connections"] as? Int ?? 0
+        }
+
+        // Check for wallet rescan status
+        var isRescanning = false
+        var rescanProgress: Double = 0
+        var rescanBlock = 0
+
+        if let walletInfo = try? await call(method: "getwalletinfo", params: []) as? [String: Any] {
+            // Check for scanning field (format: { "scanning": { "duration": N, "progress": P } })
+            if let scanning = walletInfo["scanning"] as? [String: Any] {
+                isRescanning = true
+                rescanProgress = scanning["progress"] as? Double ?? 0
+                // Estimate block from progress
+                rescanBlock = Int(Double(headers) * rescanProgress)
+                print("📊 FIX #286 v13: Wallet rescanning - progress: \(Int(rescanProgress * 100))%, block ~\(rescanBlock)")
+            }
+        }
+
+        // Determine if blockchain is syncing
+        let isSyncing = initialBlockDownload || blocks < headers - 2
+
+        // Generate human-readable status message
+        let statusMessage: String
+        if isRescanning {
+            statusMessage = "Rescanning wallet at block \(rescanBlock) (\(Int(rescanProgress * 100))%)"
+        } else if initialBlockDownload {
+            statusMessage = "Downloading blockchain: \(blocks)/\(headers) blocks (\(Int(verificationProgress * 100))%)"
+        } else if blocks < headers - 2 {
+            let blocksRemaining = headers - blocks
+            statusMessage = "Syncing: \(blocksRemaining) blocks behind"
+        } else {
+            statusMessage = "Synchronized at block \(blocks)"
+        }
+
+        return DetailedSyncStatus(
+            blocks: blocks,
+            headers: headers,
+            progress: isRescanning ? rescanProgress : verificationProgress,
+            isSyncing: isSyncing,
+            isRescanning: isRescanning,
+            rescanProgress: rescanProgress,
+            rescanBlock: rescanBlock,
+            connections: connections,
+            statusMessage: statusMessage
+        )
+    }
+
+    /// Detect if a rescan is currently in progress
+    /// Checks both wallet scanning status and z_importkey operations
+    public func getRescanStatus() async throws -> RescanStatus {
+        // Method 1: Check getwalletinfo for scanning field (Bitcoin Core style)
+        if let walletScan = try? await getWalletScanningStatus() {
+            if walletScan.isScanning {
+                return walletScan
+            }
+        }
+
+        // Method 2: Check for ongoing z_importkey operations
+        if let zOpScan = try? await getZOperationScanningStatus() {
+            if zOpScan.isScanning {
+                return zOpScan
+            }
+        }
+
+        return RescanStatus(isScanning: false, progress: 0, duration: 0, source: "none")
+    }
+
+    /// Check wallet scanning status via getwalletinfo
+    private func getWalletScanningStatus() async throws -> RescanStatus {
+        let result = try await call(method: "getwalletinfo", params: [])
+        guard let info = result as? [String: Any] else {
+            throw RPCError.invalidResponse
+        }
+
+        // Check for "scanning" field (available in some Bitcoin-derived clients)
+        // Format: { "scanning": { "duration": 1234, "progress": 0.5 } } or { "scanning": false }
+        if let scanning = info["scanning"] {
+            if let scanInfo = scanning as? [String: Any] {
+                let duration = scanInfo["duration"] as? Int ?? 0
+                let progress = scanInfo["progress"] as? Double ?? 0.0
+                print("📊 FIX #286 v12: Wallet rescan detected - progress: \(Int(progress * 100))%, duration: \(duration)s")
+                return RescanStatus(isScanning: true, progress: progress, duration: duration, source: "wallet")
+            } else if let scanBool = scanning as? Bool, scanBool == false {
+                return RescanStatus(isScanning: false, progress: 0, duration: 0, source: "none")
+            }
+        }
+
+        return RescanStatus(isScanning: false, progress: 0, duration: 0, source: "none")
+    }
+
+    /// Check for ongoing z_importkey operations via z_getoperationstatus
+    private func getZOperationScanningStatus() async throws -> RescanStatus {
+        let result = try await call(method: "z_getoperationstatus", params: [] as [Any])
+
+        guard let operations = result as? [[String: Any]] else {
+            return RescanStatus(isScanning: false, progress: 0, duration: 0, source: "none")
+        }
+
+        // Look for executing z_importkey operations
+        for op in operations {
+            let method = op["method"] as? String ?? ""
+            let status = op["status"] as? String ?? ""
+
+            if method == "z_importkey" && status == "executing" {
+                let executionSecs = op["execution_secs"] as? Double ?? 0
+                // Estimate progress based on typical rescan time (2 hours)
+                let estimatedTotal: Double = 7200
+                let progress = min(0.95, executionSecs / estimatedTotal)
+
+                print("📊 FIX #286 v12: z_importkey rescan detected - elapsed: \(Int(executionSecs))s, progress: \(Int(progress * 100))%")
+                return RescanStatus(isScanning: true, progress: progress, duration: Int(executionSecs), source: "z_importkey")
+            }
+        }
+
+        return RescanStatus(isScanning: false, progress: 0, duration: 0, source: "none")
+    }
+
     /// Unlock wallet temporarily
     public func unlockWallet(passphrase: String, timeout: Int = 60) async throws {
         _ = try await call(method: "walletpassphrase", params: [passphrase, timeout])
@@ -495,6 +809,432 @@ public class RPCClient: ObservableObject {
     /// Lock wallet
     public func lockWallet() async throws {
         _ = try await call(method: "walletlock", params: [])
+    }
+
+    // MARK: - Transaction History Methods
+
+    /// Send to a t-address (transparent transaction)
+    /// - Parameters:
+    ///   - from: Source t-address (used for coin selection, can be "*" for any)
+    ///   - to: Destination address
+    ///   - amount: Amount in ZCL
+    /// - Returns: Transaction ID
+    public func sendToAddress(from: String, to: String, amount: Double) async throws -> String {
+        // For t-to-t, use sendtoaddress or z_sendmany
+        // z_sendmany works for both z and t source addresses
+        var recipient: [String: Any] = [
+            "address": to,
+            "amount": amount
+        ]
+
+        let params: [Any] = [from, [recipient], 1, 0.0001]
+        let result = try await call(method: "z_sendmany", params: params)
+
+        guard let opid = result as? String else {
+            throw RPCError.invalidResponse
+        }
+
+        return try await waitForOperation(opid)
+    }
+
+    /// List recent transactions from wallet
+    /// - Parameters:
+    ///   - count: Number of transactions to return
+    ///   - from: Skip this many transactions
+    /// - Returns: Array of transactions
+    public func listTransactions(count: Int, from: Int) async throws -> [WalletTransaction] {
+        // FIX #286 v7: Fetch ALL wallet transactions (both t and z address)
+        let result = try await call(method: "listtransactions", params: ["*", count, from])
+
+        guard let txList = result as? [[String: Any]] else {
+            print("⚠️ FIX #286 v7: listtransactions returned invalid format")
+            return []
+        }
+
+        // FIX #286 v7 debug logs removed for cleaner output
+
+        var transactions: [WalletTransaction] = []
+
+        for tx in txList {
+            guard let txid = tx["txid"] as? String,
+                  let category = tx["category"] as? String else {
+                continue
+            }
+
+            let address = tx["address"] as? String ?? ""
+            let amountDouble = tx["amount"] as? Double ?? 0
+            let amount = UInt64(abs(amountDouble) * 100_000_000)
+            let feeDouble = tx["fee"] as? Double ?? 0
+            let fee = UInt64(abs(feeDouble) * 100_000_000)
+
+            // FIX #286 v7: Parse confirmations with multiple type attempts
+            let confirmations: Int
+            if let conf = tx["confirmations"] as? Int {
+                confirmations = conf
+            } else if let conf = tx["confirmations"] as? Int64 {
+                confirmations = Int(conf)
+            } else if let conf = tx["confirmations"] as? Double {
+                confirmations = Int(conf)
+            } else {
+                confirmations = 0
+            }
+
+            // FIX #286 v7: Parse time with multiple type attempts
+            let time: Int
+            if let t = tx["time"] as? Int {
+                time = t
+            } else if let t = tx["time"] as? Int64 {
+                time = Int(t)
+            } else if let t = tx["timereceived"] as? Int {
+                time = t
+            } else if let t = tx["timereceived"] as? Int64 {
+                time = Int(t)
+            } else {
+                time = Int(Date().timeIntervalSince1970)
+            }
+
+            // FIX #286 v7: Parse blockheight with multiple type attempts
+            let blockheight: Int?
+            if let h = tx["blockheight"] as? Int {
+                blockheight = h
+            } else if let h = tx["blockheight"] as? Int64 {
+                blockheight = Int(h)
+            } else if let h = tx["blockheight"] as? Double {
+                blockheight = Int(h)
+            } else {
+                blockheight = nil
+            }
+
+            // FIX #286 v7: Handle all transaction categories
+            // Categories: "send", "receive", "generate", "immature", "orphan"
+            let type: WalletTransactionType
+            switch category {
+            case "send":
+                type = .sent
+            case "receive", "generate":
+                type = .received
+            default:
+                // Skip orphan/immature transactions
+                continue
+            }
+
+            transactions.append(WalletTransaction(
+                txid: txid,
+                address: address,
+                amount: amount,
+                fee: fee,
+                type: type,
+                timestamp: Date(timeIntervalSince1970: TimeInterval(time)),
+                confirmations: confirmations,
+                height: blockheight != nil ? UInt64(blockheight!) : nil
+            ))
+        }
+
+        // FIX #286 v7: Log summary
+        let sentCount = transactions.filter { $0.type == .sent }.count
+        let recvCount = transactions.filter { $0.type == .received }.count
+        _ = (sentCount, recvCount)  // Used for debugging if needed
+
+        return transactions
+    }
+
+    /// FIX #286: Get all wallet transactions including z-address sends
+    /// Uses both listtransactions and z_listunspent to build complete history
+    public func getAllWalletTransactions(limit: Int) async throws -> [WalletTransaction] {
+        var allTransactions: [WalletTransaction] = []
+        var seenTxids = Set<String>()
+
+        // 1. Get t-address transactions (includes some z transactions)
+        let tTxs = try await listTransactions(count: limit, from: 0)
+        for tx in tTxs {
+            if !seenTxids.contains(tx.txid) {
+                allTransactions.append(tx)
+                seenTxids.insert(tx.txid)
+            }
+        }
+        // Verbose log removed
+
+        // 2. Get z-address received transactions for all z-addresses
+        let zAddresses = try await getZAddresses()
+        for zAddr in zAddresses {
+            let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
+            for tx in zReceived {
+                if !seenTxids.contains(tx.txid) {
+                    allTransactions.append(tx)
+                    seenTxids.insert(tx.txid)
+                }
+            }
+        }
+        // Verbose log removed
+
+        // 3. Get recent z_sendmany operation results (for sent z-address transactions)
+        // This captures outgoing z-address transactions
+        let opResults = try await getZOperationResults()
+        for opResult in opResults {
+            if let txid = opResult["result"] as? [String: Any],
+               let txidStr = txid["txid"] as? String,
+               !seenTxids.contains(txidStr) {
+                // This is a sent transaction from z_sendmany
+                let timestamp = Date()  // Operation time not available
+                allTransactions.append(WalletTransaction(
+                    txid: txidStr,
+                    address: "",  // To address not easily available
+                    amount: 0,    // Amount needs to be fetched separately
+                    fee: 0,
+                    type: .sent,
+                    timestamp: timestamp,
+                    confirmations: 0,
+                    height: nil
+                ))
+                seenTxids.insert(txidStr)
+            }
+        }
+        // Verbose log removed
+
+        // Sort by timestamp (newest first)
+        return allTransactions
+            .sorted { $0.timestamp > $1.timestamp }
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    /// FIX #286: Get z-address operation results (completed send operations)
+    public func getZOperationResults() async throws -> [[String: Any]] {
+        do {
+            let result = try await call(method: "z_getoperationresult", params: [] as [Any])
+            if let results = result as? [[String: Any]] {
+                return results
+            }
+            return []
+        } catch {
+            // z_getoperationresult may fail if no operations pending
+            return []
+        }
+    }
+
+    // MARK: - FIX #286 v17: Mempool and Pending Transaction Monitoring
+
+    /// Pending transaction info from z_sendmany operations
+    public struct PendingOperation {
+        public let opid: String
+        public let method: String
+        public let status: String   // "queued", "executing", "success", "failed"
+        public let txid: String?    // Only available after success
+        public let creationTime: Date?
+        public let executionSecs: Double
+    }
+
+    /// Get all pending z_sendmany operations (not yet confirmed)
+    public func getPendingOperations() async throws -> [PendingOperation] {
+        let result = try await call(method: "z_getoperationstatus", params: [] as [Any])
+
+        guard let operations = result as? [[String: Any]] else {
+            return []
+        }
+
+        var pending: [PendingOperation] = []
+
+        for op in operations {
+            let opid = op["id"] as? String ?? ""
+            let method = op["method"] as? String ?? ""
+            let status = op["status"] as? String ?? ""
+            let execSecs = op["execution_secs"] as? Double ?? 0
+
+            // Get txid from result if available
+            var txid: String? = nil
+            if let resultDict = op["result"] as? [String: Any] {
+                txid = resultDict["txid"] as? String
+            }
+
+            // Get creation time
+            var creationTime: Date? = nil
+            if let timeInt = op["creation_time"] as? Int {
+                creationTime = Date(timeIntervalSince1970: TimeInterval(timeInt))
+            }
+
+            pending.append(PendingOperation(
+                opid: opid,
+                method: method,
+                status: status,
+                txid: txid,
+                creationTime: creationTime,
+                executionSecs: execSecs
+            ))
+        }
+
+        return pending
+    }
+
+    /// Get unconfirmed balance (transactions in mempool)
+    public func getUnconfirmedBalance() async throws -> (transparent: Double, private_: Double) {
+        // Get balance with minconf=0 (includes unconfirmed)
+        let unconfResult = try await call(method: "z_gettotalbalance", params: [0])
+
+        // Get balance with minconf=1 (confirmed only)
+        let confResult = try await call(method: "z_gettotalbalance", params: [1])
+
+        guard let unconf = unconfResult as? [String: Any],
+              let conf = confResult as? [String: Any],
+              let unconfTransparent = Double(unconf["transparent"] as? String ?? "0"),
+              let confTransparent = Double(conf["transparent"] as? String ?? "0"),
+              let unconfPrivate = Double(unconf["private"] as? String ?? "0"),
+              let confPrivate = Double(conf["private"] as? String ?? "0") else {
+            throw RPCError.invalidResponse
+        }
+
+        let pendingTransparent = unconfTransparent - confTransparent
+        let pendingPrivate = unconfPrivate - confPrivate
+
+        return (pendingTransparent, pendingPrivate)
+    }
+
+    /// Check if a specific transaction is confirmed
+    public func getTransactionConfirmations(txid: String) async throws -> Int {
+        let tx = try await getTransaction(txid: txid)
+        return tx["confirmations"] as? Int ?? 0
+    }
+
+    /// Get raw mempool transaction IDs
+    public func getRawMempool() async throws -> [String] {
+        let result = try await call(method: "getrawmempool", params: [])
+        guard let txids = result as? [String] else {
+            return []
+        }
+        return txids
+    }
+
+    /// List received transactions for a z-address
+    /// - Parameters:
+    ///   - address: The z-address to query
+    ///   - minconf: Minimum confirmations (default 1)
+    /// - Returns: Array of received transactions
+    public func zListReceivedByAddress(_ address: String, minconf: Int = 1) async throws -> [WalletTransaction] {
+        let result = try await call(method: "z_listreceivedbyaddress", params: [address, minconf])
+
+        guard let txList = result as? [[String: Any]] else {
+            return []
+        }
+
+        // Verbose log removed
+
+        // Get current chain height for timestamp estimation
+        let chainHeight = blockHeight > 0 ? Int(blockHeight) : (try? await getInfo().height).map { Int($0) } ?? 2945000
+
+        var transactions: [WalletTransaction] = []
+
+        for tx in txList {
+            guard let txid = tx["txid"] as? String else {
+                continue
+            }
+
+            // FIX #286 v8: z_listreceivedbyaddress does NOT return confirmations/blockheight!
+            // Fields returned: ["amount", "change", "memo", "outindex", "txid"]
+            // We must call gettransaction to get the actual confirmations
+
+            let amountDouble = tx["amount"] as? Double ?? 0
+            let amount = UInt64(amountDouble * 100_000_000)
+            let memoHex = tx["memo"] as? String
+            let memo = memoHex.flatMap { Self.decodeMemo($0) }
+
+            // FIX #286 v8: Call gettransaction to get confirmations and timestamp
+            var confirmations = 0
+            var blockheight: Int? = nil
+            var timestamp = Date()
+
+            do {
+                let txDetails = try await getTransaction(txid: txid)
+                confirmations = txDetails["confirmations"] as? Int ?? 0
+                if let time = txDetails["time"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(time))
+                } else if let blocktime = txDetails["blocktime"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                }
+                if let height = txDetails["height"] as? Int {
+                    blockheight = height
+                }
+            } catch {
+                // If gettransaction fails, estimate from chain height
+                // Silently continue - this is not critical
+            }
+
+            transactions.append(WalletTransaction(
+                txid: txid,
+                address: address,
+                amount: amount,
+                fee: 0,
+                type: .received,
+                timestamp: timestamp,
+                confirmations: confirmations,
+                memo: memo,
+                height: blockheight != nil ? UInt64(blockheight!) : nil
+            ))
+        }
+
+        return transactions
+    }
+
+    /// List unspent outputs
+    /// - Parameters:
+    ///   - minConf: Minimum confirmations
+    ///   - addresses: Optional filter by addresses
+    /// - Returns: Array of unspent outputs
+    public func listUnspent(minConf: Int = 1, addresses: [String]? = nil) async throws -> [[String: Any]] {
+        var params: [Any] = [minConf, 9999999]
+        if let addrs = addresses {
+            params.append(addrs)
+        }
+
+        let result = try await call(method: "listunspent", params: params)
+
+        guard let unspent = result as? [[String: Any]] else {
+            return []
+        }
+
+        return unspent
+    }
+
+    /// FIX #367: Get shielded unspent outputs from full node (z_listunspent)
+    /// This is FAST - uses RPC instead of P2P block scanning
+    /// - Parameters:
+    ///   - minConf: Minimum confirmations (0 for mempool)
+    ///   - addresses: Optional list of z-addresses to filter
+    /// - Returns: Array of shielded unspent outputs with txid, outindex, amount, address
+    public func zListUnspent(minConf: Int = 0, addresses: [String]? = nil) async throws -> [[String: Any]] {
+        var params: [Any] = [minConf, 9999999]
+
+        // z_listunspent uses: minconf, maxconf, includeWatchonly, [addresses]
+        params.append(false)  // includeWatchonly
+        if let addrs = addresses, !addrs.isEmpty {
+            params.append(addrs)
+        }
+
+        let result = try await call(method: "z_listunspent", params: params)
+
+        guard let unspent = result as? [[String: Any]] else {
+            return []
+        }
+
+        return unspent
+    }
+
+    /// Decode memo from hex string
+    private static func decodeMemo(_ hex: String) -> String? {
+        guard hex.count % 2 == 0 else { return nil }
+
+        var bytes: [UInt8] = []
+        var index = hex.startIndex
+
+        while index < hex.endIndex {
+            let nextIndex = hex.index(index, offsetBy: 2)
+            if let byte = UInt8(hex[index..<nextIndex], radix: 16) {
+                // Stop at null terminator or 0xf6 padding
+                if byte == 0 || byte == 0xf6 { break }
+                bytes.append(byte)
+            }
+            index = nextIndex
+        }
+
+        return String(bytes: bytes, encoding: .utf8)
     }
 
     // MARK: - Private Helpers

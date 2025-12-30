@@ -825,17 +825,82 @@ final class WalletManager: ObservableObject {
             return
         }
 
-        // Deserialization failed - boost file was generated with different FFI version
-        print("❌ Tree deserialization failed - boost file generated with different FFI version")
-        print("💡 Solution: Rebuild Rust FFI library, then regenerate boost file with same version")
+        // FIX #456: Tree deserialization failed - fall back to building from CMUs instead of failing
+        // This happens when boost file was generated with different FFI version (e.g., after Rust dependencies update)
+        // The "non-canonical Option<T>" error means zcash_primitives serialization format changed
+        print("⚠️ FIX #456: Tree deserialization failed - boost file generated with different FFI version")
+        print("⚠️ FIX #456: Error was: 'non-canonical Option<T>' - this means zcash_primitives changed")
+        print("🔄 FIX #456: Falling back to building tree from CMUs (slower but always works)...")
+
         await MainActor.run {
-            self.treeLoadStatus = "Failed: FFI version mismatch"
-            self.treeLoadProgress = 0.0
+            self.treeLoadStatus = "Building commitment tree from CMUs..."
+            self.treeLoadProgress = 0.4
         }
 
-        // Clear the cached boost file - user needs to rebuild FFI
-        try? await CommitmentTreeUpdater.shared.clearCache()
-        return
+        // Extract CMUs from boost file and build tree from scratch
+        do {
+            let cmuData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
+                Task { @MainActor in
+                    self.treeLoadProgress = 0.4 + progress * 0.4  // 40-80% for CMU extraction
+                    self.treeLoadStatus = "Extracting CMUs... \(Int(progress * 100))%"
+                }
+            }
+            print("📦 Extracted \(cmuData.count) bytes of CMU data")
+
+            // Build tree from CMUs (this takes ~30-60 seconds for 1M+ CMUs)
+            await MainActor.run {
+                self.treeLoadStatus = "Building tree from CMUs (this takes 30-60s)..."
+                self.treeLoadProgress = 0.8
+            }
+
+            if ZipherXFFI.treeLoadFromCMUsWithProgress(data: cmuData) { current, total in
+                let progress = Double(current) / Double(total)
+                Task { @MainActor in
+                    self.treeLoadProgress = 0.8 + progress * 0.2  // 80-100% for tree build
+                    self.treeLoadStatus = "Building tree: \(current)/\(total) CMUs (\(Int(progress * 100))%)"
+                }
+            } {
+                let treeSize = ZipherXFFI.treeSize()
+                print("✅ FIX #456: Tree built from CMUs: \(treeSize) commitments (height \(downloadedTreeHeight))")
+
+                // Store effective height for FilterScanner
+                UserDefaults.standard.set(Int(downloadedTreeHeight), forKey: "effectiveTreeHeight")
+                UserDefaults.standard.set(Int(downloadedCMUCount), forKey: "effectiveTreeCMUCount")
+
+                // Save to database for next time (this time with CURRENT FFI version)
+                if let serializedTree = ZipherXFFI.treeSerialize() {
+                    try? WalletDatabase.shared.saveTreeState(serializedTree)
+                    print("💾 FIX #456: Tree state saved to database (current FFI version)")
+                }
+
+                await MainActor.run {
+                    self.isTreeLoaded = true
+                    self.treeLoadProgress = 1.0
+                    self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
+                    self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.showBoostDownloadSheet = false
+                    }
+                }
+                return
+            } else {
+                // CMU build also failed - this is a critical error
+                print("❌ FIX #456: CRITICAL - Both deserialization AND CMU build failed!")
+                print("❌ FIX #456: This indicates a serious FFI corruption issue")
+                await MainActor.run {
+                    self.treeLoadStatus = "Failed: Tree build error\nPlease report this issue"
+                    self.treeLoadProgress = 0.0
+                }
+                return
+            }
+        } catch {
+            print("❌ FIX #456: Failed to extract CMUs: \(error.localizedDescription)")
+            await MainActor.run {
+                self.treeLoadStatus = "Failed to extract CMUs"
+                self.treeLoadProgress = 0.0
+            }
+            return
+        }
     }
 
 
@@ -1273,18 +1338,37 @@ final class WalletManager: ObservableObject {
 
         // Extract and load headers
         do {
+            // FIX #457: Extract block hashes FIRST (needed for instant header loading)
+            let blockHashesData: Data?
+            if await CommitmentTreeUpdater.shared.hasBlockHashesSection() {
+                print("📜 FIX #457: Extracting pre-computed block hashes from boost file...")
+                blockHashesData = try await CommitmentTreeUpdater.shared.extractBlockHashes()
+                if let hashes = blockHashesData {
+                    print("📜 FIX #457: Extracted \(hashes.count / 32) block hashes (instant loading!)")
+                }
+            } else {
+                print("⚠️ FIX #457: No block hashes section in boost file - will compute hashes (slow)")
+                blockHashesData = nil
+            }
+
             guard let headerData = try await CommitmentTreeUpdater.shared.extractHeaders() else {
                 print("⚠️ FIX #413: Failed to extract headers from boost file")
                 return (false, 0)
             }
 
-            // Load headers into HeaderStore
-            try HeaderStore.shared.loadHeadersFromBoostData(headerData, startHeight: sectionInfo.startHeight)
+            // Load headers into HeaderStore with pre-computed hashes
+            // FIX #457: Pass expected count from manifest (headers have Equihash solutions, so size varies)
+            try HeaderStore.shared.loadHeadersFromBoostData(
+                headerData,
+                blockHashes: blockHashesData,
+                startHeight: sectionInfo.startHeight,
+                expectedCount: Int(sectionInfo.count)
+            )
 
-            print("✅ FIX #413: Loaded \(sectionInfo.count) headers from boost file (up to height \(sectionInfo.endHeight))")
+            print("✅ FIX #457: Loaded \(sectionInfo.count) headers from boost file (up to height \(sectionInfo.endHeight))")
             return (true, sectionInfo.endHeight)
         } catch {
-            print("❌ FIX #413: Failed to load headers from boost file: \(error.localizedDescription)")
+            print("❌ FIX #457: Failed to load headers from boost file: \(error.localizedDescription)")
             return (false, 0)
         }
     }
@@ -1510,6 +1594,13 @@ final class WalletManager: ObservableObject {
                     headerStore: HeaderStore.shared,
                     networkManager: NetworkManager.shared
                 )
+
+                // FIX #464: Report header sync progress to UI
+                hsm.onProgress = { [weak self] progress in
+                    Task { @MainActor in
+                        self?.headerSyncStatus = "Syncing headers: \(progress.currentHeight)/\(progress.totalHeight)"
+                    }
+                }
 
                 // Check if any transactions need timestamps from earlier heights
                 if let earliestNeedingTimestamp = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp() {
@@ -2236,10 +2327,10 @@ final class WalletManager: ObservableObject {
         var headerSyncSuccess = false
         var lastHeaderError: Error?
 
-        // FIX #146: Set header syncing flag ONCE at the start, BEFORE retry loop
+        // FIX #457 v11: Set header syncing flag ONCE at the start, BEFORE retry loop
         // This prevents block listeners from restarting between retry attempts
-        // which was causing P2P race conditions and 5 headers/sec slowdown
-        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true) }
+        // NOTE: For import, we DON'T stop block listeners since sync is only 100 headers (see line 2442)
+        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true, stopListeners: false) }
         defer {
             // Clear flag when ALL retries complete (success or exhausted)
             Task { @MainActor in NetworkManager.shared.setHeaderSyncing(false) }
@@ -3226,14 +3317,16 @@ final class WalletManager: ObservableObject {
             print("✅ FIX #417: Anchors extracted from valid witnesses - skipping incorrect tree root comparison")
         }
 
-        // FIX #367: Skip quick fix entirely if forceFullRescan is requested
+        // FIX #367 v2: Try quick fix FIRST, even if forceFullRescan is requested
+        // Quick fix is instant (<1 second) and often succeeds, avoiding expensive full rescan
+        // Only skip to full rescan if quick fix explicitly fails or witnesses are invalid
         if forceFullRescan {
-            print("🔄 FIX #367: FORCE FULL RESCAN requested - skipping quick fix")
+            print("🔄 FIX #367: FORCE FULL RESCAN requested - but trying quick fix first")
         }
 
-        // Only use quick fix if ALL notes have valid witnesses AND anchors are validated correct
-        // AND forceFullRescan is NOT requested
-        if !forceFullRescan && notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
+        // Use quick fix if ALL notes have valid witnesses AND anchors are validated correct
+        // This works even when forceFullRescan=true (we try quick fix before full rescan)
+        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
             print("✅ Quick fix successful! All \(anchorsFixed) notes repaired instantly")
 
             // FIX #466: Resolve boost received_in_tx placeholders BEFORE rebuilding history
@@ -3347,11 +3440,55 @@ final class WalletManager: ObservableObject {
         try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
         print("📝 Reset last scanned height to 0")
 
-        // CRITICAL: Clear HeaderStore (headers + block_times) to force full re-sync
-        // Without this, dates show as estimates and checkpoints can't be saved
-        try? HeaderStore.shared.clearAllHeaders()
+        // FIX #457 v3: RELOAD bundled headers from boost file instead of clearing
+        // Bundled headers (476969 → boost end) are pre-validated and correct
+        // Only need to sync delta headers (boost end → chain tip) via P2P
+        let treeUpdater = CommitmentTreeUpdater.shared
+
+        // Check if boost file has headers section
+        if await treeUpdater.hasHeadersSection() {
+            // Extract headers and block hashes from boost file
+            if let headerData = try? await treeUpdater.extractHeaders(),
+               let blockHashesData = try? await treeUpdater.extractBlockHashes() {
+
+                // Get manifest info to find bundled headers range
+                if let manifest = await treeUpdater.loadCachedManifest() {
+                    let bundledEndHeight = manifest.chain_height
+                    let sectionInfo = manifest.sections.first { $0.type == 7 }
+
+                    // Clear ONLY headers above bundled range (delta headers from P2P)
+                    // These need to be re-synced because they might be stale
+                    try? HeaderStore.shared.clearHeadersAboveHeight(bundledEndHeight)
+                    print("📜 FIX #457: Cleared delta headers above \(bundledEndHeight) (will re-sync via P2P)")
+
+                    // Reload bundled headers from boost file (instant, already validated)
+                    if let section = sectionInfo {
+                        print("📜 FIX #457: Reloading \(section.count) bundled headers from boost file...")
+                        try HeaderStore.shared.loadHeadersFromBoostData(
+                            headerData,
+                            blockHashes: blockHashesData,
+                            startHeight: section.start_height,
+                            expectedCount: Int(section.count)
+                        )
+                        print("✅ FIX #457: Bundled headers reloaded instantly up to height \(bundledEndHeight)")
+                    }
+                }
+            } else {
+                // Extraction failed - clear everything
+                try? HeaderStore.shared.clearAllHeaders()
+                try? HeaderStore.shared.clearBlockTimes()
+                print("⚠️ Boost file extraction failed - cleared all headers")
+            }
+        } else {
+            // Fallback: No boost file with headers, clear everything
+            try? HeaderStore.shared.clearAllHeaders()
+            try? HeaderStore.shared.clearBlockTimes()
+            print("⚠️ No boost file headers - cleared all headers (will P2P sync everything)")
+        }
+
+        // Clear block_times table (will be repopulated from bundled data + P2P sync)
         try? HeaderStore.shared.clearBlockTimes()
-        print("🗑️ Cleared HeaderStore (headers + block_times will re-sync)")
+        print("🗑️ Cleared block_times (will reload from bundled + P2P)")
 
         // CRITICAL: Clear ALL timestamp data (in-memory + HeaderStore.block_times)
         // This forces re-sync from boost file on next load

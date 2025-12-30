@@ -519,6 +519,14 @@ public final class NetworkManager: ObservableObject {
                 let gap = targetHeight - headerStoreHeight
                 print("🔧 FIX #411: Syncing \(gap) headers (from \(headerStoreHeight) to \(targetHeight))")
                 let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: self)
+
+                // FIX #464: Report header sync progress to UI
+                hsm.onProgress = { progress in
+                    Task { @MainActor in
+                        debugLog(.network, "📊 Header sync progress: \(progress.currentHeight)/\(progress.totalHeight)")
+                    }
+                }
+
                 // Sync ALL missing headers, not just 100
                 do {
                     try await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
@@ -549,7 +557,8 @@ public final class NetworkManager: ObservableObject {
     /// When true, mempool scan is disabled to prevent P2P race conditions
     /// FIX #139: Also pauses/resumes block listeners for faster header sync
     /// FIX #140: Made synchronous to ensure listeners are paused BEFORE header sync starts
-    func setHeaderSyncing(_ syncing: Bool) {
+    /// FIX #457 v11: Added stopListeners parameter (small syncs don't need to stop listeners)
+    func setHeaderSyncing(_ syncing: Bool, stopListeners: Bool = true) {
         // FIX #140: Set flag synchronously (no Task wrapper) so it takes effect immediately
         self.isHeaderSyncing = syncing
         debugLog(.network, "📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
@@ -557,9 +566,10 @@ public final class NetworkManager: ObservableObject {
         // FIX #139: Pause block listeners during header sync for 100x faster sync
         // FIX #140: Call synchronously - must happen BEFORE header sync starts
         // FIX #383: Renamed to stopAllBlockListeners/resumeAllBlockListeners
-        if syncing {
+        // FIX #457 v11: Only stop listeners if stopListeners=true (small syncs don't need it)
+        if syncing && stopListeners {
             self.stopAllBlockListeners()
-        } else {
+        } else if !syncing {
             self.resumeAllBlockListeners()
         }
     }

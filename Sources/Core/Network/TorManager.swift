@@ -140,7 +140,9 @@ public final class TorManager: ObservableObject {
 
     /// Minimum delay after SOCKS proxy is ready before .onion circuits are likely established
     /// Hidden services require rendezvous circuits which take additional time to set up
-    private let onionCircuitWarmupSeconds: TimeInterval = 10.0
+    /// FIX #331: Increased from 10s to 30s for more reliable .onion circuit establishment
+    /// Tor documentation suggests 30-60 seconds for rendezvous point establishment
+    private let onionCircuitWarmupSeconds: TimeInterval = 30.0
 
     // MARK: - Initialization
 
@@ -208,6 +210,96 @@ public final class TorManager: ObservableObject {
         }
 
         return true
+    }
+
+    // MARK: - FIX #289: App Lifecycle Coordination
+
+    /// Track when app went to background (for stale detection)
+    private var backgroundTimestamp: Date?
+
+    /// FIX #289: Put Tor into dormant mode when app goes to background
+    /// This stops polling and marks circuits as potentially stale
+    public func goDormantOnBackground() {
+        guard mode == .enabled else {
+            print("🧅 FIX #289: Tor disabled, no dormant action needed")
+            return
+        }
+
+        print("🧅 FIX #289: App going to background - Tor entering dormant mode")
+        backgroundTimestamp = Date()
+
+        // Stop status polling to save battery
+        statusPollingTask?.cancel()
+        statusPollingTask = nil
+
+        // Mark SOCKS proxy as potentially stale (will need re-verification)
+        socksProxyVerified = false
+        connectedSinceTimestamp = nil  // Reset .onion warmup timer
+
+        print("🧅 FIX #289: Tor dormant - circuits may become stale")
+    }
+
+    /// FIX #289: Wake Tor and verify connectivity when app comes to foreground
+    public func ensureRunningOnForeground() async {
+        guard mode == .enabled else {
+            print("🧅 FIX #289: Tor disabled, no foreground action needed")
+            return
+        }
+
+        print("🧅 FIX #289: App coming to foreground - checking Tor status")
+
+        // Calculate time in background
+        let backgroundDuration: TimeInterval
+        if let bgTime = backgroundTimestamp {
+            backgroundDuration = Date().timeIntervalSince(bgTime)
+            print("🧅 FIX #289: Was in background for \(Int(backgroundDuration))s")
+        } else {
+            backgroundDuration = 0
+        }
+        backgroundTimestamp = nil
+
+        // If in background > 30s, circuits are likely stale
+        let circuitsMayBeStale = backgroundDuration > 30
+
+        // Check if Tor was in connected state
+        guard case .connected = connectionState else {
+            // Tor wasn't connected - try to restart
+            print("🧅 FIX #289: Tor was not connected, attempting restart")
+            await startArti()
+            return
+        }
+
+        // Verify SOCKS proxy is still working
+        let proxyWorking = await isSocksProxyReady()
+
+        if !proxyWorking {
+            // SOCKS proxy dead - restart Tor
+            print("🧅 FIX #289: SOCKS proxy not responding - restarting Tor")
+            await stopArti()
+            await startArti()
+            return
+        }
+
+        // Proxy working - restore connected state
+        print("🧅 FIX #289: SOCKS proxy verified, restoring connected state")
+        socksProxyVerified = true
+        connectedSinceTimestamp = Date()
+
+        // If circuits may be stale, request new identity
+        if circuitsMayBeStale {
+            print("🧅 FIX #289: Circuits may be stale after \(Int(backgroundDuration))s - requesting new identity")
+            _ = await requestNewIdentity()
+        }
+
+        // Restart status polling
+        startStatusPolling()
+
+        // Notify HiddenServiceManager to check hidden service status
+        Task {
+            await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: true)
+        }
+
+        print("🧅 FIX #289: Tor fully restored from dormant mode")
     }
 
     // MARK: - FIX #142: Temporary Tor Bypass for Massive Operations
@@ -427,6 +519,125 @@ public final class TorManager: ObservableObject {
     /// Check if Arti (Rust Tor) is compiled in
     public var isArtiAvailable: Bool {
         zipherx_tor_is_available()
+    }
+
+    // MARK: - SOCKS5 Health Monitoring (FIX for Tor Proxy Crashes)
+
+    /// Track last SOCKS5 health check time
+    private var lastSOCKS5HealthCheck: Date?
+    private let SOCKS5_HEALTH_CHECK_INTERVAL: TimeInterval = 15.0  // Check every 15 seconds
+
+    /// Track consecutive SOCKS5 failures for detection
+    private var consecutiveSOCKS5Failures: Int = 0
+    private let SOCKS5_FAILURE_THRESHOLD = 2  // Restart Tor after 2 consecutive failures
+
+    /// Perform a quick SOCKS5 health check (non-blocking, fast)
+    /// Returns true if SOCKS5 proxy is accepting connections
+    public func checkSOCKS5Health() async -> Bool {
+        print("🔍 [SOCKS5] checkSOCKS5Health() called - mode: \(mode.rawValue), socksPort: \(socksPort)")
+
+        guard mode == .enabled, socksPort > 0 else {
+            print("🔍 [SOCKS5] Skipped - Tor not enabled or socksPort=0")
+            return false  // Tor not enabled or not started
+        }
+
+        // Quick TCP connection test to SOCKS5 proxy
+        let isHealthy = await testSOCKS5Connection(timeout: 1.0)  // 1 second timeout
+
+        if isHealthy {
+            consecutiveSOCKS5Failures = 0
+            lastSOCKS5HealthCheck = Date()
+            print("🔍 [SOCKS5] Health check PASSED ✅")
+            return true
+        } else {
+            consecutiveSOCKS5Failures += 1
+            print("⚠️ SOCKS5 health check FAILED (consecutive failures: \(consecutiveSOCKS5Failures))")
+
+            // If threshold exceeded, restart Tor
+            if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD {
+                print("🚨 CRITICAL: SOCKS5 proxy unresponsive - restarting Tor...")
+                await restartTor()
+                consecutiveSOCKS5Failures = 0  // Reset after restart
+            }
+
+            return false
+        }
+    }
+
+    /// Test SOCKS5 connection with timeout
+    private func testSOCKS5Connection(timeout: TimeInterval) async -> Bool {
+        print("🔍 [SOCKS5] Testing connection to 127.0.0.1:\(socksPort) (timeout: \(timeout)s)")
+
+        return await withCheckedContinuation { continuation in
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: NWEndpoint.Port(integerLiteral: socksPort)
+            )
+            let connection = NWConnection(to: endpoint, using: .tcp)
+
+            var hasResumed = false
+            let queue = DispatchQueue(label: "socks-health-\(UUID().uuidString.prefix(8))")
+
+            connection.stateUpdateHandler = { state in
+                guard !hasResumed else { return }
+                print("🔍 [SOCKS5] State update: \(state)")
+                switch state {
+                case .ready:
+                    print("🔍 [SOCKS5] Connection READY ✅")
+                    hasResumed = true
+                    connection.cancel()
+                    continuation.resume(returning: true)
+                case .failed(let error):
+                    print("🔍 [SOCKS5] Connection FAILED: \(error)")
+                    hasResumed = true
+                    connection.cancel()
+                    continuation.resume(returning: false)
+                case .cancelled:
+                    print("🔍 [SOCKS5] Connection CANCELLED")
+                    hasResumed = true
+                    connection.cancel()
+                    continuation.resume(returning: false)
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: queue)
+            print("🔍 [SOCKS5] Connection started, waiting for state...")
+
+            // Timeout
+            queue.asyncAfter(deadline: .now() + timeout) {
+                guard !hasResumed else { return }
+                print("🔍 [SOCKS5] Connection TIMEOUT after \(timeout)s")
+                hasResumed = true
+                connection.cancel()
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    /// Restart Tor completely (stop + start) with circuit readiness wait
+    public func restartTor() async {
+        print("🔄 Restarting Tor due to SOCKS5 failure or all-peers-dead event...")
+
+        // Stop Tor
+        await stopArti()
+
+        // Wait for cleanup
+        try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+
+        // Start Tor
+        await startArti()
+
+        // Wait for circuits to be ready
+        let maxWait = 30  // 30 seconds max
+        var attempts = 0
+        while !isOnionCircuitsReady && attempts < maxWait {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+            attempts += 1
+        }
+
+        print("✅ Tor restarted, circuits ready: \(isOnionCircuitsReady)")
     }
 
     // MARK: - Mode Change Handling

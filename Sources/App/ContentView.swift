@@ -5,6 +5,9 @@ struct ContentView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var biometricManager = BiometricAuthManager.shared
+    #if os(macOS)
+    @StateObject private var modeManager = WalletModeManager.shared  // FIX #448: Observe wallet source changes
+    #endif
     @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab: Tab = .balance
     @State private var isFirstLaunch: Bool = false
@@ -402,6 +405,14 @@ struct ContentView: View {
                                         // FIX #432: Sync headers to at least lastScannedHeight
                                         // Previous bug: try? swallowed errors, sync appeared to "complete" in 59ms
                                         let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+
+                                        // FIX #464: Report header sync progress to UI
+                                        hsm.onProgress = { progress in
+                                            Task { @MainActor in
+                                                walletManager.updateSyncTask(id: "fast_headers", status: .inProgress, detail: "Syncing headers \(progress.currentHeight)/\(progress.totalHeight)...")
+                                            }
+                                        }
+
                                         do {
                                             try await hsm.syncHeaders(from: headerStoreAfterTimestamps + 1, maxHeaders: gapToLastScanned + 100)
                                             let newHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
@@ -518,6 +529,14 @@ struct ContentView: View {
                                             walletManager.updateSyncTask(id: "fast_headers", status: .inProgress, detail: "Syncing headers...")
                                         }
                                         let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+
+                                        // FIX #464: Report header sync progress to UI
+                                        hsm.onProgress = { progress in
+                                            Task { @MainActor in
+                                                walletManager.updateSyncTask(id: "fast_headers", status: .inProgress, detail: "Syncing headers \(progress.currentHeight)/\(progress.totalHeight)...")
+                                            }
+                                        }
+
                                         try? await hsm.syncHeaders(from: fastPathHeaderHeight + 1, maxHeaders: fastPathGap + 100)
                                         print("✅ FIX #412 v2: Fast path header sync complete")
                                     }
@@ -696,6 +715,14 @@ struct ContentView: View {
                                             // Sync headers from headerStoreHeight to at least lastScanned
                                             // maxHeaders = gap + some buffer to ensure we reach lastScanned
                                             let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+
+                                            // FIX #464: Report header sync progress to UI
+                                            hsm.onProgress = { progress in
+                                                Task { @MainActor in
+                                                    walletManager.setConnecting(true, status: "Syncing delta headers \(progress.currentHeight)/\(progress.totalHeight)...")
+                                                }
+                                            }
+
                                             try? await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
                                         }
                                     } else {
@@ -1284,6 +1311,14 @@ struct ContentView: View {
                                         let gap = lastScanned - headerStoreHeight
                                         print("🔧 FIX #411: HeaderStore at \(headerStoreHeight), need \(lastScanned), gap=\(gap)")
                                         let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+
+                                        // FIX #464: Report header sync progress to UI
+                                        hsm.onProgress = { progress in
+                                            Task { @MainActor in
+                                                walletManager.setConnecting(true, status: "Syncing delta headers \(progress.currentHeight)/\(progress.totalHeight)...")
+                                            }
+                                        }
+
                                         try? await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: gap + 100)
                                     }
                                 } else {
@@ -1772,6 +1807,20 @@ struct ContentView: View {
 
     private var mainWalletView: some View {
         Group {
+            #if os(macOS)
+            // FIX #448: Check if using wallet.dat mode - show FullNodeWalletView instead
+            if modeManager.walletSource == .walletDat {
+                FullNodeWalletView()
+                    .environmentObject(themeManager)
+            } else if isCypherpunkTheme {
+                // Cypherpunk theme: Single-screen layout with balance, buttons, history
+                cypherpunkWalletView
+            } else {
+                // Classic themes: Tab-based layout
+                classicWalletView
+            }
+            #else
+            // iOS: Always light mode views
             if isCypherpunkTheme {
                 // Cypherpunk theme: Single-screen layout with balance, buttons, history
                 cypherpunkWalletView
@@ -1779,6 +1828,7 @@ struct ContentView: View {
                 // Classic themes: Tab-based layout
                 classicWalletView
             }
+            #endif
         }
     }
 

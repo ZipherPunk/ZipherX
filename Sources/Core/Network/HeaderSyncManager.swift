@@ -214,6 +214,18 @@ final class HeaderSyncManager {
     private func syncHeadersSimple(from startHeight: UInt64, to chainTip: UInt64) async throws {
         print("⚡ Using simple sync with peer rotation for \(chainTip - startHeight) headers")
 
+        // FIX: Timing diagnostics - track each step
+        let syncStartTime = Date()
+        var stepTimings: [String: TimeInterval] = [:]
+
+        func measureStep(_ name: String, operation: () async throws -> Void) async rethrows {
+            let stepStart = Date()
+            try await operation()
+            let stepDuration = Date().timeIntervalSince(stepStart)
+            stepTimings[name] = stepDuration
+            print("⏱️ Header sync step '\(name)' took \(String(format: "%.2f", stepDuration))s")
+        }
+
         // FIX #155: Report initial progress (0%) before starting
         let initialProgress = HeaderSyncProgress(
             currentHeight: startHeight,
@@ -230,7 +242,6 @@ final class HeaderSyncManager {
         // - Large sync (500-5000): 120 seconds (more time over Tor)
         // - Huge sync (> 5000): 300 seconds (first install/reset scenario)
         // This is critical for SYBIL protection which relies on HeaderStore height
-        let syncStartTime = Date()
         let headersNeeded = chainTip - currentHeight
         let maxSyncDuration: TimeInterval
         if headersNeeded < 500 {
@@ -241,14 +252,15 @@ final class HeaderSyncManager {
             maxSyncDuration = 300.0  // 5 minutes for massive catch-up
         }
         print("📊 FIX #377: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        stepTimings["timeout_calculated"] = Date().timeIntervalSince(syncStartTime)
 
         while currentHeight < chainTip {
             // FIX #274: Check total sync timeout
             let elapsed = Date().timeIntervalSince(syncStartTime)
             if elapsed > maxSyncDuration {
-                print("⚠️ FIX #274: Header sync timeout (\(Int(elapsed))s) - continuing with existing headers")
-                print("⚠️ Note: Timestamps may be slightly outdated for recent transactions")
-                return  // Exit gracefully, don't throw - headers are not critical
+                print("⚠️ FIX #274: Header sync timeout (\(Int(elapsed))s) - throwing error to trigger retry")
+                print("⚠️ Note: Headers were NOT synced successfully - need retry with different approach")
+                throw SyncError.timeout("Header sync timed out after \(Int(elapsed))s - \(chainTip - currentHeight) blocks remaining")
             }
 
             // CRITICAL FIX: Get FRESH peers list on each iteration
@@ -334,6 +346,15 @@ final class HeaderSyncManager {
                 continue
             }
         }
+
+        // FIX: Timing summary
+        let totalDuration = Date().timeIntervalSince(syncStartTime)
+        print("⏱️ Header sync timing summary:")
+        print("   Total duration: \(String(format: "%.2f", totalDuration))s")
+        for (step, duration) in stepTimings.sorted(by: { $0.value < $1.value }) {
+            print("   \(step): \(String(format: "%.2f", duration))s (\(Int(duration/totalDuration*100))%)")
+        }
+        print("   Headers per second: \(String(format: "%.1f", Double(headersNeeded) / totalDuration))")
     }
 
     /// FIX #141: PARALLEL header requests - request from ALL peers, take first response
@@ -366,7 +387,26 @@ final class HeaderSyncManager {
         var consecutiveFailures = 0
         let maxConsecutiveFailures = 3
 
+        // FIX #444: Calculate dynamic timeout based on headers needed
+        let headersNeeded = chainTip - startHeight
+        let maxSyncDuration: TimeInterval
+        if headersNeeded < 500 {
+            maxSyncDuration = 45  // Quick catch-up
+        } else if headersNeeded < 5000 {
+            maxSyncDuration = 120  // Tor latency
+        } else {
+            maxSyncDuration = 300  // First install/reset
+        }
+        print("⏱️ FIX #444: Parallel sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+
         while currentHeight < chainTip {
+            // FIX #444: Check for timeout
+            let totalElapsed = Date().timeIntervalSince(startTime)
+            if totalElapsed > maxSyncDuration {
+                print("⚠️ FIX #444: Header sync timeout (\(Int(totalElapsed))s) - throwing error to trigger retry")
+                print("⚠️ Note: Headers were NOT synced successfully - need retry with different approach")
+                throw SyncError.timeout("Header sync timed out after \(Int(totalElapsed))s - \(chainTip - currentHeight) blocks remaining")
+            }
             // FIX #133: Destructure tuple to get actual locator height
             let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
             // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
@@ -720,26 +760,14 @@ final class HeaderSyncManager {
                             peer.markActive()
                             return (peer.host, result)
                         } catch NetworkError.handshakeFailed {
-                            // Try reconnect once using ensureConnected (has 5s cooldown)
-                            print("🔄 [\(peer.host)] Handshake failed, trying ensureConnected...")
-                            do {
-                                try await peer.ensureConnected()
-                                let result = try await self.requestHeaders(
-                                    from: peer,
-                                    startHeight: startHeight,
-                                    endHeight: endHeight
-                                )
-                                peer.markActive()
-                                return (peer.host, result)
-                            } catch NetworkError.timeout {
-                                // Cooldown period - peer was recently reconnected
-                                print("⏳ [\(peer.host)] In reconnect cooldown, skipping...")
+                            // CRITICAL FIX: Ban peer immediately after handshake failure
+                            // Repeated handshake failures indicate the peer is incompatible/malicious
+                            print("🚫 [\(peer.host)] Handshake failed - BANNING peer (incompatible protocol)")
+                            // Record 10 failures to trigger immediate ban via shouldBan()
+                            for _ in 0..<10 {
                                 peer.recordFailure()
-                                return (peer.host, nil)
-                            } catch {
-                                peer.recordFailure()
-                                return (peer.host, nil)
                             }
+                            return (peer.host, nil)
                         } catch {
                             print("⚠️ [\(peer.host)] Failed: \(error)")
                             peer.recordFailure()
@@ -1237,6 +1265,7 @@ enum SyncError: LocalizedError {
     case unexpectedMessage(expected: String, got: String)
     case invalidHeadersPayload(reason: String)
     case noHeadersReceived
+    case timeout(String)
     case internalError(String)
 
     var errorDescription: String? {
@@ -1259,6 +1288,8 @@ enum SyncError: LocalizedError {
             return "Invalid headers payload: \(reason)"
         case .noHeadersReceived:
             return "No headers received from peers"
+        case .timeout(let msg):
+            return msg
         case .internalError(let msg):
             return "Internal error: \(msg)"
         }

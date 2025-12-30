@@ -1817,6 +1817,7 @@ struct CypherpunkMainView: View {
     @State private var transactions: [TransactionHistoryItem] = []
     @State private var isLoadingHistory = true
     @State private var selectedTransaction: TransactionHistoryItem?
+    @State private var forceReloadFromDatabase = false  // FIX #462 v2: Force reload bypassing cache
     @State private var glitchOffset: CGFloat = 0
     @State private var showGlitch: Bool = false
     @State private var previousBalance: UInt64 = 0
@@ -1906,6 +1907,13 @@ struct CypherpunkMainView: View {
         .onAppear {
             previousBalance = walletManager.shieldedBalance
             loadTransactionHistory()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
+            // FIX #462 v2: Force reload when repair completes
+            print("📜 FIX #462 v2 [S7]: Received transactionHistoryUpdated notification - forcing reload")
+            transactions = []  // Clear cache
+            forceReloadFromDatabase = true  // Set flag to bypass empty check
+            loadTransactionHistory()  // Reload from database
         }
         .onChange(of: walletManager.shieldedBalance) { newValue in
             if newValue != previousBalance {
@@ -2142,7 +2150,27 @@ struct CypherpunkMainView: View {
 
     private var actionButtons: some View {
         HStack(spacing: 12) {
-            // SEND button
+            // FIX #286 v5: RECEIVE button first (on the left)
+            Button(action: { showReceive = true }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 18))
+                    Text("RECEIVE")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(matrixGreen)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(Color.black)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(matrixGreen, lineWidth: 2)
+                )
+                .cornerRadius(8)
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            // SEND button second (on the right)
             Button(action: { showSend = true }) {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.up.circle.fill")
@@ -2162,26 +2190,6 @@ struct CypherpunkMainView: View {
                 )
                 .cornerRadius(8)
                 .shadow(color: matrixGreen.opacity(0.5), radius: 8)
-            }
-            .buttonStyle(PlainButtonStyle())
-
-            // RECEIVE button
-            Button(action: { showReceive = true }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.circle.fill")
-                        .font(.system(size: 18))
-                    Text("RECEIVE")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                }
-                .foregroundColor(matrixGreen)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(Color.black)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(matrixGreen, lineWidth: 2)
-                )
-                .cornerRadius(8)
             }
             .buttonStyle(PlainButtonStyle())
 
@@ -2477,22 +2485,35 @@ struct CypherpunkMainView: View {
 
     private func loadTransactionHistory() {
         isLoadingHistory = true
-        print("📜 TXHIST [S7]: loadTransactionHistory() CALLED")
+        print("📜 TXHIST [S7]: loadTransactionHistory() CALLED (forceReload=\(forceReloadFromDatabase))")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // FIX #162: Skip populateHistoryFromNotes() during FAST START repair
-                // Otherwise it would undo the balance reconciliation repair
-                let isRepairing = WalletManager.shared.isRepairingHistory
+                // FIX #462: Skip populateHistoryFromNotes() during ANY database repair
+                // FIX #457 just rebuilt the history, don't undo it by re-inserting change TXs!
+                // Check isRepairingDatabase flag, not isRepairingHistory
+                let isRepairing = WalletManager.shared.isRepairingDatabase
                 if isRepairing {
-                    print("📜 TXHIST [S7]: Skipping populateHistoryFromNotes (repair in progress)")
+                    print("📜 TXHIST [S7]: Skipping populateHistoryFromNotes (database repair in progress)")
+                } else if forceReloadFromDatabase {
+                    // FIX #462 v2: Force reload from database, don't populate (data already there)
+                    print("📜 TXHIST [S7]: Force reload requested - skipping populate, reading existing data from database")
                 } else {
-                    // ALWAYS populate from notes to ensure SENT transactions are generated
-                    // The populateHistoryFromNotes() function clears and rebuilds,
-                    // which is necessary to correctly calculate SENT entries from spent notes
-                    print("📜 TXHIST [S7]: Populating history from notes...")
-                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                    print("📜 TXHIST [S7]: Populated \(populated) entries (received + sent)")
+                    // FIX #462: Only populate if history is empty (first load after app restart)
+                    // This prevents re-inserting change TXs that were just filtered out
+                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
+                    if currentCount == 0 {
+                        print("📜 TXHIST [S7]: History empty, populating from notes...")
+                        let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                        print("📜 TXHIST [S7]: Populated \(populated) entries (received + sent)")
+                    } else {
+                        print("📜 TXHIST [S7]: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                    }
+                }
+
+                // Reset force reload flag
+                DispatchQueue.main.async {
+                    forceReloadFromDatabase = false
                 }
 
                 // Now fetch the history

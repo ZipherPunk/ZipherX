@@ -24,6 +24,7 @@ struct BalanceView: View {
     @State private var isLoadingHistory = true
     @State private var selectedTransaction: TransactionHistoryItem? = nil
     @State private var showTransactionDetail = false
+    @State private var forceReloadFromDatabase = false  // FIX #462 v2: Force reload bypassing cache
 
     // Fireworks state
     @State private var showFireworks = false
@@ -273,6 +274,14 @@ struct BalanceView: View {
             // Transaction sent - reload history immediately
             print("📜 Transaction history version changed - reloading")
             loadTransactionHistory()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
+            // FIX #462 v2: Force reload when repair completes
+            // This clears the in-memory cache and reloads from the clean database
+            print("📜 FIX #462 v2: Received transactionHistoryUpdated notification - forcing reload")
+            transactions = []  // Clear cache
+            forceReloadFromDatabase = true  // Set flag to bypass empty check
+            loadTransactionHistory()  // Reload from database
         }
         .onChange(of: walletManager.pendingBalance) { newPendingBalance in
             // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
@@ -814,22 +823,35 @@ struct BalanceView: View {
 
     private func loadTransactionHistory() {
         isLoadingHistory = true
-        print("📜 TXHIST: loadTransactionHistory() CALLED")
+        print("📜 TXHIST: loadTransactionHistory() CALLED (forceReload=\(forceReloadFromDatabase))")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // FIX #162: Skip populateHistoryFromNotes() during FAST START repair
-                // Otherwise it would undo the balance reconciliation repair
-                let isRepairing = WalletManager.shared.isRepairingHistory
+                // FIX #462: Skip populateHistoryFromNotes() during ANY database repair
+                // FIX #457 just rebuilt the history, don't undo it by re-inserting change TXs!
+                // Check isRepairingDatabase flag, not isRepairingHistory
+                let isRepairing = WalletManager.shared.isRepairingDatabase
                 if isRepairing {
-                    print("📜 TXHIST: Skipping populateHistoryFromNotes (repair in progress)")
+                    print("📜 TXHIST: Skipping populateHistoryFromNotes (database repair in progress)")
+                } else if forceReloadFromDatabase {
+                    // FIX #462 v2: Force reload from database, don't populate (data already there)
+                    print("📜 TXHIST: Force reload requested - skipping populate, reading existing data from database")
                 } else {
-                    // ALWAYS populate from notes to ensure SENT transactions are generated
-                    // The populateHistoryFromNotes() function clears and rebuilds,
-                    // which is necessary to correctly calculate SENT entries from spent notes
-                    print("📜 TXHIST: Populating history from notes...")
-                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                    print("📜 TXHIST: Populate result: \(populated) entries (received + sent)")
+                    // FIX #462: Only populate if history is empty (first load after app restart)
+                    // This prevents re-inserting change TXs that were just filtered out
+                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
+                    if currentCount == 0 {
+                        print("📜 TXHIST: History empty, populating from notes...")
+                        let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                        print("📜 TXHIST: Populated \(populated) entries (received + sent)")
+                    } else {
+                        print("📜 TXHIST: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                    }
+                }
+
+                // Reset force reload flag
+                DispatchQueue.main.async {
+                    forceReloadFromDatabase = false
                 }
 
                 // Now fetch the history
@@ -942,17 +964,16 @@ struct BalanceView: View {
                         .font(theme.captionFont)
                         .foregroundColor(theme.errorColor)
                     Spacer()
-                } else if networkManager.chainHeight > 0 && networkManager.walletHeight >= networkManager.chainHeight {
-                    // Blockchain is synced - check if we need to blink (syncing in progress)
-                    let isSyncing = walletManager.isSyncing
+                } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 &&
+                          networkManager.walletHeight + 5 >= networkManager.chainHeight {
+                    // FIX #286 v6: Consider "Synced" if within 5 blocks (background sync in progress)
+                    // This prevents flickering "Waiting to sync" when new blocks arrive
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(theme.successColor)
                         .font(.system(size: 10))
-                        .opacity(isSyncing ? (syncedTextVisible ? 1.0 : 0.3) : 1.0)
                     Text("Synced")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
-                        .opacity(isSyncing ? (syncedTextVisible ? 1.0 : 0.3) : 1.0)
                     Spacer()
                 } else {
                     Image(systemName: "clock")
@@ -1129,23 +1150,29 @@ struct BalanceView: View {
     /// MATRIX NEON GREEN color
     private var matrixGreen: Color { Color(red: 0.0, green: 1.0, blue: 0.0) }
 
-    /// FIX #266: Blockchain sync status emoji
+    /// FIX #266 + FIX #286 v6: Blockchain sync status emoji
+    /// Uses walletHeight/chainHeight comparison instead of syncProgress
     private var syncStatusEmoji: some View {
         Group {
-            if walletManager.syncProgress >= 1.0 {
-                // Fully synced - green checkmark
-                Text("✅")
-                    .font(.system(size: 14))
-            } else if walletManager.syncProgress > 0 {
-                // Syncing in progress
+            if walletManager.isSyncing {
+                // Initial sync in progress
                 Text("⏳")
                     .font(.system(size: 14))
             } else if !networkManager.isConnected {
                 // Not connected - warning
                 Text("⚠️")
                     .font(.system(size: 14))
+            } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 &&
+                      networkManager.walletHeight + 5 >= networkManager.chainHeight {
+                // FIX #286 v6: Synced if within 5 blocks of chain tip
+                Text("✅")
+                    .font(.system(size: 14))
+            } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 {
+                // Background sync in progress (more than 5 blocks behind)
+                Text("🔄")
+                    .font(.system(size: 14))
             } else {
-                // Connected but not syncing yet
+                // Waiting for heights to be populated
                 Text("🔄")
                     .font(.system(size: 14))
             }

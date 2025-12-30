@@ -1252,7 +1252,7 @@ struct WalletSetupView: View {
             // }
 
             // P2P fallback: use NetworkManager chain height
-            let p2pHeight = await NetworkManager.shared.chainHeight
+            let p2pHeight = await MainActor.run { NetworkManager.shared.chainHeight }
             if p2pHeight > 0 {
                 await MainActor.run {
                     currentBlockHeight = p2pHeight

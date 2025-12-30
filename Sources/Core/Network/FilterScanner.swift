@@ -942,12 +942,12 @@ final class FilterScanner {
                 print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
             }
 
-            // FIX #383: Stop block listeners BEFORE header sync to prevent race condition
-            // Block listeners consume "headers" responses, causing header sync to timeout!
-            // After sync completes, we'll resume block listeners.
-            print("🛑 FIX #383: Stopping block listeners before header sync (prevents response consumption)...")
+            // FIX #462: ALWAYS stop block listeners during header sync
+            // Block listeners consume "headers" responses, causing sync failures
+            // Even small syncs (100-600 headers) need listeners stopped
+            print("🛑 FIX #462: Stopping block listeners before header sync...")
             await PeerManager.shared.stopAllBlockListeners()
-            print("🛑 FIX #383: Block listeners stopped, starting header sync...")
+            print("🛑 FIX #462: Block listeners stopped, starting header sync...")
 
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
                 let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
@@ -981,6 +981,13 @@ final class FilterScanner {
                     headerStore: HeaderStore.shared,
                     networkManager: networkManager
                 )
+
+                // FIX #464: Report header sync progress
+                headerSyncManager.onProgress = { [weak self] progress in
+                    Task { @MainActor in
+                        self?.onProgress?(Double(progress.currentHeight) / Double(max(progress.totalHeight, 1)), progress.currentHeight, progress.totalHeight)
+                    }
+                }
 
                 do {
                     // FIX #411: REMOVED limit - sync ALL missing headers
@@ -2262,8 +2269,9 @@ final class FilterScanner {
 
         // Store all notes in database
         for note in result.notes {
-            // Create a pseudo-txid for bundled outputs (grouped by height)
-            let txidData = "boost_\(note.height)".data(using: .utf8) ?? Data()
+            // FIX #461: Use REAL txid from boost file instead of creating placeholder!
+            // The boost file contains the actual transaction ID that created this output
+            let txidData = note.receivedTxid  // Real txid - no more placeholders!
 
             // Add to known nullifiers for future spend detection
             // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
@@ -2283,7 +2291,7 @@ final class FilterScanner {
                 cmu: note.cmu
             )
 
-            // Record in transaction history
+            // Record in transaction history with REAL txid
             try? database.recordReceivedTransaction(
                 txid: txidData,
                 height: UInt64(note.height),

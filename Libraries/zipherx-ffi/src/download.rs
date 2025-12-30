@@ -20,10 +20,15 @@ static CLIENT: OnceLock<Client> = OnceLock::new();
 
 fn get_client() -> &'static Client {
     CLIENT.get_or_init(|| {
+        // FIX #463: More aggressive TCP configuration for faster network change detection
+        // - Shorter keepalive (10s) to detect broken connections faster on network change
+        // - pool_max_idle_per_host(0) = don't keep stale connections across network changes
+        // - connect_timeout for faster initial connection
         Client::builder()
-            .timeout(std::time::Duration::from_secs(3600)) // 1 hour total
-            .pool_max_idle_per_host(4) // Keep connections alive
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(3600)) // 1 hour total timeout
+            .connect_timeout(std::time::Duration::from_secs(10)) // FIX #463: Faster connection timeout
+            .pool_max_idle_per_host(0) // FIX #463: Don't reuse connections across network changes
+            .tcp_keepalive(std::time::Duration::from_secs(10)) // FIX #463: Detect dead connections faster
             .build()
             .expect("Failed to create HTTP client")
     })
@@ -66,9 +71,10 @@ pub extern "C" fn zipherx_download_cancel() {
 }
 
 /// Reset download state
+/// NOTE: Don't reset DOWNLOAD_TOTAL to 0 - keep old value to prevent progress bar flicker
 fn reset_download_state() {
     DOWNLOAD_BYTES.store(0, Ordering::Relaxed);
-    DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);
+    // DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);  // DON'T reset - will be set to expected_size immediately after
     DOWNLOAD_SPEED.store(0, Ordering::Relaxed);
     DOWNLOAD_CANCELLED.store(false, Ordering::Relaxed);
 }
@@ -146,8 +152,10 @@ async fn download_file_async(
     resume_from: u64,
     expected_size: u64,
 ) -> Result<(), DownloadError> {
-    const STALL_TIMEOUT_SECS: u64 = 30;
-    const MAX_RETRIES: u32 = 3;
+    // FIX #463: Reduced stall timeout for faster network change detection
+    // 30 seconds is too long when WiFi/network changes - 5 seconds is enough
+    const STALL_TIMEOUT_SECS: u64 = 5;
+    const MAX_RETRIES: u32 = 5;  // More retries for better recovery
 
     // FIX #345: Use static client for HTTP/2 connection reuse
     let client = get_client();
@@ -171,6 +179,12 @@ async fn download_file_async(
             request = request.header("Range", format!("bytes={}-", current_size));
         }
 
+        // FIX #457 v4: Set DOWNLOAD_TOTAL to expected_size IMMEDIATELY
+        // This allows progress bar to show from 0% even before HTTP response arrives
+        // GitHub can take 30+ seconds to respond, so we show progress based on expected size
+        DOWNLOAD_TOTAL.store(expected_size, Ordering::Relaxed);
+        DOWNLOAD_BYTES.store(current_size, Ordering::Relaxed);
+
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -178,7 +192,8 @@ async fn download_file_async(
                 if retry_count > MAX_RETRIES {
                     return Err(DownloadError::Network(format!("Failed after {} retries: {}", MAX_RETRIES, e)));
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // FIX #463: Shorter retry delay for faster network change recovery
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
@@ -190,7 +205,8 @@ async fn download_file_async(
             if retry_count > MAX_RETRIES {
                 return Err(DownloadError::Network(format!("HTTP error: {}", status)));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // FIX #463: Shorter retry delay for faster network change recovery
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
 
@@ -206,7 +222,14 @@ async fn download_file_async(
             response.content_length().unwrap_or(expected_size)
         };
 
-        DOWNLOAD_TOTAL.store(total_size, Ordering::Relaxed);
+        // FIX #457 v6: Only set DOWNLOAD_TOTAL if HTTP response provides valid size
+        // Don't overwrite the expected_size we set earlier - it's already correct!
+        // If expected_size > 0 and total_size is smaller, HTTP response is wrong, use expected_size
+        if total_size == 0 || (expected_size > 0 && total_size < expected_size) {
+            DOWNLOAD_TOTAL.store(expected_size, Ordering::Relaxed);
+        } else {
+            DOWNLOAD_TOTAL.store(total_size, Ordering::Relaxed);
+        }
 
         // FIX #345: Open file with async I/O and large buffer (8MB) for maximum throughput
         let file = if current_size > 0 && Path::new(dest_path).exists() {
@@ -294,7 +317,8 @@ async fn download_file_async(
             ));
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // FIX #463: Shorter retry delay for faster network change recovery
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 

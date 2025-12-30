@@ -579,12 +579,15 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
 
     drop(client_storage); // Release the lock before async operations
 
-    // FIX #209: Ensure keystore directories exist for persistent keypairs
-    // Arti stores keys in state_dir/keys - create it if needed
+    // FIX #430: Ensure keystore directories exist with proper structure for persistent keypairs
+    // Arti's keystore for hidden services needs specific subdirectory structure:
+    //   state_dir/keys/hs_id/<nickname>/
+    // Without this, launch_onion_service_with_hsid fails with "Error while trying to access a key store"
     let data_dir = get_tor_data_dir();
     let keys_dir = data_dir.join("state").join("keys");
-    let _ = std::fs::create_dir_all(&keys_dir);
-    eprintln!("🧅 Keystore directory: {:?}", keys_dir);
+    let hs_keys_dir = keys_dir.join("hs_id").join("zipherx");
+    let _ = std::fs::create_dir_all(&hs_keys_dir);
+    eprintln!("🧅 FIX #430: Keystore directory: {:?}", hs_keys_dir);
 
     // Build hidden service configuration
     // The service will listen for rendezvous requests
@@ -644,8 +647,10 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
                 return Err("Hidden service returned None (with keypair)".into());
             }
             Err(e) => {
-                // FIX #209: Keystore access failed - fall back to random address
-                eprintln!("🧅 FIX #209: Persistent keypair failed ({}), falling back to random address", e);
+                // FIX #430: Keystore access failed - fall back to random address
+                // This is a known Arti limitation with experimental-api keystore on iOS/macOS
+                // The hidden service still works, just with a new random address each launch
+                eprintln!("🧅 FIX #430: Persistent keypair not available (Arti keystore limitation), using random address");
                 let (svc, rend) = client.launch_onion_service(config)?
                     .ok_or("Hidden service returned None (fallback)")?;
                 (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)

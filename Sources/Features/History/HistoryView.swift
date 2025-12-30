@@ -171,18 +171,24 @@ struct HistoryView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // FIX #162: Skip populateHistoryFromNotes() during FAST START repair
-                // Otherwise it would undo the balance reconciliation repair
-                let isRepairing = WalletManager.shared.isRepairingHistory
+                // FIX #462: Skip populateHistoryFromNotes() during ANY database repair
+                // FIX #457 just rebuilt the history, don't undo it by re-inserting change TXs!
+                // Check isRepairingDatabase flag, not isRepairingHistory
+                let isRepairing = WalletManager.shared.isRepairingDatabase
                 if isRepairing {
-                    print("📜 HistoryView: Skipping populateHistoryFromNotes (repair in progress)")
+                    print("📜 HistoryView: Skipping populateHistoryFromNotes (database repair in progress)")
                 } else {
-                    // ALWAYS populate from notes to ensure SENT transactions are generated
-                    // The populateHistoryFromNotes() function clears and rebuilds,
-                    // which is necessary to correctly calculate SENT entries from spent notes
-                    let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                    if populatedCount > 0 {
-                        print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
+                    // FIX #462: Only populate if history is empty (first load after app restart)
+                    // This prevents re-inserting change TXs that were just filtered out
+                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
+                    if currentCount == 0 {
+                        print("📜 HistoryView: History empty, populating from notes...")
+                        let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                        if populatedCount > 0 {
+                            print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
+                        }
+                    } else {
+                        print("📜 HistoryView: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
                     }
                 }
 

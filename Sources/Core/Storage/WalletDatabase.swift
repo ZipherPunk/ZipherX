@@ -2731,12 +2731,18 @@ final class WalletDatabase {
             throw DatabaseError.notOpened
         }
 
-        // 626F6F7374 = hex for "boost"
+        // FIX #459: Compare actual bytes, not hex strings
+        // Boost placeholders can be:
+        // - "boost_spent_HEIGHT" (0x626F6F7374...) - full format
+        // - "boos_HEIGHT" (0x626F6F735f...) - truncated format with underscore
         let sql = """
             SELECT nf, spent_height FROM notes
             WHERE is_spent = 1
-            AND hex(spent_in_tx) LIKE '626F6F7374%'
-            AND spent_height IS NOT NULL;
+            AND spent_height IS NOT NULL
+            AND (
+                substr(spent_in_tx, 1, 5) = X'626F6F7374'  -- "boost"
+                OR substr(spent_in_tx, 1, 5) = X'626F6F735F'  -- "boos_" (truncated)
+            );
         """
 
         var stmt: OpaquePointer?
@@ -2756,6 +2762,66 @@ final class WalletDatabase {
         }
 
         return results
+    }
+
+    /// FIX #461: Get notes with boost placeholder txids in received_in_tx
+    /// Returns: [(rowid, hashedNullifier, height)]
+    func getNotesWithReceivedPlaceholderTxids() throws -> [(Int64, Data, UInt64)] {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        let sql = """
+            SELECT rowid, nf, height FROM notes
+            WHERE (
+                substr(received_in_tx, 1, 5) = X'626F6F7374'  -- "boost"
+                OR substr(received_in_tx, 1, 5) = X'626F6F735F'  -- "boos_" (truncated)
+            );
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [(Int64, Data, UInt64)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(stmt, 0)
+            guard let nfPtr = sqlite3_column_blob(stmt, 1) else { continue }
+            let nfLen = sqlite3_column_bytes(stmt, 1)
+            let hashedNullifier = Data(bytes: nfPtr, count: Int(nfLen))
+            let height = UInt64(sqlite3_column_int64(stmt, 2))
+
+            results.append((rowid, hashedNullifier, height))
+        }
+
+        return results
+    }
+
+    /// FIX #461: Update a note's received_in_tx with the real transaction ID
+    func updateNoteReceivedTxid(rowid: Int64, realTxid: Data) throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        let sql = "UPDATE notes SET received_in_tx = ? WHERE rowid = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_bind_blob(stmt, 1, (realTxid as NSData).bytes, 32, nil) == SQLITE_OK else {
+            throw DatabaseError.updateFailed("Failed to bind txid")
+        }
+        guard sqlite3_bind_int64(stmt, 2, rowid) == SQLITE_OK else {
+            throw DatabaseError.updateFailed("Failed to bind rowid")
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
     }
 
     /// FIX #371: Update a note's spent_in_tx with the real transaction ID
@@ -2778,6 +2844,67 @@ final class WalletDatabase {
         }
         hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// FIX #466: Get unspent notes with boost placeholder received_in_tx that need resolution
+    /// Returns: [(cmu, receivedHeight)] - cmu is used to match transaction outputs
+    func getUnspentNotesWithBoostReceivedTxid() throws -> [(Data, UInt64)] {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        // 626F6F7374 = hex for "boost"
+        let sql = """
+            SELECT cmu, received_height FROM notes
+            WHERE is_spent = 0
+            AND hex(received_in_tx) LIKE '626F6F7374%'
+            AND received_height IS NOT NULL;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [(Data, UInt64)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let cmuPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let cmuLen = sqlite3_column_bytes(stmt, 0)
+            let cmu = Data(bytes: cmuPtr, count: Int(cmuLen))
+            let receivedHeight = UInt64(sqlite3_column_int64(stmt, 1))
+
+            results.append((cmu, receivedHeight))
+        }
+
+        return results
+    }
+
+    /// FIX #466: Update a note's received_in_tx with the real transaction ID
+    /// Uses cmu (commitment) for lookup since it's unique per note
+    func updateNoteReceivedTxid(cmu: Data, realTxid: Data) throws {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        let sql = "UPDATE notes SET received_in_tx = ? WHERE cmu = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        realTxid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(realTxid.count), nil)
+        }
+        cmu.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(cmu.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -2944,13 +3071,15 @@ final class WalletDatabase {
         for spentTx in spentTxs {
             // FIX #295: Look for change outputs by TXID, not height
             // Change notes are in the SAME transaction (received_in_tx == spentTx.txid)
-            // Old method using height was fragile - other unrelated notes at same height were counted
+            // FIX #450 v5: BUT with boost placeholders, need height-based fallback!
             let changeSql = """
                 SELECT COALESCE(SUM(value), 0) FROM notes
                 WHERE received_in_tx = ?;
             """
-            var changeStmt: OpaquePointer?
             var changeAmount: UInt64 = 0
+
+            // First try txid match (works for real txids)
+            var changeStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
                 spentTx.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(changeStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
@@ -2961,14 +3090,40 @@ final class WalletDatabase {
                 sqlite3_finalize(changeStmt)
             }
 
-            // Sent amount = inputs - change - fee
-            // If totalInput < change + fee, something is wrong, skip
-            guard spentTx.totalInput > changeAmount + defaultFee else {
-                print("🔧 FIX #162: Skipping tx with totalInput \(spentTx.totalInput) <= change \(changeAmount) + fee \(defaultFee)")
+            // FIX #450 v5: If no change found by txid (boost placeholder case), try height match
+            if changeAmount == 0 {
+                // Look for notes received at same height that are NOT spent (these are change outputs)
+                let changeByHeightSql = """
+                    SELECT COALESCE(SUM(value), 0) FROM notes
+                    WHERE received_height = ? AND is_spent = 0;
+                """
+                if sqlite3_prepare_v2(db, changeByHeightSql, -1, &changeStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(changeStmt, 1, Int64(spentTx.height))
+                    if sqlite3_step(changeStmt) == SQLITE_ROW {
+                        let heightBasedChange = UInt64(sqlite3_column_int64(changeStmt, 0))
+                        // Only use height-based change if it makes sense (change < input)
+                        if heightBasedChange > 0 && heightBasedChange < spentTx.totalInput {
+                            changeAmount = heightBasedChange
+                            print("🔧 FIX #450 v5: Using height-based change detection for tx at height \(spentTx.height): \(changeAmount) zatoshis")
+                        }
+                    }
+                    sqlite3_finalize(changeStmt)
+                }
+            }
+
+            // FIX #450 v6: Sent amount = inputs - change (includes fee!)
+            // The fee is PART of the sent amount - it's money that left the wallet
+            // Example: Send 0.1 ZCL + 0.0001 fee = 0.1001 total sent
+            // If totalInput < change, something is wrong, skip
+            guard spentTx.totalInput > changeAmount else {
+                print("🔧 FIX #162: Skipping tx with totalInput \(spentTx.totalInput) <= change \(changeAmount)")
                 continue
             }
 
-            let sentAmount = spentTx.totalInput - changeAmount - defaultFee
+            // Sent amount includes the fee (total that left the wallet)
+            let sentAmount = spentTx.totalInput - changeAmount  // Includes fee!
+            // fee is still stored separately for display purposes
+            let actualFee = defaultFee
 
             spentTx.txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertSentStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
@@ -2988,11 +3143,11 @@ final class WalletDatabase {
             sqlite3_bind_text(insertSentStmt, 4, sentType, -1, SQLITE_TRANSIENT)
 
             sqlite3_bind_int64(insertSentStmt, 5, Int64(sentAmount))
-            sqlite3_bind_int64(insertSentStmt, 6, Int64(defaultFee))
+            sqlite3_bind_int64(insertSentStmt, 6, Int64(actualFee))
 
             if sqlite3_step(insertSentStmt) == SQLITE_DONE {
                 sentCount += 1
-                print("🔧 FIX #162: Added SENT tx at height \(spentTx.height): \(sentAmount) zatoshis (input: \(spentTx.totalInput), change: \(changeAmount), fee: \(defaultFee))")
+                print("🔧 FIX #450 v6: Added SENT tx at height \(spentTx.height): \(sentAmount) zatoshis (input: \(spentTx.totalInput), change: \(changeAmount), fee: \(actualFee), to_recipient: \(sentAmount - actualFee))")
             }
             sqlite3_reset(insertSentStmt)
         }
@@ -3478,6 +3633,7 @@ final class WalletDatabase {
 
         // Check total count (excluding change outputs for accurate count)
         // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
+        // FIX #450 v4: Filter β entries where there's an α entry at same block height (self-send change)
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
@@ -3485,7 +3641,8 @@ final class WalletDatabase {
                 t1.tx_type IN ('received', 'β')
                 AND EXISTS (
                     SELECT 1 FROM transaction_history t2
-                    WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
+                    WHERE t2.block_height = t1.block_height
+                    AND t2.tx_type IN ('sent', 'α')
                 )
             );
         """
@@ -3500,9 +3657,11 @@ final class WalletDatabase {
 
         // Exclude change outputs and deduplicate:
         // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
-        // 2. Also exclude received transactions where the same txid exists as sent
-        // 3. Use subquery with DISTINCT to deduplicate BEFORE ordering
-        // NOTE: GROUP BY can cause unpredictable order - use DISTINCT on dedup key instead
+        // 2. Filter out β entries where there's an α entry at SAME block height (self-send change)
+        // 3. Keep β entries where there's NO α entry at same height (genuine received)
+        // 4. Use subquery with DISTINCT to deduplicate BEFORE ordering
+        // FIX #450 v4: Distinguish self-send change from genuine received by checking
+        // if there's a sent (α) entry at the same block height
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
@@ -3510,8 +3669,10 @@ final class WalletDatabase {
             AND NOT (
                 t1.tx_type IN ('received', 'β')
                 AND EXISTS (
+                    -- Filter β entries where there's an α entry at SAME block height (self-send change)
                     SELECT 1 FROM transaction_history t2
-                    WHERE t2.txid = t1.txid AND t2.tx_type IN ('sent', 'α')
+                    WHERE t2.block_height = t1.block_height
+                    AND t2.tx_type IN ('sent', 'α')
                 )
             )
             AND t1.rowid IN (
@@ -3795,6 +3956,24 @@ final class WalletDatabase {
             // amountToRecipient = balance impact - fee (for display info)
             let amountToRecipient = totalBalanceImpact - fee
 
+            // FIX #464 v4: Skip SENT transactions where amountToRecipient is 0 or very small
+            // These are internal transactions (change consolidation, self-sends) that shouldn't appear in history
+            // If amountToRecipient <= 1000 zatoshis (0.00001 ZCL), it's essentially a change-only transaction
+            if amountToRecipient <= 1000 {
+                print("📜 FIX #464 v4: Skipping SENT txid=\(spentTxid.prefix(8).hexString)... - amountToRecipient=\(amountToRecipient) (change-only/self-send transaction)")
+                continue
+            }
+
+            // FIX #465: Skip PROBABLE SELF-CHANGE transactions (ZipherX internal only)
+            // If toRecipient is >95% of input, it's likely a self-change transaction (not a real send)
+            // These happen when change outputs haven't been scanned into ZipherX notes table yet
+            let recipientRatio = Double(amountToRecipient) / Double(txInfo.inputValue)
+            if recipientRatio > 0.95 && totalChangeValue == 0 {
+                let txidDesc = String(bytes: spentTxid.prefix(8), encoding: .ascii) ?? spentTxid.prefix(8).hexString
+                print("📜 FIX #465: Skipping SENT txid=\(txidDesc)... - likely self-change (recipientRatio=\(String(format: "%.1f%%", recipientRatio * 100)))")
+                continue
+            }
+
             print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
 
             var spentStmt: OpaquePointer?
@@ -3846,34 +4025,60 @@ final class WalletDatabase {
             sqlite3_finalize(spentStmt)
         }
 
-        // FIX #441: Build a set of spent heights for height-based change detection
-        // Boost file notes have mismatched txids:
-        // - received_in_tx = "boost_2943239" (placeholder)
-        // - spent_in_tx = "B6D7A3..." (real txid from blockchain)
-        // So we need to detect change by HEIGHT when txid contains "boost_"
-        var spentHeights: Set<UInt64> = []
+        // PASS 2: Insert RECEIVED transactions only (skip CHANGE outputs)
+        // FIX #460: Change outputs are filtered out in display, no need to insert them
+        // This reduces database size and prevents confusion
+
+        // FIX #464 v3: Following Zclassic's IsNoteSaplingChange logic from wallet.cpp:
+        // "A Note is marked as 'change' if the address that received it also spent
+        //  Notes in the same transaction."
+        //
+        // Build two maps:
+        // 1. txHasOurSpends: Transactions (by txid) where we spent notes
+        // 2. heightHasOurSpends: Block heights where we spent notes
+        var txHasOurSpends: Set<Data> = []
+        var heightHasOurSpends: Set<UInt64> = []
         for note in allNotes where note.isSpent {
-            if let height = note.spentHeight {
-                spentHeights.insert(height)
+            if let spentTxid = note.spentTxid {
+                txHasOurSpends.insert(spentTxid)
+            }
+            if let spentHeight = note.spentHeight {
+                heightHasOurSpends.insert(spentHeight)
             }
         }
+        print("📜 FIX #464 v3: Found \(txHasOurSpends.count) txids + \(heightHasOurSpends.count) heights where we spent notes (Zclassic logic)")
 
-        // PASS 2: Insert RECEIVED and CHANGE transactions for each note
         for note in allNotes {
             // Determine if this is a CHANGE output (received in a tx that we initiated)
             // Method 1: Direct txid match (works for real transactions recorded by WalletManager)
             var isChange = sentTxids.contains(note.txid)
 
-            // FIX #441: Method 2: Height-based match for boost file placeholders
-            // If received_in_tx starts with "boost_", check if received_height matches any spent_height
-            if !isChange && note.txid.starts(with: Data("boost_".utf8)) {
-                isChange = spentHeights.contains(note.receivedHeight)
-                if isChange {
-                    print("📜 FIX #441: Detected change via height match at \(note.receivedHeight)")
-                }
+            // FIX #464 v3: Following Zclassic's IsNoteSaplingChange:
+            // A note is CHANGE if received_in_tx (note.txid) is a transaction where we spent notes
+            // This works because when we send, we create: spends + recipient output + change output
+            // All in the SAME transaction, so change outputs have txid in txHasOurSpends
+            if !isChange && txHasOurSpends.contains(note.txid) {
+                isChange = true
+                let txidDesc = String(bytes: note.txid.prefix(8), encoding: .ascii) ?? note.txid.prefix(8).hexString
+                print("📜 FIX #464 v3: Detected change by txid (Zclassic logic): txid=\(txidDesc)")
             }
 
-            let txType = isChange ? TransactionType.change : TransactionType.received
+            // FIX #464 v3: For boost-file notes with placeholder txids, match by HEIGHT
+            // When we send a transaction, we spend notes AND receive change in the SAME block
+            // So if this note was received at a height where we spent, it's CHANGE
+            if !isChange && heightHasOurSpends.contains(note.receivedHeight) {
+                isChange = true
+                print("📜 FIX #464 v3: Detected change by height (boost-file logic): receivedHeight=\(note.receivedHeight)")
+            }
+
+            // FIX #460: Skip inserting change transactions - they're filtered in display anyway
+            if isChange {
+                let txidDesc = String(bytes: note.txid.prefix(8), encoding: .ascii) ?? note.txid.prefix(8).hexString
+                print("📜 FIX #464: Skipping change txid=\(txidDesc) at height \(note.receivedHeight)")
+                continue
+            }
+
+            let txType = TransactionType.received  // Only received after filtering change
 
             var insertStmt: OpaquePointer?
             // Use insertReceivedSql (INSERT OR REPLACE) - notes are the source of truth for received
@@ -4889,14 +5094,16 @@ struct TransactionHistoryItem {
 
     /// Transaction ID as hex string for display
     var txidString: String {
-        // txid is already stored in display format (big-endian), no reversal needed
-        txid.map { String(format: "%02x", $0) }.joined()
+        // FIX #465: txid is stored in little-endian format, reverse to big-endian for display
+        // This matches how block explorers and zclassic-cli display txids
+        txid.reversed().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Unique identifier for ForEach - uses txid prefix + type + height + value
     /// All components needed to distinguish transactions in the same block
     var uniqueId: String {
-        let txidPrefix = txid.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // FIX #465: Reverse txid prefix for display consistency
+        let txidPrefix = txid.prefix(8).reversed().map { String(format: "%02x", $0) }.joined()
         return "\(txidPrefix)_\(type.rawValue)_\(height)_\(value)"
     }
 

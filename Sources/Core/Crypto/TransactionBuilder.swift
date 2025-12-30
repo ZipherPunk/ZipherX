@@ -131,12 +131,11 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // Get current chain height (use cached first to avoid network delay)
-        var chainHeight = NetworkManager.shared.chainHeight
-        if chainHeight == 0 {
-            chainHeight = try await NetworkManager.shared.getChainHeight()
-        }
-        print("📊 Current chain height: \(chainHeight)")
+        // FIX #376: Always fetch FRESH peer consensus height
+        // Cached chainHeight can be stale when HeaderStore is behind
+        let cachedChainHeightFallback = await MainActor.run { NetworkManager.shared.chainHeight }
+        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? cachedChainHeightFallback
+        print("📊 FIX #376: Chain height (peer consensus): \(chainHeight)")
 
         // Get notes from database - requires valid witnesses
         var dbNotes = try database.getUnspentNotes(accountId: account.id)
@@ -456,11 +455,12 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // Use cached chain height first to avoid network delay
-        var chainHeight = NetworkManager.shared.chainHeight
-        if chainHeight == 0 {
-            chainHeight = try await NetworkManager.shared.getChainHeight()
-        }
+        // FIX #376: Always fetch FRESH peer consensus height
+        // Cached chainHeight can be stale when HeaderStore is behind
+        let cachedChainHeightFallback = await MainActor.run { NetworkManager.shared.chainHeight }
+        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? cachedChainHeightFallback
+        print("📊 FIX #376: Chain height (peer consensus): \(chainHeight)")
+
         var dbNotes = try database.getUnspentNotes(accountId: account.id)
 
         if dbNotes.isEmpty {
@@ -1008,18 +1008,25 @@ final class TransactionBuilder {
 
         print("📝 Database returned \(dbNotes.count) unspent notes")
 
-        // Get current chain height for confirmation calculation
-        var chainHeight = NetworkManager.shared.chainHeight
+        // FIX #376: ALWAYS fetch FRESH peer consensus height for confirmation calculation
+        // Bug: Cached chainHeight can be stale (e.g., HeaderStore height when 12k blocks behind)
+        // This caused notes at height 2950293 to show 0 confirmations when chain was at 2952xxx
+        // because cached chainHeight was 2940620 (HeaderStore)
+        var chainHeight: UInt64 = 0
 
-        // If chain height is 0, fetch it now
-        if chainHeight == 0 {
-            print("📝 Chain height not set, fetching now...")
-            if let height = try? await NetworkManager.shared.getChainHeight() {
-                chainHeight = height
-                print("📝 Fetched chain height: \(chainHeight)")
-            } else {
-                print("⚠️ Failed to get chain height, using 2920000 as fallback")
-                chainHeight = 2920000
+        print("📝 FIX #376: Fetching FRESH peer consensus height for confirmations...")
+        if let height = try? await NetworkManager.shared.getChainHeight() {
+            chainHeight = height
+            print("📝 FIX #376: Peer consensus height: \(chainHeight)")
+        } else {
+            // Fallback to cached if peer fetch fails
+            chainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
+            print("⚠️ FIX #376: Using cached height: \(chainHeight)")
+
+            // If still 0, use safe fallback
+            if chainHeight == 0 {
+                chainHeight = 2940000
+                print("⚠️ FIX #376: Using fallback height: \(chainHeight)")
             }
         }
 
@@ -1518,7 +1525,7 @@ final class TransactionBuilder {
 
         // PRIORITY 2: Try P2P (especially important for Tor mode)
         // Try multiple peers before giving up
-        let connectedPeers = networkManager.getAllConnectedPeers()
+        let connectedPeers = await MainActor.run { networkManager.getAllConnectedPeers() }
         if !connectedPeers.isEmpty {
             print("📡 Fetching delta CMUs via P2P (blocks \(startHeight)-\(endHeight))...")
             let blockCount = Int(endHeight - startHeight + 1)

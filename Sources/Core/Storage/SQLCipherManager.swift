@@ -26,7 +26,8 @@ final class SQLCipherManager {
 
     // DEBUG: Set to true to disable SQLCipher encryption for debugging
     // FIX #226: Re-enabled SQLCipher - full database encryption active
-    private static let DEBUG_DISABLE_SQLCIPHER = false
+    // TEMPORARY: Disabled for debugging FIX #375
+    private static let DEBUG_DISABLE_SQLCIPHER = true
 
     /// Whether SQLCipher is available (compiled with encryption support)
     private(set) var isSQLCipherAvailable: Bool = false

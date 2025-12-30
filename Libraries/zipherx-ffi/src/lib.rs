@@ -3074,21 +3074,25 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
             Err(_) => return 0,
         };
 
-        if tree.append(node.clone()).is_err() {
-            return 0;
-        }
-
-        // Check if this CMU is a target
+        // FIX #458: Check if this CMU is a target BEFORE appending
+        // The witness must be created BEFORE the CMU is added to the tree,
+        // so the witness is positioned at the leaf that will contain this CMU
         if !target_map.is_empty() {
             let mut cmu = [0u8; 32];
             cmu.copy_from_slice(cmu_bytes);
             if let Some(&orig_idx) = target_map.get(&cmu) {
-                // Capture witness at this position
+                // CRITICAL: Create witness BEFORE appending CMU to tree!
+                // This ensures the witness path is computed from the correct position
                 let witness = IncrementalWitness::from_tree(tree.clone());
                 captured_witnesses.push((orig_idx, i, witness));
                 found_count += 1;
-                debug_log!("📍 FIX #197: Target {} found at position {}", orig_idx, i);
+                debug_log!("📍 FIX #458: Target {} found at position {}", orig_idx, i);
             }
+        }
+
+        // Now append the CMU to the tree (after creating witness if needed)
+        if tree.append(node.clone()).is_err() {
+            return 0;
         }
 
         // Report progress every 10000 CMUs
@@ -3112,6 +3116,10 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         // Get remaining CMUs as nodes for witness updates
         // captured_witnesses already have position info, update in parallel
         use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let completed = AtomicUsize::new(0);
+        let total = captured_witnesses.len();
 
         captured_witnesses.par_iter_mut().for_each(|(orig_idx, pos, witness)| {
             // This witness was created at position *pos, needs updates from pos+1 to count-1
@@ -3126,6 +3134,13 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
                 }
             }
             debug_log!("📝 FIX #197: Witness {} updated with {} CMUs", orig_idx, updates);
+
+            // FIX #464: Report progress during parallel witness updates
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            // Report progress every 10% of witnesses completed
+            if done % 10 == 0 || done == total {
+                progress_callback(done as u64, total as u64);
+            }
         });
 
         debug_log!("⏱️ FIX #197: Witness updates took {:.1}s (parallel)",
@@ -3259,15 +3274,17 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
             Err(_) => return u64::MAX,
         };
 
+        // FIX #458: Create witness BEFORE appending at target position
+        if i == target_pos {
+            witness = Some(IncrementalWitness::from_tree(tree.clone()));
+        }
+
         if tree.append(node).is_err() {
             return u64::MAX;
         }
 
-        // Create witness at target position
-        if i == target_pos {
-            witness = Some(IncrementalWitness::from_tree(tree.clone()));
-        } else if i > target_pos {
-            // Update existing witness with new nodes
+        // Update existing witness with new nodes after target position
+        if i > target_pos {
             if let Some(ref mut w) = witness {
                 w.append(node).ok();
             }
@@ -3458,18 +3475,26 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
             Err(_) => continue,
         };
 
+        // FIX #458: Check if this position matches any target BEFORE appending
+        // The witness must be created at the position BEFORE the CMU is added
+        for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
+            if let Some(pos) = pos_opt {
+                if pos == i {
+                    // Create witness at this position BEFORE appending CMU
+                    witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
+                    debug_log!("✅ FIX #458: Created witness for target {} at position {}", t_idx, i);
+                }
+            }
+        }
+
         if tree.append(node).is_err() {
             continue;
         }
 
-        // Check if this position matches any target
+        // Update existing witnesses for positions before current
         for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
             if let Some(pos) = pos_opt {
-                if pos == i {
-                    // Create witness at this position
-                    witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
-                    debug_log!("✅ Created witness for target {} at position {}", t_idx, i);
-                } else if pos < i {
+                if pos < i {
                     // Update existing witness
                     if let Some(ref mut w) = witnesses[t_idx] {
                         w.append(node).ok();
@@ -3663,24 +3688,25 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
             Err(_) => continue,
         };
 
-        if tree.append(node).is_err() {
-            continue;
-        }
-
-        // Check if this is a target CMU
+        // FIX #458: Check if this is a target CMU BEFORE appending
+        // The witness must be created BEFORE the CMU is added to the tree
         let mut cmu = [0u8; 32];
         cmu.copy_from_slice(cmu_bytes);
         if let Some(&orig_idx) = target_map.get(&cmu) {
-            // Capture witness at this position
+            // Capture witness at this position BEFORE appending CMU
             let witness = IncrementalWitness::from_tree(tree.clone());
             captured_witnesses.push((orig_idx, i, witness));
             found_count += 1;
-            debug_log!("📍 Target {} found at position {}", orig_idx, i);
+            debug_log!("📍 FIX #458: Target {} found at position {}", orig_idx, i);
 
             // Early exit if we found all targets
             if found_count == target_count {
                 debug_log!("🎯 All {} targets found, finishing tree build for witnesses", target_count);
             }
+        }
+
+        if tree.append(node).is_err() {
+            continue;
         }
     }
 

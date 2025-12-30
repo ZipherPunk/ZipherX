@@ -169,6 +169,36 @@ final class ChatManager: ObservableObject {
     /// Cached encryption key for queue (loaded from Keychain)
     private var queueEncryptionKey: SymmetricKey?
 
+    // MARK: - FIX #329: Exponential Backoff for Hidden Service Retries
+
+    /// Tracks connection failure count per contact for exponential backoff
+    /// Key: onionAddress, Value: consecutive failure count
+    private var connectionFailureCount: [String: Int] = [:]
+
+    /// Maximum backoff delay (30 seconds)
+    private let maxBackoffSeconds: Double = 30.0
+
+    /// Base backoff delay (1 second)
+    private let baseBackoffSeconds: Double = 1.0
+
+    /// Calculate backoff delay using exponential formula: min(base * 2^failures, max)
+    private func calculateBackoff(for onionAddress: String) -> Double {
+        let failures = connectionFailureCount[onionAddress] ?? 0
+        let delay = baseBackoffSeconds * pow(2.0, Double(failures))
+        return min(delay, maxBackoffSeconds)
+    }
+
+    /// Record a connection failure for backoff calculation
+    private func recordConnectionFailure(for onionAddress: String) {
+        let current = connectionFailureCount[onionAddress] ?? 0
+        connectionFailureCount[onionAddress] = min(current + 1, 5) // Cap at 5 (32 second max)
+    }
+
+    /// Reset failure count on successful connection
+    private func resetConnectionFailure(for onionAddress: String) {
+        connectionFailureCount.removeValue(forKey: onionAddress)
+    }
+
     // MARK: - Initialization
 
     private init() {
@@ -296,6 +326,39 @@ final class ChatManager: ObservableObject {
             return
         }
 
+        // ==========================================================================
+        // FIX #330: Circuit health check before operations
+        // Verify Tor circuit is established before attempting .onion connection
+        // This prevents wasted connection attempts during circuit warmup
+        // ==========================================================================
+        let torManager = await TorManager.shared
+        let isCircuitReady = await torManager.isOnionCircuitsReady
+        let warmupRemaining = await torManager.onionCircuitWarmupRemaining
+
+        if !isCircuitReady {
+            // Option 1: Wait for warmup if it's short (< 15 seconds)
+            if warmupRemaining > 0 && warmupRemaining <= 15 {
+                print("💬 FIX #330: Waiting \(String(format: "%.0f", warmupRemaining))s for Tor circuit warmup...")
+                try await Task.sleep(nanoseconds: UInt64(warmupRemaining * 1_000_000_000) + 1_000_000_000) // +1s safety
+            } else if warmupRemaining > 15 {
+                // Option 2: If warmup is long, throw informative error
+                print("💬 FIX #330: Tor circuit not ready - \(String(format: "%.0f", warmupRemaining))s remaining")
+                throw ChatError.connectionFailed("Tor circuit warming up (\(Int(warmupRemaining))s remaining). Please wait and try again.")
+            } else {
+                // Option 3: Tor not connected at all
+                print("💬 FIX #330: Tor circuit not available")
+                throw ChatError.hiddenServiceNotRunning
+            }
+        }
+        print("💬 FIX #330: Tor circuit health check passed")
+
+        // FIX #329: Apply exponential backoff before retry
+        let backoff = calculateBackoff(for: contact.onionAddress)
+        if backoff > baseBackoffSeconds {
+            print("💬 FIX #329: Waiting \(String(format: "%.1f", backoff))s before retry (backoff)...")
+            try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+        }
+
         print("💬 Connecting to \(contact.displayName) via Tor...")
 
         // Get Tor SOCKS port
@@ -340,9 +403,10 @@ final class ChatManager: ObservableObject {
 
             connection.start(queue: networkQueue)
 
-            // Timeout after 15 seconds
+            // FIX #328: Increased timeout from 15s to 45s for .onion rendezvous circuits
+            // Tor hidden services require rendezvous point establishment which takes 30-60 seconds
             Task {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
                 if !hasResumed {
                     hasResumed = true
                     connection.cancel()
@@ -371,11 +435,16 @@ final class ChatManager: ObservableObject {
             connection.cancel()
             peers.removeValue(forKey: contact.onionAddress)
             updateContactOnlineStatus(contact.onionAddress, isOnline: false)
+            // FIX #329: Record failure for exponential backoff
+            recordConnectionFailure(for: contact.onionAddress)
             throw error
         }
 
         // Mark as fully connected after successful key exchange
         await peer.setState(.connected)
+
+        // FIX #329: Reset backoff on successful connection
+        resetConnectionFailure(for: contact.onionAddress)
 
         // Send our nickname
         if !ourNickname.isEmpty {
@@ -841,16 +910,18 @@ final class ChatManager: ObservableObject {
 
         // FIX #238: Verify the returned onion address matches what we expected
         // This prevents connecting to wrong hidden service (e.g., iOS→Sim going to macOS)
+        // FIX #332: Improved error handling with specific error type
         let expectedOnion = await peer.onionAddress
         if response.count > 32 {
             let onionData = response.dropFirst(32)
             if let returnedOnion = String(data: onionData, encoding: .utf8) {
                 if returnedOnion != expectedOnion {
                     print("🚨 FIX #238: ONION MISMATCH! Expected: \(expectedOnion.prefix(16))... Got: \(returnedOnion.prefix(16))...")
-                    print("🚨 FIX #238: Wrong hidden service! Check your contact's .onion address.")
+                    print("🚨 FIX #332: Wrong hidden service detected - providing detailed error")
                     // Cancel connection - we're connected to the wrong peer!
                     await peer.connection.cancel()
-                    throw ChatError.connectionFailed("Connected to wrong peer: expected \(expectedOnion.prefix(20))... but got \(returnedOnion.prefix(20))...")
+                    // FIX #332: Use specific error type with full addresses for debugging
+                    throw ChatError.wrongHiddenService(expected: expectedOnion, got: returnedOnion)
                 } else {
                     print("✅ FIX #238: Onion address verified: \(returnedOnion.prefix(16))...")
                 }
@@ -866,20 +937,45 @@ final class ChatManager: ObservableObject {
     private func receiveMessages(from peer: ChatPeer) {
         Task {
             let onionAddress = await peer.onionAddress
+            var consecutiveErrors = 0
+            let maxRetries = 3
+
             while await peer.state.isConnected {
                 do {
                     let data = try await receiveData(from: peer)
                     try await processReceivedData(data, from: peer)
+                    consecutiveErrors = 0  // Reset on success
                 } catch {
-                    print("💬 Receive error from \(onionAddress.prefix(16))...: \(error)")
-                    // CRITICAL FIX: Mark peer as disconnected when receive loop fails
-                    await peer.setState(.disconnected)
-                    await MainActor.run {
-                        // Update contact online status to reflect disconnection
-                        self.updateContactOnlineStatus(onionAddress, isOnline: false)
-                        print("💬 Marked \(onionAddress.prefix(16))... as offline due to receive error")
+                    consecutiveErrors += 1
+                    print("💬 FIX #397: Receive error \(consecutiveErrors)/\(maxRetries) from \(onionAddress.prefix(16))...: \(error)")
+
+                    // FIX #397: Auto-reconnect on transient errors instead of immediately marking offline
+                    // Only mark offline after multiple consecutive failures
+                    if consecutiveErrors >= maxRetries {
+                        print("💬 FIX #397: Max retries reached, attempting reconnection...")
+                        await peer.setState(.disconnected)
+
+                        // Try to reconnect instead of just marking offline
+                        if let contact = await MainActor.run(body: { self.contacts.first { $0.onionAddress == onionAddress } }) {
+                            print("💬 FIX #397: Auto-reconnecting to \(onionAddress.prefix(16))...")
+                            do {
+                                try await self.connect(to: contact)
+                                print("💬 FIX #397: Auto-reconnect successful!")
+                                return  // Exit this loop, new receiveMessages started by connectToContact
+                            } catch {
+                                print("💬 FIX #397: Auto-reconnect failed: \(error)")
+                                // Only now mark as offline after reconnect fails
+                                await MainActor.run {
+                                    self.updateContactOnlineStatus(onionAddress, isOnline: false)
+                                    print("💬 Marked \(onionAddress.prefix(16))... as offline after reconnect failure")
+                                }
+                            }
+                        }
+                        break
                     }
-                    break
+
+                    // Brief delay before retry to avoid tight loop
+                    try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms
                 }
             }
         }

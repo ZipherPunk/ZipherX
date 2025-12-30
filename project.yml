@@ -24,10 +24,7 @@ targets:
           - "**/.DS_Store"
       - path: Assets.xcassets
         buildPhase: resources
-    resources:
-      - path: Resources
-        excludes:
-          - "**/.DS_Store"
+      # FIX #344: Resources must be in sources section with buildPhase: resources
       - path: Resources/sapling-spend.params
         buildPhase: resources
       - path: Resources/sapling-output.params
@@ -78,6 +75,8 @@ targets:
         embed: false
       - framework: Libraries/SQLCipher.xcframework
         embed: false
+      # FIX #342: SystemConfiguration required by reqwest for proxy detection
+      - sdk: SystemConfiguration.framework
     entitlements:
       path: ZipherX.entitlements
       properties:
@@ -95,19 +94,16 @@ targets:
           - "**/.DS_Store"
       - path: Assets.xcassets
         buildPhase: resources
-    resources:
-      - path: Resources
-        excludes:
-          - "**/.DS_Store"
+      # FIX #344: Resources must be in sources section with buildPhase: resources
       - path: Resources/sapling-spend.params
         buildPhase: resources
       - path: Resources/sapling-output.params
         buildPhase: resources
-      # All sync data (outputs, timestamps, tree, block hashes) is downloaded from GitHub
-      # as a unified boost file (zipherx_boost_v1.bin, ~520 MB) on first sync
       # macOS only: Bundled zclassicd and zclassic-cli for Full Node mode
+      # FIX #338: Use type: folder to preserve directory structure in bundle
       - path: Resources/Binaries
         buildPhase: resources
+        type: folder
     info:
       path: Info-macOS.plist
       properties:
@@ -140,6 +136,8 @@ targets:
         embed: false
       - framework: Libraries/SQLCipher.xcframework
         embed: false
+      # FIX #342: SystemConfiguration required by reqwest for proxy detection
+      - sdk: SystemConfiguration.framework
     entitlements:
       path: ZipherXMac.entitlements
       properties:

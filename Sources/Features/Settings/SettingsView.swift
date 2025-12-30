@@ -140,10 +140,13 @@ struct SettingsView: View {
     @State private var fullRescanHeight = ""
     @State private var showRebuildWitnessesWarning = false
     @State private var showRepairNotesWarning = false
+    @State private var showFullResyncWarning = false  // FIX #367: Nuclear option
     @State private var showScanUnrecordedWarning = false
     @State private var showScanUnrecordedResult = false
     @State private var scanUnrecordedResultMessage = ""
     @State private var isScanningUnrecorded = false
+    @State private var showForceRebuildWitnessesWarning = false  // FIX: Force rebuild all witnesses
+    @State private var isRebuildingWitnesses = false
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
@@ -156,6 +159,14 @@ struct SettingsView: View {
     @State private var showBannedPeers = false
     @State private var bannedPeersList: [BannedPeer] = []
     @State private var selectedBannedPeers: Set<String> = []
+
+    // FIX #284: Parked peers management (connection timeouts - auto-retry)
+    @State private var showParkedPeers = false
+    @State private var parkedPeersList: [ParkedPeer] = []
+
+    // FIX #284: Preferred seeds management
+    @State private var showPreferredSeeds = false
+    @State private var preferredSeedsList: [WalletDatabase.TrustedPeer] = []
 
     // Custom nodes management
     @State private var showCustomNodes = false
@@ -235,6 +246,8 @@ struct SettingsView: View {
         .background(themeManager.currentTheme.backgroundColor)
         .onAppear {
             checkBiometricAvailability()
+            // FIX #455: Update reactive peer counts when Settings appears
+            networkManager.updatePeerCountsForSettings()
         }
         .alert("Export Private Key", isPresented: $showExportAlert) {
             Button("Copy to Clipboard") {
@@ -324,6 +337,15 @@ struct SettingsView: View {
         } message: {
             Text("⚠️ PRIVACY NOTICE ⚠️\n\nTor will be TEMPORARILY DISABLED during repair for faster P2P scanning. Your IP will be visible to blockchain peers during this operation.\n\n━━━━━━━━━━━━━━━━━━━━━━\n\nThis repairs database corruption by:\n• Re-scanning blockchain for spent notes\n• Clearing ALL block headers (fixes timestamps)\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Notes marked unspent but are spent\n• Transaction dates show NO DATE\n\nThis will take 5-15 minutes.\nTor will be restored after completion.\n\nDo you want to continue?")
         }
+        // FIX #367: Full Resync alert (nuclear option)
+        .alert("FULL RESYNC", isPresented: $showFullResyncWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("FULL RESYNC (Tor disabled)", role: .destructive) {
+                startFullResync()
+            }
+        } message: {
+            Text("🔴 NUCLEAR OPTION 🔴\n\nThis performs a COMPLETE blockchain rescan:\n\n• DELETES all notes from database\n• DELETES all transaction history\n• Clears ALL cached data\n• Re-downloads boost file from GitHub\n• Rescans ENTIRE blockchain from Sapling activation\n\nThis is the same as importing a private key - everything is rebuilt from scratch.\n\n⚠️ Tor will be disabled during resync\n⚠️ Takes 10-30 minutes\n⚠️ Uses significant data/bandwidth\n\nUse ONLY if regular Repair doesn't fix balance.\n\nContinue?")
+        }
         // FIX #214: Scan for unrecorded transactions alert
         .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
             Button("Cancel", role: .cancel) {}
@@ -332,6 +354,15 @@ struct SettingsView: View {
             }
         } message: {
             Text("This will quickly scan blocks from your last checkpoint to find any transactions that were broadcast but not recorded in the database.\n\nUse this if:\n• Send showed 'failed' but TX went through\n• Balance doesn't reflect a recent send\n• Tor timeout during broadcast\n\nThis is fast (usually < 30 seconds).")
+        }
+        // FIX: Force rebuild all witnesses alert
+        .alert("Force Rebuild All Witnesses", isPresented: $showForceRebuildWitnessesWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Rebuild", role: .destructive) {
+                startForceRebuildWitnesses()
+            }
+        } message: {
+            Text("This will force a complete rebuild of all witnesses for your unspent notes.\n\nUse this if:\n• Balance shows incorrectly (too low)\n• Some notes are unspendable\n• 'Witness doesn't match tree root' errors\n\nThis may take 1-5 minutes depending on the number of notes.\n\nYour wallet will remain usable during the rebuild.")
         }
         // FIX #214: Scan result alert
         .alert("Scan Complete", isPresented: $showScanUnrecordedResult) {
@@ -589,63 +620,133 @@ Both binaries must be installed to /usr/local/bin:
 
         return VStack(spacing: 8) {
             // Daemon connection status
-            HStack {
-                Circle()
-                    .fill(rpcClient.isConnected ? Color.green : Color.red)
-                    .frame(width: 8, height: 8)
-
-                Text(rpcClient.isConnected ? "Daemon Connected" : "Daemon Offline")
-                    .font(theme.bodyFont)
-                    .foregroundColor(theme.textPrimary)
-
-                Spacer()
-
-                if rpcClient.isConnected {
-                    Text("Block \(rpcClient.blockHeight)")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                }
-            }
-            .padding(10)
-            .background(theme.surfaceColor)
-            .overlay(
-                Rectangle()
-                    .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
-            )
-
-            // Debug level picker
-            VStack(alignment: .leading, spacing: 6) {
+            // Only show daemon info and debug level in wallet.dat mode
+            if modeManager.walletSource == .walletDat {
                 HStack {
-                    Image(systemName: "ant.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(theme.textSecondary)
-                    Text("Daemon Debug Level")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                }
+                    Circle()
+                        .fill(rpcClient.isConnected ? Color.green : Color.red)
+                        .frame(width: 8, height: 8)
 
-                Picker("Debug Level", selection: $fullNodeManager.daemonDebugLevel) {
-                    ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
-                        Text(level.displayName).tag(level)
+                    Text(rpcClient.isConnected ? "Daemon Connected" : "Daemon Offline")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    Spacer()
+
+                    if rpcClient.isConnected {
+                        Text("Block \(rpcClient.blockHeight)")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
                     }
                 }
-                .pickerStyle(SegmentedPickerStyle())
+                .padding(10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(rpcClient.isConnected ? Color.green.opacity(0.5) : Color.red.opacity(0.5), lineWidth: 1)
+                )
 
-                Text(fullNodeManager.daemonDebugLevel.description)
+                // Debug level picker
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Image(systemName: "ant.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(theme.textSecondary)
+                        Text("Daemon Debug Level")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    Picker("Debug Level", selection: $fullNodeManager.daemonDebugLevel) {
+                        ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
+                            Text(level.displayName).tag(level)
+                        }
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+
+                    Text(fullNodeManager.daemonDebugLevel.description)
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if fullNodeManager.needsTorRestart {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                                .font(.system(size: 10))
+                            Text("Restart daemon to apply changes")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+                .padding(10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
+                )
+            }
+
+            // Wallet Source picker
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: "wallet.pass.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                    Text("Wallet Source")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                HStack(spacing: 8) {
+                    // ZipherX Wallet option
+                    Button(action: {
+                        modeManager.setWalletSource(.zipherx)
+                    }) {
+                        HStack {
+                            Image(systemName: "shield.fill")
+                            Text("ZipherX")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(modeManager.walletSource == .zipherx ? .white : theme.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(modeManager.walletSource == .zipherx ? theme.primaryColor : theme.surfaceColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(PlainButtonStyle())
+
+                    // wallet.dat option
+                    Button(action: {
+                        modeManager.setWalletSource(.walletDat)
+                    }) {
+                        HStack {
+                            Image(systemName: "externaldrive.fill")
+                            Text("wallet.dat")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(modeManager.walletSource == .walletDat ? .white : theme.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(modeManager.walletSource == .walletDat ? theme.primaryColor : theme.surfaceColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+
+                Text(modeManager.walletSource.description)
                     .font(.system(size: 10))
                     .foregroundColor(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                if fullNodeManager.needsTorRestart {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.system(size: 10))
-                        Text("Restart daemon to apply changes")
-                            .font(.system(size: 10))
-                            .foregroundColor(.orange)
-                    }
-                }
             }
             .padding(10)
             .background(theme.surfaceColor)
@@ -654,23 +755,25 @@ Both binaries must be installed to /usr/local/bin:
                     .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
             )
 
-            // Node Management button
-            Button(action: {
-                showNodeManagement = true
-            }) {
-                HStack {
-                    Image(systemName: "gearshape.2.fill")
-                    Text("Node Management")
-                    Spacer()
-                    Image(systemName: "chevron.right")
+            // Node Management button - only in wallet.dat mode
+            if modeManager.walletSource == .walletDat {
+                Button(action: {
+                    showNodeManagement = true
+                }) {
+                    HStack {
+                        Image(systemName: "gearshape.2.fill")
+                        Text("Node Management")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(theme.bodyFont)
+                    .foregroundColor(.white)
+                    .padding(12)
+                    .background(theme.primaryColor)
+                    .cornerRadius(theme.cornerRadius)
                 }
-                .font(theme.bodyFont)
-                .foregroundColor(.white)
-                .padding(12)
-                .background(theme.primaryColor)
-                .cornerRadius(theme.cornerRadius)
+                .buttonStyle(PlainButtonStyle())
             }
-            .buttonStyle(PlainButtonStyle())
 
             // Switch to Light mode button
             Button(action: {
@@ -1176,6 +1279,64 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
+            // FIX #284: Parked Peers button (connection timeouts - auto-retry)
+            Button(action: {
+                parkedPeersList = networkManager.getParkedPeers()
+                showParkedPeers = true
+            }) {
+                HStack {
+                    Image(systemName: "parkingsign.circle")
+                        .font(.system(size: 14))
+                    Text("Parked Peers")
+                        .font(theme.bodyFont)
+                    Spacer()
+                    // FIX #455: Use @Published property instead of calculating inline
+                    Text("\(networkManager.parkedPeersCount)")
+                        .font(theme.monoFont)
+                        .foregroundColor(networkManager.parkedPeersCount > 0 ? .orange : theme.textSecondary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+
+            // FIX #284: Preferred Seeds button (priority connection, ban-exempt)
+            Button(action: {
+                preferredSeedsList = (try? WalletDatabase.shared.getPreferredSeeds()) ?? []
+                showPreferredSeeds = true
+            }) {
+                HStack {
+                    Image(systemName: "star.circle")
+                        .font(.system(size: 14))
+                    Text("Preferred Seeds")
+                        .font(theme.bodyFont)
+                    Spacer()
+                    // FIX #455: Use @Published property instead of calculating inline
+                    Text("\(networkManager.preferredSeedsCount)")
+                        .font(theme.monoFont)
+                        .foregroundColor(networkManager.preferredSeedsCount > 0 ? .yellow : theme.textSecondary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .foregroundColor(theme.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+
             // Custom Nodes button
             Button(action: {
                 showCustomNodes = true
@@ -1291,6 +1452,22 @@ Both binaries must be installed to /usr/local/bin:
         )
         .sheet(isPresented: $showBannedPeers) {
             bannedPeersSheet
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                       minHeight: 400, idealHeight: 500, maxHeight: 600)
+                #endif
+        }
+        // FIX #284: Parked Peers sheet
+        .sheet(isPresented: $showParkedPeers) {
+            parkedPeersSheet
+                #if os(macOS)
+                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                       minHeight: 400, idealHeight: 500, maxHeight: 600)
+                #endif
+        }
+        // FIX #284: Preferred Seeds sheet
+        .sheet(isPresented: $showPreferredSeeds) {
+            preferredSeedsSheet
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
                        minHeight: 400, idealHeight: 500, maxHeight: 600)
@@ -2001,6 +2178,59 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
+            // FIX #451: Force Reset Repair Flag - YELLOW (emergency unstuck button)
+            // Only show when repair flag is stuck
+            if walletManager.isRepairingDatabase {
+                Button(action: {
+                    walletManager.forceResetRepairFlag()
+                }) {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12))
+                        Text("UNSTUCK REPAIR (Flag Reset)")
+                            .font(theme.bodyFont)
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.yellow)
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.yellow.opacity(0.8), lineWidth: 2)
+                    )
+                }
+
+                Text("EMERGENCY: Repair is stuck. Click this to unstick the app so you can use it again.")
+                    .font(theme.captionFont)
+                    .foregroundColor(Color.yellow)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // FIX #367: Full Resync button - RED (nuclear option, like import PK)
+            Button(action: {
+                showFullResyncWarning = true
+            }) {
+                HStack {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12))
+                    Text("Full Resync")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.red)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.red.opacity(0.8), lineWidth: 2)
+                )
+            }
+
+            Text("Nuclear option: Deletes all notes & history, re-downloads boost file, rescans entire blockchain. Use if balance is wrong after regular repair.")
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             // FIX #214: Scan for Unrecorded TX button - ORANGE (fast, from checkpoint only)
             Button(action: {
                 showScanUnrecordedWarning = true
@@ -2029,6 +2259,38 @@ Both binaries must be installed to /usr/local/bin:
             .disabled(isScanningUnrecorded)
 
             Text("Quick scan from last checkpoint to find transactions that were broadcast but not recorded (e.g., Tor timeout).")
+                .font(theme.captionFont)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // FIX: Force Rebuild All Witnesses button - CYAN (fixes balance/witness issues)
+            Button(action: {
+                showForceRebuildWitnessesWarning = true
+            }) {
+                HStack {
+                    if isRebuildingWitnesses {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12))
+                    }
+                    Text(isRebuildingWitnesses ? "Rebuilding..." : "Force Rebuild All Witnesses")
+                        .font(theme.bodyFont)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.cyan)
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.cyan.opacity(0.8), lineWidth: 2)
+                )
+            }
+            .disabled(isRebuildingWitnesses)
+
+            Text("Forces rebuild of all witnesses to fix balance issues where notes are excluded because their witness doesn't match the current tree root.")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2558,6 +2820,163 @@ Both binaries must be installed to /usr/local/bin:
         .background(theme.backgroundColor)
     }
 
+    // MARK: - Parked Peers Sheet (FIX #284)
+
+    private var parkedPeersSheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Parked Peers")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("\(parkedPeersList.count) parked")
+                    .font(theme.bodyFont)
+                    .foregroundColor(parkedPeersList.isEmpty ? theme.textSecondary : .orange)
+                Spacer()
+                Button("Done") {
+                    showParkedPeers = false
+                }
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            if parkedPeersList.isEmpty {
+                // Empty state
+                VStack(spacing: 12) {
+                    Image(systemName: "hourglass")
+                        .font(.system(size: 40))
+                        .foregroundColor(.green)
+                    Text("No Parked Peers")
+                        .font(theme.titleFont)
+                        .foregroundColor(theme.textPrimary)
+                    Text("Peers with connection timeouts will appear here.\nThey will auto-retry with exponential backoff.")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(theme.surfaceColor)
+            } else {
+                // List of parked peers
+                List {
+                    ForEach(parkedPeersList, id: \.address) { peer in
+                        ParkedPeerRow(peer: peer)
+                            .environmentObject(themeManager)
+                    }
+                }
+                .listStyle(PlainListStyle())
+            }
+
+            // Action buttons
+            if !parkedPeersList.isEmpty {
+                VStack(spacing: 8) {
+                    // Info about exponential backoff
+                    Text("Parked peers auto-retry with exponential backoff:\n1s → 5min → 1h → 4h → 8h → 16h → 24h max")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.bottom, 4)
+
+                    // Clear all parked
+                    Button(action: {
+                        networkManager.clearAllParkedPeers()
+                        parkedPeersList = []
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.uturn.backward")
+                            Text("Clear All Parked (Force Retry)")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(Color.orange)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .padding()
+                .background(theme.backgroundColor)
+            }
+        }
+        .background(theme.backgroundColor)
+    }
+
+    // MARK: - Preferred Seeds Sheet (FIX #284)
+
+    private var preferredSeedsSheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Preferred Seeds")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("\(preferredSeedsList.count) seeds")
+                    .font(theme.bodyFont)
+                    .foregroundColor(preferredSeedsList.isEmpty ? theme.textSecondary : .yellow)
+                Spacer()
+                Button("Done") {
+                    showPreferredSeeds = false
+                }
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            // Info banner
+            HStack(spacing: 8) {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.yellow)
+                Text("Preferred seeds get priority connection and are exempt from parking timeouts.")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+            }
+            .padding()
+            .background(theme.surfaceColor.opacity(0.5))
+
+            if preferredSeedsList.isEmpty {
+                // Empty state
+                VStack(spacing: 12) {
+                    Image(systemName: "star.slash")
+                        .font(.system(size: 40))
+                        .foregroundColor(.gray)
+                    Text("No Preferred Seeds")
+                        .font(theme.titleFont)
+                        .foregroundColor(theme.textPrimary)
+                    Text("Add preferred seeds from Trusted Peers\nor they'll be auto-added from hardcoded seeds.")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(theme.surfaceColor)
+            } else {
+                // List of preferred seeds
+                List {
+                    ForEach(preferredSeedsList, id: \.host) { seed in
+                        PreferredSeedRow(
+                            seed: seed,
+                            onDemote: {
+                                try? WalletDatabase.shared.demoteFromPreferredSeed(host: seed.host, port: seed.port)
+                                preferredSeedsList = (try? WalletDatabase.shared.getPreferredSeeds()) ?? []
+                            }
+                        )
+                        .environmentObject(themeManager)
+                    }
+                }
+                .listStyle(PlainListStyle())
+            }
+        }
+        .background(theme.backgroundColor)
+    }
+
     // MARK: - Debug Section
 
     private var debugSection: some View {
@@ -2964,6 +3383,59 @@ Both binaries must be installed to /usr/local/bin:
         }
     }
 
+    // MARK: - FIX #367: Full Resync (Nuclear Option)
+
+    private func startFullResync() {
+        // Reset progress state
+        rescanProgress = 0
+        rescanCurrentHeight = 0
+        rescanMaxHeight = 0
+        rescanStartTime = Date()
+        rescanElapsedTime = 0
+
+        // Show progress view
+        showRescanProgress = true
+
+        // Start elapsed time timer
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            if let start = rescanStartTime {
+                rescanElapsedTime = Date().timeIntervalSince(start)
+            }
+        }
+
+        // Perform FULL resync in background
+        Task {
+            do {
+                print("🔄 FIX #367: Starting FULL RESYNC (nuclear option)...")
+                print("🔄 This will delete all notes, re-download boost, and rescan from scratch")
+
+                // Call repair with forceFullRescan = true
+                try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, currentHeight, maxHeight in
+                    Task { @MainActor in
+                        rescanProgress = progress
+                        rescanCurrentHeight = currentHeight
+                        rescanMaxHeight = maxHeight
+                    }
+                }, forceFullRescan: true)
+
+                // Complete
+                await MainActor.run {
+                    rescanProgress = 1.0
+                    print("✅ FIX #367: Full resync complete!")
+                }
+
+            } catch {
+                await MainActor.run {
+                    rescanTimer?.invalidate()
+                    rescanTimer = nil
+                    errorMessage = "Full resync failed: \(error.localizedDescription)"
+                    print("❌ Full resync error: \(error)")
+                    rescanProgress = -1
+                }
+            }
+        }
+    }
+
     // MARK: - FIX #214/217: Scan for Unrecorded Transactions Only
 
     private func startScanForUnrecordedTx() {
@@ -2999,6 +3471,168 @@ Both binaries must be installed to /usr/local/bin:
                 scanUnrecordedResultMessage = "Scan failed: \(error.localizedDescription)"
                 showScanUnrecordedResult = true
                 print("❌ FIX #217: Scan error: \(error)")
+            }
+        }
+    }
+
+    // FIX: Force rebuild all witnesses
+    private func startForceRebuildWitnesses() {
+        isRebuildingWitnesses = true
+        print("🔧 Starting force rebuild of all witnesses...")
+
+        Task {
+            do {
+                // Get current tree root
+                guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
+                    await MainActor.run {
+                        isRebuildingWitnesses = false
+                        errorMessage = "No tree root available - tree may not be loaded"
+                        print("❌ Force rebuild failed: No tree root")
+                    }
+                    return
+                }
+
+                // Get account ID
+                guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+                    await MainActor.run {
+                        isRebuildingWitnesses = false
+                        errorMessage = "No account found"
+                        print("❌ Force rebuild failed: No account")
+                    }
+                    return
+                }
+                let accountId = account.id
+
+                // Get unspent notes only (we don't need to rebuild witnesses for spent notes)
+                let unspentNotes = try WalletDatabase.shared.getUnspentNotes(accountId: accountId)
+
+                print("🔧 Rebuilding witnesses for \(unspentNotes.count) unspent notes...")
+
+                var successCount = 0
+                var failedCount = 0
+                var skippedCount = 0
+
+                // Get boost file info to know which notes can be rebuilt from cache
+                let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo()
+                let boostHeight = cachedInfo?.height ?? 0
+
+                // Save current tree state
+                let savedTreeState = ZipherXFFI.treeSerialize()
+                print("🔧 Starting witness rebuild for \(unspentNotes.count) notes...")
+
+                // Separate notes into categories for batch processing
+                var notesNeedingRebuild: [(note: WalletNote, cmu: Data)] = []
+                var notesBeyondBoost: [WalletNote] = []
+
+                for (index, note) in unspentNotes.enumerated() {
+                    // Debug: print first note info
+                    if index == 0 {
+                        print("🔧 First note: height=\(note.height), has anchor=\(note.anchor != nil), has CMU=\(note.cmu != nil)")
+                    }
+
+                    // Check if witness already matches current tree root
+                    if let noteAnchor = note.anchor, noteAnchor == currentTreeRoot {
+                        if index == 0 { print("🔧 First note anchor matches current tree root, skipping") }
+                        skippedCount += 1
+                        continue
+                    }
+
+                    // Check if CMU exists
+                    guard let noteCmu = note.cmu, !noteCmu.isEmpty else {
+                        print("⚠️ Note at height \(note.height) has no CMU, skipping")
+                        failedCount += 1
+                        continue
+                    }
+
+                    // Categorize by height
+                    if note.height <= boostHeight {
+                        notesNeedingRebuild.append((note, noteCmu))
+                    } else {
+                        notesBeyondBoost.append(note)
+                    }
+                }
+
+                print("🔧 Batch processing: \(notesNeedingRebuild.count) notes within boost file, \(notesBeyondBoost.count) beyond")
+
+                // Process ALL notes within boost file in ONE batch call
+                if !notesNeedingRebuild.isEmpty {
+                    print("🔧 Creating witnesses for \(notesNeedingRebuild.count) notes in single batch...")
+
+                    if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                       let cmuData = try? Data(contentsOf: cachedPath) {
+
+                        // Extract all CMUs for batch processing
+                        let targetCMUs = notesNeedingRebuild.map { $0.cmu }
+                        print("🔧 Calling treeCreateWitnessesBatch with \(targetCMUs.count) CMUs...")
+
+                        let batchStart = Date()
+                        let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: cmuData, targetCMUs: targetCMUs)
+                        let batchDuration = Date().timeIntervalSince(batchStart)
+
+                        print("🔧 Batch witness creation completed in \(String(format: "%.2f", batchDuration))s")
+
+                        // Map results back to notes
+                        for (index, (note, _)) in notesNeedingRebuild.enumerated() {
+                            if index < results.count,
+                               let result = results[index] {
+                                let (position, newWitness) = result
+                                // Extract anchor from witness (last 32 bytes)
+                                let witnessAnchor = newWitness.suffix(32)
+                                do {
+                                    try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: newWitness)
+                                    try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                    successCount += 1
+                                } catch {
+                                    print("⚠️ Failed to update note at height \(note.height): \(error)")
+                                    failedCount += 1
+                                }
+                            } else {
+                                print("⚠️ No witness returned for note at height \(note.height)")
+                                failedCount += 1
+                            }
+
+                            // Update progress every 5 notes
+                            if index % 5 == 0 {
+                                let progress = Double(index) / Double(notesNeedingRebuild.count)
+                                print("🔧 Witness rebuild progress: \(Int(progress * 100))%")
+                            }
+                        }
+                    } else {
+                        print("⚠️ Could not load CMU data from boost file")
+                        failedCount += notesNeedingRebuild.count
+                    }
+                }
+
+                // Handle notes beyond boost file
+                for note in notesBeyondBoost {
+                    print("⚠️ Note at height \(note.height) is beyond boost file (\(boostHeight)), needs P2P fetch")
+                    failedCount += 1
+                }
+
+                print("🔧 Witness rebuild completed. Success: \(successCount), Skipped: \(skippedCount), Failed: \(failedCount)")
+
+                // Restore tree state
+                if let savedState = savedTreeState {
+                    _ = ZipherXFFI.treeDeserialize(data: savedState)
+                }
+
+                // Refresh balance after rebuild
+                try await walletManager.refreshBalance()
+
+                await MainActor.run {
+                    isRebuildingWitnesses = false
+                    let message = "Witness rebuild complete!\n\n✅ Rebuilt: \(successCount)\n⏭ Skipped: \(skippedCount)\n❌ Failed: \(failedCount)\n\nBalance has been refreshed.\n\nNote: Failed notes are beyond boost file range and require blockchain sync."
+                    recoveryMessage = message
+                    showRecoverySuccess = true
+                    print("✅ Force rebuild complete: \(successCount) rebuilt, \(skippedCount) skipped, \(failedCount) failed")
+                }
+
+            } catch {
+                await MainActor.run {
+                    isRebuildingWitnesses = false
+                    errorMessage = "Witness rebuild failed: \(error.localizedDescription)"
+                    print("❌ Force rebuild error: \(error)")
+                }
             }
         }
     }
@@ -3225,6 +3859,170 @@ struct BannedPeerRow: View {
             return "\(hours)h \(minutes)m left"
         } else {
             return "\(minutes)m left"
+        }
+    }
+}
+
+// MARK: - Parked Peer Row (FIX #284)
+
+struct ParkedPeerRow: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    let peer: ParkedPeer
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Parking status icon
+            Image(systemName: peer.isReadyForRetry ? "arrow.clockwise.circle.fill" : "hourglass.circle.fill")
+                .foregroundColor(peer.isReadyForRetry ? .green : .orange)
+                .font(.system(size: 20))
+
+            // Peer info
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(peer.address):\(peer.port)")
+                    .font(theme.monoFont)
+                    .foregroundColor(theme.textPrimary)
+
+                HStack(spacing: 8) {
+                    // Retry count
+                    Text("Retries: \(peer.retryCount)")
+                        .font(theme.captionFont)
+                        .foregroundColor(.orange)
+
+                    // Time until retry
+                    if peer.isReadyForRetry {
+                        Text("• Ready to retry")
+                            .font(theme.captionFont)
+                            .foregroundColor(.green)
+                    } else {
+                        Text("• \(timeUntilRetry)")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    // Was preferred indicator
+                    if peer.wasPreferred {
+                        Text("• ⭐ Preferred")
+                            .font(theme.captionFont)
+                            .foregroundColor(.yellow)
+                    }
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var timeUntilRetry: String {
+        let nextRetryTime = peer.parkedTime.addingTimeInterval(peer.nextRetryInterval)
+        let remaining = nextRetryTime.timeIntervalSinceNow
+
+        if remaining <= 0 {
+            return "Ready"
+        }
+
+        let hours = Int(remaining / 3600)
+        let minutes = Int((remaining.truncatingRemainder(dividingBy: 3600)) / 60)
+        let seconds = Int(remaining.truncatingRemainder(dividingBy: 60))
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m until retry"
+        } else if minutes > 0 {
+            return "\(minutes)m \(seconds)s until retry"
+        } else {
+            return "\(seconds)s until retry"
+        }
+    }
+}
+
+// MARK: - Preferred Seed Row (FIX #284)
+
+struct PreferredSeedRow: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    let seed: WalletDatabase.TrustedPeer
+    let onDemote: () -> Void
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    // Calculate success rate from successes and failures
+    private var successRate: Double {
+        let total = seed.successes + seed.failures
+        guard total > 0 else { return 0 }
+        return Double(seed.successes) / Double(total)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Preferred status icon
+            Image(systemName: "star.fill")
+                .foregroundColor(.yellow)
+                .font(.system(size: 20))
+
+            // Seed info
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(seed.host):\(seed.port)")
+                    .font(theme.monoFont)
+                    .foregroundColor(theme.textPrimary)
+
+                HStack(spacing: 8) {
+                    // Success rate if available
+                    if seed.successes + seed.failures > 0 {
+                        Text("Success: \(Int(successRate * 100))%")
+                            .font(theme.captionFont)
+                            .foregroundColor(successRate > 0.7 ? .green : .orange)
+                    }
+
+                    // Last connected
+                    if let lastConnected = seed.lastConnected {
+                        Text("• \(timeAgo(lastConnected))")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    // Onion indicator
+                    if seed.isOnion {
+                        Text("• 🧅")
+                            .font(theme.captionFont)
+                    }
+
+                    // Notes
+                    if let notes = seed.notes, !notes.isEmpty {
+                        Text("• \(notes)")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                }
+            }
+
+            Spacer()
+
+            // Demote button
+            Button(action: onDemote) {
+                Image(systemName: "star.slash")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 16))
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func timeAgo(_ date: Date) -> String {
+        let interval = Date().timeIntervalSince(date)
+
+        if interval < 60 {
+            return "just now"
+        } else if interval < 3600 {
+            let minutes = Int(interval / 60)
+            return "\(minutes)m ago"
+        } else if interval < 86400 {
+            let hours = Int(interval / 3600)
+            return "\(hours)h ago"
+        } else {
+            let days = Int(interval / 86400)
+            return "\(days)d ago"
         }
     }
 }
