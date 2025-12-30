@@ -224,6 +224,13 @@ public final class PeerManager: ObservableObject {
     private var sybilBypassActive: Bool = false
     private let SYBIL_BYPASS_THRESHOLD: Int = 10
 
+    /// FIX #472: Flag to track when header sync is in progress
+    /// When true, block listeners should NOT be started (even for new peers)
+    /// This prevents race condition where new peers' block listeners consume "headers" responses
+    /// nonisolated(unsafe): Accessed from nonisolated functions via lock
+    private nonisolated(unsafe) var headerSyncInProgressFlag: Bool = false
+    private let headerSyncStateLock = NSLock()
+
     // MARK: - Initialization
 
     private init() {
@@ -263,6 +270,7 @@ public final class PeerManager: ObservableObject {
     // MARK: - Peer List Access
 
     /// Get all peers with ready connections that are valid Zclassic nodes
+    /// FIX #469: ONLY return peers with COMPLETED P2P handshake (version message received)
     /// FIX #434: Only return VALID ZCLASSIC peers (version 170010-170012)
     ///           Zcash peers (170018+) are filtered out - they return wrong Equihash params!
     /// FIX #458: Removed circular dependency - no longer calls NetworkManager.getAllConnectedPeers()
@@ -272,18 +280,27 @@ public final class PeerManager: ObservableObject {
         let peerSnapshot = peers
         peersLock.unlock()
 
-        // FIX #434: Filter for isValidZclassicPeer to exclude Zcash nodes
-        let readyPeers = peerSnapshot.filter { $0.isConnectionReady && $0.isValidZclassicPeer }
-        let zcashPeers = peerSnapshot.filter { $0.isConnectionReady && !$0.isValidZclassicPeer }
+        // FIX #469: ONLY return peers with completed handshake!
+        // Peers with isConnectionReady=true but handshake incomplete will fail when used
+        let readyPeers = peerSnapshot.filter { $0.isHandshakeComplete }
+
+        let notReady = peerSnapshot.filter { $0.isConnectionReady && !$0.isHandshakeComplete }
+        if !notReady.isEmpty {
+            print("⚠️ FIX #469: Filtered out \(notReady.count) peers with incomplete handshake (TCP connected but no version message)")
+        }
+
+        let zcashPeers = peerSnapshot.filter { $0.isConnectionReady && !$0.isValidZclassicPeer && $0.peerVersion > 0 }
         if !zcashPeers.isEmpty {
             print("⚠️ FIX #434: Filtered out \(zcashPeers.count) Zcash peers (wrong chain)")
         }
+
         // FIX #458: Return empty array if no ready peers (caller should handle this)
         // Removed circular dependency that caused infinite recursion crash
         return readyPeers
     }
 
     /// Get first available peer (must be valid Zclassic node)
+    /// FIX #469: Only return peers with COMPLETED P2P handshake
     /// FIX #434: Only return valid Zclassic peers
     /// FIX #458: Added lock to protect peers array
     public func getBestPeer() -> Peer? {
@@ -291,10 +308,11 @@ public final class PeerManager: ObservableObject {
         let peerSnapshot = peers
         peersLock.unlock()
 
-        return peerSnapshot.first { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
+        return peerSnapshot.first { $0.isHandshakeComplete && !isBanned($0.host) }
     }
 
     /// Get peers suitable for broadcast (not banned, connection ready, recent activity)
+    /// FIX #469: Only return peers with COMPLETED P2P handshake
     /// FIX #434: Only return valid Zclassic peers
     /// FIX #458: Added lock to protect peers array
     public func getPeersForBroadcast() -> [Peer] {
@@ -304,13 +322,13 @@ public final class PeerManager: ObservableObject {
 
         return peerSnapshot.filter {
             !isBanned($0.host) &&
-            $0.isConnectionReady &&
-            $0.hasRecentActivity &&
-            $0.isValidZclassicPeer
+            $0.isHandshakeComplete &&
+            $0.hasRecentActivity
         }
     }
 
     /// Get N peers for consensus operations
+    /// FIX #469: Only return peers with COMPLETED P2P handshake
     /// FIX #434: Only return valid Zclassic peers
     /// FIX #458: Added lock to protect peers array
     public func getPeersForConsensus(count: Int) -> [Peer] {
@@ -318,7 +336,7 @@ public final class PeerManager: ObservableObject {
         let peerSnapshot = peers
         peersLock.unlock()
 
-        let ready = peerSnapshot.filter { $0.isConnectionReady && !isBanned($0.host) && $0.isValidZclassicPeer }
+        let ready = peerSnapshot.filter { $0.isHandshakeComplete && !isBanned($0.host) }
         return Array(ready.prefix(count))
     }
 
@@ -579,6 +597,26 @@ public final class PeerManager: ObservableObject {
         for peer in peers {
             peer.startBlockListener()
         }
+    }
+
+    // MARK: - FIX #472: Header Sync State Management
+
+    /// Set header sync in progress state (called before header sync starts)
+    /// nonisolated: Uses its own lock for thread safety, doesn't need MainActor
+    nonisolated public func setHeaderSyncInProgress(_ inProgress: Bool) {
+        headerSyncStateLock.lock()
+        defer { headerSyncStateLock.unlock() }
+        headerSyncInProgressFlag = inProgress
+        print("📊 FIX #472: Header sync state = \(inProgress ? "IN PROGRESS" : "COMPLETE")")
+    }
+
+    /// Check if header sync is currently in progress
+    /// When true, block listeners should NOT be started
+    /// nonisolated: Uses its own lock for thread safety, doesn't need MainActor
+    nonisolated public func isHeaderSyncInProgress() -> Bool {
+        headerSyncStateLock.lock()
+        defer { headerSyncStateLock.unlock() }
+        return headerSyncInProgressFlag
     }
 
     // MARK: - Sybil Detection

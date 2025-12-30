@@ -1358,14 +1358,31 @@ final class WalletManager: ObservableObject {
 
             // Load headers into HeaderStore with pre-computed hashes
             // FIX #457: Pass expected count from manifest (headers have Equihash solutions, so size varies)
+            // FIX #470: Set task to inProgress BEFORE loading starts for immediate UI update
+            await MainActor.run {
+                self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: 0.0)
+            }
+
+            // FIX #468: Add progress callback for header loading
             try HeaderStore.shared.loadHeadersFromBoostData(
                 headerData,
                 blockHashes: blockHashesData,
                 startHeight: sectionInfo.startHeight,
                 expectedCount: Int(sectionInfo.count)
-            )
+            ) { progress in
+                // FIX #470: Use DispatchQueue.main.async for immediate UI updates
+                // Task { @MainActor in } is too slow - headers load before UI updates
+                DispatchQueue.main.async {
+                    self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: progress)
+                }
+            }
 
             print("✅ FIX #457: Loaded \(sectionInfo.count) headers from boost file (up to height \(sectionInfo.endHeight))")
+
+            // FIX #470: Mark task as completed
+            await MainActor.run {
+                self.updateDownloadTaskProgress("headers", detail: "Loaded \(sectionInfo.count) headers", progress: 1.0)
+            }
             return (true, sectionInfo.endHeight)
         } catch {
             print("❌ FIX #457: Failed to load headers from boost file: \(error.localizedDescription)")
@@ -1910,6 +1927,37 @@ final class WalletManager: ObservableObject {
                     }
                     if rebuiltCount < notesNeedingRebuild.count {
                         print("⚠️ Pre-witness: \(notesNeedingRebuild.count - rebuiltCount) witness(es) will rebuild at send time")
+
+                        // FIX #469: If ALL witnesses failed, invalidate stale CMU cache and retry
+                        if rebuiltCount == 0 && !notesInBoost.isEmpty {
+                            print("⚠️ FIX #469: All witnesses failed - invalidating stale CMU cache and retrying...")
+                            await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
+
+                            // Retry with fresh CMU data
+                            if let newCmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                               let newCmuData = try? Data(contentsOf: newCmuPath) {
+                                print("🔄 FIX #469: Retrying witness creation with fresh CMU data...")
+                                let retryResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: newCmuData, targetCMUs: notesInBoost.map { $0.cmu })
+
+                                var retryCount = 0
+                                for (index, result) in retryResults.enumerated() {
+                                    if let (_, witness) = result {
+                                        let note = notesInBoost[index].note
+                                        let witnessAnchor = witness.suffix(32)
+                                        try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                        try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                        retryCount += 1
+                                    }
+                                }
+
+                                if retryCount > 0 {
+                                    print("✅ FIX #469: Retry succeeded - \(retryCount)/\(notesInBoost.count) witnesses created")
+                                    rebuiltCount += retryCount
+                                } else {
+                                    print("❌ FIX #469: Retry also failed - CMUs may not be in bundled data")
+                                }
+                            }
+                        }
                     }
 
                     // CRITICAL: Restore tree state after witness rebuild
@@ -2054,6 +2102,14 @@ final class WalletManager: ObservableObject {
             print("⚠️ Failed to delete database: \(error)")
         }
 
+        // FIX #469: Delete CMU cache for restored wallet
+        // This ensures we start fresh with no stale CMU data
+        print("🗑️ Deleting CMU cache for restored wallet...")
+        Task {
+            await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
+            print("✅ CMU cache deleted")
+        }
+
         // Open fresh database with new key
         let dbKey = Data(SHA256.hash(data: spendingKey))
         do {
@@ -2081,6 +2137,14 @@ final class WalletManager: ObservableObject {
     /// Clears notes, tree state, scan history, and transaction history
     private func resetDatabaseForNewWallet() throws {
         print("🗑️ Clearing old wallet data from database...")
+
+        // FIX #469: Delete CMU cache for new wallet
+        // This ensures we start fresh with no stale CMU data
+        print("🗑️ Deleting CMU cache for new wallet...")
+        Task {
+            await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
+            print("✅ CMU cache deleted")
+        }
 
         // Check if database is open - if not, skip clearing (nothing to clear)
         guard WalletDatabase.shared.isOpen else {
@@ -3955,13 +4019,34 @@ final class WalletManager: ObservableObject {
     /// Update download task progress - called from FilterScanner
     @MainActor
     func updateDownloadTaskProgress(_ taskId: String, detail: String, progress: Double) {
-        // First set to in progress if not already
-        if let index = syncTasks.firstIndex(where: { $0.id == taskId }) {
-            if case .pending = syncTasks[index].status {
-                syncTasks[index].status = .inProgress
+        // FIX #468: Create task if it doesn't exist (happens during Import PK)
+        if syncTasks.firstIndex(where: { $0.id == taskId }) == nil {
+            // Create task with appropriate title based on ID
+            let title: String
+            switch taskId {
+            case "headers":
+                title = "Loading block headers"
+            case "download_outputs":
+                title = "Download shielded outputs"
+            case "download_timestamps":
+                title = "Download block timestamps"
+            case "scan":
+                title = "Decrypt shielded notes"
+            case "witnesses":
+                title = "Build Merkle witnesses"
+            default:
+                title = "Processing"
             }
+            syncTasks.append(SyncTask(id: taskId, title: title, status: .inProgress, detail: detail, progress: progress))
+        } else {
+            // First set to in progress if not already
+            if let index = syncTasks.firstIndex(where: { $0.id == taskId }) {
+                if case .pending = syncTasks[index].status {
+                    syncTasks[index].status = .inProgress
+                }
+            }
+            updateTaskWithProgress(taskId, detail: detail, progress: progress)
         }
-        updateTaskWithProgress(taskId, detail: detail, progress: progress)
     }
 
     /// Update a sync task status, detail, and progress - called from ContentView for FAST START
@@ -4950,6 +5035,14 @@ final class WalletManager: ObservableObject {
             print("✅ Old database deleted")
         } catch {
             print("⚠️ Failed to delete database: \(error)")
+        }
+
+        // FIX #469: Delete CMU cache for imported wallet
+        // This ensures we start fresh with no stale CMU data
+        print("🗑️ Deleting CMU cache for imported wallet...")
+        Task {
+            await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
+            print("✅ CMU cache deleted")
         }
 
         // Open fresh database with new key

@@ -13,12 +13,12 @@ enum ZSTDDecoder {
             guard let baseAddress = rawPtr.baseAddress else {
                 return 0
             }
-            return zipherx_zstd_decompress(
+            return UInt32(zipherx_zstd_decompress(
                 baseAddress.assumingMemoryBound(to: UInt8.self),
                 data.count,
                 &outPtr,
                 &outLen
-            )
+            ))
         }
 
         guard result == 1, let ptr = outPtr else {

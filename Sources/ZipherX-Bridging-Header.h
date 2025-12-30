@@ -1,312 +1,80 @@
-//
-//  ZipherX-Bridging-Header.h
-//  ZipherX
-//
-//  Bridging header for Rust FFI functions
-//
-
-#ifndef ZipherX_Bridging_Header_h
-#define ZipherX_Bridging_Header_h
+#ifndef ZIPHERX_FFI_H
+#define ZIPHERX_FFI_H
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
-// =============================================================================
-// SQLCipher - Encrypted Database Support
-// =============================================================================
-// SQLCipher provides transparent 256-bit AES encryption of the SQLite database.
-// NOTE: We do NOT include sqlite3.h here to avoid module conflicts.
-// Instead, we manually declare the SQLite3/SQLCipher functions we need.
+// SQLCipher - encrypted SQLite
+// sqlite3.h is available via HEADER_SEARCH_PATHS in Xcode project
+#include <sqlite3.h>
 
-// Core SQLite types
-typedef struct sqlite3 sqlite3;
-typedef struct sqlite3_stmt sqlite3_stmt;
-
-// Result codes
-#define SQLITE_OK           0
-#define SQLITE_ERROR        1
-#define SQLITE_ROW          100
-#define SQLITE_DONE         101
-#define SQLITE_NOTADB       26
-
-// Open flags
-#define SQLITE_OPEN_READWRITE     0x00000002
-#define SQLITE_OPEN_CREATE        0x00000004
-#define SQLITE_OPEN_FULLMUTEX     0x00010000
-
-// Core SQLite functions (these are provided by libsqlcipher.a)
-int sqlite3_open(const char *filename, sqlite3 **ppDb);
-int sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
-int sqlite3_close(sqlite3 *);
-int sqlite3_exec(sqlite3*, const char *sql, int (*callback)(void*,int,char**,char**), void *, char **errmsg);
-void sqlite3_free(void*);
-int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte, sqlite3_stmt **ppStmt, const char **pzTail);
-int sqlite3_step(sqlite3_stmt*);
-int sqlite3_finalize(sqlite3_stmt *pStmt);
-int sqlite3_reset(sqlite3_stmt *pStmt);
-int sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int n, void(*)(void*));
-int sqlite3_bind_int(sqlite3_stmt*, int, int);
-int sqlite3_bind_int64(sqlite3_stmt*, int, long long);
-int sqlite3_bind_text(sqlite3_stmt*, int, const char*, int n, void(*)(void*));
-int sqlite3_bind_null(sqlite3_stmt*, int);
-int sqlite3_bind_double(sqlite3_stmt*, int, double);
-double sqlite3_column_double(sqlite3_stmt*, int iCol);
-const void *sqlite3_column_blob(sqlite3_stmt*, int iCol);
-int sqlite3_column_bytes(sqlite3_stmt*, int iCol);
-int sqlite3_column_int(sqlite3_stmt*, int iCol);
-long long sqlite3_column_int64(sqlite3_stmt*, int iCol);
-const unsigned char *sqlite3_column_text(sqlite3_stmt*, int iCol);
-int sqlite3_column_type(sqlite3_stmt*, int iCol);
-int sqlite3_column_count(sqlite3_stmt *pStmt);
-int sqlite3_errcode(sqlite3 *db);
-const char *sqlite3_errmsg(sqlite3*);
-long long sqlite3_last_insert_rowid(sqlite3*);
-int sqlite3_changes(sqlite3*);
-int sqlite3_clear_bindings(sqlite3_stmt*);
-const char *sqlite3_libversion(void);
-
-// Destructor type
-typedef void (*sqlite3_destructor_type)(void*);
-
-// Destructor constants
-#define SQLITE_STATIC      ((sqlite3_destructor_type)0)
-#define SQLITE_TRANSIENT   ((sqlite3_destructor_type)-1)
-
-// Column types
-#define SQLITE_INTEGER  1
-#define SQLITE_FLOAT    2
-#define SQLITE_BLOB     4
-#define SQLITE_NULL     5
-#define SQLITE_TEXT     3
-
-// =============================================================================
-// Mnemonic Functions
-// =============================================================================
-
-/// Generate a 24-word BIP-39 mnemonic
-/// @param output Buffer of at least 256 bytes
-/// @return Length of mnemonic string, or 0 on failure
+// Key generation
 size_t zipherx_generate_mnemonic(uint8_t *output);
-
-/// Validate a BIP-39 mnemonic
-/// @param mnemonic Null-terminated mnemonic string
-/// @return true if valid
 bool zipherx_validate_mnemonic(const char *mnemonic);
-
-/// Derive seed from mnemonic (PBKDF2-SHA512)
-/// @param mnemonic Null-terminated mnemonic string
-/// @param output Buffer of at least 64 bytes for seed
-/// @return true on success
-bool zipherx_mnemonic_to_seed(const char *mnemonic, uint8_t *output);
-
-// =============================================================================
-// Key Derivation Functions
-// =============================================================================
-
-/// Derive spending key from seed (outputs 96 bytes: ask+nsk+ovk)
-/// @param seed 64-byte seed
-/// @param account Account index
-/// @param sk_out Buffer of at least 96 bytes for spending key components
-/// @return true on success
+bool zipherx_mnemonic_to_seed(const char *mnemonic, uint8_t *seed_out);
 bool zipherx_derive_spending_key(const uint8_t *seed, uint32_t account, uint8_t *sk_out);
+bool zipherx_derive_address(const uint8_t *sk, uint64_t diversifier_index, uint8_t *addr_out);
 
-/// Derive payment address from spending key
-/// @param sk 96-byte spending key (ask+nsk+ovk)
-/// @param diversifier_index Diversifier index
-/// @param address_out Buffer of at least 43 bytes for address
-/// @return true on success
-bool zipherx_derive_address(const uint8_t *sk, uint64_t diversifier_index, uint8_t *address_out);
+// Address encoding/decoding
+size_t zipherx_encode_address(const uint8_t *addr_bytes, uint8_t *output);
+bool zipherx_decode_address(const char *addr_str, uint8_t *output);
 
-/// Derive incoming viewing key from spending key
-/// @param sk 96-byte spending key
-/// @param ivk_out Buffer of at least 32 bytes for ivk
-/// @return true on success
-bool zipherx_derive_ivk(const uint8_t *sk, uint8_t *ivk_out);
+// Note decryption
+// Decrypt note using IVK (32 bytes) - returns decrypted data length
+size_t zipherx_try_decrypt_note(
+    const uint8_t *ivk,       // 32 bytes
+    const uint8_t *epk,       // 32 bytes
+    const uint8_t *cmu,       // 32 bytes
+    const uint8_t *ciphertext,// 580 bytes
+    uint8_t *output           // 564 bytes output
+);
 
-/// Compute nullifier for a note
-/// @param viewing_key 32-byte viewing key
-/// @param diversifier 11-byte diversifier
-/// @param value Note value in zatoshis
-/// @param rcm 32-byte randomness
-/// @param position Note position in tree
-/// @param nf_out Buffer of at least 32 bytes for nullifier
-/// @return true on success
-bool zipherx_compute_nullifier(const uint8_t *viewing_key,
-                                const uint8_t *diversifier,
-                                uint64_t value,
-                                const uint8_t *rcm,
-                                uint64_t position,
-                                uint8_t *nf_out);
+// Decrypt note using spending key directly (169 bytes)
+size_t zipherx_try_decrypt_note_with_sk(
+    const uint8_t *sk,        // 169 bytes
+    const uint8_t *epk,       // 32 bytes
+    const uint8_t *cmu,       // 32 bytes
+    const uint8_t *ciphertext,// 580 bytes
+    uint8_t *output           // 564 bytes output
+);
 
-// =============================================================================
-// Address Functions
-// =============================================================================
+// Full viewing key derivation
+bool zipherx_derive_fvk(const uint8_t *sk, uint8_t *fvk_out);
+bool zipherx_derive_ivk(const uint8_t *fvk, uint8_t *ivk_out);
 
-/// Encode address bytes as Zclassic z-address string
-/// @param address 43-byte address
-/// @param output Buffer of at least 128 bytes
-/// @return Length of encoded string
-size_t zipherx_encode_address(const uint8_t *address, uint8_t *output);
+/// Derive outgoing viewing key from spending key
+bool zipherx_derive_ovk(const uint8_t *sk, uint8_t *ovk_out);
 
-/// Decode Zclassic z-address string to bytes
-/// @param address_str Null-terminated z-address string
-/// @param output Buffer of at least 43 bytes
-/// @return true on success
-bool zipherx_decode_address(const char *address_str, uint8_t *output);
-
-/// Validate a z-address
-/// @param address_str Null-terminated z-address string
-/// @return true if valid
-bool zipherx_validate_address(const char *address_str);
-
-// =============================================================================
-// Note Decryption
-// =============================================================================
-
-/// Try to decrypt a Sapling note with incoming viewing key
-/// @param ivk 32-byte incoming viewing key
-/// @param epk 32-byte ephemeral public key
-/// @param cmu 32-byte note commitment
-/// @param ciphertext 580-byte encrypted ciphertext
-/// @param output Buffer of at least 564 bytes for decrypted plaintext
-/// @return 564 on success (decrypted length), 0 if note not for us
-size_t zipherx_try_decrypt_note(const uint8_t *ivk,
-                                 const uint8_t *epk,
-                                 const uint8_t *cmu,
-                                 const uint8_t *ciphertext,
-                                 uint8_t *output);
-
-/// Try to decrypt a Sapling note using the spending key
-/// Uses the full zcash_primitives derivation
-/// @param sk 169-byte extended spending key
-/// @param epk 32-byte ephemeral public key
-/// @param cmu 32-byte note commitment
-/// @param ciphertext 580-byte encrypted ciphertext
-/// @param output Buffer of at least 564 bytes for decrypted plaintext
-/// @return 564 on success (decrypted length), 0 if note not for us
-size_t zipherx_try_decrypt_note_with_sk(const uint8_t *sk,
-                                         const uint8_t *epk,
-                                         const uint8_t *cmu,
-                                         const uint8_t *ciphertext,
-                                         uint8_t *output);
-
-// =============================================================================
-// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
-// =============================================================================
-
-/// Batch decrypt multiple shielded outputs in parallel using Rayon
-/// Input format (per output, 644 bytes): epk(32) + cmu(32) + ciphertext(580)
-/// Output format (per output, 564 bytes): found(1) + diversifier(11) + value(8) + rcm(32) + memo(512)
-/// @param sk 169-byte spending key
-/// @param outputs_data Packed array of outputs (644 bytes each)
-/// @param output_count Number of outputs to process
-/// @param height Block height for version byte validation
-/// @param results Output buffer (564 bytes per output)
-/// @return Number of successfully decrypted notes
-size_t zipherx_try_decrypt_notes_parallel(const uint8_t *sk,
-                                           const uint8_t *outputs_data,
-                                           size_t output_count,
-                                           uint64_t height,
-                                           uint8_t *results);
-
-/// Get the number of CPU threads Rayon will use for parallel decryption
-size_t zipherx_get_rayon_threads(void);
-
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-/// Get library version
-/// @return Version number (3 = with Buttercup support)
-uint32_t zipherx_version(void);
-
-/// Get the consensus branch ID for a given height on Zclassic
-/// @param height Block height
-/// @return Branch ID as u32 (e.g., 0x930b540d for Buttercup at height >= 707000)
-uint32_t zipherx_get_branch_id(uint64_t height);
-
-/// Verify the library is using the correct ZclassicButtercup fork
-/// @return true if using local fork with Buttercup support (0x930b540d)
-bool zipherx_verify_buttercup_support(void);
-
-/// Double hash (BLAKE2b)
-/// @param data Input data
-/// @param len Input length
-/// @param output Buffer of at least 32 bytes
-/// @return true on success
-bool zipherx_double_sha256(const uint8_t *data, size_t len, uint8_t *output);
-
-/// Free a buffer allocated by the library
-/// @param ptr Pointer to free
-/// @param len Length of buffer
-void zipherx_free(uint8_t *ptr, size_t len);
-
-// =============================================================================
-// Spending Key Encoding/Decoding (Bech32)
-// =============================================================================
-
-/// Encode spending key as Bech32 string (secret-extended-key-main1...)
-/// @param sk 169-byte spending key
-/// @param output Buffer of at least 512 bytes for encoded string
-/// @return Length of encoded string, or 0 on failure
-size_t zipherx_encode_spending_key(const uint8_t *sk, uint8_t *output);
-
-/// Decode Bech32 spending key string to bytes
-/// @param encoded Null-terminated Bech32 string
-/// @param output Buffer of at least 169 bytes for spending key
-/// @return true on success
-bool zipherx_decode_spending_key(const char *encoded, uint8_t *output);
-
-// =============================================================================
-// Transaction Building Functions
-// =============================================================================
-
-/// Initialize the prover with Sapling parameters from file paths
-/// NOTE: May fail on macOS with Hardened Runtime - use zipherx_init_prover_from_bytes instead
-/// @param spend_path Path to sapling-spend.params
-/// @param output_path Path to sapling-output.params
-/// @return true on success
+// Prover initialization
 bool zipherx_init_prover(const char *spend_path, const char *output_path);
 
-/// Initialize the prover with Sapling parameters from raw byte arrays
-/// Use this when file access from Rust is restricted (e.g., Hardened Runtime)
-/// @param spend_data Pointer to spend params bytes
-/// @param spend_len Length of spend params (47958396 bytes)
-/// @param output_data Pointer to output params bytes
-/// @param output_len Length of output params (3592860 bytes)
-/// @return true on success
-bool zipherx_init_prover_from_bytes(const uint8_t *spend_data, size_t spend_len,
-                                     const uint8_t *output_data, size_t output_len);
+/// Initialize prover from memory (for macOS Hardened Runtime)
+bool zipherx_init_prover_from_bytes(
+    const uint8_t *spend_data,
+    size_t spend_len,
+    const uint8_t *output_data,
+    size_t output_len
+);
 
-/// Build a complete shielded transaction
-/// @param sk Extended spending key (169 bytes)
-/// @param to_address Destination address bytes (43 bytes)
-/// @param amount Amount in zatoshis
-/// @param memo Optional memo (512 bytes)
-/// @param anchor Merkle tree anchor (32 bytes)
-/// @param witness_data Serialized witness
-/// @param witness_len Length of witness data
-/// @param note_value Value of note being spent
-/// @param note_rcm Note randomness (32 bytes)
-/// @param note_diversifier Note diversifier (11 bytes)
-/// @param tx_out Output buffer for transaction (at least 10000 bytes)
-/// @param tx_out_len Output for transaction length
-/// @return true on success
-bool zipherx_build_transaction(const uint8_t *sk,
-                                const uint8_t *to_address,
-                                uint64_t amount,
-                                const uint8_t *memo,
-                                const uint8_t *anchor,
-                                const uint8_t *witness_data,
-                                size_t witness_len,
-                                uint64_t note_value,
-                                const uint8_t *note_rcm,
-                                const uint8_t *note_diversifier,
-                                uint64_t chain_height,
-                                uint8_t *tx_out,
-                                size_t *tx_out_len);
+// Transaction building
+bool zipherx_build_transaction(
+    const uint8_t *sk,
+    const uint8_t *to_address,
+    uint64_t amount,
+    const uint8_t *memo,
+    const uint8_t *anchor,
+    const uint8_t *witness_data,
+    size_t witness_len,
+    uint64_t note_value,
+    const uint8_t *note_rcm,
+    const uint8_t *note_diversifier,
+    uint64_t chain_height,
+    uint8_t *tx_out,
+    size_t *tx_out_len
+);
 
-/// Spend information for multi-input transactions
+// Spend information for multi-input transactions
 typedef struct {
     const uint8_t *witness_data;    // Serialized IncrementalWitness data
     size_t witness_len;              // Length of witness data
@@ -315,18 +83,10 @@ typedef struct {
     const uint8_t *note_diversifier; // Note diversifier (11 bytes)
 } SpendInfo;
 
-/// Build a shielded transaction with multiple input notes
-/// @param sk Extended spending key (169 bytes)
-/// @param to_address Destination address bytes (43 bytes)
-/// @param amount Amount to send in zatoshis
-/// @param memo Optional memo (512 bytes, can be NULL)
-/// @param spends Array of SpendInfo pointers
-/// @param spend_count Number of spends
-/// @param chain_height Current chain height (for branch ID selection)
-/// @param tx_out Output buffer for transaction (at least 10000 bytes)
-/// @param tx_out_len Output for transaction length
-/// @param nullifiers_out Output buffer for nullifiers (32 bytes * spend_count)
-/// @return true on success
+// Build a shielded transaction with multiple input notes
+// spends: array of SpendInfo pointers
+// spend_count: number of spends
+// nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
 bool zipherx_build_transaction_multi(
     const uint8_t *sk,
     const uint8_t *to_address,
@@ -340,140 +100,31 @@ bool zipherx_build_transaction_multi(
     uint8_t *nullifiers_out
 );
 
-/// Compute a value commitment
-/// @param value Value in zatoshis
-/// @param rcv 32-byte random scalar
-/// @param cv_out Buffer for 32-byte commitment
-/// @return true on success
-bool zipherx_compute_value_commitment(uint64_t value, const uint8_t *rcv, uint8_t *cv_out);
-
-/// Generate a random scalar
-/// @param output Buffer for 32-byte scalar
-/// @return true on success
-bool zipherx_random_scalar(uint8_t *output);
-
-/// Encrypt note plaintext
-/// @param diversifier 11-byte diversifier
-/// @param pk_d 32-byte pk_d
-/// @param value Note value
-/// @param rcm 32-byte randomness
-/// @param memo 512-byte memo
-/// @param epk_out Output for 32-byte ephemeral key
-/// @param enc_out Output for 580-byte ciphertext
-/// @return true on success
-bool zipherx_encrypt_note(const uint8_t *diversifier,
-                           const uint8_t *pk_d,
-                           uint64_t value,
-                           const uint8_t *rcm,
-                           const uint8_t *memo,
-                           uint8_t *epk_out,
-                           uint8_t *enc_out);
-
-// =============================================================================
-// Commitment Tree Functions
-// =============================================================================
-
-/// Initialize a new empty Sapling commitment tree
-/// @return true on success
+// Commitment tree functions
 bool zipherx_tree_init(void);
-
-/// Append a note commitment to the tree
-/// @param cmu 32-byte note commitment
-/// @return Position of the added commitment, or UINT64_MAX on error
 uint64_t zipherx_tree_append(const uint8_t *cmu);
-
-/// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
-/// @param cmus_data Packed CMU data (32 bytes per CMU, in wire format)
-/// @param cmu_count Number of CMUs to append
-/// @return Starting position of the first CMU, or UINT64_MAX on error
-uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);
-
-/// Create a witness for the current position
-/// @return Witness index, or UINT64_MAX on error
+uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);  // Batch append (faster)
 uint64_t zipherx_tree_witness_current(void);
-
-/// Load a witness from saved data into memory for updating
-/// @param witness_data Saved witness data (1028 bytes)
-/// @param witness_len Length of witness data
-/// @return Witness index, or UINT64_MAX on error
-uint64_t zipherx_tree_load_witness(const uint8_t *witness_data, size_t witness_len);
-
-/// Get the current tree root
-/// @param root_out Buffer for 32-byte root
-/// @return true on success
 bool zipherx_tree_root(uint8_t *root_out);
-
-/// Get witness data for a specific index
-/// @param witness_index Index from tree_witness_current
-/// @param witness_out Buffer for 1028 bytes (4 pos + 32*32 path)
-/// @return true on success
 bool zipherx_tree_get_witness(uint64_t witness_index, uint8_t *witness_out);
-
-/// Get current tree size
-/// @return Number of commitments in tree
 uint64_t zipherx_tree_size(void);
-
-/// Serialize tree state for persistence
-/// @param tree_out Buffer for serialized data
-/// @param tree_out_len Output for actual length
-/// @return true on success
 bool zipherx_tree_serialize(uint8_t *tree_out, size_t *tree_out_len);
-
-/// Deserialize tree state from persistence
-/// @param tree_data Serialized tree data
-/// @param tree_len Length of data
-/// @return true on success
 bool zipherx_tree_deserialize(const uint8_t *tree_data, size_t tree_len);
 
-/// Load tree from raw CMUs file format
-/// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
-/// @param data CMU file data
-/// @param data_len Length of data
-/// @return true on success
+// Load commitment tree from bundled CMU file
 bool zipherx_tree_load_from_cmus(const uint8_t *data, size_t data_len);
 
-/// Progress callback type for tree loading: (current, total)
+// Progress callback type for tree loading: (current, total)
 typedef void (*TreeLoadProgressCallback)(uint64_t current, uint64_t total);
 
-/// Load tree from raw CMUs file format with progress callback
-/// @param data CMU file data
-/// @param data_len Length of data
-/// @param progress_callback Callback called with (current, total) during loading
-/// @return true on success
+// Load commitment tree from bundled CMU file with progress callback
 bool zipherx_tree_load_from_cmus_with_progress(
     const uint8_t *data,
     size_t data_len,
     TreeLoadProgressCallback progress_callback
 );
 
-/// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
-/// This eliminates PHASE 1.5 by combining tree loading with witness creation.
-/// @param data Bundled CMU data [count: u64][cmu1: 32]...
-/// @param data_len Length of CMU data
-/// @param target_cmus Array of 32-byte target CMUs to create witnesses for
-/// @param target_count Number of target CMUs
-/// @param positions_out Output array for positions (uint64_t * target_count)
-/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
-/// @param progress_callback Progress callback(current, total)
-/// @return Number of witnesses successfully created
-size_t zipherx_tree_load_with_witnesses(
-    const uint8_t *data,
-    size_t data_len,
-    const uint8_t *target_cmus,
-    size_t target_count,
-    uint64_t *positions_out,
-    uint8_t *witnesses_out,
-    TreeLoadProgressCallback progress_callback
-);
-
-/// Create a witness for a specific CMU from bundled CMU data
-/// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
-/// @param cmu_data Pointer to bundled CMU file data [count: u64][cmu1: 32]...
-/// @param cmu_data_len Length of CMU data
-/// @param target_cmu The 32-byte CMU to create witness for
-/// @param witness_out Output buffer for serialized witness (at least 2000 bytes)
-/// @param witness_out_len Output for actual witness length
-/// @return The position (0-indexed) of the CMU, or UINT64_MAX on error
+// Create witness for a specific CMU from bundled data
 uint64_t zipherx_tree_create_witness_for_cmu(
     const uint8_t *cmu_data,
     size_t cmu_data_len,
@@ -482,28 +133,26 @@ uint64_t zipherx_tree_create_witness_for_cmu(
     size_t *witness_out_len
 );
 
-/// Find the position of a CMU in bundled CMU data (fast binary search, no tree building)
-/// @param cmu_data Pointer to bundled CMU file data [count: u64][cmu1: 32]...
-/// @param cmu_data_len Length of CMU data
-/// @param target_cmu The 32-byte CMU to find
-/// @return The position (0-indexed) of the CMU, or UINT64_MAX if not found
+// Find position of a CMU in bundled data (fast, no tree building)
 uint64_t zipherx_find_cmu_position(
     const uint8_t *cmu_data,
     size_t cmu_data_len,
     const uint8_t *target_cmu
 );
 
-/// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
-/// Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
-/// because it only builds the tree ONCE instead of N times.
-///
-/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
-/// @param cmu_data_len Length of CMU data
-/// @param target_cmus Array of 32-byte CMUs to create witnesses for
-/// @param target_count Number of target CMUs
-/// @param positions_out Output array for positions (u64 * target_count)
-/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
-/// @return Number of witnesses successfully created
+// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+// Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+// because it only builds the tree ONCE instead of N times.
+//
+// Parameters:
+// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+// - cmu_data_len: Length of CMU data
+// - target_cmus: Array of 32-byte CMUs to create witnesses for
+// - target_count: Number of target CMUs
+// - positions_out: Output array for positions (u64 * target_count)
+// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+//
+// Returns: Number of witnesses successfully created
 size_t zipherx_tree_create_witnesses_batch(
     const uint8_t *cmu_data,
     size_t cmu_data_len,
@@ -513,16 +162,12 @@ size_t zipherx_tree_create_witnesses_batch(
     uint8_t *witnesses_out
 );
 
-/// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
-/// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
-/// Each witness gets its own thread building tree to that position.
-/// @param target_cmus Array of 32-byte CMUs to create witnesses for
-/// @param target_count Number of target CMUs
-/// @param cmu_data Bundled CMU file [count: u64][cmu1: 32]...
-/// @param cmu_data_len Length of CMU data
-/// @param positions_out Output array for positions (u64 * target_count)
-/// @param witnesses_out Output array for witnesses (1028 bytes * target_count)
-/// @return Number of witnesses successfully created
+// Create witnesses for MULTIPLE CMUs using PARALLEL processing (Rayon)
+// This is the FASTEST option - uses all CPU cores via Rayon work-stealing.
+// Each witness gets its own thread building tree to that position.
+//
+// Parameters: same as zipherx_tree_create_witnesses_batch
+// Returns: Number of witnesses successfully created
 size_t zipherx_tree_create_witnesses_parallel(
     const uint8_t *target_cmus,
     size_t target_count,
@@ -532,89 +177,117 @@ size_t zipherx_tree_create_witnesses_parallel(
     uint8_t *witnesses_out
 );
 
-/// Extract the Merkle root (anchor) from a serialized witness
-/// @param witness_data Serialized witness (1028 bytes from treeCreateWitnessesBatch)
-/// @param witness_len Length of witness data
-/// @param root_out 32-byte output buffer for the root
-/// @return true if successful
+// Extract the Merkle root (anchor) from a serialized witness
+// witness_data: serialized witness (1028 bytes from treeCreateWitnessesBatch)
+// witness_len: length of witness data
+// root_out: 32-byte output buffer for the root
+// Returns: true if successful
 bool zipherx_witness_get_root(
     const uint8_t *witness_data,
     size_t witness_len,
     uint8_t *root_out
 );
 
-// =============================================================================
-// OVK Output Recovery (for viewing sent transactions)
-// =============================================================================
-
-/// Try to recover a sent note using the outgoing viewing key
-/// @param ovk 32-byte outgoing viewing key
-/// @param cv 32-byte value commitment
-/// @param cmu 32-byte note commitment
-/// @param epk 32-byte ephemeral public key
-/// @param enc_ciphertext 580-byte encrypted ciphertext
-/// @param out_ciphertext 80-byte output ciphertext
-/// @param output Buffer for result (at least 620 bytes)
-/// @return Length of output on success, 0 on failure
-size_t zipherx_try_recover_output_with_ovk(const uint8_t *ovk,
-                                            const uint8_t *cv,
-                                            const uint8_t *cmu,
-                                            const uint8_t *epk,
-                                            const uint8_t *enc_ciphertext,
-                                            const uint8_t *out_ciphertext,
-                                            uint8_t *output);
-
-/// Derive OVK from extended spending key
-/// @param sk 169-byte extended spending key
-/// @param ovk_out Buffer for 32-byte OVK
-/// @return true on success
-bool zipherx_derive_ovk(const uint8_t *sk, uint8_t *ovk_out);
+// Compute nullifier for a note
+bool zipherx_compute_nullifier(
+    const uint8_t *spending_key,
+    const uint8_t *diversifier,
+    uint64_t value,
+    const uint8_t *rcm,
+    uint64_t position,
+    uint8_t *nf_out
+);
 
 // =============================================================================
-// Equihash Proof-of-Work Verification (trustless header validation)
+// Parallel Note Decryption (Rayon-based, ~6.7x speedup)
 // =============================================================================
 
-/// Verify Equihash(200,9) solution for a block header
-/// @param header_bytes 140-byte block header (includes 32-byte nonce at end)
-/// @param solution Equihash solution bytes (typically 1344 bytes)
-/// @param solution_len Length of solution
-/// @return true if solution is valid
-bool zipherx_verify_equihash(const uint8_t *header_bytes,
-                              const uint8_t *solution,
-                              size_t solution_len);
+// Batch decrypt multiple shielded outputs in parallel using Rayon
+//
+// Input format (per output, 644 bytes total):
+// - epk: 32 bytes (ephemeral public key)
+// - cmu: 32 bytes (note commitment)
+// - ciphertext: 580 bytes (encrypted note)
+//
+// Output format (per output, 564 bytes total):
+// - found: 1 byte (0 = not ours, 1 = decrypted successfully)
+// - diversifier: 11 bytes (only valid if found == 1)
+// - value: 8 bytes little-endian u64 (only valid if found == 1)
+// - rcm: 32 bytes (only valid if found == 1)
+// - memo: 512 bytes (only valid if found == 1)
+//
+// Parameters:
+// - sk: spending key (169 bytes)
+// - outputs_data: packed array of outputs (644 bytes each)
+// - output_count: number of outputs to process
+// - height: block height (for version byte validation)
+// - results: output buffer (564 bytes per output)
+//
+// Returns: number of successfully decrypted notes
+size_t zipherx_try_decrypt_notes_parallel(
+    const uint8_t *sk,
+    const uint8_t *outputs_data,
+    size_t output_count,
+    uint64_t height,
+    uint8_t *results
+);
 
-/// Compute block hash (double SHA256) from header + solution
-/// @param header_bytes 140-byte block header
-/// @param solution Equihash solution bytes
-/// @param solution_len Length of solution
-/// @param hash_out Output buffer for 32-byte hash (internal byte order)
-/// @return true on success
-bool zipherx_compute_block_hash(const uint8_t *header_bytes,
-                                 const uint8_t *solution,
-                                 size_t solution_len,
-                                 uint8_t *hash_out);
+// Get the number of CPU threads Rayon will use for parallel decryption
+size_t zipherx_get_rayon_threads(void);
 
-/// Verify a chain of block headers for continuity and valid PoW
-/// @param headers_data Concatenated header data (140 bytes + varint + solution each)
-/// @param headers_count Number of headers
-/// @param expected_prev_hash Expected prevHash of first header (32 bytes), or NULL
-/// @param header_offsets Array of byte offsets for each header
-/// @param header_sizes Array of total sizes for each header
-/// @return true if all headers valid and chain is continuous
-bool zipherx_verify_header_chain(const uint8_t *headers_data,
-                                  size_t headers_count,
-                                  const uint8_t *expected_prev_hash,
-                                  const size_t *header_offsets,
-                                  const size_t *header_sizes);
+// =============================================================================
+// Equihash Proof-of-Work Verification (for trustless header validation)
+// =============================================================================
 
-/// Verify a single block header and get its hash
-/// @param header_and_solution Full header data (140 bytes + varint + solution)
-/// @param total_len Total length of data
-/// @param hash_out Output buffer for 32-byte block hash
-/// @return true if header is valid
-bool zipherx_verify_block_header(const uint8_t *header_and_solution,
-                                  size_t total_len,
-                                  uint8_t *hash_out);
+// Verify Equihash(200,9) solution for a block header
+// header_bytes: 140-byte block header (includes 32-byte nonce at end)
+// solution: Equihash solution bytes (typically 1344 bytes)
+// solution_len: Length of solution
+// Returns true if solution is valid
+bool zipherx_verify_equihash(
+    const uint8_t *header_bytes,
+    const uint8_t *solution,
+    size_t solution_len
+);
+
+// Compute block hash (double SHA256) from header + solution
+// header_bytes: 140-byte block header
+// solution: Equihash solution bytes
+// solution_len: Length of solution
+// hash_out: Output buffer for 32-byte hash (internal byte order)
+// Returns true on success
+bool zipherx_compute_block_hash(
+    const uint8_t *header_bytes,
+    const uint8_t *solution,
+    size_t solution_len,
+    uint8_t *hash_out
+);
+
+// Verify a chain of block headers for continuity and valid PoW
+// headers_data: Concatenated header data (140 bytes + varint + solution each)
+// headers_count: Number of headers
+// expected_prev_hash: Expected prevHash of first header (32 bytes), or NULL
+// header_offsets: Array of byte offsets for each header
+// header_sizes: Array of total sizes for each header
+// Returns true if all headers valid and chain is continuous
+bool zipherx_verify_header_chain(
+    const uint8_t *headers_data,
+    size_t headers_count,
+    const uint8_t *expected_prev_hash,
+    const size_t *header_offsets,
+    const size_t *header_sizes
+);
+
+// Verify a single block header and get its hash
+// header_and_solution: Full header data (140 bytes + varint + solution)
+// total_len: Total length of data
+// hash_out: Output buffer for 32-byte block hash
+// Returns true if header is valid
+bool zipherx_verify_block_header(
+    const uint8_t *header_and_solution,
+    size_t total_len,
+    uint8_t *hash_out
+);
 
 // =============================================================================
 // VUL-002 FIX: Encrypted Key Operations
@@ -631,24 +304,11 @@ bool zipherx_verify_block_header(const uint8_t *header_and_solution,
 // The encryption key (32 bytes) is derived from device ID + salt using HKDF
 // on the Swift side and passed separately.
 
-/// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
-/// The spending key is decrypted only within Rust and zeroed after use
-/// @param encrypted_sk 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
-/// @param encrypted_sk_len Length of encrypted key (should be 197)
-/// @param encryption_key 32-byte AES-256 key for decryption
-/// @param to_address Destination address bytes (43 bytes)
-/// @param amount Amount in zatoshis
-/// @param memo Optional memo (512 bytes)
-/// @param anchor Merkle tree anchor (32 bytes)
-/// @param witness_data Serialized witness
-/// @param witness_len Length of witness data
-/// @param note_value Value of note being spent
-/// @param note_rcm Note randomness (32 bytes)
-/// @param note_diversifier Note diversifier (11 bytes)
-/// @param chain_height Current chain height
-/// @param tx_out Output buffer for transaction (at least 10000 bytes)
-/// @param tx_out_len Output for transaction length
-/// @return true on success
+// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
+// encrypted_sk: 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
+// encrypted_sk_len: length of encrypted key (should be 197)
+// encryption_key: 32-byte AES-256 key for decryption
+// Other parameters same as zipherx_build_transaction
 bool zipherx_build_transaction_encrypted(
     const uint8_t *encrypted_sk,
     size_t encrypted_sk_len,
@@ -667,21 +327,11 @@ bool zipherx_build_transaction_encrypted(
     size_t *tx_out_len
 );
 
-/// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
-/// The spending key is decrypted only within Rust and zeroed after use
-/// @param encrypted_sk 197-byte AES-GCM encrypted spending key
-/// @param encrypted_sk_len Length of encrypted key (should be 197)
-/// @param encryption_key 32-byte AES-256 key for decryption
-/// @param to_address Destination address bytes (43 bytes)
-/// @param amount Amount to send in zatoshis
-/// @param memo Optional memo (512 bytes, can be NULL)
-/// @param spends Array of SpendInfo pointers
-/// @param spend_count Number of spends
-/// @param chain_height Current chain height
-/// @param tx_out Output buffer for transaction (at least 10000 bytes)
-/// @param tx_out_len Output for transaction length
-/// @param nullifiers_out Output buffer for nullifiers (32 bytes * spend_count)
-/// @return true on success
+// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
+// encrypted_sk: 197-byte AES-GCM encrypted spending key
+// encrypted_sk_len: length of encrypted key (should be 197)
+// encryption_key: 32-byte AES-256 key for decryption
+// Other parameters same as zipherx_build_transaction_multi
 bool zipherx_build_transaction_multi_encrypted(
     const uint8_t *encrypted_sk,
     size_t encrypted_sk_len,
@@ -701,9 +351,9 @@ bool zipherx_build_transaction_multi_encrypted(
 // Boost File Scanning - Complete wallet scan in Rust
 // =============================================================================
 
-/// Result for a discovered note from boost file scanning
-/// Contains all data needed to store in database and build transactions
-/// PRODUCTION: Now includes received_txid - no more placeholders!
+// Result for a discovered note from boost file scanning
+// Contains all data needed to store in database and build transactions
+// PRODUCTION: Now includes spent_txid and received_txid (FIX #374)
 typedef struct {
     uint32_t height;           // Block height where note was received
     uint64_t position;         // Position in commitment tree (for nullifier)
@@ -714,12 +364,12 @@ typedef struct {
     uint8_t nullifier[32];     // Computed nullifier
     uint8_t is_spent;          // 1 if spent, 0 if unspent
     uint32_t spent_height;     // Block height where note was spent (0 if unspent)
-    uint8_t spent_txid[32];    // Real txid of spending transaction (zeros if unspent)
-    uint8_t received_txid[32]; // PRODUCTION: Real txid that created this output (no more placeholders!)
+    uint8_t spent_txid[32];    // Real txid of spending transaction
+    uint8_t received_txid[32]; // Real txid that created this output
     uint8_t _padding[3];       // Alignment padding
 } BoostScanNote;
 
-/// Summary result from boost scan
+// Summary result from boost scan
 typedef struct {
     uint64_t total_received;   // Total value of all notes found
     uint64_t total_spent;      // Total value of spent notes
@@ -729,20 +379,20 @@ typedef struct {
     uint32_t spends_checked;   // Number of spends in boost file
 } BoostScanResult;
 
-/// Scan boost file outputs section and return discovered notes with nullifiers
-/// Performs complete PHASE 1 + PHASE 1.6 scanning in Rust:
-/// 1. Parse outputs from boost data (684 bytes per output - PRODUCTION v2 includes txid)
-/// 2. Parse spends from boost data (68 bytes per spend: height + nullifier + txid)
-/// 3. Parallel note decryption using Rayon
-/// 4. Compute nullifiers for each discovered note
-/// 5. Check nullifiers against spends to detect spent notes
-///
-/// Returns: Number of notes written to notes_out
+// Scan boost file outputs section and return discovered notes with nullifiers
+// Performs complete PHASE 1 + PHASE 1.6 scanning:
+// 1. Parse outputs from boost data (652 bytes per output)
+// 2. Parse spends from boost data (36 bytes per spend)
+// 3. Parallel note decryption using Rayon
+// 4. Compute nullifiers for each discovered note
+// 5. Check nullifiers against spends to detect spent notes
+//
+// Returns: Number of notes written to notes_out
 size_t zipherx_scan_boost_outputs(
     const uint8_t *sk,              // Extended spending key (169 bytes)
-    const uint8_t *outputs_data,    // Outputs section (684 bytes per output - includes txid)
+    const uint8_t *outputs_data,    // Outputs section (652 bytes per output)
     size_t output_count,            // Number of outputs
-    const uint8_t *spends_data,     // Spends section (68 bytes per spend)
+    const uint8_t *spends_data,     // Spends section (36 bytes per spend)
     size_t spend_count,             // Number of spends
     BoostScanNote *notes_out,       // Output buffer for discovered notes
     size_t max_notes,               // Maximum notes that can fit
@@ -786,149 +436,234 @@ bool zipherx_verify_transaction(
 );
 
 // =============================================================================
-// Tor (Arti) Integration - Embedded Tor for iOS and macOS
+// Tor (Arti) Integration
 // =============================================================================
 
-/// Start the embedded Tor client (Arti)
-/// Returns 0 on success, 1 on error
+// Start the embedded Tor client
+// Returns 0 on success, 1 on error
 int32_t zipherx_tor_start(void);
 
-/// Stop the Tor client
-/// Returns 0 on success
+// Stop the Tor client
+// Returns 0 on success
 int32_t zipherx_tor_stop(void);
 
-/// Get current Tor state
-/// 0 = Disconnected, 1 = Connecting, 2 = Bootstrapping, 3 = Connected, 4 = Error
+// Get current Tor state
+// 0 = Disconnected, 1 = Connecting, 2 = Bootstrapping, 3 = Connected, 4 = Error
 uint8_t zipherx_tor_get_state(void);
 
-/// Get bootstrap progress (0-100)
+// Get bootstrap progress (0-100)
 uint8_t zipherx_tor_get_progress(void);
 
-/// Get SOCKS proxy port (0 if not connected)
+// Get SOCKS proxy port (0 if not connected)
 uint16_t zipherx_tor_get_socks_port(void);
 
-/// Get last error message
-/// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Get last error message
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
 char* zipherx_tor_get_error(void);
 
-/// Request new Tor identity (new circuit)
-/// Returns 0 on success
+// Request new Tor identity (new circuit)
+// Returns 0 on success
 int32_t zipherx_tor_new_identity(void);
 
-/// Make an HTTP GET request through Tor
-/// Returns response body as null-terminated string (caller must free with zipherx_tor_free_string)
-/// Returns NULL on error
+// Make an HTTP GET request through Tor
+// Returns response body as null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL on error
 char* zipherx_tor_http_get(const char *url);
 
-/// Free a string allocated by Tor functions
+// Free a string allocated by Tor functions
 void zipherx_tor_free_string(char *ptr);
 
-/// Check if Tor is available (compiled in)
+// Check if Tor is available (compiled in)
 bool zipherx_tor_is_available(void);
 
 // =============================================================================
-// Hidden Service (Onion Hosting) - Make ZipherX discoverable as .onion peer
+// Hidden Service (Onion Hosting)
 // =============================================================================
 
-/// Hidden service state codes
-/// 0 = Stopped, 1 = Starting, 2 = Running, 3 = Error
-typedef uint8_t HiddenServiceState;
-
-/// FIX #272: Callback type for incoming connections
-/// Receives: client_id (unique), host (source address), port (target port)
-/// Must match Rust signature: (connection_id: u64, host_ptr: *const c_char, port: u16)
-typedef void (*HiddenServiceConnectionCallback)(uint64_t client_id, const char *host, uint16_t port);
-
-/// Start the hidden service (Tor onion service)
-/// This makes ZipherX discoverable as a .onion address
-/// Returns 0 on success, 1 on error, 2 if already running
+// Start the hidden service (requires Tor to be connected)
+// Returns 0 on success, 1 on error, 2 if already running
 int32_t zipherx_tor_hidden_service_start(void);
 
-/// Stop the hidden service
-/// Returns 0 on success
+// Stop the hidden service
+// Returns 0 on success
 int32_t zipherx_tor_hidden_service_stop(void);
 
-/// Get hidden service state
-/// 0 = Stopped, 1 = Starting, 2 = Running, 3 = Error
-HiddenServiceState zipherx_tor_hidden_service_get_state(void);
+// Get hidden service state
+// 0 = Not running, 1 = Starting, 2 = Running, 3 = Error
+uint8_t zipherx_tor_hidden_service_get_state(void);
 
-/// Get the .onion address for this hidden service
-/// Returns NULL if not running
-/// Caller must free with zipherx_tor_free_string
+// Get the .onion address of our hidden service
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL if hidden service is not running
 char* zipherx_tor_hidden_service_get_address(void);
 
-/// Set callback for incoming connections
-/// Callback receives client_id and remote_addr
-void zipherx_tor_hidden_service_set_callback(HiddenServiceConnectionCallback callback);
+// Set callback for incoming P2P connections
+// Callback signature: void(connection_id: u64, host_ptr: const char*, port: u16)
+void zipherx_tor_hidden_service_set_callback(
+    void (*callback)(uint64_t connection_id, const char *host_ptr, uint16_t port)
+);
 
-/// Check if hidden service feature is available
+// Check if hidden service feature is available (compiled in)
 bool zipherx_tor_hidden_service_is_available(void);
 
-/// Get hidden service port (typically 8033 for Zclassic P2P)
-uint16_t zipherx_tor_hidden_service_get_port(void);
-
 // =============================================================================
-// MARK: - Hidden Service Keypair (Persistent .onion Address)
+// Persistent Hidden Service Keypair (Fixed .onion Address)
 // =============================================================================
 
-/// Generate a new Ed25519 keypair for hidden service (64 bytes: 32 secret + 32 public)
-/// The keypair determines the .onion address - save it for persistent addresses
-/// Returns 0 on success, 1 on error
+// Generate a new Ed25519 keypair for hidden service
+// Returns 64 bytes (32-byte secret + 32-byte public) into out_keypair buffer
+// Returns 0 on success, 1 on error
 int32_t zipherx_tor_generate_hs_keypair(uint8_t *out_keypair);
 
-/// Set the hidden service keypair from 64 bytes (32-byte secret + 32-byte public)
-/// This keypair will be used when starting the hidden service to maintain a fixed .onion address
-/// Must be called BEFORE zipherx_tor_hidden_service_start()
-/// Returns 0 on success, 1 on error
+// Set the hidden service keypair (64 bytes: secret + public)
+// This enables persistent .onion address across restarts
+// Returns 0 on success, 1 on error
 int32_t zipherx_tor_set_hs_keypair(const uint8_t *keypair, size_t len);
 
-/// Clear the stored hidden service keypair
-/// Next hidden service start will generate a random .onion address
-/// Returns 0 on success
+// Clear the stored keypair (next start will generate random address)
+// Returns 0 on success
 int32_t zipherx_tor_clear_hs_keypair(void);
 
-/// Check if a persistent keypair is set
-/// Returns 1 if keypair is set, 0 if not
+// Check if a persistent keypair is set
+// Returns 1 if set, 0 if not
 int32_t zipherx_tor_has_hs_keypair(void);
 
-/// Get the .onion address that would be generated from the stored keypair
-/// Returns NULL if no keypair is set
-/// Caller must free with zipherx_tor_free_string
+// Get the .onion address from the stored keypair (without starting service)
+// Returns pointer to null-terminated string (caller must free with zipherx_tor_free_string)
+// Returns NULL if no keypair is set
 char* zipherx_tor_get_keypair_onion_address(void);
 
 // =============================================================================
-// MARK: - Cypherpunk Chat (Encrypted P2P Messaging over Tor)
+// Cypherpunk Chat (Encrypted P2P Messaging over Tor)
 // =============================================================================
 
-/// Callback type for incoming chat messages
-/// connection_id: unique identifier for the connection
-/// data_ptr: pointer to encrypted message data
-/// data_len: length of message data
-typedef void (*ChatMessageCallback)(uint64_t connection_id, const uint8_t *data_ptr, size_t data_len);
+// Set callback for incoming chat messages
+// Callback signature: void(connection_id: u64, data_ptr: const u8*, data_len: usize)
+void zipherx_tor_chat_set_callback(
+    void (*callback)(uint64_t connection_id, const uint8_t *data_ptr, size_t data_len)
+);
 
-/// Set callback for incoming chat messages
-void zipherx_tor_chat_set_callback(ChatMessageCallback callback);
-
-/// Get the chat port for ZipherX encrypted messaging (8034)
+// Get the chat port for ZipherX encrypted messaging (8034)
 uint16_t zipherx_tor_chat_get_port(void);
 
-/// Send an encrypted chat message to an .onion address
-/// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
-/// Returns 0 on success, 1 on error
-int32_t zipherx_tor_chat_send(const char *onion_address, const uint8_t *data, size_t data_len);
+// Send an encrypted chat message to an .onion address
+// The message should already be encrypted by the caller (X25519 + ChaCha20-Poly1305)
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_chat_send(
+    const char *onion_address,
+    const uint8_t *data,
+    size_t data_len
+);
 
 // =============================================================================
-// MARK: - FIX #342: Fast HTTP Downloads (Rust reqwest - replaces slow Swift URLSession)
+// Library Info & Branch ID
 // =============================================================================
 
-/// Download a file with resume support using Rust reqwest (much faster than Swift URLSession)
-/// @param url_ptr URL string bytes
-/// @param url_len URL string length
-/// @param dest_path_ptr Destination file path bytes
-/// @param dest_path_len Destination file path length
-/// @param resume_from Byte offset to resume from (0 for fresh download)
-/// @param expected_size Expected total file size (for progress calculation)
-/// @return 0=success, 1=network error, 2=file error, 3=cancelled, 4=other error
+/// Get library version (3 = with ZclassicButtercup support)
+uint32_t zipherx_version(void);
+
+/// Get the consensus branch ID for a given block height
+/// Returns 0x930b540d for heights >= 707,000 (ZclassicButtercup)
+uint32_t zipherx_get_branch_id(uint64_t height);
+
+/// Verify the library supports ZclassicButtercup branch ID
+/// Returns true if the library is built with the correct local fork
+bool zipherx_verify_buttercup_support(void);
+
+/// Get the number of CPU threads Rayon will use for parallel operations
+size_t zipherx_get_rayon_threads(void);
+
+// =============================================================================
+// ZSTD Decompression
+// =============================================================================
+
+/// Decompress ZSTD-compressed data
+/// Returns 1 on success, 0 on failure
+/// Output buffer must be freed with zipherx_free_buffer
+int32_t zipherx_zstd_decompress(
+    const uint8_t *compressed_ptr,
+    size_t compressed_len,
+    uint8_t **out_ptr,
+    size_t *out_len
+);
+
+/// Free a buffer allocated by Rust FFI
+void zipherx_free_buffer(uint8_t *ptr);
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/// Progress callback type for tree loading: (current, total)
+typedef void (*TreeLoadProgressCallback)(uint64_t current, uint64_t total);
+
+/// Compute double SHA256 hash
+/// Returns true on success
+bool zipherx_double_sha256(const uint8_t *input, size_t len, uint8_t *hash_out);
+
+/// Compute value commitment
+bool zipherx_compute_value_commitment(uint64_t value, const uint8_t *rcv, uint8_t *cv_out);
+
+/// Generate random scalar (32 bytes)
+bool zipherx_random_scalar(uint8_t *output);
+
+/// Encrypt a note for transmission
+bool zipherx_encrypt_note(
+    const uint8_t *diversifier,   // 11 bytes
+    const uint8_t *pk_d,          // 32 bytes
+    uint64_t value,
+    const uint8_t *rcm,           // 32 bytes
+    const uint8_t *memo,          // 512 bytes
+    uint8_t *epk_out,             // 32 bytes output
+    uint8_t *enc_out              // 580 bytes output
+);
+
+/// Try to recover output with OVK (for viewing our own outgoing notes)
+/// Returns recovered output length
+size_t zipherx_try_recover_output_with_ovk(
+    const uint8_t *ovk,            // 32 bytes
+    const uint8_t *cv,             // 32 bytes
+    const uint8_t *cmu,            // 32 bytes
+    const uint8_t *epk,            // 32 bytes
+    const uint8_t *enc_ciphertext, // 580 bytes
+    const uint8_t *out_ciphertext, // 80 bytes
+    uint8_t *output                // recovered output
+);
+
+/// Encode spending key as Bech32 string (secret-extended-key-main1...)
+/// Returns length of encoded string
+size_t zipherx_encode_spending_key(const uint8_t *sk, uint8_t *output);
+
+/// Decode Bech32 spending key string to bytes
+/// Returns true on success
+bool zipherx_decode_spending_key(const char *addr_str, uint8_t *sk_out);
+
+/// Validate a z-address
+/// Returns true if valid
+bool zipherx_validate_address(const char *addr_str);
+
+/// Load witness from serialized data (1028 bytes)
+/// Returns witness index or u64::MAX on error
+uint64_t zipherx_tree_load_witness(const uint8_t *witness_data, size_t witness_len);
+
+/// Load commitment tree and create witnesses for multiple CMUs in one pass
+/// Returns number of witnesses created
+size_t zipherx_tree_load_with_witnesses(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmus,
+    size_t target_count,
+    uint64_t *positions_out,
+    uint8_t *witnesses_out,
+    TreeLoadProgressCallback progress_callback
+);
+
+// =============================================================================
+// FIX #342: Fast HTTP Downloads (Rust reqwest - replaces slow Swift URLSession)
+// =============================================================================
+
+// Download a file with resume support
+// Returns: 0=success, 1=network error, 2=file error, 3=cancelled, 4=other error
 int32_t zipherx_download_file(
     const uint8_t *url_ptr,
     size_t url_len,
@@ -938,25 +673,18 @@ int32_t zipherx_download_file(
     uint64_t expected_size
 );
 
-/// Get current download progress (thread-safe, call from Swift timer)
-/// @param bytes_downloaded Output for bytes downloaded so far
-/// @param total_bytes Output for total expected bytes
-/// @param speed_bps Output for current speed in bytes per second
+// Get current download progress (thread-safe, call from Swift timer)
 void zipherx_download_get_progress(
     uint64_t *bytes_downloaded,
     uint64_t *total_bytes,
     double *speed_bps
 );
 
-/// Cancel the current download
+// Cancel current download
 void zipherx_download_cancel(void);
 
-/// Verify SHA256 checksum of a file
-/// @param file_path_ptr File path bytes
-/// @param file_path_len File path length
-/// @param expected_hash_ptr Expected hash hex string bytes
-/// @param expected_hash_len Expected hash hex string length
-/// @return 1=match, 0=mismatch, -1=error
+// Verify SHA256 checksum of a file
+// Returns: 1=match, 0=mismatch, -1=error
 int32_t zipherx_verify_sha256(
     const uint8_t *file_path_ptr,
     size_t file_path_len,
@@ -964,25 +692,4 @@ int32_t zipherx_verify_sha256(
     size_t expected_hash_len
 );
 
-// =============================================================================
-// ZSTD Decompression - Boost File Support
-// =============================================================================
-
-/// Decompress ZSTD data
-/// @param compressed_ptr Pointer to compressed data
-/// @param compressed_len Length of compressed data
-/// @param out_ptr Pointer to store output buffer pointer (caller must free with zipherx_free_buffer)
-/// @param out_len Pointer to store output length
-/// @return 1 on success, 0 on failure
-uint32_t zipherx_zstd_decompress(
-    const uint8_t *compressed_ptr,
-    size_t compressed_len,
-    uint8_t **out_ptr,
-    size_t *out_len
-);
-
-/// Free a buffer allocated by zipherx_zstd_decompress
-/// @param ptr Pointer to free
-void zipherx_free_buffer(uint8_t *ptr);
-
-#endif /* ZipherX_Bridging_Header_h */
+#endif // ZIPHERX_FFI_H

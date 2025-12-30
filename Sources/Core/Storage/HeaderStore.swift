@@ -612,7 +612,8 @@ final class HeaderStore {
     /// Uses chunked inserts to avoid SQLite out-of-memory errors
     /// FIX #457: Accepts pre-computed block hashes to avoid slow SHA-256 computation
     /// FIX #457 v2: Accepts expectedCount because boost file headers include Equihash solutions (variable size)
-    func loadHeadersFromBoostData(_ data: Data, blockHashes: Data? = nil, startHeight: UInt64, expectedCount: Int? = nil) throws {
+    /// FIX #468: Added onProgress callback for real-time progress updates
+    func loadHeadersFromBoostData(_ data: Data, blockHashes: Data? = nil, startHeight: UInt64, expectedCount: Int? = nil, onProgress: ((Double) -> Void)? = nil) throws {
         let headerSize = 140  // Compact header without solution or block_hash
         // FIX #457 v2: Use expected count from manifest if provided, else calculate from data size
         let headerCount = expectedCount ?? (data.count / headerSize)
@@ -831,6 +832,9 @@ final class HeaderStore {
                 if processedCount % 100000 == 0 || processedCount == headerCount {
                     print("📜 FIX #457: Inserted \(processedCount)/\(headerCount) headers...")
                 }
+
+                // FIX #468: Report progress after each chunk
+                onProgress?(Double(processedCount) / Double(headerCount))
             }
         }
 

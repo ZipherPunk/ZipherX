@@ -3044,14 +3044,33 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         None
     };
 
+    // FIX #471: Support both byte orders for target CMUs to handle potential byte order mismatches
+    // The database might store CMUs in different byte order than boost file
     let mut target_map: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    let mut target_map_reversed: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+
     if let Some(targets) = targets {
         for i in 0..target_count {
             let offset = i * 32;
             let mut cmu = [0u8; 32];
             cmu.copy_from_slice(&targets[offset..offset + 32]);
+
+            // Insert both original and reversed byte orders
             target_map.insert(cmu, i);
+
+            let mut cmu_reversed = [0u8; 32];
+            for j in 0..32 {
+                cmu_reversed[j] = cmu[31 - j];
+            }
+            target_map_reversed.insert(cmu_reversed, i);
+
+            // FIX #471: Debug log first few target CMUs in both byte orders
+            if i < 3 {
+                eprintln!("🎯 FIX #471: Target CMU[{}]: {}... (reversed: {}...)",
+                         i, hex::encode(&cmu[0..8]), hex::encode(&cmu_reversed[0..8]));
+            }
         }
+        eprintln!("🎯 FIX #471: Loaded {} target CMUs into lookup maps (both byte orders)", target_count);
     }
 
     // Storage for witnesses captured during tree build
@@ -3077,16 +3096,35 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         // FIX #458: Check if this CMU is a target BEFORE appending
         // The witness must be created BEFORE the CMU is added to the tree,
         // so the witness is positioned at the leaf that will contain this CMU
+        // FIX #471: Try both byte orders to handle database storage inconsistencies
         if !target_map.is_empty() {
             let mut cmu = [0u8; 32];
             cmu.copy_from_slice(cmu_bytes);
-            if let Some(&orig_idx) = target_map.get(&cmu) {
+
+            // Try original byte order first
+            let mut orig_idx = None;
+            if let Some(&idx) = target_map.get(&cmu) {
+                orig_idx = Some(idx);
+            } else {
+                // Try reversed byte order
+                let mut cmu_reversed = [0u8; 32];
+                for j in 0..32 {
+                    cmu_reversed[j] = cmu[31 - j];
+                }
+                if let Some(&idx) = target_map_reversed.get(&cmu_reversed) {
+                    orig_idx = Some(idx);
+                    eprintln!("🔄 FIX #471: Target CMU matched in REVERSED byte order at position {} (CMU: {}...)",
+                             i, hex::encode(&cmu[0..8]));
+                }
+            }
+
+            if let Some(idx) = orig_idx {
                 // CRITICAL: Create witness BEFORE appending CMU to tree!
                 // This ensures the witness path is computed from the correct position
                 let witness = IncrementalWitness::from_tree(tree.clone());
-                captured_witnesses.push((orig_idx, i, witness));
+                captured_witnesses.push((idx, i, witness));
                 found_count += 1;
-                debug_log!("📍 FIX #458: Target {} found at position {}", orig_idx, i);
+                debug_log!("📍 FIX #458: Target {} found at position {} (CMU: {}...)", idx, i, hex::encode(&cmu[0..8]));
             }
         }
 
@@ -3160,20 +3198,42 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
 
     // Serialize witnesses to output
     let mut success_count = 0;
+    debug_log!("🔧 FIX #466: Starting serialization of {} captured witnesses", captured_witnesses.len());
     for (orig_idx, pos, witness) in captured_witnesses {
         let pos_ptr = positions_out.add(orig_idx);
         let witness_ptr = witnesses_out.add(orig_idx * 1028);
 
+        // FIX #466 v2: Check witness path BEFORE serialization
+        let path_filled = witness.path().is_some();
+        let root = witness.root();
+        let mut root_bytes = [0u8; 32];
+        root.write(&mut root_bytes[..]).unwrap_or(());
+
+        debug_log!("🔍 FIX #466: Witness[{}] at pos {} - path_filled={}, root={:02x}{:02x}...{} bytes",
+                   orig_idx, pos, path_filled, root_bytes[0], root_bytes[1],
+                   if path_filled { "OK" } else { "EMPTY PATH!" });
+
         let mut serialized = Vec::new();
-        if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
-            *pos_ptr = pos;
-            std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
-            if serialized.len() < 1028 {
-                std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+        match write_incremental_witness(&witness, &mut serialized) {
+            Ok(()) => {
+                debug_log!("✅ FIX #466: Witness[{}] serialized to {} bytes (path_filled={})",
+                           orig_idx, serialized.len(), path_filled);
+                if serialized.len() <= 1028 {
+                    *pos_ptr = pos;
+                    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                    if serialized.len() < 1028 {
+                        std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                    }
+                    success_count += 1;
+                } else {
+                    debug_log!("❌ FIX #466: Witness[{}] too large: {} bytes", orig_idx, serialized.len());
+                    *pos_ptr = u64::MAX;
+                }
             }
-            success_count += 1;
-        } else {
-            *pos_ptr = u64::MAX;
+            Err(e) => {
+                debug_log!("❌ FIX #466: Failed to serialize witness[{}]: {:?}", orig_idx, e);
+                *pos_ptr = u64::MAX;
+            }
         }
     }
 

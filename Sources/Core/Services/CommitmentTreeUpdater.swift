@@ -281,6 +281,10 @@ actor CommitmentTreeUpdater {
         // Save manifest
         try saveManifest(remoteManifest)
 
+        // FIX #469: Invalidate CMU cache when new boost file is downloaded
+        // This ensures CMUs in cache match the current boost file version
+        invalidateCMUCache()
+
         // Update UserDefaults for effective tree height
         await MainActor.run {
             ZipherXConstants.updateTreeInfo(
@@ -668,6 +672,26 @@ actor CommitmentTreeUpdater {
     /// Path to cached legacy CMU file (extracted from boost file)
     private var cachedLegacyCMUPath: URL {
         boostCacheDirectory.appendingPathComponent("legacy_cmus_v\(Self.legacyCMUCacheVersion).bin")
+    }
+
+    /// FIX #469: Invalidate CMU cache when boost file is updated
+    /// This ensures the cached CMUs match the current boost file version
+    private func invalidateCMUCache() {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: cachedLegacyCMUPath.path) {
+            do {
+                try fm.removeItem(at: cachedLegacyCMUPath)
+                print("🗑️ FIX #469: Invalidated CMU cache (will re-extract from current boost file)")
+            } catch {
+                print("⚠️ FIX #469: Failed to delete CMU cache: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// FIX #469: Public method to invalidate CMU cache (called from FilterScanner on retry)
+    /// This is called when witness creation fails due to stale CMU cache
+    func invalidateCMUCachePublic() async {
+        invalidateCMUCache()
     }
 
     /// Clean up old cache versions

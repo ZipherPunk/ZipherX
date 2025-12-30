@@ -100,12 +100,17 @@ final class FilterScanner {
     }
 
     /// Report progress for PHASE 1 (parallel note discovery)
-    private func reportPhase1Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64) {
+    private func reportPhase1Progress(_ localProgress: Double, height: UInt64, maxHeight: UInt64, customDetail: String? = nil) {
         let overall = mapProgress(localProgress, in: phase1ProgressRange)
         onProgress?(overall, height, maxHeight)
-        // FIX #128: Always show progress percentage during note decryption
-        let percent = Int(localProgress * 100)
-        onStatusUpdate?("phase1", "Decrypting shielded notes (\(percent)%)...")
+        // FIX #469: Use custom detail if provided, otherwise show default with percentage
+        if let detail = customDetail {
+            onStatusUpdate?("phase1", detail)
+        } else {
+            // FIX #128: Always show progress percentage during note decryption
+            let percent = Int(localProgress * 100)
+            onStatusUpdate?("phase1", "Decrypting shielded notes (\(percent)%)...")
+        }
     }
 
     /// Report progress for PHASE 1.5 (witness computation)
@@ -539,7 +544,6 @@ final class FilterScanner {
                         spendingKey: spendingKey
                     ) { phase, detail in
                         // Progress callback from processBoostFileWithRust
-                        self.onStatusUpdate?("phase1", detail)
                         // Map sub-phases to 5-40% progress
                         let subProgress: Double
                         switch phase {
@@ -550,7 +554,8 @@ final class FilterScanner {
                         case "complete": subProgress = 1.0
                         default: subProgress = 0.50
                         }
-                        self.reportPhase1Progress(subProgress, height: self.currentChainHeight, maxHeight: targetHeight)
+                        // FIX #469: Pass custom detail to preserve the descriptive message
+                        self.reportPhase1Progress(subProgress, height: self.currentChainHeight, maxHeight: targetHeight, customDetail: detail)
                     }
                     print("🦀 Rust scan complete: \(result.notesFound) notes, \(result.notesSpent) spent, balance: \(Double(result.balance) / 100_000_000) ZCL")
                     usedRustBoostScan = true
@@ -946,6 +951,11 @@ final class FilterScanner {
             // Block listeners consume "headers" responses, causing sync failures
             // Even small syncs (100-600 headers) need listeners stopped
             print("🛑 FIX #462: Stopping block listeners before header sync...")
+
+            // FIX #472: Set header sync in progress flag BEFORE stopping listeners
+            // This prevents NEW peers from starting listeners during sync
+            await PeerManager.shared.setHeaderSyncInProgress(true)
+
             await PeerManager.shared.stopAllBlockListeners()
             print("🛑 FIX #462: Block listeners stopped, starting header sync...")
 
@@ -1026,6 +1036,11 @@ final class FilterScanner {
             // Header sync is done, now block listeners can safely consume messages again
             print("▶️ FIX #383: Resuming block listeners after header sync...")
             await PeerManager.shared.resumeAllBlockListeners()
+
+            // FIX #472: Clear header sync in progress flag AFTER resuming listeners
+            // This allows NEW peers to start listeners normally
+            await PeerManager.shared.setHeaderSyncInProgress(false)
+
             print("▶️ FIX #383: Block listeners resumed")
 
             // FIX #362: Explicit entry log to confirm PHASE 2 is running
@@ -3074,15 +3089,38 @@ final class FilterScanner {
             reportPhase15Progress(0.05, current: 0, total: 1)
             let startTime = Date()
 
+            // FIX #469: Verify CMU cache matches current tree size before witness creation
+            // The tree size (number of CMUs) should match the CMU count from the boost file
+            // Note: cmuDataHeight is block height, cmuDataCount is number of CMUs
+            var actualBundledData = bundledData
+            let currentTreeSize = ZipherXFFI.treeSize()
+            // Only invalidate if we have CMU data loaded but the count doesn't match
+            if cmuDataCount > 0 && cmuDataCount != currentTreeSize {
+                print("⚠️ FIX #469: CMU cache size mismatch (cache has \(cmuDataCount) CMUs, tree has \(currentTreeSize)) - invalidating cache...")
+                await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
+                // Reload CMU data
+                if let newCmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let newCmuData = try? Data(contentsOf: newCmuPath) {
+                    actualBundledData = newCmuData
+                    print("✅ FIX #469: Reloaded fresh CMU data (\(newCmuData.count) bytes)")
+                }
+            }
+
             // FIX #197: Use COMBINED tree load + witness creation
             // This loads tree into global FFI memory AND creates witnesses in single pass
             // Much faster than separate load + batch witness (56s → 15-20s)
+            let witnessCount = UInt64(targetCMUs.count)
             let results = ZipherXFFI.treeLoadWithWitnesses(
-                data: bundledData,
+                data: actualBundledData,
                 targetCMUs: targetCMUs,
-                onProgress: { current, total in
+                onProgress: { [weak self] current, total in
                     let progress = 0.05 + 0.85 * (Double(current) / Double(max(total, 1)))
-                    self.reportPhase15Progress(progress, current: Int(current), total: Int(total))
+                    // FIX #467: Show witness count in status, but use CMU progress for percentage
+                    // If total equals witnessCount, this is witness update progress
+                    // Otherwise it's tree building progress (CMU count)
+                    let displayCurrent = total == witnessCount ? current : witnessCount
+                    let displayTotal = total == witnessCount ? total : witnessCount
+                    self?.reportPhase15Progress(progress, current: Int(displayCurrent), total: Int(displayTotal))
                 }
             )
 
@@ -3107,6 +3145,46 @@ final class FilterScanner {
 
             reportPhase15Progress(1.0, current: successCount, total: targetCMUs.count)
             print("✅ FIX #197 PHASE 1.5: \(successCount)/\(targetCMUs.count) witnesses in \(String(format: "%.1f", elapsed))s (3-4x faster!)")
+
+            // FIX #469: If witness creation failed completely, invalidate CMU cache and retry
+            // This handles the case where cached CMU file doesn't match database notes
+            if successCount == 0 && targetCMUs.count > 0 {
+                print("⚠️ FIX #469: Witness creation failed - invalidating stale CMU cache and retrying...")
+                let treeUpdater = CommitmentTreeUpdater.shared
+                await treeUpdater.invalidateCMUCachePublic()
+
+                // Try to reload CMU data
+                if let newCmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let newCmuData = try? Data(contentsOf: newCmuPath) {
+                    print("🔄 FIX #469: Retrying witness creation with fresh CMU data...")
+                    let retryResults = ZipherXFFI.treeLoadWithWitnesses(
+                        data: newCmuData,
+                        targetCMUs: targetCMUs,
+                        onProgress: { [weak self] current, total in
+                            self?.reportPhase15Progress(0.95, current: Int(current), total: Int(total))
+                        }
+                    )
+
+                    var retrySuccessCount = 0
+                    for (index, result) in retryResults.enumerated() {
+                        guard let noteId = noteIdMap[index] else { continue }
+                        if let (_, witness) = result {
+                            try database.updateNoteWitness(noteId: noteId, witness: witness)
+                            if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                                try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                            }
+                            retrySuccessCount += 1
+                        }
+                    }
+
+                    if retrySuccessCount > 0 {
+                        print("✅ FIX #469: Retry succeeded - \(retrySuccessCount)/\(targetCMUs.count) witnesses created")
+                        reportPhase15Progress(1.0, current: retrySuccessCount, total: targetCMUs.count)
+                    } else {
+                        print("❌ FIX #469: Retry also failed - CMUs may not be in bundled data")
+                    }
+                }
+            }
 
         } catch {
             debugLog(.error, "FIX #197 PHASE 1.5 error: \(error)")

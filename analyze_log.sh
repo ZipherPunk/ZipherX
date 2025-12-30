@@ -1,8 +1,19 @@
 #!/bin/bash
 
-# ZipherX Log Analyzer
-# Performs deep analysis of zmac.log or z.log
+# =============================================================================
+# ZipherX Log Analyzer - ENHANCED VERSION 2.0
+# =============================================================================
+# Performs deep, accurate analysis of zmac.log or z.log
 # Usage: ./analyze_log.sh [zmac|ios|path/to/logfile]
+#
+# Version 2.0 Features:
+# - Accurate feature detection (checks actual function calls, not just strings)
+# - Real-time peer count tracking
+# - Connection success rate calculation
+# - Peer churn analysis
+# - Performance bottleneck identification
+# - Actionable recommendations
+# =============================================================================
 
 set -e
 
@@ -13,10 +24,13 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
+# =============================================================================
 # Determine log file
+# =============================================================================
 if [ -z "$1" ]; then
     echo -e "${CYAN}Select log file to analyze:${NC}"
     echo "  1) zmac.log (macOS)"
@@ -40,431 +54,582 @@ if [ ! -f "$LOGFILE" ]; then
     exit 1
 fi
 
+# =============================================================================
+# Header
+# =============================================================================
 echo ""
-echo -e "${BOLD}${PURPLE}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${PURPLE}║           ZIPHERX LOG ANALYZER - DEEP ANALYSIS                ║${NC}"
-echo -e "${BOLD}${PURPLE}╚═══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${MAGENTA}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${MAGENTA}║         ZIPHERX LOG ANALYZER v2.0 - DEEP ANALYSIS              ║${NC}"
+echo -e "${BOLD}${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${CYAN}Analyzing:${NC} $LOGFILE"
 echo -e "${CYAN}File size:${NC} $(du -h "$LOGFILE" | cut -f1)"
 echo -e "${CYAN}Line count:${NC} $(wc -l < "$LOGFILE")"
-echo -e "${CYAN}Time range:${NC} $(head -1 "$LOGFILE" | cut -d']' -f1 | tr -d '[') to $(tail -1 "$LOGFILE" | cut -d']' -f1 | tr -d '[')"
+
+# Time range
+FIRST_TIME=$(head -1 "$LOGFILE" | grep -oE "\[[0-9]+:[0-9]+:[0-9]+\.[0-9]+\]" | tr -d '[]' || echo "unknown")
+LAST_TIME=$(tail -1 "$LOGFILE" | grep -oE "\[[0-9]+:[0-9]+:[0-9]+\.[0-9]+\]" | tr -d '[]' || echo "unknown")
+echo -e "${CYAN}Time range:${NC} $FIRST_TIME to $LAST_TIME"
+
+# Calculate duration if possible
+if [ "$FIRST_TIME" != "unknown" ] && [ "$LAST_TIME" != "unknown" ]; then
+    # Simple duration calculation (same day only)
+    FIRST_SEC=$(date -j -f "%H:%M:%S" "$FIRST_TIME" +%s 2>/dev/null || echo "0")
+    LAST_SEC=$(date -j -f "%H:%M:%S" "$LAST_TIME" +%s 2>/dev/null || echo "0")
+    if [ "$FIRST_SEC" -gt 0 ] && [ "$LAST_SEC" -gt 0 ]; then
+        DURATION=$((LAST_SEC - FIRST_SEC))
+        if [ "$DURATION" -gt 0 ]; then
+            DURATION_MIN=$((DURATION / 60))
+            echo -e "${CYAN}Duration:${NC} ${DURATION_MIN} minutes"
+        fi
+    fi
+fi
 echo ""
 
-# ============================================================================
-# SECTION 1: APP STARTUP
-# ============================================================================
+# =============================================================================
+# SECTION 1: APP STARTUP & HEALTH CHECKS
+# =============================================================================
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  1. APP STARTUP & INITIALIZATION${NC}"
+echo -e "${BOLD}${BLUE}  1. APP STARTUP & HEALTH CHECKS${NC}"
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 echo -e "\n${YELLOW}Startup Mode:${NC}"
 if grep -q "FAST START" "$LOGFILE"; then
-    echo -e "  ${GREEN}FAST START${NC} detected (cached tree, minimal sync)"
-    grep "FAST START" "$LOGFILE" | head -2
+    echo -e "  ${GREEN}✓ FAST START${NC} (cached tree, minimal sync)"
+    FAST_START_TIME=$(grep "FAST START" "$LOGFILE" | head -1 | grep -oE "\[[0-9]+:[0-9]+:[0-9]+\.[0-9]+\]" | tr -d '[]')
+    echo -e "    Started at: $FAST_START_TIME"
 elif grep -q "FULL START" "$LOGFILE"; then
-    echo -e "  ${YELLOW}FULL START${NC} detected (full tree download/rebuild)"
-    grep "FULL START" "$LOGFILE" | head -2
-fi
-
-echo -e "\n${YELLOW}Database State:${NC}"
-grep -E "lastScannedHeight|cachedChainHeight|blocksBehind|walletHeight" "$LOGFILE" | head -5
-
-echo -e "\n${YELLOW}Health Checks:${NC}"
-health_issues=$(grep -E "health check.*issue|health check.*failed|WALLET HEALTH.*issue" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-health_issues=${health_issues:-0}
-if [ "$health_issues" -gt 0 ]; then
-    echo -e "  ${RED}Found $health_issues health issue(s):${NC}"
-    grep -E "health check.*issue|health check.*failed|WALLET HEALTH.*issue" "$LOGFILE" | head -5
+    echo -e "  ${YELLOW}⚠ FULL START${NC} (full tree download/rebuild)"
+    FULL_START_TIME=$(grep "FULL START" "$LOGFILE" | head -1 | grep -oE "\[[0-9]+:[0-9]+:[0-9]+\.[0-9]+\]" | tr -d '[]')
+    echo -e "    Started at: $FULL_START_TIME"
 else
-    echo -e "  ${GREEN}No health issues detected${NC}"
+    echo -e "  ${CYAN}Unknown startup mode${NC}"
 fi
 
-# ============================================================================
-# SECTION 2: PEER CONNECTIONS
-# ============================================================================
+echo -e "\n${YELLOW}Health Check Results:${NC}"
+# Check for health check completion
+HEALTH_CHECKS=$(grep -c "checkConnectionHealth() called" "$LOGFILE" 2>/dev/null || echo "0")
+HEALTH_CHECKS=$(echo "$HEALTH_CHECKS" | tr -d '[:space:]')
+echo -e "  Health checks performed: ${GREEN}$HEALTH_CHECKS${NC}"
+
+# Check for wallet health issues
+WALLET_ISSUES=$(grep -E "WALLET HEALTH.*issue|health check.*issue" "$LOGFILE" 2>/dev/null | wc -l | tr -d '[:space:]')
+WALLET_ISSUES=${WALLET_ISSUES:-0}
+if [ "$WALLET_ISSUES" -gt 0 ]; then
+    echo -e "  ${RED}✗ $WALLET_ISSUES wallet health issue(s) detected${NC}"
+    echo -e "    Issues:"
+    grep -E "WALLET HEALTH.*issue|health check.*issue" "$LOGFILE" 2>/dev/null | head -3 | sed 's/^/    /'
+else
+    echo -e "  ${GREEN}✓ No wallet health issues${NC}"
+fi
+
+# =============================================================================
+# SECTION 2: TOR & SOCKS5 STATUS
+# =============================================================================
 echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  2. PEER CONNECTIONS${NC}"
+echo -e "${BOLD}${BLUE}  2. TOR & SOCKS5 PROXY STATUS${NC}"
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-echo -e "\n${YELLOW}Connection Summary:${NC}"
-connected=$(grep -E "Connected to.*peer|✅ Connected to" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-failed=$(grep -E "Failed to connect|Connection failed|Connection refused" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  Connected: ${GREEN}$connected${NC}"
-echo -e "  Failed: ${RED}$failed${NC}"
+echo -e "\n${YELLOW}Tor Mode:${NC}"
+TOR_MODE=$(grep "Tor mode:" "$LOGFILE" 2>/dev/null | tail -1 | grep -oE "enabled|disabled" || echo "unknown")
+case "$TOR_MODE" in
+    enabled)
+        echo -e "  ${GREEN}✓ Tor mode: ENABLED${NC}"
+        ;;
+    disabled)
+        echo -e "  ${CYAN}○ Tor mode: DISABLED (Direct connection)${NC}"
+        ;;
+    *)
+        echo -e "  ${YELLOW}? Tor mode: Unknown${NC}"
+        ;;
+esac
 
-echo -e "\n${YELLOW}Hardcoded Seeds Status (FIX #421):${NC}"
-if grep -q "FIX #421" "$LOGFILE"; then
-    grep "FIX #421" "$LOGFILE" | head -3
-else
-    echo -e "  ${YELLOW}FIX #421 not detected in log${NC}"
-fi
+echo -e "\n${YELLOW}SOCKS5 Proxy Health:${NC}"
+# Check for SOCKS5 health check function calls
+SOCKS5_CHECKS=$(grep -c "checkSOCKS5Health\|SOCKS5 health check" "$LOGFILE" 2>/dev/null || echo "0")
+SOCKS5_CHECKS=$(echo "$SOCKS5_CHECKS" | tr -d '[:space:]')
+SOCKS5_HEALTHY=$(grep -c "Tor SOCKS5 health check PASSED\|SOCKS5 health.*PASSED\|Tor SOCKS5.*healthy" "$LOGFILE" 2>/dev/null || echo "0")
+SOCKS5_HEALTHY=$(echo "$SOCKS5_HEALTHY" | tr -d '[:space:]')
+SOCKS5_FAILED=$(grep -c "Tor SOCKS5 health check failed\|SOCKS5 health.*failed" "$LOGFILE" 2>/dev/null || echo "0")
+SOCKS5_FAILED=$(echo "$SOCKS5_FAILED" | tr -d '[:space:]')
 
-echo -e "\n${YELLOW}Successful Peer Connections:${NC}"
-grep -E "✅ Connected to.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" "$LOGFILE" | \
-    sed 's/.*Connected to/Connected to/' | sort | uniq -c | sort -rn | head -10
-
-echo -e "\n${YELLOW}Peer Versions Seen:${NC}"
-grep -oE "version [0-9]+" "$LOGFILE" | sort | uniq -c | sort -rn
-
-echo -e "\n${YELLOW}Block Listeners:${NC}"
-listeners=$(grep -E "Block listener started|Started block listener" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  Started: ${GREEN}$listeners${NC} block listeners"
-
-# ============================================================================
-# SECTION 3: BANS & SYBIL ATTACKS
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  3. BANS & SYBIL ATTACKS${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-echo -e "\n${YELLOW}Sybil Attack Detection:${NC}"
-sybil=$(grep -E "SYBIL|Sybil|sybil|wrong chain|Wrong chain" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$sybil" -gt 0 ]; then
-    echo -e "  ${RED}$sybil Sybil-related events detected!${NC}"
-    grep -E "SYBIL|Sybil|wrong chain|Wrong chain" "$LOGFILE" | head -5
-else
-    echo -e "  ${GREEN}No Sybil attacks detected${NC}"
-fi
-
-echo -e "\n${YELLOW}Permanently Banned Peers:${NC}"
-grep -E "Banned.*permanently|PERMANENT.*ban|banPeerPermanently" "$LOGFILE" | \
-    grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | sort | uniq -c | sort -rn | head -10
-
-echo -e "\n${YELLOW}Zcash Nodes Rejected (version >= 170020):${NC}"
-zcash_rejects=$(grep -E "170020|170021|170022|170023|170100" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${RED}$zcash_rejects${NC} Zcash node rejection(s)"
-
-echo -e "\n${YELLOW}Persisted Bans (FIX #424):${NC}"
-if grep -q "FIX #424" "$LOGFILE"; then
-    grep "FIX #424" "$LOGFILE" | head -3
-else
-    echo -e "  ${YELLOW}FIX #424 ban persistence not detected${NC}"
-fi
-
-# ============================================================================
-# SECTION 4: HEADER SYNC
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  4. HEADER SYNC${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-echo -e "\n${YELLOW}Header Sync Status:${NC}"
-if grep -q "Header sync complete|Header sync.*complete" "$LOGFILE"; then
-    echo -e "  ${GREEN}Header sync completed${NC}"
-    grep -E "Header sync complete|Synced.*headers" "$LOGFILE" | tail -3
-elif grep -q "Header sync.*failed|Insufficient peers|No headers received" "$LOGFILE"; then
-    echo -e "  ${RED}Header sync FAILED${NC}"
-    grep -E "Header sync.*failed|Insufficient peers|No headers received" "$LOGFILE" | tail -5
-else
-    echo -e "  ${YELLOW}Header sync status unknown${NC}"
-fi
-
-echo -e "\n${YELLOW}PeerManager Sync (FIX #425):${NC}"
-if grep -q "syncPeers|FIX #425" "$LOGFILE"; then
-    grep -E "syncPeers|FIX #425" "$LOGFILE" | head -3
-else
-    echo -e "  ${YELLOW}PeerManager sync not detected (FIX #425 may not be in this log)${NC}"
-fi
-
-echo -e "\n${YELLOW}Header Sync Timeouts:${NC}"
-timeouts=$(grep -E "Header sync.*timeout|timeout.*header|No headers received" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${YELLOW}$timeouts${NC} timeout(s)"
-
-# ============================================================================
-# SECTION 5: BLOCK SYNC (PHASE 1 & 2)
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  5. BLOCK SYNC (PHASE 1 & 2)${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-echo -e "\n${YELLOW}PHASE 1 (Bundled Tree Scan):${NC}"
-if grep -q "PHASE 1" "$LOGFILE"; then
-    grep "PHASE 1" "$LOGFILE" | head -5
-else
-    echo -e "  ${YELLOW}PHASE 1 not detected${NC}"
-fi
-
-echo -e "\n${YELLOW}PHASE 2 (P2P Block Sync):${NC}"
-if grep -q "PHASE 2" "$LOGFILE"; then
-    grep "PHASE 2" "$LOGFILE" | tail -5
-else
-    echo -e "  ${YELLOW}PHASE 2 not detected${NC}"
-fi
-
-echo -e "\n${YELLOW}Equihash Verification:${NC}"
-equihash_fails=$(grep -E "Equihash.*FAILED|Equihash solution length mismatch" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$equihash_fails" -gt 0 ]; then
-    echo -e "  ${RED}$equihash_fails Equihash failure(s) detected!${NC}"
-    echo -e "  ${RED}CRITICAL: PHASE 2 likely stuck due to pre-Bubbles header mismatch${NC}"
-    grep -E "Equihash.*FAILED|Equihash solution length mismatch" "$LOGFILE" | head -3
-    # Check if locator at height 0
-    if grep -q "locator at height 0" "$LOGFILE"; then
-        echo -e "  ${RED}⚠️ FIX #440: Header sync starting from height 0 (pre-Bubbles)!${NC}"
-        echo -e "  ${RED}   BundledBlockHashes not loaded - need FIX #440${NC}"
+if [ "$SOCKS5_CHECKS" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ SOCKS5 health monitoring: ACTIVE${NC} ($SOCKS5_CHECKS checks performed)"
+    if [ "$SOCKS5_HEALTHY" -gt 0 ]; then
+        echo -e "    ${GREEN}✓ $SOCKS5_HEALTHY healthy checks${NC}"
+    fi
+    if [ "$SOCKS5_FAILED" -gt 0 ]; then
+        echo -e "    ${YELLOW}⚠ $SOCKS5_FAILED failed checks${NC}"
     fi
 else
-    echo -e "  ${GREEN}No Equihash verification failures${NC}"
+    echo -e "  ${YELLOW}○ SOCKS5 health monitoring: Not detected${NC}"
 fi
 
-echo -e "\n${YELLOW}Sync Progress:${NC}"
-grep -E "[0-9]+%|blocks/sec|progress" "$LOGFILE" | tail -5
+# SOCKS5 connection errors
+SOCKS5_REFUSED=$(grep -c "SOCKS5 error: Connection refused" "$LOGFILE" 2>/dev/null || echo "0")
+SOCKS5_REFUSED=$(echo "$SOCKS5_REFUSED" | tr -d '[:space:]')
+echo -e "  SOCKS5 'Connection refused' errors: ${SOCKS5_REFUSED}"
 
-echo -e "\n${YELLOW}Last Scanned Height:${NC}"
-grep -E "lastScannedHeight saved|updateLastScannedHeight|Scan complete.*height" "$LOGFILE" | tail -3
-
-echo -e "\n${YELLOW}Background Sync:${NC}"
-bg_syncs=$(grep -E "Background sync" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$bg_syncs${NC} background sync event(s)"
-grep "Background sync" "$LOGFILE" | tail -3
-
-# ============================================================================
-# SECTION 6: NOTES & BALANCE
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  6. NOTES & BALANCE${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-echo -e "\n${YELLOW}Notes Found:${NC}"
-notes=$(grep -E "Note found|Found note|Unspent note" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$notes${NC} note(s) found/logged"
-
-echo -e "\n${YELLOW}Balance Updates:${NC}"
-grep -E "Balance|balance|zatoshis|ZCL" "$LOGFILE" | grep -v "unbalanced" | tail -5
-
-echo -e "\n${YELLOW}Spent Notes:${NC}"
-spent=$(grep -E "Note spent|markNoteSpent|NULLIFIER" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${YELLOW}$spent${NC} spent note event(s)"
-
-# ============================================================================
-# SECTION 7: TRANSACTIONS
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  7. TRANSACTIONS${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-echo -e "\n${YELLOW}Transaction Building:${NC}"
-txbuilds=$(grep -E "buildShielded|Building transaction|prepareTransaction|Groth16|zk-SNARK" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$txbuilds${NC} transaction build event(s)"
-
-echo -e "\n${YELLOW}Broadcasts:${NC}"
-broadcasts=$(grep -E "broadcast|Broadcast|Propagat" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$broadcasts${NC} broadcast event(s)"
-grep -E "Pre-computed txid|Starting broadcast|Propagat" "$LOGFILE" | tail -5
-
-echo -e "\n${YELLOW}Confirmations:${NC}"
-confirmed=$(grep -E "Confirmed|confirmIncoming|confirmOutgoing" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$confirmed${NC} confirmation event(s)"
-grep -E "Confirmed|confirmIncoming|confirmOutgoing" "$LOGFILE" | tail -5
-
-echo -e "\n${YELLOW}Mempool Activity:${NC}"
-mempool=$(grep -E "mempool|MEMPOOL|Mempool" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${GREEN}$mempool${NC} mempool event(s)"
-
-echo -e "\n${YELLOW}Transaction Rejections:${NC}"
-rejects=$(grep -E "reject|Reject|REJECT|bad-txns" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$rejects" -gt 0 ]; then
-    echo -e "  ${RED}$rejects rejection(s) detected!${NC}"
-    grep -E "reject|Reject|REJECT|bad-txns" "$LOGFILE" | tail -5
+if [ "$SOCKS5_REFUSED" -gt 10 ]; then
+    echo -e "    ${RED}✗ CRITICAL: Many SOCKS5 errors - Tor proxy may be down${NC}"
+elif [ "$SOCKS5_REFUSED" -gt 3 ]; then
+    echo -e "    ${YELLOW}⚠ Some SOCKS5 errors - Tor may be unstable${NC}"
 else
-    echo -e "  ${GREEN}No rejections${NC}"
+    echo -e "    ${GREEN}✓ SOCKS5 connection healthy${NC}"
 fi
 
-# ============================================================================
-# SECTION 8: TOR STATUS
-# ============================================================================
+# =============================================================================
+# SECTION 3: PEER CONNECTION ANALYSIS
+# =============================================================================
 echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  8. TOR STATUS${NC}"
+echo -e "${BOLD}${BLUE}  3. PEER CONNECTION ANALYSIS${NC}"
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-echo -e "\n${YELLOW}Tor Connection State:${NC}"
-# Check for Tor mode enabled but not connected (FIX #427 issue)
-if grep -q "Tor mode: enabled" "$LOGFILE"; then
-    echo -e "  Tor mode: ${GREEN}enabled${NC}"
-    # Check if Tor is actually connected
-    if grep -E "Tor connected: true|SOCKS port: [1-9]" "$LOGFILE" | tail -1 | grep -q "true\|[1-9]"; then
-        echo -e "  Tor status: ${GREEN}connected${NC}"
+echo -e "\n${YELLOW}Connection Success Rate:${NC}"
+
+# Count successful connections
+SUCCESS_COUNT=$(grep -c "Handshake complete\|✅ FIX #246.*Reconnected successfully" "$LOGFILE" 2>/dev/null || echo "0")
+SUCCESS_COUNT=$(echo "$SUCCESS_COUNT" | tr -d '[:space:]')
+
+# Count failed connections
+FAILED_COUNT=$(grep -c "❌ Failed:\|Connection failed\|Timed out" "$LOGFILE" 2>/dev/null || echo "0")
+FAILED_COUNT=$(echo "$FAILED_COUNT" | tr -d '[:space:]')
+
+TOTAL_ATTEMPTS=$((SUCCESS_COUNT + FAILED_COUNT))
+if [ "$TOTAL_ATTEMPTS" -gt 0 ]; then
+    SUCCESS_RATE=$((SUCCESS_COUNT * 100 / TOTAL_ATTEMPTS))
+    echo -e "  Successful: ${GREEN}$SUCCESS_COUNT${NC}"
+    echo -e "  Failed: ${RED}$FAILED_COUNT${NC}"
+    echo -e "  Success rate: ${CYAN}$SUCCESS_RATE%${NC}"
+
+    if [ "$SUCCESS_RATE" -ge 80 ]; then
+        echo -e "    ${GREEN}✓ Excellent connection rate${NC}"
+    elif [ "$SUCCESS_RATE" -ge 50 ]; then
+        echo -e "    ${YELLOW}⚠ Moderate connection rate${NC}"
     else
-        if grep -E "Tor connected: false|SOCKS port: 0" "$LOGFILE" | tail -1 | grep -q "false\|: 0"; then
-            echo -e "  Tor status: ${RED}NOT CONNECTED (mode enabled but SOCKS=0)${NC}"
-            echo -e "  ${YELLOW}This causes peer recovery to fail - peers can't connect!${NC}"
+        echo -e "    ${RED}✗ Poor connection rate${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}No connection attempts detected${NC}"
+fi
+
+echo -e "\n${YELLOW}Current Peer Status:${NC}"
+
+# Get the most recent peer count from logs
+FINAL_PEER_LINE=$(grep -E "Connected to [0-9]+/[0-9]+ target peers|Final: Connected to [0-9]+/[0-9]+" "$LOGFILE" 2>/dev/null | tail -1)
+if [ -n "$FINAL_PEER_LINE" ]; then
+    echo -e "  $FINAL_PEER_LINE"
+
+    # Extract current and target
+    CURRENT_PEERS=$(echo "$FINAL_PEER_LINE" | grep -oE "Connected to [0-9]+" | grep -oE "[0-9]+")
+    TARGET_PEERS=$(echo "$FINAL_PEER_LINE" | grep -oE "/[0-9]+ target" | grep -oE "[0-9]+")
+
+    if [ -n "$CURRENT_PEERS" ] && [ -n "$TARGET_PEERS" ]; then
+        if [ "$CURRENT_PEERS" -ge "$TARGET_PEERS" ]; then
+            echo -e "    ${GREEN}✓ Target achieved ($CURRENT_PEERS/$TARGET_PEERS)${NC}"
+        elif [ "$CURRENT_PEERS" -ge 3 ]; then
+            echo -e "    ${YELLOW}⚠ Below target but above minimum ($CURRENT_PEERS/$TARGET_PEERS)${NC}"
+        else
+            echo -e "    ${RED}✗ Below minimum threshold ($CURRENT_PEERS/$TARGET_PEERS)${NC}"
         fi
     fi
 else
-    echo -e "  ${YELLOW}Tor mode status unknown${NC}"
+    echo -e "  ${YELLOW}Could not determine current peer count${NC}"
 fi
 
-echo -e "\n${YELLOW}Tor Bypass Events (FIX #286):${NC}"
-tor_bypass=$(grep -E "FIX #286.*bypass|Tor bypassed|bypassTorForMassiveOperation" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$tor_bypass" -gt 0 ]; then
-    echo -e "  ${YELLOW}$tor_bypass Tor bypass event(s)${NC}"
-    grep -E "FIX #286.*bypass|Tor bypassed" "$LOGFILE" | tail -3
-    # Check if peers reconnected after bypass
-    if grep -A 20 "Tor bypassed" "$LOGFILE" | grep -q "0 peers connected\|0 direct peer"; then
-        echo -e "  ${RED}WARNING: Tor bypass left 0 peers connected!${NC}"
+echo -e "\n${YELLOW}Peer Churn (connects/disconnects):${NC}"
+
+# Count peer churn events
+PEER_CONNECT=$(grep -c "Block listener started\|Handshake complete" "$LOGFILE" 2>/dev/null || echo "0")
+PEER_CONNECT=$(echo "$PEER_CONNECT" | tr -d '[:space:]')
+PEER_DISCONNECT=$(grep -c "Block listener ended\|peer.*disconnected\|Removing peer" "$LOGFILE" 2>/dev/null || echo "0")
+PEER_DISCONNECT=$(echo "$PEER_DISCONNECT" | tr -d '[:space:]')
+
+echo -e "  Peers connected: $PEER_CONNECT"
+echo -e "  Peers disconnected: $PEER_DISCONNECT"
+
+if [ "$PEER_DISCONNECT" -gt "$PEER_CONNECT" ]; then
+    CHURN_RATE=$((PEER_DISCONNECT - PEER_CONNECT))
+    echo -e "    ${YELLOW}⚠ Net loss: $CHURN_RATE more disconnects than connects${NC}"
+elif [ "$PEER_CONNECT" -gt 0 ]; then
+    echo -e "    ${GREEN}✓ Healthy peer turnover${NC}"
+fi
+
+echo -e "\n${YELLOW}Handshake Failures:${NC}"
+HANDSHAKE_FAIL=$(grep -c "handshake.*failed\|Handshake failed\|performHandshake.*error" "$LOGFILE" 2>/dev/null || echo "0")
+HANDSHAKE_FAIL=$(echo "$HANDSHAKE_FAIL" | tr -d '[:space:]')
+echo -e "  Handshake failures: $HANDSHAKE_FAIL"
+
+if [ "$HANDSHAKE_FAIL" -gt 10 ]; then
+    echo -e "    ${RED}✗ Many handshake failures - incompatible peers?${NC}"
+elif [ "$HANDSHAKE_FAIL" -gt 3 ]; then
+    echo -e "    ${YELLOW}⚠ Some handshake failures${NC}"
+else
+    echo -e "    ${GREEN}✓ Handshake failures normal${NC}"
+fi
+
+echo -e "\n${YELLOW}Connection Health Monitoring:${NC}"
+
+# Check for connection health monitoring
+HEALTH_MONITOR=$(grep -c "checkConnectionHealth()\|💓 Connection health\|countAlivePeers" "$LOGFILE" 2>/dev/null || echo "0")
+HEALTH_MONITOR=$(echo "$HEALTH_MONITOR" | tr -d '[:space:]')
+if [ "$HEALTH_MONITOR" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Connection health monitoring: ACTIVE${NC} ($HEALTH_MONITOR checks)"
+
+    # Get latest health status
+    LATEST_HEALTH=$(grep "💓 Connection health:" "$LOGFILE" 2>/dev/null | tail -1)
+    if [ -n "$LATEST_HEALTH" ]; then
+        echo -e "    Latest: $LATEST_HEALTH"
+    fi
+else
+    echo -e "  ${YELLOW}○ Connection health monitoring: Not detected${NC}"
+fi
+
+# =============================================================================
+# SECTION 4: CHAIN SYNC STATUS
+# =============================================================================
+echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${BLUE}  4. CHAIN SYNC STATUS${NC}"
+echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+echo -e "\n${YELLOW}Chain Height:${NC}"
+
+# Get latest chain height
+CHAIN_HEIGHT=$(grep -E "chainHeight.*29[0-9]{6}|Using P2P consensus: [0-9]+" "$LOGFILE" 2>/dev/null | tail -1 | grep -oE "29[0-9]{6}" || echo "unknown")
+if [ "$CHAIN_HEIGHT" != "unknown" ]; then
+    echo -e "  Current chain height: ${GREEN}$CHAIN_HEIGHT${NC}"
+else
+    echo -e "  ${YELLOW}Chain height: Unknown${NC}"
+fi
+
+# Get wallet height
+WALLET_HEIGHT=$(grep -E "walletHeight.*29[0-9]{6}|last_scanned_height.*29[0-9]{6}" "$LOGFILE" 2>/dev/null | tail -1 | grep -oE "29[0-9]{6}" || echo "unknown")
+if [ "$WALLET_HEIGHT" != "unknown" ]; then
+    echo -e "  Wallet height: ${CYAN}$WALLET_HEIGHT${NC}"
+
+    # Calculate blocks behind
+    if [ "$CHAIN_HEIGHT" != "unknown" ]; then
+        BLOCKS_BEHIND=$((CHAIN_HEIGHT - WALLET_HEIGHT))
+        if [ "$BLOCKS_BEHIND" -le 100 ]; then
+            echo -e "    ${GREEN}✓ Synced (within 100 blocks)${NC}"
+        elif [ "$BLOCKS_BEHIND" -le 1000 ]; then
+            echo -e "    ${YELLOW}⚠ $BLOCKS_BEHIND blocks behind${NC}"
+        else
+            echo -e "    ${RED}✗ $BLOCKS_BEHIND blocks behind (needs sync)${NC}"
+        fi
+    fi
+else
+    echo -e "  ${YELLOW}Wallet height: Unknown${NC}"
+fi
+
+echo -e "\n${YELLOW}Header Sync Status:${NC}"
+
+HEADER_SYNC_COMPLETE=$(grep -c "Header sync complete\|Synced [0-9]+ headers.*100%" "$LOGFILE" 2>/dev/null || echo "0")
+HEADER_SYNC_COMPLETE=$(echo "$HEADER_SYNC_COMPLETE" | tr -d '[:space:]')
+HEADER_SYNC_TIMEOUT=$(grep -c "Header sync.*timeout\|FIX #444: Header sync timeout" "$LOGFILE" 2>/dev/null || echo "0")
+HEADER_SYNC_TIMEOUT=$(echo "$HEADER_SYNC_TIMEOUT" | tr -d '[:space:]')
+
+echo -e "  Successful syncs: ${GREEN}$HEADER_SYNC_COMPLETE${NC}"
+echo -e "  Timeouts: ${YELLOW}$HEADER_SYNC_TIMEOUT${NC}"
+
+if [ "$HEADER_SYNC_COMPLETE" -gt 0 ]; then
+    # Get latest sync details
+    LATEST_SYNC=$(grep -E "Synced [0-9]+ headers" "$LOGFILE" 2>/dev/null | tail -1)
+    if [ -n "$LATEST_SYNC" ]; then
+        echo -e "    Latest: $LATEST_SYNC"
     fi
 fi
 
-echo -e "\n${YELLOW}FIX #427 (Peer Recovery with Hardcoded Seeds):${NC}"
-if grep -q "FIX #427" "$LOGFILE"; then
-    grep "FIX #427" "$LOGFILE" | head -5
-else
-    echo -e "  ${YELLOW}FIX #427 not detected (may need upgrade)${NC}"
+if [ "$HEADER_SYNC_TIMEOUT" -gt 2 ]; then
+    echo -e "    ${RED}✗ Multiple header sync timeouts - may be stuck${NC}"
 fi
 
-echo -e "\n${YELLOW}Reserved/Invalid IP Attempts:${NC}"
-# Check for reserved IP addresses being used (254.x.x.x, 10.x.x.x, etc.)
-# Use word boundary to avoid matching 140.174 as 0.174
-reserved_ips=$(grep -oE "\b(254|10|127)\.[0-9]+\.[0-9]+\.[0-9]+\b" "$LOGFILE" 2>/dev/null | sort | uniq -c | sort -rn | head -5)
-if [ -n "$reserved_ips" ]; then
-    echo -e "  ${RED}Found attempts to connect to reserved IPs:${NC}"
-    echo "$reserved_ips" | while read line; do echo "    $line"; done
+echo -e "\n${YELLOW}Header Sync Timing Diagnostics:${NC}"
+
+TIMING_DIAG=$(grep -c "⏱️ Header sync timing summary\|measureStep\|timing diagnostics" "$LOGFILE" 2>/dev/null || echo "0")
+TIMING_DIAG=$(echo "$TIMING_DIAG" | tr -d '[:space:]')
+if [ "$TIMING_DIAG" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Header sync timing diagnostics: ACTIVE${NC}"
+
+    # Show timing summary if available
+    TIMING_SUMMARY=$(grep -A 10 "⏱️ Header sync timing summary" "$LOGFILE" 2>/dev/null | head -11)
+    if [ -n "$TIMING_SUMMARY" ]; then
+        echo -e "$TIMING_SUMMARY" | sed 's/^/    /'
+    fi
 else
-    echo -e "  ${GREEN}No reserved IP connection attempts${NC}"
+    echo -e "  ${YELLOW}○ Header sync timing diagnostics: Not detected${NC}"
 fi
 
-echo -e "\n${YELLOW}Hidden Service (.onion):${NC}"
-if grep -q "Hidden service|\.onion|HiddenService" "$LOGFILE"; then
-    grep -E "Hidden service.*Running|\.onion|HiddenService" "$LOGFILE" | head -3
-else
-    echo -e "  ${YELLOW}Hidden service not detected${NC}"
-fi
-
-echo -e "\n${YELLOW}Tor Errors:${NC}"
-tor_errors=$(grep -E "Tor.*error|Tor.*failed|SOCKS5.*error|circuit.*failed" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$tor_errors" -gt 0 ]; then
-    echo -e "  ${RED}$tor_errors Tor error(s)${NC}"
-    grep -E "Tor.*error|Tor.*failed|SOCKS5.*error|circuit.*failed" "$LOGFILE" | tail -3
-else
-    echo -e "  ${GREEN}No Tor errors${NC}"
-fi
-
-# ============================================================================
-# SECTION 9: ERRORS & WARNINGS
-# ============================================================================
+# =============================================================================
+# SECTION 5: BLOCK & TRANSACTION SCANNING
+# =============================================================================
 echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  9. ERRORS & WARNINGS${NC}"
+echo -e "${BOLD}${BLUE}  5. BLOCK & TRANSACTION SCANNING${NC}"
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-echo -e "\n${YELLOW}Critical Errors:${NC}"
-errors=$(grep -E "ERROR|Error|error|FATAL|fatal|CRASH|crash" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${RED}$errors${NC} error(s) in log"
+echo -e "\n${YELLOW}Block Scanning (PHASE 2):${NC}"
 
-echo -e "\n${YELLOW}Top Error Types:${NC}"
-grep -E "ERROR|Error|error|failed|Failed|FAILED" "$LOGFILE" | \
-    sed 's/\[.*\]//' | sort | uniq -c | sort -rn | head -10
+# Check for PHASE 2 scanning
+PHASE2_START=$(grep -c "🔄 Starting PHASE 2\|PHASE 2: Scanning blocks" "$LOGFILE" 2>/dev/null || echo "0")
+PHASE2_START=$(echo "$PHASE2_START" | tr -d '[:space:]')
+PHASE2_COMPLETE=$(grep -c "PHASE 2 complete\|✅ PHASE 2.*complete" "$LOGFILE" 2>/dev/null || echo "0")
+PHASE2_COMPLETE=$(echo "$PHASE2_COMPLETE" | tr -d '[:space:]')
 
-echo -e "\n${YELLOW}Warnings:${NC}"
-warnings=$(grep -E "Warning|WARNING|warn|WARN" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${YELLOW}$warnings${NC} warning(s) in log"
+if [ "$PHASE2_START" -gt 0 ]; then
+    echo -e "  PHASE 2 scans started: ${GREEN}$PHASE2_START${NC}"
+    echo -e "  PHASE 2 scans completed: ${GREEN}$PHASE2_COMPLETE${NC}"
 
-echo -e "\n${YELLOW}Timeouts:${NC}"
-timeouts=$(grep -E "timeout|Timeout|TIMEOUT|timed out" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-echo -e "  ${YELLOW}$timeouts${NC} timeout(s)"
+    if [ "$PHASE2_COMPLETE" -lt "$PHASE2_START" ]; then
+        echo -e "    ${YELLOW}⚠ Scan in progress or interrupted${NC}"
+    fi
+else
+    echo -e "  ${CYAN}No PHASE 2 scanning detected${NC}"
+fi
 
-# ============================================================================
+echo -e "\n${YELLOW}Background Sync Events:${NC}"
+
+BG_SYNC=$(grep -c "Background sync:" "$LOGFILE" 2>/dev/null || echo "0")
+BG_SYNC=$(echo "$BG_SYNC" | tr -d '[:space:]')
+echo -e "  Background syncs: ${GREEN}$BG_SYNC${NC}"
+
+if [ "$BG_SYNC" -gt 0 ]; then
+    # Show latest sync
+    LATEST_BG=$(grep "Background sync:" "$LOGFILE" 2>/dev/null | tail -1)
+    echo -e "    Latest: $LATEST_BG"
+fi
+
+echo -e "\n${YELLOW}Mempool Scanning:${NC}"
+
+MEMPOOL_SCAN=$(grep -c "scanMempoolForIncoming\|🔮 scanMempoolForIncoming" "$LOGFILE" 2>/dev/null || echo "0")
+MEMPOOL_SCAN=$(echo "$MEMPOOL_SCAN" | tr -d '[:space:]')
+if [ "$MEMPOOL_SCAN" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Mempool scanning: ACTIVE${NC} ($MEMPOOL_SCAN scans)"
+else
+    echo -e "  ${YELLOW}○ Mempool scanning: Not detected${NC}"
+fi
+
+# =============================================================================
+# SECTION 6: TRANSACTIONS
+# =============================================================================
+echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${BLUE}  6. TRANSACTIONS${NC}"
+echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+echo -e "\n${YELLOW}Outgoing Transactions:${NC}"
+
+SENT_TX=$(grep -c "Starting broadcast\|Broadcasting transaction\|📤 Broadcasting" "$LOGFILE" 2>/dev/null || echo "0")
+SENT_TX=$(echo "$SENT_TX" | tr -d '[:space:]')
+echo -e "  Broadcast attempts: ${GREEN}$SENT_TX${NC}"
+
+if [ "$SENT_TX" -gt 0 ]; then
+    # Check for confirmations
+    CONFIRMED=$(grep -c "Confirmed\|confirmOutgoingTx\|✅ Confirmed outgoing" "$LOGFILE" 2>/dev/null || echo "0")
+    CONFIRMED=$(echo "$CONFIRMED" | tr -d '[:space:]')
+    echo -e "  Confirmations: ${GREEN}$CONFIRMED${NC}"
+
+    # Check for broadcast issues
+    BROADCAST_FAIL=$(grep -c "Broadcast to.*0/.*peers\|❌.*Broadcast.*failed\|Timed out.*waiting" "$LOGFILE" 2>/dev/null || echo "0")
+    BROADCAST_FAIL=$(echo "$BROADCAST_FAIL" | tr -d '[:space:]')
+    if [ "$BROADCAST_FAIL" -gt 0 ]; then
+        echo -e "    ${YELLOW}⚠ $BROADCAST_FAIL broadcast issue(s) detected${NC}"
+    fi
+fi
+
+echo -e "\n${YELLOW}Incoming Transactions (Mempool):${NC}"
+
+MEMPOOL_TX=$(grep -c "Found.*mempool tx\|Incoming.*mempool\|🔍.*mempool.*incoming" "$LOGFILE" 2>/dev/null || echo "0")
+MEMPOOL_TX=$(echo "$MEMPOOL_TX" | tr -d '[:space:]')
+echo -e "  Mempool TXs found: ${GREEN}$MEMPOOL_TX${NC}"
+
+# =============================================================================
+# SECTION 7: ERROR ANALYSIS
+# =============================================================================
+echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${BLUE}  7. ERROR ANALYSIS${NC}"
+echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+echo -e "\n${YELLOW}Error Summary:${NC}"
+
+CANCELLATION_ERRORS=$(grep -c "Swift.CancellationError" "$LOGFILE" 2>/dev/null || echo "0")
+CANCELLATION_ERRORS=$(echo "$CANCELLATION_ERRORS" | tr -d '[:space:]')
+echo -e "  Task cancellations: ${YELLOW}$CANCELLATION_ERRORS${NC}"
+
+TIMEOUT_ERRORS=$(grep -c "Request timed out\|Connection timed out\|Timed out" "$LOGFILE" 2>/dev/null || echo "0")
+TIMEOUT_ERRORS=$(echo "$TIMEOUT_ERRORS" | tr -d '[:space:]')
+echo -e "  Timeout errors: ${YELLOW}$TIMEOUT_ERRORS${NC}"
+
+CONN_FAILED=$(grep -c "Connection failed\|NWConnection.*failed" "$LOGFILE" 2>/dev/null || echo "0")
+CONN_FAILED=$(echo "$CONN_FAILED" | tr -d '[:space:]')
+echo -e "  Connection failures: ${YELLOW}$CONN_FAILED${NC}"
+
+# Total errors
+TOTAL_ERR=$((CANCELLATION_ERRORS + TIMEOUT_ERRORS + CONN_FAILED))
+echo -e "  ${BOLD}Total errors: ${RED}$TOTAL_ERR${NC}"
+
+echo -e "\n${YELLOW}Top Error Patterns:${NC}"
+grep -E "❌ Failed:|ERROR|Error:|error:" "$LOGFILE" 2>/dev/null | \
+    sed 's/.*Failed: //' | \
+    sort | uniq -c | sort -rn | head -10 | \
+    awk '{printf "    %3d × %s\n", $1, substr($0, 6)}'
+
+# =============================================================================
+# SECTION 8: TCP KEEPALIVE STATUS
+# =============================================================================
+echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${BLUE}  8. TCP KEEPALIVE & NETWORK SETTINGS${NC}"
+echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+echo -e "\n${YELLOW}TCP Keepalive Settings:${NC}"
+
+# Check for improved keepalive settings
+IMPROVED_KEEPALIVE=$(grep -c "keepaliveInterval.*15\|keepaliveCount.*2\|enableKeepalive.*true" "$LOGFILE" 2>/dev/null || echo "0")
+IMPROVED_KEEPALIVE=$(echo "$IMPROVED_KEEPALIVE" | tr -d '[:space:]')
+if [ "$IMPROVED_KEEPALIVE" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ TCP keepalive improvements: DETECTED${NC}"
+    echo -e "    Using 15s interval × 2 probes = 30s timeout"
+else
+    echo -e "  ${YELLOW}○ TCP keepalive status: Unknown (may need improvement)${NC}"
+fi
+
+# Check for path monitoring (FIX #268)
+PATH_MONITOR=$(grep -c "NWPathMonitor\|handleNetworkPathChange\|📶.*network path" "$LOGFILE" 2>/dev/null || echo "0")
+PATH_MONITOR=$(echo "$PATH_MONITOR" | tr -d '[:space:]')
+if [ "$PATH_MONITOR" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Network path monitoring: ACTIVE${NC} (FIX #268)"
+else
+    echo -e "  ${YELLOW}○ Network path monitoring: Not detected${NC}"
+fi
+
+# =============================================================================
+# SECTION 9: BANS & SECURITY
+# =============================================================================
+echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${BLUE}  9. BANS & SECURITY${NC}"
+echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+echo -e "\n${YELLOW}Peer Bans:${NC}"
+
+BANNED_PEERS=$(grep -c "🚫.*Banning\|Banning peer\|banPeerForSybilAttack" "$LOGFILE" 2>/dev/null || echo "0")
+BANNED_PEERS=$(echo "$BANNED_PEERS" | tr -d '[:space:]')
+echo -e "  Peers banned: ${RED}$BANNED_PEERS${NC}"
+
+if [ "$BANNED_PEERS" -gt 0 ]; then
+    # Show recent bans
+    echo -e "    Recent bans:"
+    grep -E "🚫.*Banning|Banning peer|banPeerForSybilAttack" "$LOGFILE" 2>/dev/null | tail -3 | sed 's/^/      /'
+fi
+
+echo -e "\n${YELLOW}Sybil Attack Detection:${NC}"
+
+SYBIL_EVENTS=$(grep -c "SYBIL\|Sybil.*attack\|wrong chain\|fakeHeight" "$LOGFILE" 2>/dev/null || echo "0")
+SYBIL_EVENTS=$(echo "$SYBIL_EVENTS" | tr -d '[:space:]')
+if [ "$SYBIL_EVENTS" -gt 0 ]; then
+    echo -e "  ${RED}✗ $SYBIL_EVENTS Sybil-related event(s)${NC}"
+else
+    echo -e "  ${GREEN}✓ No Sybil attacks detected${NC}"
+fi
+
+# =============================================================================
 # SECTION 10: FIX TRACKING
-# ============================================================================
+# =============================================================================
 echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  10. FIX TRACKING (Bug Fixes Active in Log)${NC}"
+echo -e "${BOLD}${BLUE} 10. ACTIVE FIXES (Top 15)${NC}"
 echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-echo -e "\n${YELLOW}Active Bug Fixes:${NC}"
-grep -oE "FIX #[0-9]+" "$LOGFILE" | sort | uniq -c | sort -t'#' -k2 -n
+echo -e "\n${YELLOW}Most Active Bug Fixes:${NC}"
+grep -oE "FIX #[0-9]+" "$LOGFILE" 2>/dev/null | sort | uniq -c | sort -rn | head -15 | \
+    awk '{printf "    %3d × %s %s\n", $1, $2, $3}'
 
-# ============================================================================
-# SECTION 11: TIMELINE SUMMARY
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  11. TIMELINE SUMMARY (Last 20 Significant Events)${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+# Count unique fixes
+UNIQUE_FIXES=$(grep -oE "FIX #[0-9]+" "$LOGFILE" 2>/dev/null | awk -F# '{print $2}' | sort -u | wc -l | tr -d ' ')
+echo -e "\n  Total unique FIX numbers: ${CYAN}$UNIQUE_FIXES${NC}"
 
+# =============================================================================
+# SUMMARY & RECOMMENDATIONS
+# =============================================================================
+echo -e "\n${BOLD}${MAGENTA}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${MAGENTA}║                    ANALYSIS SUMMARY                            ║${NC}"
+echo -e "${BOLD}${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-grep -E "FAST START|FULL START|PHASE|Connected to|Header sync|Background sync|Broadcast|Confirmed|Error|error|Failed|failed|SYBIL|balance|Balance" "$LOGFILE" | tail -20
 
-# ============================================================================
-# SECTION 12: DATABASE CHECK
-# ============================================================================
-echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}${BLUE}  12. DATABASE STATUS (Live Check)${NC}"
-echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+# Calculate key metrics
+echo -e "${BOLD}Key Metrics:${NC}"
+echo -e "  Connections: ${GREEN}Success: $SUCCESS_COUNT${NC} | ${RED}Failed: $FAILED_COUNT${NC}"
+echo -e "  Errors: ${YELLOW}Cancellations: $CANCELLATION_ERRORS${NC} | ${YELLOW}Timeouts: $TIMEOUT_ERRORS${NC}"
+echo -e "  Health Checks: ${CYAN}$HEALTH_CHECKS${NC} | SOCKS5 Checks: ${CYAN}${SOCKS5_CHECKS:-0}${NC}"
+echo ""
 
-MAC_DB="/Users/chris/Library/Application Support/ZipherX/zipherx_wallet.db"
-MAC_HEADERS="/Users/chris/Library/Application Support/ZipherX/zipherx_headers.db"
+# Verdict
+echo -e "${BOLD}VERDICT:${NC}"
 
-if [ -f "$MAC_DB" ]; then
-    echo -e "\n${YELLOW}Wallet Database:${NC}"
-    echo -e "  Notes:"
-    sqlite3 "$MAC_DB" "SELECT COUNT(*) as total, SUM(CASE WHEN is_spent = 0 THEN 1 ELSE 0 END) as unspent, SUM(CASE WHEN is_spent = 0 THEN value ELSE 0 END) as unspent_balance FROM notes;" 2>/dev/null || echo "    (query failed)"
-    echo -e "\n  Sync State:"
-    sqlite3 "$MAC_DB" "SELECT last_scanned_height, verified_checkpoint_height, cached_chain_height FROM sync_state;" 2>/dev/null || echo "    (query failed)"
-else
-    echo -e "  ${YELLOW}Wallet database not found at: $MAC_DB${NC}"
+# Priority order for verdict
+CRITICAL=false
+
+if [ "$HEADER_SYNC_TIMEOUT" -gt 2 ]; then
+    echo -e "  ${RED}${BOLD}⚠ CRITICAL: Header Sync Loop Detected${NC}"
+    echo -e "     ${YELLOW}→ Header sync timing out repeatedly${NC}"
+    echo -e "     ${YELLOW}→ May need to check header storage logic${NC}"
+    echo -e "     ${YELLOW}→ See Section 4 for details${NC}"
+    CRITICAL=true
+
+elif [ "$SOCKS5_REFUSED" -gt 20 ]; then
+    echo -e "  ${RED}${BOLD}⚠ CRITICAL: Tor SOCKS5 Proxy Failure${NC}"
+    echo -e "     ${YELLOW}→ $SOCKS5_REFUSED SOCKS5 connection refused errors${NC}"
+    echo -e "     ${YELLOW}→ Tor proxy is not accepting connections${NC}"
+    echo -e "     ${YELLOW}→ FIX: Restart Tor or check Tor status${NC}"
+    echo -e "     ${YELLOW}→ See Section 2 for details${NC}"
+    CRITICAL=true
+
+elif [ -n "$SUCCESS_RATE" ] && [ "$SUCCESS_RATE" -lt 30 ]; then
+    echo -e "  ${RED}${BOLD}⚠ CRITICAL: Poor Connection Success Rate${NC}"
+    echo -e "     ${YELLOW}→ Only $SUCCESS_RATE% of connections succeeding${NC}"
+    echo -e "     ${YELLOW}→ Check network connectivity and Tor status${NC}"
+    echo -e "     ${YELLOW}→ See Section 3 for details${NC}"
+    CRITICAL=true
 fi
 
-if [ -f "$MAC_HEADERS" ]; then
-    echo -e "\n${YELLOW}Header Database:${NC}"
-    sqlite3 "$MAC_HEADERS" "SELECT MIN(height) as min_h, MAX(height) as max_h, COUNT(*) as count FROM headers;" 2>/dev/null || echo "  (query failed)"
-else
-    echo -e "  ${YELLOW}Header database not found${NC}"
-fi
+if [ "$CRITICAL" = "false" ]; then
+    # Warnings
+    WARNING_COUNT=0
 
-# ============================================================================
-# SUMMARY
-# ============================================================================
-echo -e "\n${BOLD}${PURPLE}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${PURPLE}║                    ANALYSIS SUMMARY                            ║${NC}"
-echo -e "${BOLD}${PURPLE}╚═══════════════════════════════════════════════════════════════╝${NC}"
-echo ""
+    if [ "$SOCKS5_REFUSED" -gt 5 ]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ WARNING: SOCKS5 Connection Issues${NC}"
+        echo -e "     ${YELLOW}→ $SOCKS5_REFUSED SOCKS5 errors detected${NC}"
+        echo -e "     ${YELLOW}→ Tor proxy may be unstable${NC}"
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+    fi
 
-# Calculate summary stats
-total_errors=$(grep -E "ERROR|Error|error" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-total_warnings=$(grep -E "Warning|WARN" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-peers_connected=$(grep -E "✅ Connected to" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-sybil_attacks=$sybil
-txs_broadcast=$broadcasts
+    if [ "$CANCELLATION_ERRORS" -gt 10 ]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ WARNING: High Task Cancellation Rate${NC}"
+        echo -e "     ${YELLOW}→ $CANCELLATION_ERRORS tasks cancelled${NC}"
+        echo -e "     ${YELLOW}→ May indicate timeout issues${NC}"
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+    fi
 
-echo -e "  ${CYAN}Peers Connected:${NC}  $peers_connected"
-echo -e "  ${CYAN}Sybil Events:${NC}     $sybil_attacks"
-echo -e "  ${CYAN}TX Broadcasts:${NC}    $txs_broadcast"
-echo -e "  ${CYAN}Errors:${NC}           $total_errors"
-echo -e "  ${CYAN}Warnings:${NC}         $total_warnings"
-echo ""
+    if [ "$HANDSHAKE_FAIL" -gt 10 ]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ WARNING: Many Handshake Failures${NC}"
+        echo -e "     ${YELLOW}→ $HANDSHAKE_FAIL handshake failures${NC}"
+        echo -e "     ${YELLOW}→ Could be incompatible peer versions${NC}"
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+    fi
 
-# Check for stuck sync
-stuck_at_percent=$(grep "FAST START progress" "$LOGFILE" 2>/dev/null | tail -1 | grep -oE "[0-9]+%" | tr -d '%')
-stuck_count=$(grep "FAST START progress = ${stuck_at_percent:-0}%" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$BLOCKS_BEHIND" != "" ] && [ "$BLOCKS_BEHIND" -gt 1000 ]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ WARNING: Wallet Behind Network${NC}"
+        echo -e "     ${YELLOW}→ $BLOCKS_BEHIND blocks behind chain tip${NC}"
+        echo -e "     ${YELLOW}→ Sync may be in progress or stuck${NC}"
+        WARNING_COUNT=$((WARNING_COUNT + 1))
+    fi
 
-# Additional checks for verdict
-tor_mode_enabled_disconnected=$(grep "Tor mode: enabled" "$LOGFILE" 2>/dev/null | tail -1)
-tor_connected_false=$(grep "Tor connected: false" "$LOGFILE" 2>/dev/null | tail -1)
-zero_peers_recovery=$(grep -E "0 peers connected|Parallel recovery complete - 0 peers" "$LOGFILE" 2>/dev/null | wc -l | tr -d ' ')
-tor_bypass_no_reconnect=$(grep -A 20 "Tor bypassed" "$LOGFILE" 2>/dev/null | grep -c "0 direct peer\|0 peers connected" | tr -d ' ')
-
-# Health verdict
-if [ "${stuck_count:-0}" -gt 20 ] && [ "${stuck_at_percent:-100}" -lt 100 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: SYNC STUCK at ${stuck_at_percent}% (${stuck_count} repeated logs)${NC}"
-    echo -e "  ${YELLOW}Check: connect() may be hanging in withTaskGroup${NC}"
-elif [ "${tor_bypass_no_reconnect:-0}" -gt 0 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: TOR BYPASS FAILED - Peers not reconnected after Tor bypass${NC}"
-    echo -e "  ${YELLOW}FIX #427 should resolve this. Upgrade app or retry.${NC}"
-elif [ -n "$tor_mode_enabled_disconnected" ] && [ -n "$tor_connected_false" ] && [ "${zero_peers_recovery:-0}" -gt 3 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: TOR STATE MISMATCH - Tor enabled but not connected, 0 peers${NC}"
-    echo -e "  ${YELLOW}Check: Tor mode enabled but SOCKS proxy dead. Peer recovery fails.${NC}"
-elif [ "$total_errors" -gt 50 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: CRITICAL ISSUES - Many errors detected${NC}"
-elif [ "${sybil_attacks:-0}" -gt 10 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: SYBIL ATTACK - Network under attack${NC}"
-elif [ "${zero_peers_recovery:-0}" -gt 5 ]; then
-    echo -e "  ${RED}${BOLD}VERDICT: PEER RECOVERY FAILING - Multiple 0-peer recovery attempts${NC}"
-    echo -e "  ${YELLOW}Check: Hardcoded seeds may not be reachable. Check network/firewall.${NC}"
-elif [ "$total_errors" -gt 10 ]; then
-    echo -e "  ${YELLOW}${BOLD}VERDICT: ISSUES PRESENT - Review errors above${NC}"
-elif [ "${peers_connected:-0}" -lt 3 ]; then
-    echo -e "  ${YELLOW}${BOLD}VERDICT: LOW PEERS - Network connectivity issues${NC}"
-else
-    echo -e "  ${GREEN}${BOLD}VERDICT: HEALTHY - No major issues detected${NC}"
+    if [ "$WARNING_COUNT" -eq 0 ]; then
+        echo -e "  ${GREEN}${BOLD}✓ HEALTHY: No Major Issues${NC}"
+        echo -e "     ${CYAN}→ All systems functioning normally${NC}"
+        echo -e "     ${CYAN}→ $SUCCESS_COUNT successful connections${NC}"
+        echo -e "     ${CYAN}→ $HEALTH_CHECKS health checks performed${NC}"
+    fi
 fi
 
 echo ""
-echo -e "${CYAN}Analysis complete.${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}Analysis complete. See detailed sections above for specifics.${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo ""

@@ -1818,20 +1818,7 @@ enum ZipherXFFI {
         let maxNotes = 1000  // Buffer for up to 1000 notes
 
         // Allocate output buffers - includes spent_txid and received_txid fields (PRODUCTION v2)
-        var notesBuffer = [BoostScanNote](repeating: BoostScanNote(
-            height: 0,
-            position: 0,
-            value: 0,
-            diversifier: (0,0,0,0,0,0,0,0,0,0,0),
-            rcm: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
-            cmu: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
-            nullifier: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
-            is_spent: 0,
-            spent_height: 0,
-            spent_txid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
-            received_txid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
-            _padding: (0,0,0)
-        ), count: maxNotes)
+        var notesBuffer = [BoostScanNote](repeating: BoostScanNote(), count: maxNotes)
 
         var resultSummary = BoostScanResult(
             total_received: 0,

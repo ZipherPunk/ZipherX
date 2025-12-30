@@ -6901,9 +6901,19 @@ public final class NetworkManager: ObservableObject {
                 return  // Skip normal dead peer handling
             }
 
-            // Normal dead peer handling
+            // FIX #473: Handle dead peers (they will be parked and not immediately retried)
             for deadPeer in deadPeers {
                 await handleDeadPeer(deadPeer)
+            }
+
+            // FIX #473: CRITICAL - Pre-emptively connect to MORE peers before we hit 0
+            // Bitcoin Core maintains 8-10 outgoing connections for redundancy
+            // We should connect to replacements IMMEDIATELY when peers die, not wait until 0
+            let currentReadyCount = peers.filter { $0.isConnectionReady }.count
+            if currentReadyCount < CONSENSUS_THRESHOLD {
+                print("⚠️ FIX #473: Only \(currentReadyCount) peers alive (need \(CONSENSUS_THRESHOLD)) - pre-emptively connecting to replacements...")
+                // Trigger immediate recovery to connect to more peers before we hit 0
+                await attemptPeerRecovery()
             }
         }
 
@@ -6959,6 +6969,7 @@ public final class NetworkManager: ObservableObject {
     /// Handle a dead peer with reconnection using exponential backoff
     /// FIX #268: Uses generation tracking to abort if network changed during sleep
     /// FIX #384: Uses PeerManager for backoff tracking
+    /// FIX #473: Park failing peers so they're not immediately retried
     private func handleDeadPeer(_ peer: Peer) async {
         // FIX #268: Capture generation at start - if it changes, abort reconnection
         // FIX #388: Use local synchronous generation counter
@@ -6973,6 +6984,13 @@ public final class NetworkManager: ObservableObject {
         // FIX #384: Sync peer removal to PeerManager
         await MainActor.run {
             PeerManager.shared.syncPeers(self.peers)
+        }
+
+        // FIX #473: PARK the peer so it's not immediately retried in recovery
+        // This prevents wasting time on peers that are known to fail
+        // Peers will be unparked when they're ready for retry (exponential backoff)
+        await MainActor.run {
+            PeerManager.shared.parkPeer(peer.host, port: peer.port)
         }
 
         // FIX #384: Get current attempt count and increment using PeerManager

@@ -965,6 +965,14 @@ public final class Peer {
         }
     }
 
+    /// Check if P2P handshake is complete (version message received and validated)
+    var isHandshakeComplete: Bool {
+        // Handshake is complete when we have received and validated a version message
+        // peerVersion > 0 means we received a version message
+        // isValidZclassicPeer checks if the version is within valid range
+        return peerVersion > 0 && isValidZclassicPeer
+    }
+
     /// FIX #434: Check if peer is a valid Zclassic node (not Zcash or other chain)
     /// Zclassic uses protocol versions 170010-170012
     /// Zcash uses 170018+ (NU5 upgrades) - these return wrong Equihash params!
@@ -1051,6 +1059,13 @@ public final class Peer {
     /// Call this after handshake completes
     /// NOTE: The listener only runs when peer is idle (not busy with other operations)
     func startBlockListener() {
+        // FIX #472: Check if header sync is in progress - if so, DON'T start listener
+        // This prevents race condition where new peers' block listeners consume "headers" responses
+        if PeerManager.shared.isHeaderSyncInProgress() {
+            print("📊 FIX #472: [\(host)] Block listener NOT started - header sync in progress")
+            return
+        }
+
         // ATOMIC CHECK: Use lock to prevent multiple listeners from starting
         // Without lock, two concurrent calls could both pass the guard before either sets _isListening
         listenerLock.lock()

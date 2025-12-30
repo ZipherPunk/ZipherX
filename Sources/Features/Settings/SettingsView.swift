@@ -380,11 +380,13 @@ struct SettingsView: View {
         }
         .alert("FINAL CONFIRMATION", isPresented: $showDeleteWalletConfirm) {
             TextField("Type DELETE to confirm", text: $deleteConfirmText)
+                .textInputAutocapitalization(.allCharacters)  // FIX #474: Show uppercase keyboard
             Button("CANCEL - KEEP MY WALLET", role: .cancel) {
                 deleteConfirmText = ""
             }
             Button("DELETE FOREVER", role: .destructive) {
-                if deleteConfirmText.uppercased() == "DELETE" {
+                // FIX #474: Case-sensitive validation - must be exact "DELETE" (not "delete" or "Delete")
+                if deleteConfirmText == "DELETE" {
                     performDeleteWallet()
                 }
                 deleteConfirmText = ""
