@@ -10,7 +10,7 @@ pub mod tor;
 pub mod download;
 
 // Set to true for verbose debug output, false for production
-const DEBUG_LOGGING: bool = false;
+const DEBUG_LOGGING: bool = true;  // FIX #514: Enabled to verify CMU byte order handling
 
 // Macro for conditional debug output
 macro_rules! debug_log {
@@ -3513,15 +3513,35 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
 
     debug_log!("🔧 Batch witness: {} targets, {} total CMUs", target_count, count);
 
+    // FIX #514 v3: Create reversed byte lookup maps for all targets (byte order mismatch handling)
+    // The database might store CMUs in different byte order than boost file
+    let mut target_bytes_reversed: Vec<[u8; 32]> = vec![[0u8; 32]; target_count];
+    for t_idx in 0..target_count {
+        let target_offset = t_idx * 32;
+        // Reverse: swap bytes from opposite ends
+        for j in 0..32 {
+            target_bytes_reversed[t_idx][j] = targets[target_offset + (31 - j)];
+        }
+    }
+
     // First pass: find all target positions (fast linear scan)
     let mut target_positions: Vec<Option<u64>> = vec![None; target_count];
     let mut offset = 8;
     for i in 0..count {
         let cmu_bytes = &bytes[offset..offset + 32];
         for (t_idx, target_offset) in (0..target_count).map(|t| (t, t * 32)) {
-            if target_positions[t_idx].is_none() && &targets[target_offset..target_offset + 32] == cmu_bytes {
-                target_positions[t_idx] = Some(i);
-                debug_log!("📍 Target {} found at position {}", t_idx, i);
+            if target_positions[t_idx].is_none() {
+                // FIX #514 v3: Check both original AND reversed byte orders
+                let target_bytes = &targets[target_offset..target_offset + 32];
+                let target_reversed = &target_bytes_reversed[t_idx];
+
+                if target_bytes == cmu_bytes {
+                    target_positions[t_idx] = Some(i);
+                    debug_log!("📍 Target {} found at position {} (original byte order)", t_idx, i);
+                } else if target_reversed == cmu_bytes {
+                    target_positions[t_idx] = Some(i);
+                    debug_log!("📍 Target {} found at position {} (REVERSED byte order)", t_idx, i);
+                }
             }
         }
         offset += 32;
@@ -3739,13 +3759,23 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
     debug_log!("🔧 Batch witness (optimized): {} targets, {} total CMUs", target_count, count);
     let start_time = std::time::Instant::now();
 
-    // Build a HashMap of target CMUs for O(1) lookup
+    // FIX #514 v3: Build a HashMap of target CMUs for O(1) lookup
+    // Include both original AND reversed byte orders for database compatibility
     let mut target_map: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
     for i in 0..target_count {
         let offset = i * 32;
+
+        // Add original byte order
         let mut cmu = [0u8; 32];
         cmu.copy_from_slice(&targets[offset..offset + 32]);
         target_map.insert(cmu, i);
+
+        // FIX #514 v3: Also add reversed byte order
+        let mut cmu_reversed = [0u8; 32];
+        for j in 0..32 {
+            cmu_reversed[j] = targets[offset + (31 - j)];
+        }
+        target_map.insert(cmu_reversed, i);
     }
 
     // Storage for witnesses we capture during tree build

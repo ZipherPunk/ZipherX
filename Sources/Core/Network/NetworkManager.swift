@@ -4732,31 +4732,21 @@ public final class NetworkManager: ObservableObject {
                 let currentSuccessCount = await state.getSuccessCount()
                 print("📊 FIX #392: After 500ms wait, successCount=\(currentSuccessCount)")
 
-                // FIX #390: Trust high peer acceptance (4+), only require P2P verify for low counts (2-3)
-                // Rationale: If 4+ independent peers accept with 0 rejections, TX is valid
-                // P2P getdata can fail due to propagation timing, but 4+ accepts is strong signal
+                // FIX #515: ALWAYS verify via P2P getdata, regardless of peer acceptance count
+                // Peers can LIE about accepting (Sybil attack) - MUST verify TX is actually in mempool!
+                // Previous FIX #390 shortcut was UNSAFE - see user case: 9 peers accepted but TX not in mempool
                 let rejectCount = await state.getRejectCount()
 
-                if currentSuccessCount >= 4 && rejectCount == 0 {
-                    // FIX #390: High acceptance (4+ peers, 0 rejections) - trust the broadcast!
-                    // Don't require P2P verify - getdata can fail due to propagation timing
-                    print("✅ FIX #390: TX accepted by \(currentSuccessCount) peers with 0 rejections - broadcast SUCCESS")
-                    onProgress?("verify", "✅ Accepted by \(currentSuccessCount) peers", 1.0)
-                    mempoolVerified = true
-                    await state.setVerified()
-                    await MainActor.run {
-                        self.setMempoolVerified()
-                    }
-                } else if currentSuccessCount >= 2 {
-                    // FIX #389 v2: Low acceptance (2-3 peers) - verify via P2P getdata
-                    // Could be partial propagation, need to confirm TX is actually in mempool
-                    print("📡 FIX #389 v2: \(currentSuccessCount) peers accepted - verifying TX in mempool...")
-                    onProgress?("verify", "Verifying with \(currentSuccessCount) accepting peers...", 0.7)
+                if currentSuccessCount >= 2 {
+                    // FIX #515: ALL acceptance counts (2+) require actual P2P getdata verification
+                    // High acceptance counts are promising but NOT proof of mempool inclusion
+                    print("📡 FIX #515: \(currentSuccessCount) peers accepted - verifying TX is ACTUALLY in mempool...")
+                    onProgress?("verify", "Verifying in mempool (\(currentSuccessCount) accepts)...", 0.7)
 
-                    // FIX #389 v2: Do actual P2P getdata verification for low acceptance counts
-                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                    // FIX #515: Do actual P2P getdata verification for ALL acceptance counts
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
                     if p2pVerified {
-                        print("✅ FIX #389 v2: TX verified via P2P getdata after \(currentSuccessCount) peer accepts")
+                        print("✅ FIX #515: TX verified via P2P getdata - found in \(currentSuccessCount) peers' mempools")
                         onProgress?("verify", "✅ Verified in network mempool", 1.0)
                         mempoolVerified = true
                         await state.setVerified()
@@ -4764,16 +4754,18 @@ public final class NetworkManager: ObservableObject {
                             self.setMempoolVerified()
                         }
                     } else {
-                        // FIX #389 v2: Multiple accepts but P2P verify FAILED - wait and retry
-                        print("⚠️ FIX #389 v2: \(currentSuccessCount) peers accepted but TX not found in mempool - waiting...")
-                        onProgress?("verify", "Waiting for network propagation...", 0.8)
+                        // FIX #515: Peers lied about accepting OR TX failed to propagate
+                        // CRITICAL: Do NOT trust peer acceptance - TX is NOT in mempool!
+                        print("⚠️ FIX #515: \(currentSuccessCount) peers accepted but TX NOT FOUND in any mempool!")
+                        print("🚨 FIX #515: Possible Sybil attack or broken peers - DO NOT trust acceptance!")
 
-                        // Wait 3 seconds for TX to propagate through network
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        // Wait 5 seconds and retry once (may have been propagation delay)
+                        onProgress?("verify", "Waiting for propagation...", 0.8)
+                        try? await Task.sleep(nanoseconds: 5_000_000_000)
 
-                        let retryVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                        let retryVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 10)
                         if retryVerified {
-                            print("✅ FIX #389 v2: TX verified on retry after propagation delay")
+                            print("✅ FIX #515: TX verified on retry after propagation delay")
                             onProgress?("verify", "✅ Transaction verified in network", 1.0)
                             mempoolVerified = true
                             await state.setVerified()
@@ -4781,22 +4773,16 @@ public final class NetworkManager: ObservableObject {
                                 self.setMempoolVerified()
                             }
                         } else {
-                            // FIX #390: Even with failed P2P verify, if 2-3 peers accepted with 0 rejections,
-                            // trust the broadcast - P2P getdata is unreliable for fresh TXs
+                            // FIX #515: Still not found after retry - BROADCAST FAILED
+                            // Peers lied OR all mempools rejected the transaction
+                            print("🚨 FIX #515: TX STILL not found after retry - PEERS LIED or TX INVALID!")
+                            print("🚨 FIX #515: Broadcast FAILED - do NOT mark as mempool verified!")
                             if rejectCount == 0 {
-                                print("⚠️ FIX #390: P2P verify failed but \(currentSuccessCount) peers accepted with 0 rejections - trusting broadcast")
-                                onProgress?("verify", "✅ Accepted by \(currentSuccessCount) peers", 1.0)
-                                mempoolVerified = true
-                                await state.setVerified()
-                                await MainActor.run {
-                                    self.setMempoolVerified()
-                                }
-                            } else {
-                                // Some peers rejected - this is a real failure
-                                print("🚨 FIX #389 v2: \(currentSuccessCount) accepts but \(rejectCount) rejections + P2P verify failed")
-                                onProgress?("error", "⚠️ Transaction may have failed (\(rejectCount) rejections)", 1.0)
-                                // mempoolVerified remains false
+                                // 0 rejections means peers silently dropped the TX (broken/malicious)
+                                print("⚠️ FIX #515: 0 rejections = peers accepted but didn't add to mempool (broken or Sybil attack)")
                             }
+                            onProgress?("error", "⚠️ Broadcast failed - not in mempool", 1.0)
+                            // mempoolVerified remains FALSE - user must retry send
                         }
                     }
                 } else if currentSuccessCount == 1 {
