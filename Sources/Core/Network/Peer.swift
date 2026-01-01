@@ -474,22 +474,32 @@ public final class Peer {
             return
         }
 
+        // FIX #504 CRITICAL: localhost/127.0.0.1 should NEVER route through Tor!
+        // Local node must connect directly for speed and reliability
+        let isLocalhost = host == "127.0.0.1" || host == "localhost" || host.hasPrefix("192.168.") || host.hasPrefix("10.") || host.hasPrefix("172.16.")
+
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(integerLiteral: port))
 
         // Use Tor parameters if Tor is enabled (for privacy even with regular IPs)
         // CRITICAL: If Tor mode is enabled, ALWAYS use SOCKS5 (connectViaSocks5 will wait for Tor)
         // This prevents direct connections when Tor isn't ready yet
         // FIX #144: Check isTorBypassed - when bypassed, connect directly for speed
+        // FIX #504: NEVER route localhost through Tor!
         let torEnabled = await TorManager.shared.mode == .enabled
         let torBypassed = await TorManager.shared.isTorBypassed
-        if torEnabled && !torBypassed {
+        if torEnabled && !torBypassed && !isLocalhost {
             // Route through Tor SOCKS5 proxy for privacy (will wait for Tor if not ready)
+            // BUT NOT for localhost - local nodes connect directly!
             try await connectViaSocks5()
             return
         }
         // FIX #144: If Tor is bypassed, use direct connection for faster header sync
-        if torBypassed {
-            print("📡 [\(host)] Connecting directly (Tor bypassed for speed)")
+        if torBypassed || isLocalhost {
+            if isLocalhost {
+                print("📡 [\(host)] Connecting directly (localhost - never through Tor)")
+            } else {
+                print("📡 [\(host)] Connecting directly (Tor bypassed for speed)")
+            }
         }
 
         // FIX #267: Configure TCP-level keepalive to prevent iOS from killing idle connections
@@ -945,7 +955,10 @@ public final class Peer {
 
     /// FIX #184: Thread-safe disconnect to prevent double-free crash
     func disconnect() {
-        stopBlockListener()
+        // FIX #509: Stop block listener in background task (async function)
+        // The listener will be cancelled and cleaned up, but we don't wait for it
+        Task { await stopBlockListener() }
+
         connectionLock.lock()
         let conn = connection
         connection = nil
@@ -1172,12 +1185,20 @@ public final class Peer {
     }
 
     /// Stop listening for block announcements
-    func stopBlockListener() {
+    /// FIX #509 v2: Quick stop - set flag and cancel, don't wait for task to finish
+    /// Race condition prevented by stopping listeners BEFORE header sync starts
+    func stopBlockListener() async {
         listenerLock.lock()
-        _isListening = false
-        blockListenerTask?.cancel()
+        _isListening = false  // Set flag first (checked by receiveMessageNonBlockingTolerant)
+        let task = blockListenerTask
         blockListenerTask = nil
         listenerLock.unlock()
+
+        // Cancel the task (don't wait for it to finish)
+        // The task will exit on its next loop iteration because _isListening = false
+        task?.cancel()
+
+        print("📡 [\(host)] Block listener stopped")
     }
 
     /// Receive message without blocking indefinitely (uses short timeout)
@@ -1488,6 +1509,7 @@ public final class Peer {
 
         // Protocol version (bytes 0-3) - use safe loading
         peerVersion = data.loadInt32(at: 0)
+        print("🔍 FIX #478: [\(host)] Parsed version payload: peerVersion=\(peerVersion), payloadSize=\(data.count) bytes")
 
         // Skip services (8), timestamp (8), addr_recv (26), addr_from (26), nonce (8)
         // = 76 bytes, then user agent
@@ -1871,6 +1893,10 @@ public final class Peer {
         let syncedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
         let startHeight: Int32 = Int32(min(syncedHeight, UInt64(Int32.max)))
         payload.append(contentsOf: withUnsafeBytes(of: startHeight.littleEndian) { Array($0) })
+
+        // FIX #478: Relay flag (1 byte) - True means we want transaction relay from peer
+        // This was MISSING - peers might reject connections without this flag!
+        payload.append(0x01)
 
         return payload
     }

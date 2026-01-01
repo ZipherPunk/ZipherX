@@ -76,7 +76,10 @@ final class HeaderSyncManager {
             }
         }
 
-        guard chainTip > startHeight else {
+        // FIX #484: Check if we need to sync (chainTip >= startHeight means we need headers)
+        // All callers pass (currentHeight + 1) as startHeight
+        // So if chainTip == startHeight, we need exactly 1 header
+        guard chainTip >= startHeight else {
             print("✅ Already synced to tip")
             return
         }
@@ -210,21 +213,15 @@ final class HeaderSyncManager {
     }
 
     /// FIX #122: Simple single-peer header sync for small ranges (<500 headers)
+    /// FIX #501: Aggressive peer rotation - try each trusted peer for 5s max, then switch
+    /// FIX #502: PRIORITIZE localhost (127.0.0.1) - user's local node
     /// No consensus overhead - just fetch from one peer and verify Equihash
     private func syncHeadersSimple(from startHeight: UInt64, to chainTip: UInt64) async throws {
-        print("⚡ Using simple sync with peer rotation for \(chainTip - startHeight) headers")
+        print("⚡ FIX #502: Using localhost-priority header sync for \(chainTip - startHeight) headers")
 
         // FIX: Timing diagnostics - track each step
         let syncStartTime = Date()
         var stepTimings: [String: TimeInterval] = [:]
-
-        func measureStep(_ name: String, operation: () async throws -> Void) async rethrows {
-            let stepStart = Date()
-            try await operation()
-            let stepDuration = Date().timeIntervalSince(stepStart)
-            stepTimings[name] = stepDuration
-            print("⏱️ Header sync step '\(name)' took \(String(format: "%.2f", stepDuration))s")
-        }
 
         // FIX #155: Report initial progress (0%) before starting
         let initialProgress = HeaderSyncProgress(
@@ -237,49 +234,90 @@ final class HeaderSyncManager {
         var currentHeight = startHeight
         var failedPeers = Set<String>()
 
-        // FIX #377: Dynamic timeout based on headers needed
-        // - Small sync (< 500): 45 seconds (quick catch-up)
-        // - Large sync (500-5000): 120 seconds (more time over Tor)
-        // - Huge sync (> 5000): 300 seconds (first install/reset scenario)
-        // This is critical for SYBIL protection which relies on HeaderStore height
+        // FIX #501: Much longer total timeout - we'll try many peers
         let headersNeeded = chainTip - currentHeight
-        let maxSyncDuration: TimeInterval
-        if headersNeeded < 500 {
-            maxSyncDuration = 45.0
-        } else if headersNeeded < 5000 {
-            maxSyncDuration = 120.0
-        } else {
-            maxSyncDuration = 300.0  // 5 minutes for massive catch-up
-        }
-        print("📊 FIX #377: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
-        stepTimings["timeout_calculated"] = Date().timeIntervalSince(syncStartTime)
+        let maxSyncDuration: TimeInterval = 300.0  // 5 minutes to try all peers
+        print("📊 FIX #502: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+
+        // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
+        let localhostPeer = "127.0.0.1"
+        let trustedSeedPeers = [
+            "37.187.76.79",     // Known working Zclassic peer
+            "135.181.94.12",    // Known working Zclassic peer
+            "140.174.189.3",    // Zclassic seed node
+            "140.174.189.17",   // Zclassic seed node
+            "205.209.104.118"   // Zclassic seed node
+        ]
 
         while currentHeight < chainTip {
             // FIX #274: Check total sync timeout
             let elapsed = Date().timeIntervalSince(syncStartTime)
             if elapsed > maxSyncDuration {
-                print("⚠️ FIX #274: Header sync timeout (\(Int(elapsed))s) - throwing error to trigger retry")
-                print("⚠️ Note: Headers were NOT synced successfully - need retry with different approach")
+                print("⚠️ FIX #502: Header sync timeout after \(Int(elapsed))s - tried all peers")
                 throw SyncError.timeout("Header sync timed out after \(Int(elapsed))s - \(chainTip - currentHeight) blocks remaining")
             }
 
-            // CRITICAL FIX: Get FRESH peers list on each iteration
-            // FIX #384: Use PeerManager for centralized peer access
+            // FIX #502 v2: PRIORITIZE localhost (127.0.0.1) ABOVE ALL OTHER PEERS
+            // User's local node is most reliable - no network latency, always available
+            // Secondary: peers that have reported valid heights (peerStartHeight > 0)
+            // These are peers that completed handshake and sent us a valid chain height
             let currentPeers = await MainActor.run {
-                PeerManager.shared.getReadyPeers().filter { !failedPeers.contains($0.host) }
+                let allPeers = networkManager.peers.filter { peer in
+                    peer.isHandshakeComplete &&
+                    peer.hasRecentActivity &&  // FIX #504: MUST have recent activity (connection is alive!)
+                    peer.peerStartHeight > 0 &&  // MUST have reported a valid height
+                    !failedPeers.contains(peer.host)
+                }
+
+                // FIX #502: Sort by: localhost FIRST, then trusted, then by recency of height report
+                return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
+                    let peer1IsLocalhost = peer1.host == localhostPeer
+                    let peer2IsLocalhost = peer2.host == localhostPeer
+
+                    // FIX #502: Localhost ALWAYS comes first
+                    if peer1IsLocalhost && !peer2IsLocalhost {
+                        return true  // peer1 (localhost) first
+                    } else if !peer1IsLocalhost && peer2IsLocalhost {
+                        return false  // peer2 (localhost) first
+                    }
+
+                    // Neither or both are localhost - use existing trusted seed logic
+                    let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
+                    let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
+
+                    if peer1IsTrusted && !peer2IsTrusted {
+                        return true  // peer1 first
+                    } else if !peer1IsTrusted && peer2IsTrusted {
+                        return false  // peer2 first
+                    } else {
+                        // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
+                        return peer1.peerStartHeight > peer2.peerStartHeight
+                    }
+                }
             }
 
             guard let peer = currentPeers.first else {
-                // Wait and retry with refreshed peer list
-                print("⚠️ No ready peers, waiting 2s for reconnection...")
+                // FIX #502: Suggest adding localhost if no peers available
+                print("⚠️ FIX #502: No ready peers with valid heights, waiting 2s...")
+                print("   💡 TIP: Start your local Zclassic node: zclassicd -daemon -listen=1 -listenonion=0")
+                print("   💡 Or add custom node: Settings → Network → Add Node (127.0.0.1:8033)")
                 try await Task.sleep(nanoseconds: 2_000_000_000)
-                failedPeers.removeAll() // Reset failed peers to retry all
-                let retryPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
-                guard !retryPeers.isEmpty else {
-                    throw SyncError.insufficientPeers(got: 0, need: 1)
+
+                // FIX #477: Check timeout AFTER sleep to prevent infinite loop
+                let elapsedAfterSleep = Date().timeIntervalSince(syncStartTime)
+                if elapsedAfterSleep > maxSyncDuration {
+                    print("⚠️ FIX #502: Header sync timeout after peer wait (\(Int(elapsedAfterSleep))s)")
+                    throw SyncError.timeout("Header sync timed out after \(Int(elapsedAfterSleep))s while waiting for peers")
                 }
+
+                failedPeers.removeAll() // Reset failed peers to retry all
                 continue
             }
+
+            let isTrusted = trustedSeedPeers.contains(peer.host)
+            let isLocalhost = peer.host == localhostPeer
+            let peerLabel = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
+            print("📡 FIX #502: Trying peer \(peer.host) \(peerLabel) - reported height: \(peer.peerStartHeight)")
 
             // FIX #133: Destructure tuple to get actual locator height
             let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
@@ -287,20 +325,17 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             do {
-                // FIX #419: Use withExclusiveAccessTimeout to prevent indefinite hangs
-                // The lock acquisition itself can now timeout, preventing deadlocks
-                // when block listeners are holding the lock for too long
-                let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: 8.0) {
+                // FIX #501: Very aggressive timeout - 5 seconds per peer, then switch
+                let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: 5.0) {
                     try await peer.sendMessage(command: "getheaders", payload: payload)
 
                     var receivedHeaders: [ZclassicBlockHeader]?
                     var attempts = 0
 
-                    // FIX #274: Reduced from 3 attempts to 2 for faster rotation
-                    while receivedHeaders == nil && attempts < 2 {
+                    // Only 1 attempt with 3 second timeout - if peer doesn't respond, move on
+                    while receivedHeaders == nil && attempts < 1 {
                         attempts += 1
-                        // FIX #274: Reduced from 10s to 5s per attempt
-                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
+                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 3)
                         if command == "headers" {
                             // FIX #133: Use correct starting height from actual locator
                             receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
@@ -311,7 +346,7 @@ final class HeaderSyncManager {
                 }
 
                 guard !headers.isEmpty else {
-                    print("⚠️ No headers from peer \(peer.host), trying another...")
+                    print("⚠️ FIX #502: Peer \(peer.host) returned no headers, trying next peer...")
                     failedPeers.insert(peer.host)
                     continue
                 }
@@ -332,16 +367,15 @@ final class HeaderSyncManager {
                 )
                 onProgress?(progress)
 
-                print("✅ Synced \(headers.count) headers to \(actualEndHeight) (\(progress.percentComplete)%)")
+                print("✅ FIX #502: Synced \(headers.count) headers to \(actualEndHeight) (\(progress.percentComplete)%) from \(peer.host)")
+
+                // Clear failed peers on success - a working peer might recover
+                failedPeers.removeAll()
 
             } catch {
-                // FIX #274: Log timeout specifically and disconnect peer to reset stuck receive
-                if case NetworkError.timeout = error {
-                    print("⚠️ FIX #274: Peer \(peer.host) timed out (8s max), trying another peer...")
-                    peer.disconnect()  // Reset stuck NWConnection
-                } else {
-                    print("⚠️ Peer \(peer.host) failed: \(error.localizedDescription)")
-                }
+                // FIX #501: Log failure and immediately disconnect/reset peer
+                print("⚠️ FIX #502: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting and trying next...")
+                peer.disconnect()  // Reset stuck NWConnection
                 failedPeers.insert(peer.host)
                 continue
             }
@@ -349,23 +383,59 @@ final class HeaderSyncManager {
 
         // FIX: Timing summary
         let totalDuration = Date().timeIntervalSince(syncStartTime)
-        print("⏱️ Header sync timing summary:")
+        print("⏱️ FIX #502: Header sync timing summary:")
         print("   Total duration: \(String(format: "%.2f", totalDuration))s")
-        for (step, duration) in stepTimings.sorted(by: { $0.value < $1.value }) {
-            print("   \(step): \(String(format: "%.2f", duration))s (\(Int(duration/totalDuration*100))%)")
-        }
         print("   Headers per second: \(String(format: "%.1f", Double(headersNeeded) / totalDuration))")
     }
 
     /// FIX #141: PARALLEL header requests - request from ALL peers, take first response
+    /// FIX #501: Aggressive peer rotation - try each trusted peer for 5s max, then switch
+    /// FIX #502: PRIORITIZE localhost (127.0.0.1) - user's local node
     /// Over Tor, latency varies wildly. Parallel requests ensure fastest peer wins.
     /// IMPORTANT: P2P getheaders returns headers AFTER the locator hash
     /// Each batch uses the last received header's hash as locator for the next batch
     private func syncHeadersParallel(from startHeight: UInt64, to chainTip: UInt64) async throws {
-        print("🚀 FIX #141: Using PARALLEL header requests for \(chainTip - startHeight) headers")
+        print("🚀 FIX #502: Using PARALLEL header requests with localhost priority for \(chainTip - startHeight) headers")
 
-        // FIX #384: Use PeerManager for centralized peer access
-        let peers = await MainActor.run { PeerManager.shared.getReadyPeers() }
+        // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
+        let localhostPeer = "127.0.0.1"
+        let trustedSeedPeers = [
+            "37.187.76.79",     // Known working Zclassic peer
+            "135.181.94.12",    // Known working Zclassic peer
+            "140.174.189.3",    // Zclassic seed node
+            "140.174.189.17",   // Zclassic seed node
+            "205.209.104.118"   // Zclassic seed node
+        ]
+
+        // FIX #483: Use NetworkManager.peers directly instead of PeerManager
+        let peers = await MainActor.run {
+            let allPeers = networkManager.peers.filter { $0.isHandshakeComplete }
+            // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
+            return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
+                let peer1IsLocalhost = peer1.host == localhostPeer
+                let peer2IsLocalhost = peer2.host == localhostPeer
+
+                // FIX #502: Localhost ALWAYS comes first
+                if peer1IsLocalhost && !peer2IsLocalhost {
+                    return true  // peer1 (localhost) first
+                } else if !peer1IsLocalhost && peer2IsLocalhost {
+                    return false  // peer2 (localhost) first
+                }
+
+                // Neither or both are localhost - use existing trusted seed logic
+                let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
+                let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
+
+                if peer1IsTrusted && !peer2IsTrusted {
+                    return true  // peer1 first
+                } else if !peer1IsTrusted && peer2IsTrusted {
+                    return false  // peer2 first
+                } else {
+                    // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
+                    return peer1.peerStartHeight > peer2.peerStartHeight
+                }
+            }
+        }
         guard !peers.isEmpty else {
             throw SyncError.insufficientPeers(got: 0, need: 1)
         }
@@ -378,134 +448,130 @@ final class HeaderSyncManager {
         )
         onProgress?(initialProgress)
 
-        print("📊 Requesting headers from ALL \(peers.count) peers in parallel (first response wins)")
+        print("📊 FIX #502: Requesting headers from \(peers.count) peers (localhost first, then trusted)")
 
         var currentHeight = startHeight
         var totalSynced = 0
         let totalNeeded = Int(chainTip - startHeight)
         let startTime = Date()
-        var consecutiveFailures = 0
-        let maxConsecutiveFailures = 3
+        var failedPeers = Set<String>()
 
-        // FIX #444: Calculate dynamic timeout based on headers needed
+        // FIX #501: Much longer total timeout - we'll try many peers
         let headersNeeded = chainTip - startHeight
-        let maxSyncDuration: TimeInterval
-        if headersNeeded < 500 {
-            maxSyncDuration = 45  // Quick catch-up
-        } else if headersNeeded < 5000 {
-            maxSyncDuration = 120  // Tor latency
-        } else {
-            maxSyncDuration = 300  // First install/reset
-        }
-        print("⏱️ FIX #444: Parallel sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        let maxSyncDuration: TimeInterval = 300.0  // 5 minutes
+        print("⏱️ FIX #502: Parallel sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
 
         while currentHeight < chainTip {
-            // FIX #444: Check for timeout
+            // FIX #501: Check for timeout
             let totalElapsed = Date().timeIntervalSince(startTime)
             if totalElapsed > maxSyncDuration {
-                print("⚠️ FIX #444: Header sync timeout (\(Int(totalElapsed))s) - throwing error to trigger retry")
-                print("⚠️ Note: Headers were NOT synced successfully - need retry with different approach")
+                print("⚠️ FIX #502: Header sync timeout after \(Int(totalElapsed))s - tried all peers")
                 throw SyncError.timeout("Header sync timed out after \(Int(totalElapsed))s - \(chainTip - currentHeight) blocks remaining")
             }
+
             // FIX #133: Destructure tuple to get actual locator height
             let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
             // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
             let headersStartHeight = actualLocatorHeight + 1
 
-            // Get fresh peer list for each batch
-            // FIX #384: Use PeerManager for centralized peer access
-            let currentPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
-            guard !currentPeers.isEmpty else {
-                print("⚠️ No connected peers, waiting 1s...")
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                consecutiveFailures += 1
-                if consecutiveFailures >= maxConsecutiveFailures {
-                    throw SyncError.insufficientPeers(got: 0, need: 1)
+            // Get fresh peer list for each batch, prioritizing trusted peers
+            // FIX #502 v2: PRIORITIZE localhost, then peers with valid heights (peerStartHeight > 0)
+            let currentPeers = await MainActor.run {
+                let allPeers = networkManager.peers.filter { peer in
+                    peer.isHandshakeComplete &&
+                    peer.hasRecentActivity &&  // FIX #504: MUST have recent activity (connection is alive!)
+                    peer.peerStartHeight > 0 &&  // MUST have reported a valid height
+                    !failedPeers.contains(peer.host)
                 }
-                continue
-            }
+                // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
+                return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
+                    let peer1IsLocalhost = peer1.host == localhostPeer
+                    let peer2IsLocalhost = peer2.host == localhostPeer
 
-            // FIX #141: Request from ALL peers in parallel, take first valid response
-            // This dramatically speeds up sync over Tor where latency varies wildly
-            // FIX #142: Increased timeout from 2s to 15s for Tor compatibility
-            // FIX #148: Use detached tasks to avoid waiting for cancelled peer timeouts
-            //          The old withTaskGroup waited for ALL tasks even after cancelAll()
-            //          This caused 36+ second delays between batches
-            var headers: [ZclassicBlockHeader]?
-            let totalPeers = currentPeers.count
+                    // FIX #502: Localhost ALWAYS comes first
+                    if peer1IsLocalhost && !peer2IsLocalhost {
+                        return true  // peer1 (localhost) first
+                    } else if !peer1IsLocalhost && peer2IsLocalhost {
+                        return false  // peer2 (localhost) first
+                    }
 
-            // Thread-safe state for tracking completion
-            final class SyncState: @unchecked Sendable {
-                var tasksCompleted = 0
-                var resumed = false
-                let lock = NSLock()
-            }
-            let state = SyncState()
+                    // Neither or both are localhost - use existing trusted seed logic
+                    let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
+                    let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
 
-            // Create a continuation to get the first result without waiting for others
-            headers = await withCheckedContinuation { continuation in
-                for peer in currentPeers {
-                    Task.detached { [state, headersStartHeight, totalPeers] in
-                        defer {
-                            state.lock.lock()
-                            state.tasksCompleted += 1
-                            // If all tasks failed and we haven't resumed yet, resume with nil
-                            if state.tasksCompleted >= totalPeers && !state.resumed {
-                                state.resumed = true
-                                state.lock.unlock()
-                                continuation.resume(returning: nil)
-                            } else {
-                                state.lock.unlock()
-                            }
-                        }
-
-                        do {
-                            let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
-                                try await peer.sendMessage(command: "getheaders", payload: payload)
-                                // FIX #142: 15s timeout for Tor mode
-                                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 15)
-                                if command == "headers" {
-                                    return try self.parseHeadersPayload(response, startingAt: headersStartHeight)
-                                }
-                                return []
-                            }
-
-                            // First valid response wins - resume immediately!
-                            if !result.isEmpty {
-                                state.lock.lock()
-                                if !state.resumed {
-                                    state.resumed = true
-                                    state.lock.unlock()
-                                    print("⚡ FIX #148: Got \(result.count) headers from \(peer.host) (INSTANT - no wait for others)")
-                                    continuation.resume(returning: result)
-                                } else {
-                                    state.lock.unlock()
-                                }
-                            }
-                        } catch {
-                            // Task failed or cancelled - don't log CancellationError spam
-                            if !(error is CancellationError) {
-                                print("⚠️ Peer \(peer.host) header request failed: \(error.localizedDescription)")
-                            }
-                        }
+                    if peer1IsTrusted && !peer2IsTrusted {
+                        return true  // peer1 first
+                    } else if !peer1IsTrusted && peer2IsTrusted {
+                        return false  // peer2 first
+                    } else {
+                        // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
+                        return peer1.peerStartHeight > peer2.peerStartHeight
                     }
                 }
             }
 
-            guard let headers = headers, !headers.isEmpty else {
-                print("⚠️ No headers from any peer, retrying...")
-                consecutiveFailures += 1
-                if consecutiveFailures >= maxConsecutiveFailures {
-                    // Wait and retry with fresh peers
-                    print("⚠️ \(maxConsecutiveFailures) consecutive failures, waiting 2s for peers...")
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
-                    consecutiveFailures = 0
+            guard !currentPeers.isEmpty else {
+                print("⚠️ FIX #502: No connected peers, waiting 2s for reconnection...")
+                print("   💡 TIP: Start your local Zclassic node: zclassicd -daemon -listen=1 -listenonion=0")
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+
+                // FIX #477: Check timeout AFTER sleep
+                let totalElapsedAfterSleep = Date().timeIntervalSince(startTime)
+                if totalElapsedAfterSleep > maxSyncDuration {
+                    print("⚠️ FIX #502: Parallel sync timeout after peer wait")
+                    throw SyncError.timeout("Header sync timed out waiting for peers")
                 }
+
+                failedPeers.removeAll() // Reset failed peers to retry all
                 continue
             }
 
-            // Success - reset failure counter
-            consecutiveFailures = 0
+            // FIX #501: Try each peer with aggressive timeout (5 seconds max)
+            var headers: [ZclassicBlockHeader]?
+            let perPeerTimeout: TimeInterval = 5.0  // 5 seconds per peer
+
+            for (index, peer) in currentPeers.enumerated() {
+                let isTrusted = trustedSeedPeers.contains(peer.host)
+                let isLocalhost = peer.host == localhostPeer
+                let peerLabel = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
+                print("📡 FIX #502: Trying \(peer.host) [\(index + 1)/\(currentPeers.count)] \(peerLabel) - reported height: \(peer.peerStartHeight)")
+
+                do {
+                    let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: perPeerTimeout) {
+                        try await peer.sendMessage(command: "getheaders", payload: payload)
+
+                        // FIX #501: Only 1 attempt with 3 second timeout
+                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 3)
+
+                        if command == "headers" {
+                            return try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                        }
+
+                        return []
+                    }
+
+                    if !result.isEmpty {
+                        // Success!
+                        print("✅ FIX #502: Got \(result.count) headers from \(peer.host)")
+                        headers = result
+                        failedPeers.removeAll() // Clear failed peers on success
+                        break  // Exit peer loop - we got our headers
+                    }
+
+                } catch {
+                    // This peer failed, try next one
+                    print("⚠️ FIX #501: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting")
+                    peer.disconnect()
+                    failedPeers.insert(peer.host)
+                    continue
+                }
+            }
+
+            guard let headers = headers, !headers.isEmpty else {
+                print("⚠️ FIX #502: All peers failed, waiting 2s before retry...")
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                continue
+            }
 
             // FIX #133: Verify chain continuity with correct starting height
             try verifyHeaderChain(headers, startingAt: headersStartHeight)
@@ -533,7 +599,7 @@ final class HeaderSyncManager {
 
         let totalTime = Date().timeIntervalSince(startTime)
         let finalRate = totalTime > 0 ? Double(totalSynced) / totalTime : 0
-        print("🎉 Header sync complete: \(totalSynced) headers in \(String(format: "%.1f", totalTime)) seconds (\(Int(finalRate)) headers/sec)")
+        print("🎉 FIX #502: Header sync complete: \(totalSynced) headers in \(String(format: "%.1f", totalTime))s (\(Int(finalRate)) headers/sec)")
     }
 
     /// Fetch headers from a single peer for a specific range
@@ -698,8 +764,8 @@ final class HeaderSyncManager {
         let minPeersToTry = 10  // Try at least 10 peers before giving up
 
         // Get ALL available peers for resilience
-        // FIX #384: Use PeerManager for centralized peer access
-        var allPeers = await MainActor.run { PeerManager.shared.allPeers }
+        // FIX #483: Use NetworkManager.peers directly instead of PeerManager
+        var allPeers = await MainActor.run { networkManager.peers }
 
         // If we don't have enough peers, try to connect more
         if allPeers.count < minPeersToTry {
@@ -710,17 +776,17 @@ final class HeaderSyncManager {
             // The connect() call initiates connections but they may not be ready yet
             var waitAttempts = 0
             let maxWaitAttempts = 30 // 30 * 0.5s = 15 seconds max
-            var peerCount = await MainActor.run { PeerManager.shared.connectedPeerCount }
+            var peerCount = await MainActor.run { networkManager.connectedPeers }
             while peerCount < minPeers && waitAttempts < maxWaitAttempts {
                 try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
                 waitAttempts += 1
-                peerCount = await MainActor.run { PeerManager.shared.connectedPeerCount }
+                peerCount = await MainActor.run { networkManager.connectedPeers }
                 if waitAttempts % 4 == 0 { // Log every 2 seconds
                     print("⏳ Waiting for peers to connect... (\(peerCount)/\(minPeers) ready, waited \(waitAttempts / 2)s)")
                 }
             }
 
-            allPeers = await MainActor.run { PeerManager.shared.allPeers }
+            allPeers = await MainActor.run { networkManager.peers }
             print("📡 After waiting: \(allPeers.count) peers connected")
         }
 

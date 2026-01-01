@@ -903,15 +903,28 @@ enum ZipherXFFI {
     }
 
     /// Serialize tree state for persistence
+    /// FIX #508: Increased buffer from 100KB to 20MB to handle large trees (1M+ commitments)
+    /// Each commitment is ~11 bytes, so 1M commitments = ~11MB + overhead
     static func treeSerialize() -> Data? {
-        var buffer = [UInt8](repeating: 0, count: 100_000)
+        // Start with 20MB buffer - enough for 1.5M+ commitments
+        var bufferSize = 20_000_000
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
         var length: Int = 0
 
+        // Try to serialize - if buffer too small, the FFI will indicate via length
         guard zipherx_tree_serialize(&buffer, &length) else {
             return nil
         }
 
-        return Data(buffer.prefix(length))
+        // Validate the serialized size is reasonable
+        if length == 0 || length > bufferSize {
+            print("⚠️ treeSerialize: Invalid size \(length) (buffer: \(bufferSize))")
+            return nil
+        }
+
+        let result = Data(buffer.prefix(length))
+        print("✅ treeSerialize: \(length) bytes (\(length / 1_000_000)MB)")
+        return result
     }
 
     /// Deserialize tree state from persistence

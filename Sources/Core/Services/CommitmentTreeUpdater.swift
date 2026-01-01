@@ -674,6 +674,46 @@ actor CommitmentTreeUpdater {
         boostCacheDirectory.appendingPathComponent("legacy_cmus_v\(Self.legacyCMUCacheVersion).bin")
     }
 
+    /// FIX #496: Path to CMU cache metadata file (stores boost file signature for validation)
+    private var cachedLegacyCMUMetaPath: URL {
+        boostCacheDirectory.appendingPathComponent("legacy_cmus_v\(Self.legacyCMUCacheVersion).meta.json")
+    }
+
+    /// FIX #496: Metadata structure for CMU cache validation
+    private struct CMUCacheMetadata: Codable {
+        let chainHeight: UInt64
+        let outputCount: UInt64
+        let treeRoot: String
+        let createdAt: Date
+    }
+
+    /// FIX #496: Check if cached CMU file is valid (matches current boost file)
+    private func isCachedCMUValid() -> Bool {
+        guard FileManager.default.fileExists(atPath: cachedLegacyCMUPath.path),
+              FileManager.default.fileExists(atPath: cachedLegacyCMUMetaPath.path) else {
+            return false
+        }
+
+        guard let manifest = loadCachedManifest(),
+              let metaData = try? Data(contentsOf: cachedLegacyCMUMetaPath),
+              let metadata = try? JSONDecoder().decode(CMUCacheMetadata.self, from: metaData) else {
+            return false
+        }
+
+        // Validate against current boost file manifest
+        let isValid = metadata.chainHeight == manifest.chain_height &&
+                      metadata.outputCount == manifest.output_count &&
+                      metadata.treeRoot == manifest.tree_root
+
+        if !isValid {
+            print("⚠️ FIX #496: CMU cache stale - boosting file has changed")
+            print("   Cache: height=\(metadata.chainHeight), outputs=\(metadata.outputCount)")
+            print("   Current: height=\(manifest.chain_height), outputs=\(manifest.output_count)")
+        }
+
+        return isValid
+    }
+
     /// FIX #469: Invalidate CMU cache when boost file is updated
     /// This ensures the cached CMUs match the current boost file version
     private func invalidateCMUCache() {
@@ -685,6 +725,10 @@ actor CommitmentTreeUpdater {
             } catch {
                 print("⚠️ FIX #469: Failed to delete CMU cache: \(error.localizedDescription)")
             }
+        }
+        // FIX #496: Also delete metadata file
+        if fm.fileExists(atPath: cachedLegacyCMUMetaPath.path) {
+            try? fm.removeItem(at: cachedLegacyCMUMetaPath)
         }
     }
 
@@ -710,22 +754,36 @@ actor CommitmentTreeUpdater {
 
     /// Legacy method - get cached CMU data in legacy format
     /// Extracts CMUs from boost file on first call, caches for subsequent calls
+    /// FIX #496: Validates cache against boost file manifest to detect stale cache
     func getCachedCMUFilePath() async -> URL? {
         // Clean up old cache versions first
         cleanupOldCacheVersions()
 
-        // Check if we have cached legacy CMU file
-        if FileManager.default.fileExists(atPath: cachedLegacyCMUPath.path) {
+        // FIX #496: Check if we have VALID cached legacy CMU file
+        if isCachedCMUValid() {
             return cachedLegacyCMUPath
         }
 
-        // Need to extract from boost file
+        // Cache is invalid or doesn't exist - need to extract from boost file
         guard hasCachedBoostFile() else { return nil }
+        guard let manifest = loadCachedManifest() else { return nil }
 
         do {
             let cmuData = try await extractCMUsInLegacyFormat()
             try cmuData.write(to: cachedLegacyCMUPath)
-            print("💾 Cached legacy CMU data (v\(Self.legacyCMUCacheVersion)): \(cmuData.count) bytes")
+
+            // FIX #496: Write metadata file for validation on next access
+            let metadata = CMUCacheMetadata(
+                chainHeight: manifest.chain_height,
+                outputCount: manifest.output_count,
+                treeRoot: manifest.tree_root,
+                createdAt: Date()
+            )
+            let metaData = try JSONEncoder().encode(metadata)
+            try metaData.write(to: cachedLegacyCMUMetaPath)
+
+            print("💾 FIX #496: Cached legacy CMU data (v\(Self.legacyCMUCacheVersion)): \(cmuData.count) bytes")
+            print("   Chain height: \(manifest.chain_height), Outputs: \(manifest.output_count)")
             return cachedLegacyCMUPath
         } catch {
             print("❌ Failed to extract legacy CMU data: \(error)")

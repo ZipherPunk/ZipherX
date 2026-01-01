@@ -21,8 +21,10 @@
 		0EC0AE8AA031C37EA515AF19 /* HeaderSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D114627F3AC22A9229292187 /* HeaderSyncManager.swift */; };
 		166B61D02B2AEB89D06A158A /* BundledShieldedOutputs.swift in Sources */ = {isa = PBXBuildFile; fileRef = F745C75EE82A4C61B3D8050B /* BundledShieldedOutputs.swift */; };
 		173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04D760700D0BE0A40A1FA82A /* PrivacyQuotes.swift */; };
+		181AA8222539CB2B4466F3B3 /* ParallelImportProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20DAC18EA4D3211E1BFE4BC /* ParallelImportProgressView.swift */; };
 		189A8CFCC5B8479B29F14DC3 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFCB4EE9BBE481DCD741022B /* ChatView.swift */; };
 		19D558691C9ED092DBA470FB /* FilterScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */; };
+		1A4879FBD776F69F9F13C3BA /* TempImportDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9DEC86845018A04D6E4B6F /* TempImportDatabase.swift */; };
 		1A94928949C49A5977D23471 /* NodeManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77C159B8B06BA2E8D96A48A4 /* NodeManagementView.swift */; };
 		1B2C46C9C59FD9C9A20EA667 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
 		1B44F7C3066ACAB0BE47817A /* HiddenServiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98F1D06E3F628828D11677A0 /* HiddenServiceManager.swift */; };
@@ -95,6 +97,7 @@
 		76E34B0E07EC1B8587C2BE12 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		772BD4E27BC23CDF88246433 /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */; };
 		79B002B28B3284D1D6AEEA57 /* Mac7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7173E7574C060D4285B73B46 /* Mac7Theme.swift */; };
+		79DAD21F6675673EE96F6D46 /* TempImportDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9DEC86845018A04D6E4B6F /* TempImportDatabase.swift */; };
 		7A661F99BFC98FC7B4CED056 /* BoostDownloadProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 374534D4E96BDE4077D846D2 /* BoostDownloadProgressView.swift */; };
 		7A96BC266309441F5614C1C7 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
 		7DD7B225E2DA39C043608A61 /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
@@ -121,6 +124,7 @@
 		9EC14CE9632CD7A08AC73157 /* PeerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F15365AE4A32D33ADD3A2C9 /* PeerManager.swift */; };
 		A267410BE746BFF0D75C31BA /* RPCTransactionHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CE5EBA97526EFB9B7FBCFDE /* RPCTransactionHistoryView.swift */; };
 		A2ADB56D4E059E232CD01868 /* ModeSelectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */; };
+		A2C3B25A0431065971C71E69 /* ParallelImportCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */; };
 		A55CFCE2DAF3DF2CDB44D929 /* ChatManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 981EE3318B95CD2FF12ACE26 /* ChatManager.swift */; };
 		A78EA99D79B9E04DD8F0F21F /* BootstrapProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */; };
 		AAAA7D846C416018A6016B6A /* ZSTDDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */; };
@@ -133,6 +137,7 @@
 		B5432C123C1ECD9D24CA0466 /* FullNodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30119E869C42D69D497AEDB5 /* FullNodeManager.swift */; };
 		B552F00F9BAC0EDFEC81AC17 /* SaplingParams.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F54464087D684EC795896B7 /* SaplingParams.swift */; };
 		B5B246CE197ED4FFA22ECDDB /* WalletHealthCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */; };
+		B8D6695938ADC2A20FD62580 /* ParallelImportProgressView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20DAC18EA4D3211E1BFE4BC /* ParallelImportProgressView.swift */; };
 		B999C8F0D77345F8DF9D5479 /* BlockHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD23F43B8205785891BF585 /* BlockHeader.swift */; };
 		BBADE5F0F632DC3ACEE0FA7F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6C673DA8922F1FE8EAAB2C04 /* Assets.xcassets */; };
 		BE8B73B81BBB312FA91E602A /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B90A78B033ABA943576A2233 /* SystemConfiguration.framework */; };
@@ -158,6 +163,7 @@
 		DF1194B4D13E3961B6C8FABB /* WalletManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */; };
 		DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119FB9D2179DC1425CABD79E /* NotificationManager.swift */; };
 		DFB88567CE1D7F8126F32FE6 /* Win95Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA9A163DB79D1C4871FD5D /* Win95Theme.swift */; };
+		E0D13D273AA047050C6255CC /* ParallelImportCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */; };
 		E22921E78C57B62CA4102447 /* FullNodeWalletView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1500F3C326420079448B8DE3 /* FullNodeWalletView.swift */; };
 		E28BFCDCD673EC9B73F5F6F8 /* RPCSendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C3A879F952BA4C51952109B /* RPCSendView.swift */; };
 		E39DCCF851A4EDB79C72A464 /* WalletOperationsProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = D301D43373B396F4C45D6B6B /* WalletOperationsProtocol.swift */; };
@@ -202,6 +208,7 @@
 		1500F3C326420079448B8DE3 /* FullNodeWalletView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullNodeWalletView.swift; sourceTree = "<group>"; };
 		18503D95176D0AB2FFC6FB47 /* NetworkManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkManager.swift; sourceTree = "<group>"; };
 		20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderStore.swift; sourceTree = "<group>"; };
+		21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelImportCoordinator.swift; sourceTree = "<group>"; };
 		22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkTheme.swift; sourceTree = "<group>"; };
 		235376F572F89B6D83EDA88C /* WalletTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletTests.swift; sourceTree = "<group>"; };
 		2F15365AE4A32D33ADD3A2C9 /* PeerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerManager.swift; sourceTree = "<group>"; };
@@ -250,11 +257,13 @@
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
 		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
+		B20DAC18EA4D3211E1BFE4BC /* ParallelImportProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelImportProgressView.swift; sourceTree = "<group>"; };
 		B7F6B7B7115F3075801EC5C5 /* ExplorerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExplorerView.swift; sourceTree = "<group>"; };
 		B90A78B033ABA943576A2233 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		BB1AF6B2117E203E51A3F91E /* ThemeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeManager.swift; sourceTree = "<group>"; };
 		BC0A89DDCE7B836E49AF56B4 /* SendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SendView.swift; sourceTree = "<group>"; };
 		BEEED2B5C27020329DE6B900 /* FullNodeSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullNodeSettingsView.swift; sourceTree = "<group>"; };
+		BF9DEC86845018A04D6E4B6F /* TempImportDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TempImportDatabase.swift; sourceTree = "<group>"; };
 		C32AD650ECA6938459D48D26 /* RPCWalletOperations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCWalletOperations.swift; sourceTree = "<group>"; };
 		C5A570D44D1F4FD4E8FC9B9B /* Binaries */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Binaries; path = Resources/Binaries; sourceTree = SOURCE_ROOT; };
 		C6537E08D964E75E72B38163 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -308,6 +317,7 @@
 			children = (
 				C9DA5C3F9CE4297EF0801FCE /* BIP39Wordlist.swift */,
 				84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */,
+				21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */,
 				5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */,
 				9C3CE4B161CEE52CEB1A1EB3 /* WalletManager.swift */,
 				0F8541370D08E261E66B44BB /* Protocols */,
@@ -364,6 +374,7 @@
 				EFE06D18E8A7B75D2BC40B4E /* CommitmentTreeUpdater.swift */,
 				9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */,
 				119FB9D2179DC1425CABD79E /* NotificationManager.swift */,
+				B20DAC18EA4D3211E1BFE4BC /* ParallelImportProgressView.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -537,6 +548,7 @@
 				20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */,
 				1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */,
 				9068ED711254490CAD1CD553 /* SQLCipherManager.swift */,
+				BF9DEC86845018A04D6E4B6F /* TempImportDatabase.swift */,
 				7DFB72AF4C111E6FF82D85B8 /* WalletDatabase.swift */,
 			);
 			path = Storage;
@@ -858,6 +870,8 @@
 				259A2EDB88C817E0EC89AA3D /* NetworkManager.swift in Sources */,
 				1A94928949C49A5977D23471 /* NodeManagementView.swift in Sources */,
 				55B0CB3E3A91EF351BAC5427 /* NotificationManager.swift in Sources */,
+				E0D13D273AA047050C6255CC /* ParallelImportCoordinator.swift in Sources */,
+				B8D6695938ADC2A20FD62580 /* ParallelImportProgressView.swift in Sources */,
 				DCB48F14E31DBA6705F0BC79 /* Peer.swift in Sources */,
 				B26FF06A04BCF61484270D64 /* PeerManager.swift in Sources */,
 				34481E26708F49AD37EB6C93 /* PrivacyQuotes.swift in Sources */,
@@ -877,6 +891,7 @@
 				E8AE0DF3E6B2CAF78CD6BF8C /* SettingsView.swift in Sources */,
 				7A96BC266309441F5614C1C7 /* System7Components.swift in Sources */,
 				87821B0808BF2BB65B8DC3A7 /* System7Theme.swift in Sources */,
+				79DAD21F6675673EE96F6D46 /* TempImportDatabase.swift in Sources */,
 				E4979D57487D8A0547221B53 /* ThemeManager.swift in Sources */,
 				988980FA5A2C432B02F6B092 /* ThemedComponents.swift in Sources */,
 				06809D718F601662F7E64D8B /* TorManager.swift in Sources */,
@@ -942,6 +957,8 @@
 				B206085A126576BA85A3A1CC /* NetworkManager.swift in Sources */,
 				3ED999E9CD43C4F583CCDA90 /* NodeManagementView.swift in Sources */,
 				DF4AC378ABE9F16C7E2B0F33 /* NotificationManager.swift in Sources */,
+				A2C3B25A0431065971C71E69 /* ParallelImportCoordinator.swift in Sources */,
+				181AA8222539CB2B4466F3B3 /* ParallelImportProgressView.swift in Sources */,
 				3742555859851725FDC9B9DE /* Peer.swift in Sources */,
 				9EC14CE9632CD7A08AC73157 /* PeerManager.swift in Sources */,
 				173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */,
@@ -961,6 +978,7 @@
 				8F96DBBCEB07605710EF38BD /* SettingsView.swift in Sources */,
 				0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */,
 				C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */,
+				1A4879FBD776F69F9F13C3BA /* TempImportDatabase.swift in Sources */,
 				2181FB4B936836564DCC5956 /* ThemeManager.swift in Sources */,
 				C1774CA00E6E010499540342 /* ThemedComponents.swift in Sources */,
 				099D7898F55101699514DC81 /* TorManager.swift in Sources */,

@@ -149,6 +149,8 @@ public final class PeerManager: ObservableObject {
     /// FIX #235, FIX #423: Hardcoded Zclassic seed nodes - EXEMPT from cooldown
     /// These are VERIFIED good ZCL nodes that should ALWAYS be tried first
     public let HARDCODED_SEEDS: Set<String> = [
+        // FIX #507: Local node - highest priority (always fastest when available)
+        "127.0.0.1",          // Local zclassicd node on port 8033
         // Original seeds
         "140.174.189.3",
         "140.174.189.17",
@@ -578,23 +580,47 @@ public final class PeerManager: ObservableObject {
 
     // MARK: - Block Listener Coordination
 
-    /// Stop all block listeners (before header sync)
+    /// FIX #462: Stop all block listeners before header sync
+    /// FIX #509: Now waits for listeners to actually finish (prevents headers consumption race)
+    /// This prevents them from consuming "headers" responses meant for header sync
     public func stopAllBlockListeners() async {
         print("🛑 PeerManager: Stopping all block listeners...")
+
+        // FIX #509: Get peers snapshot with lock, then stop each listener
+        peersLock.lock()
+        let peersSnapshot = peers
+        peersLock.unlock()
+
         var stoppedCount = 0
-        for peer in peers {
+
+        // FIX #509: Await each stop to ensure listener is actually finished
+        for peer in peersSnapshot {
             if peer.isListening {
-                peer.stopBlockListener()
+                await peer.stopBlockListener()
                 stoppedCount += 1
             }
         }
-        print("🛑 PeerManager: Stopped \(stoppedCount) block listeners")
+
+        print("🛑 PeerManager: Stopped \(stoppedCount) block listeners (all finished)")
     }
 
     /// Resume all block listeners (after header sync)
+    /// FIX #509 v2: DISABLED - Block listeners should NOT start automatically
+    /// They should only be started when app is 100% ready on main balance screen
     public func resumeAllBlockListeners() async {
-        print("▶️ PeerManager: Resuming all block listeners...")
-        for peer in peers {
+        print("▶️ FIX #509: PeerManager resumeAllBlockListeners called - BLOCKED (will start on main screen only)")
+        // DO NOT start block listeners here anymore
+    }
+
+    /// FIX #509: Start block listeners ONLY when app is fully ready on main balance screen
+    /// This should be called explicitly by the UI when the main screen is displayed
+    public func startBlockListenersOnMainScreen() async {
+        print("▶️ FIX #509: PeerManager - Starting block listeners on main balance screen...")
+        peersLock.lock()
+        let peersSnapshot = peers
+        peersLock.unlock()
+
+        for peer in peersSnapshot {
             peer.startBlockListener()
         }
     }

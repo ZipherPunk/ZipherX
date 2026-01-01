@@ -3299,12 +3299,27 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
         return u64::MAX;
     }
 
+    // FIX #471: Check both original AND reversed byte orders for target CMU
+    // The database might store CMUs in different byte order than boost file
+    let mut target_bytes_reversed = [0u8; 32];
+    for j in 0..32 {
+        target_bytes_reversed[j] = target_bytes[31 - j];
+    }
+
     // Find target CMU position (compare against wire format in file)
+    // FIX #514: Try both byte orders to handle potential mismatches
     let mut target_pos: Option<u64> = None;
     let mut offset = 8;
     for i in 0..count {
         if &bytes[offset..offset + 32] == target_bytes {
             target_pos = Some(i);
+            debug_log!("📍 Found target CMU at position {} (original byte order)", i);
+            break;
+        }
+        // Also try reversed byte order
+        if &bytes[offset..offset + 32] == target_bytes_reversed {
+            target_pos = Some(i);
+            debug_log!("📍 Found target CMU at position {} (REVERSED byte order - database has opposite order!)", i);
             break;
         }
         offset += 32;
@@ -3313,12 +3328,15 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     let target_pos = match target_pos {
         Some(p) => p,
         None => {
-            debug_log!("❌ Target CMU not found in bundled data");
+            debug_log!("❌ FIX #514: Target CMU not found in bundled data (tried both byte orders)");
+            debug_log!("   Target CMU: {}", hex::encode(target_bytes));
+            debug_log!("   Target CMU (reversed): {}", hex::encode(target_bytes_reversed));
             return u64::MAX;
         }
     };
 
-    debug_log!("📍 Found target CMU at position {}", target_pos);
+    // Remove the old log line since we now log when found
+    // debug_log!("📍 Found target CMU at position {}", target_pos);
 
     // Build tree up to target position, creating witness there
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();

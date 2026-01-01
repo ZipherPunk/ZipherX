@@ -69,29 +69,34 @@ struct BoostDownloadProgressView: View {
     @ViewBuilder
     private var statusIcon: some View {
         let progress = walletManager.treeLoadProgress
+        let status = walletManager.treeLoadStatus.lowercased()
 
-        if progress >= 1.0 {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 64))
-                .foregroundColor(theme.successColor)
-        } else if walletManager.treeLoadStatus.lowercased().contains("failed") {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 64))
-                .foregroundColor(theme.errorColor)
+        // FIX #505: ALWAYS show percentage text - user wants to see the numbers!
+        if status.contains("failed") {
+            // Error state - show warning icon with error message
+            VStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 48))
+                    .foregroundColor(theme.errorColor)
+                Text("Failed")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(theme.errorColor)
+            }
         } else {
-            // Animated progress indicator
+            // Always show circular progress with percentage - even at 100%
             ZStack {
                 Circle()
                     .stroke(theme.borderColor, lineWidth: 4)
                     .frame(width: 64, height: 64)
 
                 Circle()
-                    .trim(from: 0, to: progress)
+                    .trim(from: 0, to: min(progress, 1.0))
                     .stroke(theme.primaryColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                     .frame(width: 64, height: 64)
                     .rotationEffect(.degrees(-90))
 
-                Text("\(Int(progress * 100))%")
+                // FIX #505: Show percentage text even at 100% (user wants to see "100%" not just checkmark)
+                Text("\(Int(min(progress, 1.0) * 100))%")
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                     .foregroundColor(theme.textPrimary)
             }
@@ -194,27 +199,53 @@ struct BoostDownloadProgressView: View {
         // 30-50%: Verify
         // 50-80%: Load tree
         // 80-100%: Initialize
+        // BUT: Use status text to determine actual current step
 
         if status.contains("failed") {
-            if step == currentStep(progress) { return .failed }
-            if step < currentStep(progress) { return .completed }
+            if step == currentStep(progress, status: status) { return .failed }
+            if step < currentStep(progress, status: status) { return .completed }
             return .pending
         }
 
         if progress >= 1.0 { return .completed }
 
-        let currentStepIndex = currentStep(progress)
+        let currentStepIndex = currentStep(progress, status: status)
         if step < currentStepIndex { return .completed }
         if step == currentStepIndex { return .inProgress }
         return .pending
     }
 
-    private func currentStep(_ progress: Double) -> Int {
+    private func currentStep(_ progress: Double, status: String) -> Int {
+        // First check status text for more accurate step detection
+        if status.contains("finalizing") || status.contains("witness") || status.contains("initialize") || status.contains("ready") {
+            return 4  // Initialize wallet phase
+        }
+        if status.contains("building") || status.contains("extract") || status.contains("CMU") ||
+           status.contains("loading") || status.contains("tree") || status.contains("commitment") {
+            return 3  // Load commitment tree phase
+        }
+        if status.contains("verify") || status.contains("check") || status.contains("validat") || status.contains("integrity") {
+            return 2  // Verify integrity phase
+        }
+        if status.contains("download") || status.contains("fetch") {
+            return 1  // Download phase
+        }
+        if status.contains("update") || status.contains("check for") {
+            return 0  // Check for updates phase
+        }
+
+        // Fallback to progress-based detection
+        // Updated boundaries to match actual progress ranges:
+        // 0-10%: Check for updates
+        // 10-40%: Download
+        // 40-85%: Load tree (includes verify + build)
+        // 85-99%: Finalize/Initialize
+        // 100%: Complete
         if progress < 0.1 { return 0 }
-        if progress < 0.3 { return 1 }
-        if progress < 0.5 { return 2 }
-        if progress < 0.8 { return 3 }
-        return 4
+        if progress < 0.4 { return 1 }
+        if progress < 0.85 { return 3 }  // Tree loading is 40-85%
+        if progress < 1.0 { return 4 }
+        return 4  // 100% = initialized
     }
 
     private func statusTextColor(_ status: TaskStatus) -> Color {

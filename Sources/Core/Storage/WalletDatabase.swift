@@ -121,8 +121,47 @@ final class WalletDatabase {
     }
 
     /// Decrypt transaction type from database storage
+    /// FIX #503: Use byte comparison FIRST - String comparison fails due to Unicode normalization
     private func decryptTxType(_ stored: String) -> TransactionType {
-        return WalletDatabase.txTypeDecryptionMap[stored] ?? .received
+        let storedBytes = stored.data(using: .utf8)
+
+        // FIX #503: Try byte comparison FIRST - more reliable than String dictionary lookup
+        for (key, value) in WalletDatabase.txTypeDecryptionMap {
+            let keyBytes = key.data(using: .utf8)
+            if storedBytes == keyBytes {
+                return value
+            }
+        }
+
+        // FIX #492: Direct lookup (legacy, less reliable due to Unicode normalization)
+        if let result = WalletDatabase.txTypeDecryptionMap[stored] {
+            return result
+        }
+
+        // FIX #492 v2: Handle Unicode normalization issues
+        // Check first byte directly (faster than iterating)
+        if let firstByte = storedBytes?.first {
+            switch firstByte {
+            case 0xCE:  // Greek letters range
+                if let secondByte = storedBytes?.dropFirst().first {
+                    switch secondByte {
+                    case 0xB1: return .sent   // α
+                    case 0xB2: return .received  // β
+                    case 0xB3: return .change   // γ
+                    default: break
+                    }
+                }
+            default: break
+            }
+        }
+
+        // Still failed - log for debugging
+        print("⚠️ FIX #503: decryptTxType lookup failed for '\(stored)' (bytes: \(storedBytes?.hexString ?? "N/A"))")
+
+        print("   Available keys: \(WalletDatabase.txTypeDecryptionMap.keys.map { "\($0)(\($0.data(using: .utf8)?.hexString ?? "N/A"))" }.joined(separator: ", "))")
+
+        // Final fallback
+        return .received
     }
 
     static let shared = WalletDatabase()

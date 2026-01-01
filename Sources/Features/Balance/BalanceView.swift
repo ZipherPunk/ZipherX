@@ -55,6 +55,37 @@ struct BalanceView: View {
 
     var body: some View {
         let _ = print("📜 BALANCEVIEW: body being rendered")
+        mainContent
+            .alert("Error", isPresented: $showError) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(errorMessage)
+            }
+            .sheet(isPresented: $showTransactionDetail) {
+                if let tx = selectedTransaction {
+                    TransactionDetailView(transaction: tx)
+                        .environmentObject(themeManager)
+                        .environmentObject(networkManager)
+                        #if os(macOS)
+                        .frame(minWidth: 500, idealWidth: 550, minHeight: 500, idealHeight: 600)
+                        #endif
+                }
+            }
+            .onAppear(perform: onAppearHandler)
+            .onDisappear(perform: stopAutoRefresh)
+            .onChange(of: walletManager.shieldedBalance, perform: onBalanceChanged)
+            .onChange(of: walletManager.transactionHistoryVersion, perform: onTransactionHistoryVersionChanged)
+            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated")), perform: onTransactionHistoryNotification)
+            .onChange(of: walletManager.pendingBalance, perform: onPendingBalanceChanged)
+            .onChange(of: networkManager.settlementCelebrationTrigger, perform: onSettlementCelebrationTrigger)
+            .onChange(of: networkManager.mempoolIncomingCelebrationTrigger, perform: onMempoolIncomingCelebrationTrigger)
+            .onChange(of: networkManager.outgoingClearingTrigger, perform: onOutgoingClearingTrigger)
+            .onReceive(blinkTimer, perform: onBlinkTimer)
+    }
+
+    // MARK: - Main Content
+
+    private var mainContent: some View {
         ZStack {
             VStack(spacing: 16) {
                 // Balance display
@@ -111,258 +142,250 @@ struct BalanceView: View {
             }
         }
         .background(themeManager.currentTheme.backgroundColor)
-        .alert("Error", isPresented: $showError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(errorMessage)
-        }
-        .sheet(isPresented: $showTransactionDetail) {
-            if let tx = selectedTransaction {
-                TransactionDetailView(transaction: tx)
-                    .environmentObject(themeManager)
-                    .environmentObject(networkManager)
-                    #if os(macOS)
-                    .frame(minWidth: 500, idealWidth: 550, minHeight: 500, idealHeight: 600)
-                    #endif
+    }
+
+    // MARK: - Event Handlers
+
+    private func onAppearHandler() {
+        print("📜 BALANCEVIEW: onAppear TRIGGERED")
+        // Initialize previous balance
+        previousBalance = walletManager.shieldedBalance
+        // Start automatic refresh every 3 seconds
+        startAutoRefresh()
+        // Load transaction history
+        loadTransactionHistory()
+
+        // Check for pending Clearing celebration (receiver incoming mempool)
+        if let mempool = networkManager.justDetectedIncomingMempool {
+            print("📜 BALANCEVIEW: Found pending Clearing celebration on appear - triggering now!")
+            clearingTxId = mempool.txid
+            clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+            clearingTime = mempool.clearingTime
+            clearingIsOutgoing = false  // Receiver side
+            withAnimation {
+                showClearingCelebration = true
+            }
+            print("🏦 CLEARING (onAppear)! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justDetectedIncomingMempool = nil
             }
         }
-        .onAppear {
-            print("📜 BALANCEVIEW: onAppear TRIGGERED")
-            // Initialize previous balance
-            previousBalance = walletManager.shieldedBalance
-            // Start automatic refresh every 3 seconds
-            startAutoRefresh()
-            // Load transaction history
-            loadTransactionHistory()
 
-            // Check for pending Clearing celebration (receiver incoming mempool)
-            if let mempool = networkManager.justDetectedIncomingMempool {
-                print("📜 BALANCEVIEW: Found pending Clearing celebration on appear - triggering now!")
-                clearingTxId = mempool.txid
-                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
-                clearingTime = mempool.clearingTime
-                clearingIsOutgoing = false  // Receiver side
-                withAnimation {
-                    showClearingCelebration = true
-                }
-                print("🏦 CLEARING (onAppear)! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
-
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justDetectedIncomingMempool = nil
-                }
+        // Check for pending Clearing celebration (sender outgoing mempool verified)
+        if let cleared = networkManager.justClearedOutgoing {
+            print("📜 BALANCEVIEW: Found pending sender Clearing celebration on appear - triggering now!")
+            clearingTxId = cleared.txid
+            clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+            clearingTime = cleared.clearingTime
+            clearingIsOutgoing = true  // Sender side
+            withAnimation {
+                showClearingCelebration = true
             }
+            print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
 
-            // Check for pending Clearing celebration (sender outgoing mempool verified)
-            if let cleared = networkManager.justClearedOutgoing {
-                print("📜 BALANCEVIEW: Found pending sender Clearing celebration on appear - triggering now!")
-                clearingTxId = cleared.txid
-                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
-                clearingTime = cleared.clearingTime
-                clearingIsOutgoing = true  // Sender side
-                withAnimation {
-                    showClearingCelebration = true
-                }
-                print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
-
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justClearedOutgoing = nil
-                }
-            }
-
-            // Also check for pending Settlement celebration
-            if let confirmed = networkManager.justConfirmedTx {
-                print("📜 BALANCEVIEW: Found pending Settlement celebration on appear - triggering now!")
-                settlementTxId = confirmed.txid
-                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
-                settlementIsOutgoing = confirmed.isOutgoing
-                settlementClearingTime = confirmed.clearingTime
-                settlementTime = confirmed.settlementTime
-                withAnimation {
-                    showSettlementCelebration = true
-                }
-                print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL")
-
-                // When outgoing tx is confirmed, clear balance tracking
-                if confirmed.isOutgoing {
-                    print("💰 Outgoing tx confirmed - clearing balance tracking")
-                    walletManager.clearBalanceBeforeLastSend()
-                }
-
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justConfirmedTx = nil
-                }
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justClearedOutgoing = nil
             }
         }
-        .onDisappear {
-            // Stop auto refresh when leaving view
-            stopAutoRefresh()
-        }
-        .onChange(of: walletManager.shieldedBalance) { newValue in
-            // Balance changed - reload transaction history
-            if newValue != previousBalance {
-                loadTransactionHistory()
+
+        // Also check for pending Settlement celebration
+        if let confirmed = networkManager.justConfirmedTx {
+            print("📜 BALANCEVIEW: Found pending Settlement celebration on appear - triggering now!")
+            settlementTxId = confirmed.txid
+            settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+            settlementIsOutgoing = confirmed.isOutgoing
+            settlementClearingTime = confirmed.clearingTime
+            settlementTime = confirmed.settlementTime
+            withAnimation {
+                showSettlementCelebration = true
+            }
+            print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL")
+
+            // When outgoing tx is confirmed, clear balance tracking
+            if confirmed.isOutgoing {
+                print("💰 Outgoing tx confirmed - clearing balance tracking")
+                walletManager.clearBalanceBeforeLastSend()
             }
 
-            // Detect incoming ZCL - balance increased!
-            // IMPORTANT: Suppress fireworks for change outputs from our own sends
-            if newValue > previousBalance && previousBalance > 0 {
-                let increase = newValue - previousBalance
-
-                // Check if this is likely a change output from a recent send
-                // Use MULTIPLE criteria to be conservative (any TRUE = suppress fireworks)
-                var isLikelyChangeOutput = false
-
-                // Method 1a: Check two-phase tracking (INSTANT detection)
-                // If pendingBroadcastAmount > 0, we just sent and this is almost certainly change
-                if networkManager.pendingBroadcastAmount > 0 {
-                    isLikelyChangeOutput = true
-                    print("💰 Change detection (pendingBroadcast): instant outgoing pending - suppressing fireworks")
-                }
-
-                // Method 1b: Check if there's a pending outgoing transaction (LEGACY)
-                // If mempoolOutgoing > 0, we just sent and this is almost certainly change
-                if !isLikelyChangeOutput && networkManager.mempoolOutgoing > 0 {
-                    isLikelyChangeOutput = true
-                    print("💰 Change detection (mempoolOutgoing): outgoing pending - suppressing fireworks")
-                }
-
-                // Method 2: Time-based - any send in last 120 seconds means this might be change
-                if !isLikelyChangeOutput, let lastSend = walletManager.lastSendTimestamp {
-                    let timeSinceSend = Date().timeIntervalSince(lastSend)
-                    if timeSinceSend < 120.0 {
-                        isLikelyChangeOutput = true
-                        print("💰 Change detection (time): sent \(Int(timeSinceSend))s ago - suppressing fireworks")
-                    }
-                }
-
-                // Method 3: Balance comparison - if new balance <= what we had before sending
-                if !isLikelyChangeOutput, let balanceBeforeSend = walletManager.balanceBeforeLastSend {
-                    if newValue <= balanceBeforeSend {
-                        isLikelyChangeOutput = true
-                        print("💰 Change detection (balance): newBalance=\(newValue) <= balanceBeforeSend=\(balanceBeforeSend)")
-                    }
-                }
-
-                if isLikelyChangeOutput {
-                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no celebration)")
-                    // Change output detected means our tx was mined!
-                    // Clear tracking after a brief delay to ensure UI is stable
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        // Only clear if still pending (confirmation handler might have cleared already)
-                        if networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0 {
-                            print("💰 Change detected - clearing pending state (tx mined)")
-                            networkManager.clearPendingBroadcast()
-                            networkManager.clearAllPendingOutgoing()
-                            walletManager.clearBalanceBeforeLastSend()
-                        }
-                    }
-                } else {
-                    // Real incoming transaction detected!
-                    // Don't show fireworks - the Settlement celebration will be shown via justConfirmedTx
-                    // or Clearing celebration via justDetectedIncomingMempool
-                    print("📥 Received \(Double(increase) / 100_000_000.0) ZCL (celebration will be triggered by confirmation/mempool handler)")
-                    // Clear tracking after real incoming is processed
-                    walletManager.clearBalanceBeforeLastSend()
-                }
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justConfirmedTx = nil
             }
-            previousBalance = newValue
         }
-        .onChange(of: walletManager.transactionHistoryVersion) { _ in
-            // Transaction sent - reload history immediately
-            print("📜 Transaction history version changed - reloading")
+    }
+
+    private func onBalanceChanged(newValue: UInt64) {
+        // Balance changed - reload transaction history
+        if newValue != previousBalance {
             loadTransactionHistory()
         }
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
-            // FIX #462 v2: Force reload when repair completes
-            // This clears the in-memory cache and reloads from the clean database
-            print("📜 FIX #462 v2: Received transactionHistoryUpdated notification - forcing reload")
-            transactions = []  // Clear cache
-            forceReloadFromDatabase = true  // Set flag to bypass empty check
-            loadTransactionHistory()  // Reload from database
-        }
-        .onChange(of: walletManager.pendingBalance) { newPendingBalance in
-            // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
-            // SAFETY: Clear pending states if stale (tx was mined but tracking wasn't cleared)
-            if newPendingBalance == 0 && (networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0) {
-                print("💰 pendingBalance=0 but pending tracking active - clearing stale pending state")
-                networkManager.clearPendingBroadcast()
-                networkManager.clearAllPendingOutgoing()
+
+        // Detect incoming ZCL - balance increased!
+        // IMPORTANT: Suppress fireworks for change outputs from our own sends
+        if newValue > previousBalance && previousBalance > 0 {
+            let increase = newValue - previousBalance
+
+            // Check if this is likely a change output from a recent send
+            // Use MULTIPLE criteria to be conservative (any TRUE = suppress fireworks)
+            var isLikelyChangeOutput = false
+
+            // Method 1a: Check two-phase tracking (INSTANT detection)
+            // If pendingBroadcastAmount > 0, we just sent and this is almost certainly change
+            if networkManager.pendingBroadcastAmount > 0 {
+                isLikelyChangeOutput = true
+                print("💰 Change detection (pendingBroadcast): instant outgoing pending - suppressing fireworks")
+            }
+
+            // Method 1b: Check if there's a pending outgoing transaction (LEGACY)
+            // If mempoolOutgoing > 0, we just sent and this is almost certainly change
+            if !isLikelyChangeOutput && networkManager.mempoolOutgoing > 0 {
+                isLikelyChangeOutput = true
+                print("💰 Change detection (mempoolOutgoing): outgoing pending - suppressing fireworks")
+            }
+
+            // Method 2: Time-based - any send in last 120 seconds means this might be change
+            if !isLikelyChangeOutput, let lastSend = walletManager.lastSendTimestamp {
+                let timeSinceSend = Date().timeIntervalSince(lastSend)
+                if timeSinceSend < 120.0 {
+                    isLikelyChangeOutput = true
+                    print("💰 Change detection (time): sent \(Int(timeSinceSend))s ago - suppressing fireworks")
+                }
+            }
+
+            // Method 3: Balance comparison - if new balance <= what we had before sending
+            if !isLikelyChangeOutput, let balanceBeforeSend = walletManager.balanceBeforeLastSend {
+                if newValue <= balanceBeforeSend {
+                    isLikelyChangeOutput = true
+                    print("💰 Change detection (balance): newBalance=\(newValue) <= balanceBeforeSend=\(balanceBeforeSend)")
+                }
+            }
+
+            if isLikelyChangeOutput {
+                print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no celebration)")
+                // Change output detected means our tx was mined!
+                // Clear tracking after a brief delay to ensure UI is stable
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    // Only clear if still pending (confirmation handler might have cleared already)
+                    if networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0 {
+                        print("💰 Change detected - clearing pending state (tx mined)")
+                        networkManager.clearPendingBroadcast()
+                        networkManager.clearAllPendingOutgoing()
+                        walletManager.clearBalanceBeforeLastSend()
+                    }
+                }
+            } else {
+                // Real incoming transaction detected!
+                // Don't show fireworks - the Settlement celebration will be shown via justConfirmedTx
+                // or Clearing celebration via justDetectedIncomingMempool
+                print("📥 Received \(Double(increase) / 100_000_000.0) ZCL (celebration will be triggered by confirmation/mempool handler)")
+                // Clear tracking after real incoming is processed
                 walletManager.clearBalanceBeforeLastSend()
             }
         }
-        .onChange(of: networkManager.settlementCelebrationTrigger) { _ in
-            // Transaction was confirmed - show Settlement celebration!
-            // Using trigger counter instead of optional txid for reliable SwiftUI observation
-            if let confirmed = networkManager.justConfirmedTx {
-                settlementTxId = confirmed.txid
-                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
-                settlementIsOutgoing = confirmed.isOutgoing
-                settlementClearingTime = confirmed.clearingTime
-                settlementTime = confirmed.settlementTime
-                withAnimation {
-                    showSettlementCelebration = true
-                }
-                print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
+        previousBalance = newValue
+    }
 
-                // When outgoing tx is confirmed, clear balance tracking
-                // This happens AFTER change output is detected and added to balance
-                if confirmed.isOutgoing {
-                    print("💰 Outgoing tx confirmed - clearing balance tracking")
-                    walletManager.clearBalanceBeforeLastSend()
-                }
+    private func onTransactionHistoryVersionChanged(_: Any) {
+        // Transaction sent - reload history immediately
+        print("📜 Transaction history version changed - reloading")
+        loadTransactionHistory()
+    }
 
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justConfirmedTx = nil
-                }
+    private func onTransactionHistoryNotification(_: Notification) {
+        // FIX #462 v2: Force reload when repair completes
+        // This clears the in-memory cache and reloads from the clean database
+        print("📜 FIX #462 v2: Received transactionHistoryUpdated notification - forcing reload")
+        transactions = []  // Clear cache
+        forceReloadFromDatabase = true  // Set flag to bypass empty check
+        loadTransactionHistory()  // Reload from database
+    }
+
+    private func onPendingBalanceChanged(newPendingBalance: UInt64) {
+        // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
+        // SAFETY: Clear pending states if stale (tx was mined but tracking wasn't cleared)
+        if newPendingBalance == 0 && (networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0) {
+            print("💰 pendingBalance=0 but pending tracking active - clearing stale pending state")
+            networkManager.clearPendingBroadcast()
+            networkManager.clearAllPendingOutgoing()
+            walletManager.clearBalanceBeforeLastSend()
+        }
+    }
+
+    private func onSettlementCelebrationTrigger(_: Any) {
+        // Transaction was confirmed - show Settlement celebration!
+        // Using trigger counter instead of optional txid for reliable SwiftUI observation
+        if let confirmed = networkManager.justConfirmedTx {
+            settlementTxId = confirmed.txid
+            settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+            settlementIsOutgoing = confirmed.isOutgoing
+            settlementClearingTime = confirmed.clearingTime
+            settlementTime = confirmed.settlementTime
+            withAnimation {
+                showSettlementCelebration = true
+            }
+            print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
+
+            // When outgoing tx is confirmed, clear balance tracking
+            // This happens AFTER change output is detected and added to balance
+            if confirmed.isOutgoing {
+                print("💰 Outgoing tx confirmed - clearing balance tracking")
+                walletManager.clearBalanceBeforeLastSend()
+            }
+
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justConfirmedTx = nil
             }
         }
-        .onChange(of: networkManager.mempoolIncomingCelebrationTrigger) { _ in
-            // Incoming ZCL detected in mempool - show Clearing celebration!
-            if let mempool = networkManager.justDetectedIncomingMempool {
-                clearingTxId = mempool.txid
-                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
-                clearingTime = mempool.clearingTime
-                clearingIsOutgoing = false  // Receiver side
-                withAnimation {
-                    showClearingCelebration = true
-                }
-                print("🏦 CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+    }
 
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justDetectedIncomingMempool = nil
-                }
+    private func onMempoolIncomingCelebrationTrigger(_: Any) {
+        // Incoming ZCL detected in mempool - show Clearing celebration!
+        if let mempool = networkManager.justDetectedIncomingMempool {
+            clearingTxId = mempool.txid
+            clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+            clearingTime = mempool.clearingTime
+            clearingIsOutgoing = false  // Receiver side
+            withAnimation {
+                showClearingCelebration = true
+            }
+            print("🏦 CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justDetectedIncomingMempool = nil
             }
         }
-        .onChange(of: networkManager.outgoingClearingTrigger) { _ in
-            // Sender's tx verified in mempool - show Clearing celebration!
-            if let cleared = networkManager.justClearedOutgoing {
-                clearingTxId = cleared.txid
-                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
-                clearingTime = cleared.clearingTime
-                clearingIsOutgoing = true  // Sender side
-                withAnimation {
-                    showClearingCelebration = true
-                }
-                print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+    }
 
-                // Clear the trigger after handling
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    networkManager.justClearedOutgoing = nil
-                }
+    private func onOutgoingClearingTrigger(_: Any) {
+        // Sender's tx verified in mempool - show Clearing celebration!
+        if let cleared = networkManager.justClearedOutgoing {
+            clearingTxId = cleared.txid
+            clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+            clearingTime = cleared.clearingTime
+            clearingIsOutgoing = true  // Sender side
+            withAnimation {
+                showClearingCelebration = true
+            }
+            print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+
+            // Clear the trigger after handling
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                networkManager.justClearedOutgoing = nil
             }
         }
-        .onReceive(blinkTimer) { _ in
-            // Toggle visibility for blinking effect when syncing
-            if walletManager.isSyncing {
-                syncedTextVisible.toggle()
-            } else {
-                syncedTextVisible = true  // Always visible when not syncing
-            }
+    }
+
+    private func onBlinkTimer(_: Date) {
+        // Toggle visibility for blinking effect when syncing
+        if walletManager.isSyncing {
+            syncedTextVisible.toggle()
+        } else {
+            syncedTextVisible = true  // Always visible when not syncing
         }
     }
 

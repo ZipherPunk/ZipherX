@@ -682,7 +682,7 @@ final class WalletManager: ObservableObject {
         await MainActor.run {
             self.treeLoadStatus = "Downloading boost data..."
             self.treeLoadProgress = 0.1
-            self.showBoostDownloadSheet = true  // FIX #278: Show progress sheet
+            // FIX #509: Removed progress sheet - all progress shown on main import screen
             self.boostDownloadSpeed = ""
             self.boostETA = ""
         }
@@ -814,13 +814,10 @@ final class WalletManager: ObservableObject {
 
             await MainActor.run {
                 self.isTreeLoaded = true
-                self.treeLoadProgress = 1.0
+                // FIX #505: DON'T set progress to 1.0 yet - import still needs to run
+                // DON'T dismiss sheet yet - header loading happens after this
                 self.treeLoadStatus = "Privacy infrastructure ready\n\(treeSize.formatted()) commitments loaded"
-                self.updateOverallProgress(phase: .loadingTree, phaseProgress: 1.0)
-                // FIX #278: Auto-dismiss sheet after 1 second
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    self.showBoostDownloadSheet = false
-                }
+                print("✅ FIX #505: Tree loaded, but keeping sheet open for header loading...")
             }
             return
         }
@@ -990,6 +987,15 @@ final class WalletManager: ObservableObject {
     /// without requiring new blocks (which triggers backgroundSyncToHeight)
     func ensureHeaderTimestamps() async {
         print("📜 FIX #120: Checking for transactions needing timestamps...")
+
+        // FIX #495: Skip if we're already at chain tip (no need to sync headers)
+        let currentChainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
+        let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+
+        if currentChainHeight > 0 && walletHeight >= currentChainHeight - 100 {
+            print("✅ FIX #495: Already at chain tip (walletHeight=\(walletHeight), chain=\(currentChainHeight)), skipping header sync")
+            return
+        }
 
         // FIX #120: First, detect and clear wrong timestamps in the gap between boost file and header store
         // Boost file (BlockTimestampManager) covers up to ~2935315
@@ -1191,9 +1197,10 @@ final class WalletManager: ObservableObject {
 
         // FIX #136: Set header syncing flag to pause mempool scan during sync
         // This prevents P2P race conditions that cause header sync to get stuck
-        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true) }
+        // FIX #509: Now async - waits for listeners to actually stop
+        await NetworkManager.shared.setHeaderSyncing(true)
         defer {
-            Task { @MainActor in NetworkManager.shared.setHeaderSyncing(false) }
+            Task { await NetworkManager.shared.setHeaderSyncing(false) }
         }
 
         let hsm = HeaderSyncManager(
@@ -1201,23 +1208,27 @@ final class WalletManager: ObservableObject {
             networkManager: NetworkManager.shared
         )
 
-        // FIX #144: Report progress to UI for header sync
+        // FIX #487 v3: Report progress to UI for header sync (direct @Published updates)
         hsm.onProgress = { [weak self] progress in
-            Task { @MainActor in
-                // Update header sync UI properties
+            // Update @Published properties directly on main thread
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
                 let progressPercentage = progress.totalHeight > 0
                     ? Double(progress.currentHeight) / Double(progress.totalHeight)
                     : 0.0
-                self?.headerSyncProgress = progressPercentage
-                self?.headerSyncCurrentHeight = UInt64(progress.currentHeight)
-                self?.headerSyncTargetHeight = UInt64(progress.totalHeight)
-                self?.headerSyncStatus = "Syncing block timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
+                self.headerSyncProgress = progressPercentage
+                self.headerSyncCurrentHeight = UInt64(progress.currentHeight)
+                self.headerSyncTargetHeight = UInt64(progress.totalHeight)
+                self.headerSyncStatus = "Syncing block timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
 
                 // Also update syncTasks if available
-                if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
-                    self?.syncTasks[index].status = .inProgress
-                    self?.syncTasks[index].detail = "Syncing timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
-                    self?.syncTasks[index].progress = progressPercentage
+                // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
+                if let index = self.syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                    var task = self.syncTasks[index]
+                    task.status = .inProgress
+                    task.detail = "Syncing timestamps: \(progress.currentHeight) / \(progress.totalHeight)"
+                    task.progress = progressPercentage
+                    self.syncTasks[index] = task
                 }
             }
         }
@@ -1267,10 +1278,13 @@ final class WalletManager: ObservableObject {
                 self.headerSyncStatus = ""
 
                 // Mark syncTask as completed if available
+                // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
                 if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
-                    syncTasks[index].status = .completed
-                    syncTasks[index].detail = "Timestamps synced (\(fixedCount ?? 0) fixed)"
-                    syncTasks[index].progress = 1.0
+                    var task = syncTasks[index]
+                    task.status = .completed
+                    task.detail = "Timestamps synced (\(fixedCount ?? 0) fixed)"
+                    task.progress = 1.0
+                    syncTasks[index] = task
                 }
             }
         } catch {
@@ -1288,9 +1302,12 @@ final class WalletManager: ObservableObject {
                 self.headerSyncStatus = "Sync failed: \(error.localizedDescription)"
 
                 // Mark task as failed
+                // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
                 if let index = syncTasks.firstIndex(where: { $0.id == "headers" }) {
-                    syncTasks[index].status = .failed(error.localizedDescription)
-                    syncTasks[index].detail = "Sync failed"
+                    var task = syncTasks[index]
+                    task.status = .failed(error.localizedDescription)
+                    task.detail = "Sync failed"
+                    syncTasks[index] = task
                 }
             }
         }
@@ -1363,17 +1380,38 @@ final class WalletManager: ObservableObject {
                 self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: 0.0)
             }
 
-            // FIX #468: Add progress callback for header loading
-            try HeaderStore.shared.loadHeadersFromBoostData(
-                headerData,
-                blockHashes: blockHashesData,
-                startHeight: sectionInfo.startHeight,
-                expectedCount: Int(sectionInfo.count)
-            ) { progress in
-                // FIX #470: Use DispatchQueue.main.async for immediate UI updates
-                // Task { @MainActor in } is too slow - headers load before UI updates
-                DispatchQueue.main.async {
-                    self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: progress)
+            // FIX #488: Run blocking loadHeadersFromBoostData on background thread
+            // This prevents blocking the main thread, allowing UI updates during the 100-second load
+            // The callback uses DispatchQueue.main.async which queues blocks on main thread
+            // If main thread is blocked, those blocks never execute until load completes
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else {
+                        continuation.resume(returning: ())
+                        return
+                    }
+
+                    do {
+                        // FIX #468: Add progress callback for header loading
+                        try HeaderStore.shared.loadHeadersFromBoostData(
+                            headerData,
+                            blockHashes: blockHashesData,
+                            startHeight: sectionInfo.startHeight,
+                            expectedCount: Int(sectionInfo.count)
+                        ) { [weak self] progress in
+                            print("🔧 FIX #487 v4: Header load progress: \(Int(progress * 100))%")
+
+                            // FIX #497 v4: Dispatch to main queue for UI updates
+                            // updateDownloadTaskProgress replaces entire struct (triggers SwiftUI)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self = self else { return }
+                                self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: progress)
+                            }
+                        }
+                        continuation.resume(returning: ())
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
 
@@ -1612,9 +1650,10 @@ final class WalletManager: ObservableObject {
                     networkManager: NetworkManager.shared
                 )
 
-                // FIX #464: Report header sync progress to UI
+                // FIX #487 v3: Report header sync progress to UI (direct @Published updates)
                 hsm.onProgress = { [weak self] progress in
-                    Task { @MainActor in
+                    // Update @Published property directly on main thread
+                    DispatchQueue.main.async { [weak self] in
                         self?.headerSyncStatus = "Syncing headers: \(progress.currentHeight)/\(progress.totalHeight)"
                     }
                 }
@@ -1778,7 +1817,11 @@ final class WalletManager: ObservableObject {
                 print("🔄 Pre-witness: Rebuilding \(notesNeedingRebuild.count) stale witness(es)...")
 
                 // Save current tree state before rebuilding
+                // WARNING: treeCreateWitnessesBatch modifies the FFI tree, must save/restore
+                // This can take 10-30 seconds on large trees - UI will show "Finalizing..."
+                print("🔄 Pre-witness: Saving tree state before rebuild...")
                 let savedTreeState = ZipherXFFI.treeSerialize()
+                print("✅ Pre-witness: Tree state saved (\(savedTreeState?.count ?? 0) bytes)")
 
                 // Try to get CMU data for witness rebuild
                 if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
@@ -1919,7 +1962,50 @@ final class WalletManager: ObservableObject {
                             print("⚠️ Pre-witness: No P2P peers connected (0 peers) - skipping delta CMU fetch")
                         }
                     } else if !notesAfterBoost.isEmpty && isImportedWallet {
-                        print("⏭️ Pre-witness: Skipping P2P witness rebuild for \(notesAfterBoost.count) note(s) during import (will rebuild at send time)")
+                        // FIX #482: For PHASE 2 notes during import/repair, try direct FFI tree retrieval
+                        // FilterScanner should have updated witnesses via treeAppend auto-update
+                        // But we verify and use FFI tree witnesses as fallback
+                        print("🔧 FIX #482: \(notesAfterBoost.count) PHASE 2 note(s) - using FFI tree witnesses...")
+
+                        var ffiCount = 0
+                        var failedCount = 0
+
+                        for item in notesAfterBoost {
+                            let note = item.note
+                            let cmu = item.cmu
+
+                            // Try to get witness directly from FFI tree
+                            // Note: This requires the note's position in tree, which we may not have
+                            // Fallback: Check if current witness anchor matches tree root
+                            if let noteAnchor = note.anchor, noteAnchor == currentTreeRoot {
+                                // Witness is already current, no action needed
+                                ffiCount += 1
+                            } else if !note.witness.isEmpty {
+                                // Witness exists but anchor doesn't match - extract anchor from witness
+                                if note.witness.count >= 1028 {
+                                    let witnessAnchor = note.witness.suffix(32)
+                                    if witnessAnchor == currentTreeRoot {
+                                        // Witness is current, just update anchor in DB
+                                        try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                        ffiCount += 1
+                                    } else {
+                                        // Witness is stale - mark for rebuild at send time
+                                        print("⚠️ FIX #482: Note at height \(note.height) has stale witness (will rebuild at send)")
+                                        failedCount += 1
+                                    }
+                                }
+                            } else {
+                                print("⚠️ FIX #482: Note at height \(note.height) has no witness (will rebuild at send)")
+                                failedCount += 1
+                            }
+                        }
+
+                        if ffiCount > 0 {
+                            print("✅ FIX #482: \(ffiCount) PHASE 2 witness(es) already current")
+                        }
+                        if failedCount > 0 {
+                            print("⚠️ FIX #482: \(failedCount) PHASE 2 witness(es) need rebuild (FIX #480 will handle at send)")
+                        }
                     }
 
                     if rebuiltCount > 0 {
@@ -1963,8 +2049,28 @@ final class WalletManager: ObservableObject {
                     // CRITICAL: Restore tree state after witness rebuild
                     // treeCreateWitnessesBatch modifies the FFI tree, we need to restore it
                     if let savedState = savedTreeState {
-                        _ = ZipherXFFI.treeInit()
-                        _ = ZipherXFFI.treeDeserialize(data: savedState)
+                        // FIX #508: Validate saved state before clearing tree
+                        if savedState.count < 1000 {
+                            print("⚠️ Pre-witness: Saved tree state too small (\(savedState.count) bytes), skipping restore")
+                        } else {
+                            // Only clear tree if we have a valid state to restore
+                            _ = ZipherXFFI.treeInit()
+                            let success = ZipherXFFI.treeDeserialize(data: savedState)
+                            if !success {
+                                print("❌ Pre-witness: Failed to restore tree from saved state (\(savedState.count) bytes)")
+                                print("❌ Pre-witness: Tree is now EMPTY - wallet may be corrupted!")
+                                // Try to recover by reloading from database
+                                if let dbTree = try? WalletDatabase.shared.getTreeState(),
+                                   ZipherXFFI.treeDeserialize(data: dbTree) {
+                                    print("✅ Pre-witness: Recovered tree from database")
+                                } else {
+                                    print("❌ Pre-witness: Could not recover tree from database either")
+                                }
+                            } else {
+                                let treeSize = ZipherXFFI.treeSize()
+                                print("✅ Pre-witness: Tree restored successfully (\(treeSize) commitments)")
+                            }
+                        }
                     }
                 } else {
                     print("⚠️ Pre-witness: No CMU data available for rebuild, \(notesNeedingRebuild.count) note(s) will rebuild at send time")
@@ -2394,10 +2500,11 @@ final class WalletManager: ObservableObject {
         // FIX #457 v11: Set header syncing flag ONCE at the start, BEFORE retry loop
         // This prevents block listeners from restarting between retry attempts
         // NOTE: For import, we DON'T stop block listeners since sync is only 100 headers (see line 2442)
-        await MainActor.run { NetworkManager.shared.setHeaderSyncing(true, stopListeners: false) }
+        // FIX #509: Now async - awaits setHeaderSyncing call
+        await NetworkManager.shared.setHeaderSyncing(true, stopListeners: false)
         defer {
             // Clear flag when ALL retries complete (success or exhausted)
-            Task { @MainActor in NetworkManager.shared.setHeaderSyncing(false) }
+            Task { await NetworkManager.shared.setHeaderSyncing(false) }
         }
 
         for attempt in 1...maxHeaderRetries {
@@ -2449,19 +2556,28 @@ final class WalletManager: ObservableObject {
                     networkManager: NetworkManager.shared
                 )
 
-                // Track progress
+                // FIX #487 v3: Immediate UI updates for header sync progress
+                // Direct @Published property updates bypass MainActor restrictions
+                // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
                 headerSync.onProgress = { [weak self] progress in
-                    Task { @MainActor in
-                        if let index = self?.syncTasks.firstIndex(where: { $0.id == "headers" }) {
-                            self?.syncTasks[index].detail = "\(progress.currentHeight) / \(progress.totalHeight)"
+                    // Update @Published syncTasks directly on main thread
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else { return }
+                        if let index = self.syncTasks.firstIndex(where: { $0.id == "headers" }) {
+                            var task = self.syncTasks[index]
+                            task.detail = "\(progress.currentHeight) / \(progress.totalHeight)"
                             // Calculate progress percentage (0.0 to 1.0)
                             let progressPercentage = progress.totalHeight > 0
                                 ? Double(progress.currentHeight) / Double(progress.totalHeight)
                                 : 0.0
-                            self?.syncTasks[index].progress = progressPercentage
+                            task.progress = progressPercentage
+                            self.syncTasks[index] = task
 
                             // Update monotonic progress for header sync phase
-                            self?.updateOverallProgress(phase: .syncingHeaders, phaseProgress: progressPercentage)
+                            // Use async since we're already in a DispatchQueue.main.async block
+                            Task { @MainActor in
+                                self.updateOverallProgress(phase: .syncingHeaders, phaseProgress: progressPercentage)
+                            }
                         }
                     }
                 }
@@ -2554,22 +2670,27 @@ final class WalletManager: ObservableObject {
                 self?.syncStatus = status
 
                 // Update task detail and monotonic progress based on phase
+                // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
+                    var task = self?.syncTasks[index] ?? SyncTask(id: "scan", title: "Scanning", status: .inProgress)
                     switch phase {
                     case "phase1":
-                        self?.syncTasks[index].detail = "Parallel note decryption"
+                        task.detail = "Parallel note decryption"
                         self?.updateOverallProgress(phase: .phase1Scanning, phaseProgress: 0.0)
                     case "phase1.5":
-                        self?.syncTasks[index].detail = "Computing Merkle witnesses"
+                        task.detail = "Computing Merkle witnesses"
                         self?.updateOverallProgress(phase: .phase15Witnesses, phaseProgress: 0.0)
                     case "phase1.6":
-                        self?.syncTasks[index].detail = "Detecting spent notes"
+                        task.detail = "Detecting spent notes"
                         self?.updateOverallProgress(phase: .phase16SpentCheck, phaseProgress: 0.0)
                     case "phase2":
-                        self?.syncTasks[index].detail = "Sequential tree building"
+                        task.detail = "Sequential tree building"
                         self?.updateOverallProgress(phase: .phase2Sequential, phaseProgress: 0.0)
                     default:
                         break
+                    }
+                    if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
+                        self?.syncTasks[index] = task
                     }
                 }
             }
@@ -2613,8 +2734,13 @@ final class WalletManager: ObservableObject {
                     default: phasePrefix = ""
                     }
 
-                    self?.syncTasks[index].detail = "\(phasePrefix)Block \(currentHeight.formatted())\(dateString)"
-                    self?.syncTasks[index].progress = progress
+                    // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
+                    var task = self?.syncTasks[index] ?? SyncTask(id: "scan", title: "Scanning", status: .inProgress)
+                    task.detail = "\(phasePrefix)Block \(currentHeight.formatted())\(dateString)"
+                    task.progress = progress
+                    if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
+                        self?.syncTasks[index] = task
+                    }
                 }
 
                 // Update syncStatus with cypherpunk messages based on scan phase
@@ -2641,19 +2767,24 @@ final class WalletManager: ObservableObject {
         }
 
         // Witness sync progress callback - update witnesses task with real progress
+        // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
         scanner.onWitnessProgress = { [weak self] current, total, status in
             Task { @MainActor in
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                    var task = self?.syncTasks[index] ?? SyncTask(id: "witnesses", title: "Witnesses", status: .inProgress)
                     if total > 0 {
-                        self?.syncTasks[index].status = .inProgress
-                        self?.syncTasks[index].detail = status
-                        self?.syncTasks[index].progress = Double(current) / Double(total)
+                        task.status = .inProgress
+                        task.detail = status
+                        task.progress = Double(current) / Double(total)
                         self?.syncStatus = "Syncing Merkle witnesses..."
                     }
                     if current == total {
-                        self?.syncTasks[index].status = .completed
-                        self?.syncTasks[index].detail = total > 0 ? "\(total) witness(es) synced" : "No witnesses needed"
-                        self?.syncTasks[index].progress = 1.0
+                        task.status = .completed
+                        task.detail = total > 0 ? "\(total) witness(es) synced" : "No witnesses needed"
+                        task.progress = 1.0
+                    }
+                    if let index = self?.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
+                        self?.syncTasks[index] = task
                     }
                 }
             }
@@ -2828,9 +2959,12 @@ final class WalletManager: ObservableObject {
         if notesNeedingSync.isEmpty {
             await MainActor.run {
                 self.syncStatus = "All witnesses up to date"
+                // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
                 if let index = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
-                    self.syncTasks[index].detail = "All current"
-                    self.syncTasks[index].progress = 1.0
+                    var task = self.syncTasks[index]
+                    task.detail = "All current"
+                    task.progress = 1.0
+                    self.syncTasks[index] = task
                 }
             }
             print("✅ No witnesses need syncing")
@@ -2854,9 +2988,12 @@ final class WalletManager: ObservableObject {
 
             await MainActor.run {
                 self.syncStatus = witnessMessages[messageIndex]
+                // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
                 if let taskIndex = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
-                    self.syncTasks[taskIndex].detail = "Note \(index + 1)/\(notesNeedingSync.count)"
-                    self.syncTasks[taskIndex].progress = progress
+                    var task = self.syncTasks[taskIndex]
+                    task.detail = "Note \(index + 1)/\(notesNeedingSync.count)"
+                    task.progress = progress
+                    self.syncTasks[taskIndex] = task
                 }
             }
 
@@ -2883,9 +3020,12 @@ final class WalletManager: ObservableObject {
 
         await MainActor.run {
             self.syncStatus = "Witnesses synchronized"
+            // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
             if let taskIndex = self.syncTasks.firstIndex(where: { $0.id == "witnesses" }) {
-                self.syncTasks[taskIndex].detail = "\(notesNeedingSync.count) synced"
-                self.syncTasks[taskIndex].progress = 1.0
+                var task = self.syncTasks[taskIndex]
+                task.detail = "\(notesNeedingSync.count) synced"
+                task.progress = 1.0
+                self.syncTasks[taskIndex] = task
             }
         }
 
@@ -3458,6 +3598,16 @@ final class WalletManager: ObservableObject {
                 print("📜 FIX #462 v2: Posted transactionHistoryUpdated notification - forcing UI refresh")
             }
 
+            // FIX #482: Update all witnesses in database to match final tree state
+            // After quick fix (anchor extraction), the tree hasn't changed, so witnesses should be current
+            // But we still verify and update any stale witnesses to ensure send is instant
+            print("🔧 FIX #482: Verifying all witnesses match current tree state...")
+            await MainActor.run {
+                self.treeLoadStatus = "Finalizing (updating witnesses)..."
+                self.treeLoadProgress = 0.99  // Move to 99% to show almost done
+            }
+            await preRebuildWitnessesForInstantPayment(accountId: account.id)
+
             // FIX #459: NOW show 100% progress - AFTER all operations complete
             // This prevents UI from showing 100% while repair is still running (verifyAllUnspentNotesOnChain takes 10+ seconds)
             onProgress(1.0, 100, 100)
@@ -3533,7 +3683,17 @@ final class WalletManager: ObservableObject {
                             blockHashes: blockHashesData,
                             startHeight: section.start_height,
                             expectedCount: Int(section.count)
-                        )
+                        ) { progress in
+                            // FIX #468: Report progress during header reload
+                            // FIX #485: Add debug log to verify callback is being called
+                            print("🔧 FIX #485: Header load progress callback: \(Int(progress * 100))%")
+                            DispatchQueue.main.async {
+                                // FIX #505: Update treeLoadProgress so UI shows header loading progress!
+                                self.treeLoadProgress = 0.05 + (progress * 0.05)  // 5-10% for header loading
+                                self.treeLoadStatus = "Loading headers from boost file... \(Int(progress * 100))%"
+                                onProgress(0.1 + (progress * 0.1), UInt64(Double(section.count) * progress), UInt64(section.count))
+                            }
+                        }
                         print("✅ FIX #457: Bundled headers reloaded instantly up to height \(bundledEndHeight)")
                     }
                 }
@@ -3589,8 +3749,21 @@ final class WalletManager: ObservableObject {
         }
         // Also clear the FFI tree to ensure fresh start
         _ = ZipherXFFI.treeInit()
-        print("🌳 Reloading commitment tree from GitHub...")
-        await preloadCommitmentTree()
+
+        // FIX #506: Use PARALLEL import for faster tree loading
+        // Falls back to sequential if parallel fails
+        print("🌳 Reloading commitment tree using PARALLEL extraction...")
+        do {
+            try await importParallelWithProgress { progress in
+                // Map parallel import progress (0-1) to overall repair progress (0-30%)
+                onProgress(progress * 0.3, UInt64(progress * 30), 100)
+            }
+            print("✅ FIX #506: Parallel tree loading successful")
+        } catch {
+            print("⚠️ FIX #506: Parallel import failed: \(error.localizedDescription)")
+            print("🔄 Falling back to sequential tree loading...")
+            await preloadCommitmentTree()
+        }
 
         // FIX #440: Load BundledBlockHashes BEFORE full rescan
         // PHASE 2 header sync needs these hashes to build correct P2P locators
@@ -3661,6 +3834,16 @@ final class WalletManager: ObservableObject {
             transactionHistoryVersion += 1
             print("📜 FIX #462: Incremented transactionHistoryVersion to \(transactionHistoryVersion) - views should reload")
         }
+
+        // FIX #482: Update all witnesses in database to match final tree state
+        // After full rescan, FilterScanner updates witnesses, but we verify all are current
+        // This ensures send is instant - no witness rebuild delay at send time
+        print("🔧 FIX #482: Verifying all witnesses match current tree state after full rescan...")
+        await MainActor.run {
+            self.treeLoadStatus = "Finalizing (updating witnesses)..."
+            self.treeLoadProgress = 0.99  // Move to 99% to show almost done
+        }
+        await preRebuildWitnessesForInstantPayment(accountId: account.id)
 
         print("✅ Database repair complete - full resync finished")
     }
@@ -3958,12 +4141,15 @@ final class WalletManager: ObservableObject {
 
     /// Update a sync task status
     @MainActor
+    // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
     private func updateTask(_ id: String, status: SyncTaskStatus, detail: String? = nil) {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
-            syncTasks[index].status = status
+            var task = syncTasks[index]
+            task.status = status
             if let detail = detail {
-                syncTasks[index].detail = detail
+                task.detail = detail
             }
+            syncTasks[index] = task
 
             // Update syncStatus with cypherpunk messages
             if case .inProgress = status {
@@ -4001,10 +4187,13 @@ final class WalletManager: ObservableObject {
 
     /// Update a sync task with progress (keeps inProgress status)
     @MainActor
+    // FIX #488 v3: Replace struct in array to trigger SwiftUI @Published update
     private func updateTaskWithProgress(_ id: String, detail: String, progress: Double) {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
-            syncTasks[index].detail = detail
-            syncTasks[index].progress = progress
+            var task = syncTasks[index]
+            task.detail = detail
+            task.progress = progress
+            syncTasks[index] = task
         }
     }
 
@@ -4042,7 +4231,10 @@ final class WalletManager: ObservableObject {
             // First set to in progress if not already
             if let index = syncTasks.firstIndex(where: { $0.id == taskId }) {
                 if case .pending = syncTasks[index].status {
-                    syncTasks[index].status = .inProgress
+                    // FIX #497: Replace entire task struct to trigger SwiftUI @Published update
+                    var task = syncTasks[index]
+                    task.status = .inProgress
+                    syncTasks[index] = task
                 }
             }
             updateTaskWithProgress(taskId, detail: detail, progress: progress)
@@ -4051,16 +4243,19 @@ final class WalletManager: ObservableObject {
 
     /// Update a sync task status, detail, and progress - called from ContentView for FAST START
     /// FIX #154: Added progress parameter for individual task progress bars
+    /// FIX #497: Replace entire task struct to trigger SwiftUI @Published update
     @MainActor
     func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
-            syncTasks[index].status = status
+            var task = syncTasks[index]
+            task.status = status
             if let detail = detail {
-                syncTasks[index].detail = detail
+                task.detail = detail
             }
             if let progress = progress {
-                syncTasks[index].progress = progress
+                task.progress = progress
             }
+            syncTasks[index] = task
         }
     }
 
@@ -4173,6 +4368,10 @@ final class WalletManager: ObservableObject {
     ///   - onProgress: Callback for progress updates
     /// - Returns: Transaction ID
     func sendShieldedWithProgress(to toAddress: String, amount: UInt64, memo: String? = nil, onProgress: @escaping SendProgressCallback) async throws -> String {
+        // FIX #511: Stop block listeners during TX build to prevent race condition
+        // Block listeners can consume "headers" or other responses that TX build needs
+        await NetworkManager.shared.stopAllBlockListeners()
+
         // Validate destination is a z-address (shielded only!)
         guard isValidZAddress(toAddress) else {
             throw WalletError.invalidAddress("ZipherX only supports z-addresses. t-addresses are not allowed.")
@@ -4375,6 +4574,10 @@ final class WalletManager: ObservableObject {
             try? await refreshBalance()
         }
 
+        // FIX #511: Restart block listeners after TX is accepted
+        // Transaction is now safely in mempool/accepted by peers, can resume block announcements
+        await NetworkManager.shared.startBlockListenersOnMainScreen()
+
         return txId
     }
 
@@ -4385,6 +4588,9 @@ final class WalletManager: ObservableObject {
     ///   - memo: Optional encrypted memo
     /// - Returns: Transaction ID
     func sendShielded(to toAddress: String, amount: UInt64, memo: String? = nil) async throws -> String {
+        // FIX #511: Stop block listeners during TX build to prevent race condition
+        await NetworkManager.shared.stopAllBlockListeners()
+
         // Validate destination is a z-address (shielded only!)
         guard isValidZAddress(toAddress) else {
             throw WalletError.invalidAddress("ZipherX only supports z-addresses. t-addresses are not allowed.")
@@ -4562,6 +4768,9 @@ final class WalletManager: ObservableObject {
 
         // Refresh balance
         try await refreshBalance()
+
+        // FIX #511: Restart block listeners after TX is accepted
+        await NetworkManager.shared.startBlockListenersOnMainScreen()
 
         return txId
     }
@@ -4956,7 +5165,18 @@ final class WalletManager: ObservableObject {
 
     /// Import spending key from Bech32 string (secret-extended-key-main1...)
     /// Also accepts legacy hex format (338 chars)
+    /// FIX #504: CRITICAL - DISABLE Tor during import for direct P2P connections
     func importSpendingKey(_ keyString: String) throws {
+        // CRITICAL: DISABLE Tor during import PK to ensure P2P connections work!
+        // Routing through Tor causes connection failures even for localhost
+        print("🚫 FIX #504: DISABLING Tor during import PK - direct P2P connections required")
+        DispatchQueue.main.async {
+            Task {
+                await TorManager.shared.bypassTorForMassiveOperation()
+                print("✅ FIX #504: Tor bypassed - P2P connections will be direct")
+            }
+        }
+
         // Record creation time for accurate sync timing display
         DispatchQueue.main.async {
             self.walletCreationTime = Date()
@@ -5059,15 +5279,119 @@ final class WalletManager: ObservableObject {
         treeLoadProgress = 0.0
         treeLoadStatus = ""
 
-        // Update state - mark as imported wallet (may have historical notes)
-        DispatchQueue.main.async {
-            self.zAddress = address
-            self.isWalletCreated = true
-            self.isImportedWallet = true  // Important: triggers historical note scanning
-            self.saveWalletState()
-        }
+        // FIX #500: Don't update state here - let importSpendingKeyAsync handle it
+        // The DispatchQueue.main.async was causing a race condition where ContentView
+        // wouldn't see the state changes until after the function returned
 
         print("✅ Key imported successfully (will scan for historical notes)")
+    }
+
+    // FIX #500: Tracks whether import PK is currently in progress
+    @Published public private(set) var isImportInProgress: Bool = false
+    private var importProcessTask: Task<Void, Never>?
+
+    // FIX #500: Async version of importSpendingKey that properly signals completion
+    // CRITICAL: Sets isWalletCreated = true so ContentView shows sync screen immediately
+    // Uses isImportInProgress to track when the full import (sync) completes
+    @MainActor
+    func importSpendingKeyAsync(_ keyString: String) async throws {
+        // Mark import as in progress
+        self.isImportInProgress = true
+
+        // Run the synchronous import on background thread
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try self.importSpendingKey(keyString)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        // Immediately mark wallet as created so ContentView shows sync screen
+        self.zAddress = try self.deriveZAddressFromStoredKey()
+        self.isWalletCreated = true
+        self.isImportedWallet = true  // Important: triggers historical note scanning
+        self.saveWalletState()
+        print("✅ FIX #500 v3: Wallet created, ContentView should now show sync screen with progress")
+
+        // Don't clear isImportInProgress yet - let ContentView clear it when sync completes
+        // ContentView will observe sync completion and clear both flags
+    }
+
+    // FIX #500: Call when import sync completes
+    @MainActor
+    func markImportComplete() {
+        self.isImportInProgress = false
+        print("✅ FIX #500: Import sync completed")
+
+        // FIX #510: Trigger UI refresh for transaction history
+        // Without this, history doesn't display after import until app restart
+        self.transactionHistoryVersion += 1
+        print("📜 FIX #510: Incremented transactionHistoryVersion to \(transactionHistoryVersion) - views should reload")
+
+        // Post notification to force reload from database
+        NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+        print("📜 FIX #510: Posted transactionHistoryUpdated notification - forcing UI refresh")
+    }
+
+    // Helper to derive address from stored key
+    private func deriveZAddressFromStoredKey() throws -> String {
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        return try deriveZAddress(from: spendingKey)
+    }
+
+    // MARK: - FIX #506: Parallel Import Architecture
+
+    /// FIX #506: Run parallel extraction for faster import PK
+    /// Downloads boost file, then runs headers/CMUs/network/hashes extraction in parallel
+    /// - Parameter onProgress: Progress callback for overall operation (0.0-1.0)
+    func importParallelWithProgress(onProgress: @escaping (Double) -> Void) async throws {
+        print("🚀 FIX #506: Starting PARALLEL import for faster PK import...")
+
+        let coordinator = ParallelImportCoordinator.shared
+
+        // Step 1: Download boost file
+        onProgress(0.1)
+        print("📦 Step 1: Downloading boost file...")
+        let (boostFileURL, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+            Task { @MainActor in
+                onProgress(0.1 + progress * 0.2)  // 10-30% for download
+                self.treeLoadStatus = status
+            }
+        }
+
+        print("✅ Boost file downloaded: height=\(height), cmus=\(cmuCount)")
+
+        // Step 2: PARALLEL extraction (headers, CMUs, network, hashes all run simultaneously)
+        onProgress(0.3)
+        print("⚡️ Step 2: Running PARALLEL extraction (4 tasks simultaneous)...")
+
+        let tempData = try await coordinator.runParallelExtraction(boostFile: boostFileURL)
+
+        let speedup = 110.0 / max(tempData.duration, 1.0)  // Sequential takes ~110s
+        print("✅ Parallel extraction completed in \(String(format: "%.1f", tempData.duration))s")
+        print("   Speedup: \(String(format: "%.1f", speedup))x faster than sequential")
+
+        // Step 3: Build tree and commit to production
+        onProgress(0.5)
+        print("🌳 Step 3: Building tree from temp CMUs...")
+
+        try await coordinator.commitToProduction(tempData: tempData) { progress in
+            onProgress(0.5 + progress * 0.5)  // 50-100% for tree build + commit
+        }
+
+        // Mark tree as loaded
+        await MainActor.run {
+            self.isTreeLoaded = true
+            self.treeLoadProgress = 1.0
+            self.treeLoadStatus = "Privacy infrastructure ready\n\(ZipherXFFI.treeSize().formatted()) commitments loaded"
+        }
+
+        onProgress(1.0)
+        print("✅ FIX #506: Parallel import complete!")
     }
 
     // MARK: - FIX #262: Pre-Build Nullifier Verification

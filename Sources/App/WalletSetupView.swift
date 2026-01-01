@@ -3,7 +3,9 @@ import SwiftUI
 /// Wallet Setup View - Create or restore wallet
 /// Uses current theme from ThemeManager
 struct WalletSetupView: View {
-    @EnvironmentObject var walletManager: WalletManager
+    // FIX #488 v4: Use @ObservedObject instead of @EnvironmentObject for WalletManager
+    // This ensures the view updates when syncTasks change during import
+    @ObservedObject private var walletManager = WalletManager.shared
     @EnvironmentObject var themeManager: ThemeManager
 
     @State private var showCreateWallet = false
@@ -21,6 +23,30 @@ struct WalletSetupView: View {
     @State private var showMnemonicWords = false  // Hidden by default for cypherpunk security
     @State private var showPrivateKeyInput = false  // Hidden by default
     @State private var showMnemonicInput = false  // Hidden by default for restore
+
+    // FIX #488 v4: Track import progress from syncTasks
+    // Uses @ObservedObject walletManager to ensure view updates
+    private var importProgressText: String {
+        guard isProcessing else { return "" }
+
+        // Check if WalletManager has sync tasks
+        let syncTasks = walletManager.syncTasks
+        // FIX #500: Debug logging to see what's happening
+        print("🔍 FIX #500: importProgressText computed - syncTasks.count = \(syncTasks.count)")
+        for task in syncTasks {
+            print("🔍 FIX #500:   Task: \(task.id), progress: \(task.progress ?? 0.0), detail: \(task.detail ?? "nil")")
+        }
+
+        if let headerTask = syncTasks.first(where: { $0.id == "headers" }),
+           let progress = headerTask.progress {
+            let pct = Int(progress * 100)
+            print("🔍 FIX #500: Found headers task, progress: \(pct)%")
+            return " \(pct)% - \(headerTask.detail ?? "Processing...")"
+        }
+
+        print("🔍 FIX #500: No headers task found, returning IMPORTING...")
+        return "IMPORTING..."
+    }
 
     /* DISABLED: Scan options no longer needed - full scan is fast (2-5 min) with parallel decryption
     // Scan options for imported wallets
@@ -931,7 +957,7 @@ struct WalletSetupView: View {
                                     .scaleEffect(0.8)
                                     .tint(theme.backgroundColor)
                             }
-                            Text(isProcessing ? "IMPORTING..." : "IMPORT KEY")
+                            Text(isProcessing ? importProgressText : "IMPORT KEY")
                         }
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundColor(theme.backgroundColor)
@@ -1298,20 +1324,18 @@ struct WalletSetupView: View {
 
         isProcessing = true
 
+        // FIX #500: Use async version to ensure ContentView transitions properly
         Task {
             do {
-                try self.walletManager.importSpendingKey(keyToImport)
+                try await self.walletManager.importSpendingKeyAsync(keyToImport)
 
-                await MainActor.run {
-                    self.privateKeyInput = ""
-                    self.isProcessing = false
-                }
+                // Key imported successfully - ContentView is now showing sync progress
+                // isImportInProgress tracks when the full import completes
+                self.privateKeyInput = ""
             } catch {
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.showError = true
-                    self.isProcessing = false
-                }
+                self.errorMessage = error.localizedDescription
+                self.showError = true
+                self.isProcessing = false
             }
         }
     }

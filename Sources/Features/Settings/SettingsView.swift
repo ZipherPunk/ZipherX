@@ -196,47 +196,176 @@ struct SettingsView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        contentWithAlerts
+    }
+
+    private var contentWithAlerts: some View {
+        mainContent
+            .onAppear {
+                checkBiometricAvailability()
+                networkManager.updatePeerCountsForSettings()
+            }
+            .sheet(isPresented: $showPINSetup) {
+                pinSetupSheet
+                    #if os(macOS)
+                    .frame(minWidth: 400, idealWidth: 450, minHeight: 350, idealHeight: 400)
+                    #endif
+            }
+            .sheet(isPresented: $showRescanProgress) {
+                rescanProgressView
+                    #if os(macOS)
+                    .frame(minWidth: 450, idealWidth: 500, minHeight: 300, idealHeight: 350)
+                    #endif
+            }
+    }
+
+    // MARK: - Alert Helpers
+    // Group alerts to avoid type-check timeout
+
+    @ViewBuilder
+    private var mainContent: some View {
+        scrollViewContent
+            .alert("Export Private Key", isPresented: $showExportAlert) {
+                Button("Copy to Clipboard") { copyToClipboard(exportedKey) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Your private key:\n\n\(exportedKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+            }
+            .alert("Error", isPresented: $showError) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(errorMessage)
+            }
+            .alert("Funds Recovered!", isPresented: $showRecoverySuccess) {
+                Button("Nice!", role: .cancel) {}
+            } message: {
+                Text(recoveryMessage)
+            }
+    }
+
+    private var scrollViewContent: some View {
+        settingsScrollView
+            .alert("Full Blockchain Rescan", isPresented: $showRescanWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Rescan", role: .destructive) { startFullRescan() }
+            } message: {
+                Text("WARNING: This will delete all cached data and rescan the entire blockchain from scratch.\n\nThis process can take 30-60 minutes and uses significant data.\n\nYour funds are safe - only cached data is deleted.\n\nDo you want to continue?")
+            }
+            .alert("Quick Scan for Notes", isPresented: $showQuickScan) {
+                TextField("Start Height", text: $quickScanHeight)
+                    #if os(iOS)
+                    .keyboardType(.numberPad)
+                    #endif
+                Button("Cancel", role: .cancel) { quickScanHeight = "" }
+                Button("Scan") {
+                    if let height = UInt64(quickScanHeight) {
+                        startQuickScan(from: height)
+                    }
+                    quickScanHeight = ""
+                }
+            } message: {
+                Text("Enter block height to start scanning for notes.\n\nThis uses the bundled tree and only scans for YOUR notes.\n\nExample: 2918000")
+            }
+            .alert("Full Rescan from Height", isPresented: $showFullRescanFromHeight) {
+                TextField("Start Height", text: $fullRescanHeight)
+                    #if os(iOS)
+                    .keyboardType(.numberPad)
+                    #endif
+                Button("Cancel", role: .cancel) { fullRescanHeight = "" }
+                Button("Rescan") {
+                    if let height = UInt64(fullRescanHeight) {
+                        startFullRescanFromHeight(height)
+                    }
+                    fullRescanHeight = ""
+                }
+            } message: {
+                Text("Enter block height to start full rescan.\n\nThis rebuilds the commitment tree and creates proper witnesses so notes can be SPENT.\n\nExample: 2918000")
+            }
+    }
+
+    private var settingsScrollView: some View {
+        framedContent
+            .alert("Rebuild Witnesses", isPresented: $showRebuildWitnessesWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Rebuild", role: .destructive) { startRebuildWitnesses() }
+            } message: {
+                Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
+            }
+            .alert("Repair Database", isPresented: $showRepairNotesWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Repair (Tor will be disabled)", role: .destructive) { startRepairNotes() }
+            } message: {
+                Text("⚠️ PRIVACY NOTICE ⚠️\n\nTor will be TEMPORARILY DISABLED during repair for faster P2P scanning. Your IP will be visible to blockchain peers during this operation.\n\n━━━━━━━━━━━━━━━━━━━━━━\n\nThis repairs database corruption by:\n• Re-scanning blockchain for spent notes\n• Clearing ALL block headers (fixes timestamps)\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Notes marked unspent but are spent\n• Transaction dates show NO DATE\n\nThis will take 5-15 minutes.\nTor will be restored after completion.\n\nDo you want to continue?")
+            }
+            .alert("FULL RESYNC", isPresented: $showFullResyncWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("FULL RESYNC (Tor disabled)", role: .destructive) { startFullResync() }
+            } message: {
+                Text("🔴 NUCLEAR OPTION 🔴\n\nThis performs a COMPLETE blockchain rescan:\n\n• DELETES all notes from database\n• DELETES all transaction history\n• Clears ALL cached data\n• Re-downloads boost file from GitHub\n• Rescans ENTIRE blockchain from Sapling activation\n\nThis is the same as importing a private key - everything is rebuilt from scratch.\n\n⚠️ Tor will be disabled during resync\n⚠️ Takes 10-30 minutes\n⚠️ Uses significant data/bandwidth\n\nUse ONLY if regular Repair doesn't fix balance.\n\nContinue?")
+            }
+    }
+
+    private var framedContent: some View {
+        baseContent
+            .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Scan Now", role: .destructive) { startScanForUnrecordedTx() }
+            } message: {
+                Text("This will quickly scan blocks from your last checkpoint to find any transactions that were broadcast but not recorded in the database.\n\nUse this if:\n• Send showed 'failed' but TX went through\n• Balance doesn't reflect a recent send\n• Tor timeout during broadcast\n\nThis is fast (usually < 30 seconds).")
+            }
+            .alert("Force Rebuild All Witnesses", isPresented: $showForceRebuildWitnessesWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Rebuild", role: .destructive) { startForceRebuildWitnesses() }
+            } message: {
+                Text("This will force a complete rebuild of all witnesses for your unspent notes.\n\nUse this if:\n• Balance shows incorrectly (too low)\n• Some notes are unspendable\n• 'Witness doesn't match tree root' errors\n\nThis may take 1-5 minutes depending on the number of notes.\n\nYour wallet will remain usable during the rebuild.")
+            }
+            .alert("Scan Complete", isPresented: $showScanUnrecordedResult) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(scanUnrecordedResultMessage)
+            }
+    }
+
+    private var baseContent: some View {
+        deletableContent
+            .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
+                Button("Cancel - Keep Wallet", role: .cancel) {}
+                Button("I Understand, Delete", role: .destructive) { showDeleteWalletConfirm = true }
+            } message: {
+                Text("!!! CRITICAL WARNING !!!\n\nThis will PERMANENTLY DELETE your wallet!\n\nYour PRIVATE KEY will be ERASED FOREVER.\nAll transaction history will be LOST.\nYour funds will be UNRECOVERABLE.\n\nHave you EXPORTED your private key?\nIf not, press Cancel NOW!\n\nTHIS CANNOT BE UNDONE!")
+            }
+            .alert("FINAL CONFIRMATION", isPresented: $showDeleteWalletConfirm) {
+                TextField("Type DELETE to confirm", text: $deleteConfirmText)
+                Button("CANCEL - KEEP MY WALLET", role: .cancel) { deleteConfirmText = "" }
+                Button("DELETE FOREVER", role: .destructive) {
+                    if deleteConfirmText == "DELETE" {
+                        performDeleteWallet()
+                    }
+                    deleteConfirmText = ""
+                }
+            } message: {
+                Text("Type DELETE (in capital letters) to confirm.\n\nAfter this, your wallet is GONE FOREVER.\n\nNo recovery is possible without your private key backup!")
+            }
+            .alert("Seed Phrase Not Stored", isPresented: $showSeedPhraseInfo) {
+                Button("I Understand", role: .cancel) {}
+            } message: {
+                Text("\"Privacy is necessary for an open society.\"\n\nFor maximum security, your 24-word seed phrase was shown ONLY during wallet creation and is NOT stored on this device.\n\nIf you didn't write it down, use \"Export Private Key\" above as your backup.\n\nYour private key can fully restore your wallet.")
+            }
+    }
+
+    private var deletableContent: some View {
         ScrollView {
             VStack(spacing: 16) {
-                /* DISABLED: Appearance section - hide themes for now
-                // Appearance section (themes)
-                appearanceSection
-                */
-
                 #if os(macOS)
-                // Wallet mode section (macOS only)
                 walletModeSection
                 #endif
 
-                // Security section
                 securitySection
-
-                // Privacy Report section
                 privacyReportSection
-
-                // Network section
                 networkSection
-
-                // Export section
                 exportSection
-
-                // Repair Database button (standalone)
                 repairDatabaseSection
-
-                // Debug logging section (FIX #189: Re-enabled for debugging)
                 debugLoggingSection
-
-                /* DISABLED: Blockchain data section - hide for now
-                // Rescan section
-                rescanSection
-                */
-
-                // Note: Delete wallet is now in exportSection (Danger Zone)
-
-                /* DISABLED: Debug tools section
-                // Debug section (for testing header sync)
-                debugSection
-                */
 
                 Spacer()
             }
@@ -244,161 +373,6 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(themeManager.currentTheme.backgroundColor)
-        .onAppear {
-            checkBiometricAvailability()
-            // FIX #455: Update reactive peer counts when Settings appears
-            networkManager.updatePeerCountsForSettings()
-        }
-        .alert("Export Private Key", isPresented: $showExportAlert) {
-            Button("Copy to Clipboard") {
-                copyToClipboard(exportedKey)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Your private key:\n\n\(exportedKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
-        }
-        .alert("Error", isPresented: $showError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(errorMessage)
-        }
-        .alert("Funds Recovered!", isPresented: $showRecoverySuccess) {
-            Button("Nice!", role: .cancel) {}
-        } message: {
-            Text(recoveryMessage)
-        }
-        .sheet(isPresented: $showPINSetup) {
-            pinSetupSheet
-                #if os(macOS)
-                .frame(minWidth: 400, idealWidth: 450, minHeight: 350, idealHeight: 400)
-                #endif
-        }
-        .alert("Full Blockchain Rescan", isPresented: $showRescanWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("Rescan", role: .destructive) {
-                startFullRescan()
-            }
-        } message: {
-            Text("WARNING: This will delete all cached data and rescan the entire blockchain from scratch.\n\nThis process can take 30-60 minutes and uses significant data.\n\nYour funds are safe - only cached data is deleted.\n\nDo you want to continue?")
-        }
-        .sheet(isPresented: $showRescanProgress) {
-            rescanProgressView
-                #if os(macOS)
-                .frame(minWidth: 450, idealWidth: 500, minHeight: 300, idealHeight: 350)
-                #endif
-        }
-        .alert("Quick Scan for Notes", isPresented: $showQuickScan) {
-            TextField("Start Height", text: $quickScanHeight)
-                #if os(iOS)
-                .keyboardType(.numberPad)
-                #endif
-            Button("Cancel", role: .cancel) {
-                quickScanHeight = ""
-            }
-            Button("Scan") {
-                if let height = UInt64(quickScanHeight) {
-                    startQuickScan(from: height)
-                }
-                quickScanHeight = ""
-            }
-        } message: {
-            Text("Enter block height to start scanning for notes.\n\nThis uses the bundled tree and only scans for YOUR notes.\n\nExample: 2918000")
-        }
-        .alert("Full Rescan from Height", isPresented: $showFullRescanFromHeight) {
-            TextField("Start Height", text: $fullRescanHeight)
-                #if os(iOS)
-                .keyboardType(.numberPad)
-                #endif
-            Button("Cancel", role: .cancel) {
-                fullRescanHeight = ""
-            }
-            Button("Rescan") {
-                if let height = UInt64(fullRescanHeight) {
-                    startFullRescanFromHeight(height)
-                }
-                fullRescanHeight = ""
-            }
-        } message: {
-            Text("Enter block height to start full rescan.\n\nThis rebuilds the commitment tree and creates proper witnesses so notes can be SPENT.\n\nExample: 2918000")
-        }
-        .alert("Rebuild Witnesses", isPresented: $showRebuildWitnessesWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("Rebuild", role: .destructive) {
-                startRebuildWitnesses()
-            }
-        } message: {
-            Text("This will rebuild witnesses from the bundled tree height.\n\nThis is needed after Quick Scan to make notes spendable.\n\nIt will take 5-15 minutes depending on blocks since bundled tree.\n\nDo you want to continue?")
-        }
-        .alert("Repair Database", isPresented: $showRepairNotesWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("Repair (Tor will be disabled)", role: .destructive) {
-                startRepairNotes()
-            }
-        } message: {
-            Text("⚠️ PRIVACY NOTICE ⚠️\n\nTor will be TEMPORARILY DISABLED during repair for faster P2P scanning. Your IP will be visible to blockchain peers during this operation.\n\n━━━━━━━━━━━━━━━━━━━━━━\n\nThis repairs database corruption by:\n• Re-scanning blockchain for spent notes\n• Clearing ALL block headers (fixes timestamps)\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Notes marked unspent but are spent\n• Transaction dates show NO DATE\n\nThis will take 5-15 minutes.\nTor will be restored after completion.\n\nDo you want to continue?")
-        }
-        // FIX #367: Full Resync alert (nuclear option)
-        .alert("FULL RESYNC", isPresented: $showFullResyncWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("FULL RESYNC (Tor disabled)", role: .destructive) {
-                startFullResync()
-            }
-        } message: {
-            Text("🔴 NUCLEAR OPTION 🔴\n\nThis performs a COMPLETE blockchain rescan:\n\n• DELETES all notes from database\n• DELETES all transaction history\n• Clears ALL cached data\n• Re-downloads boost file from GitHub\n• Rescans ENTIRE blockchain from Sapling activation\n\nThis is the same as importing a private key - everything is rebuilt from scratch.\n\n⚠️ Tor will be disabled during resync\n⚠️ Takes 10-30 minutes\n⚠️ Uses significant data/bandwidth\n\nUse ONLY if regular Repair doesn't fix balance.\n\nContinue?")
-        }
-        // FIX #214: Scan for unrecorded transactions alert
-        .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("Scan Now", role: .destructive) {
-                startScanForUnrecordedTx()
-            }
-        } message: {
-            Text("This will quickly scan blocks from your last checkpoint to find any transactions that were broadcast but not recorded in the database.\n\nUse this if:\n• Send showed 'failed' but TX went through\n• Balance doesn't reflect a recent send\n• Tor timeout during broadcast\n\nThis is fast (usually < 30 seconds).")
-        }
-        // FIX: Force rebuild all witnesses alert
-        .alert("Force Rebuild All Witnesses", isPresented: $showForceRebuildWitnessesWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("Rebuild", role: .destructive) {
-                startForceRebuildWitnesses()
-            }
-        } message: {
-            Text("This will force a complete rebuild of all witnesses for your unspent notes.\n\nUse this if:\n• Balance shows incorrectly (too low)\n• Some notes are unspendable\n• 'Witness doesn't match tree root' errors\n\nThis may take 1-5 minutes depending on the number of notes.\n\nYour wallet will remain usable during the rebuild.")
-        }
-        // FIX #214: Scan result alert
-        .alert("Scan Complete", isPresented: $showScanUnrecordedResult) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(scanUnrecordedResultMessage)
-        }
-        .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
-            Button("Cancel - Keep Wallet", role: .cancel) {}
-            Button("I Understand, Delete", role: .destructive) {
-                showDeleteWalletConfirm = true
-            }
-        } message: {
-            Text("!!! CRITICAL WARNING !!!\n\nThis will PERMANENTLY DELETE your wallet!\n\nYour PRIVATE KEY will be ERASED FOREVER.\nAll transaction history will be LOST.\nYour funds will be UNRECOVERABLE.\n\nHave you EXPORTED your private key?\nIf not, press Cancel NOW!\n\nTHIS CANNOT BE UNDONE!")
-        }
-        .alert("FINAL CONFIRMATION", isPresented: $showDeleteWalletConfirm) {
-            TextField("Type DELETE to confirm", text: $deleteConfirmText)
-                .textInputAutocapitalization(.allCharacters)  // FIX #474: Show uppercase keyboard
-            Button("CANCEL - KEEP MY WALLET", role: .cancel) {
-                deleteConfirmText = ""
-            }
-            Button("DELETE FOREVER", role: .destructive) {
-                // FIX #474: Case-sensitive validation - must be exact "DELETE" (not "delete" or "Delete")
-                if deleteConfirmText == "DELETE" {
-                    performDeleteWallet()
-                }
-                deleteConfirmText = ""
-            }
-        } message: {
-            Text("Type DELETE (in capital letters) to confirm.\n\nAfter this, your wallet is GONE FOREVER.\n\nNo recovery is possible without your private key backup!")
-        }
-        .alert("Seed Phrase Not Stored", isPresented: $showSeedPhraseInfo) {
-            Button("I Understand", role: .cancel) {}
-        } message: {
-            Text("\"Privacy is necessary for an open society.\"\n\nFor maximum security, your 24-word seed phrase was shown ONLY during wallet creation and is NOT stored on this device.\n\nIf you didn't write it down, use \"Export Private Key\" above as your backup.\n\nYour private key can fully restore your wallet.")
-        }
     }
 
     // MARK: - Wallet Mode Section (macOS only)
@@ -661,10 +635,13 @@ Both binaries must be installed to /usr/local/bin:
 
                     Picker("Debug Level", selection: $fullNodeManager.daemonDebugLevel) {
                         ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
-                            Text(level.displayName).tag(level)
+                            Text(level.displayName)
+                                .foregroundColor(theme.textPrimary)  // FIX #487 v3: Ensure text is visible
+                                .tag(level)
                         }
                     }
                     .pickerStyle(SegmentedPickerStyle())
+                    .foregroundColor(theme.textPrimary)  // FIX #487 v3: Ensure picker content is visible
 
                     Text(fullNodeManager.daemonDebugLevel.description)
                         .font(.system(size: 10))

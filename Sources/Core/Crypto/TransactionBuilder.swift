@@ -371,8 +371,20 @@ final class TransactionBuilder {
                 print("✅ Created witness at position \(result.position)")
                 witnessToUse = result.witness
             } else {
-                print("❌ Failed to find note CMU in downloaded tree")
-                throw TransactionError.proofGenerationFailed
+                // FIX #493 v3: CMU not in bundled file - rebuild via P2P
+                print("⚠️ FIX #493 v3: CMU not in bundled file, rebuilding via P2P...")
+                if let result = try await rebuildWitnessForNote(
+                    cmu: cmu,
+                    noteHeight: noteHeight,
+                    downloadedTreeHeight: downloadedTreeHeight,
+                    chainHeight: chainHeight
+                ) {
+                    witnessToUse = result.witness
+                    print("✅ FIX #493 v3: Rebuilt witness via P2P (\(result.witness.count) bytes)")
+                } else {
+                    print("❌ Failed to rebuild witness via P2P")
+                    throw TransactionError.proofGenerationFailed
+                }
             }
         }
 
@@ -846,6 +858,16 @@ final class TransactionBuilder {
                 let noteCMU = note.cmu
                 let noteHeight = note.height
 
+                // FIX #480: After tree rebuild (import/repair), all witnesses are stale
+                // Check if tree was rebuilt since this witness was created
+                // If tree size > 1,000,000, we just did an import/repair and all witnesses need rebuild
+                let currentTreeSize = ZipherXFFI.treeSize()
+                let treeWasRebuilt = currentTreeSize > 1000000 // Large tree indicates import/repair just happened
+                if treeWasRebuilt && note.witness.count == 1028 && !needsRebuild {
+                    print("🔧 FIX #480: Tree was rebuilt (size: \(currentTreeSize) CMUs) - forcing witness rebuild for note at height \(noteHeight)")
+                    needsRebuild = true
+                }
+
                 // INSTANT MODE CHECK: If witness has valid structure and was updated by pre-witness rebuild,
                 // trust it without requiring header validation (header sync may lag behind tree sync)
                 if !needsRebuild && note.witness.count >= 1028 {
@@ -882,7 +904,7 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
 
-                    print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight)")
+                    print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight) (P2P sync)")
                     // FIX #115: Pass chainHeight for consistent anchor
                     if let result = try await rebuildWitnessForNote(
                         cmu: cmu,
@@ -895,16 +917,73 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
                 } else if needsRebuild, let cmu = noteCMU {
+                    print("⚠️ Rebuilding witness for note \(index + 1) using bundled CMU file")
                     guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
                           let cachedData = try? Data(contentsOf: cachedPath) else {
+                        print("❌ FIX #480: Failed to get bundled CMU file")
                         throw TransactionError.proofGenerationFailed
                     }
 
+                    print("🔧 FIX #480: Creating witness from bundled CMU file (\(cachedData.count) bytes)")
+                    print("🔧 Target CMU: \(cmu.prefix(16).hexString)...")
+                    print("🔧 Note height: \(noteHeight), downloadedTreeHeight: \(downloadedTreeHeight)")
+
                     if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
                         witnessToUse = result.witness
+                        print("✅ FIX #480: Witness created successfully at position \(result.position) (\(result.witness.count) bytes)")
                     } else {
-                        print("❌ Failed to create witness for note \(index + 1)")
-                        throw TransactionError.proofGenerationFailed
+                        // FIX #493 v3: CMU not in bundled file - ALWAYS rebuild via P2P
+                        // This handles both PHASE 2 notes (height > downloadedTreeHeight) AND
+                        // notes found during scan that were appended to global tree
+                        print("⚠️ FIX #493 v3: CMU not found in bundled file")
+                        print("   Target CMU: \(cmu.hexString)")
+                        print("   Bundled file: \((cachedData.count - 8) / 32) CMUs")
+                        print("   Note height: \(noteHeight), downloadedTreeHeight: \(downloadedTreeHeight)")
+
+                        // FIX #513: Diagnostic - fetch the specific block at note height to verify CMU exists on-chain
+                        // This helps identify if the database CMU is wrong or if bundled file is incomplete
+                        print("🔍 FIX #513: Fetching block at note height \(noteHeight) to verify CMU...")
+                        let connectedPeers = await MainActor.run { NetworkManager.shared.getAllConnectedPeers() }
+                        if let peer = connectedPeers.first {
+                            do {
+                                let blocks = try await peer.getFullBlocks(from: noteHeight, count: 1)
+                                if let block = blocks.first {
+                                    var foundCMU = false
+                                    for tx in block.transactions {
+                                        for output in tx.outputs {
+                                            if output.cmu == cmu {
+                                                foundCMU = true
+                                                print("✅ FIX #513: CMU VERIFIED at height \(noteHeight) - database is correct!")
+                                                break
+                                            }
+                                        }
+                                        if foundCMU { break }
+                                    }
+                                    if !foundCMU {
+                                        print("❌ FIX #513: CMU NOT FOUND at height \(noteHeight) - database CMU is WRONG!")
+                                        print("❌ FIX #513: Block has \(block.transactions.reduce(0) { $0 + $1.outputs.count }) outputs")
+                                        print("💡 FIX #513: Run 'Settings → Repair Database → Full Rescan' to fix this note")
+                                    }
+                                }
+                            } catch {
+                                print("⚠️ FIX #513: Could not verify CMU on-chain: \(error.localizedDescription)")
+                            }
+                        }
+
+                        // ALWAYS rebuild witness via P2P when CMU not in bundled file
+                        print("🔄 Rebuilding witness via P2P...")
+                        if let result = try await rebuildWitnessForNote(
+                            cmu: cmu,
+                            noteHeight: noteHeight,
+                            downloadedTreeHeight: downloadedTreeHeight,
+                            chainHeight: chainHeight
+                        ) {
+                            witnessToUse = result.witness
+                            print("✅ FIX #493 v3: Rebuilt witness via P2P (\(result.witness.count) bytes)")
+                        } else {
+                            print("❌ Failed to rebuild witness via P2P")
+                            throw TransactionError.proofGenerationFailed
+                        }
                     }
                 }
 
@@ -1260,9 +1339,12 @@ final class TransactionBuilder {
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
 
+        // FIX #514: Also create reversed version of target CMU for byte order comparison
+        let cmuReversed = Data(cmu.reversed())
+
         for blockCMU in allDeltaCMUs {
-            // Check if this is our note's CMU
-            if blockCMU == cmu {
+            // Check if this is our note's CMU (try both byte orders)
+            if blockCMU == cmu || blockCMU == cmuReversed {
                 // Found our note! Append it and capture witness
                 let position = ZipherXFFI.treeAppend(cmu: blockCMU)
                 if position == UInt64.max {
@@ -1475,7 +1557,9 @@ final class TransactionBuilder {
     private func fetchCMUsFromBlocks(startHeight: UInt64, endHeight: UInt64) async -> [Data] {
         var allCMUs: [Data] = []
         let networkManager = NetworkManager.shared
-        let torEnabled = await TorManager.shared.mode == .enabled
+        // FIX #499: Don't check Tor.mode here - it's @MainActor and can hang if main thread is blocked
+        // We use P2P only anyway (InsightAPI is disabled)
+        let torEnabled = false  // P2P only mode
 
         // PRIORITY 1: Check local delta bundle first (instant, no network!)
         // This enables instant witness generation for notes after the bundled tree

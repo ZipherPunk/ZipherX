@@ -556,62 +556,67 @@ public final class NetworkManager: ObservableObject {
     /// FIX #130: Set header syncing state (called from WalletManager)
     /// When true, mempool scan is disabled to prevent P2P race conditions
     /// FIX #139: Also pauses/resumes block listeners for faster header sync
-    /// FIX #140: Made synchronous to ensure listeners are paused BEFORE header sync starts
+    /// FIX #509: Now async - waits for listeners to actually finish before returning
     /// FIX #457 v11: Added stopListeners parameter (small syncs don't need to stop listeners)
-    func setHeaderSyncing(_ syncing: Bool, stopListeners: Bool = true) {
+    func setHeaderSyncing(_ syncing: Bool, stopListeners: Bool = true) async {
         // FIX #140: Set flag synchronously (no Task wrapper) so it takes effect immediately
         self.isHeaderSyncing = syncing
         debugLog(.network, "📡 Header sync state: \(syncing ? "STARTED" : "COMPLETED")")
 
         // FIX #139: Pause block listeners during header sync for 100x faster sync
-        // FIX #140: Call synchronously - must happen BEFORE header sync starts
+        // FIX #509: Now awaits to ensure listeners are ACTUALLY stopped before continuing
         // FIX #383: Renamed to stopAllBlockListeners/resumeAllBlockListeners
         // FIX #457 v11: Only stop listeners if stopListeners=true (small syncs don't need it)
         if syncing && stopListeners {
-            self.stopAllBlockListeners()
+            await self.stopAllBlockListeners()
         } else if !syncing {
-            self.resumeAllBlockListeners()
+            await self.resumeAllBlockListeners()
         }
     }
 
     /// FIX #139/FIX #383: Stop all block listeners before header sync
+    /// FIX #509: Now async - waits for listeners to actually finish
     /// FIX #384: Delegates to PeerManager (but also operates on local peers for sync)
-    public func stopAllBlockListeners() {
+    public func stopAllBlockListeners() async {
         print("🛑 FIX #383: Stopping all block listeners...")
         debugLog(.network, "⏸️ FIX #140: Pausing \(peers.count) block listeners for header sync...")
 
-        // Stop local peers
+        // FIX #509: Stop local peers and wait for them to finish
         var stoppedCount = 0
         for peer in peers {
             if peer.isListening {
-                peer.stopBlockListener()
+                await peer.stopBlockListener()
                 stoppedCount += 1
             }
         }
 
         // Also delegate to PeerManager (in case it has additional peers)
-        Task { @MainActor in
-            await PeerManager.shared.stopAllBlockListeners()
-        }
+        await PeerManager.shared.stopAllBlockListeners()
 
         debugLog(.network, "⏸️ FIX #140: Stopped \(stoppedCount) block listeners")
     }
 
     /// FIX #139/FIX #383: Resume all block listeners after header sync
-    /// FIX #384: Delegates to PeerManager (but also operates on local peers for sync)
-    public func resumeAllBlockListeners() {
-        print("▶️ FIX #383: Resuming all block listeners...")
-        debugLog(.network, "▶️ FIX #140: Resuming block listeners for \(peers.count) peers...")
+    /// FIX #509 v2: DISABLED - Block listeners should NOT start automatically
+    /// They should only be started when app is 100% ready on main balance screen
+    public func resumeAllBlockListeners() async {
+        print("▶️ FIX #509: resumeAllBlockListeners called - BLOCKED (will start on main screen only)")
+        // DO NOT start block listeners here anymore
+        // They will be started explicitly when main balance view is ready
+    }
 
-        // Resume local peers
+    /// FIX #509: Start block listeners ONLY when app is fully ready on main balance screen
+    /// This should be called explicitly by the UI when the main screen is displayed
+    public func startBlockListenersOnMainScreen() async {
+        print("▶️ FIX #509: Starting block listeners on main balance screen...")
+
+        // Start local peers
         for peer in peers {
             peer.startBlockListener()
         }
 
         // Also delegate to PeerManager
-        Task { @MainActor in
-            await PeerManager.shared.resumeAllBlockListeners()
-        }
+        await PeerManager.shared.startBlockListenersOnMainScreen()
     }
 
     // MARK: - Connection Cooldown (FIX #114)
@@ -626,6 +631,7 @@ public final class NetworkManager: ObservableObject {
     // These are known-good nodes that should always be retried immediately
     // NOTE: Keep in sync with PeerManager.shared.HARDCODED_SEEDS
     private let HARDCODED_SEEDS = Set<String>([
+        "127.0.0.1",          // FIX #507: Local node - highest priority (always fastest)
         "140.174.189.3",
         "140.174.189.17",
         "205.209.104.118",
@@ -875,6 +881,9 @@ public final class NetworkManager: ObservableObject {
                 // Add to connected peers if not already there
                 if !self.peers.contains(where: { $0.host == host && $0.port == port }) {
                     self.peers.append(peer)
+                    // FIX #478: Also add to PeerManager to keep peer lists in sync
+                    // HeaderSyncManager uses PeerManager.shared.getReadyPeers()
+                    PeerManager.shared.addPeer(peer)
                 }
                 self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
                 self.recordCustomNodeConnection(host: host, port: port, success: true)
@@ -2134,9 +2143,10 @@ public final class NetworkManager: ObservableObject {
 
         // FIX #421: Add hardcoded Zclassic seeds FIRST - these are guaranteed good nodes
         // They must be in allCandidates before any filtering/prioritization can work
+        // FIX #502: Use defaultPort (8033) instead of hardcoded 16125 - Zclassic uses MagicBean port
         var hardcodedPeers: [PeerAddress] = []
         for seedHost in PeerManager.shared.HARDCODED_SEEDS {
-            hardcodedPeers.append(PeerAddress(host: seedHost, port: 16125))
+            hardcodedPeers.append(PeerAddress(host: seedHost, port: defaultPort))
         }
 
         // Add fresh DNS discoveries, then persisted addresses
@@ -2250,6 +2260,8 @@ public final class NetworkManager: ObservableObject {
                 for await (peer, address) in group {
                     if let peer = peer {
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         connectedCount += 1
 
                         // FIX #173: Reset Sybil counter - legitimate peer connected!
@@ -2347,6 +2359,8 @@ public final class NetworkManager: ObservableObject {
                         print("🔄 [FIX #229] Trying trusted peer \(address.host):\(address.port) (direct)...")
                         let peer = try await connectToPeer(address)
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         connectedCount += 1
                         setupBlockListener(for: peer)
                         resetSybilCounter()
@@ -4193,6 +4207,8 @@ public final class NetworkManager: ObservableObject {
                 for await (peer, _) in group {
                     if let peer = peer {
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         connectedCount += 1
                         self.resetSybilCounter()
                         self.setupBlockListener(for: peer)
@@ -4246,6 +4262,7 @@ public final class NetworkManager: ObservableObject {
 
     /// Set up block announcement listener for a peer
     /// When the peer receives a new block via P2P inv message, it triggers a background sync
+    /// FIX #509: NO LONGER auto-starts the listener - listeners are started only when app is ready
     private func setupBlockListener(for peer: Peer) {
         peer.onBlockAnnounced = { [weak self] blockHash in
             guard let self = self else { return }
@@ -4259,8 +4276,11 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        // Start listening in background
-        peer.startBlockListener()
+        // FIX #509: DO NOT auto-start block listener here!
+        // Block listeners are now started only:
+        // 1. After header sync completes (resumeAllBlockListeners)
+        // 2. When app is ready on main screen (explicit call)
+        // This prevents race condition where listeners consume headers during sync
     }
 
     /// Called when any peer announces a new block
@@ -5160,8 +5180,9 @@ public final class NetworkManager: ObservableObject {
 
         // P2P-FIRST architecture: prioritize trustless P2P data
         // CRITICAL: Always verify against network - don't trust stale cached values!
-        let torEnabled = await TorManager.shared.mode == .enabled
-        print("📡 Getting chain height (P2P-first, Tor=\(torEnabled ? "ON" : "OFF"))...")
+        // FIX #499: Don't check Tor.mode here - it's @MainActor and can hang if main thread is blocked
+        // We use P2P only anyway, so Tor mode doesn't matter for chain height
+        print("📡 Getting chain height (P2P-first)...")
 
         // FIX #120: InsightAPI commented out - P2P only
         // 1. Get network height from InsightAPI - ONLY if Tor is disabled
@@ -5175,7 +5196,6 @@ public final class NetworkManager: ObservableObject {
         // } else {
         //     print("🧅 Tor enabled - skipping InsightAPI (Cloudflare blocks Tor)")
         // }
-        _ = torEnabled  // Suppress unused warning
         print("📡 P2P only mode - InsightAPI disabled")
 
         // 2. Check header store (our locally verified headers)
@@ -5792,6 +5812,13 @@ public final class NetworkManager: ObservableObject {
             for (peerIndex, peer) in availablePeers.enumerated() {
                 let rangeStart = height + UInt64(peerIndex * blocksPerPeer)
                 let rangeEnd = min(rangeStart + UInt64(blocksPerPeer), height + UInt64(count))
+
+                // FIX #498: Check if rangeStart is out of bounds BEFORE subtraction
+                // Prevents UInt64 underflow crash when rangeStart >= rangeEnd
+                if rangeStart >= height + UInt64(count) {
+                    break  // No more blocks to fetch
+                }
+
                 let rangeCount = Int(rangeEnd - rangeStart)
 
                 if rangeCount <= 0 { break }
@@ -6185,6 +6212,8 @@ public final class NetworkManager: ObservableObject {
 
                     if let peer = try? await connectToPeer(seedAddress) {
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         setupBlockListener(for: peer)
                         print("✅ FIX #235: Connected to hardcoded seed \(seedHost)")
 
@@ -6234,6 +6263,8 @@ public final class NetworkManager: ObservableObject {
 
                 if let peer = try? await connectToPeer(address) {
                     peers.append(peer)
+                    // FIX #478: Also add to PeerManager to keep peer lists in sync
+                    PeerManager.shared.addPeer(peer)
 
                     // Set up block announcement listener
                     setupBlockListener(for: peer)
@@ -6443,6 +6474,8 @@ public final class NetworkManager: ObservableObject {
                 if let peer = peer {
                     if recovered < maxPeers {
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         setupBlockListener(for: peer)
                         recovered += 1
                         unparkPeer(address.host, port: address.port)
@@ -6478,6 +6511,8 @@ public final class NetworkManager: ObservableObject {
                 do {
                     let peer = try await connectToPeer(address)
                     peers.append(peer)
+                    // FIX #478: Also add to PeerManager to keep peer lists in sync
+                    PeerManager.shared.addPeer(peer)
                     setupBlockListener(for: peer)
                     recovered += 1
                     unparkPeer(address.host, port: address.port)
@@ -6517,6 +6552,8 @@ public final class NetworkManager: ObservableObject {
                         let address = PeerAddress(host: seed.host, port: seed.port)
                         let peer = try await connectToPeer(address)
                         peers.append(peer)
+                        // FIX #478: Also add to PeerManager to keep peer lists in sync
+                        PeerManager.shared.addPeer(peer)
                         setupBlockListener(for: peer)
                         unparkPeer(seed.host, port: seed.port)
                         print("✅ FIX #227: Direct connection to \(seed.host) succeeded")
@@ -7074,6 +7111,8 @@ public final class NetworkManager: ObservableObject {
         do {
             let peer = try await connectToPeer(address)
             peers.append(peer)
+            // FIX #478: Also add to PeerManager to keep peer lists in sync
+            PeerManager.shared.addPeer(peer)
             setupBlockListener(for: peer)
 
             // FIX #384: Sync success to PeerManager
