@@ -1214,6 +1214,39 @@ final class HeaderStore {
             storageSize: storageSize
         )
     }
+
+    // MARK: - FIX #516: Anchor Validation
+
+    /// Check if a Sapling root (anchor) exists in the blockchain headers
+    /// Returns true if the anchor is found in any block header
+    func containsSaplingRoot(_ anchor: Data) async -> Bool {
+        // The saplingRoot is stored as hex string in database
+        let anchorHex = anchor.map { String(format: "%02x", $0) }.joined()
+
+        let sql = "SELECT COUNT(*) FROM headers WHERE sapling_root = ? COLLATE NOCASE;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("⚠️ FIX #516: Failed to prepare query: \(String(cString: sqlite3_errmsg(db)))")
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        // Bind the anchor hex string
+        guard sqlite3_bind_text(stmt, 1, (anchorHex as NSString).utf8String, -1, nil) == SQLITE_OK else {
+            print("⚠️ FIX #516: Failed to bind anchor: \(String(cString: sqlite3_errmsg(db)))")
+            return false
+        }
+
+        // Execute query
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return false
+        }
+
+        // Get count
+        let count = sqlite3_column_int64(stmt, 0)
+        return count > 0
+    }
 }
 
 // MARK: - Data Types
