@@ -10,21 +10,29 @@
 
 use std::fs;
 use std::time::Instant;
-use zipherx_ffi::{zipherx_tree_load_from_cmus_with_progress, zipherx_tree_serialize, zipherx_tree_size, TreeLoadProgressCallback};
 
-/// Tree loading callback wrapper
-extern "C" fn progress_callback_impl(current: u64, total: u64) {
+/// Tree loading callback type
+type TreeLoadCallback = extern "C" fn(current: u64, total: u64);
+
+extern "C" {
+    /// Load tree from CMUs (from FFI)
+    fn zipherx_tree_load_from_cmus_with_progress(
+        cmu_data: *const u8,
+        cmu_len: usize,
+        callback: TreeLoadCallback,
+    ) -> bool;
+
+    /// Serialize tree (from FFI)
+    fn zipherx_tree_serialize(tree_out: *mut u8, tree_out_len: *mut usize) -> bool;
+
+    /// Get tree size (from FFI)
+    fn zipherx_tree_size() -> u64;
+}
+
+extern "C" fn progress_callback(current: u64, total: u64) {
     if total > 0 {
         let percent = (current * 100) / total;
         eprintln!("📊 Progress: {}/{} CMUs ({}%)", current, total, percent);
-    }
-}
-
-// Wrap the callback to match the expected type
-struct CallbackWrapper;
-impl CallbackWrapper {
-    extern "C" fn callback(current: u64, total: u64) {
-        progress_callback_impl(current, total);
     }
 }
 
