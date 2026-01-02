@@ -401,9 +401,10 @@ actor CommitmentTreeUpdater {
 
         try fileHandle.seek(toOffset: outputSection.offset)
 
-        let count = Int(outputCount)
-        for i in 0..<count {
-            guard let recordData = try fileHandle.read(upToCount: recordSize) else {
+        let outputCountInt = Int(outputCount)
+        let recordSizeInt = Int(recordSize)
+        for i in 0..<outputCountInt {
+            guard let recordData = try fileHandle.read(upToCount: recordSizeInt) else {
                 throw BoostFileError.readError
             }
 
@@ -416,7 +417,7 @@ actor CommitmentTreeUpdater {
 
             // Progress callback every 10000 records
             if i % 10000 == 0 {
-                onProgress?(Double(i) / Double(count))
+                onProgress?(Double(i) / Double(outputCountInt))
             }
         }
 
