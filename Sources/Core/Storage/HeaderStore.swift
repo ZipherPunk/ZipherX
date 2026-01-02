@@ -145,9 +145,11 @@ final class HeaderStore {
     }
 
     /// Compute work for a single block from bits (compact target representation)
+    /// Compact format: exponent (byte 3) | mantissa (bytes 0-2)
+    /// Formula: target = mantissa * 256^(exponent - 3)
     private func computeWorkFromBits(bits: UInt32) -> Data {
-        // Convert bits to target: target = (bits & 0x007FFFFF) * 256^((0x00FFFFFF - bits) >> 24)
-        let exponent = UInt32((0x00FFFFFF - bits) >> 24)
+        // Extract exponent (most significant byte) and mantissa (lower 3 bytes)
+        let exponent = (bits >> 24) & 0xFF
         let mantissa = bits & 0x007FFFFF
         var target: UInt64 = UInt64(mantissa)
         if exponent <= 3 {
