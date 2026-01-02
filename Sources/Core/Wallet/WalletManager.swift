@@ -403,6 +403,26 @@ final class WalletManager: ObservableObject {
         if !rootValid {
             print("⚠️ Delta tree root mismatch - clearing for rebuild")
             deltaManager.clearDeltaBundle()
+
+            // FIX #533: CRITICAL - Reload FFI tree from boost file WITHOUT corrupt delta CMUs
+            // The delta CMUs corrupted the tree state, causing anchor validation to fail
+            print("🔧 FIX #533: Reloading FFI tree from boost file to remove corrupt delta CMUs...")
+            do {
+                let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                _ = ZipherXFFI.treeInit()  // Reset tree
+                if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("✅ FIX #533: Reloaded tree from boost file: \(treeSize) CMUs (corrupt delta CMUs removed)")
+                    if let treeData = ZipherXFFI.treeSerialize() {
+                        try? WalletDatabase.shared.saveTreeState(treeData)
+                    }
+                } else {
+                    print("⚠️ FIX #533: Failed to deserialize tree after clearing delta")
+                }
+            } catch {
+                print("⚠️ FIX #533: Failed to reload tree: \(error)")
+            }
+
             return
         }
 
