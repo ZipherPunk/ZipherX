@@ -2928,6 +2928,12 @@ final class WalletManager: ObservableObject {
                 UserDefaults.standard.set(false, forKey: "wallet_imported")
                 UserDefaults.standard.synchronize()
             }
+
+            // FIX #520: Trigger UI refresh for transaction history after import
+            // Without this, history doesn't display correctly until app restart
+            await MainActor.run {
+                markImportComplete()
+            }
         }
 
         // Complete monotonic progress - we're done!
