@@ -2969,6 +2969,29 @@ final class WalletManager: ObservableObject {
             }
         }
 
+        // FIX #535: CRITICAL - Sync headers to match chain tip BEFORE showing as "ready"
+        // After import, lastScannedHeight is at chain tip, but headers might only be synced to boost end + 100
+        // This causes "Anchor NOT FOUND" errors when trying to send
+        print("📍 FIX #535: Import complete - syncing headers to chain tip...")
+        do {
+            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            let chainTip = NetworkManager.shared.chainHeight  // Current P2P consensus height
+
+            if chainTip > headerStoreHeight {
+                let headersNeeded = chainTip - headerStoreHeight
+                print("📥 FIX #535: Import sync - syncing \(headersNeeded) headers to chain tip...")
+
+                let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: NetworkManager.shared)
+                try await hsm.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headersNeeded + 100)
+
+                let finalHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                print("✅ FIX #535: Import header sync complete - now at \(finalHeaderHeight)")
+            }
+        } catch {
+            print("⚠️ FIX #535: Import header sync failed: \(error.localizedDescription)")
+            // Continue anyway - user can manually sync via Settings
+        }
+
         // Complete monotonic progress - we're done!
         await MainActor.run {
             self.completeProgress()
