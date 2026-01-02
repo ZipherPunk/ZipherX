@@ -373,15 +373,15 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.fileNotFound
         }
 
-        // Output record format in boost file (652 bytes each):
-        // - height: 4 bytes (UInt32 LE) - offset 0
-        // - index: 4 bytes (UInt32 LE) - offset 4
-        // - cmu: 32 bytes - offset 8
-        // - epk: 32 bytes - offset 40
-        // - ciphertext: 580 bytes - offset 72
-        // Total: 652 bytes per output
-        let recordSize = 652
-        let cmuOffset = 8  // height(4) + index(4) = 8
+        // Output record format in boost file:
+        // NEW FORMAT (with txid - FIX #374): 684 bytes
+        // OLD FORMAT (without txid): 652 bytes
+        // Detect format from section size / count
+        let actualRecordSize = outputSection.size / outputSection.count
+        let recordSize = actualRecordSize == 684 || actualRecordSize == 652 ? actualRecordSize : 684  // Default to new format
+        let cmuOffset = 8  // height(4) + index(4) = 8 (same for both formats)
+
+        print("🔧 Boost file record size: \(recordSize) bytes (\(recordSize == 684 ? "with txid" : "without txid"))")
 
         let outputCount = outputSection.count
         print("🔄 Extracting \(outputCount) CMUs in legacy format...")
