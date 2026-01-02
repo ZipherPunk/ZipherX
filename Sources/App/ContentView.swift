@@ -150,6 +150,72 @@ struct ContentView: View {
                         print("DEBUGZIPHERX: 🚀 Task: Tree is loaded!")
 
                         // ==========================================================
+                        // FIX #535: CRITICAL - Sync headers BEFORE showing UI as "ready"
+                        // The app MUST have complete headers before ANY operation
+                        // Otherwise transactions fail with "Anchor NOT FOUND" errors
+                        // ==========================================================
+                        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                        print("📍 FIX #535: HeaderStore height at startup: \(headerStoreHeight)")
+
+                        // Load bundled headers from boost file FIRST (instant)
+                        if headerStoreHeight < 2964000 {
+                            print("📦 FIX #535: Loading bundled headers from boost file...")
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Loading block headers...")
+                            }
+                            let (loadedBoost, boostEndHeight) = await walletManager.loadHeadersFromBoostFile()
+                            if loadedBoost {
+                                print("✅ FIX #535: Loaded bundled headers up to \(boostEndHeight)")
+                            }
+                        }
+
+                        // Connect to P2P network for delta header sync
+                        if headerStoreHeight < 2964000 || lastScannedHeight > 0 {
+                            print("🔗 FIX #535: Connecting to P2P network for header sync...")
+                            do {
+                                try await networkManager.connect()
+
+                                // Wait for peers with chain height
+                                var peerWait = 0
+                                let maxPeerWait = 300 // 30 seconds
+                                var chainHeight: UInt64 = 0
+
+                                while (networkManager.connectedPeers < 3 || chainHeight == 0) && peerWait < maxPeerWait {
+                                    try? await Task.sleep(nanoseconds: 100_000_000)
+                                    peerWait += 1
+                                    chainHeight = networkManager.chainHeight
+
+                                    if peerWait % 50 == 0 {
+                                        print("⏳ FIX #535: Waiting for peers... peers=\(networkManager.connectedPeers), chainHeight=\(chainHeight)")
+                                    }
+                                }
+
+                                // Sync headers to match current chain height
+                                let currentHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                                if chainHeight > currentHeaderHeight {
+                                    let headersNeeded = chainHeight - currentHeaderHeight
+                                    print("📥 FIX #535: Syncing \(headersNeeded) headers from P2P...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Syncing \(headersNeeded) headers...")
+                                    }
+
+                                    let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: networkManager)
+                                    hsm.onProgress = { progress in
+                                        Task { @MainActor in
+                                            let percent = Int(progress.percentComplete)
+                                            walletManager.setConnecting(true, status: "Syncing headers \(percent)%")
+                                        }
+                                    }
+
+                                    try await hsm.syncHeaders(from: currentHeaderHeight + 1, maxHeaders: headersNeeded + 100)
+                                    print("✅ FIX #535: Header sync complete")
+                                }
+                            } catch {
+                                print("⚠️ FIX #535: Header sync failed: \(error.localizedDescription)")
+                            }
+                        }
+
+                        // ==========================================================
                         // FAST START MODE: For consecutive app launches
                         // If wallet is already synced, show cached balance immediately
                         // and do background sync later (achieves <5s startup)
