@@ -283,6 +283,10 @@ struct ContentView: View {
 
                                                 // Build tree from CMUs
                                                 if let data = cmuData {
+                                                    print("🔍 FIX #534 DEBUG: About to load {} bytes into tree...", data.count)
+                                                    print("🔍 FIX #534 DEBUG: First 8 bytes (count): {}", data.prefix(8).hexString)
+                                                    print("🔍 FIX #534 DEBUG: First CMU (bytes 8-40): {}", data.subdata(in: 8..<40).hexString)
+
                                                     if ZipherXFFI.treeLoadFromCMUs(data: data) {
                                                         let rebuiltSize = ZipherXFFI.treeSize()
                                                         print("✅ FIX #534: Rebuilt tree from CMUs: \(rebuiltSize) commitments")
