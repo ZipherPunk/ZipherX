@@ -1511,15 +1511,18 @@ final class FilterScanner {
 
         print("🔧 FIX #524: Boost file ends at height \(effectiveHeight) with \(effectiveCMUCount) CMUs")
 
-        // Step 2: Load tree from boost file (correct state)
-        if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-           let cachedData = try? Data(contentsOf: cachedPath) {
+        // Step 2: Load tree from boost file serialized tree section (correct state)
+        // FIX #529 v2: Use extractSerializedTree() to get the proper serialized tree format
+        // Do NOT use legacy CMU file - it might be cached from old boost file!
+        do {
+            let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+            print("🔧 FIX #524: Extracted serialized tree from boost file: \(serializedTree.count) bytes")
 
             // Reset FFI tree
             _ = ZipherXFFI.treeInit()
 
-            // Deserialize from boost file
-            if ZipherXFFI.treeDeserialize(data: cachedData) {
+            // Deserialize the serialized tree (correct format!)
+            if ZipherXFFI.treeDeserialize(data: serializedTree) {
                 let treeSize = ZipherXFFI.treeSize()
                 print("🔧 FIX #524: Loaded tree from boost file: \(treeSize) CMUs")
 
@@ -1599,19 +1602,24 @@ final class FilterScanner {
                             print("⚠️ FIX #524: Tree root still doesn't match blockchain")
                             print("   Our root:    \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                             print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            return false
                         }
                     } else {
                         print("⚠️ FIX #524: Cannot validate - no header at height \(lastScannedHeight)")
+                        return false
                     }
+                } else {
+                    print("⚠️ FIX #524: No tree root available after deserialization")
+                    return false
                 }
             } else {
                 print("❌ FIX #524: Failed to deserialize tree from boost file")
+                return false
             }
-        } else {
-            print("❌ FIX #524: Boost file not available")
+        } catch {
+            print("❌ FIX #524: Failed to extract serialized tree from boost file: \(error.localizedDescription)")
+            return false
         }
-
-        return false
     }
 
     /// Parse raw block data into CompactBlock format
