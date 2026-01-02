@@ -430,9 +430,14 @@ final class FilterScanner {
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
                         }
+                    } else {
+                        // FIX #528: Deserialization failed - try legacy CMU fallback
+                        print("⚠️ FIX #528: Cached tree deserialization failed - trying legacy CMU fallback")
+                        treeInitialized = await loadTreeFromLegacyCMUs(boostHeight: cachedInfo.height, boostOutputCount: cachedInfo.cmuCount)
                     }
                 } catch {
-                    print("⚠️ Failed to extract serialized tree: \(error)")
+                    print("⚠️ FIX #528: Failed to extract serialized tree: \(error) - trying legacy CMU fallback")
+                    treeInitialized = await loadTreeFromLegacyCMUs(boostHeight: cachedInfo.height, boostOutputCount: cachedInfo.cmuCount)
                 }
             }
 
@@ -465,10 +470,16 @@ final class FilterScanner {
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
                         }
+                    } else {
+                        // FIX #528: Deserialization failed - try loading from legacy CMU file
+                        print("⚠️ FIX #528: Tree deserialization failed - trying legacy CMU fallback")
+                        treeInitialized = await loadTreeFromLegacyCMUs(boostHeight: boostHeight, boostOutputCount: boostOutputCount)
                     }
                 } catch {
                     print("❌ Failed to extract tree from boost file: \(error)")
-                    treeInitialized = false
+                    // FIX #528: Try fallback to legacy CMU loading
+                    print("⚠️ FIX #528: Extract failed - trying legacy CMU fallback")
+                    treeInitialized = await loadTreeFromLegacyCMUs(boostHeight: boostHeight, boostOutputCount: boostOutputCount)
                 }
             }
         }
@@ -3361,6 +3372,58 @@ struct CompactTx: Hashable {
 /// Nullifier for spend detection
 struct CompactSpend: Hashable {
     let nullifier: Data  // 32 bytes
+}
+
+// MARK: - FIX #528: Legacy CMU Tree Loading
+
+/// FIX #528: Load tree from legacy CMU file when deserialization fails
+/// This is a fallback when the serialized tree format is incompatible
+/// - Parameter boostHeight: Height from boost file (to set cmuDataHeight)
+/// - Parameter boostOutputCount: Output count from boost file (to set cmuDataCount)
+/// - Returns: true if tree was loaded successfully
+private func loadTreeFromLegacyCMUs(boostHeight: UInt64, boostOutputCount: UInt64) async -> Bool {
+    print("🔧 FIX #528: Loading tree from legacy CMU file...")
+
+    // Get legacy CMU file path
+    guard let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() else {
+        print("❌ FIX #528: No cached CMU file available")
+        return false
+    }
+
+    // Load CMU data
+    guard let cmuData = try? Data(contentsOf: cmuPath) else {
+        print("❌ FIX #528: Failed to load CMU file")
+        return false
+    }
+
+    print("🔧 FIX #528: Loaded \(cmuData.count) bytes of CMU data")
+
+    // Initialize tree
+    _ = ZipherXFFI.treeInit()
+
+    // Load tree from CMUs (this builds the tree from scratch)
+    let loaded = ZipherXFFI.treeLoadFromCMUs(cmuData: cmuData)
+
+    if loaded {
+        let treeSize = ZipherXFFI.treeSize()
+        print("✅ FIX #528: Tree loaded from legacy CMUs: \(treeSize) commitments")
+
+        // Set metadata for position lookup
+        self.cmuDataHeight = boostHeight
+        self.cmuDataCount = boostOutputCount
+        self.cmuDataForPositionLookup = cmuData
+
+        // Save tree state for future use
+        if let treeData = ZipherXFFI.treeSerialize() {
+            try? WalletDatabase.shared.saveTreeState(treeData)
+            print("✅ FIX #528: Saved tree state to database")
+        }
+
+        return true
+    } else {
+        print("❌ FIX #528: Failed to load tree from CMUs")
+        return false
+    }
 }
 
 /// Encrypted output for trial decryption
