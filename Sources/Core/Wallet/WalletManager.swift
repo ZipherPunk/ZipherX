@@ -1428,26 +1428,6 @@ final class WalletManager: ObservableObject {
         }
     }
 
-    /// FIX #523: Check if headers were loaded during import (to skip redundant P2P sync)
-    /// Returns true if this is an import and bundled headers were already loaded
-    func wasImportedWithBundledHeaders() async -> Bool {
-        // Only applies during import
-        guard isImportedWallet else {
-            return false
-        }
-
-        // Check if HeaderStore has headers from boost file
-        // Boost file ends at 2,962,638, so we should have at least some headers if loaded
-        let headerCount = (try? HeaderStore.shared.getHeaderCount()) ?? 0
-        let hasBundledHeaders = headerCount > 1000  // Should have 2.4M+ if loaded
-
-        if hasBundledHeaders {
-            print("⚡ FIX #523: Import detected with \(headerCount) bundled headers already loaded")
-        }
-
-        return hasBundledHeaders
-    }
-
     /// FIX #413: Check GitHub for newer boost file and download if available
     /// Returns true if a newer boost file was downloaded
     func checkAndDownloadNewerBoostFile() async -> Bool {

@@ -936,27 +936,28 @@ final class FilterScanner {
             let bundledHashes = BundledBlockHashes.shared
             let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : UInt64(0)
 
-            // FIX #523: During import, WalletManager already loaded bundled headers (FIX #522)
-            // Skip redundant P2P sync to avoid deadlock on localhost peer
-            let walletManager = WalletManager.shared
-            let wasImportedWithHeaders = await walletManager.wasImportedWithBundledHeaders()
-
-            if wasImportedWithHeaders {
-                print("⚡ FIX #523: Skipping P2P header sync during import - headers already loaded by WalletManager")
-                print("⚡ FIX #523: PHASE 2 will use existing headers (may be slightly behind tip, but sufficient for scan)")
-                headersAvailable = true  // Mark as available to skip P2P sync
+            // FIX #413: Load bundled headers from boost file FIRST (instant vs P2P timeout!)
+            // The boost file contains 2.4M+ pre-verified headers - loading them is instant
+            // This avoids P2P sync timeout issues with block listeners consuming responses
+            print("📜 FIX #413: Loading bundled headers from boost file before PHASE 2...")
+            let (loadedBundledHeaders, boostHeaderEndHeight) = await WalletManager.shared.loadHeadersFromBoostFile()
+            if loadedBundledHeaders {
+                print("✅ FIX #413: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load!")
             } else {
-                // FIX #413: Load bundled headers from boost file FIRST (instant vs P2P timeout!)
-                // The boost file contains 2.4M+ pre-verified headers - loading them is instant
-                // This avoids P2P sync timeout issues with block listeners consuming responses
-                print("📜 FIX #413: Loading bundled headers from boost file before PHASE 2...")
-                let (loadedBundledHeaders, boostHeaderEndHeight) = await WalletManager.shared.loadHeadersFromBoostFile()
-                if loadedBundledHeaders {
-                    print("✅ FIX #413: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load!")
-                } else {
-                    print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
-                }
+                print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
             }
+
+            // FIX #525: NEVER skip header sync during PHASE 2!
+            // Headers MUST be synced to targetHeight for tree root validation
+            // Even if WalletManager loaded bundled headers during import (FIX #522),
+            // we still need to sync the delta (boost height → target height)
+            //
+            // Previous FIX #523 blocked this sync, causing:
+            // - Tree built with CMUs from blocks beyond boost file
+            // - But HeaderStore had no headers for those blocks
+            // - Tree root validation failed (no header at target height)
+            // - Result: "Anchor NOT FOUND" errors when sending
+            print("⚡ FIX #525: Ensuring headers synced to target height \(targetHeight) for tree root validation")
 
             // FIX #462: ALWAYS stop block listeners during header sync
             // Block listeners consume "headers" responses, causing sync failures
