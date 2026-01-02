@@ -928,7 +928,48 @@ final class TransactionBuilder {
                     print("🔧 Target CMU: \(cmu.prefix(16).hexString)...")
                     print("🔧 Note height: \(noteHeight), downloadedTreeHeight: \(downloadedTreeHeight)")
 
-                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
+                    // FIX #531: CRITICAL - Include PHASE 2 CMUs to match global tree state
+                    // The cached legacy file only has boost file CMUs, but global tree may have PHASE 2 CMUs
+                    var cmuDataToUse = cachedData
+                    let cachedCount = (cachedData.count - 8) / 32
+                    let currentTreeSize = ZipherXFFI.treeSize()
+
+                    if currentTreeSize > cachedCount {
+                        print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, cached file has \(cachedCount) CMUs")
+                        print("🔧 FIX #531: Adding \(currentTreeSize - cachedCount) PHASE 2 CMUs to witness creation...")
+
+                        // Get PHASE 2 CMUs from DeltaCMU manager
+                        if let manifest = DeltaCMUManager.shared.getManifest(),
+                           manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
+                            let boostEndHeight = ZipherXConstants.effectiveTreeHeight
+                            if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                                startHeight: boostEndHeight + 1,
+                                endHeight: manifest.endHeight
+                            ) {
+                                // Append delta CMUs to the data
+                                var newCount = currentTreeSize
+                                var newCmuData = Data()
+
+                                // Write new count
+                                newCmuData.append(contentsOf: withUnsafeBytes(of: UInt64(newCount).littleEndian) { Array($0) })
+
+                                // Copy cached CMUs (skip count byte)
+                                newCmuData.append(cachedData[8...])
+
+                                // Append delta CMUs
+                                for cmu in deltaCMUs {
+                                    newCmuData.append(cmu)
+                                }
+
+                                cmuDataToUse = newCmuData
+                                print("✅ FIX #531: Updated CMU data to \(newCount) CMUs (\(cmuDataToUse.count) bytes)")
+                            } else {
+                                print("⚠️ FIX #531: Failed to load delta CMUs - witness may be invalid!")
+                            }
+                        }
+                    }
+
+                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cmuDataToUse, targetCMU: cmu) {
                         witnessToUse = result.witness
                         print("✅ FIX #480: Witness created successfully at position \(result.position) (\(result.witness.count) bytes)")
                     } else {
@@ -955,6 +996,45 @@ final class TransactionBuilder {
                             }
 
                             print("📦 FIX #514 v4: Extracted \(count) CMUs from boost file outputs section (\(cmuData.count) bytes)")
+
+                            // FIX #531: CRITICAL - Include PHASE 2 CMUs to match global tree state
+                            // The witness must be created from the SAME tree state as the blockchain
+                            // If global tree has more CMUs than boost file, we need to include them
+                            let currentTreeSize = ZipherXFFI.treeSize()
+                            if currentTreeSize > count {
+                                print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, boost has \(count) CMUs")
+                                print("🔧 FIX #531: Adding \(currentTreeSize - count) PHASE 2 CMUs to witness creation...")
+
+                                // Get PHASE 2 CMUs from DeltaCMU manager
+                                if let manifest = DeltaCMUManager.shared.getManifest(),
+                                   manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
+                                    let boostEndHeight = ZipherXConstants.effectiveTreeHeight
+                                    if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                                        startHeight: boostEndHeight + 1,
+                                        endHeight: manifest.endHeight
+                                    ) {
+                                        // Append delta CMUs to the data
+                                        var newCount = currentTreeSize
+                                        var newCmuData = Data()
+
+                                        // Write new count
+                                        newCmuData.append(contentsOf: withUnsafeBytes(of: UInt64(newCount).littleEndian) { Array($0) })
+
+                                        // Copy boost CMUs
+                                        newCmuData.append(cmuData[8...])  // Skip count byte
+
+                                        // Append delta CMUs
+                                        for cmu in deltaCMUs {
+                                            newCmuData.append(cmu)
+                                        }
+
+                                        cmuData = newCmuData
+                                        print("✅ FIX #531: Updated CMU data to \(newCount) CMUs (\(cmuData.count) bytes)")
+                                    } else {
+                                        print("⚠️ FIX #531: Failed to load delta CMUs - witness may be invalid!")
+                                    }
+                                }
+                            }
 
                             if let boostResult = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cmuData, targetCMU: cmu) {
                                 witnessToUse = boostResult.witness
