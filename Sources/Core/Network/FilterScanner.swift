@@ -1357,7 +1357,19 @@ final class FilterScanner {
         }
 
         // Save tree checkpoint after scan completes
-        await saveTreeCheckpointAfterSync()
+        let checkpointSaved = await saveTreeCheckpointAfterSync()
+
+        // FIX #524: If checkpoint wasn't saved due to tree root mismatch, fix the tree!
+        // This happens when FFI tree state becomes corrupted during PHASE 2
+        // Symptoms: witnesses are 37 bytes (invalid), tree root doesn't match blockchain
+        if !checkpointSaved {
+            print("🔧 FIX #524: Tree root mismatch detected - attempting repair...")
+            if await fixTreeRootMismatch(lastScannedHeight: targetHeight) {
+                print("✅ FIX #524: Tree root mismatch repaired - witnesses updated")
+            } else {
+                print("⚠️ FIX #524: Could not repair tree root mismatch - may need full rescan")
+            }
+        }
 
         // DELTA BUNDLE: Save collected outputs for instant witness generation
         if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
@@ -1409,45 +1421,46 @@ final class FilterScanner {
 
     /// Save a tree checkpoint after sync completes
     /// This ensures we have a verified tree state for reliable transaction building
-    private func saveTreeCheckpointAfterSync() async {
+    /// - Returns: true if checkpoint was saved, false if validation failed
+    private func saveTreeCheckpointAfterSync() async -> Bool {
         do {
             // Get current tree state
             guard let treeSerialized = ZipherXFFI.treeSerialize() else {
                 print("⚠️ Cannot save checkpoint - tree not serialized")
-                return
+                return false
             }
 
             let treeSize = ZipherXFFI.treeSize()
             guard treeSize > 0 else {
                 print("⚠️ Cannot save checkpoint - tree is empty")
-                return
+                return false
             }
 
             // Get the tree root
             guard let treeRoot = ZipherXFFI.treeRoot() else {
                 print("⚠️ Cannot save checkpoint - no tree root")
-                return
+                return false
             }
 
             // Get last scanned height and block hash
             let lastScanned = try database.getLastScannedHeight()
             guard lastScanned > 0 else {
                 print("⚠️ Cannot save checkpoint - no scanned height")
-                return
+                return false
             }
 
             // Get block hash from HeaderStore
             guard let header = try HeaderStore.shared.getHeader(at: lastScanned) else {
                 print("⚠️ Cannot save checkpoint - no header at height \(lastScanned)")
-                return
+                return false
             }
 
             // Validate tree root matches HeaderStore before saving
             if treeRoot != header.hashFinalSaplingRoot {
                 print("⚠️ Tree root mismatch at height \(lastScanned) - NOT saving checkpoint")
-                print("   Our root:    \(treeRoot.hexString)")
-                print("   Header root: \(header.hashFinalSaplingRoot.hexString)")
-                return
+                print("   Our root:    \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                return false
             }
 
             // Save the verified checkpoint
@@ -1464,9 +1477,129 @@ final class FilterScanner {
                 try database.pruneOldCheckpoints()
             }
 
+            print("✅ Checkpoint saved at height \(lastScanned) with \(treeSize) CMUs")
+            return true
+
         } catch {
             print("⚠️ Failed to save tree checkpoint: \(error)")
+            return false
         }
+    }
+
+    /// FIX #524: Repair tree root mismatch by reloading from boost file
+    /// This fixes the issue where PHASE 2 corrupts the FFI tree state
+    /// - Parameter lastScannedHeight: The height we scanned to
+    /// - Returns: true if repair succeeded, false otherwise
+    private func fixTreeRootMismatch(lastScannedHeight: UInt64) async -> Bool {
+        print("🔧 FIX #524: Starting tree root mismatch repair...")
+
+        // Step 1: Get the correct tree root from boost file (should match blockchain)
+        let effectiveHeight = ZipherXConstants.effectiveTreeHeight
+        let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
+
+        print("🔧 FIX #524: Boost file ends at height \(effectiveHeight) with \(effectiveCMUCount) CMUs")
+
+        // Step 2: Load tree from boost file (correct state)
+        if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+           let cachedData = try? Data(contentsOf: cachedPath) {
+
+            // Reset FFI tree
+            _ = ZipherXFFI.treeInit()
+
+            // Deserialize from boost file
+            if ZipherXFFI.treeDeserialize(data: cachedData) {
+                let treeSize = ZipherXFFI.treeSize()
+                print("🔧 FIX #524: Loaded tree from boost file: \(treeSize) CMUs")
+
+                // Step 3: If we scanned beyond boost file, append delta CMUs
+                if lastScannedHeight > effectiveHeight {
+                    print("🔧 FIX #524: Appending delta CMUs from height \(effectiveHeight + 1) to \(lastScannedHeight)...")
+
+                    // Get delta CMUs from DeltaCMUManager
+                    let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                        startHeight: effectiveHeight + 1,
+                        endHeight: lastScannedHeight
+                    )
+
+                    if let cmus = deltaCMUs, !cmus.isEmpty {
+                        var appendedCount = 0
+                        for cmu in cmus {
+                            let position = ZipherXFFI.treeAppend(cmu: cmu)
+                            if position != UInt64.max {
+                                appendedCount += 1
+                            }
+                        }
+                        print("🔧 FIX #524: Appended \(appendedCount) delta CMUs")
+                    } else {
+                        print("⚠️ FIX #524: No delta CMUs found for range \(effectiveHeight + 1)-\(lastScannedHeight)")
+                    }
+                }
+
+                // Step 4: Verify tree root now matches
+                if let newTreeRoot = ZipherXFFI.treeRoot() {
+                    let treeSize = ZipherXFFI.treeSize()
+                    print("🔧 FIX #524: New tree root: \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    print("🔧 FIX #524: New tree size: \(treeSize) CMUs")
+
+                    // Try to validate against last scanned height
+                    if let header = try? HeaderStore.shared.getHeader(at: lastScannedHeight) {
+                        if newTreeRoot == header.hashFinalSaplingRoot {
+                            print("✅ FIX #524: Tree root now matches blockchain at height \(lastScannedHeight)!")
+
+                            // Step 5: Force rebuild ALL witnesses
+                            print("🔧 FIX #524: Rebuilding all witnesses with correct tree state...")
+
+                            let accountId = (try? database.getAccount(index: 0)?.id) ?? 0
+                            let allNotes = (try? database.getAllNotes(accountId: accountId)) ?? []
+
+                            var rebuiltCount = 0
+                            for note in allNotes {
+                                if let cmu = note.cmu, !cmu.isEmpty {
+                                    // Try to create witness from boost file CMU data
+                                    if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                                       let cachedData = try? Data(contentsOf: cachedPath) {
+                                        if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
+                                            if result.witness.count >= 1028 {  // Valid witness
+                                                try? database.updateNoteWitness(noteId: note.id, witness: result.witness)
+
+                                                // Get anchor from witness
+                                                if let witnessAnchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                                                    try? database.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                                }
+
+                                                rebuiltCount += 1
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            print("✅ FIX #524: Rebuilt \(rebuiltCount)/\(allNotes.count) witnesses")
+
+                            // Save the corrected tree state
+                            if let treeData = ZipherXFFI.treeSerialize() {
+                                try? database.saveTreeState(treeData)
+                                print("💾 FIX #524: Saved corrected tree state to database")
+                            }
+
+                            return true
+                        } else {
+                            print("⚠️ FIX #524: Tree root still doesn't match blockchain")
+                            print("   Our root:    \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        }
+                    } else {
+                        print("⚠️ FIX #524: Cannot validate - no header at height \(lastScannedHeight)")
+                    }
+                }
+            } else {
+                print("❌ FIX #524: Failed to deserialize tree from boost file")
+            }
+        } else {
+            print("❌ FIX #524: Boost file not available")
+        }
+
+        return false
     }
 
     /// Parse raw block data into CompactBlock format
