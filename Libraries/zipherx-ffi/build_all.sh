@@ -29,24 +29,25 @@ echo ""
 
 # FIX #203: Build all targets IN PARALLEL (4x faster!)
 echo "═══════════════════════════════════════════════════════════════"
-echo "🚀 Building ALL targets in PARALLEL..."
+echo "🚀 Building LIBRARIES ONLY in PARALLEL..."
 echo "═══════════════════════════════════════════════════════════════"
+echo "⚠️  Note: Building --lib only to avoid binary linking issues"
 
-# Start all builds in background
+# Start all builds in background (LIB ONLY!)
 echo "🔨 [1/4] macOS (arm64)..."
-cargo build --release > /tmp/build_macos_arm64.log 2>&1 &
+cargo build --release --lib > /tmp/build_macos_arm64.log 2>&1 &
 PID1=$!
 
 echo "🔨 [2/4] macOS (x86_64)..."
-cargo build --release --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
+cargo build --release --lib --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
 PID2=$!
 
 echo "🔨 [3/4] iOS Device (arm64)..."
-cargo build --release --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
+cargo build --release --lib --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
 PID3=$!
 
 echo "🔨 [4/4] iOS Simulator (arm64)..."
-cargo build --release --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
+cargo build --release --lib --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
 PID4=$!
 
 echo ""
@@ -56,16 +57,20 @@ echo "⏳ Waiting for all builds to complete (running in parallel)..."
 FAILED=0
 
 wait $PID1
-if [ $? -eq 0 ]; then echo "✅ macOS (arm64) done"; else echo "❌ macOS (arm64) FAILED"; FAILED=1; fi
+STATUS1=$?
+if [ $STATUS1 -eq 0 ]; then echo "✅ macOS (arm64) done"; else echo "❌ macOS (arm64) FAILED (exit code: $STATUS1)"; FAILED=1; fi
 
 wait $PID2
-if [ $? -eq 0 ]; then echo "✅ macOS (x86_64) done"; else echo "❌ macOS (x86_64) FAILED"; FAILED=1; fi
+STATUS2=$?
+if [ $STATUS2 -eq 0 ]; then echo "✅ macOS (x86_64) done"; else echo "❌ macOS (x86_64) FAILED (exit code: $STATUS2)"; FAILED=1; fi
 
 wait $PID3
-if [ $? -eq 0 ]; then echo "✅ iOS Device done"; else echo "❌ iOS Device FAILED"; FAILED=1; fi
+STATUS3=$?
+if [ $STATUS3 -eq 0 ]; then echo "✅ iOS Device done"; else echo "❌ iOS Device FAILED (exit code: $STATUS3)"; FAILED=1; fi
 
 wait $PID4
-if [ $? -eq 0 ]; then echo "✅ iOS Simulator done"; else echo "❌ iOS Simulator FAILED"; FAILED=1; fi
+STATUS4=$?
+if [ $STATUS4 -eq 0 ]; then echo "✅ iOS Simulator done"; else echo "❌ iOS Simulator FAILED (exit code: $STATUS4)"; FAILED=1; fi
 
 if [ $FAILED -eq 1 ]; then
     echo ""
@@ -78,7 +83,7 @@ if [ $FAILED -eq 1 ]; then
 fi
 
 echo ""
-echo "✅ All 4 targets built successfully!"
+echo "✅ All 4 library targets built successfully!"
 
 # Create universal macOS library
 echo ""
