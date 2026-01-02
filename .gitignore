@@ -106,3 +106,5 @@ zclassic-fork/
 # Claude-generated fix documentation (local only)
 ZIPHERX_FIXES_SUMMARY.md
 ZIPHERX_FIXES_SUMMARY.html
+Libraries/ZipherXFFI.xcframework/
+Libraries/libzipherx_ffi.a
