@@ -150,12 +150,38 @@ struct ContentView: View {
                         print("DEBUGZIPHERX: 🚀 Task: Tree is loaded!")
 
                         // ==========================================================
+                        // FAST START MODE: For consecutive app launches
+                        // If wallet is already synced, show cached balance immediately
+                        // and do background sync later (achieves <5s startup)
+                        // ==========================================================
+                        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                        let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+                        let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
+
+                        // FIX #168: Use verified_checkpoint_height for INSTANT startup
+                        // If checkpoint == lastScannedHeight, wallet is fully verified - NO health checks needed!
+                        let checkpointHeight = (try? WalletDatabase.shared.getVerifiedCheckpointHeight()) ?? 0
+                        let checkpointGap = lastScannedHeight > checkpointHeight ? lastScannedHeight - checkpointHeight : 0
+                        let isCheckpointValid = checkpointHeight > 0 && checkpointGap <= 10  // Within 10 blocks = valid
+
+                        print("📍 FIX #168: Checkpoint=\(checkpointHeight), LastScanned=\(lastScannedHeight), Gap=\(checkpointGap)")
+
+                        // FIX #120: Check if cached chain height is stale
+                        // If lastScannedHeight is significantly AHEAD of cached height, the cache is stale
+                        // This can happen if P2P peers reported fake heights or cache wasn't updated
+                        let cacheIsStale = lastScannedHeight > cachedChainHeight + 100
+                        if cacheIsStale {
+                            print("⚠️ STALE CACHE: lastScannedHeight (\(lastScannedHeight)) >> cachedChainHeight (\(cachedChainHeight))")
+                            print("⚠️ Disabling FAST START - need to verify chain height via P2P")
+                        }
+
+                        // ==========================================================
                         // FIX #535: CRITICAL - Sync headers BEFORE showing UI as "ready"
                         // The app MUST have complete headers before ANY operation
                         // Otherwise transactions fail with "Anchor NOT FOUND" errors
                         // ==========================================================
                         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-                        print("📍 FIX #535: HeaderStore height at startup: \(headerStoreHeight)")
+                        print("📍 FIX #535: HeaderStore height at startup: \(headerStoreHeight), LastScanned: \(lastScannedHeight)")
 
                         // Load bundled headers from boost file FIRST (instant)
                         if headerStoreHeight < 2964000 {
@@ -170,7 +196,9 @@ struct ContentView: View {
                         }
 
                         // Connect to P2P network for delta header sync
-                        if headerStoreHeight < 2964000 || lastScannedHeight > 0 {
+                        // Only sync if: HeaderStore is empty OR wallet has data that needs headers
+                        let needsHeaderSync = headerStoreHeight < 2964000 || lastScannedHeight > 0
+                        if needsHeaderSync {
                             print("🔗 FIX #535: Connecting to P2P network for header sync...")
                             do {
                                 try await networkManager.connect()
@@ -213,32 +241,6 @@ struct ContentView: View {
                             } catch {
                                 print("⚠️ FIX #535: Header sync failed: \(error.localizedDescription)")
                             }
-                        }
-
-                        // ==========================================================
-                        // FAST START MODE: For consecutive app launches
-                        // If wallet is already synced, show cached balance immediately
-                        // and do background sync later (achieves <5s startup)
-                        // ==========================================================
-                        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
-                        let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
-                        let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
-
-                        // FIX #168: Use verified_checkpoint_height for INSTANT startup
-                        // If checkpoint == lastScannedHeight, wallet is fully verified - NO health checks needed!
-                        let checkpointHeight = (try? WalletDatabase.shared.getVerifiedCheckpointHeight()) ?? 0
-                        let checkpointGap = lastScannedHeight > checkpointHeight ? lastScannedHeight - checkpointHeight : 0
-                        let isCheckpointValid = checkpointHeight > 0 && checkpointGap <= 10  // Within 10 blocks = valid
-
-                        print("📍 FIX #168: Checkpoint=\(checkpointHeight), LastScanned=\(lastScannedHeight), Gap=\(checkpointGap)")
-
-                        // FIX #120: Check if cached chain height is stale
-                        // If lastScannedHeight is significantly AHEAD of cached height, the cache is stale
-                        // This can happen if P2P peers reported fake heights or cache wasn't updated
-                        let cacheIsStale = lastScannedHeight > cachedChainHeight + 100
-                        if cacheIsStale {
-                            print("⚠️ STALE CACHE: lastScannedHeight (\(lastScannedHeight)) >> cachedChainHeight (\(cachedChainHeight))")
-                            print("⚠️ Disabling FAST START - need to verify chain height via P2P")
                         }
 
                         // Fast start if: already synced (within 50 blocks) AND has cached data AND cache is not stale
