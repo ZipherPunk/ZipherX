@@ -219,6 +219,13 @@ final class HeaderSyncManager {
     private func syncHeadersSimple(from startHeight: UInt64, to chainTip: UInt64) async throws {
         print("⚡ FIX #502: Using localhost-priority header sync for \(chainTip - startHeight) headers")
 
+        // FIX #519: Set flag to prevent health checks from disrupting sync
+        await networkManager.setHeaderSyncInProgress(true)
+        defer {
+            // FIX #519: Always clear flag when done (even if error)
+            Task { await networkManager.setHeaderSyncInProgress(false) }
+        }
+
         // FIX: Timing diagnostics - track each step
         let syncStartTime = Date()
         var stepTimings: [String: TimeInterval] = [:]
@@ -398,6 +405,13 @@ final class HeaderSyncManager {
     /// Each batch uses the last received header's hash as locator for the next batch
     private func syncHeadersParallel(from startHeight: UInt64, to chainTip: UInt64) async throws {
         print("🚀 FIX #502: Using PARALLEL header requests with localhost priority for \(chainTip - startHeight) headers")
+
+        // FIX #519: Set flag to prevent health checks from disrupting sync
+        await networkManager.setHeaderSyncInProgress(true)
+        defer {
+            // FIX #519: Always clear flag when done (even if error)
+            Task { await networkManager.setHeaderSyncInProgress(false) }
+        }
 
         // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
         let localhostPeer = "127.0.0.1"

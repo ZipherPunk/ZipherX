@@ -273,6 +273,20 @@ public final class NetworkManager: ObservableObject {
     /// Prevents mempool scan, stats refresh, etc. from interfering with critical startup sync
     @Published private(set) var backgroundProcessesEnabled: Bool = false
 
+    /// FIX #519: Flag to indicate header sync is in progress
+    /// Health checks should NOT ping peers during header sync as it disrupts the sync
+    private(set) var headerSyncInProgress: Bool = false
+
+    /// FIX #519: Set header sync in progress flag
+    func setHeaderSyncInProgress(_ inProgress: Bool) {
+        headerSyncInProgress = inProgress
+        if inProgress {
+            print("🔒 FIX #519: Header sync in progress - health checks will skip pings")
+        } else {
+            print("🔓 FIX #519: Header sync complete - health checks resumed")
+        }
+    }
+
     /// FIX #145: Enable background processes (called after initial sync completes)
     func enableBackgroundProcesses() {
         backgroundProcessesEnabled = true
@@ -6739,6 +6753,14 @@ public final class NetworkManager: ObservableObject {
 
     /// Check connection health and trigger recovery if needed
     private func checkConnectionHealth() async {
+        // FIX #519: Skip ping checks during header sync - they disrupt the sync!
+        if headerSyncInProgress {
+            print("🔍 [HEALTH] Header sync in progress - skipping ping checks (would disrupt sync)")
+            // Still update UI counts without pinging
+            updatePeerCountsForSettings()
+            return
+        }
+
         print("🔍 [HEALTH] checkConnectionHealth() called at \(Date())")
 
         let connectedCount = connectedPeers
