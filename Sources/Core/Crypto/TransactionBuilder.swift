@@ -931,7 +931,7 @@ final class TransactionBuilder {
                     // FIX #531: CRITICAL - Include PHASE 2 CMUs to match global tree state
                     // The cached legacy file only has boost file CMUs, but global tree may have PHASE 2 CMUs
                     var cmuDataToUse = cachedData
-                    let cachedCount = (cachedData.count - 8) / 32
+                    let cachedCount = UInt64((cachedData.count - 8) / 32)
                     let currentTreeSize = ZipherXFFI.treeSize()
 
                     if currentTreeSize > cachedCount {
@@ -1001,9 +1001,10 @@ final class TransactionBuilder {
                             // The witness must be created from the SAME tree state as the blockchain
                             // If global tree has more CMUs than boost file, we need to include them
                             let currentTreeSize = ZipherXFFI.treeSize()
-                            if currentTreeSize > count {
-                                print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, boost has \(count) CMUs")
-                                print("🔧 FIX #531: Adding \(currentTreeSize - count) PHASE 2 CMUs to witness creation...")
+                            let boostCount = UInt64(count)
+                            if currentTreeSize > boostCount {
+                                print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, boost has \(boostCount) CMUs")
+                                print("🔧 FIX #531: Adding \(currentTreeSize - boostCount) PHASE 2 CMUs to witness creation...")
 
                                 // Get PHASE 2 CMUs from DeltaCMU manager
                                 if let manifest = DeltaCMUManager.shared.getManifest(),
