@@ -258,15 +258,17 @@ final class HeaderSyncManager {
             }
 
             // FIX #502 v2: PRIORITIZE localhost (127.0.0.1) ABOVE ALL OTHER PEERS
+            // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it first!
             // User's local node is most reliable - no network latency, always available
             // Secondary: peers that have reported valid heights (peerStartHeight > 0)
             // These are peers that completed handshake and sent us a valid chain height
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
                     peer.isHandshakeComplete &&
-                    peer.hasRecentActivity &&  // FIX #504: MUST have recent activity (connection is alive!)
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
-                    !failedPeers.contains(peer.host)
+                    !failedPeers.contains(peer.host) &&
+                    // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it!
+                    (peer.host == localhostPeer || peer.hasRecentActivity)
                 }
 
                 // FIX #502: Sort by: localhost FIRST, then trusted, then by recency of height report
@@ -475,13 +477,16 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             // Get fresh peer list for each batch, prioritizing trusted peers
+            // FIX #517: For localhost, skip hasRecentActivity check - always try it!
             // FIX #502 v2: PRIORITIZE localhost, then peers with valid heights (peerStartHeight > 0)
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
                     peer.isHandshakeComplete &&
-                    peer.hasRecentActivity &&  // FIX #504: MUST have recent activity (connection is alive!)
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
-                    !failedPeers.contains(peer.host)
+                    !failedPeers.contains(peer.host) &&
+                    // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it first!
+                    // Localhost is user's own node - should always be available for header sync
+                    (peer.host == localhostPeer || peer.hasRecentActivity)
                 }
                 // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
                 return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
