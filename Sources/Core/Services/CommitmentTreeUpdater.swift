@@ -201,9 +201,19 @@ actor CommitmentTreeUpdater {
 
         onProgress?(0.0, "Checking for boost data...")
 
+        // FIX #526: Validate cached manifest before using it
+        // If manifest is stale (old height from 2025-12-29), delete it to force re-download
+        _ = await validateAndFixCachedManifest()
+
         // Check for valid cached boost file first
         let cachedManifest = loadCachedManifest()
         if let cachedManifest = cachedManifest {
+            // FIX #526: Log what we have in cache
+            print("🔧 FIX #526: Checking cached manifest:")
+            print("   Height: \(cachedManifest.chain_height)")
+            print("   Outputs: \(cachedManifest.output_count)")
+            print("   Created: \(cachedManifest.created_at)")
+
             let activePath = getActiveBoostPath(for: cachedManifest)
             let expectedSize = cachedManifest.isThreePartFormat
                 ? cachedManifest.files.core?.size ?? cachedManifest.files.uncompressed.size
@@ -219,6 +229,11 @@ actor CommitmentTreeUpdater {
                     // Only fetch remote manifest if cache is valid - compare heights
                     onProgress?(0.02, "Checking for updates...")
                     if let remoteManifest = try? await fetchRemoteManifest() {
+                        // FIX #526: Log comparison
+                        print("🔧 FIX #526: Remote vs Cached comparison:")
+                        print("   Remote height: \(remoteManifest.chain_height)")
+                        print("   Cached height: \(cachedManifest.chain_height)")
+
                         if remoteManifest.chain_height > cachedManifest.chain_height {
                             // Remote has newer version - download it
                             print("🚀 FIX #178: Remote boost file is NEWER (remote=\(remoteManifest.chain_height) > cached=\(cachedManifest.chain_height)) - downloading update...")
@@ -241,7 +256,19 @@ actor CommitmentTreeUpdater {
 
         // Must download from GitHub (no valid cache OR remote has newer version)
         onProgress?(0.05, "Fetching manifest from GitHub...")
+
+        // FIX #526: Clear cached release info to ensure we get fresh data
+        cachedReleaseInfo = nil
+        print("🔧 FIX #526: Cleared cached release info for fresh fetch")
+
         let remoteManifest = try await fetchRemoteManifest()
+
+        // FIX #526: Log what we got from remote
+        print("🔧 FIX #526: Fetched remote manifest from GitHub:")
+        print("   Height: \(remoteManifest.chain_height)")
+        print("   Outputs: \(remoteManifest.output_count)")
+        print("   Created: \(remoteManifest.created_at)")
+        print("   Tree root: \(remoteManifest.tree_root.prefix(16))...")
 
         let activePath = getActiveBoostPath(for: remoteManifest)
         let isThreePart = remoteManifest.isThreePartFormat
@@ -640,7 +667,43 @@ actor CommitmentTreeUpdater {
             try FileManager.default.removeItem(at: boostCacheDirectory)
             try FileManager.default.createDirectory(at: boostCacheDirectory, withIntermediateDirectories: true)
         }
-        print("🧹 Boost cache cleared (reset for fresh download)")
+    }
+
+    // FIX #526: Validate cached manifest and auto-fix if stale
+    /// Checks if cached manifest matches the expected boost file data
+    /// If manifest is stale (height mismatch), deletes it to force re-download
+    func validateAndFixCachedManifest() async -> Bool {
+        guard let manifest = loadCachedManifest() else {
+            // No manifest - need to download
+            return false
+        }
+
+        // Check against GitHub for latest
+        do {
+            // Clear cache to get fresh data
+            cachedReleaseInfo = nil
+
+            let remoteManifest = try await fetchRemoteManifest()
+
+            print("🔧 FIX #526: Manifest validation:")
+            print("   Cached height: \(manifest.chain_height)")
+            print("   Remote height: \(remoteManifest.chain_height)")
+
+            if remoteManifest.chain_height > manifest.chain_height {
+                // Cached manifest is STALE - delete it to force re-download
+                print("⚠️ FIX #526: Cached manifest is STALE - deleting to force re-download")
+                try? FileManager.default.removeItem(at: cachedManifestPath)
+                print("✅ FIX #526: Deleted stale manifest file")
+                return false  // No valid cache after deletion
+            }
+
+            print("✅ FIX #526: Cached manifest is up-to-date")
+            return true  // Cache is valid
+        } catch {
+            print("⚠️ FIX #526: Could not validate manifest against GitHub: \(error.localizedDescription)")
+            // If we can't reach GitHub, assume cached is OK
+            return true
+        }
     }
 
     /// Completely delete the boost cache directory (used when deleting wallet)
@@ -907,6 +970,10 @@ actor CommitmentTreeUpdater {
     }
 
     private func fetchRemoteManifest() async throws -> BoostManifest {
+        // FIX #526: Clear cached release info to ensure we get fresh data from GitHub
+        // Without this, we might get old manifest data from a cached release
+        cachedReleaseInfo = nil
+
         // FIX #194: Retry on transient GitHub errors (502, 503, 504)
         let maxRetries = 3
         var lastError: Error?
@@ -1014,9 +1081,45 @@ actor CommitmentTreeUpdater {
         }
     }
 
+    // FIX #526: Ensure manifest is saved with correct data
+    // The manifest file is critical for CMU extraction and validation
+    // If this file has stale data, witness creation will fail
     private func saveManifest(_ manifest: BoostManifest) throws {
+        // DEBUG: Log what we're about to save
+        print("🔧 FIX #526: Saving manifest with:")
+        print("   Height: \(manifest.chain_height)")
+        print("   Outputs: \(manifest.output_count)")
+        print("   Created: \(manifest.created_at)")
+        print("   Tree root: \(manifest.tree_root.prefix(16))...")
+        print("   Path: \(cachedManifestPath.path)")
+
         let data = try JSONEncoder().encode(manifest)
-        try data.write(to: cachedManifestPath)
+        print("🔧 FIX #526: Encoded manifest size: \(data.count) bytes")
+
+        // Ensure directory exists
+        let directory = cachedManifestPath.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        // Write atomically to prevent corruption
+        try data.write(to: cachedManifestPath, options: .atomic)
+
+        // Verify the write by reading back
+        if let savedData = try? Data(contentsOf: cachedManifestPath),
+           let savedManifest = try? JSONDecoder().decode(BoostManifest.self, from: savedData) {
+            print("🔧 FIX #526: Verified saved manifest:")
+            print("   Height: \(savedManifest.chain_height)")
+            print("   Outputs: \(savedManifest.output_count)")
+            if savedManifest.chain_height == manifest.chain_height &&
+               savedManifest.output_count == manifest.output_count {
+                print("✅ FIX #526: Manifest saved and verified successfully")
+            } else {
+                print("⚠️ FIX #526: WARNING - Saved manifest doesn't match expected!")
+            }
+        } else {
+            print("❌ FIX #526: ERROR - Failed to verify saved manifest!")
+        }
     }
 
     private func downloadBoostFile(manifest: BoostManifest, onProgress: ((Double) -> Void)?) async throws {
