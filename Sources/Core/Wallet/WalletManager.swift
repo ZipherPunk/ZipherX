@@ -4438,6 +4438,39 @@ final class WalletManager: ObservableObject {
         }
         onProgress("verify", "Notes verified", 1.0)
 
+        // FIX #527: CRITICAL - Validate CMU tree root before allowing send
+        // If tree root doesn't match blockchain, all witnesses are invalid
+        // Sending with invalid witnesses = wasted proof + guaranteed rejection
+        onProgress("verify", "Validating commitment tree...", 0.5)
+        let treeValid = await validateCMUTreeBeforeSend()
+        if !treeValid.isValid {
+            // Tree root MISMATCH - block send with clear error
+            throw WalletError.transactionFailed("""
+                🚨 CRITICAL SECURITY ISSUE
+
+                Your commitment tree state does NOT match the blockchain!
+
+                This means your wallet's internal tree is corrupted or out of sync.
+                If you try to send, your transaction will be REJECTED by the network.
+
+                Details:
+                • Our tree root:  \(treeValid.ourRoot)
+                • Blockchain root: \(treeValid.headerRoot)
+
+                🔧 REQUIRED FIX:
+                Go to Settings → Database Repair → Full Rescan
+
+                This will rebuild your commitment tree from the verified blockchain data.
+
+                Your funds are SAFE - this is just a data sync issue.
+                The Full Rescan will fix the tree and restore normal operation.
+
+                "Never send with an invalid tree - it's guaranteed to fail."
+                — ZipherX Security Protocol
+                """)
+        }
+        onProgress("verify", "Commitment tree validated", 1.0)
+
         // SECURITY: Get spending key wrapped in SecureData for automatic memory cleanup
         // The key is zeroed as soon as the transaction is built (VUL-002 mitigation)
         let secureKey = try secureStorage.retrieveSpendingKeySecure()
@@ -5520,6 +5553,74 @@ final class WalletManager: ObservableObject {
         } catch {
             print("⚠️ FIX #262: Block scan failed: \(error) - proceeding with build")
             return nil  // Don't block on scan failure
+        }
+    }
+
+    // MARK: - FIX #527: CMU Tree Validation
+
+    /// Result of CMU tree validation
+    struct CMUTreeValidationResult {
+        let isValid: Bool
+        let ourRoot: String
+        let headerRoot: String
+        let height: UInt64
+    }
+
+    /// FIX #527: Validate CMU tree root matches blockchain before allowing sends
+    /// This prevents sending with invalid witnesses that will be rejected
+    /// - Returns: Validation result with details
+    private func validateCMUTreeBeforeSend() async -> CMUTreeValidationResult {
+        // Get our current tree root from FFI
+        guard let ourTreeRoot = ZipherXFFI.treeRoot() else {
+            print("⚠️ FIX #527: Could not get FFI tree root - allowing send (might fail)")
+            return CMUTreeValidationResult(isValid: true, ourRoot: "unavailable", headerRoot: "unavailable", height: 0)
+        }
+
+        let ourRootHex = ourTreeRoot.hexString
+        print("🔧 FIX #527: Our tree root: \(ourRootHex.prefix(16))...")
+
+        // Get last scanned height
+        let lastScanned: UInt64
+        do {
+            lastScanned = try await WalletDatabase.shared.getLastScannedHeight()
+        } catch {
+            print("⚠️ FIX #527: Could not get last scanned height - allowing send")
+            return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: "unknown", height: 0)
+        }
+
+        guard lastScanned > 0 else {
+            print("⚠️ FIX #527: No scanned height - allowing send (new wallet?)")
+            return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: "unknown", height: 0)
+        }
+
+        // Get header at last scanned height
+        do {
+            let headerStore = HeaderStore.shared
+            try headerStore.open()
+
+            guard let header = try headerStore.getHeader(at: lastScanned) else {
+                print("⚠️ FIX #527: No header at height \(lastScanned) - allowing send")
+                return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: "no_header", height: lastScanned)
+            }
+
+            let headerRoot = header.hashFinalSaplingRoot.hexString
+            print("🔧 FIX #527: Header tree root at \(lastScanned): \(headerRoot.prefix(16))...")
+
+            // Compare roots
+            if ourRootHex == headerRoot {
+                print("✅ FIX #527: Tree roots match - safe to send")
+                return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: headerRoot, height: lastScanned)
+            } else {
+                print("❌ FIX #527: TREE ROOT MISMATCH - BLOCKING SEND")
+                print("   Our root:    \(ourRootHex)")
+                print("   Header root: \(headerRoot)")
+                print("   Height:      \(lastScanned)")
+                return CMUTreeValidationResult(isValid: false, ourRoot: ourRootHex, headerRoot: headerRoot, height: lastScanned)
+            }
+
+        } catch {
+            print("⚠️ FIX #527: Header validation error: \(error) - allowing send")
+            return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: "error", height: lastScanned)
         }
     }
 
