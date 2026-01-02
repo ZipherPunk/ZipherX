@@ -1353,7 +1353,9 @@ final class HeaderSyncManager {
 
                     // Ban this peer for providing wrong fork data
                     print("🚫 FIX #535: Banning peer \(peerHost) for providing wrong fork data")
-                    networkManager.banPeerForSybilAttack(peerHost)
+                    Task { @MainActor in
+                        networkManager.banPeerForSybilAttack(peerHost)
+                    }
 
                     throw SyncError.wrongFork(
                         height: header.height,

@@ -6930,6 +6930,7 @@ final class WalletManager: ObservableObject {
                     let blockHash = Data(hash2)
 
                     // 4. Create ZclassicBlockHeader for storage (includes solution!)
+                    // FIX #535: Chainwork will be computed by HeaderStore.insertHeader()
                     let zclHeader = ZclassicBlockHeader(
                         version: UInt32(header.version),
                         hashPrevBlock: header.prevBlockHash,
@@ -6940,7 +6941,8 @@ final class WalletManager: ObservableObject {
                         nonce: header.nonce,
                         solution: header.solution,  // Store solution for later verification!
                         height: height,
-                        blockHash: blockHash
+                        blockHash: blockHash,
+                        chainwork: Data(count: 32)  // FIX #535: Will be computed by HeaderStore
                     )
                     headersForStorage.append(zclHeader)
                 }

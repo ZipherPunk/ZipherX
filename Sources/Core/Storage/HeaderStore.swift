@@ -128,11 +128,11 @@ final class HeaderStore {
     /// where target is derived from bits (compact representation of difficulty)
     private func computeChainWork(for header: ZclassicBlockHeader) throws -> Data {
         // Get previous header's chainwork
-        var previousChainWork = Data(count: 32, repeatedValue: 0)  // Zero for genesis
+        var previousChainWork = Data(count: 32)  // Zero for genesis
 
         if header.height > 0 {
             if let prevHeader = try? getHeader(at: header.height - 1) {
-                previousChainWork = prevHeader.chainwork ?? Data(count: 32, repeatedValue: 0)
+                previousChainWork = prevHeader.chainwork.isEmpty ? Data(count: 32) : prevHeader.chainwork
             }
         }
 
@@ -149,11 +149,11 @@ final class HeaderStore {
         // Convert bits to target: target = (bits & 0x007FFFFF) * 256^((0x00FFFFFF - bits) >> 24)
         let exponent = UInt32((0x00FFFFFF - bits) >> 24)
         let mantissa = bits & 0x007FFFFF
-        var target: UInt64 = mantissa
+        var target: UInt64 = UInt64(mantissa)
         if exponent <= 3 {
-            target >>= UInt32(8 * (3 - exponent))
+            target >>= UInt64(8 * (3 - Int(exponent)))
         } else {
-            target <<= UInt32(8 * (exponent - 3))
+            target <<= UInt64(8 * (Int(exponent) - 3))
         }
 
         // work = 2^256 / (target + 1)
