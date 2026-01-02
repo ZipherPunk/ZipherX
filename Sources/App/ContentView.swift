@@ -229,6 +229,51 @@ struct ContentView: View {
                                 print("⚡ FIX #168: INSTANT START - checkpoint valid (gap=\(checkpointGap))")
                                 print("⚡ FIX #408: HeaderStore healthy (within \(headersBehind) blocks)")
 
+                                // FIX #530: CRITICAL - Initialize tree from boost file before health checks
+                                // Without this, FFI tree state is corrupted from previous session
+                                // This causes DeltaCMU manager to clear its bundle (tree root mismatch)
+                                print("🌳 FIX #530: Initializing tree from boost file...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Initializing commitment tree...")
+                                }
+
+                                do {
+                                    // Extract and deserialize tree from cached boost file
+                                    let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
+                                    if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                                        let treeSize = ZipherXFFI.treeSize()
+                                        print("🌳 FIX #530: Tree deserialized: \(treeSize) commitments from boost file")
+
+                                        // Load delta CMUs on top if available
+                                        if let manifest = DeltaCMUManager.shared.getManifest(),
+                                           manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
+                                            print("📦 FIX #530: Loading delta CMUs from height \(ZipherXConstants.effectiveTreeHeight + 1) to \(manifest.endHeight)...")
+                                            if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                                                startHeight: ZipherXConstants.effectiveTreeHeight + 1,
+                                                endHeight: manifest.endHeight
+                                            ) {
+                                                var appendedCount = 0
+                                                for cmu in deltaCMUs {
+                                                    let position = ZipherXFFI.treeAppend(cmu: cmu)
+                                                    if position > 0 {
+                                                        appendedCount += 1
+                                                    }
+                                                }
+                                                print("📦 FIX #530: Appended \(appendedCount) delta CMUs to tree")
+
+                                                let newTreeSize = ZipherXFFI.treeSize()
+                                                print("🌳 FIX #530: Tree size after delta: \(newTreeSize) commitments")
+                                            }
+                                        }
+                                    } else {
+                                        print("⚠️ FIX #530: Failed to deserialize tree - will initialize fresh")
+                                        _ = ZipherXFFI.treeInit()
+                                    }
+                                } catch {
+                                    print("⚠️ FIX #530: Failed to extract tree: \(error.localizedDescription) - initializing fresh")
+                                    _ = ZipherXFFI.treeInit()
+                                }
+
                                 // FIX #409: Run QUICK health check before showing UI
                                 // User expects wallet state to be validated at startup
                                 print("🏥 FIX #409: Running quick health check before INSTANT START...")
