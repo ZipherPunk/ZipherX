@@ -244,6 +244,50 @@ struct ContentView: View {
                                         let treeSize = ZipherXFFI.treeSize()
                                         print("🌳 FIX #530: Tree deserialized: \(treeSize) commitments from boost file")
 
+                                        // FIX #534: CRITICAL - Validate tree root after deserialization
+                                        // The Python serialization might be incompatible with Rust deserialization
+                                        // If tree root doesn't match manifest, fall back to building from CMUs
+                                        if let manifest = CommitmentTreeUpdater.shared.loadCachedManifest(),
+                                           let deserializedRoot = ZipherXFFI.treeRoot() {
+                                            let expectedRoot = manifest.tree_root
+                                            let actualRoot = deserializedRoot.hexString
+
+                                            if actualRoot != expectedRoot {
+                                                print("❌ FIX #534: Tree root MISMATCH after deserialization!")
+                                                print("   Expected: \(expectedRoot)")
+                                                print("   Actual:   \(actualRoot)")
+                                                print("🔄 FIX #534: Falling back to building tree from CMUs...")
+
+                                                // Reset and build from CMUs instead
+                                                _ = ZipherXFFI.treeInit()
+
+                                                // Load CMUs from legacy cache and build tree
+                                                if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                                                   let cmuData = try? Data(contentsOf: cmuPath) {
+                                                    if ZipherXFFI.treeLoadFromCMUs(data: cmuData) {
+                                                        let rebuiltSize = ZipherXFFI.treeSize()
+                                                        print("✅ FIX #534: Rebuilt tree from CMUs: \(rebuiltSize) commitments")
+
+                                                        // Verify the rebuilt tree root
+                                                        if let rebuiltRoot = ZipherXFFI.treeRoot() {
+                                                            let rebuiltRootHex = rebuiltRoot.hexString
+                                                            print("🔍 FIX #534: Rebuilt tree root: \(rebuiltRootHex)")
+
+                                                            if rebuiltRootHex == expectedRoot {
+                                                                print("✅ FIX #534: Tree root MATCHES manifest - CMU build successful!")
+                                                            } else {
+                                                                print("⚠️ FIX #534: Tree root still MISMATCH - CMU file may be corrupted")
+                                                            }
+                                                        }
+                                                    } else {
+                                                        print("❌ FIX #534: Failed to build tree from CMUs")
+                                                    }
+                                                }
+                                            } else {
+                                                print("✅ FIX #534: Tree root validation PASSED - deserialization is correct")
+                                            }
+                                        }
+
                                         // Load delta CMUs on top if available
                                         if let manifest = DeltaCMUManager.shared.getManifest(),
                                            manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
