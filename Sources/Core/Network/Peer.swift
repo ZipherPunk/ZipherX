@@ -1185,20 +1185,33 @@ public final class Peer {
     }
 
     /// Stop listening for block announcements
-    /// FIX #509 v2: Quick stop - set flag and cancel, don't wait for task to finish
-    /// Race condition prevented by stopping listeners BEFORE header sync starts
+    /// FIX #509 v3: Wait for task to finish and release messageLock before returning
+    /// This prevents race condition where header sync tries to acquire messageLock while listener holds it
     func stopBlockListener() async {
         listenerLock.lock()
-        _isListening = false  // Set flag first (checked by receiveMessageNonBlockingTolerant)
+        _isListening = false  // Set flag first (checked by listener loop)
         let task = blockListenerTask
         blockListenerTask = nil
         listenerLock.unlock()
 
-        // Cancel the task (don't wait for it to finish)
-        // The task will exit on its next loop iteration because _isListening = false
+        // Cancel the task and wait for it to finish
+        // CRITICAL: We must wait because the task might be holding messageLock
         task?.cancel()
 
-        print("📡 [\(host)] Block listener stopped")
+        // Wait for task to finish and release messageLock
+        // The task holds messageLock during receive operations, so we must wait
+        if let task = task {
+            do {
+                // Await the task value (will return when task finishes or is cancelled)
+                _ = await task.value
+            } catch is CancellationError {
+                // Expected - task was cancelled
+            } catch {
+                // Other errors - ignore, task is being stopped anyway
+            }
+        }
+
+        print("📡 [\(host)] Block listener stopped and messageLock released")
     }
 
     /// Receive message without blocking indefinitely (uses short timeout)
@@ -1238,7 +1251,9 @@ public final class Peer {
             throw NetworkError.notConnected
         }
 
-        // Use a short timeout to periodically check if we should stop
+        // FIX #529: Use very short timeout (100ms) to prevent holding messageLock too long
+        // The block listener acquires messageLock before calling this function
+        // If timeout is too long, header sync will timeout trying to acquire messageLock
         return try await withThrowingTaskGroup(of: (String, Data).self) { group in
             group.addTask {
                 // FIX #120: Check cancellation before blocking on receive
@@ -1247,9 +1262,9 @@ public final class Peer {
             }
 
             group.addTask {
-                // FIX #120: Reduced from 5s to 1s to allow faster listener shutdown
-                // This is the maximum time stopBlockListener() will wait before listener exits
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+                // FIX #529: Reduced from 1s to 100ms to prevent blocking header sync
+                // This allows header sync to acquire messageLock quickly when needed
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 throw NetworkError.timeout
             }
 
