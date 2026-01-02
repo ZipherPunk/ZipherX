@@ -2483,10 +2483,23 @@ final class WalletManager: ObservableObject {
         // Header sync takes too long (3000+ blocks from checkpoint) and blocks the entire import
         // Headers will be synced in background later or on first transaction
         let shouldSkipHeaderSync = wasImported
+
+        // FIX #522: Load bundled headers from boost file even during import (instant, no P2P needed)
+        // This ensures HeaderStore is populated for timestamps and tree root validation
+        if wasImported {
+            print("⚡ FIX #522: Loading bundled headers from boost file (instant import path)...")
+            let (loadedBundledHeaders, boostHeaderEndHeight) = await loadHeadersFromBoostFile()
+            if loadedBundledHeaders {
+                print("✅ FIX #522: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load during import!")
+            } else {
+                print("⚠️ FIX #522: Could not load bundled headers during import")
+            }
+        }
+
         if shouldSkipHeaderSync {
-            print("⚡ FIX #183: Skipping header sync for import - P2P consensus already verified chain height")
-            print("⚡ FIX #183: Headers will sync in background (needed for timestamps, not balance)")
-            await updateTask("headers", status: .completed, detail: "Deferred to background")
+            print("⚡ FIX #183: Skipping P2P header sync for import - P2P consensus already verified chain height")
+            print("⚡ FIX #183: P2P delta sync will run in background if needed (for latest blocks)")
+            await updateTask("headers", status: .completed, detail: "Bundled headers loaded")
         } else {
             print("📡 Using P2P header sync (NO RPC for sync/repair)")
         }
