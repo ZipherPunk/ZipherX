@@ -261,10 +261,29 @@ struct ContentView: View {
                                                 // Reset and build from CMUs instead
                                                 _ = ZipherXFFI.treeInit()
 
-                                                // Load CMUs from legacy cache and build tree
+                                                // First, try to load from legacy cache
+                                                var cmuData: Data?
+                                                var cmuLoaded = false
+
                                                 if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                                                   let cmuData = try? Data(contentsOf: cmuPath) {
-                                                    if ZipherXFFI.treeLoadFromCMUs(data: cmuData) {
+                                                   FileManager.default.fileExists(atPath: cmuPath.path) {
+                                                    cmuData = try? Data(contentsOf: cmuPath)
+                                                }
+
+                                                // If CMU file doesn't exist or failed to load, extract from boost file
+                                                if cmuData == nil {
+                                                    print("🔧 FIX #534: CMU cache not found - extracting from boost file...")
+                                                    do {
+                                                        cmuData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat()
+                                                        print("✅ FIX #534: Extracted CMUs from boost file: \(cmuData!.count) bytes")
+                                                    } catch {
+                                                        print("❌ FIX #534: Failed to extract CMUs from boost file: \(error)")
+                                                    }
+                                                }
+
+                                                // Build tree from CMUs
+                                                if let data = cmuData {
+                                                    if ZipherXFFI.treeLoadFromCMUs(data: data) {
                                                         let rebuiltSize = ZipherXFFI.treeSize()
                                                         print("✅ FIX #534: Rebuilt tree from CMUs: \(rebuiltSize) commitments")
 
@@ -276,12 +295,19 @@ struct ContentView: View {
                                                             if rebuiltRootHex == expectedRoot {
                                                                 print("✅ FIX #534: Tree root MATCHES manifest - CMU build successful!")
                                                             } else {
-                                                                print("⚠️ FIX #534: Tree root still MISMATCH - CMU file may be corrupted")
+                                                                print("⚠️ FIX #534: Tree root still MISMATCH - deleting corrupted cache")
+                                                                // Delete corrupted cache so it will be regenerated
+                                                                if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                                                                    try? FileManager.default.removeItem(at: cmuPath)
+                                                                    print("🗑️ FIX #534: Deleted corrupted CMU cache - will regenerate on next restart")
+                                                                }
                                                             }
                                                         }
                                                     } else {
                                                         print("❌ FIX #534: Failed to build tree from CMUs")
                                                     }
+                                                } else {
+                                                    print("❌ FIX #534: No CMU data available - tree will be empty")
                                                 }
                                             } else {
                                                 print("✅ FIX #534: Tree root validation PASSED - deserialization is correct")
