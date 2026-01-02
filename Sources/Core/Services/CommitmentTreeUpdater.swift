@@ -368,6 +368,12 @@ actor CommitmentTreeUpdater {
             throw BoostFileError.sectionNotFound("outputs")
         }
 
+        print("🔍 CMU EXTRACTION DEBUG: Found outputs section in manifest:")
+        print("   type: \(outputSection.type)")
+        print("   count: \(outputSection.count) (0x\(String(outputSection.count, radix: 16)))")
+        print("   size: \(outputSection.size)")
+        print("   offset: \(outputSection.offset)")
+
         let activePath = getActiveBoostPath(for: manifest)
         guard FileManager.default.fileExists(atPath: activePath.path) else {
             throw BoostFileError.fileNotFound
@@ -385,15 +391,21 @@ actor CommitmentTreeUpdater {
 
         let outputCount = outputSection.count
         print("🔄 Extracting \(outputCount) CMUs in legacy format...")
+        print("🔍 CMU EXTRACTION DEBUG: outputSection.count = \(outputCount) (0x\(String(outputCount, radix: 16)))")
 
         // Allocate result buffer: 8 bytes for count + 32 bytes per CMU
         var result = Data(count: 8 + Int(outputCount) * 32)
 
         // Write count as UInt64 LE
         var count = outputCount
+        print("🔍 CMU EXTRACTION DEBUG: count var = \(count) (0x\(String(count, radix: 16)))")
+
         withUnsafeBytes(of: &count) { bytes in
+            print("🔍 CMU EXTRACTION DEBUG: bytes to write: \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
             result.replaceSubrange(0..<8, with: bytes)
         }
+
+        print("🔍 CMU EXTRACTION DEBUG: result first 8 bytes: \(result.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))")
 
         // Read and extract CMUs
         let fileHandle = try FileHandle(forReadingFrom: activePath)
