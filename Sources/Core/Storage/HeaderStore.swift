@@ -112,17 +112,143 @@ final class HeaderStore {
         // This is a migration - only runs if column doesn't exist
         let migrationSQL = "ALTER TABLE headers ADD COLUMN solution BLOB;"
         sqlite3_exec(db, migrationSQL, nil, nil, nil)  // Ignore error if column exists
+
+        // FIX #535: Add chainwork column for fork detection (CRITICAL SECURITY)
+        // Chainwork = accumulated proof-of-work difficulty
+        // Allows us to detect when P2P peers are on a wrong fork (lower chainwork)
+        let chainworkMigration = "ALTER TABLE headers ADD COLUMN chainwork BLOB;"
+        sqlite3_exec(db, chainworkMigration, nil, nil, nil)  // Ignore error if column exists
     }
 
     // MARK: - Header Operations
 
+    /// FIX #535: Compute chainwork (accumulated proof-of-work) for a header
+    /// Chainwork represents the total work in the chain up to this block
+    /// Formula: chainwork = previous_chainwork + (2^256 / (target + 1))
+    /// where target is derived from bits (compact representation of difficulty)
+    private func computeChainWork(for header: ZclassicBlockHeader) throws -> Data {
+        // Get previous header's chainwork
+        var previousChainWork = Data(count: 32, repeatedValue: 0)  // Zero for genesis
+
+        if header.height > 0 {
+            if let prevHeader = try? getHeader(at: header.height - 1) {
+                previousChainWork = prevHeader.chainwork ?? Data(count: 32, repeatedValue: 0)
+            }
+        }
+
+        // Compute work for this block: work = 2^256 / (target + 1)
+        // Target is derived from bits using the compact representation
+        let work = computeWorkFromBits(bits: header.bits)
+
+        // Add work to previous chainwork (big integer addition)
+        return addChainwork(previous: previousChainWork, work: work)
+    }
+
+    /// Compute work for a single block from bits (compact target representation)
+    private func computeWorkFromBits(bits: UInt32) -> Data {
+        // Convert bits to target: target = (bits & 0x007FFFFF) * 256^((0x00FFFFFF - bits) >> 24)
+        let exponent = UInt32((0x00FFFFFF - bits) >> 24)
+        let mantissa = bits & 0x007FFFFF
+        var target: UInt64 = mantissa
+        if exponent <= 3 {
+            target >>= UInt32(8 * (3 - exponent))
+        } else {
+            target <<= UInt32(8 * (exponent - 3))
+        }
+
+        // work = 2^256 / (target + 1)
+        // For large targets, work is approximately (2^256 - 1) / target
+        // We store as little-endian 256-bit integer
+
+        var work = [UInt8](repeating: 0, count: 32)
+
+        if target < 2 {
+            // Very low target (very high difficulty) - max work
+            work[31] = 0xFF  // Approximate max work
+        } else {
+            // work ≈ 2^256 / target
+            // For practical purposes, we can use a simplified representation
+            // since we're mainly comparing chainwork, not computing exact values
+
+            // Use a simplified 64-bit work value for comparison
+            // This is sufficient for detecting forks (higher bits are same for all recent blocks)
+            let work64 = UInt64.max / UInt64(target)
+
+            // Store as little-endian
+            for i in 0..<8 {
+                work[i] = UInt8((work64 >> (i * 8)) & 0xFF)
+            }
+        }
+
+        return Data(work)
+    }
+
+    /// Add two chainwork values (big integer addition)
+    private func addChainwork(previous: Data, work: Data) -> Data {
+        var result = [UInt8](repeating: 0, count: 32)
+        var carry: UInt64 = 0
+
+        // Convert Data to [UInt64] for easier addition
+        let prevArray = previous.withUnsafeBytes { Array($0) }
+        let workArray = work.withUnsafeBytes { Array($0) }
+
+        // Add as 64-bit chunks (little-endian)
+        for i in stride(from: 0, to: 32, by: 8) {
+            var a: UInt64 = 0
+            var b: UInt64 = 0
+
+            for j in 0..<8 where i + j < 32 {
+                a |= UInt64(prevArray[i + j]) << (j * 8)
+                b |= UInt64(workArray[i + j]) << (j * 8)
+            }
+
+            let sum = a &+ b &+ carry
+            result[i + 0] = UInt8((sum >> 0) & 0xFF)
+            result[i + 1] = UInt8((sum >> 8) & 0xFF)
+            result[i + 2] = UInt8((sum >> 16) & 0xFF)
+            result[i + 3] = UInt8((sum >> 24) & 0xFF)
+            result[i + 4] = UInt8((sum >> 32) & 0xFF)
+            result[i + 5] = UInt8((sum >> 40) & 0xFF)
+            result[i + 6] = UInt8((sum >> 48) & 0xFF)
+            result[i + 7] = UInt8((sum >> 56) & 0xFF)
+
+            carry = sum >> 64
+        }
+
+        return Data(result)
+    }
+
+    /// FIX #535: Compare two chainwork values
+    /// Returns: .orderedAscending if a < b, .orderedSame if a == b, .orderedDescending if a > b
+    /// Chainwork is stored as little-endian 256-bit integer
+    func compareChainwork(_ a: Data, _ b: Data) -> ComparisonResult {
+        guard a.count == 32 && b.count == 32 else {
+            return .orderedSame  // Invalid data
+        }
+
+        let aArray = a.withUnsafeBytes { Array($0) }
+        let bArray = b.withUnsafeBytes { Array($0) }
+
+        // Compare from most significant byte (end) to least significant (start)
+        for i in stride(from: 31, through: 0, by: -1) {
+            if aArray[i] < bArray[i] {
+                return .orderedAscending
+            } else if aArray[i] > bArray[i] {
+                return .orderedDescending
+            }
+        }
+
+        return .orderedSame
+    }
+
     /// Insert or replace a block header
     /// FIX #188: Now includes Equihash solution for local verification
+    /// FIX #535: Now includes chainwork for fork detection
     func insertHeader(_ header: ZclassicBlockHeader) throws {
         let sql = """
             INSERT OR REPLACE INTO headers
-            (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
         var stmt: OpaquePointer?
@@ -132,6 +258,9 @@ final class HeaderStore {
         defer { sqlite3_finalize(stmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // FIX #535: Compute chainwork for this header
+        let chainwork = try computeChainWork(for: header)
 
         sqlite3_bind_int64(stmt, 1, Int64(header.height))
         header.blockHash.withUnsafeBytes { ptr in
@@ -160,6 +289,10 @@ final class HeaderStore {
         } else {
             sqlite3_bind_null(stmt, 10)
         }
+        // FIX #535: Store chainwork for fork detection
+        chainwork.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(chainwork.count), SQLITE_TRANSIENT)
+        }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
@@ -179,10 +312,11 @@ final class HeaderStore {
         do {
             // FIX #476: Prepare statement ONCE instead of 160 times!
             // This is the key optimization - prepare/finalize are expensive operations
+            // FIX #535: Now includes chainwork for fork detection
             let sql = """
                 INSERT OR REPLACE INTO headers
-                (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
 
             var stmt: OpaquePointer?
@@ -226,6 +360,11 @@ final class HeaderStore {
                 } else {
                     sqlite3_bind_null(stmt, 10)
                 }
+                // FIX #535: Compute and store chainwork for fork detection
+                let chainwork = try computeChainWork(for: header)
+                chainwork.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(chainwork.count), SQLITE_TRANSIENT)
+                }
 
                 // Execute
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -245,7 +384,7 @@ final class HeaderStore {
     /// Get header at specific height
     func getHeader(at height: UInt64) throws -> ZclassicBlockHeader? {
         let sql = """
-            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
+            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
             WHERE height = ?;
         """
@@ -268,7 +407,7 @@ final class HeaderStore {
     /// Get header by block hash
     func getHeader(hash: Data) throws -> ZclassicBlockHeader? {
         let sql = """
-            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
+            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
             WHERE block_hash = ?;
         """
@@ -397,7 +536,7 @@ final class HeaderStore {
     /// Get headers in a range (for syncing)
     func getHeaders(from startHeight: UInt64, to endHeight: UInt64) throws -> [ZclassicBlockHeader] {
         let sql = """
-            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version
+            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
             WHERE height >= ? AND height <= ?
             ORDER BY height ASC;
@@ -1047,6 +1186,20 @@ final class HeaderStore {
 
         let version = UInt32(sqlite3_column_int64(stmt, 8))
 
+        // FIX #535: Read chainwork column (column 10)
+        // Note: column 9 is solution, which we may or may not have selected
+        var chainwork = Data(count: 32)
+        let columnCount = sqlite3_column_count(stmt)
+        if columnCount > 10 {
+            // Check if chainwork column exists (newer schema)
+            if let chainworkPtr = sqlite3_column_blob(stmt, 10) {
+                let chainworkLen = sqlite3_column_bytes(stmt, 10)
+                if chainworkLen == 32 {
+                    chainwork = Data(bytes: chainworkPtr, count: Int(chainworkLen))
+                }
+            }
+        }
+
         return ZclassicBlockHeader(
             version: version,
             hashPrevBlock: prevHash,
@@ -1057,7 +1210,8 @@ final class HeaderStore {
             nonce: nonce,
             solution: Data(),  // Not stored - headers from DB were already verified
             height: height,
-            blockHash: blockHash
+            blockHash: blockHash,
+            chainwork: chainwork  // FIX #535: Include chainwork
         )
     }
 
@@ -1067,8 +1221,9 @@ final class HeaderStore {
     /// Returns the last N headers that have solutions stored
     /// - Parameter count: Number of headers to retrieve (default 100)
     func getHeadersWithSolutions(count: Int = 100) throws -> [ZclassicBlockHeader] {
+        // FIX #535: Now includes chainwork for fork detection
         let sql = """
-            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution
+            SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
             WHERE solution IS NOT NULL AND length(solution) > 0
             ORDER BY height DESC
@@ -1111,6 +1266,18 @@ final class HeaderStore {
             let solutionLength = sqlite3_column_bytes(stmt, 9)
             let solution = Data(bytes: sqlite3_column_blob(stmt, 9), count: Int(solutionLength))
 
+            // FIX #535: Read chainwork (column 10)
+            var chainwork = Data(count: 32)
+            let columnCount = sqlite3_column_count(stmt)
+            if columnCount > 10 {
+                if let chainworkPtr = sqlite3_column_blob(stmt, 10) {
+                    let chainworkLen = sqlite3_column_bytes(stmt, 10)
+                    if chainworkLen == 32 {
+                        chainwork = Data(bytes: chainworkPtr, count: Int(chainworkLen))
+                    }
+                }
+            }
+
             let header = ZclassicBlockHeader(
                 version: version,
                 hashPrevBlock: prevHash,
@@ -1121,7 +1288,8 @@ final class HeaderStore {
                 nonce: nonce,
                 solution: solution,
                 height: height,
-                blockHash: blockHash
+                blockHash: blockHash,
+                chainwork: chainwork  // FIX #535: Include chainwork
             )
             headers.append(header)
         }

@@ -22,6 +22,10 @@ struct ZclassicBlockHeader {
     let height: UInt64
     let blockHash: Data           // 32 bytes (computed from header + solution)
 
+    // FIX #535: Chainwork for fork detection (accumulated proof-of-work)
+    // This allows us to detect when P2P peers are on a wrong fork (lower chainwork)
+    let chainwork: Data           // 32 bytes - accumulated work from genesis to this block
+
     /// The Sapling anchor from zcashd's tree state
     /// This is guaranteed to match zcashd's internal computation
     var anchor: Data {
@@ -96,6 +100,8 @@ struct ZclassicBlockHeader {
         // Without solution, we can't compute the real block hash
         // Use a placeholder or zero hash
         let blockHash = Data(count: 32)
+        // FIX #535: Chainwork will be computed later by HeaderStore
+        let chainwork = Data(count: 32)
 
         return ZclassicBlockHeader(
             version: version,
@@ -107,7 +113,8 @@ struct ZclassicBlockHeader {
             nonce: nonce,
             solution: Data(),
             height: height,
-            blockHash: blockHash
+            blockHash: blockHash,
+            chainwork: chainwork
         )
     }
 
@@ -193,6 +200,9 @@ struct ZclassicBlockHeader {
             throw ParseError.hashComputationFailed
         }
 
+        // FIX #535: Chainwork will be computed later by HeaderStore
+        let chainwork = Data(count: 32)
+
         return ZclassicBlockHeader(
             version: version,
             hashPrevBlock: hashPrevBlock,
@@ -203,7 +213,8 @@ struct ZclassicBlockHeader {
             nonce: nonce,
             solution: solution,
             height: height,
-            blockHash: blockHash
+            blockHash: blockHash,
+            chainwork: chainwork
         )
     }
 

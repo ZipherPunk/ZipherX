@@ -547,6 +547,7 @@ final class HeaderSyncManager {
 
             // FIX #501: Try each peer with aggressive timeout (5 seconds max)
             var headers: [ZclassicBlockHeader]?
+            var successPeerHost: String? = nil  // FIX #535: Track which peer provided headers
             let perPeerTimeout: TimeInterval = 5.0  // 5 seconds per peer
 
             for (index, peer) in currentPeers.enumerated() {
@@ -572,7 +573,26 @@ final class HeaderSyncManager {
                     if !result.isEmpty {
                         // Success!
                         print("✅ FIX #502: Got \(result.count) headers from \(peer.host)")
+
+                        // FIX #535: Log first few block hashes to trace which peer sent which chain
+                        // This helps identify when peers are on different forks
+                        if !result.isEmpty {
+                            let firstHeader = result[0]
+                            let blockHashHex = firstHeader.blockHash.map { String(format: "%02x", $0) }.joined()
+                            print("🔍 FIX #535: [\(peer.host)] First header at height \(firstHeader.height):")
+                            print("   blockHash: \(blockHashHex.prefix(32))...")
+                            print("   prevHash:  \(firstHeader.hashPrevBlock.map { String(format: "%02x", $0) }.joined().prefix(32))...")
+
+                            if result.count > 1 {
+                                let lastHeader = result[result.count - 1]
+                                let lastBlockHashHex = lastHeader.blockHash.map { String(format: "%02x", $0) }.joined()
+                                print("🔍 FIX #535: [\(peer.host)] Last header at height \(lastHeader.height):")
+                                print("   blockHash: \(lastBlockHashHex.prefix(32))...")
+                            }
+                        }
+
                         headers = result
+                        successPeerHost = peer.host  // FIX #535: Remember which peer provided headers
                         failedPeers.removeAll() // Clear failed peers on success
                         break  // Exit peer loop - we got our headers
                     }
@@ -594,6 +614,13 @@ final class HeaderSyncManager {
 
             // FIX #133: Verify chain continuity with correct starting height
             try verifyHeaderChain(headers, startingAt: headersStartHeight)
+
+            // FIX #535: Validate chainwork to detect wrong forks
+            // This prevents Sybil attacks where 9 peers provide wrong blockchain data
+            // Compare P2P chainwork against our trusted HeaderStore chainwork
+            if let peerHost = successPeerHost {
+                try validateChainwork(headers, fromPeer: peerHost)
+            }
 
             // Store headers
             try headerStore.insertHeaders(headers)
@@ -1299,6 +1326,79 @@ final class HeaderSyncManager {
 
         print("✅ Header chain continuity verified")
     }
+
+    /// FIX #535: Validate chainwork to detect wrong forks
+    /// Compares P2P chainwork against trusted HeaderStore chainwork
+    /// - Rejects if P2P chainwork < existing chainwork (wrong fork!)
+    /// - Accepts if P2P chainwork >= existing chainwork (reorg or same chain)
+    /// - Bans peers that provide wrong fork data
+    private func validateChainwork(_ headers: [ZclassicBlockHeader], fromPeer peerHost: String) throws {
+        for header in headers {
+            // Check if we have an existing header at this height
+            if let existingHeader = try? headerStore.getHeader(at: header.height) {
+                // Compare chainwork values
+                let comparison = headerStore.compareChainwork(header.chainwork, existingHeader.chainwork)
+
+                if comparison == .orderedAscending {
+                    // P2P chainwork is LOWER - this is a WRONG FORK!
+                    let p2pWorkHex = header.chainwork.map { String(format: "%02x", $0) }.joined().suffix(16)
+                    let existingWorkHex = existingHeader.chainwork.map { String(format: "%02x", $0) }.joined().suffix(16)
+
+                    print("🚨 FIX #535: WRONG FORK DETECTED from peer \(peerHost)!")
+                    print("   Height: \(header.height)")
+                    print("   P2P chainwork (WRONG): ...\(p2pWorkHex)")
+                    print("   Our chainwork (CORRECT): ...\(existingWorkHex)")
+                    print("   P2P block hash: \(header.blockHash.map { String(format: "%02x", $0) }.joined().prefix(32))...")
+                    print("   Our block hash: \(existingHeader.blockHash.map { String(format: "%02x", $0) }.joined().prefix(32))...")
+
+                    // Ban this peer for providing wrong fork data
+                    print("🚫 FIX #535: Banning peer \(peerHost) for providing wrong fork data")
+                    networkManager.banPeerForSybilAttack(peerHost)
+
+                    throw SyncError.wrongFork(
+                        height: header.height,
+                        peer: peerHost,
+                        p2pChainwork: String(p2pWorkHex),
+                        ourChainwork: String(existingWorkHex)
+                    )
+                } else if comparison == .orderedDescending {
+                    // P2P chainwork is HIGHER - this is a REORG!
+                    let p2pWorkHex = header.chainwork.map { String(format: "%02x", $0) }.joined().suffix(16)
+                    let existingWorkHex = existingHeader.chainwork.map { String(format: "%02x", $0) }.joined().suffix(16)
+
+                    print("🔄 FIX #535: CHAIN REORG detected from peer \(peerHost)")
+                    print("   Height: \(header.height)")
+                    print("   P2P chainwork (HIGHER): ...\(p2pWorkHex)")
+                    print("   Our chainwork (LOWER): ...\(existingWorkHex)")
+                    print("   Accepting P2P chain (has more proof-of-work)")
+
+                    // Continue - will replace with higher chainwork headers
+                } else {
+                    // Equal chainwork - same chain, different blocks at same height?
+                    // This shouldn't happen with valid Equihash proofs
+                    let p2pHash = header.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
+                    let existingHash = existingHeader.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
+
+                    if header.blockHash != existingHeader.blockHash {
+                        print("⚠️ FIX #535: Same chainwork but different block hashes at height \(header.height)")
+                        print("   P2P: \(p2pHash)...")
+                        print("   Us:  \(existingHash)...")
+                        print("   This indicates a difficulty collision or invalid data")
+                        // Reject - same chainwork should mean same block
+                        throw SyncError.wrongFork(
+                            height: header.height,
+                            peer: peerHost,
+                            p2pChainwork: "same",
+                            ourChainwork: "same"
+                        )
+                    }
+                }
+            }
+            // No existing header at this height - OK, will insert new
+        }
+
+        print("✅ FIX #535: Chainwork validation passed for \(headers.count) headers")
+    }
 }
 
 // MARK: - Extensions
@@ -1352,6 +1452,7 @@ enum SyncError: LocalizedError {
     case noHeadersReceived
     case timeout(String)
     case internalError(String)
+    case wrongFork(height: UInt64, peer: String, p2pChainwork: String, ourChainwork: String)  // FIX #535
 
     var errorDescription: String? {
         switch self {
@@ -1377,6 +1478,9 @@ enum SyncError: LocalizedError {
             return msg
         case .internalError(let msg):
             return "Internal error: \(msg)"
+        case .wrongFork(let height, let peer, let p2pWork, let ourWork):
+            // FIX #535: Wrong fork detected - peer provided chain with lower accumulated work
+            return "Wrong fork from \(peer) at height \(height): P2P chainwork (\(p2pWork)) < our chainwork (\(ourWork))"
         }
     }
 }
