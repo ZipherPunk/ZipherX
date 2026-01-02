@@ -10,31 +10,24 @@
 
 use std::fs;
 use std::time::Instant;
+use zipherx_ffi::{zipherx_tree_load_from_cmus_with_progress, zipherx_tree_serialize, zipherx_tree_size, TreeLoadProgressCallback};
 
-/// Tree loading callback
-type TreeLoadCallback = extern "C" fn(current: u64, total: u64);
-
-extern "C" {
-    /// Load tree from CMUs (from FFI)
-    fn zipherx_tree_load_from_cmus_with_progress(
-        cmu_data: *const u8,
-        cmu_len: usize,
-        callback: TreeLoadCallback,
-    ) -> bool;
-
-    /// Serialize tree (from FFI)
-    fn zipherx_tree_serialize(tree_out: *mut u8, tree_out_len: *mut usize) -> bool;
-
-    /// Get tree size (from FFI)
-    fn zipherx_tree_size() -> u64;
-}
-
-extern "C" fn progress_callback(current: u64, total: u64) {
+/// Tree loading callback wrapper
+extern "C" fn progress_callback_impl(current: u64, total: u64) {
     if total > 0 {
         let percent = (current * 100) / total;
         eprintln!("📊 Progress: {}/{} CMUs ({}%)", current, total, percent);
     }
 }
+
+// Wrap the callback to match the expected type
+struct CallbackWrapper;
+impl CallbackWrapper {
+    extern "C" fn callback(current: u64, total: u64) {
+        progress_callback_impl(current, total);
+    }
+}
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -89,27 +82,27 @@ fn main() {
     eprintln!("🏗️  Building tree (this takes 30-60 seconds for 1M+ CMUs)...");
     let build_start = Instant::now();
 
-    unsafe {
-        let success = zipherx_tree_load_from_cmus_with_progress(
+    // FIX #518: Call library function directly (not through extern "C")
+    let success = unsafe {
+        zipherx_tree_load_from_cmus_with_progress(
             cmu_data.as_ptr(),
             cmu_data.len(),
-            progress_callback,
-        );
+            CallbackWrapper::callback,
+        )
+    };
 
-        if !success {
-            eprintln!("❌ Failed to build tree from CMUs");
-            std::process::exit(1);
-        }
+    if !success {
+        eprintln!("❌ Failed to build tree from CMUs");
+        std::process::exit(1);
     }
 
     let build_duration = build_start.elapsed();
     eprintln!("✅ Tree built in {:?}", build_duration);
 
     // Get tree size
-    unsafe {
-        let tree_size = zipherx_tree_size();
-        eprintln!("📏 Tree size: {} commitments", tree_size);
-    }
+    // FIX #518: Call library function directly (not through extern "C")
+    let tree_size = unsafe { zipherx_tree_size() };
+    eprintln!("📏 Tree size: {} commitments", tree_size);
 
     // Serialize tree
     eprintln!("💾 Serializing tree...");
@@ -117,22 +110,21 @@ fn main() {
     // Allocate buffer for serialization
     let mut buffer = vec![0u8; 10_000_000]; // 10MB should be enough
 
-    unsafe {
-        let mut out_len: usize = buffer.len();
+    // FIX #518: Call library function directly (not through extern "C")
+    let mut out_len: usize = buffer.len();
 
-        // First call: get required size
-        if !zipherx_tree_serialize(buffer.as_mut_ptr(), &mut out_len) {
-            eprintln!("❌ Failed to serialize tree (first call)");
-            std::process::exit(1);
-        }
+    // First call: get required size
+    if unsafe { !zipherx_tree_serialize(buffer.as_mut_ptr(), &mut out_len) } {
+        eprintln!("❌ Failed to serialize tree (first call)");
+        std::process::exit(1);
+    }
 
-        eprintln!("✅ Serialized tree size: {} bytes", out_len);
+    eprintln!("✅ Serialized tree size: {} bytes", out_len);
 
-        // Write to file
-        if let Err(e) = fs::write(output_path, &buffer[..out_len]) {
-            eprintln!("❌ Failed to write tree file: {}", e);
-            std::process::exit(1);
-        }
+    // Write to file
+    if let Err(e) = fs::write(output_path, &buffer[..out_len]) {
+        eprintln!("❌ Failed to write tree file: {}", e);
+        std::process::exit(1);
     }
 
     let total_duration = start.elapsed();

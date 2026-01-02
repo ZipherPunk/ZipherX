@@ -29,25 +29,25 @@ echo ""
 
 # FIX #203: Build all targets IN PARALLEL (4x faster!)
 echo "═══════════════════════════════════════════════════════════════"
-echo "🚀 Building LIBRARIES ONLY in PARALLEL..."
+echo "🚀 Building ALL targets (libs + binaries) in PARALLEL..."
 echo "═══════════════════════════════════════════════════════════════"
-echo "⚠️  Note: Building --lib only to avoid binary linking issues"
+echo "⚠️  Note: FIX #518 fixed binary linking, now building full package"
 
-# Start all builds in background (LIB ONLY!)
+# Start all builds in background
 echo "🔨 [1/4] macOS (arm64)..."
-cargo build --release --lib > /tmp/build_macos_arm64.log 2>&1 &
+cargo build --release > /tmp/build_macos_arm64.log 2>&1 &
 PID1=$!
 
 echo "🔨 [2/4] macOS (x86_64)..."
-cargo build --release --lib --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
+cargo build --release --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
 PID2=$!
 
 echo "🔨 [3/4] iOS Device (arm64)..."
-cargo build --release --lib --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
+cargo build --release --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
 PID3=$!
 
 echo "🔨 [4/4] iOS Simulator (arm64)..."
-cargo build --release --lib --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
+cargo build --release --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
 PID4=$!
 
 echo ""
