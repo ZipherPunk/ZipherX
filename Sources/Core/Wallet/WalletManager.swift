@@ -1876,6 +1876,9 @@ final class WalletManager: ObservableObject {
             // TransactionBuilder will get fresh witnesses from global tree using treeGetWitness()
             // This ensures ALL witnesses have SAME root (current global tree root)
 
+            // FIX #557 v39: Set initial progress to ensure UI updates immediately
+            await progress?("Preparing witness sync...", 0)
+
             // Check if global tree needs sync to chain tip
             let networkManager = NetworkManager.shared
             let chainHeight = try await networkManager.getChainHeight()
@@ -1884,6 +1887,7 @@ final class WalletManager: ObservableObject {
             if currentTreeSize >= chainHeight {
                 print("✅ FIX #557 v32: Global tree already at chain tip (\(currentTreeSize) >= \(chainHeight))")
                 print("✅ FIX #557 v32: Witnesses will be created from current tree state when sending")
+                await progress?("Witness sync complete", 100)
                 return
             }
 
