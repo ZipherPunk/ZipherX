@@ -132,18 +132,18 @@ final class TransactionBuilder {
         }
 
         // Get current chain height (use cached first to avoid network delay)
-        var chainHeight = NetworkManager.shared.chainHeight
+        var chainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
         if chainHeight == 0 {
             chainHeight = try await NetworkManager.shared.getChainHeight()
         }
         print("📊 Current chain height: \(chainHeight)")
 
         // Get notes from database - requires valid witnesses
-        var dbNotes = try database.getUnspentNotes(accountId: account.id)
+        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
 
         // If no notes with witnesses, check for notes without witnesses that need rebuild
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.id)
+            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
             if allNotes.isEmpty {
                 print("📝 No notes found in database")
                 throw TransactionError.insufficientFunds
@@ -457,14 +457,14 @@ final class TransactionBuilder {
         }
 
         // Use cached chain height first to avoid network delay
-        var chainHeight = NetworkManager.shared.chainHeight
+        var chainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
         if chainHeight == 0 {
             chainHeight = try await NetworkManager.shared.getChainHeight()
         }
-        var dbNotes = try database.getUnspentNotes(accountId: account.id)
+        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
 
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.id)
+            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
             if allNotes.isEmpty {
                 throw TransactionError.insufficientFunds
             }
@@ -1004,12 +1004,12 @@ final class TransactionBuilder {
             print("📝 No account found in database")
             return []
         }
-        let dbNotes = try database.getUnspentNotes(accountId: account.id)
+        let dbNotes = try database.getUnspentNotes(accountId: account.accountId)
 
         print("📝 Database returned \(dbNotes.count) unspent notes")
 
         // Get current chain height for confirmation calculation
-        var chainHeight = NetworkManager.shared.chainHeight
+        var chainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
 
         // If chain height is 0, fetch it now
         if chainHeight == 0 {
@@ -1518,7 +1518,7 @@ final class TransactionBuilder {
 
         // PRIORITY 2: Try P2P (especially important for Tor mode)
         // Try multiple peers before giving up
-        let connectedPeers = networkManager.getAllConnectedPeers()
+        let connectedPeers = await MainActor.run { networkManager.getAllConnectedPeers() }
         if !connectedPeers.isEmpty {
             print("📡 Fetching delta CMUs via P2P (blocks \(startHeight)-\(endHeight))...")
             let blockCount = Int(endHeight - startHeight + 1)
