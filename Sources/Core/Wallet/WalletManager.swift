@@ -1964,7 +1964,7 @@ final class WalletManager: ObservableObject {
                         // FIX #557 v29: Fetch to CHAIN TIP (not just maxNoteHeight!) - Dec 24th approach!
                         // This ensures all witnesses have the SAME root (at chain tip state)
                         let networkManager = NetworkManager.shared
-                        let chainHeight = await networkManager.getChainHeight()
+                        let chainHeight = try await networkManager.getChainHeight()
                         let maxNoteHeight = notesAfterBoost.map { $0.note.height }.max() ?? boostHeight
                         let targetHeight = max(chainHeight, maxNoteHeight)  // Go to chain tip!
 
