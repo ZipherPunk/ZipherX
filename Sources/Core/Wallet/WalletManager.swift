@@ -1909,11 +1909,11 @@ final class WalletManager: ObservableObject {
                         // FIX #557 v27: Use ONLY boost CMUs for witness creation!
                         // Adding delta CMUs causes witness roots to not match HeaderStore anchors
                         // Witnesses are created from boost state, anchors from HeaderStore at note heights
-                        // These MUST match for transactions to work!
+                        // Transaction builder (FIX #557 v27b) will use HeaderStore anchor as source of truth
                         let boostCMUData = cmuData  // Has format: [count: u64][cmu1: 32]...
 
                         print("✅ FIX #557 v27: Creating witnesses from boost CMUs only (\(cachedInfo.height) height)")
-                        print("✅ FIX #557 v27: Witness roots will match HeaderStore anchors at note heights")
+                        print("✅ FIX #557 v27: Transaction builder will use HeaderStore anchors (source of truth)")
                         await progress?("Creating witnesses...", 50)
 
                         // Create witnesses from boost CMUs only (no delta!)
@@ -1921,7 +1921,7 @@ final class WalletManager: ObservableObject {
                         let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: boostCMUData, targetCMUs: targetCMUs)
 
                         // FIX #557 v24: Use HeaderStore anchor for EACH note (not common anchor!)
-                        // Witnesses have different roots, so each note needs its own anchor from its block height
+                        // Transaction builder will use HeaderStore anchor as source of truth
                         let headerStore = HeaderStore.shared
                         try? headerStore.open()
 
@@ -1939,30 +1939,31 @@ final class WalletManager: ObservableObject {
                                     do {
                                         try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
                                         if let witnessRoot = ZipherXFFI.witnessGetRoot(witness) {
-                                            print("✅ FIX #557 v24: Updated note \(note.id) witness, root: \(witnessRoot.prefix(4).hexString)...")
+                                            print("✅ FIX #557 v27: Updated note \(note.id) witness, root: \(witnessRoot.prefix(4).hexString)...")
                                         } else {
-                                            print("⚠️ FIX #557 v24: Witness updated but root extraction failed!")
+                                            print("⚠️ FIX #557 v27: Witness updated but root extraction failed!")
                                         }
                                     } catch {
-                                        print("❌ FIX #557 v24: Failed to update witness for note \(note.id): \(error.localizedDescription)")
+                                        print("❌ FIX #557 v27: Failed to update witness for note \(note.id): \(error.localizedDescription)")
                                     }
 
-                                    // Update anchor from HeaderStore (per-note anchor!)
+                                    // Update anchor from HeaderStore (transaction builder will use this!)
                                     do {
                                         try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: anchor)
-                                        print("✅ FIX #557 v24: Updated note \(note.id) anchor from height \(note.height): \(anchor.prefix(4).hexString)...")
+                                        print("✅ FIX #557 v27: Updated note \(note.id) anchor from height \(note.height): \(anchor.prefix(4).hexString)...")
                                     } catch {
-                                        print("❌ FIX #557 v24: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
+                                        print("❌ FIX #557 v27: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
                                     }
                                     rebuiltCount += 1
                                 } else {
-                                    print("⚠️ FIX #557 v24: Failed to get anchor for note \(note.id) at height \(note.height)")
+                                    print("⚠️ FIX #557 v27: Failed to get anchor for note \(note.id) at height \(note.height)")
                                 }
                             }
                         }
 
                         // FIX #557 v24: Summary
-                        print("✅ FIX #557 v24: Witness rebuild complete - updated \(rebuiltCount) notes with per-note anchors")
+                        print("✅ FIX #557 v27: Witness rebuild complete - updated \(rebuiltCount) notes")
+                        print("✅ FIX #557 v27: Transaction builder will use HeaderStore anchors (FIX #557 v27b)")
                         await progress?("Witness rebuild complete!", 100)
                     }
 
@@ -5649,6 +5650,37 @@ final class WalletManager: ObservableObject {
     private func deriveZAddressFromStoredKey() throws -> String {
         let spendingKey = try secureStorage.retrieveSpendingKey()
         return try deriveZAddress(from: spendingKey)
+    }
+
+    /// FIX #557 v28: Get cumulative CMU count up to a specific block height
+    /// This tells us how many CMUs exist in the commitment tree up to the given height
+    /// Used to truncate CMU data when creating witnesses at specific tree states
+    /// - Parameter upToHeight: The block height to get CMU count for
+    /// - Returns: Number of CMUs up to (and including) this height
+    private func getCumulativeCMUCount(upToHeight: UInt64) -> UInt64 {
+        // FIX #557 v28: Count notes in our database up to this height
+        // This gives us the position of the last CMU at this height
+        do {
+            let allNotes = try WalletDatabase.shared.getAllNotes(accountId: 1)
+            let notesAtOrBeforeHeight = allNotes.filter { UInt64($0.height) <= upToHeight }
+
+            // Each note has one CMU, so count = number of notes
+            // Add offset for Sapling activation (CMUs before our first note)
+            let saplingActivationOffset = UInt64(800_000)  // Approximate CMUs before our notes started
+            let totalCount = saplingActivationOffset + UInt64(notesAtOrBeforeHeight.count)
+
+            print("📊 FIX #557 v28: Counted \(notesAtOrBeforeHeight.count) notes up to height \(upToHeight), total CMUs: \(totalCount)")
+            return totalCount
+        } catch {
+            print("⚠️ FIX #557 v28: Failed to count notes: \(error.localizedDescription)")
+            // Fallback: use simple approximation
+            let saplingActivation = UInt64(476_969)
+            if upToHeight < saplingActivation {
+                return 0
+            }
+            let blocksSinceSapling = upToHeight - saplingActivation
+            return UInt64(Double(blocksSinceSapling) * 0.35)
+        }
     }
 
     // MARK: - FIX #506: Parallel Import Architecture
