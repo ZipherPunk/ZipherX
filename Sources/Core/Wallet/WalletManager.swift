@@ -2049,23 +2049,56 @@ final class WalletManager: ObservableObject {
             // Update database to track tree sync height
             _ = try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
 
-            // CRITICAL FIX #557 v33: Mark all database witnesses as stale so TransactionBuilder rebuilds them!
-            // The global tree is now at chain tip, but database witnesses are from old tree state
-            // By clearing witness data, TransactionBuilder will rebuild witnesses from current tree
-            print("🔄 FIX #557 v33: Clearing stale database witnesses...")
+            // CRITICAL FIX #557 v36: UPDATE all witnesses using December 24th approach!
+            // 1. Load existing witnesses into FFI tree (tracks positions automatically)
+            // 2. Append delta CMUs (updates all loaded witnesses in-place!)
+            // 3. Extract updated witnesses from tracked positions
+            print("🔄 FIX #557 v36: Updating all witnesses using treeLoadWitness...")
             let allNotes = try WalletDatabase.shared.getAllNotes(accountId: accountId)
-            var clearedCount = 0
+            var witnessIndices: [(note: WalletNote, position: UInt64)] = []
+
             for note in allNotes {
-                if !note.witness.isEmpty {
-                    _ = try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: Data())
-                    _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: Data())
-                    clearedCount += 1
+                guard !note.witness.isEmpty else {
+                    print("⚠️ FIX #557 v36: Note \(note.id) has empty witness, skipping")
+                    continue
+                }
+
+                // Load witness into FFI tree - returns POSITION of this witness
+                let position = note.witness.withUnsafeBytes { ptr in
+                    ZipherXFFI.treeLoadWitness(
+                        witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                        witnessLen: note.witness.count
+                    )
+                }
+
+                if position != UInt64.max {
+                    witnessIndices.append((note: note, position: position))
                 }
             }
-            print("✅ FIX #557 v33: Cleared \(clearedCount) stale witnesses - TransactionBuilder will rebuild from current tree")
+
+            print("✅ FIX #557 v36: Loaded \(witnessIndices.count) witnesses into FFI tree")
+
+            // Delta CMUs were already appended above - witnesses are now updated!
+            // Extract updated witnesses from tracked positions
+            var updatedCount = 0
+            for (note, position) in witnessIndices {
+                if let updatedWitness = ZipherXFFI.treeGetWitness(index: position) {
+                    _ = try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: updatedWitness)
+                    updatedCount += 1
+                }
+            }
+
+            // Update anchors to current tree root
+            if let globalRoot = ZipherXFFI.treeRoot() {
+                for (note, _) in witnessIndices {
+                    _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: globalRoot)
+                }
+            }
+
+            print("✅ FIX #557 v36: Updated \(updatedCount) witnesses with current tree state")
 
             print("✅ FIX #557 v32: Global tree synced to chain tip (\(chainHeight))")
-            print("✅ FIX #557 v33: TransactionBuilder will now rebuild witnesses from current tree state")
+            print("✅ FIX #557 v36: All witnesses updated with current tree root (anchor)")
             await progress?("Tree sync complete!", 100)
 
         } catch {
