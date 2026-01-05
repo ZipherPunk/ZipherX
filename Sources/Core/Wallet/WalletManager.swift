@@ -2056,10 +2056,11 @@ final class WalletManager: ObservableObject {
             print("🔄 FIX #557 v36: Updating all witnesses using treeLoadWitness...")
             let allNotes = try WalletDatabase.shared.getAllNotes(accountId: accountId)
             var witnessIndices: [(note: WalletNote, position: UInt64)] = []
+            var emptyWitnessNotes: [WalletNote] = []
 
             for note in allNotes {
-                guard !note.witness.isEmpty else {
-                    print("⚠️ FIX #557 v36: Note \(note.id) has empty witness, skipping")
+                if note.witness.isEmpty {
+                    emptyWitnessNotes.append(note)
                     continue
                 }
 
@@ -2076,7 +2077,7 @@ final class WalletManager: ObservableObject {
                 }
             }
 
-            print("✅ FIX #557 v36: Loaded \(witnessIndices.count) witnesses into FFI tree")
+            print("✅ FIX #557 v36: Loaded \(witnessIndices.count) witnesses, \(emptyWitnessNotes.count) empty")
 
             // Delta CMUs were already appended above - witnesses are now updated!
             // Extract updated witnesses from tracked positions
@@ -2096,6 +2097,52 @@ final class WalletManager: ObservableObject {
             }
 
             print("✅ FIX #557 v36: Updated \(updatedCount) witnesses with current tree state")
+
+            // FIX #557 v37: Fallback - rebuild empty witnesses using boost + delta
+            if !emptyWitnessNotes.isEmpty {
+                print("⚠️ FIX #557 v37: \(emptyWitnessNotes.count) empty witnesses - rebuilding from boost + delta...")
+
+                // Convert WalletNote to SpendableNote for rebuildWitnessesForNotes
+                let spendableNotes = emptyWitnessNotes.map { note -> SpendableNote in
+                    SpendableNote(
+                        id: note.id,
+                        account: note.account,
+                        diversifier: note.diversifier,
+                        value: note.value,
+                        rcm: note.rcm,
+                        cmu: note.cmu,
+                        nullifier: note.nullifier,
+                        height: note.height,
+                        witness: note.witness,
+                        anchor: note.anchor,
+                        isChange: note.isChange,
+                        outputIndex: note.outputIndex,
+                        spentInTx: note.spentInTx,
+                        blockHash: note.blockHash,
+                        spendHeight: note.spendHeight
+                    )
+                }
+
+                // Rebuild witnesses using TransactionBuilder's function
+                do {
+                    let boostHeight = ZipherXConstants.effectiveTreeHeight
+                    let results = try await rebuildWitnessesForNotes(
+                        notes: spendableNotes,
+                        downloadedTreeHeight: boostHeight,
+                        chainHeight: chainHeight
+                    )
+
+                    // Update database with rebuilt witness/anchor
+                    for result in results {
+                        _ = try? WalletDatabase.shared.updateNoteWitness(noteId: result.note.id, witness: result.witness)
+                        _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: result.note.id, anchor: result.anchor)
+                    }
+
+                    print("✅ FIX #557 v37: Rebuilt \(results.count) empty witnesses")
+                } catch {
+                    print("❌ FIX #557 v37: Failed to rebuild empty witnesses: \(error)")
+                }
+            }
 
             print("✅ FIX #557 v32: Global tree synced to chain tip (\(chainHeight))")
             print("✅ FIX #557 v36: All witnesses updated with current tree root (anchor)")
