@@ -1901,24 +1901,38 @@ final class WalletManager: ObservableObject {
             let boostHeight = cachedInfo.height
 
             // If we're behind boost file, load boost CMUs first
-            if currentTreeSize < boostHeight {
-                print("🔄 FIX #557 v32: Loading boost CMUs (\(boostHeight - currentTreeSize) CMUs)...")
-                await progress?("Loading boost CMUs...", 40)
+            guard let cmuData = try? Data(contentsOf: cachedPath) else {
+                print("❌ FIX #557 v32: Failed to load boost CMU data")
+                return
+            }
 
-                guard let cmuData = try? Data(contentsOf: cachedPath) else {
-                    print("❌ FIX #557 v32: Failed to load boost CMU data")
-                    return
-                }
+            // Read CMU count from boost file (first 8 bytes)
+            guard cmuData.count >= 8 else {
+                print("❌ FIX #557 v32: Invalid boost CMU data (too small)")
+                return
+            }
+
+            let boostCMUCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            print("📊 FIX #557 v32: Boost file has \(boostCMUCount) CMUs (to block \(boostHeight))")
+
+            // Only load boost CMUs if current tree is behind boost file
+            if currentTreeSize < boostCMUCount {
+                print("🔄 FIX #557 v32: Loading boost CMUs (\(boostCMUCount - currentTreeSize) CMUs)...")
+                await progress?("Loading boost CMUs...", 40)
 
                 // Parse and append boost CMUs (skip count header, skip already synced ones)
                 let offset = 8 + (currentTreeSize * 32)
                 guard offset < cmuData.count else {
-                    print("❌ FIX #557 v32: Invalid boost CMU data offset")
+                    print("❌ FIX #557 v32: Invalid boost CMU data offset (offset: \(offset), data size: \(cmuData.count))")
+                    print("❌ FIX #557 v32: Tree might be from newer boost file, resetting...")
+                    // Reset tree and start fresh
+                    _ = ZipherXFFI.treeInit()
+                    currentTreeSize = 0
                     return
                 }
 
                 var appendedCount = 0
-                let totalCMUs = boostHeight - currentTreeSize
+                let totalCMUs = boostCMUCount - currentTreeSize
                 while offset + UInt64(appendedCount * 32 + 32) <= UInt64(cmuData.count) {
                     let cmuOffset = offset + UInt64(appendedCount * 32)
                     let cmu = cmuData.subdata(in: Int(cmuOffset)..<Int(cmuOffset + 32))
@@ -1933,6 +1947,8 @@ final class WalletManager: ObservableObject {
                 }
 
                 print("✅ FIX #557 v32: Appended \(appendedCount) boost CMUs to global tree")
+            } else {
+                print("✅ FIX #557 v32: Global tree already has \(currentTreeSize) CMUs (boost has \(boostCMUCount))")
             }
 
             // Fetch delta CMUs from boostHeight+1 to chainHeight
