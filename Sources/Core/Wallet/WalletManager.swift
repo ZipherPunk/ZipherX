@@ -2206,7 +2206,7 @@ final class WalletManager: ObservableObject {
             }
 
             // FIX #557 v26: Pass async progress callback that updates UI immediately
-            await preRebuildWitnessesForInstantPayment(accountId: account.accountId) { status, percent in
+            await preRebuildWitnessesForInstantPayment(accountId: account.accountId) { status, percent async in
                 // FIX #557 v26: Use MainActor.run immediately to update UI
                 // Callback is now async, so this will execute before returning
                 await MainActor.run {
