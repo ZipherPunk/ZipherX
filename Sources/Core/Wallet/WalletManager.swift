@@ -1927,7 +1927,6 @@ final class WalletManager: ObservableObject {
                     print("❌ FIX #557 v32: Tree might be from newer boost file, resetting...")
                     // Reset tree and start fresh
                     _ = ZipherXFFI.treeInit()
-                    currentTreeSize = 0
                     return
                 }
 
@@ -2030,8 +2029,23 @@ final class WalletManager: ObservableObject {
             // Update database to track tree sync height
             _ = try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
 
+            // CRITICAL FIX #557 v33: Mark all database witnesses as stale so TransactionBuilder rebuilds them!
+            // The global tree is now at chain tip, but database witnesses are from old tree state
+            // By clearing witness data, TransactionBuilder will rebuild witnesses from current tree
+            print("🔄 FIX #557 v33: Clearing stale database witnesses...")
+            let allNotes = try WalletDatabase.shared.getAllNotes(accountId: accountId)
+            var clearedCount = 0
+            for note in allNotes {
+                if !note.witness.isEmpty {
+                    _ = try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: Data())
+                    _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: Data())
+                    clearedCount += 1
+                }
+            }
+            print("✅ FIX #557 v33: Cleared \(clearedCount) stale witnesses - TransactionBuilder will rebuild from current tree")
+
             print("✅ FIX #557 v32: Global tree synced to chain tip (\(chainHeight))")
-            print("✅ FIX #557 v32: TransactionBuilder will now create witnesses from current tree state")
+            print("✅ FIX #557 v33: TransactionBuilder will now rebuild witnesses from current tree state")
             await progress?("Tree sync complete!", 100)
 
         } catch {
