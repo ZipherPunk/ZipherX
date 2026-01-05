@@ -1872,193 +1872,150 @@ final class WalletManager: ObservableObject {
                 print("✅ Pre-witness: \(alreadyCurrentCount) note(s) already instant-ready")
             }
 
-            // CRITICAL: Actually rebuild stale witnesses (don't defer to send time!)
-            // FIX #557 v15: Early return if ALL witnesses are current (incremental updates)
-            if notesNeedingRebuild.isEmpty {
-                print("✅ FIX #557 v15: All \(alreadyCurrentCount) witnesses already current - skipping rebuild")
+            // CRITICAL FIX #557 v32: Don't create witnesses! Just sync GLOBAL tree to chain tip!
+            // TransactionBuilder will get fresh witnesses from global tree using treeGetWitness()
+            // This ensures ALL witnesses have SAME root (current global tree root)
+
+            // Check if global tree needs sync to chain tip
+            let networkManager = NetworkManager.shared
+            let chainHeight = try await networkManager.getChainHeight()
+            let currentTreeSize = ZipherXFFI.treeSize()
+
+            if currentTreeSize >= chainHeight {
+                print("✅ FIX #557 v32: Global tree already at chain tip (\(currentTreeSize) >= \(chainHeight))")
+                print("✅ FIX #557 v32: Witnesses will be created from current tree state when sending")
                 return
             }
 
-            if !notesNeedingRebuild.isEmpty {
-                print("🔄 Pre-witness: Rebuilding \(notesNeedingRebuild.count) stale witness(es)...")
-                await progress?("Rebuilding witnesses for instant send...", 10)
+            print("🔄 FIX #557 v32: Syncing global tree to chain tip (\(currentTreeSize) → \(chainHeight))")
+            print("🔄 FIX #557 v32: This ensures TransactionBuilder gets fresh witnesses from current tree state")
+            await progress?("Syncing global tree to chain tip...", 30)
 
-                // Save current tree state before rebuilding
-                // WARNING: treeCreateWitnessesBatch modifies the FFI tree, must save/restore
-                // This can take 10-30 seconds on large trees - UI will show "Finalizing..."
-                print("🔄 Pre-witness: Saving tree state before rebuild...")
-                let savedTreeState = ZipherXFFI.treeSerialize()
-                print("✅ Pre-witness: Tree state saved (\(savedTreeState?.count ?? 0) bytes)")
-                await progress?("Preparing witness rebuild...", 20)
+            // Get boost file info
+            guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                  let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo() else {
+                print("⚠️ FIX #557 v32: No boost file available, skipping tree sync")
+                return
+            }
 
-                // Try to get CMU data for witness rebuild
-                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                   let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo(),
-                   let cmuData = try? Data(contentsOf: cachedPath) {
+            let boostHeight = cachedInfo.height
 
-                    let boostHeight = cachedInfo.height
+            // If we're behind boost file, load boost CMUs first
+            if currentTreeSize < boostHeight {
+                print("🔄 FIX #557 v32: Loading boost CMUs (\(boostHeight - currentTreeSize) CMUs)...")
+                await progress?("Loading boost CMUs...", 40)
 
-                    // CRITICAL FIX #557 v31: Don't separate notes! ALL notes need witnesses at CHAIN TIP!
-                    // Fetching delta CMUs to chain tip ensures ALL witnesses have SAME root
-                    var rebuiltCount = 0
+                guard let cmuData = try? Data(contentsOf: cachedPath) else {
+                    print("❌ FIX #557 v32: Failed to load boost CMU data")
+                    return
+                }
 
-                    if !notesNeedingRebuild.isEmpty {
-                        print("🔄 FIX #557 v31: Rebuilding \(notesNeedingRebuild.count) witnesses to CHAIN TIP...")
-                        print("🔄 FIX #557 v31: This ensures all witnesses have same root (critical for transactions!)")
-                        await progress?("Fetching delta CMUs to chain tip...", 30)
+                // Parse and append boost CMUs (skip count header, skip already synced ones)
+                let offset = 8 + (currentTreeSize * 32)
+                guard offset < cmuData.count else {
+                    print("❌ FIX #557 v32: Invalid boost CMU data offset")
+                    return
+                }
 
-                        // Fetch delta CMUs to CHAIN TIP (not just maxNoteHeight!)
-                        let networkManager = NetworkManager.shared
-                        let chainHeight = try await networkManager.getChainHeight()
-                        let targetHeight = max(chainHeight, boostHeight)  // Go to chain tip!
+                var appendedCount = 0
+                while offset + (appendedCount * 32) + 32 <= cmuData.count {
+                    let cmuOffset = offset + (appendedCount * 32)
+                    let cmu = cmuData.subdata(in: cmuOffset..<(cmuOffset + 32))
+                    _ = ZipherXFFI.treeAppend(cmu: cmu)
+                    appendedCount += 1
 
-                        print("🔄 FIX #557 v31: Boost height: \(boostHeight), Chain tip: \(chainHeight), Target: \(targetHeight)")
-
-                        // Check if we need delta CMUs
-                        var combinedCMUData = cmuData
-                        var deltaCMUFetched = false
-
-                        if targetHeight > boostHeight {
-                            print("🔄 FIX #557 v31: Fetching delta CMUs from \(boostHeight + 1) to \(targetHeight)...")
-                            await progress?("Fetching delta CMUs...", 40)
-
-                            let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
-                            if connectedPeerCount > 0 {
-                                var deltaCMUs: [Data] = []
-                                let startHeight = boostHeight + 1
-                                let batchSize = 50
-                                let maxRetries = 2
-                                let maxConsecutiveFailures = 3
-
-                                var currentHeight = startHeight
-                                var consecutiveFailures = 0
-
-                                while currentHeight <= targetHeight && consecutiveFailures < maxConsecutiveFailures {
-                                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
-                                    let blockCount = Int(endHeight - currentHeight + 1)
-
-                                    var batchSucceeded = false
-                                    for attempt in 1...maxRetries {
-                                        do {
-                                            let blocks = try await withTimeout(seconds: 30) {
-                                                try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
-                                            }
-                                            for block in blocks {
-                                                for tx in block.transactions {
-                                                    for output in tx.outputs {
-                                                        deltaCMUs.append(output.cmu)
-                                                    }
-                                                }
-                                            }
-                                            batchSucceeded = true
-                                            consecutiveFailures = 0
-                                            break
-                                        } catch {
-                                            if attempt < maxRetries {
-                                                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                                            } else {
-                                                print("⚠️ FIX #557 v31: Batch failed: \(error.localizedDescription)")
-                                            }
-                                        }
-                                    }
-
-                                    if !batchSucceeded {
-                                        consecutiveFailures += 1
-                                    }
-
-                                    currentHeight = endHeight + 1
-                                }
-
-                                if !deltaCMUs.isEmpty || consecutiveFailures == 0 {
-                                    // Combine boost + delta CMUs
-                                    let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-                                    let totalCount = boostCount + UInt64(deltaCMUs.count)
-
-                                    combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
-                                    var countLE = totalCount
-                                    withUnsafeBytes(of: &countLE) { combinedCMUData.append(contentsOf: $0) }
-                                    combinedCMUData.append(cmuData.suffix(from: 8))
-                                    for cmu in deltaCMUs {
-                                        combinedCMUData.append(cmu)
-                                    }
-
-                                    print("✅ FIX #557 v31: Fetched \(deltaCMUs.count) delta CMUs to height \(targetHeight)")
-                                    print("✅ FIX #557 v31: Combined CMU count: \(totalCount) (boost: \(boostCount) + delta: \(deltaCMUs.count))")
-                                    deltaCMUFetched = true
-                                } else {
-                                    print("⚠️ FIX #557 v31: Failed to fetch delta CMUs, using boost only (witnesses will have old roots)")
-                                }
-                            } else {
-                                print("⚠️ FIX #557 v31: No peers connected, using boost only")
-                            }
-                        } else {
-                            print("✅ FIX #557 v31: Already at chain tip (\(targetHeight) == \(boostHeight))")
-                        }
-
-                        // Create ALL witnesses from combined CMU data (boost + delta to chain tip!)
-                        await progress?("Creating witnesses at chain tip...", 60)
-                        let allTargetCMUs = notesNeedingRebuild.map { $0.cmu }
-                        let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: allTargetCMUs)
-
-                        // Save witnesses with anchors extracted FROM witnesses
-                        await progress?("Saving witnesses...", 80)
-                        for (index, result) in results.enumerated() {
-                            if let (_, witness) = result {
-                                let note = notesNeedingRebuild[index].note
-
-                                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) {
-                                    do {
-                                        try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                        try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                        print("✅ FIX #557 v31: Updated note \(note.id), root: \(witnessAnchor.prefix(4).hexString)...")
-                                        rebuiltCount += 1
-                                    } catch {
-                                        print("❌ FIX #557 v31: Failed to update note \(note.id): \(error.localizedDescription)")
-                                    }
-                                } else {
-                                    print("❌ FIX #557 v31: Failed to extract root for note \(note.id)")
-                                }
-                            }
-                        }
-
-                        if deltaCMUFetched {
-                            print("✅ FIX #557 v31: Rebuilt \(rebuiltCount) witnesses at CHAIN TIP (all have same root!)")
-                        } else {
-                            print("⚠️ FIX #557 v31: Rebuilt \(rebuiltCount) witnesses at boost height (may have different roots)")
-                        }
-                        await progress?("Witness rebuild complete!", 100)
+                    if appendedCount % 100000 == 0 {
+                        print("🔄 FIX #557 v32: Appended \(appendedCount) boost CMUs...")
+                        await progress?("Loading boost CMUs... \(Int((Double(appendedCount) / Double(boostHeight - currentTreeSize)) * 100))%", 40)
                     }
+                }
 
-                    // CRITICAL: Restore tree state after witness rebuild
-                    // treeCreateWitnessesBatch modifies the FFI tree, we need to restore it
-                    if let savedState = savedTreeState {
-                        // FIX #508: Validate saved state before clearing tree
-                        if savedState.count < 1000 {
-                            print("⚠️ Pre-witness: Saved tree state too small (\(savedState.count) bytes), skipping restore")
-                        } else {
-                            // Only clear tree if we have a valid state to restore
-                            _ = ZipherXFFI.treeInit()
-                            let success = ZipherXFFI.treeDeserialize(data: savedState)
-                            if !success {
-                                print("❌ Pre-witness: Failed to restore tree from saved state (\(savedState.count) bytes)")
-                                print("❌ Pre-witness: Tree is now EMPTY - wallet may be corrupted!")
-                                // Try to recover by reloading from database
-                                if let dbTree = try? WalletDatabase.shared.getTreeState(),
-                                   ZipherXFFI.treeDeserialize(data: dbTree) {
-                                    print("✅ Pre-witness: Recovered tree from database")
-                                } else {
-                                    print("❌ Pre-witness: Could not recover tree from database either")
+                print("✅ FIX #557 v32: Appended \(appendedCount) boost CMUs to global tree")
+            }
+
+            // Fetch delta CMUs from boostHeight+1 to chainHeight
+            if chainHeight > boostHeight {
+                print("🔄 FIX #557 v32: Fetching delta CMUs from \(boostHeight + 1) to \(chainHeight)...")
+                await progress?("Fetching delta CMUs...", 60)
+
+                let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
+                guard connectedPeerCount > 0 else {
+                    print("⚠️ FIX #557 v32: No peers connected, skipping delta sync")
+                    return
+                }
+
+                var deltaCMUs: [Data] = []
+                let startHeight = boostHeight + 1
+                let batchSize = 50
+                let maxRetries = 2
+                let maxConsecutiveFailures = 3
+
+                var currentHeight = startHeight
+                var consecutiveFailures = 0
+
+                while currentHeight <= chainHeight && consecutiveFailures < maxConsecutiveFailures {
+                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, chainHeight)
+                    let blockCount = Int(endHeight - currentHeight + 1)
+
+                    var batchSucceeded = false
+                    for attempt in 1...maxRetries {
+                        do {
+                            let blocks = try await withTimeout(seconds: 30) {
+                                try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
+                            }
+                            for block in blocks {
+                                for tx in block.transactions {
+                                    for output in tx.outputs {
+                                        deltaCMUs.append(output.cmu)
+                                    }
                                 }
+                            }
+                            batchSucceeded = true
+                            consecutiveFailures = 0
+                            break
+                        } catch {
+                            if attempt < maxRetries {
+                                try? await Task.sleep(nanoseconds: 1_000_000_000)
                             } else {
-                                let treeSize = ZipherXFFI.treeSize()
-                                print("✅ Pre-witness: Tree restored successfully (\(treeSize) commitments)")
+                                print("⚠️ FIX #557 v32: Batch failed: \(error.localizedDescription)")
                             }
                         }
                     }
+
+                    if !batchSucceeded {
+                        consecutiveFailures += 1
+                    }
+
+                    currentHeight = endHeight + 1
+                }
+
+                if !deltaCMUs.isEmpty {
+                    print("🔄 FIX #557 v32: Appending \(deltaCMUs.count) delta CMUs to global tree...")
+                    await progress?("Appending delta CMUs...", 80)
+
+                    for cmu in deltaCMUs {
+                        _ = ZipherXFFI.treeAppend(cmu: cmu)
+                    }
+
+                    print("✅ FIX #557 v32: Appended \(deltaCMUs.count) delta CMUs")
                 } else {
-                    print("⚠️ Pre-witness: No CMU data available for rebuild, \(notesNeedingRebuild.count) note(s) will rebuild at send time")
+                    print("⚠️ FIX #557 v32: Failed to fetch delta CMUs")
                 }
             }
+
+            // Save updated tree state to database
+            if let treeData = ZipherXFFI.treeSerialize() {
+                _ = try? WalletDatabase.shared.saveTreeState(treeData)
+                print("✅ FIX #557 v32: Saved global tree state (\(treeData.count) bytes)")
+            }
+
+            // Update database to track tree sync height
+            _ = try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+
+            print("✅ FIX #557 v32: Global tree synced to chain tip (\(chainHeight))")
+            print("✅ FIX #557 v32: TransactionBuilder will now create witnesses from current tree state")
+            await progress?("Tree sync complete!", 100)
+
         } catch {
             print("⚠️ Pre-witness rebuild failed: \(error.localizedDescription)")
         }
