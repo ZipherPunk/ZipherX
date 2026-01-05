@@ -1338,11 +1338,18 @@ final class WalletDatabase {
             // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
             let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
             let encryptedRcm = Data(bytes: rcmPtr!, count: Int(rcmLen))
-            let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+
+            // FIX #557 v33 crash fix: Witness might be NULL after clearing stale witnesses
+            let witness: Data
+            if witnessPtr == nil {
+                witness = Data()
+            } else {
+                let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                witness = try decryptBlob(encryptedWitness)
+            }
 
             let diversifier = try decryptBlob(encryptedDiv)
             let rcm = try decryptBlob(encryptedRcm)
-            let witness = try decryptBlob(encryptedWitness)
 
             // CMU might be NULL (not encrypted - public on chain)
             var cmuData: Data? = nil
