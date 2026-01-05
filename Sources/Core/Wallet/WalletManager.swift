@@ -2102,40 +2102,39 @@ final class WalletManager: ObservableObject {
             if !emptyWitnessNotes.isEmpty {
                 print("⚠️ FIX #557 v37: \(emptyWitnessNotes.count) empty witnesses - rebuilding from boost + delta...")
 
-                // Convert WalletNote to SpendableNote for rebuildWitnessesForNotes
-                let spendableNotes = emptyWitnessNotes.map { note -> SpendableNote in
-                    SpendableNote(
-                        id: note.id,
-                        account: note.account,
-                        diversifier: note.diversifier,
+                // Map WalletNote to (id, SpendableNote) tuples
+                let notesWithIds = emptyWitnessNotes.map { note -> (Int64, SpendableNote) in
+                    let spendable = SpendableNote(
                         value: note.value,
+                        anchor: note.anchor ?? Data(),  // Handle optional anchor
+                        witness: note.witness,
+                        diversifier: note.diversifier,
                         rcm: note.rcm,
-                        cmu: note.cmu,
+                        position: note.height, // Use height as position hint
                         nullifier: note.nullifier,
                         height: note.height,
-                        witness: note.witness,
-                        anchor: note.anchor,
-                        isChange: note.isChange,
-                        outputIndex: note.outputIndex,
-                        spentInTx: note.spentInTx,
-                        blockHash: note.blockHash,
-                        spendHeight: note.spendHeight
+                        cmu: note.cmu
                     )
+                    return (note.id, spendable)
                 }
 
                 // Rebuild witnesses using TransactionBuilder's function
                 do {
                     let boostHeight = ZipherXConstants.effectiveTreeHeight
-                    let results = try await rebuildWitnessesForNotes(
+                    let spendableNotes = notesWithIds.map { $0.1 }
+                    let txBuilder = TransactionBuilder()
+                    let results = try await txBuilder.rebuildWitnessesForNotes(
                         notes: spendableNotes,
                         downloadedTreeHeight: boostHeight,
                         chainHeight: chainHeight
                     )
 
                     // Update database with rebuilt witness/anchor
-                    for result in results {
-                        _ = try? WalletDatabase.shared.updateNoteWitness(noteId: result.note.id, witness: result.witness)
-                        _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: result.note.id, anchor: result.anchor)
+                    // Match results by index since both arrays are sorted by height
+                    for (index, result) in results.enumerated() {
+                        let noteId = notesWithIds[index].0
+                        _ = try? WalletDatabase.shared.updateNoteWitness(noteId: noteId, witness: result.witness)
+                        _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: result.anchor)
                     }
 
                     print("✅ FIX #557 v37: Rebuilt \(results.count) empty witnesses")
