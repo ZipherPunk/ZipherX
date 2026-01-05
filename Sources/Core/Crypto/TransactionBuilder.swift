@@ -390,6 +390,11 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
+        // FIX #557 v40: Log the actual anchor being used
+        let actualAnchor = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("🔑 FIX #557 v40: Transaction built with anchor: \(actualAnchor)...")
+        print("   (anchor source: \(note.witness.count) byte witness)")
+
         print("✅ Transaction built: \(rawTx.count) bytes")
 
         // Print raw transaction hex for manual broadcast debugging
