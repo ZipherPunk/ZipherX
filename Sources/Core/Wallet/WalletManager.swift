@@ -1898,265 +1898,135 @@ final class WalletManager: ObservableObject {
 
                     let boostHeight = cachedInfo.height
 
-                    // Separate notes into those within boost range and those beyond
-                    let notesInBoost = notesNeedingRebuild.filter { $0.note.height <= boostHeight }
-                    let notesAfterBoost = notesNeedingRebuild.filter { $0.note.height > boostHeight }
-
+                    // CRITICAL FIX #557 v31: Don't separate notes! ALL notes need witnesses at CHAIN TIP!
+                    // Fetching delta CMUs to chain tip ensures ALL witnesses have SAME root
                     var rebuiltCount = 0
 
-                    // Rebuild witnesses for notes within boost file range
-                    if !notesInBoost.isEmpty {
-                        // FIX #557 v29: RESTORED from Dec 24th working version
-                        // Extract anchor FROM witness (not from HeaderStore!)
-                        // TransactionBuilder will also extract anchor from witness - they WILL match!
-                        let boostCMUData = cmuData  // Has format: [count: u64][cmu1: 32]...
+                    if !notesNeedingRebuild.isEmpty {
+                        print("🔄 FIX #557 v31: Rebuilding \(notesNeedingRebuild.count) witnesses to CHAIN TIP...")
+                        print("🔄 FIX #557 v31: This ensures all witnesses have same root (critical for transactions!)")
+                        await progress?("Fetching delta CMUs to chain tip...", 30)
 
-                        print("✅ FIX #557 v29: Creating witnesses from boost CMUs (\(cachedInfo.height) height)")
-                        print("✅ FIX #557 v29: Will extract anchor FROM witness (Dec 24th approach)")
-                        await progress?("Creating witnesses...", 50)
-
-                        // Create witnesses from boost CMUs
-                        let targetCMUs = notesInBoost.map { $0.cmu }
-                        let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: boostCMUData, targetCMUs: targetCMUs)
-
-                        // FIX #557 v18: Update progress - witnesses created, saving to database
-                        await progress?("Saving witnesses to database...", 70)
-
-                        // Update database with witnesses and anchors
-                        for (index, result) in results.enumerated() {
-                            if let (position, witness) = result {
-                                let note = notesInBoost[index].note
-
-                                // CRITICAL FIX #557 v30: Use FFI function to extract root from witness!
-                                // witness.suffix(32) returns zeros - witness structure doesn't store root at end!
-                                guard let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) else {
-                                    print("❌ FIX #557 v30: Failed to extract root from witness for note \(note.id)")
-                                    continue
-                                }
-
-                                // Update witness
-                                do {
-                                    try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                    print("✅ FIX #557 v30: Updated note \(note.id) witness, root: \(witnessAnchor.prefix(4).hexString)...")
-                                } catch {
-                                    print("❌ FIX #557 v30: Failed to update witness for note \(note.id): \(error.localizedDescription)")
-                                }
-
-                                // Update anchor FROM witness root (transaction builder will use same method!)
-                                do {
-                                    try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                    print("✅ FIX #557 v30: Updated note \(note.id) anchor: \(witnessAnchor.prefix(4).hexString)...")
-                                } catch {
-                                    print("❌ FIX #557 v30: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
-                                }
-                                rebuiltCount += 1
-                            }
-                        }
-
-                        // Summary
-                        print("✅ FIX #557 v30: Witness rebuild complete - updated \(rebuiltCount) notes")
-                        print("✅ FIX #557 v30: All anchors extracted using witnessGetRoot() FFI function")
-                        await progress?("Witness rebuild complete!", 100)
-                    }
-
-                    // For notes beyond boost file, we need delta CMUs from chain
-                    // This is more expensive but necessary for correctness
-                    // FIX #XXX: Skip P2P witness rebuild during import to avoid 20+ second delays
-                    if !notesAfterBoost.isEmpty && !isImportedWallet {
-                        print("🔄 FIX #557 v29: \(notesAfterBoost.count) note(s) beyond boost file, fetching delta CMUs to CHAIN TIP...")
-
-                        // FIX #557 v29: Fetch to CHAIN TIP (not just maxNoteHeight!) - Dec 24th approach!
-                        // This ensures all witnesses have the SAME root (at chain tip state)
+                        // Fetch delta CMUs to CHAIN TIP (not just maxNoteHeight!)
                         let networkManager = NetworkManager.shared
                         let chainHeight = try await networkManager.getChainHeight()
-                        let maxNoteHeight = notesAfterBoost.map { $0.note.height }.max() ?? boostHeight
-                        let targetHeight = max(chainHeight, maxNoteHeight)  // Go to chain tip!
+                        let targetHeight = max(chainHeight, boostHeight)  // Go to chain tip!
 
-                        print("🔄 FIX #557 v29: Boost height: \(boostHeight), Max note height: \(maxNoteHeight), Chain tip: \(chainHeight)")
-                        print("🔄 FIX #557 v29: Fetching delta CMUs to height \(targetHeight) (all witnesses will have same root!)")
+                        print("🔄 FIX #557 v31: Boost height: \(boostHeight), Chain tip: \(chainHeight), Target: \(targetHeight)")
 
-                        // FIX #119: Check for actual connected peers, not just "isConnected" flag
-                        let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
-                        if connectedPeerCount > 0 {
-                            // Fetch blocks between boostHeight+1 and CHAIN TIP (not just maxNoteHeight!)
-                            // FIX #115: More resilient P2P fetch with per-batch retry and longer timeouts
-                            var deltaCMUs: [Data] = []
-                            let startHeight = boostHeight + 1
-                            let batchSize = 50
-                            var failedBatches = 0
-                            let maxRetries = 2
-                            let maxConsecutiveFailures = 3  // FIX #119: Stop after 3 consecutive batch failures
+                        // Check if we need delta CMUs
+                        var combinedCMUData = cmuData
+                        var deltaCMUFetched = false
 
-                            var currentHeight = startHeight
-                            var consecutiveFailures = 0
-                            while currentHeight <= targetHeight && consecutiveFailures < maxConsecutiveFailures {
-                                let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
-                                let blockCount = Int(endHeight - currentHeight + 1)
+                        if targetHeight > boostHeight {
+                            print("🔄 FIX #557 v31: Fetching delta CMUs from \(boostHeight + 1) to \(targetHeight)...")
+                            await progress?("Fetching delta CMUs...", 40)
 
-                                var batchSucceeded = false
-                                // Retry each batch up to maxRetries times
-                                for attempt in 1...maxRetries {
-                                    do {
-                                        // FIX #110: Use getBlocksOnDemandP2P which has multi-peer retry and reconnection logic
-                                        // FIX #115: Increased timeout from 15s to 30s for Tor reliability
-                                        let blocks = try await withTimeout(seconds: 30) {
-                                            try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
-                                        }
-                                        for block in blocks {
-                                            for tx in block.transactions {
-                                                for output in tx.outputs {
-                                                    deltaCMUs.append(output.cmu)
+                            let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
+                            if connectedPeerCount > 0 {
+                                var deltaCMUs: [Data] = []
+                                let startHeight = boostHeight + 1
+                                let batchSize = 50
+                                let maxRetries = 2
+                                let maxConsecutiveFailures = 3
+
+                                var currentHeight = startHeight
+                                var consecutiveFailures = 0
+
+                                while currentHeight <= targetHeight && consecutiveFailures < maxConsecutiveFailures {
+                                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
+                                    let blockCount = Int(endHeight - currentHeight + 1)
+
+                                    var batchSucceeded = false
+                                    for attempt in 1...maxRetries {
+                                        do {
+                                            let blocks = try await withTimeout(seconds: 30) {
+                                                try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
+                                            }
+                                            for block in blocks {
+                                                for tx in block.transactions {
+                                                    for output in tx.outputs {
+                                                        deltaCMUs.append(output.cmu)
+                                                    }
                                                 }
                                             }
-                                        }
-                                        batchSucceeded = true
-                                        consecutiveFailures = 0  // Reset on success
-                                        break // Success, exit retry loop
-                                    } catch {
-                                        if attempt < maxRetries {
-                                            print("⚠️ Pre-witness: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)), retrying...")
-                                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second delay before retry
-                                        } else {
-                                            print("⚠️ Pre-witness: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts: \(error.localizedDescription)")
-                                            failedBatches += 1
+                                            batchSucceeded = true
+                                            consecutiveFailures = 0
+                                            break
+                                        } catch {
+                                            if attempt < maxRetries {
+                                                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                            } else {
+                                                print("⚠️ FIX #557 v31: Batch failed: \(error.localizedDescription)")
+                                            }
                                         }
                                     }
-                                }
 
-                                if !batchSucceeded {
-                                    consecutiveFailures += 1
-                                }
-
-                                currentHeight = endHeight + 1
-                            }
-
-                            // FIX #119: Log if we stopped early due to network issues
-                            if consecutiveFailures >= maxConsecutiveFailures {
-                                print("⚠️ Pre-witness: Stopping delta fetch after \(maxConsecutiveFailures) consecutive failures (network unavailable)")
-                            }
-
-                            // Only proceed if we got some CMUs (allow partial success)
-                            if !deltaCMUs.isEmpty || failedBatches == 0 {
-                                // Build combined CMU data: boost + delta
-                                let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-                                let totalCount = boostCount + UInt64(deltaCMUs.count)
-
-                                var combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
-                                var countLE = totalCount
-                                withUnsafeBytes(of: &countLE) { combinedCMUData.append(contentsOf: $0) }
-                                combinedCMUData.append(cmuData.suffix(from: 8))
-                                for cmu in deltaCMUs {
-                                    combinedCMUData.append(cmu)
-                                }
-
-                                // Rebuild witnesses for notes after boost
-                                let afterBoostCMUs = notesAfterBoost.map { $0.cmu }
-                                let afterResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: afterBoostCMUs)
-
-                                for (index, result) in afterResults.enumerated() {
-                                    if let (_, witness) = result {
-                                        let note = notesAfterBoost[index].note
-                                        // FIX #557 v30: Use FFI function to extract root from witness!
-                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) {
-                                            try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                            try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                            rebuiltCount += 1
-                                        } else {
-                                            print("❌ FIX #557 v30: Failed to extract root from witness for note \(note.id)")
-                                        }
+                                    if !batchSucceeded {
+                                        consecutiveFailures += 1
                                     }
+
+                                    currentHeight = endHeight + 1
                                 }
 
-                                if failedBatches > 0 {
-                                    print("⚠️ Pre-witness: \(failedBatches) batch(es) failed, some notes may need rebuild at send time")
+                                if !deltaCMUs.isEmpty || consecutiveFailures == 0 {
+                                    // Combine boost + delta CMUs
+                                    let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+                                    let totalCount = boostCount + UInt64(deltaCMUs.count)
+
+                                    combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
+                                    var countLE = totalCount
+                                    withUnsafeBytes(of: &countLE) { combinedCMUData.append(contentsOf: $0) }
+                                    combinedCMUData.append(cmuData.suffix(from: 8))
+                                    for cmu in deltaCMUs {
+                                        combinedCMUData.append(cmu)
+                                    }
+
+                                    print("✅ FIX #557 v31: Fetched \(deltaCMUs.count) delta CMUs to height \(targetHeight)")
+                                    print("✅ FIX #557 v31: Combined CMU count: \(totalCount) (boost: \(boostCount) + delta: \(deltaCMUs.count))")
+                                    deltaCMUFetched = true
+                                } else {
+                                    print("⚠️ FIX #557 v31: Failed to fetch delta CMUs, using boost only (witnesses will have old roots)")
                                 }
                             } else {
-                                print("⚠️ Pre-witness: All P2P batches failed, notes will rebuild at send time")
+                                print("⚠️ FIX #557 v31: No peers connected, using boost only")
                             }
                         } else {
-                            print("⚠️ Pre-witness: No P2P peers connected (0 peers) - skipping delta CMU fetch")
+                            print("✅ FIX #557 v31: Already at chain tip (\(targetHeight) == \(boostHeight))")
                         }
-                    } else if !notesAfterBoost.isEmpty && isImportedWallet {
-                        // FIX #482: For PHASE 2 notes during import/repair, try direct FFI tree retrieval
-                        // FilterScanner should have updated witnesses via treeAppend auto-update
-                        // But we verify and use FFI tree witnesses as fallback
-                        print("🔧 FIX #482: \(notesAfterBoost.count) PHASE 2 note(s) - using FFI tree witnesses...")
 
-                        var ffiCount = 0
-                        var failedCount = 0
+                        // Create ALL witnesses from combined CMU data (boost + delta to chain tip!)
+                        await progress?("Creating witnesses at chain tip...", 60)
+                        let allTargetCMUs = notesNeedingRebuild.map { $0.cmu }
+                        let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: allTargetCMUs)
 
-                        for item in notesAfterBoost {
-                            let note = item.note
-                            let cmu = item.cmu
+                        // Save witnesses with anchors extracted FROM witnesses
+                        await progress?("Saving witnesses...", 80)
+                        for (index, result) in results.enumerated() {
+                            if let (_, witness) = result {
+                                let note = notesNeedingRebuild[index].note
 
-                            // FIX #557 v6: Check witness root FIRST, not database anchor
-                            // The database anchor might be current but witness bytes might be stale!
-                            var witnessIsCurrent = false
-
-                            if !note.witness.isEmpty {
-                                if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
-                                    if witnessAnchor == currentTreeRoot {
-                                        witnessIsCurrent = true
-                                        ffiCount += 1
+                                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) {
+                                    do {
+                                        try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                        try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                        print("✅ FIX #557 v31: Updated note \(note.id), root: \(witnessAnchor.prefix(4).hexString)...")
+                                        rebuiltCount += 1
+                                    } catch {
+                                        print("❌ FIX #557 v31: Failed to update note \(note.id): \(error.localizedDescription)")
                                     }
-                                }
-                            }
-
-                            if witnessIsCurrent {
-                                continue
-                            }
-
-                            // Witness is stale - mark for rebuild at send time
-                            print("⚠️ FIX #557 v6: Note at height \(note.height) has stale witness (will rebuild at send)")
-                            failedCount += 1
-                        }
-
-                        if ffiCount > 0 {
-                            print("✅ FIX #482: \(ffiCount) PHASE 2 witness(es) already current")
-                        }
-                        if failedCount > 0 {
-                            print("⚠️ FIX #482: \(failedCount) PHASE 2 witness(es) need rebuild (FIX #480 will handle at send)")
-                        }
-                    }
-
-                    if rebuiltCount > 0 {
-                        print("✅ Pre-witness: Rebuilt \(rebuiltCount) witness(es) - INSTANT payments ready!")
-                    }
-                    if rebuiltCount < notesNeedingRebuild.count {
-                        print("⚠️ Pre-witness: \(notesNeedingRebuild.count - rebuiltCount) witness(es) will rebuild at send time")
-
-                        // FIX #469: If ALL witnesses failed, invalidate stale CMU cache and retry
-                        if rebuiltCount == 0 && !notesInBoost.isEmpty {
-                            print("⚠️ FIX #469: All witnesses failed - invalidating stale CMU cache and retrying...")
-                            await CommitmentTreeUpdater.shared.invalidateCMUCachePublic()
-
-                            // Retry with fresh CMU data
-                            if let newCmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                               let newCmuData = try? Data(contentsOf: newCmuPath) {
-                                print("🔄 FIX #469: Retrying witness creation with fresh CMU data...")
-                                let retryResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: newCmuData, targetCMUs: notesInBoost.map { $0.cmu })
-
-                                var retryCount = 0
-                                for (index, result) in retryResults.enumerated() {
-                                    if let (_, witness) = result {
-                                        let note = notesInBoost[index].note
-                                        // FIX #555: Update witness, use HeaderStore anchor (not witness root)
-                                        try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
-                                            try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
-                                        }
-                                        retryCount += 1
-                                    }
-                                }
-
-                                if retryCount > 0 {
-                                    print("✅ FIX #469: Retry succeeded - \(retryCount)/\(notesInBoost.count) witnesses created")
-                                    rebuiltCount += retryCount
                                 } else {
-                                    print("❌ FIX #469: Retry also failed - CMUs may not be in bundled data")
+                                    print("❌ FIX #557 v31: Failed to extract root for note \(note.id)")
                                 }
                             }
                         }
+
+                        if deltaCMUFetched {
+                            print("✅ FIX #557 v31: Rebuilt \(rebuiltCount) witnesses at CHAIN TIP (all have same root!)")
+                        } else {
+                            print("⚠️ FIX #557 v31: Rebuilt \(rebuiltCount) witnesses at boost height (may have different roots)")
+                        }
+                        await progress?("Witness rebuild complete!", 100)
                     }
 
                     // CRITICAL: Restore tree state after witness rebuild
