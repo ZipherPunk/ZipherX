@@ -2015,6 +2015,19 @@ final class WalletManager: ObservableObject {
                     }
 
                     print("✅ FIX #557 v32: Appended \(deltaCMUs.count) delta CMUs")
+
+                    // CRITICAL FIX #557 v35: Verify tree root matches header at chainHeight
+                    if let header = try? HeaderStore.shared.getHeader(at: chainHeight),
+                       let ourRoot = ZipherXFFI.treeRoot() {
+                        if ourRoot == header.hashFinalSaplingRoot {
+                            print("✅ FIX #557 v35: Tree root VERIFIED at height \(chainHeight)")
+                        } else {
+                            print("⚠️ FIX #557 v35: Tree root MISMATCH at height \(chainHeight)")
+                            print("   Our root:   \(ourRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            print("   Delta CMUs may be incomplete or wrong!")
+                        }
+                    }
                 } else {
                     print("⚠️ FIX #557 v32: Failed to fetch delta CMUs")
                 }

@@ -1502,6 +1502,16 @@ final class FilterScanner {
     private func fixTreeRootMismatch(lastScannedHeight: UInt64) async -> Bool {
         print("🔧 FIX #524: Starting tree root mismatch repair...")
 
+        // CRITICAL FIX #557 v35: Check if tree root already matches header (FIX #557 v32 handles this now!)
+        // FIX #524 should NOT run if FIX #557 v32 already synced the tree!
+        if let header = try? HeaderStore.shared.getHeader(at: lastScannedHeight),
+           let ourRoot = ZipherXFFI.treeRoot() {
+            if ourRoot == header.hashFinalSaplingRoot {
+                print("✅ FIX #557 v35: Tree root already matches header at \(lastScannedHeight) - FIX #524 not needed!")
+                return true
+            }
+        }
+
         // Step 1: Get the correct tree root from boost file (should match blockchain)
         let effectiveHeight = ZipherXConstants.effectiveTreeHeight
         let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
