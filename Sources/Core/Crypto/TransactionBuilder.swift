@@ -131,18 +131,19 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // FIX #376: Always fetch FRESH peer consensus height
-        // Cached chainHeight can be stale when HeaderStore is behind
-        let cachedChainHeightFallback = await MainActor.run { NetworkManager.shared.chainHeight }
-        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? cachedChainHeightFallback
-        print("📊 FIX #376: Chain height (peer consensus): \(chainHeight)")
+        // Get current chain height (use cached first to avoid network delay)
+        var chainHeight = NetworkManager.shared.chainHeight
+        if chainHeight == 0 {
+            chainHeight = try await NetworkManager.shared.getChainHeight()
+        }
+        print("📊 Current chain height: \(chainHeight)")
 
         // Get notes from database - requires valid witnesses
-        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        var dbNotes = try database.getUnspentNotes(accountId: account.id)
 
         // If no notes with witnesses, check for notes without witnesses that need rebuild
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
+            let allNotes = try database.getAllUnspentNotes(accountId: account.id)
             if allNotes.isEmpty {
                 print("📝 No notes found in database")
                 throw TransactionError.insufficientFunds
@@ -257,16 +258,16 @@ final class TransactionBuilder {
         } else {
             print("⚠️ Block header not available at height \(noteHeight)")
             print("📝 Will compute anchor by building tree to note height...")
-            // FIX #551: Don't use zero placeholder - handle explicitly later
-            anchorFromHeader = Data()  // Empty data, checked explicitly below
+            // anchorFromHeader will be set after rebuilding witness
+            anchorFromHeader = Data(count: 32) // placeholder
         }
 
         // OPTIMIZATION: Check if witness is already current (background sync keeps it updated)
         var witnessToUse = note.witness
         var needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
 
-        // Check if we have a valid anchor from header store (non-empty and not all zeros)
-        let haveHeaderAnchor = !anchorFromHeader.isEmpty && !anchorFromHeader.allSatisfy { $0 == 0 }
+        // Check if we have a valid anchor from header store
+        let haveHeaderAnchor = !anchorFromHeader.allSatisfy { $0 == 0 }
 
         if needsRebuild {
             print("⚠️ Witness invalid (\(note.witness.count) bytes), needs rebuild")
@@ -284,14 +285,20 @@ final class TransactionBuilder {
                     print("   witnessRoot: \(witnessRootHex)... == headerAnchor: \(headerAnchorHex)...")
                     needsRebuild = false
                 } else {
-                    // FIX #557 v3: Rebuild witness to match header anchor!
-                    // The witness was built with wrong tree state - rebuild it now.
-                    print("⚠️ FIX #557 v3: Witness root differs from header anchor!")
+                    // CRITICAL ERROR: Witness was built with wrong tree state!
+                    // This can't be fixed at transaction time - need database repair.
+                    print("❌ WITNESS/ANCHOR MISMATCH DETECTED!")
                     print("   witnessRoot:   \(witnessRootHex)...")
                     print("   headerAnchor:  \(headerAnchorHex)...")
                     print("   Note height:   \(noteHeight)")
-                    print("   Will rebuild witness to match header anchor...")
-                    needsRebuild = true
+                    print("")
+                    print("💡 The witness was saved with a different tree state than the blockchain's.")
+                    print("   To fix: Go to Settings → 'Repair Notes (fix balance)'")
+                    throw TransactionError.witnessAnchorMismatch(
+                        noteHeight: noteHeight,
+                        witnessRoot: witnessRootHex,
+                        headerAnchor: headerAnchorHex
+                    )
                 }
             } else {
                 print("⚠️ Could not extract root from witness, will rebuild")
@@ -348,15 +355,8 @@ final class TransactionBuilder {
                     print("📝 Using computed anchor: \(anchorHex)...")
                 }
             } else {
-                // FIX #557 v25: Rebuild failed (e.g., delta CMUs fetch failed)
-                // Use database witness/anchor instead - FIX #557 v24 set these correctly with per-note anchors
-                print("⚠️ FIX #557 v25: Witness rebuild returned nil, using database witness/anchor")
-                print("⚠️ FIX #557 v25: Database has per-note anchors from FIX #557 v24")
-                witnessToUse = note.witness
-                if note.anchor.count == 32 {
-                    anchorFromHeader = note.anchor
-                    print("✅ FIX #557 v25: Using database anchor: \(note.anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                }
+                print("❌ Failed to rebuild witness")
+                throw TransactionError.proofGenerationFailed
             }
         } else if noteHeight <= downloadedTreeHeight && needsRebuild, let cmu = noteCMU {
             // Note is within downloaded tree range - use treeCreateWitnessForCMU
@@ -372,53 +372,9 @@ final class TransactionBuilder {
                 print("✅ Created witness at position \(result.position)")
                 witnessToUse = result.witness
             } else {
-                // FIX #493 v3: CMU not in bundled file - rebuild via P2P
-                print("⚠️ FIX #493 v3: CMU not in bundled file, rebuilding via P2P...")
-                if let result = try await rebuildWitnessForNote(
-                    cmu: cmu,
-                    noteHeight: noteHeight,
-                    downloadedTreeHeight: downloadedTreeHeight,
-                    chainHeight: chainHeight
-                ) {
-                    witnessToUse = result.witness
-                    print("✅ FIX #493 v3: Rebuilt witness via P2P (\(result.witness.count) bytes)")
-                } else {
-                    // FIX #557 v25: P2P rebuild failed - use database witness/anchor
-                    // FIX #557 v24 set per-note anchors in database correctly
-                    print("⚠️ FIX #557 v25: P2P rebuild failed, using database witness/anchor")
-                    witnessToUse = note.witness
-                    if note.anchor.count == 32 {
-                        anchorFromHeader = note.anchor
-                        print("✅ FIX #557 v25: Using database anchor: \(note.anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                    }
-                }
+                print("❌ Failed to find note CMU in downloaded tree")
+                throw TransactionError.proofGenerationFailed
             }
-        }
-
-        // FIX #557 v27: ALWAYS use HeaderStore anchor - it's the source of truth!
-        // The witness root may differ (witness created from boost file at wrong position)
-        // But HeaderStore has the correct anchor from blockchain at note's height
-        var anchorToUse = anchorFromHeader
-        if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-            let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-            let headerAnchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-
-            if witnessRoot == anchorFromHeader {
-                print("✅ FIX #557 v27: Witness root matches header anchor - PERFECT!")
-                print("   witnessRoot: \(witnessRootHex)... == headerAnchor: \(headerAnchorHex)...")
-                anchorToUse = witnessRoot
-            } else {
-                // FIX #557 v27: Witness root differs, but TRUST HeaderStore anchor!
-                // HeaderStore anchor is from actual blockchain at note's height
-                // Witness root is from boost file (may be at different tree position)
-                print("⚠️ FIX #557 v27: Witness root differs from header anchor!")
-                print("   witnessRoot:  \(witnessRootHex)...")
-                print("   headerAnchor: \(headerAnchorHex)...")
-                print("   ✅ Using HeaderStore anchor (blockchain source of truth)")
-                anchorToUse = anchorFromHeader  // CRITICAL: Use HeaderStore anchor!
-            }
-        } else {
-            print("⚠️ FIX #557 v27: Could not extract witness root, using header anchor")
         }
 
         // VUL-002 FIX: Use encrypted key FFI to ensure key is decrypted only in Rust
@@ -432,8 +388,8 @@ final class TransactionBuilder {
             toAddress: toAddressBytes,
             amount: amount,
             memo: memoData,
-            anchor: anchorToUse,  // FIX #557 v2: Use witness root (not header anchor!)
-            witness: witnessToUse,  // Use original witness (no modification!)
+            anchor: anchorFromHeader,  // CRITICAL: Use anchor from block header at note height
+            witness: witnessToUse,     // Use rebuilt witness that matches anchor
             noteValue: note.value,
             noteRcm: note.rcm,
             noteDiversifier: note.diversifier,
@@ -500,16 +456,15 @@ final class TransactionBuilder {
             throw TransactionError.proofGenerationFailed
         }
 
-        // FIX #376: Always fetch FRESH peer consensus height
-        // Cached chainHeight can be stale when HeaderStore is behind
-        let cachedChainHeightFallback = await MainActor.run { NetworkManager.shared.chainHeight }
-        let chainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? cachedChainHeightFallback
-        print("📊 FIX #376: Chain height (peer consensus): \(chainHeight)")
-
-        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        // Use cached chain height first to avoid network delay
+        var chainHeight = NetworkManager.shared.chainHeight
+        if chainHeight == 0 {
+            chainHeight = try await NetworkManager.shared.getChainHeight()
+        }
+        var dbNotes = try database.getUnspentNotes(accountId: account.id)
 
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
+            let allNotes = try database.getAllUnspentNotes(accountId: account.id)
             if allNotes.isEmpty {
                 throw TransactionError.insufficientFunds
             }
@@ -891,37 +846,27 @@ final class TransactionBuilder {
                 let noteCMU = note.cmu
                 let noteHeight = note.height
 
-                // FIX #480 v2: Don't force rebuild based on tree size alone
-                // The old logic (treeSize > 1M) was always true after import, causing 42s delays
-                // Instead, rely on witness root validation below to detect stale witnesses
-                let currentTreeSize = ZipherXFFI.treeSize()
-                if currentTreeSize > 1000000 && note.witness.count == 1028 && !needsRebuild {
-                    print("📊 FIX #480 v2: Large tree (\(currentTreeSize) CMUs) - validating witness root instead of forcing rebuild")
-                    // Don't set needsRebuild = true - let validation below decide
-                }
+                // INSTANT MODE CHECK: If witness has valid structure and was updated by pre-witness rebuild,
+                // trust it without requiring header validation (header sync may lag behind tree sync)
+                if !needsRebuild && note.witness.count >= 1028 {
+                    // Extract the anchor from the witness itself (last 32 bytes)
+                    let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness)
 
-                // FIX #557 v5: ALWAYS rebuild witness to chain tip
-                // Check if chain moved forward > 100 blocks - witness is stale
-                let chainGap = chainHeight > note.height ? (chainHeight - note.height) : 0
-                if chainGap > 100 {
-                    print("⚠️ Note \(index + 1): Chain moved forward \(chainGap) blocks - forcing rebuild")
-                    print("   Note height: \(note.height)")
-                    print("   Chain height: \(chainHeight)")
-                    needsRebuild = true
-                } else if !needsRebuild && note.witness.count >= 1028 {
-                    // Recent witness - validate it
-                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
-                        if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
-                            if witnessRoot == headerAnchor && ZipherXFFI.witnessPathIsValid(note.witness) {
-                                print("✅ Note \(index + 1) witness current - INSTANT mode!")
-                            } else {
-                                print("⚠️ Note \(index + 1) witness validation failed - forcing rebuild")
-                                needsRebuild = true
-                            }
+                    if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
+                        // Witness has a valid root - check if it matches stored anchor
+                        if note.anchor == witnessRoot {
+                            print("✅ Note \(index + 1) witness anchor consistent - INSTANT mode!")
+                            // Witness and stored anchor match - trust it
+                        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
+                            // Stored anchor differs from witness - use witness (more recent from pre-witness)
+                            print("✅ Note \(index + 1) using witness root (pre-witness updated) - INSTANT mode!")
                         } else {
-                            needsRebuild = true
+                            // No valid stored anchor but witness has one - trust witness
+                            print("✅ Note \(index + 1) using witness root - INSTANT mode!")
                         }
                     } else {
+                        // Witness structure invalid - need rebuild
+                        print("⚠️ Note \(index + 1) witness has invalid root - forcing rebuild")
                         needsRebuild = true
                     }
                 } else if !needsRebuild {
@@ -937,7 +882,7 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
 
-                    print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight) (P2P sync)")
+                    print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight)")
                     // FIX #115: Pass chainHeight for consistent anchor
                     if let result = try await rebuildWitnessForNote(
                         cmu: cmu,
@@ -950,191 +895,16 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
                 } else if needsRebuild, let cmu = noteCMU {
-                    print("⚠️ Rebuilding witness for note \(index + 1) using bundled CMU file")
                     guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
                           let cachedData = try? Data(contentsOf: cachedPath) else {
-                        print("❌ FIX #480: Failed to get bundled CMU file")
                         throw TransactionError.proofGenerationFailed
                     }
 
-                    print("🔧 FIX #480: Creating witness from bundled CMU file (\(cachedData.count) bytes)")
-                    print("🔧 Target CMU: \(cmu.prefix(16).hexString)...")
-                    print("🔧 Note height: \(noteHeight), downloadedTreeHeight: \(downloadedTreeHeight)")
-
-                    // FIX #531: CRITICAL - Include PHASE 2 CMUs to match global tree state
-                    // The cached legacy file only has boost file CMUs, but global tree may have PHASE 2 CMUs
-                    var cmuDataToUse = cachedData
-                    let cachedCount = UInt64((cachedData.count - 8) / 32)
-                    let currentTreeSize = ZipherXFFI.treeSize()
-
-                    if currentTreeSize > cachedCount {
-                        print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, cached file has \(cachedCount) CMUs")
-                        print("🔧 FIX #531: Adding \(currentTreeSize - cachedCount) PHASE 2 CMUs to witness creation...")
-
-                        // Get PHASE 2 CMUs from DeltaCMU manager
-                        if let manifest = DeltaCMUManager.shared.getManifest(),
-                           manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
-                            let boostEndHeight = ZipherXConstants.effectiveTreeHeight
-                            if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
-                                startHeight: boostEndHeight + 1,
-                                endHeight: manifest.endHeight
-                            ) {
-                                // Append delta CMUs to the data
-                                var newCount = currentTreeSize
-                                var newCmuData = Data()
-
-                                // Write new count
-                                newCmuData.append(contentsOf: withUnsafeBytes(of: UInt64(newCount).littleEndian) { Array($0) })
-
-                                // Copy cached CMUs (skip count byte)
-                                newCmuData.append(cachedData[8...])
-
-                                // Append delta CMUs
-                                for cmu in deltaCMUs {
-                                    newCmuData.append(cmu)
-                                }
-
-                                cmuDataToUse = newCmuData
-                                print("✅ FIX #531: Updated CMU data to \(newCount) CMUs (\(cmuDataToUse.count) bytes)")
-                            } else {
-                                print("⚠️ FIX #531: Failed to load delta CMUs - witness may be invalid!")
-                            }
-                        }
-                    }
-
-                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cmuDataToUse, targetCMU: cmu) {
+                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
                         witnessToUse = result.witness
-                        print("✅ FIX #480: Witness created successfully at position \(result.position) (\(result.witness.count) bytes)")
                     } else {
-                        // FIX #514 v4: Try boost file outputs section when legacy_cmus_v2.bin fails
-                        // The legacy file only contains trial-decrypted notes, not boost-imported notes
-                        print("⚠️ FIX #514 v4: CMU not in legacy_cmus_v2.bin, trying boost file outputs section...")
-                        var foundInBoost = false
-                        do {
-                            // extractShieldedOutputs gets data from boost file outputs section (has ALL notes)
-                            let boostOutputsData = try await CommitmentTreeUpdater.shared.extractShieldedOutputs()
-                            // Convert outputs data to legacy CMU format for treeCreateWitnessForCMU
-                            // Outputs format: height(4) + index(4) + cmu(32) + epk(32) + enc(580) + txid(32) = 684 bytes
-                            // Need to extract just CMUs in order
-                            let entrySize = 684
-                            let count = boostOutputsData.count / entrySize
-                            var cmuData = Data()
-                            // Write count as UInt64 LE
-                            cmuData.append(contentsOf: withUnsafeBytes(of: UInt64(count).littleEndian) { Array($0) })
-                            // Extract CMUs from each output entry
-                            for i in 0..<count {
-                                let offset = i * entrySize + 8  // Skip height(4) + index(4)
-                                let cmu = boostOutputsData[offset..<offset+32]
-                                cmuData.append(contentsOf: cmu)
-                            }
-
-                            print("📦 FIX #514 v4: Extracted \(count) CMUs from boost file outputs section (\(cmuData.count) bytes)")
-
-                            // FIX #531: CRITICAL - Include PHASE 2 CMUs to match global tree state
-                            // The witness must be created from the SAME tree state as the blockchain
-                            // If global tree has more CMUs than boost file, we need to include them
-                            let currentTreeSize = ZipherXFFI.treeSize()
-                            let boostCount = UInt64(count)
-                            if currentTreeSize > boostCount {
-                                print("🔧 FIX #531: Global tree has \(currentTreeSize) CMUs, boost has \(boostCount) CMUs")
-                                print("🔧 FIX #531: Adding \(currentTreeSize - boostCount) PHASE 2 CMUs to witness creation...")
-
-                                // Get PHASE 2 CMUs from DeltaCMU manager
-                                if let manifest = DeltaCMUManager.shared.getManifest(),
-                                   manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
-                                    let boostEndHeight = ZipherXConstants.effectiveTreeHeight
-                                    if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
-                                        startHeight: boostEndHeight + 1,
-                                        endHeight: manifest.endHeight
-                                    ) {
-                                        // Append delta CMUs to the data
-                                        var newCount = currentTreeSize
-                                        var newCmuData = Data()
-
-                                        // Write new count
-                                        newCmuData.append(contentsOf: withUnsafeBytes(of: UInt64(newCount).littleEndian) { Array($0) })
-
-                                        // Copy boost CMUs
-                                        newCmuData.append(cmuData[8...])  // Skip count byte
-
-                                        // Append delta CMUs
-                                        for cmu in deltaCMUs {
-                                            newCmuData.append(cmu)
-                                        }
-
-                                        cmuData = newCmuData
-                                        print("✅ FIX #531: Updated CMU data to \(newCount) CMUs (\(cmuData.count) bytes)")
-                                    } else {
-                                        print("⚠️ FIX #531: Failed to load delta CMUs - witness may be invalid!")
-                                    }
-                                }
-                            }
-
-                            if let boostResult = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cmuData, targetCMU: cmu) {
-                                witnessToUse = boostResult.witness
-                                print("✅ FIX #514 v4: Witness created from boost file outputs at position \(boostResult.position) (\(boostResult.witness.count) bytes)")
-                                foundInBoost = true
-                            } else {
-                                print("❌ FIX #514 v4: CMU not found in boost file outputs section either!")
-                            }
-                        } catch {
-                            print("⚠️ FIX #514 v4: Boost file extraction failed: \(error.localizedDescription)")
-                        }
-
-                        if !foundInBoost {
-                            // FIX #493 v3: CMU not in bundled file - ALWAYS rebuild via P2P
-                            // This handles both PHASE 2 notes (height > downloadedTreeHeight) AND
-                            // notes found during scan that were appended to global tree
-                            print("⚠️ FIX #493 v3: CMU not found in bundled file")
-                            print("   Target CMU: \(cmu.hexString)")
-                            print("   Bundled file: \((cachedData.count - 8) / 32) CMUs")
-                            print("   Note height: \(noteHeight), downloadedTreeHeight: \(downloadedTreeHeight)")
-
-                            // FIX #513: Diagnostic - fetch the specific block at note height to verify CMU exists on-chain
-                            // This helps identify if the database CMU is wrong or if bundled file is incomplete
-                            print("🔍 FIX #513: Fetching block at note height \(noteHeight) to verify CMU...")
-                            let connectedPeers = await MainActor.run { NetworkManager.shared.getAllConnectedPeers() }
-                            if let peer = connectedPeers.first {
-                                do {
-                                    let blocks = try await peer.getFullBlocks(from: noteHeight, count: 1)
-                                    if let block = blocks.first {
-                                        var foundCMU = false
-                                        for tx in block.transactions {
-                                            for output in tx.outputs {
-                                                if output.cmu == cmu {
-                                                    foundCMU = true
-                                                    print("✅ FIX #513: CMU VERIFIED at height \(noteHeight) - database is correct!")
-                                                    break
-                                                }
-                                            }
-                                            if foundCMU { break }
-                                        }
-                                        if !foundCMU {
-                                            print("❌ FIX #513: CMU NOT FOUND at height \(noteHeight) - database CMU is WRONG!")
-                                            print("❌ FIX #513: Block has \(block.transactions.reduce(0) { $0 + $1.outputs.count }) outputs")
-                                            print("💡 FIX #513: Run 'Settings → Repair Database → Full Rescan' to fix this note")
-                                        }
-                                    }
-                                } catch {
-                                    print("⚠️ FIX #513: Could not verify CMU on-chain: \(error.localizedDescription)")
-                                }
-                            }
-
-                            // ALWAYS rebuild witness via P2P when CMU not in bundled file
-                            print("🔄 Rebuilding witness via P2P...")
-                            if let result = try await rebuildWitnessForNote(
-                                cmu: cmu,
-                                noteHeight: noteHeight,
-                                downloadedTreeHeight: downloadedTreeHeight,
-                                chainHeight: chainHeight
-                            ) {
-                                witnessToUse = result.witness
-                                print("✅ FIX #493 v3: Rebuilt witness via P2P (\(result.witness.count) bytes)")
-                            } else {
-                                print("❌ Failed to rebuild witness via P2P")
-                                throw TransactionError.proofGenerationFailed
-                            }
-                        }
+                        print("❌ Failed to create witness for note \(index + 1)")
+                        throw TransactionError.proofGenerationFailed
                     }
                 }
 
@@ -1151,19 +921,8 @@ final class TransactionBuilder {
             // Convert to SpendInfoSwift array
             var spendInfos: [ZipherXFFI.SpendInfoSwift] = []
             for (note, witness) in preparedSpends {
-                // FIX #557: Replace witness root with HeaderStore anchor for multi-input too!
-                var modifiedWitness = witness
-                if let noteHeader = try? headerStore.getHeader(at: note.height) {
-                    let anchorFromHeader = noteHeader.hashFinalSaplingRoot
-                    if modifiedWitness.count >= 32 {
-                        // Replace last 32 bytes (the root) with HeaderStore anchor
-                        modifiedWitness.replaceSubrange((modifiedWitness.count - 32)..<modifiedWitness.count, with: anchorFromHeader)
-                        print("🔧 FIX #557: Multi-input - replaced witness root for note at height \(note.height)")
-                    }
-                }
-
                 let info = ZipherXFFI.SpendInfoSwift(
-                    witness: modifiedWitness,  // FIX #557: Use modified witness
+                    witness: witness,
                     value: note.value,
                     rcm: note.rcm,
                     diversifier: note.diversifier
@@ -1197,7 +956,7 @@ final class TransactionBuilder {
         } else {
             // SINGLE-INPUT TRANSACTION (existing logic)
             let note = preparedSpends[0].note
-            var witnessToUse = preparedSpends[0].witness  // FIX #557 v17: var to allow reload after rebuild
+            let witnessToUse = preparedSpends[0].witness
             let noteHeight = note.height
 
             // Get anchor from header store
@@ -1210,82 +969,6 @@ final class TransactionBuilder {
                 anchorFromHeader = Data(count: 32)
             }
 
-            // FIX #557 v5: Check if database witness is already CURRENT before rebuilding
-            // The witness was just rebuilt in pre-witness phase, so check if it matches current anchor
-            var finalWitness = witnessToUse
-            let chainGap = chainHeight > noteHeight ? (chainHeight - noteHeight) : 0
-
-            // FIX #557 v14: Check if witness root matches current anchor BEFORE rebuilding
-            // This avoids the expensive 1M+ CMU tree load when witness is already current
-            var needsRebuild = false
-
-            // FIX #557 v17: Check if rebuild is in progress and wait for it to complete
-            // This prevents race condition where send screen checks witnesses while rebuild is updating DB
-            let wm = WalletManager.shared
-            let isRebuilding = await MainActor.run { wm.isRebuildingWitnesses }
-            if isRebuilding {
-                print("⚠️ FIX #557 v17: Witness rebuild in progress, waiting for completion...")
-                // Wait up to 10 seconds for rebuild to complete
-                for _ in 0..<100 {
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                    let isStillRebuilding = await MainActor.run { wm.isRebuildingWitnesses }
-                    if !isStillRebuilding {
-                        print("✅ FIX #557 v17: Rebuild completed, reloading witness from database...")
-                        // Reload witness from database using cmu as identifier
-                        let database = WalletDatabase.shared
-                        guard let account = try? database.getAccount(index: 0) else { break }
-                        let dbNotes = try database.getUnspentNotes(accountId: account.accountId)
-                        if let freshNote = dbNotes.first(where: { $0.cmu == note.cmu }) {
-                            witnessToUse = freshNote.witness
-                            print("✅ FIX #557 v17: Reloaded witness for note with cmu: \(note.cmu?.prefix(4).hexString ?? "nil")...")
-                        }
-                        break
-                    }
-                }
-                print("⚠️ FIX #557 v17: Wait complete, checking witness freshness...")
-            }
-
-            if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-                if witnessRoot == anchorFromHeader {
-                    let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("✅ FIX #557 v14: Database witness is CURRENT - root matches header anchor!")
-                    print("   Witness root: \(rootHex)... (skipping tree load)")
-                } else {
-                    let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    let headerRootHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("⚠️ FIX #557 v14: Witness root mismatch - needs rebuild")
-                    print("   Witness root: \(witnessRootHex)...")
-                    print("   Header anchor: \(headerRootHex)...")
-                    needsRebuild = true
-                }
-            } else {
-                print("⚠️ FIX #557 v14: Could not extract witness root - forcing rebuild")
-                needsRebuild = true
-            }
-
-            if needsRebuild {
-                if chainGap > 0 {
-                    print("⚠️ FIX #557 v5: Chain moved forward \(chainGap) blocks - rebuilding witness")
-                    print("   Note height: \(noteHeight)")
-                    print("   Chain height: \(chainHeight)")
-                } else {
-                    print("⚠️ FIX #557 v5: Forcing witness rebuild to chain tip")
-                }
-
-                if note.cmu != nil {
-                    print("🔧 FIX #557 v5: Rebuilding witness to chain tip...")
-                    if let result = try await rebuildWitnessForNote(
-                        cmu: note.cmu!,
-                        noteHeight: noteHeight,
-                        downloadedTreeHeight: downloadedTreeHeight,
-                        chainHeight: chainHeight
-                    ) {
-                        finalWitness = result.witness
-                        print("✅ FIX #557 v5: Witness rebuilt (\(result.witness.count) bytes) - anchor will match chain!")
-                    }
-                }
-            }
-
             // VUL-002 FIX: Use encrypted key FFI for single-input transaction
             let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
             print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
@@ -1296,8 +979,8 @@ final class TransactionBuilder {
                 toAddress: toAddressBytes,
                 amount: amount,
                 memo: memoData,
-                anchor: anchorFromHeader,  // FIX #557 v3: Use header anchor (witness rebuilt to match)
-                witness: finalWitness,  // FIX #557 v3: Use rebuilt witness that matches anchor
+                anchor: anchorFromHeader,
+                witness: witnessToUse,
                 noteValue: note.value,
                 noteRcm: note.rcm,
                 noteDiversifier: note.diversifier,
@@ -1321,29 +1004,22 @@ final class TransactionBuilder {
             print("📝 No account found in database")
             return []
         }
-        let dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        let dbNotes = try database.getUnspentNotes(accountId: account.id)
 
         print("📝 Database returned \(dbNotes.count) unspent notes")
 
-        // FIX #376: ALWAYS fetch FRESH peer consensus height for confirmation calculation
-        // Bug: Cached chainHeight can be stale (e.g., HeaderStore height when 12k blocks behind)
-        // This caused notes at height 2950293 to show 0 confirmations when chain was at 2952xxx
-        // because cached chainHeight was 2940620 (HeaderStore)
-        var chainHeight: UInt64 = 0
+        // Get current chain height for confirmation calculation
+        var chainHeight = NetworkManager.shared.chainHeight
 
-        print("📝 FIX #376: Fetching FRESH peer consensus height for confirmations...")
-        if let height = try? await NetworkManager.shared.getChainHeight() {
-            chainHeight = height
-            print("📝 FIX #376: Peer consensus height: \(chainHeight)")
-        } else {
-            // Fallback to cached if peer fetch fails
-            chainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
-            print("⚠️ FIX #376: Using cached height: \(chainHeight)")
-
-            // If still 0, use safe fallback
-            if chainHeight == 0 {
-                chainHeight = 2940000
-                print("⚠️ FIX #376: Using fallback height: \(chainHeight)")
+        // If chain height is 0, fetch it now
+        if chainHeight == 0 {
+            print("📝 Chain height not set, fetching now...")
+            if let height = try? await NetworkManager.shared.getChainHeight() {
+                chainHeight = height
+                print("📝 Fetched chain height: \(chainHeight)")
+            } else {
+                print("⚠️ Failed to get chain height, using 2920000 as fallback")
+                chainHeight = 2920000
             }
         }
 
@@ -1549,85 +1225,6 @@ final class TransactionBuilder {
         let cachedCount = cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
         print("📊 Downloaded tree has \(cachedCount) CMUs ending at height \(downloadedTreeHeight)")
 
-        // FIX #514 v2: Try to create witness directly from downloaded CMUs FIRST
-        // This handles notes that are in the boost file (downloadedTreeHeight range)
-        print("🔍 FIX #514 v2: Checking if CMU is in downloaded file...")
-        if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
-            print("✅ FIX #514 v2: Found CMU in downloaded file at position \(result.position)")
-            print("✅ FIX #514 v2: Witness created from downloaded data (\(result.witness.count) bytes)")
-
-            // FIX #557 v10: Load ALL CMUs to get CURRENT anchor at chain tip!
-            // The witness is created at note's position (correct)
-            // But the anchor MUST be the current tree root (chain tip), not note's old position!
-            // Previously we loaded only up to note position - WRONG anchor (FIX #541 bug)!
-            print("🔧 FIX #557 v10: Loading ALL \(cachedCount) CMUs to get CURRENT anchor at chain tip!")
-
-            // Load ALL CMUs into tree to get CURRENT anchor (not just to note position!)
-            guard ZipherXFFI.treeInit() else {
-                print("❌ Failed to initialize tree for anchor")
-                return nil
-            }
-
-            if !ZipherXFFI.treeLoadFromCMUs(data: cachedData) {
-                print("❌ Failed to load CMUs for anchor")
-                return nil
-            }
-
-            // FIX #557 v11: Fetch delta CMUs from boost end to CURRENT chain tip!
-            // The boost file only goes to downloadedTreeHeight, but we need current chain tip
-            let currentChainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? downloadedTreeHeight
-            let boostHeight = downloadedTreeHeight
-
-            if currentChainHeight > boostHeight {
-                print("🔧 FIX #557 v11: Fetching delta CMUs from \(boostHeight + 1) to \(currentChainHeight)...")
-                let deltaCMUs = await fetchCMUsFromBlocks(startHeight: boostHeight + 1, endHeight: currentChainHeight)
-                print("📊 Got \(deltaCMUs.count) delta CMUs")
-
-                // FIX #557 v16: Check if delta CMUs were successfully fetched
-                if deltaCMUs.isEmpty {
-                    print("⚠️ FIX #557 v16: Failed to fetch delta CMUs (0 fetched, \(currentChainHeight - boostHeight) expected)")
-                    print("⚠️ FIX #557 v16: Tree anchor would be STALE - using HeaderStore anchor as fallback")
-
-                    // FIX #557 v25: Return nil to use database witness/anchor instead
-                    // The boost file witness (result.witness) was created from old tree state
-                    // HeaderStore anchor (headerAnchor) is from current chain state
-                    // These DON'T match - returning them would cause "Anchor NOT FOUND" error
-                    // FIX #557 v24 already set correct per-note anchors in database - use those!
-                    print("⚠️ FIX #557 v25: Boost witness + Header anchor don't match, returning nil")
-                    print("⚠️ FIX #557 v25: Will use database witness/anchor (FIX #557 v24 set these correctly)")
-                    return nil
-                }
-
-                // Append delta CMUs to tree
-                for cmu in deltaCMUs {
-                    _ = ZipherXFFI.treeAppend(cmu: cmu)
-                }
-                print("✅ FIX #557 v11: Tree now at current chain tip \(currentChainHeight)")
-            }
-
-            // Get anchor from CURRENT tree root (chain tip) - CORRECT!
-            guard let anchor = ZipherXFFI.treeRoot() else {
-                print("❌ Failed to get tree root for anchor")
-                return nil
-            }
-
-            print("✅ FIX #557 v10: Anchor from full tree (current): \(anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-
-            // CRITICAL: The witness must also be updated to match the CURRENT anchor!
-            // The result.witness was created at note's position, but we need witness at current tree root
-            // The tree is now loaded with ALL CMUs, so get the witness from the LOADED tree at the same position
-            if let updatedWitness = ZipherXFFI.treeGetWitness(index: result.position) {
-                print("✅ FIX #557 v10: Witness from loaded tree at position \(result.position) (\(updatedWitness.count) bytes)")
-                return (witness: updatedWitness, anchor: anchor)
-            } else {
-                print("⚠️ FIX #557 v10: Failed to get witness from loaded tree, using original (may not match anchor!)")
-                return (witness: result.witness, anchor: anchor)
-            }
-        }
-
-        print("⚠️ FIX #514 v2: CMU not in downloaded file, trying delta blocks...")
-        print("   (Note might be beyond downloadedTreeHeight or in P2P-only range)")
-
         // 2. Initialize fresh tree
         guard ZipherXFFI.treeInit() else {
             print("❌ Failed to initialize tree")
@@ -1656,12 +1253,9 @@ final class TransactionBuilder {
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
 
-        // FIX #514: Also create reversed version of target CMU for byte order comparison
-        let cmuReversed = Data(cmu.reversed())
-
         for blockCMU in allDeltaCMUs {
-            // Check if this is our note's CMU (try both byte orders)
-            if blockCMU == cmu || blockCMU == cmuReversed {
+            // Check if this is our note's CMU
+            if blockCMU == cmu {
                 // Found our note! Append it and capture witness
                 let position = ZipherXFFI.treeAppend(cmu: blockCMU)
                 if position == UInt64.max {
@@ -1831,11 +1425,23 @@ final class TransactionBuilder {
         print("🌳 Creating witnesses using batch processing...")
         let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: allNoteCMUs)
 
-        // 6. FIX #556: Get anchors from HeaderStore for each note based on block height
-        // CRITICAL: Witness root is from CMU position, NOT block height!
-        // Each note is at a different block height, so each needs its own anchor from that block's header.
-        print("🔧 FIX #556: Getting anchors from HeaderStore for each note...")
+        // 6. Get anchor FROM THE FIRST WITNESS (NOT from global tree!)
+        // CRITICAL: treeCreateWitnessesBatch builds its OWN local tree, NOT the global COMMITMENT_TREE.
+        // So ZipherXFFI.treeRoot() returns the WRONG anchor - it returns the global tree's root.
+        // We must extract the anchor from the witness data itself using witnessGetRoot().
+        guard let firstResult = batchResults.first, let (_, firstWitness) = firstResult else {
+            print("❌ Failed to create first witness")
+            throw TransactionError.proofGenerationFailed
+        }
 
+        guard let anchor = ZipherXFFI.witnessGetRoot(firstWitness) else {
+            print("❌ Failed to extract anchor from witness")
+            throw TransactionError.proofGenerationFailed
+        }
+        let rootHex = anchor.map { String(format: "%02x", $0) }.joined()
+        print("📝 Extracted anchor from witness (same for all): \(rootHex.prefix(16))...")
+
+        // 7. Build results with same anchor for all (all witnesses from same batch have same root)
         var results: [(note: SpendableNote, witness: Data, anchor: Data)] = []
         for (index, result) in batchResults.enumerated() {
             guard let (position, witness) = result else {
@@ -1843,17 +1449,8 @@ final class TransactionBuilder {
                 throw TransactionError.proofGenerationFailed
             }
             let note = sortedNotes[index]
-
-            // FIX #556: Get anchor from HeaderStore using note's block height (NOT witness root!)
-            guard let anchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) else {
-                print("❌ Failed to get anchor from HeaderStore for note at height \(note.height)")
-                throw TransactionError.proofGenerationFailed
-            }
-
-            let rootHex = anchor.map { String(format: "%02x", $0) }.joined()
-            print("   ✅ Note \(index + 1): height \(note.height), position \(position), anchor \(rootHex.prefix(16))...")
-
             results.append((note: note, witness: witness, anchor: anchor))
+            print("   ✅ Note \(index + 1): position \(position), witness \(witness.count) bytes")
         }
 
         // 8. Save updated tree state to database
@@ -1871,9 +1468,7 @@ final class TransactionBuilder {
     private func fetchCMUsFromBlocks(startHeight: UInt64, endHeight: UInt64) async -> [Data] {
         var allCMUs: [Data] = []
         let networkManager = NetworkManager.shared
-        // FIX #499: Don't check Tor.mode here - it's @MainActor and can hang if main thread is blocked
-        // We use P2P only anyway (InsightAPI is disabled)
-        let torEnabled = false  // P2P only mode
+        let torEnabled = await TorManager.shared.mode == .enabled
 
         // PRIORITY 1: Check local delta bundle first (instant, no network!)
         // This enables instant witness generation for notes after the bundled tree
@@ -1923,7 +1518,7 @@ final class TransactionBuilder {
 
         // PRIORITY 2: Try P2P (especially important for Tor mode)
         // Try multiple peers before giving up
-        let connectedPeers = await MainActor.run { networkManager.getAllConnectedPeers() }
+        let connectedPeers = networkManager.getAllConnectedPeers()
         if !connectedPeers.isEmpty {
             print("📡 Fetching delta CMUs via P2P (blocks \(startHeight)-\(endHeight))...")
             let blockCount = Int(endHeight - startHeight + 1)

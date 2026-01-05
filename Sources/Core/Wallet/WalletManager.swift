@@ -1906,24 +1906,18 @@ final class WalletManager: ObservableObject {
 
                     // Rebuild witnesses for notes within boost file range
                     if !notesInBoost.isEmpty {
-                        // FIX #557 v27: Use ONLY boost CMUs for witness creation!
-                        // Adding delta CMUs causes witness roots to not match HeaderStore anchors
-                        // Witnesses are created from boost state, anchors from HeaderStore at note heights
-                        // Transaction builder (FIX #557 v27b) will use HeaderStore anchor as source of truth
+                        // FIX #557 v29: RESTORED from Dec 24th working version
+                        // Extract anchor FROM witness (not from HeaderStore!)
+                        // TransactionBuilder will also extract anchor from witness - they WILL match!
                         let boostCMUData = cmuData  // Has format: [count: u64][cmu1: 32]...
 
-                        print("✅ FIX #557 v27: Creating witnesses from boost CMUs only (\(cachedInfo.height) height)")
-                        print("✅ FIX #557 v27: Transaction builder will use HeaderStore anchors (source of truth)")
+                        print("✅ FIX #557 v29: Creating witnesses from boost CMUs (\(cachedInfo.height) height)")
+                        print("✅ FIX #557 v29: Will extract anchor FROM witness (Dec 24th approach)")
                         await progress?("Creating witnesses...", 50)
 
-                        // Create witnesses from boost CMUs only (no delta!)
+                        // Create witnesses from boost CMUs
                         let targetCMUs = notesInBoost.map { $0.cmu }
                         let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: boostCMUData, targetCMUs: targetCMUs)
-
-                        // FIX #557 v24: Use HeaderStore anchor for EACH note (not common anchor!)
-                        // Transaction builder will use HeaderStore anchor as source of truth
-                        let headerStore = HeaderStore.shared
-                        try? headerStore.open()
 
                         // FIX #557 v18: Update progress - witnesses created, saving to database
                         await progress?("Saving witnesses to database...", 70)
@@ -1933,37 +1927,31 @@ final class WalletManager: ObservableObject {
                             if let (position, witness) = result {
                                 let note = notesInBoost[index].note
 
-                                // Get anchor from HeaderStore for this note's block height
-                                if let anchor = try? headerStore.getSaplingRoot(at: UInt64(note.height)) {
-                                    // Update witness
-                                    do {
-                                        try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                        if let witnessRoot = ZipherXFFI.witnessGetRoot(witness) {
-                                            print("✅ FIX #557 v27: Updated note \(note.id) witness, root: \(witnessRoot.prefix(4).hexString)...")
-                                        } else {
-                                            print("⚠️ FIX #557 v27: Witness updated but root extraction failed!")
-                                        }
-                                    } catch {
-                                        print("❌ FIX #557 v27: Failed to update witness for note \(note.id): \(error.localizedDescription)")
-                                    }
+                                // Extract anchor FROM the witness (last 32 bytes) - Dec 24th approach!
+                                let witnessAnchor = witness.suffix(32)
 
-                                    // Update anchor from HeaderStore (transaction builder will use this!)
-                                    do {
-                                        try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: anchor)
-                                        print("✅ FIX #557 v27: Updated note \(note.id) anchor from height \(note.height): \(anchor.prefix(4).hexString)...")
-                                    } catch {
-                                        print("❌ FIX #557 v27: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
-                                    }
-                                    rebuiltCount += 1
-                                } else {
-                                    print("⚠️ FIX #557 v27: Failed to get anchor for note \(note.id) at height \(note.height)")
+                                // Update witness
+                                do {
+                                    try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                    print("✅ FIX #557 v29: Updated note \(note.id) witness, anchor: \(witnessAnchor.prefix(4).hexString)...")
+                                } catch {
+                                    print("❌ FIX #557 v29: Failed to update witness for note \(note.id): \(error.localizedDescription)")
                                 }
+
+                                // Update anchor FROM witness (transaction builder will use same method!)
+                                do {
+                                    try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                    print("✅ FIX #557 v29: Updated note \(note.id) anchor from witness")
+                                } catch {
+                                    print("❌ FIX #557 v29: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
+                                }
+                                rebuiltCount += 1
                             }
                         }
 
-                        // FIX #557 v24: Summary
-                        print("✅ FIX #557 v27: Witness rebuild complete - updated \(rebuiltCount) notes")
-                        print("✅ FIX #557 v27: Transaction builder will use HeaderStore anchors (FIX #557 v27b)")
+                        // Summary
+                        print("✅ FIX #557 v29: Witness rebuild complete - updated \(rebuiltCount) notes")
+                        print("✅ FIX #557 v29: All anchors extracted from witnesses (Dec 24th approach)")
                         await progress?("Witness rebuild complete!", 100)
                     }
 
@@ -1971,17 +1959,22 @@ final class WalletManager: ObservableObject {
                     // This is more expensive but necessary for correctness
                     // FIX #XXX: Skip P2P witness rebuild during import to avoid 20+ second delays
                     if !notesAfterBoost.isEmpty && !isImportedWallet {
-                        print("🔄 Pre-witness: \(notesAfterBoost.count) note(s) beyond boost file, fetching delta CMUs...")
+                        print("🔄 FIX #557 v29: \(notesAfterBoost.count) note(s) beyond boost file, fetching delta CMUs to CHAIN TIP...")
 
-                        // Get the max note height to know how far to fetch
-                        let maxNoteHeight = notesAfterBoost.map { $0.note.height }.max() ?? boostHeight
-
-                        // Fetch delta CMUs from chain via P2P
+                        // FIX #557 v29: Fetch to CHAIN TIP (not just maxNoteHeight!) - Dec 24th approach!
+                        // This ensures all witnesses have the SAME root (at chain tip state)
                         let networkManager = NetworkManager.shared
+                        let chainHeight = await networkManager.getChainHeight()
+                        let maxNoteHeight = notesAfterBoost.map { $0.note.height }.max() ?? boostHeight
+                        let targetHeight = max(chainHeight, maxNoteHeight)  // Go to chain tip!
+
+                        print("🔄 FIX #557 v29: Boost height: \(boostHeight), Max note height: \(maxNoteHeight), Chain tip: \(chainHeight)")
+                        print("🔄 FIX #557 v29: Fetching delta CMUs to height \(targetHeight) (all witnesses will have same root!)")
+
                         // FIX #119: Check for actual connected peers, not just "isConnected" flag
                         let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
                         if connectedPeerCount > 0 {
-                            // Fetch blocks between boostHeight+1 and maxNoteHeight
+                            // Fetch blocks between boostHeight+1 and CHAIN TIP (not just maxNoteHeight!)
                             // FIX #115: More resilient P2P fetch with per-batch retry and longer timeouts
                             var deltaCMUs: [Data] = []
                             let startHeight = boostHeight + 1
@@ -1992,8 +1985,8 @@ final class WalletManager: ObservableObject {
 
                             var currentHeight = startHeight
                             var consecutiveFailures = 0
-                            while currentHeight <= maxNoteHeight && consecutiveFailures < maxConsecutiveFailures {
-                                let endHeight = min(currentHeight + UInt64(batchSize) - 1, maxNoteHeight)
+                            while currentHeight <= targetHeight && consecutiveFailures < maxConsecutiveFailures {
+                                let endHeight = min(currentHeight + UInt64(batchSize) - 1, targetHeight)
                                 let blockCount = Int(endHeight - currentHeight + 1)
 
                                 var batchSucceeded = false
@@ -2059,11 +2052,10 @@ final class WalletManager: ObservableObject {
                                 for (index, result) in afterResults.enumerated() {
                                     if let (_, witness) = result {
                                         let note = notesAfterBoost[index].note
-                                        // FIX #555: Update witness, use HeaderStore anchor (not witness root)
+                                        // FIX #557 v29: Extract anchor FROM witness (Dec 24th approach!)
+                                        let witnessAnchor = witness.suffix(32)
                                         try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
-                                            try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
-                                        }
+                                        try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
                                         rebuiltCount += 1
                                     }
                                 }
