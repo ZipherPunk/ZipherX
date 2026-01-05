@@ -1194,7 +1194,10 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let cmuPtr = sqlite3_column_blob(stmt, 9)
                 let cmuLen = sqlite3_column_bytes(stmt, 9)
-                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if cmuPtr != nil && cmuLen > 0 {
+                    cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                }
             }
 
             // Anchor might be NULL
@@ -1202,7 +1205,10 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
                 let anchorPtr = sqlite3_column_blob(stmt, 10)
                 let anchorLen = sqlite3_column_bytes(stmt, 10)
-                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if anchorPtr != nil && anchorLen > 0 {
+                    anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                }
             }
 
             let note = WalletNote(
@@ -1274,7 +1280,10 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let cmuPtr = sqlite3_column_blob(stmt, 9)
                 let cmuLen = sqlite3_column_bytes(stmt, 9)
-                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if cmuPtr != nil && cmuLen > 0 {
+                    cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                }
             }
 
             // Anchor might be NULL
@@ -1282,7 +1291,10 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
                 let anchorPtr = sqlite3_column_blob(stmt, 10)
                 let anchorLen = sqlite3_column_bytes(stmt, 10)
-                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if anchorPtr != nil && anchorLen > 0 {
+                    anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                }
             }
 
             let note = WalletNote(
@@ -1356,7 +1368,10 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let cmuPtr = sqlite3_column_blob(stmt, 9)
                 let cmuLen = sqlite3_column_bytes(stmt, 9)
-                cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if cmuPtr != nil && cmuLen > 0 {
+                    cmuData = Data(bytes: cmuPtr!, count: Int(cmuLen))
+                }
             }
 
             // Anchor might be NULL
@@ -1364,7 +1379,16 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
                 let anchorPtr = sqlite3_column_blob(stmt, 10)
                 let anchorLen = sqlite3_column_bytes(stmt, 10)
-                anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if anchorPtr != nil && anchorLen > 0 {
+                    anchorData = Data(bytes: anchorPtr!, count: Int(anchorLen))
+                }
+            }
+
+            // FIX #557 v34: Safety check for nullifier (should never be NULL)
+            guard nfPtr != nil && nfLen > 0 else {
+                print("⚠️ WARNING: Note \(id) has NULL nullifier - skipping")
+                continue
             }
 
             let note = WalletNote(
