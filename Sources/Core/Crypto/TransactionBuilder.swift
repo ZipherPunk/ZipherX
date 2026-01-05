@@ -272,34 +272,19 @@ final class TransactionBuilder {
         if needsRebuild {
             print("⚠️ Witness invalid (\(note.witness.count) bytes), needs rebuild")
         } else if haveHeaderAnchor {
-            // CRITICAL: Verify witness root matches header anchor!
-            // The witness contains the tree root it was built against.
-            // If this matches the header anchor (blockchain's canonical finalSaplingRoot),
-            // we can use the witness directly. If not, the witness is stale/wrong.
+            // CRITICAL FIX #557 v38: Extract anchor FROM THE WITNESS!
+            // After FIX #557 v36, witnesses are updated to chain tip root.
+            // The witness anchor is the CORRECT anchor for transactions.
             if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
                 let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
                 let headerAnchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
 
-                if witnessRoot == anchorFromHeader {
-                    print("✅ Witness root matches header anchor - INSTANT mode!")
-                    print("   witnessRoot: \(witnessRootHex)... == headerAnchor: \(headerAnchorHex)...")
-                    needsRebuild = false
-                } else {
-                    // CRITICAL ERROR: Witness was built with wrong tree state!
-                    // This can't be fixed at transaction time - need database repair.
-                    print("❌ WITNESS/ANCHOR MISMATCH DETECTED!")
-                    print("   witnessRoot:   \(witnessRootHex)...")
-                    print("   headerAnchor:  \(headerAnchorHex)...")
-                    print("   Note height:   \(noteHeight)")
-                    print("")
-                    print("💡 The witness was saved with a different tree state than the blockchain's.")
-                    print("   To fix: Go to Settings → 'Repair Notes (fix balance)'")
-                    throw TransactionError.witnessAnchorMismatch(
-                        noteHeight: noteHeight,
-                        witnessRoot: witnessRootHex,
-                        headerAnchor: headerAnchorHex
-                    )
-                }
+                // Use witness anchor instead of header anchor
+                anchorFromHeader = witnessRoot
+                print("✅ FIX #557 v38: Using anchor from WITNESS")
+                print("   witnessAnchor: \(witnessRootHex)...")
+                print("   (headerAnchor was: \(headerAnchorHex)...)")
+                needsRebuild = false
             } else {
                 print("⚠️ Could not extract root from witness, will rebuild")
                 needsRebuild = true
@@ -348,8 +333,15 @@ final class TransactionBuilder {
                 print("✅ Successfully rebuilt witness for note at height \(noteHeight)")
                 witnessToUse = result.witness
 
-                // Use computed anchor if we don't have it from header store
-                if anchorFromHeader.allSatisfy({ $0 == 0 }) {
+                // CRITICAL FIX #557 v38: Extract anchor FROM THE WITNESS!
+                // After FIX #557 v36, witness has chain tip root, not note height root.
+                // The witness anchor is the CORRECT anchor to use for the transaction.
+                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessToUse) {
+                    anchorFromHeader = witnessAnchor
+                    let anchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("📝 FIX #557 v38: Using anchor from WITNESS: \(anchorHex)...")
+                } else if anchorFromHeader.allSatisfy({ $0 == 0 }) {
+                    // Fallback to computed anchor
                     anchorFromHeader = result.anchor
                     let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
                     print("📝 Using computed anchor: \(anchorHex)...")
