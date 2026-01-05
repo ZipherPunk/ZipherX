@@ -3682,7 +3682,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
 /// This is needed when using treeCreateWitnessesBatch which builds its own tree
 /// rather than using the global COMMITMENT_TREE
 ///
-/// witness_data: Serialized witness (1028 bytes)
+/// witness_data: Serialized witness (up to 1028 bytes, zero-padded)
 /// root_out: 32-byte output buffer for the root
 /// Returns: true if successful
 #[no_mangle]
@@ -3700,12 +3700,23 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
         Some(s) => s,
         None => return false,
     };
-    let mut reader = std::io::Cursor::new(witness_slice);
+
+    // CRITICAL FIX #557 v41: Strip TRAILING zero padding from witness before deserialization!
+    // Witnesses are stored zero-padded to 1028 bytes, but read_incremental_witness
+    // expects exact serialized length. Extra trailing zeros cause deserialization to fail.
+    // Find the last non-zero byte to determine actual length.
+    let actual_len = witness_slice.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(witness_slice.len());
+    let trimmed_slice = &witness_slice[..actual_len];
+
+    let mut reader = std::io::Cursor::new(trimmed_slice);
 
     let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
         match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
             Ok(w) => w,
-            Err(_) => return false,
+            Err(_) => {
+                debug_log!("❌ zipherx_witness_get_root: deserialization failed (len={})", actual_len);
+                return false;
+            }
         };
 
     let root = witness.root();
@@ -3715,6 +3726,7 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
     }
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
+    debug_log!("✅ zipherx_witness_get_root: extracted root {}...", hex::encode(&root_bytes[..8]));
     true
 }
 
@@ -3741,7 +3753,13 @@ pub unsafe extern "C" fn zipherx_witness_path_is_valid(
         Some(s) => s,
         None => return false,
     };
-    let mut reader = std::io::Cursor::new(witness_slice);
+
+    // CRITICAL FIX #557 v41: Strip TRAILING zero padding from witness before deserialization!
+    // Same fix as zipherx_witness_get_root - see explanation there.
+    let actual_len = witness_slice.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(witness_slice.len());
+    let trimmed_slice = &witness_slice[..actual_len];
+
+    let mut reader = std::io::Cursor::new(trimmed_slice);
 
     let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
         match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
