@@ -617,6 +617,39 @@ final class HeaderStore {
         return nil
     }
 
+    /// FIX #546: Get sapling root (anchor) for a specific block height
+    /// This returns the canonical anchor from the blockchain header for trustless transaction building
+    /// According to SESSION_SUMMARY_2025-11-28.md: "Anchor MUST come from header store - not from computed tree state"
+    func getSaplingRoot(at height: UInt64) throws -> Data? {
+        // Ensure database is open
+        if db == nil {
+            try open()
+        }
+
+        let sql = "SELECT sapling_root FROM headers WHERE height = ? LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            // No header found at this height
+            return nil
+        }
+
+        guard let saplingRootPtr = sqlite3_column_blob(stmt, 0) else {
+            return nil
+        }
+        let saplingRootLength = sqlite3_column_bytes(stmt, 0)
+        let saplingRoot = Data(bytes: saplingRootPtr, count: Int(saplingRootLength))
+
+        return saplingRoot
+    }
+
     // MARK: - Block Times (from boost file)
 
     /// Insert a single block timestamp (from boost file or sync)
@@ -792,6 +825,65 @@ final class HeaderStore {
         print("🗑️ Cleared all block times")
     }
 
+    // MARK: - FIX #536: Header Corruption Detection
+
+    /// Result of sapling_root corruption check
+    struct CorruptionCheckResult {
+        let isCorrupted: Bool
+        let sampledCount: Int
+        let uniqueRoots: Int
+    }
+
+    /// Check if headers have corrupted sapling_roots (duplicated values)
+    /// Samples every Nth header to detect corruption without full scan
+    /// Returns CorruptionCheckResult with isCorrupted=true if duplicates found
+    func checkSaplingRootCorruptionInRange(_ startHeight: UInt64, _ endHeight: UInt64) throws -> CorruptionCheckResult {
+        // Sample every 1000th header for efficiency (still catches massive corruption)
+        let step = max(1000, Int((endHeight - startHeight) / 1000))
+
+        let sql = "SELECT DISTINCT sapling_root FROM headers WHERE height >= ? AND height <= ? AND height % ? = 0;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_bind_int64(stmt, 1, Int64(startHeight)) == SQLITE_OK &&
+              sqlite3_bind_int64(stmt, 2, Int64(endHeight)) == SQLITE_OK &&
+              sqlite3_bind_int64(stmt, 3, Int64(step)) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed("Failed to bind parameters")
+        }
+
+        var uniqueRoots = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            uniqueRoots += 1
+        }
+
+        // Calculate expected sample count
+        let rangeSize = Int(endHeight - startHeight + 1)
+        let sampledCount = (rangeSize + step - 1) / step  // Ceiling division
+
+        // If we have significantly fewer unique roots than sampled, corruption exists
+        // Allow 5% tolerance for edge cases
+        let expectedUnique = sampledCount
+        let isCorrupted = uniqueRoots < expectedUnique * 95 / 100
+
+        return CorruptionCheckResult(
+            isCorrupted: isCorrupted,
+            sampledCount: sampledCount,
+            uniqueRoots: uniqueRoots
+        )
+    }
+
+    /// Delete all headers in a specific height range
+    func deleteHeadersInRange(from: UInt64, to: UInt64) throws {
+        let sql = "DELETE FROM headers WHERE height >= ? AND height <= ?;"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     // MARK: - FIX #413: Bundled Headers from Boost File
 
     /// FIX #413: Load headers from boost file data
@@ -826,6 +918,9 @@ final class HeaderStore {
         // FIX #457 v8: Check if we CONTIGUOUSLY have all the boost file headers
         // Old bug: Only checked if max height >= endHeight, which skipped loading
         // when database had sparse headers from P2P sync but missing boost range!
+        //
+        // FIX #536: Check for HEADER CORRUPTION (duplicated sapling_roots) before skipping load
+        // If headers are corrupted, force reload even if contiguous range exists
         let hasContiguousBoostHeaders: Bool
         if let existingMax = try? getLatestHeight() {
             // Check if we have a CONTIGUOUS range covering the boost file
@@ -836,11 +931,32 @@ final class HeaderStore {
             let countInRange = (try? countHeadersInRange(from: startHeight, to: endHeight)) ?? 0
             let expectedCount = Int(endHeight - startHeight + 1)
 
-            hasContiguousBoostHeaders = hasMin && hasMax && (countInRange >= expectedCount * 95 / 100) // Allow 5% gaps
+            // FIX #536: Check for corruption (duplicated sapling_roots)
+            // Sample 1000 headers in the boost range - if many have duplicate sapling_roots, headers are corrupted
+            var hasCorruption = false
+            if hasMin && hasMax && countInRange >= expectedCount * 95 / 100 {
+                // Quick corruption check: count unique sapling_roots vs total headers
+                let corruptionCheck = try? checkSaplingRootCorruptionInRange(startHeight, endHeight)
+                if let check = corruptionCheck, check.isCorrupted {
+                    print("🚨 FIX #536: CRITICAL - HeaderStore has CORRUPTED sapling_roots!")
+                    print("🚨 FIX #536: Sample: \(check.sampledCount) headers, only \(check.uniqueRoots) unique sapling_roots")
+                    print("🚨 FIX #536: Expected ~\(check.sampledCount) unique, but found duplicates - FORCING RELOAD")
+                    hasCorruption = true
+                }
+            }
+
+            hasContiguousBoostHeaders = hasMin && hasMax && (countInRange >= expectedCount * 95 / 100) && !hasCorruption
 
             if hasContiguousBoostHeaders {
                 print("📜 FIX #457: Headers already loaded (contiguous range \(existingMin)-\(existingMax), skipping)")
                 return
+            } else if hasCorruption {
+                print("📜 FIX #536: Corrupted headers detected - will reload from boost file")
+                // Delete corrupted headers before reload
+                if let minH = try? getMinHeight(), let maxH = try? getLatestHeight() {
+                    print("🗑️ FIX #536: Deleting corrupted headers from height \(minH) to \(maxH)...")
+                    try? deleteHeadersInRange(from: minH, to: maxH)
+                }
             } else {
                 print("📜 FIX #457: Need boost headers - existing: \(existingMin)-\(existingMax) (\(countInRange)/\(expectedCount) in range)")
             }
@@ -865,7 +981,7 @@ final class HeaderStore {
         var processedCount = 0
 
         let sql = """
-            INSERT OR IGNORE INTO headers
+            INSERT OR REPLACE INTO headers
             (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
@@ -1389,11 +1505,9 @@ final class HeaderStore {
 
     /// Check if a Sapling root (anchor) exists in the blockchain headers
     /// Returns true if the anchor is found in any block header
+    /// FIX #536: Bind as BLOB instead of TEXT (sapling_root is BLOB column)
     func containsSaplingRoot(_ anchor: Data) async -> Bool {
-        // The saplingRoot is stored as hex string in database
-        let anchorHex = anchor.map { String(format: "%02x", $0) }.joined()
-
-        let sql = "SELECT COUNT(*) FROM headers WHERE sapling_root = ? COLLATE NOCASE;"
+        let sql = "SELECT COUNT(*) FROM headers WHERE sapling_root = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1402,9 +1516,14 @@ final class HeaderStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        // Bind the anchor hex string
-        guard sqlite3_bind_text(stmt, 1, (anchorHex as NSString).utf8String, -1, nil) == SQLITE_OK else {
-            print("⚠️ FIX #516: Failed to bind anchor: \(String(cString: sqlite3_errmsg(db)))")
+        // FIX #536: Bind as BLOB (not TEXT) - sapling_root is stored as BLOB
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let bindResult = anchor.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(stmt, 1, bytes.baseAddress, Int32(anchor.count), SQLITE_TRANSIENT)
+        }
+
+        guard bindResult == SQLITE_OK else {
+            print("⚠️ FIX #536: Failed to bind anchor BLOB: \(String(cString: sqlite3_errmsg(db)))")
             return false
         }
 

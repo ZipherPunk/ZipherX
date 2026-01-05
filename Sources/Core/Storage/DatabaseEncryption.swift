@@ -15,6 +15,7 @@ import IOKit
 
 /// Provides AES-GCM-256 encryption for sensitive database fields
 /// Key is derived from device-specific identifier + stored salt using HKDF
+@available(macOS 10.15, iOS 13.0, *)
 final class DatabaseEncryption {
     static let shared = DatabaseEncryption()
 

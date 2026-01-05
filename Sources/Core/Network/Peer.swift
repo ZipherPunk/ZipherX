@@ -314,6 +314,80 @@ public final class Peer {
         return false
     }
 
+    // MARK: - FIX #535: Performance Score for Header Sync Prioritization
+
+    /// Calculate overall performance score (higher = better peer)
+    /// Used to rank peers for header sync - best peers tried first
+    func getPerformanceScore() -> Double {
+        var score: Double = 0.0
+
+        // Success rate (0-100 points)
+        let totalAttempts = self.score.successCount + self.score.failureCount
+        if totalAttempts > 0 {
+            let successRate = Double(self.score.successCount) / Double(totalAttempts)
+            score += successRate * 100.0
+        }
+
+        // Headers provided (0-50 points)
+        if self.score.headersProvided > 0 {
+            // Logarithmic scale - first few headers matter most
+            score += min(50.0, log(1.0 + Double(self.score.headersProvided)) * 10)
+        }
+
+        // Chainwork validations (0-30 points) - critical for fork detection
+        score += min(30.0, Double(self.score.chainworkValidations) * 5)
+
+        // Recent activity bonus (0-20 points)
+        if let lastSuccess = lastSuccess {
+            let hoursSinceSuccess = Date().timeIntervalSince(lastSuccess) / 3600
+            if hoursSinceSuccess < 1 {
+                score += 20.0  // Very recent
+            } else if hoursSinceSuccess < 6 {
+                score += 10.0  // Recent
+            } else if hoursSinceSuccess < 24 {
+                score += 5.0   // Somewhat recent
+            }
+        }
+
+        // Consecutive failures penalty
+        if consecutiveFailures > 0 {
+            score -= Double(consecutiveFailures) * 10.0
+        }
+
+        // Fast response time bonus (if we have data)
+        if self.score.headerResponseTimeMs > 0 && self.score.headerResponseTimeMs < 1000 {
+            score += 10.0  // Sub-second response
+        } else if self.score.headerResponseTimeMs > 0 && self.score.headerResponseTimeMs < 5000 {
+            score += 5.0   // Under 5 seconds
+        }
+
+        // Ensure score is non-negative
+        return max(0, score)
+    }
+
+    /// Get detailed performance description for debug logging
+    func getPerformanceDescription() -> String {
+        let totalAttempts = score.successCount + score.failureCount
+        let successRate = totalAttempts > 0 ? Double(score.successCount) / Double(totalAttempts) * 100 : 0
+        let perfScore = getPerformanceScore()
+
+        var desc = "\(host):\(port)"
+        desc += " | Score: \(String(format: "%.1f", perfScore))"
+        desc += " | Success: \(score.successCount)/\(totalAttempts) (\(String(format: "%.1f", successRate))%)"
+        desc += " | Headers: \(score.headersProvided)"
+        desc += " | Chainwork: \(score.chainworkValidations)"
+
+        if score.headerResponseTimeMs > 0 {
+            desc += " | Avg: \(String(format: "%.0f", score.headerResponseTimeMs))ms"
+        }
+
+        if consecutiveFailures > 0 {
+            desc += " | Failures: \(consecutiveFailures)"
+        }
+
+        return desc
+    }
+
     // MARK: - Message Queue
 
     /// Check if peer is currently busy with another operation
@@ -523,16 +597,6 @@ public final class Peer {
 
         connection = NWConnection(to: endpoint, using: parameters)
 
-        // FIX #267: Add viability handler to detect when iOS thinks connection is dead
-        connection?.viabilityUpdateHandler = { [weak self] isViable in
-            guard let self = self else { return }
-            if !isViable {
-                print("⚠️ FIX #267: [\(self.host)] Connection no longer viable - iOS network change detected")
-                // Disconnect so NetworkManager can reconnect
-                self.disconnect()
-            }
-        }
-
         // Add timeout for connection
         // FIX #152: Use withTaskCancellationHandler to ensure continuation resumes on cancellation
         return try await withThrowingTaskGroup(of: Void.self) { group in
@@ -556,6 +620,8 @@ public final class Peer {
                             switch state {
                             case .ready:
                                 hasResumed = true
+                                // FIX #545 v2: Removed viabilityUpdateHandler to prevent nw_connection warnings
+                                // Keepalive pings (FIX #246) and path monitoring (FIX #268) already detect dead connections
                                 continuation.resume()
                             case .failed(let error):
                                 hasResumed = true
@@ -641,15 +707,6 @@ public final class Peer {
 
         connection = NWConnection(to: proxyEndpoint, using: parameters)
 
-        // FIX #267: Add viability handler for Tor connections
-        connection?.viabilityUpdateHandler = { [weak self] isViable in
-            guard let self = self else { return }
-            if !isViable {
-                print("⚠️ FIX #267: [\(self.host)] Tor connection no longer viable")
-                self.disconnect()
-            }
-        }
-
         // Wait for connection to proxy with proper continuation handling
         // Use a class-based lock for thread-safe flag (NSLock is Sendable)
         final class ResumedFlag: @unchecked Sendable {
@@ -674,6 +731,9 @@ public final class Peer {
                         switch state {
                         case .ready:
                             if !resumed.checkAndSet() {
+                                // FIX #545: Set viability handler AFTER connection is ready
+                                // FIX #545 v2: Removed viabilityUpdateHandler to prevent nw_connection warnings
+                                // Keepalive pings (FIX #246) and path monitoring (FIX #268) already detect dead connections
                                 continuation.resume()
                             }
                         case .failed(let error):
@@ -3574,6 +3634,12 @@ struct PeerScore {
     var lastResponseTime: Date?
     var bytesReceived: UInt64 = 0
     var bytesSent: UInt64 = 0
+
+    // FIX #535: Performance tracking for header sync prioritization
+    var headersProvided: Int = 0          // Number of valid headers provided
+    var headerResponseTimeMs: Double = 0  // Average header response time in milliseconds
+    var chainworkValidations: Int = 0     // Number of successful chainwork validations
+    var lastChainworkValidation: Date?    // Last successful chainwork validation time
 }
 
 // MARK: - Banned Peer

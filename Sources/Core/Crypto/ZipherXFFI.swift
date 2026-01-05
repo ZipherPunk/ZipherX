@@ -1252,6 +1252,30 @@ enum ZipherXFFI {
         }
     }
 
+    /// Check if the witness path is valid (not corrupted)
+    ///
+    /// A corrupted witness might have a valid root() but invalid path().
+    /// The path is used by Zcash builder to create the zk-SNARK proof,
+    /// so it must be valid for the transaction to be accepted.
+    ///
+    /// - Parameter witness: Serialized witness data (1028 bytes)
+    /// - Returns: true if path is valid, false if corrupted or invalid
+    static func witnessPathIsValid(_ witness: Data) -> Bool {
+        guard witness.count >= 100 else {
+            print("❌ witnessPathIsValid: witness too short (\(witness.count) bytes)")
+            return false
+        }
+
+        let isValid = witness.withUnsafeBytes { witnessPtr in
+            zipherx_witness_path_is_valid(
+                witnessPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                witness.count
+            )
+        }
+
+        return isValid
+    }
+
     // MARK: - OVK Output Recovery (Transaction History)
 
     /// Derive outgoing viewing key from spending key

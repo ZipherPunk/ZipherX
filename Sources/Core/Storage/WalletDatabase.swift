@@ -963,7 +963,7 @@ final class WalletDatabase {
         let birthday = UInt64(sqlite3_column_int64(stmt, 4))
 
         return Account(
-            id: id,
+            accountId: id,
             spendingKey: Data(bytes: skPtr!, count: Int(skLen)),
             viewingKey: Data(bytes: vkPtr!, count: Int(vkLen)),
             address: address,
@@ -3459,6 +3459,52 @@ final class WalletDatabase {
         }
     }
 
+    /// FIX #550: Get anchor for a specific note
+    /// Used to verify anchor writes succeeded
+    func getAnchor(for noteId: Int64) throws -> Data? {
+        let sql = "SELECT anchor FROM notes WHERE id = ? LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        guard let anchorPtr = sqlite3_column_blob(stmt, 0) else {
+            return nil
+        }
+        let anchorLength = sqlite3_column_bytes(stmt, 0)
+        let anchor = Data(bytes: anchorPtr, count: Int(anchorLength))
+
+        return anchor
+    }
+
+    /// FIX #554: Get height for a specific note
+    /// Used to get correct anchor from HeaderStore when witness extraction fails
+    func getNoteHeight(noteId: Int64) throws -> Int64? {
+        let sql = "SELECT height FROM notes WHERE id = ? LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        return sqlite3_column_int64(stmt, 0)
+    }
+
     /// Update nullifier for a note (used when recomputing nullifiers with correct positions)
     func updateNoteNullifier(noteId: Int64, nullifier: Data) throws {
         // Hash the nullifier before storage for privacy
@@ -5079,7 +5125,7 @@ final class WalletDatabase {
 // MARK: - Data Types
 
 struct Account {
-    let id: Int64
+    let accountId: Int64  // FIX #557 v8: Renamed from 'id' to avoid SwiftUI .id() modifier conflict
     let spendingKey: Data
     let viewingKey: Data
     let address: String

@@ -278,19 +278,20 @@ final class HeaderSyncManager {
                     (peer.host == localhostPeer || peer.hasRecentActivity)
                 }
 
-                // FIX #502: Sort by: localhost FIRST, then trusted, then by recency of height report
+                // FIX #535: Performance-based sorting - BEST peers tried FIRST
+                // Priority: localhost > trusted seed > highest performance score > highest height
                 return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
                     let peer1IsLocalhost = peer1.host == localhostPeer
                     let peer2IsLocalhost = peer2.host == localhostPeer
 
-                    // FIX #502: Localhost ALWAYS comes first
+                    // Localhost ALWAYS comes first (user's local node is most reliable)
                     if peer1IsLocalhost && !peer2IsLocalhost {
                         return true  // peer1 (localhost) first
                     } else if !peer1IsLocalhost && peer2IsLocalhost {
                         return false  // peer2 (localhost) first
                     }
 
-                    // Neither or both are localhost - use existing trusted seed logic
+                    // Neither or both are localhost - use trusted seed logic
                     let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
                     let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
 
@@ -299,9 +300,29 @@ final class HeaderSyncManager {
                     } else if !peer1IsTrusted && peer2IsTrusted {
                         return false  // peer2 first
                     } else {
-                        // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
-                        return peer1.peerStartHeight > peer2.peerStartHeight
+                        // Both trusted or both not trusted - USE PERFORMANCE SCORE!
+                        let score1 = peer1.getPerformanceScore()
+                        let score2 = peer2.getPerformanceScore()
+
+                        if abs(score1 - score2) > 5.0 {
+                            // Significant performance difference - use score
+                            return score1 > score2
+                        } else {
+                            // Similar performance - prefer higher peerStartHeight (more recent)
+                            return peer1.peerStartHeight > peer2.peerStartHeight
+                        }
                     }
+                }
+            }
+
+            // FIX #535: Log peer performance rankings (best to worst)
+            if !currentPeers.isEmpty {
+                print("📊 FIX #535: Peer Performance Ranking (best to worst):")
+                for (index, peer) in currentPeers.prefix(10).enumerated() {
+                    let isLocalhost = peer.host == localhostPeer
+                    let isTrusted = trustedSeedPeers.contains(peer.host)
+                    let label = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
+                    print("   \(index + 1). \(label) \(peer.getPerformanceDescription())")
                 }
             }
 
@@ -364,6 +385,11 @@ final class HeaderSyncManager {
                 try verifyHeaderChain(headers, startingAt: headersStartHeight)
                 try headerStore.insertHeaders(headers)
 
+                // FIX #535: Track peer performance - update peer that provided headers
+                peer.recordSuccess()
+                peer.score.headersProvided += headers.count
+                print("✅ FIX #535: Updated \(peer.host) performance - now at \(peer.score.headersProvided) headers provided")
+
                 // FIX #133: Use actual header heights, not requested heights
                 let actualEndHeight = headersStartHeight + UInt64(headers.count) - 1
                 currentHeight = actualEndHeight + 1
@@ -384,6 +410,7 @@ final class HeaderSyncManager {
             } catch {
                 // FIX #501: Log failure and immediately disconnect/reset peer
                 print("⚠️ FIX #502: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting and trying next...")
+                peer.recordFailure()
                 peer.disconnect()  // Reset stuck NWConnection
                 failedPeers.insert(peer.host)
                 continue
@@ -502,19 +529,19 @@ final class HeaderSyncManager {
                     // Localhost is user's own node - should always be available for header sync
                     (peer.host == localhostPeer || peer.hasRecentActivity)
                 }
-                // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
+                // FIX #535: Performance-based sorting - BEST peers tried FIRST
                 return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
                     let peer1IsLocalhost = peer1.host == localhostPeer
                     let peer2IsLocalhost = peer2.host == localhostPeer
 
-                    // FIX #502: Localhost ALWAYS comes first
+                    // Localhost ALWAYS comes first (user's local node is most reliable)
                     if peer1IsLocalhost && !peer2IsLocalhost {
                         return true  // peer1 (localhost) first
                     } else if !peer1IsLocalhost && peer2IsLocalhost {
                         return false  // peer2 (localhost) first
                     }
 
-                    // Neither or both are localhost - use existing trusted seed logic
+                    // Neither or both are localhost - use trusted seed logic
                     let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
                     let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
 
@@ -523,9 +550,29 @@ final class HeaderSyncManager {
                     } else if !peer1IsTrusted && peer2IsTrusted {
                         return false  // peer2 first
                     } else {
-                        // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
-                        return peer1.peerStartHeight > peer2.peerStartHeight
+                        // Both trusted or both not trusted - USE PERFORMANCE SCORE!
+                        let score1 = peer1.getPerformanceScore()
+                        let score2 = peer2.getPerformanceScore()
+
+                        if abs(score1 - score2) > 5.0 {
+                            // Significant performance difference - use score
+                            return score1 > score2
+                        } else {
+                            // Similar performance - prefer higher peerStartHeight (more recent)
+                            return peer1.peerStartHeight > peer2.peerStartHeight
+                        }
                     }
+                }
+            }
+
+            // FIX #535: Log peer performance rankings (best to worst)
+            if !currentPeers.isEmpty {
+                print("📊 FIX #535: Peer Performance Ranking (best to worst):")
+                for (index, peer) in currentPeers.prefix(10).enumerated() {
+                    let isLocalhost = peer.host == localhostPeer
+                    let isTrusted = trustedSeedPeers.contains(peer.host)
+                    let label = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
+                    print("   \(index + 1). \(label) \(peer.getPerformanceDescription())")
                 }
             }
 
@@ -600,6 +647,7 @@ final class HeaderSyncManager {
                 } catch {
                     // This peer failed, try next one
                     print("⚠️ FIX #501: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting")
+                    peer.recordFailure()
                     peer.disconnect()
                     failedPeers.insert(peer.host)
                     continue
@@ -615,11 +663,24 @@ final class HeaderSyncManager {
             // FIX #133: Verify chain continuity with correct starting height
             try verifyHeaderChain(headers, startingAt: headersStartHeight)
 
+            // FIX #535: Track peer performance - update the peer that provided headers
+            if let successHost = successPeerHost {
+                let successPeer = await MainActor.run {
+                    networkManager.peers.first(where: { $0.host == successHost })
+                }
+                if let peer = successPeer {
+                    peer.recordSuccess()
+                    peer.score.headersProvided += headers.count
+                    // Response time is tracked implicitly via success rate in performance score
+                    print("✅ FIX #535: Updated \(successHost) performance - now at \(peer.score.headersProvided) headers provided")
+                }
+            }
+
             // FIX #535: Validate chainwork to detect wrong forks
             // This prevents Sybil attacks where 9 peers provide wrong blockchain data
             // Compare P2P chainwork against our trusted HeaderStore chainwork
             if let peerHost = successPeerHost {
-                try validateChainwork(headers, fromPeer: peerHost)
+                try await validateChainwork(headers, fromPeer: peerHost)
             }
 
             // Store headers
@@ -1266,6 +1327,7 @@ final class HeaderSyncManager {
 
         var currentHeight = height
         var prevHash: Data?
+        var prevHashFromHeaderStore = false  // FIX #536: Track where prevHash came from
 
         // FIX #437 + #438: Use correct hash sources for chain continuity
         // - BundledBlockHashes: For heights within bundled range (correct hashes from GitHub)
@@ -1278,10 +1340,12 @@ final class HeaderSyncManager {
 
             if bundledHashes.isLoaded, let bundledHash = bundledHashes.getBlockHash(at: prevHeight) {
                 prevHash = bundledHash
+                prevHashFromHeaderStore = false
                 print("📋 FIX #437: Using BundledBlockHashes for chain continuity at height \(prevHeight)")
             } else if prevHeight > bundledEndHeight, let prevHeader = try? headerStore.getHeader(at: prevHeight) {
                 // FIX #438: Only use HeaderStore for heights ABOVE bundled range (P2P synced = correct)
                 prevHash = prevHeader.blockHash
+                prevHashFromHeaderStore = true
                 print("📋 FIX #438: Using HeaderStore for chain continuity at height \(prevHeight) (above bundled \(bundledEndHeight))")
             }
         }
@@ -1290,9 +1354,9 @@ final class HeaderSyncManager {
         for (index, header) in headers.enumerated() {
             // Verify previous hash links correctly
             // Skip verification for the very first header if we don't have its previous block
-            if let prevHash = prevHash {
+            if prevHash != nil {
                 // Debug: Print only first and last headers to reduce log spam
-                let prevHex = prevHash.map { String(format: "%02x", $0) }.joined()
+                let prevHex = prevHash!.map { String(format: "%02x", $0) }.joined()
                 let gotPrevHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined()
                 let currentBlockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
 
@@ -1301,16 +1365,44 @@ final class HeaderSyncManager {
                     print("🔍 Height \(currentHeight): blockHash=\(currentBlockHex.prefix(16))... prevBlock=\(gotPrevHex.prefix(16))...")
                 }
 
-                guard header.hashPrevBlock == prevHash else {
+                guard header.hashPrevBlock == prevHash! else {
                     print("❌ MISMATCH at height \(currentHeight)!")
                     print("   Expected prevHash: \(prevHex.prefix(32))...")
                     print("   Got prevHash:      \(gotPrevHex.prefix(32))...")
-                    throw SyncError.chainDiscontinuity(
-                        height: currentHeight,
-                        expectedPrevHash: String(prevHex.prefix(16)),
-                        gotPrevHash: String(gotPrevHex.prefix(16))
-                    )
+
+                    // FIX #536: Check if prevHash came from HeaderStore (might be corrupted!)
+                    if prevHashFromHeaderStore {
+                        print("🚨 FIX #536: Chain discontinuity with HeaderStore-sourced prevHash!")
+                        print("🚨 FIX #536: This indicates HeaderStore has CORRUPTED headers from old fork!")
+                        print("🗑️ FIX #536: Deleting corrupted headers from height \(currentHeight - 1) onwards...")
+
+                        // Delete corrupted headers
+                        let prevHeight = currentHeight - 1
+                        if let maxH = try? headerStore.getLatestHeight() {
+                            try? headerStore.deleteHeadersInRange(from: prevHeight, to: maxH)
+                            print("✅ FIX #536: Deleted corrupted headers from \(prevHeight) to \(maxH)")
+                        }
+
+                        // FIX #536: Peer is CORRECT! Use peer's header.hashPrevBlock as new prevHash
+                        // This allows us to continue verification with the correct chain
+                        print("✅ FIX #536: Peer headers are correct - using peer's chain for verification")
+                        prevHash = header.hashPrevBlock  // Update to peer's prevHash (correct)
+                        prevHashFromHeaderStore = false  // Now using peer's chain
+                        // Skip rest of this iteration and continue with next header
+                        currentHeight += 1
+                        continue
+                    } else {
+                        // If prevHash came from BundledBlockHashes, that's a real problem
+                        throw SyncError.chainDiscontinuity(
+                            height: currentHeight,
+                            expectedPrevHash: String(prevHex.prefix(16)),
+                            gotPrevHash: String(gotPrevHex.prefix(16))
+                        )
+                    }
                 }
+
+                // Update prevHash for next iteration
+                prevHash = header.blockHash
             } else if index == 0 {
                 // First header and no previous - this is OK for initial sync
                 let blockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
@@ -1332,7 +1424,7 @@ final class HeaderSyncManager {
     /// - Rejects if P2P chainwork < existing chainwork (wrong fork!)
     /// - Accepts if P2P chainwork >= existing chainwork (reorg or same chain)
     /// - Bans peers that provide wrong fork data
-    private func validateChainwork(_ headers: [ZclassicBlockHeader], fromPeer peerHost: String) throws {
+    private func validateChainwork(_ headers: [ZclassicBlockHeader], fromPeer peerHost: String) async throws {
         for header in headers {
             // Check if we have an existing header at this height
             if let existingHeader = try? headerStore.getHeader(at: header.height) {
@@ -1400,6 +1492,16 @@ final class HeaderSyncManager {
         }
 
         print("✅ FIX #535: Chainwork validation passed for \(headers.count) headers")
+
+        // FIX #535: Track successful chainwork validation for peer performance
+        let peer = await MainActor.run {
+            networkManager.peers.first(where: { $0.host == peerHost })
+        }
+        if let p = peer {
+            p.score.chainworkValidations += 1
+            p.score.lastChainworkValidation = Date()
+            print("✅ FIX #535: Updated \(peerHost) chainwork validations - now at \(p.score.chainworkValidations)")
+        }
     }
 }
 

@@ -2743,8 +2743,10 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
         return false;
     }
 
-    if data.len() > 100_000 {
-        debug_log!("❌ Tree too large to serialize");
+    // FIX #557 v7: Increased limit to 20MB to handle large trees (1M+ commitments)
+    // Each commitment is ~11 bytes, so 1M commitments = ~11MB
+    if data.len() > 20_000_000 {
+        eprintln!("❌ Tree too large to serialize ({} bytes)", data.len());
         return false;
     }
 
@@ -3557,13 +3559,14 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         }
     };
 
-    debug_log!("🌲 Building tree to position {} for batch witnesses", max_pos);
+    debug_log!("🌲 FIX #557 v23: Building tree once, creating witnesses with same root");
 
-    // Second pass: build tree and create witnesses at target positions
+    // FIX #557 v23: Build tree ONCE, create witnesses at max position, all have same root
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
     let mut witnesses: Vec<Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = vec![None; target_count];
-
     offset = 8;
+
+    // Build tree to max_pos, creating witnesses AFTER each target position
     for i in 0..=max_pos {
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
@@ -3573,36 +3576,20 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
             Err(_) => continue,
         };
 
-        // FIX #458: Check if this position matches any target BEFORE appending
-        // The witness must be created at the position BEFORE the CMU is added
+        tree.append(node).ok();
+
+        // Create witness AFTER appending CMU (witness includes this CMU in path)
         for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
             if let Some(pos) = pos_opt {
                 if pos == i {
-                    // Create witness at this position BEFORE appending CMU
                     witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
-                    debug_log!("✅ FIX #458: Created witness for target {} at position {}", t_idx, i);
-                }
-            }
-        }
-
-        if tree.append(node).is_err() {
-            continue;
-        }
-
-        // Update existing witnesses for positions before current
-        for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
-            if let Some(pos) = pos_opt {
-                if pos < i {
-                    // Update existing witness
-                    if let Some(ref mut w) = witnesses[t_idx] {
-                        w.append(node).ok();
-                    }
+                    debug_log!("✅ FIX #557 v23: Created witness[{}] at position {} (after CMU)", t_idx, i);
                 }
             }
         }
     }
 
-    // Continue updating witnesses until end of data (to get final root)
+    // Continue building tree to end, updating ALL witnesses
     while offset + 32 <= cmu_data_len {
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
@@ -3612,13 +3599,42 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
             Err(_) => continue,
         };
 
-        // Update all witnesses
+        tree.append(node).ok();
+
+        // Update ALL witnesses
         for witness_opt in witnesses.iter_mut() {
             if let Some(ref mut w) = witness_opt {
                 w.append(node).ok();
             }
         }
     }
+
+    let final_root = tree.root();
+    let mut final_root_bytes = [0u8; 32];
+    final_root.write(&mut final_root_bytes[..]).unwrap_or(());
+    debug_log!("🌳 FIX #557 v23: Final root: {}", hex::encode(&final_root_bytes[..4]));
+
+    // Verify all witnesses have the same root
+    let mut all_match = true;
+    for (t_idx, witness_opt) in witnesses.iter().enumerate() {
+        if let Some(w) = witness_opt {
+            let w_root = w.root();
+            if w_root != final_root {
+                all_match = false;
+                let mut w_root_bytes = [0u8; 32];
+                w_root.write(&mut w_root_bytes[..]).unwrap_or(());
+                debug_log!("⚠️ FIX #557 v23: Witness[{}] has wrong root: {} (expected: {})",
+                    t_idx, hex::encode(&w_root_bytes[..4]), hex::encode(&final_root_bytes[..4]));
+            }
+        }
+    }
+
+    if all_match {
+        debug_log!("✅ FIX #557 v23: All witnesses have the SAME final root!");
+    } else {
+        debug_log!("⚠️ FIX #557 v23: Witnesses have DIFFERENT roots - append() not working as expected");
+    }
+
 
     // Serialize witnesses to output
     let mut success_count = 0;
@@ -3627,6 +3643,19 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         let witness_ptr = witnesses_out.add(t_idx * 1028);
 
         if let (Some(pos), Some(witness)) = (target_positions[t_idx], witness_opt) {
+            // FIX #557 v23: Verify witness root before serialization
+            let witness_root = witness.root();
+            if witness_root == final_root {
+                debug_log!("✅ FIX #557 v23: Witness[{}] at pos {} has final root", t_idx, pos);
+            } else {
+                let mut witness_root_bytes = [0u8; 32];
+                witness_root.write(&mut witness_root_bytes[..]).unwrap_or(());
+                debug_log!("⚠️ FIX #557 v23: Witness[{}] at pos {} has wrong root: {} (expected: {})",
+                           t_idx, pos,
+                           hex::encode(&witness_root_bytes[..4]),
+                           hex::encode(&final_root_bytes[..4]));
+            }
+
             let mut serialized = Vec::new();
             if write_incremental_witness(witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
                 *pos_ptr = pos;
@@ -3687,6 +3716,43 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     true
+}
+
+/// Check if a witness path is valid (non-empty)
+/// FIX #557: Verify that witness.path() returns Some instead of None
+/// A witness with empty path will compute wrong anchor even if root is correct
+///
+/// Parameters:
+/// - witness_data: Serialized witness data
+/// - witness_len: Length of witness data
+///
+/// Returns: true if path is valid (witness.path() returns Some), false otherwise
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_path_is_valid(
+    witness_data: *const u8,
+    witness_len: usize,
+) -> bool {
+    if witness_len < 100 {
+        return false;
+    }
+
+    // FIX #230: Validate witness pointer with safe_slice
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => return false,
+    };
+    let mut reader = std::io::Cursor::new(witness_slice);
+
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+
+    // Check if path() returns Some (valid path) or None (empty/stale witness)
+    let path_is_valid = witness.path().is_some();
+    debug_log!("🔍 witness_path_is_valid: path_is_some={}", path_is_valid);
+    path_is_valid
 }
 
 /// Create witnesses for multiple CMUs using BATCH processing (OPTIMIZED)
@@ -3827,28 +3893,60 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
     debug_log!("⏱️ Tree build phase took {:.1}s (found {}/{})",
                tree_build_time.as_secs_f64(), found_count, target_count);
 
-    // Now continue updating ALL captured witnesses with remaining CMUs
-    // This brings all witnesses to the same final anchor
-    debug_log!("🔄 Updating {} witnesses to final anchor...", captured_witnesses.len());
+    // FIX #557 v18: Update all captured witnesses to have the same final root
+    // The witnesses were captured at different positions, so they have different roots.
+    // We need to update each witness with CMUs from its position to the end.
+    debug_log!("🔄 FIX #557 v18: Updating {} witnesses to final anchor...", captured_witnesses.len());
     let update_start = std::time::Instant::now();
 
-    while offset + 32 <= cmu_data_len {
-        let cmu_bytes = &bytes[offset..offset + 32];
-        offset += 32;
+    // Get the final tree root for verification
+    let final_root = tree.root();
+    let mut final_root_bytes = [0u8; 32];
+    final_root.write(&mut final_root_bytes[..]).unwrap_or(());
+    debug_log!("🌳 FIX #557 v18: Final tree root: {}", hex::encode(&final_root_bytes[..4]));
 
-        if let Ok(node) = zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
-            for (_, _, witness) in &mut captured_witnesses {
-                witness.append(node.clone()).ok();
+    // For each captured witness, we need to update it with CMUs that came AFTER its position
+    // The witnesses were captured BEFORE appending their target CMU, so they include all CMUs
+    // from 0 to pos-1. We need to add CMUs from pos to count-1.
+    let mut final_witnesses: Vec<(usize, u64, IncrementalWitness<zcash_primitives::sapling::Node, 32>)> = Vec::new();
+
+    for (orig_idx, pos, old_witness) in captured_witnesses {
+        // Start with a clone of the old witness (which has CMUs 0 to pos-1)
+        let mut witness = old_witness;
+
+        // Add CMUs from pos to count-1 (including the target CMU and all after it)
+        let mut update_offset = 8 + (pos as usize * 32);
+        while update_offset + 32 <= cmu_data_len {
+            let cmu_bytes = &bytes[update_offset..update_offset + 32];
+            update_offset += 32;
+
+            if let Ok(node) = zcash_primitives::sapling::Node::read(&cmu_bytes[..]) {
+                witness.append(node).ok();
             }
         }
+
+        // Verify the witness now has the correct root
+        let witness_root = witness.root();
+        if witness_root == final_root {
+            debug_log!("✅ FIX #557 v18: Witness[{}] at pos {} now has final root", orig_idx, pos);
+        } else {
+            let mut witness_root_bytes = [0u8; 32];
+            witness_root.write(&mut witness_root_bytes[..]).unwrap_or(());
+            debug_log!("⚠️ FIX #557 v18: Witness[{}] at pos {} has wrong root: {} (expected: {})",
+                       orig_idx, pos,
+                       hex::encode(&witness_root_bytes[..4]),
+                       hex::encode(&final_root_bytes[..4]));
+        }
+
+        final_witnesses.push((orig_idx, pos, witness));
     }
 
     let update_time = update_start.elapsed();
-    debug_log!("⏱️ Witness update phase took {:.1}s", update_time.as_secs_f64());
+    debug_log!("⏱️ FIX #557 v18: Witness update took {:.1}s", update_time.as_secs_f64());
 
     // Serialize and copy results to output arrays
     let mut success_count = 0;
-    for (orig_idx, pos, witness) in captured_witnesses {
+    for (orig_idx, pos, witness) in final_witnesses {
         let pos_ptr = positions_out.add(orig_idx);
         let witness_ptr = witnesses_out.add(orig_idx * 1028);
 
@@ -3867,7 +3965,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
     }
 
     let total_time = start_time.elapsed();
-    debug_log!("✅ Batch witness complete: {}/{} in {:.1}s (tree: {:.1}s, update: {:.1}s)",
+    debug_log!("✅ FIX #557 v18: Batch witness complete: {}/{} in {:.1}s (tree: {:.1}s, update: {:.1}s)",
                success_count, target_count, total_time.as_secs_f64(),
                tree_build_time.as_secs_f64(), update_time.as_secs_f64());
     success_count

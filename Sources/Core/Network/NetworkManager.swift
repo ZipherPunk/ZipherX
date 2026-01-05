@@ -388,6 +388,8 @@ public final class NetworkManager: ObservableObject {
     /// FIX #409: Health check timer
     private var healthCheckTimer: Timer?
     private let HEALTH_CHECK_INTERVAL: TimeInterval = 60  // Check every 60 seconds
+    private var healthAlertDismissTime: Date? = nil  // FIX #543: Track when user last dismissed alert
+    private let HEALTH_ALERT_SNOOZE_INTERVAL: TimeInterval = 300  // FIX #543: Don't re-alert for 5 minutes after dismissal
 
     /// FIX #409: Start continuous health monitoring
     func startHealthMonitoring() {
@@ -416,6 +418,15 @@ public final class NetworkManager: ObservableObject {
     func performHealthCheck() async {
         // Don't check during initial sync
         guard backgroundProcessesEnabled else { return }
+
+        // FIX #543: Check if we're in snooze period (user recently dismissed alert)
+        if let dismissTime = healthAlertDismissTime {
+            let timeSinceDismiss = Date().timeIntervalSince(dismissTime)
+            if timeSinceDismiss < HEALTH_ALERT_SNOOZE_INTERVAL {
+                // Skip alert - user recently dismissed, don't annoy them
+                return
+            }
+        }
 
         // Check 1: HeaderStore health
         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
@@ -476,8 +487,9 @@ public final class NetworkManager: ObservableObject {
         }
 
         // Check 3: Wallet sync stuck (wallet far behind chain for >5 minutes)
+        // FIX #555: Skip check if walletHeight is 0 (wallet not loaded yet) or during initial sync
         let walletBehind = chainHeight > walletHeight ? chainHeight - walletHeight : 0
-        if walletBehind > 100 && !suppressBackgroundSync {
+        if walletBehind > 100 && !suppressBackgroundSync && walletHeight > 0 {
             // FIX #410: Block SEND only - balance may be wrong, could overspend
             blockFeatures([.send], reason: "Wallet behind network - balance may be outdated")
             criticalHealthAlert = CriticalHealthAlert(
@@ -508,6 +520,8 @@ public final class NetworkManager: ObservableObject {
             print("✅ FIX #409/410: Health check passed - clearing alerts and unblocking features")
             criticalHealthAlert = nil
             unblockAllFeatures()
+            // FIX #543: Clear snooze time when health checks pass - issue is resolved
+            healthAlertDismissTime = nil
         }
     }
 
@@ -562,6 +576,9 @@ public final class NetworkManager: ObservableObject {
 
         case .dismiss:
             print("🔧 FIX #409: User dismissed alert")
+            // FIX #543: Record dismissal time to prevent immediate re-alert
+            healthAlertDismissTime = Date()
+            print("🔧 FIX #543: Health alert snoozed for \(Int(HEALTH_ALERT_SNOOZE_INTERVAL))s")
         }
 
         criticalHealthAlert = nil
@@ -2203,12 +2220,22 @@ public final class NetworkManager: ObservableObject {
         // This prevents FAST START from getting stuck waiting for slow peer connections
         // After initial connection, background processes will continue adding peers
         let connectStartTime = Date()
-        let maxConnectDuration: TimeInterval = 20.0 // 20 seconds max for initial connection
+        let maxConnectDuration: TimeInterval = 20.0 // 20 seconds for early return with peers
         let minPeersForEarlyReturn = 3 // Return early if we have at least 3 peers
+        let absMaxConnectDuration: TimeInterval = 30.0 // FIX #542: Absolute max 30s regardless of peer count
 
         while connectedCount < targetPeers && peerIndex < validPeers.count {
             // FIX #429: Check if we've exceeded the connection timeout
             let elapsed = Date().timeIntervalSince(connectStartTime)
+
+            // FIX #542: Absolute timeout - return after 30s regardless of peer count
+            // This prevents the 255-second wait when peers are slow to connect
+            if elapsed > absMaxConnectDuration {
+                print("⏱️ FIX #542: Absolute connect timeout (\(String(format: "%.1f", elapsed))s) - returning with \(connectedCount) peers (background connection continues)")
+                break
+            }
+
+            // Early return if we have enough peers and 20s passed
             if elapsed > maxConnectDuration && connectedCount >= minPeersForEarlyReturn {
                 print("⏱️ FIX #429: connect() timeout (\(String(format: "%.1f", elapsed))s) - returning with \(connectedCount) peers (will continue in background)")
                 break
@@ -2326,6 +2353,14 @@ public final class NetworkManager: ObservableObject {
 
             // Log progress
             print("📊 Connected \(connectedCount)/\(targetPeers) peers (tried \(peerIndex)/\(validPeers.count))")
+
+            // FIX #547: Check for early return AFTER batch completes too
+            // This prevents waiting 20s when localhost already connected
+            let elapsedAfterBatch = Date().timeIntervalSince(connectStartTime)
+            if elapsedAfterBatch > 3.0 && connectedCount >= minPeersForEarlyReturn {
+                print("⏱️ FIX #547: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
+                break
+            }
         }
 
         // Persist after successful connections
@@ -5077,17 +5112,16 @@ public final class NetworkManager: ObservableObject {
         // - Anchor (32 bytes): The Merkle tree root
         // - BindingSig (64 bytes)
 
-        // Parse transaction to find anchor
-        // This is complex - for now, use a simpler approach:
-        // The anchor is typically the last 96 bytes before the end of tx data
-        // (32 bytes anchor + 64 bytes bindingSig)
+        // FIX #516 v2: Account for valueBalance (8 bytes) before anchor
+        // Zcash Sapling bundle ends with: [valueBalance (8)] [anchor (32)] [bindingSig (64)]
+        // So anchor is at offset: txData.count - 64 - 32 - 8
 
-        guard txData.count >= 96 else {
+        guard txData.count >= 104 else {
             throw NetworkError.invalidTransaction("Transaction too short to contain anchor")
         }
 
-        // Anchor is at offset: txData.count - 64 (bindingSig) - 32 (anchor)
-        let anchorOffset = txData.count - 64 - 32
+        // Anchor is at offset: txData.count - 64 (bindingSig) - 32 (anchor) - 8 (valueBalance)
+        let anchorOffset = txData.count - 64 - 32 - 8
         let anchor = txData.subdata(in: anchorOffset..<anchorOffset + 32)
 
         print("🔍 FIX #516: Extracted anchor: \(anchor.map { String(format: "%02x", $0) }.joined())")

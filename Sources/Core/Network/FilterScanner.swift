@@ -764,7 +764,7 @@ final class FilterScanner {
                 // This ensures all notes end up with the SAME anchor (enabling INSTANT mode).
                 do {
                     guard let account = try database.getAccount(index: 0) else { throw ScanError.databaseError }
-                    let phase1Notes = try database.getAllUnspentNotes(accountId: account.id)
+                    let phase1Notes = try database.getAllUnspentNotes(accountId: account.accountId)
                     var loadedCount = 0
                     for note in phase1Notes {
                         // Only load valid witnesses (1028 bytes, not all zeros)
@@ -1304,8 +1304,9 @@ final class FilterScanner {
         // If more blocks are scanned (N+1, ..., latest), the tree grows and the
         // witness becomes stale. We MUST update it to match the final tree root.
 
-        // Get current tree root (anchor) to save with witnesses
-        let currentAnchor = ZipherXFFI.treeRoot() ?? Data()
+        // FIX #554: NO currentAnchor fallback! Using final tree root for all notes causes mismatches.
+        // Each note's anchor must come from its block's header (via HeaderStore).
+        // Witness anchors are extracted below. If extraction fails, we get anchor from HeaderStore.
 
         // Calculate total witnesses to update
         let totalWitnesses = existingWitnessIndices.count + pendingWitnesses.count
@@ -1317,7 +1318,7 @@ final class FilterScanner {
         }
 
         // Update existing notes' witnesses and anchors
-        // CRITICAL FIX: Use header store anchor (blockchain's finalSaplingRoot) for each note,
+        // CRITICAL: Use header store anchor (blockchain's finalSaplingRoot) for each note,
         // NOT the end-of-scan tree root! The header anchor is the canonical blockchain state.
         let headerStore = HeaderStore.shared
         try? headerStore.open()
@@ -1326,12 +1327,10 @@ final class FilterScanner {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
 
-                // Get anchor from witness itself (most accurate - matches witness state)
-                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessData) {
-                    try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
-                } else {
-                    // Fallback: use current tree root
-                    try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                // FIX #555: ALWAYS use HeaderStore anchor - witness root is from end of scan, WRONG!
+                if let noteHeight = try? database.getNoteHeight(noteId: noteId),
+                   let headerAnchor = try? headerStore.getSaplingRoot(at: UInt64(noteHeight)) {
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
                 }
                 witnessesUpdated += 1
                 onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
@@ -1343,12 +1342,10 @@ final class FilterScanner {
             if let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) {
                 try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
 
-                // Get anchor from witness itself (most accurate - matches witness state)
-                if let witnessAnchor = ZipherXFFI.witnessGetRoot(witnessData) {
-                    try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
-                } else {
-                    // Fallback: use current tree root
-                    try? database.updateNoteAnchor(noteId: noteId, anchor: currentAnchor)
+                // FIX #555: ALWAYS use HeaderStore anchor - witness root is from end of scan, WRONG!
+                if let noteHeight = try? database.getNoteHeight(noteId: noteId),
+                   let headerAnchor = try? headerStore.getSaplingRoot(at: UInt64(noteHeight)) {
+                    try? database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
                 }
                 witnessesUpdated += 1
                 onWitnessProgress?(witnessesUpdated, totalWitnesses, "Witness \(witnessesUpdated)/\(totalWitnesses)")
@@ -1564,7 +1561,7 @@ final class FilterScanner {
                             // Step 5: Force rebuild ALL witnesses
                             print("🔧 FIX #524: Rebuilding all witnesses with correct tree state...")
 
-                            let accountId = (try? database.getAccount(index: 0)?.id) ?? 0
+                            let accountId = (try? database.getAccount(index: 0)?.accountId) ?? 0
                             let allNotes = (try? database.getAllNotes(accountId: accountId)) ?? []
 
                             var rebuiltCount = 0
@@ -3173,7 +3170,7 @@ final class FilterScanner {
                 return
             }
 
-            let notes = try database.getAllUnspentNotes(accountId: account.id)
+            let notes = try database.getAllUnspentNotes(accountId: account.accountId)
             let notesNeedingWitness = notes.filter { note in
                 note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
             }
@@ -3223,7 +3220,7 @@ final class FilterScanner {
                 return
             }
 
-            let notes = try database.getAllUnspentNotes(accountId: account.id)
+            let notes = try database.getAllUnspentNotes(accountId: account.accountId)
             let notesNeedingWitness = notes.filter { note in
                 note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
             }

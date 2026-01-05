@@ -318,7 +318,8 @@ struct ContentView: View {
                                         if let manifest = CommitmentTreeUpdater.shared.loadCachedManifest(),
                                            let deserializedRoot = ZipherXFFI.treeRoot() {
                                             let expectedRoot = manifest.tree_root
-                                            let actualRoot = deserializedRoot.hexString
+                                            // FIX #548: Reverse bytes for comparison (manifest stores big-endian, treeRoot returns little-endian)
+                                            let actualRoot = Data(deserializedRoot.reversed()).hexString
 
                                             if actualRoot != expectedRoot {
                                                 print("❌ FIX #534: Tree root MISMATCH after deserialization!")
@@ -361,7 +362,8 @@ struct ContentView: View {
 
                                                         // Verify the rebuilt tree root
                                                         if let rebuiltRoot = ZipherXFFI.treeRoot() {
-                                                            let rebuiltRootHex = rebuiltRoot.hexString
+                                                            // FIX #548: Reverse bytes for comparison (manifest stores big-endian, treeRoot returns little-endian)
+                                                            let rebuiltRootHex = Data(rebuiltRoot.reversed()).hexString
                                                             print("🔍 FIX #534: Rebuilt tree root: \(rebuiltRootHex)")
 
                                                             if rebuiltRootHex == expectedRoot {
@@ -440,6 +442,17 @@ struct ContentView: View {
                                     }
                                 }
 
+                                // FIX #557 v9: Rebuild all stale witnesses BEFORE showing UI!
+                                // This ensures when the balance is shown, all witnesses are current
+                                // Same as FAST START FIX #557 v8, but for INSTANT START path
+                                print("🔄 FIX #557 v9: Rebuilding stale witnesses before showing UI (INSTANT START)...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
+                                }
+
+                                await walletManager.rebuildWitnessesForStartup()
+                                print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
+
                                 // Show UI after health check completes
                                 await MainActor.run {
                                     walletManager.setRepairingHistory(false)
@@ -449,7 +462,7 @@ struct ContentView: View {
                                     walletManager.completeProgress()
                                 }
 
-                                print("⚡ FIX #168: INSTANT START COMPLETE (with health check)!")
+                                print("⚡ FIX #168: INSTANT START COMPLETE (with health check + witness rebuild)!")
 
                                 // Start network and background sync asynchronously (non-blocking)
                                 Task {
@@ -1080,6 +1093,24 @@ struct ContentView: View {
                             } else {
                                 print("✅ FAST START: All health checks passed! (100% complete)")
                             }
+
+                            // FIX #557 v8: Rebuild all stale witnesses BEFORE showing UI!
+                            // This ensures when the balance is shown, all witnesses are current
+                            // and transactions can be built instantly without rejection.
+                            print("🔄 FIX #557 v8: Rebuilding stale witnesses before showing UI...")
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
+                                walletManager.syncTasks.append(SyncTask(id: "witness_sync", title: "Sync Merkle witnesses", status: .inProgress, progress: 0.0))
+                            }
+
+                            // FIX #557 v8: Rebuild witnesses using WalletManager's account access
+                            // Direct call to avoid SwiftUI .id modifier conflict
+                            await walletManager.rebuildWitnessesForStartup()
+
+                            await MainActor.run {
+                                walletManager.updateSyncTask(id: "witness_sync", status: .completed)
+                            }
+                            print("✅ FIX #557 v8: Witnesses synced - balance is now accurate!")
 
                             // Mark initial sync as complete - NOW safe because all checks passed or were fixed
                             print("⚡ FAST START COMPLETE: UI ready!")
@@ -2545,6 +2576,7 @@ struct ContentView: View {
 }
 
 // MARK: - Cypherpunk Alerts Modifier (breaks up complex type-check expression)
+// FIX #540: Consolidate all alerts into a single unified sheet to prevent SwiftUI warnings
 struct CypherpunkAlertsModifier: ViewModifier {
     @Binding var showInsufficientDiskSpaceAlert: Bool
     @Binding var showRepairNeededAlert: Bool
@@ -2560,186 +2592,230 @@ struct CypherpunkAlertsModifier: ViewModifier {
     @ObservedObject var walletManager: WalletManager
     @ObservedObject var networkManager: NetworkManager
 
+    // Unified alert state
+    @State private var activeAlert: UnifiedAlert? = nil
+
     func body(content: Content) -> some View {
         content
-            .modifier(DiskSpaceAlertModifier(
-                showAlert: $showInsufficientDiskSpaceAlert,
-                availableDiskSpace: availableDiskSpace
-            ))
-            .modifier(RepairNeededAlertModifier(
-                showAlert: $showRepairNeededAlert,
-                selectedTab: $selectedTab,
-                showSettings: $showCypherpunkSettings,
-                repairNeededReason: repairNeededReason
-            ))
-            .modifier(SybilAlertModifier(
-                showAlert: $showSybilAttackAlert,
-                networkManager: networkManager
-            ))
-            .modifier(ExternalSpendAlertModifier(
-                showAlert: $showExternalWalletSpendAlert,
-                networkManager: networkManager
-            ))
-            .modifier(ReducedVerificationAlertModifier(
-                showAlert: $showReducedVerificationAlert,
-                walletManager: walletManager
-            ))
-            .modifier(CriticalHealthAlertModifier(
-                showAlert: $showCriticalHealthAlert,
-                healthAlertTitle: healthAlertTitle,
-                walletManager: walletManager,
-                networkManager: networkManager
-            ))
-            // FIX #409: Watch for critical health alerts
+            .onChange(of: showInsufficientDiskSpaceAlert) { newValue in
+                if newValue { activeAlert = .diskSpace }
+            }
+            .onChange(of: showRepairNeededAlert) { newValue in
+                if newValue { activeAlert = .repairNeeded }
+            }
+            .onChange(of: showSybilAttackAlert) { newValue in
+                if newValue { activeAlert = .sybilAttack }
+            }
+            .onChange(of: showExternalWalletSpendAlert) { newValue in
+                if newValue { activeAlert = .externalSpend }
+            }
+            .onChange(of: showReducedVerificationAlert) { newValue in
+                if newValue { activeAlert = .reducedVerification }
+            }
             .onChange(of: networkManager.criticalHealthAlert != nil) { hasAlert in
-                if hasAlert {
-                    showCriticalHealthAlert = true
-                }
+                if hasAlert { activeAlert = .criticalHealth }
             }
-    }
-}
-
-// MARK: - Individual Alert Modifiers
-
-struct DiskSpaceAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    let availableDiskSpace: String
-
-    func body(content: Content) -> some View {
-        content
-            .alert("Insufficient Disk Space", isPresented: $showAlert) {
-                Button("OK", role: .cancel) { }
-            } message: {
-                Text("ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.")
-            }
-    }
-}
-
-struct RepairNeededAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    @Binding var selectedTab: ContentView.Tab
-    @Binding var showSettings: Bool
-    let repairNeededReason: String
-
-    func body(content: Content) -> some View {
-        content
-            .alert("⚠️ Database Repair Recommended", isPresented: $showAlert) {
-                Button("Later", role: .cancel) { }
-                Button("Open Settings") {
-                    selectedTab = .settings
-                    showSettings = true
+            .sheet(item: Binding(
+                get: { activeAlert },
+                set: { newValue in
+                    activeAlert = newValue
+                    // Reset all individual alert states
+                    showInsufficientDiskSpaceAlert = false
+                    showRepairNeededAlert = false
+                    showSybilAttackAlert = false
+                    showExternalWalletSpendAlert = false
+                    showReducedVerificationAlert = false
+                    showCriticalHealthAlert = false
                 }
-            } message: {
-                Text("Your wallet may show an incorrect balance.\n\n\(repairNeededReason)\n\nTo fix this:\n1. Go to Settings\n2. Tap 'Repair Database'\n3. Wait for repair to complete\n\nNote: Tor will be temporarily disabled during repair for faster scanning.\n\nSend is disabled until repair is complete to prevent errors.")
-            }
-    }
-}
-
-struct SybilAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    @ObservedObject var networkManager: NetworkManager
-
-    func body(content: Content) -> some View {
-        content
-            .alert("🚨 Security Alert: Sybil Attack Detected", isPresented: $showAlert) {
-                Button("OK", role: .cancel) {
-                    networkManager.clearSybilAttackAlert()
-                }
-            } message: {
-                if let alert = networkManager.sybilVersionAttackAlert {
-                    Text("Detected \(alert.attackerCount) suspicious peer(s) reporting fake blockchain data.\n\n\(alert.bypassedTor ? "Tor has been temporarily bypassed to connect directly to trusted peers." : "Malicious peers have been banned.")\n\nYour funds are safe. The wallet is using verified peer consensus.\n\n\"Privacy is necessary for an open society in the electronic age.\"\n— A Cypherpunk's Manifesto")
-                } else {
-                    Text("Suspicious network activity detected. Malicious peers have been blocked.")
-                }
-            }
-            .onChange(of: networkManager.sybilVersionAttackAlert != nil) { hasAlert in
-                if hasAlert {
-                    showAlert = true
-                }
-            }
-    }
-}
-
-struct ExternalSpendAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    @ObservedObject var networkManager: NetworkManager
-
-    func body(content: Content) -> some View {
-        content
-            .alert("⚠️ External Wallet Activity Detected", isPresented: $showAlert) {
-                Button("OK", role: .cancel) { }
-            } message: {
-                if let spend = networkManager.externalWalletSpendDetected {
-                    let zcl = Double(spend.amount) / 100_000_000.0
-                    Text("Another wallet is spending your funds!\n\nAmount: \(String(format: "%.8f", zcl)) ZCL\nTxID: \(spend.txid.prefix(16))...\n\nThis transaction was NOT initiated by ZipherX. If you did not authorize this, your private key may be compromised.\n\nSend is temporarily disabled until this transaction confirms.")
-                } else {
-                    Text("External wallet activity detected on your address.")
-                }
-            }
-            .onChange(of: networkManager.externalWalletSpendDetected != nil) { hasSpend in
-                if hasSpend {
-                    showAlert = true
-                }
-            }
-    }
-}
-
-struct ReducedVerificationAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    @ObservedObject var walletManager: WalletManager
-
-    func body(content: Content) -> some View {
-        content
-            .alert("⚠️ Reduced Blockchain Verification", isPresented: $showAlert) {
-                Button("I Accept the Risk", role: .cancel) {
-                    walletManager.clearReducedVerificationAlert()
-                }
-            } message: {
-                if let info = walletManager.reducedVerificationAlert {
-                    Text("""
-                        Only \(info.peerCount) peer(s) connected - insufficient for full consensus verification.
-
-                        Reason: \(info.reason)
-
-                        Your wallet will operate with reduced proof-of-work verification. This is acceptable for most use cases, but provides less protection against sophisticated chain-level attacks.
-
-                        For maximum security, wait for more peers to connect or add trusted peers in Settings.
-
-                        "We cannot expect governments, corporations, or other large, faceless organizations to grant us privacy out of their beneficence."
-                        — A Cypherpunk's Manifesto
-                        """)
-                } else {
-                    Text("Insufficient peers for full blockchain verification.")
-                }
-            }
-            .onChange(of: walletManager.reducedVerificationAlert != nil) { hasAlert in
-                if hasAlert {
-                    showAlert = true
-                } else {
-                    // FIX #414: Dismiss alert when Tree Root Validation clears it
-                    showAlert = false
-                }
-            }
-    }
-}
-
-struct CriticalHealthAlertModifier: ViewModifier {
-    @Binding var showAlert: Bool
-    let healthAlertTitle: String
-    let walletManager: WalletManager
-    let networkManager: NetworkManager
-
-    func body(content: Content) -> some View {
-        content
-            .sheet(isPresented: $showAlert) {
-                HealthAlertSheet(
+            )) { alert in
+                UnifiedAlertSheet(
+                    alert: alert,
+                    availableDiskSpace: availableDiskSpace,
+                    repairNeededReason: repairNeededReason,
+                    healthAlertTitle: healthAlertTitle,
+                    selectedTab: $selectedTab,
+                    showCypherpunkSettings: $showCypherpunkSettings,
                     walletManager: walletManager,
-                    networkManager: networkManager,
-                    isPresented: $showAlert
+                    networkManager: networkManager
                 )
             }
     }
 }
+
+// MARK: - Unified Alert Types
+enum UnifiedAlert: Identifiable {
+    case diskSpace
+    case repairNeeded
+    case sybilAttack
+    case externalSpend
+    case reducedVerification
+    case criticalHealth
+
+    var id: String {
+        switch self {
+        case .diskSpace: return "diskSpace"
+        case .repairNeeded: return "repairNeeded"
+        case .sybilAttack: return "sybilAttack"
+        case .externalSpend: return "externalSpend"
+        case .reducedVerification: return "reducedVerification"
+        case .criticalHealth: return "criticalHealth"
+        }
+    }
+}
+
+// MARK: - Unified Alert Sheet
+struct UnifiedAlertSheet: View {
+    let alert: UnifiedAlert
+    let availableDiskSpace: String
+    let repairNeededReason: String
+    let healthAlertTitle: String
+    @Binding var selectedTab: ContentView.Tab
+    @Binding var showCypherpunkSettings: Bool
+    @ObservedObject var walletManager: WalletManager
+    @ObservedObject var networkManager: NetworkManager
+
+    var body: some View {
+        switch alert {
+        case .diskSpace:
+            diskSpaceAlert
+        case .repairNeeded:
+            repairNeededAlert
+        case .sybilAttack:
+            sybilAttackAlert
+        case .externalSpend:
+            externalSpendAlert
+        case .reducedVerification:
+            reducedVerificationAlert
+        case .criticalHealth:
+            criticalHealthAlert
+        }
+    }
+
+    private var diskSpaceAlert: some View {
+        AlertWrapper(
+            title: "Insufficient Disk Space",
+            message: "ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.",
+            primaryButton: ("OK", {})
+        )
+    }
+
+    private var repairNeededAlert: some View {
+        AlertWrapper(
+            title: "⚠️ Database Repair Recommended",
+            message: "Your wallet may show an incorrect balance.\n\n\(repairNeededReason)\n\nTo fix this:\n1. Go to Settings\n2. Tap 'Repair Database'\n3. Wait for repair to complete\n\nNote: Tor will be temporarily disabled during repair for faster scanning.\n\nSend is disabled until repair is complete to prevent errors.",
+            primaryButton: ("Later", {}),
+            secondaryButton: ("Open Settings", {
+                selectedTab = .settings
+                showCypherpunkSettings = true
+            })
+        )
+    }
+
+    private var sybilAttackAlert: some View {
+        let alert = networkManager.sybilVersionAttackAlert
+        return AlertWrapper(
+            title: "🚨 Security Alert: Sybil Attack Detected",
+            message: "Detected \(alert?.attackerCount ?? 0) suspicious peer(s) reporting fake blockchain data.\n\n\(alert?.bypassedTor ?? false ? "Tor has been temporarily bypassed to connect directly to trusted peers." : "Malicious peers have been banned.")\n\nYour funds are safe. The wallet is using verified peer consensus.\n\n\"Privacy is necessary for an open society in the electronic age.\"\n— A Cypherpunk's Manifesto",
+            primaryButton: ("OK", {
+                networkManager.clearSybilAttackAlert()
+            })
+        )
+    }
+
+    private var externalSpendAlert: some View {
+        let spend = networkManager.externalWalletSpendDetected
+        let zcl = Double(spend?.amount ?? 0) / 100_000_000.0
+        return AlertWrapper(
+            title: "⚠️ External Wallet Activity Detected",
+            message: "Another wallet is spending your funds!\n\nAmount: \(String(format: "%.8f", zcl)) ZCL\nTxID: \((spend?.txid ?? "").prefix(16))...\n\nThis transaction was NOT initiated by ZipherX. If you did not authorize this, your private key may be compromised.\n\nSend is temporarily disabled until this transaction confirms.",
+            primaryButton: ("OK", {})
+        )
+    }
+
+    private var reducedVerificationAlert: some View {
+        AlertWrapper(
+            title: "⚠️ Reduced Verification Mode",
+            message: "Insufficient peers available for full transaction verification.\n\nTransactions will still be sent but with reduced security:\n\n• Validated by fewer peers than recommended\n• Higher vulnerability to Sybil attacks\n• Consider waiting for more connections\n\nThis is normal during initial connection or on mobile networks.",
+            primaryButton: ("OK", {})
+        )
+    }
+
+    private var criticalHealthAlert: some View {
+        AlertWrapper(
+            title: healthAlertTitle.isEmpty ? "⚠️ Wallet Health Issue Detected" : healthAlertTitle,
+            message: "Critical wallet health issues have been detected that may affect your balance or transaction ability.\n\nPlease check the Health section in Settings for details and recommended actions.\n\nYour funds are safe, but functionality may be limited until issues are resolved.",
+            primaryButton: ("Open Settings", {
+                // FIX #549: Dismiss alert when opening settings to prevent loop
+                Task { @MainActor in
+                    await networkManager.handleHealthAlertAction(.dismiss)
+                }
+                selectedTab = .settings
+                showCypherpunkSettings = true
+            }),
+            secondaryButton: ("Dismiss", {
+                // FIX #549: Properly dismiss the alert
+                Task { @MainActor in
+                    await networkManager.handleHealthAlertAction(.dismiss)
+                }
+            })
+        )
+    }
+}
+
+// MARK: - Alert Wrapper (replaces .alert() for use in .sheet)
+struct AlertWrapper: View {
+    let title: String
+    let message: String
+    let primaryButton: (String, () -> Void)
+    var secondaryButton: (String, () -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text(title)
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(.white)
+
+            Text(message)
+                .font(.system(size: 14))
+                .foregroundColor(.white.opacity(0.9))
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 16) {
+                if let secondary = secondaryButton {
+                    Button(action: secondary.1) {
+                        Text(secondary.0)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.bordered)
+                    .foregroundColor(.white)
+
+                    Button(action: primaryButton.1) {
+                        Text(primaryButton.0)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                } else {
+                    Button(action: primaryButton.1) {
+                        Text(primaryButton.0)
+                            .padding(.horizontal, 30)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: 400)
+        .background(Color.black.opacity(0.9))
+        .cornerRadius(12)
+    }
+}
+
+// FIX #540: Old individual alert modifiers removed - replaced by unified alert system above
 
 // MARK: - Health Alert Sheet View
 struct HealthAlertSheet: View {

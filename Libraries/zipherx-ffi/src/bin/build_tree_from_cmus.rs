@@ -95,7 +95,7 @@ fn main() {
         zipherx_tree_load_from_cmus_with_progress(
             cmu_data.as_ptr(),
             cmu_data.len(),
-            CallbackWrapper::callback,
+            progress_callback,
         )
     };
 

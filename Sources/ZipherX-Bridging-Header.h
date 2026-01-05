@@ -188,6 +188,17 @@ bool zipherx_witness_get_root(
     uint8_t *root_out
 );
 
+// Check if the witness path is valid (not corrupted)
+// A corrupted witness might have a valid root() but invalid path()
+// The path is used by Zcash builder to create the zk-SNARK proof
+// witness_data: serialized witness (1028 bytes)
+// witness_len: length of witness data
+// Returns: true if path is valid, false if corrupted
+bool zipherx_witness_path_is_valid(
+    const uint8_t *witness_data,
+    size_t witness_len
+);
+
 // Compute nullifier for a note
 bool zipherx_compute_nullifier(
     const uint8_t *spending_key,

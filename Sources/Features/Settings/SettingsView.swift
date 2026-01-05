@@ -3480,7 +3480,7 @@ Both binaries must be installed to /usr/local/bin:
                     }
                     return
                 }
-                let accountId = account.id
+                let accountId = account.accountId
 
                 // Get unspent notes only (we don't need to rebuild witnesses for spent notes)
                 let unspentNotes = try WalletDatabase.shared.getUnspentNotes(accountId: accountId)
@@ -3509,9 +3509,20 @@ Both binaries must be installed to /usr/local/bin:
                         print("🔧 First note: height=\(note.height), has anchor=\(note.anchor != nil), has CMU=\(note.cmu != nil)")
                     }
 
-                    // Check if witness already matches current tree root
-                    if let noteAnchor = note.anchor, noteAnchor == currentTreeRoot {
-                        if index == 0 { print("🔧 First note anchor matches current tree root, skipping") }
+                    // FIX #557 v6: Check witness root FIRST, not database anchor
+                    // The database anchor might be current but witness bytes might be stale!
+                    var witnessIsCurrent = false
+
+                    if !note.witness.isEmpty {
+                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
+                            if witnessAnchor == currentTreeRoot {
+                                witnessIsCurrent = true
+                                if index == 0 { print("🔧 First note WITNESS ROOT matches current tree root, skipping") }
+                            }
+                        }
+                    }
+
+                    if witnessIsCurrent {
                         skippedCount += 1
                         continue
                     }
@@ -3555,11 +3566,27 @@ Both binaries must be installed to /usr/local/bin:
                             if index < results.count,
                                let result = results[index] {
                                 let (position, newWitness) = result
-                                // Extract anchor from witness (last 32 bytes)
-                                let witnessAnchor = newWitness.suffix(32)
                                 do {
                                     try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: newWitness)
-                                    try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+
+                                    // FIX #546: Get anchor from HEADER STORE instead of from witness
+                                    // According to SESSION_SUMMARY_2025-11-28.md: "Anchor MUST come from header store - not from computed tree state"
+                                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
+                                        try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
+                                        let anchorHex = headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                        print("   ✅ Note \(note.id) height \(note.height): anchor from HEADER at \(anchorHex)...")
+
+                                        // FIX #546 v2: Verify the write actually persisted
+                                        if let verifyAnchor = try? WalletDatabase.shared.getAnchor(for: note.id),
+                                           verifyAnchor == headerAnchor {
+                                            print("   ✅ Note \(note.id): Verified anchor in DB matches HEADER")
+                                        } else {
+                                            print("   ❌ Note \(note.id): ANCHOR MISMATCH IN DB - write failed!")
+                                        }
+                                    } else {
+                                        print("   ⚠️ Note \(note.id) height \(note.height): no header found for anchor")
+                                    }
+
                                     successCount += 1
                                 } catch {
                                     print("⚠️ Failed to update note at height \(note.height): \(error)")

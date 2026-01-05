@@ -84,6 +84,10 @@ final class WalletHealthCheck {
         // This is 100% trustless - our tree state vs Equihash-verified block header
         results.append(await checkTreeRootMatchesHeader())
 
+        // 15. FIX #550: Auto-detect and fix anchor mismatches
+        // Compares stored note anchors with blockchain headers to detect witness corruption
+        results.append(await checkNoteAnchorsMatchHeaders())
+
         return results
     }
 
@@ -860,5 +864,68 @@ final class WalletHealthCheck {
         UserDefaults.standard.removeObject(forKey: "phantomTransactions")
 
         return .passed("Sent TX Verification", details: "All \(verifiedCount) sent transaction(s) verified on blockchain ✓")
+    }
+
+    // MARK: - FIX #550: Auto-detect and fix anchor mismatches
+
+    /// FIX #550: Auto-detect and fix anchor mismatches at startup
+    /// Compares stored note anchors with blockchain headers
+    /// If mismatches found, auto-rebuilds witnesses with correct HeaderStore anchors
+    private func checkNoteAnchorsMatchHeaders() async -> HealthCheckResult {
+        do {
+            // Get all unspent notes with anchors
+            let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 0)
+            let unspentNotes = notes.filter { $0.cmu != nil && $0.anchor != nil }
+
+            guard !unspentNotes.isEmpty else {
+                return .passed("Anchor Validation", details: "No unspent notes with anchors to check")
+            }
+
+            print("🔍 FIX #550: Checking anchors for \(unspentNotes.count) unspent notes...")
+
+            var mismatchedNotes: [(noteId: Int64, height: UInt64, storedAnchor: Data)] = []
+
+            // Check each note's anchor against the header
+            for note in unspentNotes {
+                guard let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)),
+                      let storedAnchor = note.anchor else {
+                    continue
+                }
+
+                if storedAnchor != headerAnchor {
+                    mismatchedNotes.append((noteId: note.id, height: note.height, storedAnchor: storedAnchor))
+                    print("   ❌ Note \(note.id) height \(note.height): ANCHOR MISMATCH")
+                    print("      Stored:  \(storedAnchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    print("      Header:  \(headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                }
+            }
+
+            if mismatchedNotes.isEmpty {
+                print("✅ FIX #550: All \(unspentNotes.count) note anchors match blockchain headers!")
+                return .passed("Anchor Validation", details: "All \(unspentNotes.count) note anchors match blockchain headers ✓")
+            }
+
+            // FIX #550: AUTO-FIX - Rebuild witnesses with correct HeaderStore anchors
+            print("🔧 FIX #550: Found \(mismatchedNotes.count) mismatched anchors - AUTO-FIXING...")
+            print("   This will rebuild witnesses with correct anchors from HeaderStore...")
+
+            // Trigger the witness rebuild from WalletManager
+            // This will rebuild ALL witnesses with HeaderStore anchors (FIX #546)
+            let fixed = await WalletManager.shared.fixAnchorMismatches()
+
+            if fixed == mismatchedNotes.count {
+                print("✅ FIX #550: Successfully fixed all \(fixed) mismatched anchors!")
+                return .passed("Anchor Validation", details: "Fixed \(fixed) mismatched anchors ✓")
+            } else {
+                print("⚠️ FIX #550: Fixed \(fixed)/\(mismatchedNotes.count) anchors")
+                return .failed("Anchor Validation",
+                              details: "Fixed \(fixed)/\(mismatchedNotes.count) mismatched anchors. Click Force Rebuild Witnesses in Settings to retry.",
+                              critical: false)
+            }
+
+        } catch {
+            print("❌ FIX #550: Error checking anchors: \(error)")
+            return .failed("Anchor Validation", details: "Error: \(error.localizedDescription)", critical: false)
+        }
     }
 }
