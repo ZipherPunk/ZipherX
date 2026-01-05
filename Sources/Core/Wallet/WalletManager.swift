@@ -2017,16 +2017,23 @@ final class WalletManager: ObservableObject {
                     print("✅ FIX #557 v32: Appended \(deltaCMUs.count) delta CMUs")
 
                     // CRITICAL FIX #557 v35: Verify tree root matches header at chainHeight
-                    if let header = try? HeaderStore.shared.getHeader(at: chainHeight),
-                       let ourRoot = ZipherXFFI.treeRoot() {
-                        if ourRoot == header.hashFinalSaplingRoot {
+                    let ourRoot = ZipherXFFI.treeRoot()
+                    if let header = try? HeaderStore.shared.getHeader(at: chainHeight) {
+                        if let root = ourRoot, root == header.hashFinalSaplingRoot {
                             print("✅ FIX #557 v35: Tree root VERIFIED at height \(chainHeight)")
                         } else {
                             print("⚠️ FIX #557 v35: Tree root MISMATCH at height \(chainHeight)")
-                            print("   Our root:   \(ourRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            if let root = ourRoot {
+                                print("   Our root:   \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            } else {
+                                print("   Our root:   FAILED to get root!")
+                            }
                             print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                            print("   Delta CMUs may be incomplete or wrong!")
+                            print("   Delta CMUs: \(deltaCMUs.count), Expected: ~\(chainHeight - boostHeight)")
+                            print("   Boost file may have wrong CMUs OR delta CMUs are incomplete!")
                         }
+                    } else {
+                        print("⚠️ FIX #557 v35: Could not fetch header at \(chainHeight) for verification")
                     }
                 } else {
                     print("⚠️ FIX #557 v32: Failed to fetch delta CMUs")
