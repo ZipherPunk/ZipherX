@@ -1927,31 +1927,35 @@ final class WalletManager: ObservableObject {
                             if let (position, witness) = result {
                                 let note = notesInBoost[index].note
 
-                                // Extract anchor FROM the witness (last 32 bytes) - Dec 24th approach!
-                                let witnessAnchor = witness.suffix(32)
+                                // CRITICAL FIX #557 v30: Use FFI function to extract root from witness!
+                                // witness.suffix(32) returns zeros - witness structure doesn't store root at end!
+                                guard let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) else {
+                                    print("❌ FIX #557 v30: Failed to extract root from witness for note \(note.id)")
+                                    continue
+                                }
 
                                 // Update witness
                                 do {
                                     try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                    print("✅ FIX #557 v29: Updated note \(note.id) witness, anchor: \(witnessAnchor.prefix(4).hexString)...")
+                                    print("✅ FIX #557 v30: Updated note \(note.id) witness, root: \(witnessAnchor.prefix(4).hexString)...")
                                 } catch {
-                                    print("❌ FIX #557 v29: Failed to update witness for note \(note.id): \(error.localizedDescription)")
+                                    print("❌ FIX #557 v30: Failed to update witness for note \(note.id): \(error.localizedDescription)")
                                 }
 
-                                // Update anchor FROM witness (transaction builder will use same method!)
+                                // Update anchor FROM witness root (transaction builder will use same method!)
                                 do {
                                     try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                    print("✅ FIX #557 v29: Updated note \(note.id) anchor from witness")
+                                    print("✅ FIX #557 v30: Updated note \(note.id) anchor: \(witnessAnchor.prefix(4).hexString)...")
                                 } catch {
-                                    print("❌ FIX #557 v29: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
+                                    print("❌ FIX #557 v30: Failed to update anchor for note \(note.id): \(error.localizedDescription)")
                                 }
                                 rebuiltCount += 1
                             }
                         }
 
                         // Summary
-                        print("✅ FIX #557 v29: Witness rebuild complete - updated \(rebuiltCount) notes")
-                        print("✅ FIX #557 v29: All anchors extracted from witnesses (Dec 24th approach)")
+                        print("✅ FIX #557 v30: Witness rebuild complete - updated \(rebuiltCount) notes")
+                        print("✅ FIX #557 v30: All anchors extracted using witnessGetRoot() FFI function")
                         await progress?("Witness rebuild complete!", 100)
                     }
 
@@ -2052,11 +2056,14 @@ final class WalletManager: ObservableObject {
                                 for (index, result) in afterResults.enumerated() {
                                     if let (_, witness) = result {
                                         let note = notesAfterBoost[index].note
-                                        // FIX #557 v29: Extract anchor FROM witness (Dec 24th approach!)
-                                        let witnessAnchor = witness.suffix(32)
-                                        try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
-                                        try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                        rebuiltCount += 1
+                                        // FIX #557 v30: Use FFI function to extract root from witness!
+                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(witness) {
+                                            try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: witness)
+                                            try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
+                                            rebuiltCount += 1
+                                        } else {
+                                            print("❌ FIX #557 v30: Failed to extract root from witness for note \(note.id)")
+                                        }
                                     }
                                 }
 
