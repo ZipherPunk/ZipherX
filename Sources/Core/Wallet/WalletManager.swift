@@ -1918,15 +1918,17 @@ final class WalletManager: ObservableObject {
                 }
 
                 var appendedCount = 0
-                while offset + (appendedCount * 32) + 32 <= cmuData.count {
-                    let cmuOffset = offset + (appendedCount * 32)
-                    let cmu = cmuData.subdata(in: cmuOffset..<(cmuOffset + 32))
+                let totalCMUs = boostHeight - currentTreeSize
+                while offset + UInt64(appendedCount * 32 + 32) <= UInt64(cmuData.count) {
+                    let cmuOffset = offset + UInt64(appendedCount * 32)
+                    let cmu = cmuData.subdata(in: Int(cmuOffset)..<Int(cmuOffset + 32))
                     _ = ZipherXFFI.treeAppend(cmu: cmu)
                     appendedCount += 1
 
                     if appendedCount % 100000 == 0 {
                         print("🔄 FIX #557 v32: Appended \(appendedCount) boost CMUs...")
-                        await progress?("Loading boost CMUs... \(Int((Double(appendedCount) / Double(boostHeight - currentTreeSize)) * 100))%", 40)
+                        let percent = Int((Double(appendedCount) / Double(totalCMUs)) * 100)
+                        await progress?("Loading boost CMUs... \(percent)%", 40)
                     }
                 }
 
