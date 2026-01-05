@@ -1185,8 +1185,11 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
                 let witnessPtr = sqlite3_column_blob(stmt, 8)
                 let witnessLen = sqlite3_column_bytes(stmt, 8)
-                let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
-                witnessData = try decryptBlob(encryptedWitness)
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if witnessPtr != nil && witnessLen > 0 {
+                    let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                    witnessData = try decryptBlob(encryptedWitness)
+                }
             }
 
             // CMU might be NULL (not encrypted - public on chain)
@@ -1271,8 +1274,11 @@ final class WalletDatabase {
             if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
                 let witnessPtr = sqlite3_column_blob(stmt, 8)
                 let witnessLen = sqlite3_column_bytes(stmt, 8)
-                let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
-                witnessData = try decryptBlob(encryptedWitness)
+                // FIX #557 v34: Double-check pointer isn't nil (empty blob != NULL)
+                if witnessPtr != nil && witnessLen > 0 {
+                    let encryptedWitness = Data(bytes: witnessPtr!, count: Int(witnessLen))
+                    witnessData = try decryptBlob(encryptedWitness)
+                }
             }
 
             // CMU might be NULL (not encrypted - public on chain)
