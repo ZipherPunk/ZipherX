@@ -835,6 +835,9 @@ final class TransactionBuilder {
             }
         } else {
             // Single-input transaction - use existing logic
+            var witnessAnchorForTx: Data? = nil  // CRITICAL FIX #557 v42: Store witness root for transaction
+            var preparedWitness: Data? = nil     // Store the prepared witness
+
             for (index, note) in selectedNotes.enumerated() {
                 print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
 
@@ -843,33 +846,21 @@ final class TransactionBuilder {
                 let noteCMU = note.cmu
                 let noteHeight = note.height
 
-                // INSTANT MODE CHECK: If witness has valid structure and was updated by pre-witness rebuild,
-                // trust it without requiring header validation (header sync may lag behind tree sync)
+                // CRITICAL FIX #557 v42: Extract anchor FROM THE WITNESS!
+                // After FIX #557 v36, witnesses are updated to chain tip root.
+                // The witness anchor is the CORRECT anchor for transactions.
                 if !needsRebuild && note.witness.count >= 1028 {
-                    // Extract the anchor from the witness itself (last 32 bytes)
                     let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness)
 
                     if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
-                        // Witness has a valid root - check if it matches stored anchor
-                        if note.anchor == witnessRoot {
-                            print("✅ Note \(index + 1) witness anchor consistent - INSTANT mode!")
-                            // Witness and stored anchor match - trust it
-                        } else if note.anchor.count == 32 && !note.anchor.allSatisfy({ $0 == 0 }) {
-                            // Stored anchor differs from witness - use witness (more recent from pre-witness)
-                            print("✅ Note \(index + 1) using witness root (pre-witness updated) - INSTANT mode!")
-                        } else {
-                            // No valid stored anchor but witness has one - trust witness
-                            print("✅ Note \(index + 1) using witness root - INSTANT mode!")
-                        }
+                        // Witness has valid root - USE IT for transaction!
+                        witnessAnchorForTx = witnessRoot
+                        let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("✅ FIX #557 v42: Note \(index + 1) using WITNESS ANCHOR: \(rootHex)...")
                     } else {
-                        // Witness structure invalid - need rebuild
                         print("⚠️ Note \(index + 1) witness has invalid root - forcing rebuild")
                         needsRebuild = true
                     }
-                } else if !needsRebuild {
-                    // Witness too short - need rebuild
-                    print("⚠️ Note \(index + 1) witness too short (\(note.witness.count) bytes) - forcing rebuild")
-                    needsRebuild = true
                 }
 
                 // Only rebuild witness if needed
@@ -956,10 +947,18 @@ final class TransactionBuilder {
             let witnessToUse = preparedSpends[0].witness
             let noteHeight = note.height
 
-            // Get anchor from header store
+            // CRITICAL FIX #557 v42: Use witness anchor if available, otherwise fall back to header
             var anchorFromHeader: Data
-            if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+            if let witnessAnchor = witnessAnchorForTx {
+                // Use the anchor extracted from the witness (chain tip root)
+                anchorFromHeader = witnessAnchor
+                let anchorHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("✅ FIX #557 v42: Using WITNESS ANCHOR for transaction: \(anchorHex)...")
+            } else if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+                // Fallback: Use header anchor (note height root)
                 anchorFromHeader = noteHeader.hashFinalSaplingRoot
+                let anchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("⚠️ FIX #557 v42: Using HEADER ANCHOR (no witness root): \(anchorHex)...")
             } else if let currentTreeRoot = ZipherXFFI.treeRoot() {
                 anchorFromHeader = currentTreeRoot
             } else {
