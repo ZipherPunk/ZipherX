@@ -4835,7 +4835,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
 
     // DEBUG FIX #557 v43: Log witness root for debugging
     let witness_root = witness.root();
-    let mut witness_root_bytes = [0u8; 32];
+    let mut witness_root_bytes = Vec::new();
     let _ = witness_root.write(&mut witness_root_bytes);
     debug_log!("🔍 FIX #557 v43: Witness root from deserialized witness: {}...", hex::encode(&witness_root_bytes[..8]));
 
@@ -4848,12 +4848,6 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
             return false;
         }
     };
-
-    // DEBUG FIX #557 v43: Log anchor computed from merkle path
-    let path_anchor = merkle_path.root();
-    let mut path_anchor_bytes = [0u8; 32];
-    let _ = path_anchor.write(&mut path_anchor_bytes);
-    debug_log!("🔍 FIX #557 v43: Anchor from merkle_path: {}...", hex::encode(&path_anchor_bytes[..8]));
 
     // Create transaction builder
     let target_height = BlockHeight::from_u32(chain_height as u32);
