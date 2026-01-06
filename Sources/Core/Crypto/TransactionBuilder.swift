@@ -580,6 +580,7 @@ final class TransactionBuilder {
 
         // Prepare witnesses for all selected notes
         var preparedSpends: [(note: SpendableNote, witness: Data)] = []
+        var witnessAnchorForTx: Data? = nil  // CRITICAL FIX #557 v42: Store witness root for transaction
 
         // CRITICAL FIX: For multi-input transactions, ALL witnesses MUST have the same anchor.
         if isMultiInput {
@@ -835,9 +836,6 @@ final class TransactionBuilder {
             }
         } else {
             // Single-input transaction - use existing logic
-            var witnessAnchorForTx: Data? = nil  // CRITICAL FIX #557 v42: Store witness root for transaction
-            var preparedWitness: Data? = nil     // Store the prepared witness
-
             for (index, note) in selectedNotes.enumerated() {
                 print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
 
