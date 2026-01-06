@@ -4816,8 +4816,13 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         Rseed::BeforeZip212(rcm),
     );
 
+    // CRITICAL FIX #557 v43: Strip TRAILING zeros before witness deserialization!
+    // Witnesses are stored zero-padded to 1028 bytes
+    let actual_len = witness_slice.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(witness_slice.len());
+    let trimmed_slice = &witness_slice[..actual_len];
+
     // Deserialize the IncrementalWitness
-    let mut reader = std::io::Cursor::new(witness_slice);
+    let mut reader = std::io::Cursor::new(trimmed_slice);
     let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
         match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
             Ok(w) => w,
@@ -4828,6 +4833,12 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
             }
         };
 
+    // DEBUG FIX #557 v43: Log witness root for debugging
+    let witness_root = witness.root();
+    let mut witness_root_bytes = [0u8; 32];
+    let _ = witness_root.write(&mut witness_root_bytes);
+    debug_log!("🔍 FIX #557 v43: Witness root from deserialized witness: {}...", hex::encode(&witness_root_bytes[..8]));
+
     // Get the merkle path from the witness
     let merkle_path = match witness.path() {
         Some(p) => p,
@@ -4837,6 +4848,12 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
             return false;
         }
     };
+
+    // DEBUG FIX #557 v43: Log anchor computed from merkle path
+    let path_anchor = merkle_path.root();
+    let mut path_anchor_bytes = [0u8; 32];
+    let _ = path_anchor.write(&mut path_anchor_bytes);
+    debug_log!("🔍 FIX #557 v43: Anchor from merkle_path: {}...", hex::encode(&path_anchor_bytes[..8]));
 
     // Create transaction builder
     let target_height = BlockHeight::from_u32(chain_height as u32);
