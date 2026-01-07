@@ -875,11 +875,23 @@ final class WalletDatabase {
         // Migration 11: FIX #370 - Add last_deep_verification timestamp to sync_state
         // Tracks when the last deep verification scan was run
         if !syncStateColumns.contains("last_deep_verification") {
-            let alterSql = "ALTER TABLE sync_state ADD COLUMN last_deep_verification INTEGER NOT NULL DEFAULT 0;"
+            let alterSql = "ALTER TABLE sync_state ADD COLUMN last_deep_verification INTEGER NOT NULL DEFAULT 0;";
             if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
                 print("📂 Migration 11: Added last_deep_verification column to sync_state (FIX #370)")
             } else {
                 print("⚠️ Migration 11: Failed to add last_deep_verification: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        // Migration 12: FIX #557 v45 - Add witness_index column to notes table
+        // Stores the index of the witness in the global FFI tree, allowing us to retrieve fresh witnesses
+        let notesColumns = getTableColumns("notes")
+        if !notesColumns.contains("witness_index") {
+            let alterSql = "ALTER TABLE notes ADD COLUMN witness_index INTEGER NOT NULL DEFAULT 0;";
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 12: Added witness_index column to notes table (FIX #557 v45)")
+            } else {
+                print("⚠️ Migration 12: Failed to add witness_index: \(String(cString: sqlite3_errmsg(db)))")
             }
         }
     }
@@ -1147,7 +1159,7 @@ final class WalletDatabase {
     /// Get all unspent notes (regardless of witness status) - for diagnostics
     func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
             FROM notes
             WHERE account_id = ? AND is_spent = 0
             ORDER BY received_height ASC;
@@ -1214,6 +1226,9 @@ final class WalletDatabase {
                 }
             }
 
+            // FIX #557 v45: Extract witness_index
+            let witnessIndex = UInt64(sqlite3_column_int64(stmt, 11))
+
             let note = WalletNote(
                 id: id,
                 diversifier: diversifier,
@@ -1223,7 +1238,8 @@ final class WalletDatabase {
                 height: height,
                 witness: witnessData,
                 cmu: cmuData,
-                anchor: anchorData
+                anchor: anchorData,
+                witnessIndex: witnessIndex
             )
 
             notes.append(note)
@@ -1236,7 +1252,7 @@ final class WalletDatabase {
     /// This is needed to calculate total received amount which must equal spent + unspent
     func getAllNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
             FROM notes
             WHERE account_id = ?
             ORDER BY received_height ASC;
@@ -1303,6 +1319,9 @@ final class WalletDatabase {
                 }
             }
 
+            // FIX #557 v45: Extract witness_index
+            let witnessIndex = UInt64(sqlite3_column_int64(stmt, 11))
+
             let note = WalletNote(
                 id: id,
                 diversifier: diversifier,
@@ -1312,7 +1331,8 @@ final class WalletDatabase {
                 height: height,
                 witness: witnessData,
                 cmu: cmuData,
-                anchor: anchorData
+                anchor: anchorData,
+                witnessIndex: witnessIndex
             )
 
             notes.append(note)
@@ -1324,7 +1344,7 @@ final class WalletDatabase {
     /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
             FROM notes
             WHERE account_id = ? AND is_spent = 0 AND witness IS NOT NULL
             ORDER BY received_height ASC;
@@ -1391,6 +1411,9 @@ final class WalletDatabase {
                 }
             }
 
+            // FIX #557 v45: Extract witness_index
+            let witnessIndex = UInt64(sqlite3_column_int64(stmt, 11))
+
             // FIX #557 v34: Safety check for nullifier (should never be NULL)
             guard nfPtr != nil && nfLen > 0 else {
                 print("⚠️ WARNING: Note \(id) has NULL nullifier - skipping")
@@ -1406,7 +1429,8 @@ final class WalletDatabase {
                 height: height,
                 witness: witness,
                 cmu: cmuData,
-                anchor: anchorData
+                anchor: anchorData,
+                witnessIndex: witnessIndex
             )
 
             notes.append(note)
@@ -3496,6 +3520,42 @@ final class WalletDatabase {
         }
     }
 
+    /// FIX #557 v45: Update witness_index for a note
+    /// Stores the index in the global FFI tree, allowing us to retrieve fresh witnesses
+    func updateNoteWitnessIndex(noteId: Int64, witnessIndex: UInt64) throws {
+        let sql = "UPDATE notes SET witness_index = ? WHERE id = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(witnessIndex))
+        sqlite3_bind_int64(stmt, 2, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// FIX #557 v45: Helper function to get column names for a table
+    /// Used in migrations to check if a column already exists
+    private func getTableColumns(_ tableName: String) -> Set<String> {
+        var columns: Set<String> = []
+        var stmt: OpaquePointer?
+        let sql = "PRAGMA table_info(\(tableName));"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let columnName = sqlite3_column_text(stmt, 1) {
+                    columns.insert(String(cString: columnName))
+                }
+            }
+            sqlite3_finalize(stmt)
+        }
+        return columns
+    }
+
     /// FIX #550: Get anchor for a specific note
     /// Used to verify anchor writes succeeded
     func getAnchor(for noteId: Int64) throws -> Data? {
@@ -5179,6 +5239,7 @@ struct WalletNote {
     let witness: Data
     let cmu: Data? // Note commitment - needed for witness rebuild
     let anchor: Data? // Tree root when witness was last updated
+    let witnessIndex: UInt64 // FIX #557 v45: Index in global FFI tree for retrieving fresh witnesses
     var confirmations: Int = 0 // Set by caller based on current chain height
 }
 

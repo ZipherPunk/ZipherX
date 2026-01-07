@@ -1381,6 +1381,8 @@ final class FilterScanner {
         }
 
         // DELTA BUNDLE: Save collected outputs for instant witness generation
+        // FIX #558 v4: Debug logging
+        print("📦 FIX #558 v4: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count)")
         if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
             if let treeRoot = ZipherXFFI.treeRoot() {
                 let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight

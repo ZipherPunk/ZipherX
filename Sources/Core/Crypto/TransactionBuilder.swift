@@ -471,6 +471,12 @@ final class TransactionBuilder {
         // Use downloaded tree height from GitHub
         let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
+        // FIX #557 v46: Load cached boost file data for potential witness rebuild
+        var cachedBoostFileData: Data? = nil
+        if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+            cachedBoostFileData = try? Data(contentsOf: cachedPath)
+        }
+
         // Check if tree is already loaded in memory (from startup preload)
         let currentTreeSize = ZipherXFFI.treeSize()
         if currentTreeSize > 0 {
@@ -482,8 +488,7 @@ final class TransactionBuilder {
         } else {
             onProgress("tree", "Loading tree from GitHub cache...", 0.0)
 
-            if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-               let cachedData = try? Data(contentsOf: cachedPath) {
+            if let cachedData = cachedBoostFileData {
 
                 // Count CMUs for progress display
                 let cmuCount = cachedData.count >= 8 ?
@@ -525,6 +530,11 @@ final class TransactionBuilder {
                     onProgress("tree", "Tree ready", 1.0)
                 } else {
                     throw TransactionError.proofGenerationFailed
+                }
+
+                // Load the newly extracted boost file data for witness rebuild
+                if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                    cachedBoostFileData = try? Data(contentsOf: cachedPath)
                 }
             }
         }
@@ -695,8 +705,44 @@ final class TransactionBuilder {
             if allValid && anchorMatchesTree {
                 // INSTANT MODE: All witnesses are valid with matching anchors that match current tree!
                 print("✅ Multi-input INSTANT mode: All \(selectedNotes.count) notes have valid witnesses with matching anchors!")
+
+                // FIX #557 v46: Ensure tree is loaded and rebuild any stale witnesses
+                if ZipherXFFI.treeSize() == 0 {
+                    print("⚠️ FIX #557 v46: Global tree not loaded, loading from database...")
+                    if let treeState = try? WalletDatabase.shared.getTreeState() {
+                        if ZipherXFFI.treeDeserialize(data: treeState) {
+                            print("✅ FIX #557 v46: Tree state loaded (size: \(ZipherXFFI.treeSize()))")
+                        }
+                    }
+                }
+
+                let currentTreeRoot = ZipherXFFI.treeRoot()
+                var rebuildCount = 0
+
                 for note in selectedNotes {
-                    preparedSpends.append((note: note, witness: note.witness))
+                    var witnessToUse = note.witness
+
+                    // Check if witness is stale
+                    if let wRoot = ZipherXFFI.witnessGetRoot(note.witness),
+                       let tRoot = currentTreeRoot,
+                       wRoot != tRoot {
+                        print("⚠️ FIX #557 v46: Witness is stale, rebuilding...")
+                        if let cmu = note.cmu, let cachedData = cachedBoostFileData {
+                            if let result = ZipherXFFI.treeCreateWitnessForCMU(
+                                cmuData: cachedData,
+                                targetCMU: cmu
+                            ) {
+                                witnessToUse = result.witness
+                                rebuildCount += 1
+                            }
+                        }
+                    }
+
+                    preparedSpends.append((note: note, witness: witnessToUse))
+                }
+
+                if rebuildCount > 0 {
+                    print("✅ FIX #557 v46: Rebuilt \(rebuildCount)/\(selectedNotes.count) stale witnesses")
                 }
             } else if allValid && commonAnchor != nil && currentTreeRoot != nil {
                 // Check if anchors match but tree validation failed, OR if anchors are actually stale
@@ -839,29 +885,42 @@ final class TransactionBuilder {
             for (index, note) in selectedNotes.enumerated() {
                 print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
 
-                var witnessToUse = note.witness
-                var needsRebuild = note.witness.count < 1028 || note.witness.allSatisfy { $0 == 0 }
-                let noteCMU = note.cmu
-                let noteHeight = note.height
-
-                // CRITICAL FIX #557 v42: Extract anchor FROM THE WITNESS!
-                // After FIX #557 v36, witnesses are updated to chain tip root.
-                // The witness anchor is the CORRECT anchor for transactions.
-                if !needsRebuild && note.witness.count >= 1028 {
-                    let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness)
-
-                    if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
-                        // Witness has valid root - USE IT for transaction!
-                        witnessAnchorForTx = witnessRoot
-                        let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("✅ FIX #557 v42: Note \(index + 1) using WITNESS ANCHOR: \(rootHex)...")
-                    } else {
-                        print("⚠️ Note \(index + 1) witness has invalid root - forcing rebuild")
-                        needsRebuild = true
+                // FIX #557 v46: If tree state is not loaded, load it first
+                if ZipherXFFI.treeSize() == 0 {
+                    print("⚠️ FIX #557 v46: Global tree not loaded, loading from database...")
+                    if let treeState = try? WalletDatabase.shared.getTreeState() {
+                        if ZipherXFFI.treeDeserialize(data: treeState) {
+                            print("✅ FIX #557 v46: Tree state loaded (size: \(ZipherXFFI.treeSize()))")
+                        }
                     }
                 }
 
-                // Only rebuild witness if needed
+                // Use the stored witness initially
+                var witnessToUse = note.witness
+                var needsRebuild = witnessToUse.count < 1024 || witnessToUse.allSatisfy { $0 == 0 }
+
+                // FIX #557 v46: Check if witness is stale by comparing roots
+                if !needsRebuild && witnessToUse.count >= 1028 {
+                    let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse)
+                    let currentTreeRoot = ZipherXFFI.treeRoot()
+
+                    if let wRoot = witnessRoot, let tRoot = currentTreeRoot {
+                        let wHex = wRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let tHex = tRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+                        if wRoot != tRoot {
+                            print("⚠️ FIX #557 v46: Witness is stale (witness: \(wHex)... tree: \(tHex)...), rebuilding...")
+                            needsRebuild = true
+                        } else {
+                            print("✅ FIX #557 v46: Witness is current (\(wHex)...)...")
+                        }
+                    }
+                }
+
+                let noteCMU = note.cmu
+                let noteHeight = note.height
+
+                // Rebuild witness if needed
                 if needsRebuild && noteHeight > downloadedTreeHeight {
                     guard let cmu = noteCMU else {
                         print("❌ Note \(index + 1) has no CMU for witness rebuild")
@@ -880,17 +939,60 @@ final class TransactionBuilder {
                     } else {
                         throw TransactionError.proofGenerationFailed
                     }
-                } else if needsRebuild, let cmu = noteCMU {
-                    guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                          let cachedData = try? Data(contentsOf: cachedPath) else {
+                } else if needsRebuild {
+                    // FIX #562: Use global tree to create fresh witness (no P2P fetch needed!)
+                    print("FIX #562: Witness is stale, using global tree to create fresh witness...")
+
+                    guard let cmu = noteCMU else {
+                        print("ERROR: Note CMU not available, cannot rebuild witness")
                         throw TransactionError.proofGenerationFailed
                     }
 
-                    if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
-                        witnessToUse = result.witness
-                    } else {
-                        print("❌ Failed to create witness for note \(index + 1)")
+                    // Get current tree root
+                    guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
+                        print("ERROR: Global tree not available")
                         throw TransactionError.proofGenerationFailed
+                    }
+
+                    // Use cached boost data for treeCreateWitnessForCMU
+                    guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                          let cachedData = try? Data(contentsOf: cachedPath) else {
+                        print("ERROR: Boost file not cached")
+                        throw TransactionError.proofGenerationFailed
+                    }
+
+                    // Create witness using global tree (FAST - no P2P fetch!)
+                    guard let result = ZipherXFFI.treeCreateWitnessForCMU(
+                        cmuData: cachedData,
+                        targetCMU: cmu
+                    ) else {
+                        print("ERROR: treeCreateWitnessForCMU failed - CMU might not be in tree")
+                        throw TransactionError.proofGenerationFailed
+                    }
+
+                    witnessToUse = result.witness
+
+                    // Verify witness root matches current tree root
+                    if let wRoot = ZipherXFFI.witnessGetRoot(result.witness) {
+                        let wHex = wRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let tHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        if wRoot == currentTreeRoot {
+                            print("SUCCESS: Witness created from global tree - root: \(wHex)...")
+                        } else {
+                            print("WARNING: Witness root (\(wHex)) != tree root (\(tHex))")
+                        }
+                    }
+                }
+
+                // Extract anchor FROM THE WITNESS for transaction
+                if witnessToUse.count >= 1028 {
+                    let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse)
+
+                    if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
+                        // Witness has valid root - USE IT for transaction!
+                        witnessAnchorForTx = witnessRoot
+                        let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("✅ FIX #557 v42: Note \(index + 1) using WITNESS ANCHOR: \(rootHex)...")
                     }
                 }
 
@@ -945,22 +1047,27 @@ final class TransactionBuilder {
             let witnessToUse = preparedSpends[0].witness
             let noteHeight = note.height
 
-            // CRITICAL FIX #557 v42: Use witness anchor if available, otherwise fall back to header
+            // CRITICAL FIX #557 v44: Use CURRENT global tree root as anchor
+            // The witness root is stale (updated earlier, tree has grown since)
+            // We MUST use the current tree root at transaction time
             var anchorFromHeader: Data
-            if let witnessAnchor = witnessAnchorForTx {
-                // Use the anchor extracted from the witness (chain tip root)
-                anchorFromHeader = witnessAnchor
-                let anchorHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("✅ FIX #557 v42: Using WITNESS ANCHOR for transaction: \(anchorHex)...")
+            if let currentTreeRoot = ZipherXFFI.treeRoot() {
+                // Use CURRENT global tree root (most recent state)
+                anchorFromHeader = currentTreeRoot
+                let anchorHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("✅ FIX #557 v44: Using CURRENT TREE ROOT as anchor: \(anchorHex)...")
+                if let witnessAnchor = witnessAnchorForTx {
+                    let witnessHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("   (witness root was stale: \(witnessHex)... now: \(anchorHex)...)")
+                }
             } else if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
                 // Fallback: Use header anchor (note height root)
                 anchorFromHeader = noteHeader.hashFinalSaplingRoot
                 let anchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("⚠️ FIX #557 v42: Using HEADER ANCHOR (no witness root): \(anchorHex)...")
-            } else if let currentTreeRoot = ZipherXFFI.treeRoot() {
-                anchorFromHeader = currentTreeRoot
+                print("⚠️ FIX #557 v44: Using HEADER ANCHOR (no tree root): \(anchorHex)...")
             } else {
                 anchorFromHeader = Data(count: 32)
+                print("❌ FIX #557 v44: No anchor available!")
             }
 
             // VUL-002 FIX: Use encrypted key FFI for single-input transaction
@@ -1063,7 +1170,8 @@ final class TransactionBuilder {
                 position: UInt64(dbNote.height) * 1000, // Approximate position
                 nullifier: dbNote.nullifier, // For marking as spent
                 height: UInt64(dbNote.height), // Store note height for anchor lookup
-                cmu: dbNote.cmu // Note commitment for witness rebuild
+                cmu: dbNote.cmu, // Note commitment for witness rebuild
+                witnessIndex: dbNote.witnessIndex // FIX #557 v45: Track witness index for fresh retrieval
             )
 
             spendableNotes.append(note)
@@ -1836,6 +1944,7 @@ struct SpendableNote {
     let nullifier: Data // nullifier for spending detection
     let height: UInt64 // block height where note was received
     let cmu: Data? // note commitment - needed for witness rebuild
+    let witnessIndex: UInt64 // FIX #557 v45: Index in global FFI tree for retrieving fresh witnesses
 }
 
 // MARK: - Transaction Errors

@@ -487,7 +487,8 @@ final class WalletManager: ObservableObject {
             var collectedOutputs: [DeltaCMUManager.DeltaOutput] = []
 
             // Fetch blocks in batches
-            let batchSize: UInt64 = 50
+            // FIX #561 v2: 500 is fine for P2P on-demand (rebuildWitnessForNote uses global tree now)
+            let batchSize: UInt64 = 500
             var currentStart = startHeight
 
             while currentStart <= chainHeight {
@@ -590,6 +591,9 @@ final class WalletManager: ObservableObject {
     @Published private(set) var treeLoadProgress: Double = 0.0
     @Published private(set) var treeLoadStatus: String = ""
 
+    // FIX #562: Track when witnesses were last updated to skip redundant staleness checks
+    private var lastWitnessUpdate: Date? = nil
+
     // FIX #278: Boost download stats for progress view (like BootstrapProgressView)
     @Published private(set) var boostDownloadSpeed: String = ""
     @Published private(set) var boostETA: String = ""
@@ -689,10 +693,36 @@ final class WalletManager: ObservableObject {
                     // (treeLoadFromCMUs will replace the tree in FFI memory)
                 } else {
                     print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
+
+                    // FIX #558 v2: Load delta CMUs to complete the tree
+                    // The delta CMUs are saved from previous scans but NOT loaded into the tree
+                    // This causes PHASE 2 to refetch blocks on every startup!
+                    let deltaManager = DeltaCMUManager.shared
+                    if let deltaCMUs = deltaManager.loadDeltaCMUs(), !deltaCMUs.isEmpty {
+                        print("📦 FIX #558 v2: Loading \(deltaCMUs.count) delta CMUs into tree...")
+                        var appendedCount = 0
+                        for cmu in deltaCMUs {
+                            let position = ZipherXFFI.treeAppend(cmu: cmu)
+                            if position != UInt64.max {
+                                appendedCount += 1
+                            }
+                        }
+                        let newTreeSize = ZipherXFFI.treeSize()
+                        print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
+                        print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
+
+                        // Save updated tree state
+                        if let treeData = ZipherXFFI.treeSerialize() {
+                            try? WalletDatabase.shared.saveTreeState(treeData)
+                        }
+                    } else {
+                        print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
+                    }
+
                     await MainActor.run {
                         self.isTreeLoaded = true
                         self.treeLoadProgress = 1.0
-                        self.treeLoadStatus = "Privacy state restored\n\(treeSize.formatted()) commitments ready"
+                        self.treeLoadStatus = "Privacy state restored\n\(ZipherXFFI.treeSize().formatted()) commitments ready"
                     }
                     return
                 }
@@ -838,6 +868,31 @@ final class WalletManager: ObservableObject {
             if let serializedTree = ZipherXFFI.treeSerialize() {
                 try? WalletDatabase.shared.saveTreeState(serializedTree)
                 print("💾 Tree state saved to database for future use")
+            }
+
+            // FIX #558 v2: Load delta CMUs to complete the tree (boost file path)
+            // The delta CMUs are saved from previous scans but NOT loaded into the tree
+            // This causes PHASE 2 to refetch blocks on every startup!
+            let deltaManager = DeltaCMUManager.shared
+            if let deltaCMUs = deltaManager.loadDeltaCMUs(), !deltaCMUs.isEmpty {
+                print("📦 FIX #558 v2: Loading \(deltaCMUs.count) delta CMUs into tree...")
+                var appendedCount = 0
+                for cmu in deltaCMUs {
+                    let position = ZipherXFFI.treeAppend(cmu: cmu)
+                    if position != UInt64.max {
+                        appendedCount += 1
+                    }
+                }
+                let newTreeSize = ZipherXFFI.treeSize()
+                print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
+                print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
+
+                // Save updated tree state
+                if let treeData = ZipherXFFI.treeSerialize() {
+                    try? WalletDatabase.shared.saveTreeState(treeData)
+                }
+            } else {
+                print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
             }
 
             await MainActor.run {
@@ -1967,7 +2022,8 @@ final class WalletManager: ObservableObject {
 
                 var deltaCMUs: [Data] = []
                 let startHeight = boostHeight + 1
-                let batchSize = 50
+                // FIX #561 v2: 500 is fine for P2P on-demand (rebuildWitnessForNote uses global tree now)
+                let batchSize = 500
                 let maxRetries = 2
                 let maxConsecutiveFailures = 3
 
@@ -2078,6 +2134,8 @@ final class WalletManager: ObservableObject {
 
                 if position != UInt64.max {
                     witnessIndices.append((note: note, position: position))
+                    // FIX #557 v45: Store witness_index in database for later retrieval
+                    _ = try? WalletDatabase.shared.updateNoteWitnessIndex(noteId: note.id, witnessIndex: position)
                 }
             }
 
@@ -2101,6 +2159,11 @@ final class WalletManager: ObservableObject {
             }
 
             print("✅ FIX #557 v36: Updated \(updatedCount) witnesses with current tree state")
+            print("✅ FIX #557 v45: Stored witness indices for \(witnessIndices.count) notes")
+
+            // FIX #562: Record when witnesses were last updated
+            lastWitnessUpdate = Date()
+            print("✅ FIX #562: Witness update timestamp recorded")
 
             // FIX #557 v37: Fallback - rebuild empty witnesses using boost + delta
             if !emptyWitnessNotes.isEmpty {
@@ -2117,7 +2180,8 @@ final class WalletManager: ObservableObject {
                         position: note.height, // Use height as position hint
                         nullifier: note.nullifier,
                         height: note.height,
-                        cmu: note.cmu
+                        cmu: note.cmu,
+                        witnessIndex: note.witnessIndex // FIX #557 v45: Include witness index
                     )
                     return (note.id, spendable)
                 }
@@ -2457,6 +2521,8 @@ final class WalletManager: ObservableObject {
             self.syncStatus = "Initializing privacy shield..."
             // Move to connecting phase (tree loading should already be done)
             self.updateOverallProgress(phase: .connecting, phaseProgress: 0.0)
+            // FIX #558: Add FAST START task IDs that ContentView updates
+            // Previous bug: IDs didn't match, so updateSyncTask() calls failed silently
             self.syncTasks = [
                 SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
                 SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
@@ -2467,7 +2533,19 @@ final class WalletManager: ObservableObject {
                 SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
                 SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
                 SyncTask(id: "witnesses", title: "Build Merkle witnesses", status: .pending),
-                SyncTask(id: "balance", title: "Tally unspent notes", status: .pending)
+                SyncTask(id: "balance", title: "Tally unspent notes", status: .pending),
+                // FAST START tasks (ContentView.swift)
+                SyncTask(id: "fast_balance", title: "Load balance from database", status: .pending),
+                SyncTask(id: "fast_peers", title: "Connect to P2P network", status: .pending),
+                SyncTask(id: "fast_headers", title: "Sync block headers", status: .pending),
+                SyncTask(id: "fast_health", title: "Verify wallet health", status: .pending),
+                SyncTask(id: "fast_repair", title: "Auto-repair if needed", status: .pending),
+                // Repair tasks
+                SyncTask(id: "balance_repair", title: "Repair database", status: .pending),
+                SyncTask(id: "balance_repair_early", title: "Early repair check", status: .pending),
+                SyncTask(id: "full_repair", title: "Full database rescan", status: .pending),
+                SyncTask(id: "tree_rebuild", title: "Rebuild commitment tree", status: .pending),
+                SyncTask(id: "witness_sync", title: "Sync witnesses", status: .pending)
             ]
         }
 
@@ -6039,7 +6117,8 @@ final class WalletManager: ObservableObject {
 
         // Fetch blocks via P2P
         var recoveredCount = 0
-        let batchSize: UInt64 = 50
+        // FIX #561 v2: 500 is fine for P2P on-demand fetches
+        let batchSize: UInt64 = 500
 
         var batchStart = startHeight
         while batchStart < chainHeight {
@@ -6478,7 +6557,8 @@ final class WalletManager: ObservableObject {
         var successfulBatches = 0
         var failedBatches = 0
         var consecutiveFailures = 0
-        let batchSize: UInt64 = 50
+        // FIX #561 v2: 500 is fine for P2P on-demand fetches
+        let batchSize: UInt64 = 500
 
         // FIX #367: Add 60-second total timeout to prevent repair from hanging
         let scanStartTime = Date()

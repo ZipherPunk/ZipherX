@@ -464,15 +464,30 @@ struct ContentView: View {
 
                                 print("⚡ FIX #168: INSTANT START COMPLETE (with health check + witness rebuild)!")
 
-                                // Start network and background sync asynchronously (non-blocking)
+                                // FIX #560: Mark all fast_* tasks as completed before returning
+                                // Without this, progress stays at 0% because tasks are still .pending
+                                await MainActor.run {
+                                    walletManager.updateSyncTask(id: "fast_balance", status: .completed)
+                                    walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                    walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                    walletManager.updateSyncTask(id: "fast_health", status: .completed)
+                                    print("✅ FIX #560: All FAST START tasks marked as completed - progress should show 100%")
+                                    
+                                    // FIX #560: Enable background processes for INSTANT START
+                                    // User is going directly to main view, need background processes active
+                                    networkManager.enableBackgroundProcesses()
+                                    print("✅ FIX #560: Background processes enabled for INSTANT START")
+                                }
+
+                                // FIX #560: DO NOT enable background processes yet!
+                                // Background processes will be enabled AFTER FAST START completes
+                                // Starting them now causes mempool scan, block notifications to interfere
                                 Task {
                                     do {
                                         try await networkManager.connect()
-                                        networkManager.enableBackgroundProcesses()
                                         await networkManager.fetchNetworkStats()
                                     } catch {
                                         print("⚠️ FIX #168: Background connect error: \(error.localizedDescription)")
-                                        networkManager.enableBackgroundProcesses()
                                     }
                                 }
                                 return  // EXIT - UI is now showing!
@@ -498,13 +513,10 @@ struct ContentView: View {
                             // Initialize FAST START tasks for UI display
                             // Note: Use unique IDs (fast_*) to avoid conflict with currentSyncTasks computed property
                             // which adds its own "tree" and "connect" tasks
+                            // FIX #558 v3: Update existing tasks instead of replacing the array
+                            // The tasks are already initialized in WalletManager.syncTasks
                             await MainActor.run {
-                                walletManager.syncTasks = [
-                                    SyncTask(id: "fast_balance", title: "Retrieve cached balance", status: .inProgress),
-                                    SyncTask(id: "fast_peers", title: "Verify peer consensus", status: .pending),
-                                    SyncTask(id: "fast_headers", title: "Sync block timestamps", status: .pending),
-                                    SyncTask(id: "fast_health", title: "Validate wallet health", status: .pending)
-                                ]
+                                walletManager.updateSyncTask(id: "fast_balance", status: .inProgress)
                             }
 
                             // Load cached balance immediately (no network wait!)
@@ -1114,6 +1126,11 @@ struct ContentView: View {
 
                             // Mark initial sync as complete - NOW safe because all checks passed or were fixed
                             print("⚡ FAST START COMPLETE: UI ready!")
+
+                            // FIX #560: Enable background processes AFTER FAST START completes
+                            // This prevents mempool scan, block notifications from interfering with startup
+                            networkManager.enableBackgroundProcesses()
+                            print("✅ FIX #560: Background processes enabled - mempool scan, block notifications now active")
 
                             // FIX #500: Clear import progress flag if this was an import
                             if walletManager.isImportInProgress {
@@ -1915,20 +1932,45 @@ struct ContentView: View {
     /// Combined progress for all sync phases - MONOTONIC (never decreases!)
     /// Uses WalletManager.overallProgress which only ever increases
     private var currentSyncProgress: Double {
-        // FIX #154: Check if we're in FAST START mode (tasks have fast_ prefix)
-        let isFastStartMode = walletManager.syncTasks.contains { $0.id.hasPrefix("fast_") }
+        // FIX #560: Check if we're in FAST START mode (tree loaded, initial sync)
+        // Don't check isSyncing because FAST START might sync headers!
+        let isFastStartMode = walletManager.isTreeLoaded && isInitialSync
 
         if isFastStartMode {
-            // FIX #154: Compute progress from FAST START task completion
-            // Use currentSyncTasks which includes tree + connect + fast_* tasks (6 total)
-            let allTasks = currentSyncTasks
-            let totalTasks = allTasks.count
-            guard totalTasks > 0 else { return 0.0 }
+            // FIX #560: Manually build task list for FAST START progress
+            // Don't rely on walletManager.syncTasks which might not have fast_* tasks yet
+            var tasks: [SyncTask] = []
 
+            // Tree task (always completed in FAST START)
+            tasks.append(SyncTask(id: "tree", title: "Load Sapling note tree", status: .completed))
+
+            // Connect task (depends on connection state)
+            if !networkManager.isConnected {
+                let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
+                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: status))
+            } else {
+                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .completed))
+            }
+
+            // CRITICAL FIX #560: Don't show 100% if we're still connecting or syncing!
+            // The isConnecting flag stays true until ALL FAST START work completes
+            if walletManager.isConnecting {
+                // Add a "finalizing" task to keep progress below 100%
+                tasks.append(SyncTask(id: "finalizing", title: "Finalizing startup...", status: .inProgress))
+            }
+
+            // Add fast_* tasks from WalletManager if they exist
+            let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+            if !fastTasks.isEmpty {
+                tasks.append(contentsOf: fastTasks)
+            }
+
+            // Calculate progress
+            let totalTasks = max(tasks.count, 1)  // At least 1 to avoid division by zero
             var completedCount = 0
             var inProgressCount = 0
 
-            for task in allTasks {
+            for task in tasks {
                 switch task.status {
                 case .completed, .failed:
                     completedCount += 1
@@ -1939,12 +1981,10 @@ struct ContentView: View {
                 }
             }
 
-            // Each completed task contributes proportionally, in-progress = 50% credit
             let completedProgress = Double(completedCount) / Double(totalTasks)
             let inProgressProgress = (Double(inProgressCount) / Double(totalTasks)) * 0.5
 
             let progress = min(completedProgress + inProgressProgress, 1.0)
-            print("🔍 FIX #154: FAST START progress = \(Int(progress * 100))% (completed=\(completedCount), inProgress=\(inProgressCount), total=\(totalTasks))")
             return progress
         }
 
@@ -2030,6 +2070,10 @@ struct ContentView: View {
     /// Combined task list including tree loading
     /// Order: Tree → Connect → Sync tasks (headers, scan, witnesses, balance)
     private var currentSyncTasks: [SyncTask] {
+        // FIX #562: Check if we're in FAST START mode (tree loaded, initial sync)
+        // Don't check isSyncing because FAST START might sync headers!
+        let isFastStartMode = walletManager.isTreeLoaded && isInitialSync
+
         var tasks: [SyncTask] = []
 
         // 1. FIRST: Tree loading task (loads before network connection)
@@ -2059,12 +2103,28 @@ struct ContentView: View {
             tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .pending))
         }
 
-        // 3. THIRD: Sync tasks from WalletManager (headers, scan, witnesses, balance)
-        if !walletManager.syncTasks.isEmpty {
-            tasks.append(contentsOf: walletManager.syncTasks)
-        } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
-            // Sync already complete or skipped - show completed scan task
-            tasks.append(SyncTask(id: "scan", title: "Decrypt shielded notes", status: .completed))
+        // 3. THIRD: Sync tasks from WalletManager
+        if isFastStartMode {
+            // FIX #562: FAST START mode - only show fast_* tasks, not all 20+ tasks!
+            // CRITICAL: Don't show 100% if we're still connecting or syncing!
+            if walletManager.isConnecting {
+                // Add a "finalizing" task to keep progress below 100%
+                tasks.append(SyncTask(id: "finalizing", title: "Finalizing startup...", status: .inProgress))
+            }
+
+            // Add fast_* tasks from WalletManager if they exist
+            let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+            if !fastTasks.isEmpty {
+                tasks.append(contentsOf: fastTasks)
+            }
+        } else {
+            // NORMAL START mode - show all sync tasks
+            if !walletManager.syncTasks.isEmpty {
+                tasks.append(contentsOf: walletManager.syncTasks)
+            } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
+                // Sync already complete or skipped - show completed scan task
+                tasks.append(SyncTask(id: "scan", title: "Decrypt shielded notes", status: .completed))
+            }
         }
 
         return tasks
@@ -2594,31 +2654,55 @@ struct CypherpunkAlertsModifier: ViewModifier {
 
     // Unified alert state
     @State private var activeAlert: UnifiedAlert? = nil
+    // FIX #562: Track when alert was just dismissed to prevent immediate re-presentation
+    @State private var alertDismissedAt: Date? = nil
 
     func body(content: Content) -> some View {
         content
             .onChange(of: showInsufficientDiskSpaceAlert) { newValue in
-                if newValue { activeAlert = .diskSpace }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if newValue, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .diskSpace
+                }
             }
             .onChange(of: showRepairNeededAlert) { newValue in
-                if newValue { activeAlert = .repairNeeded }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if newValue, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .repairNeeded
+                }
             }
             .onChange(of: showSybilAttackAlert) { newValue in
-                if newValue { activeAlert = .sybilAttack }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if newValue, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .sybilAttack
+                }
             }
             .onChange(of: showExternalWalletSpendAlert) { newValue in
-                if newValue { activeAlert = .externalSpend }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if newValue, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .externalSpend
+                }
             }
             .onChange(of: showReducedVerificationAlert) { newValue in
-                if newValue { activeAlert = .reducedVerification }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if newValue, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .reducedVerification
+                }
             }
             .onChange(of: networkManager.criticalHealthAlert != nil) { hasAlert in
-                if hasAlert { activeAlert = .criticalHealth }
+                // FIX #562: Only show alert if not just dismissed (within 1 second)
+                if hasAlert, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .criticalHealth
+                }
             }
             .sheet(item: Binding(
                 get: { activeAlert },
                 set: { newValue in
                     activeAlert = newValue
+                    // FIX #562: Record when alert was dismissed to prevent immediate re-presentation
+                    if newValue == nil {
+                        alertDismissedAt = Date()
+                    }
                     // Reset all individual alert states
                     showInsufficientDiskSpaceAlert = false
                     showRepairNeededAlert = false

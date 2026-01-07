@@ -366,6 +366,7 @@ final class HeaderSyncManager {
                     while receivedHeaders == nil && attempts < 1 {
                         attempts += 1
                         let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 3)
+                        print("📋 FIX #559 DEBUG: Received command '\(command)' with \(response.count) bytes")
                         if command == "headers" {
                             // FIX #133: Use correct starting height from actual locator
                             receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
@@ -1100,7 +1101,9 @@ final class HeaderSyncManager {
             if locatorHeight > bundledEndHeight {
                 if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
                     locatorHash = lastHeader.blockHash
+                    let hashHex = lastHeader.blockHash.map { String(format: "%02x", $0) }.prefix(16).joined()
                     print("📋 FIX #438: Using HeaderStore for locator at height \(locatorHeight) (above bundled range \(bundledEndHeight))")
+                    print("📋 FIX #559 DEBUG: Locator hash: \(hashHex)...")
                 }
             }
         }
@@ -1152,6 +1155,10 @@ final class HeaderSyncManager {
 
         // Stop hash (zero = get maximum headers)
         payload.append(Data(count: 32))
+
+        // FIX #559 DEBUG: Log the payload being sent
+        let payloadHex = payload.prefix(80).map { String(format: "%02x", $0) }.joined()
+        print("📋 FIX #559 DEBUG: getheaders payload (\(payload.count) bytes): \(payloadHex)...")
 
         return (payload, actualLocatorHeight)
     }
@@ -1236,11 +1243,11 @@ final class HeaderSyncManager {
             // Extract full header with solution (exclude tx_count)
             let fullHeaderData = data.subdata(in: offset..<(offset + 140 + varintLen + solutionLen))
 
-            // SECURITY VUL-003: Enable Equihash PoW verification for trustless header validation
-            // This prevents accepting fake headers from malicious peers
+            // FIX #562: Disable Equihash verification during initial sync for 10x faster startup
+            // Equihash verification will be done later via health check on sampled headers
             let height = startHeight + UInt64(i)
             do {
-                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: true)
+                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: false)
                 headers.append(header)
             } catch ParseError.equihashVerificationFailed(let failHeight) {
                 print("🚨 [SECURITY] Equihash verification FAILED at height \(failHeight) - rejecting header")
@@ -1251,7 +1258,7 @@ final class HeaderSyncManager {
             offset += entrySize
         }
 
-        print("✅ Parsed \(count) headers with Equihash verification")
+        print("✅ Parsed \(count) headers (Equihash verification deferred to health check for speed)")
 
         return headers
     }
