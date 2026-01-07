@@ -940,13 +940,8 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
                 } else if needsRebuild {
-                    // FIX #562: Use global tree to create fresh witness (no P2P fetch needed!)
-                    print("FIX #562: Witness is stale, using global tree to create fresh witness...")
-
-                    guard let cmu = noteCMU else {
-                        print("ERROR: Note CMU not available, cannot rebuild witness")
-                        throw TransactionError.proofGenerationFailed
-                    }
+                    // FIX #562 v2: Use stored witness index to get fresh witness from global tree!
+                    print("FIX #562 v2: Witness is stale, using stored index + global tree...")
 
                     // Get current tree root
                     guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
@@ -954,33 +949,55 @@ final class TransactionBuilder {
                         throw TransactionError.proofGenerationFailed
                     }
 
-                    // Use cached boost data for treeCreateWitnessForCMU
-                    guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                          let cachedData = try? Data(contentsOf: cachedPath) else {
-                        print("ERROR: Boost file not cached")
-                        throw TransactionError.proofGenerationFailed
-                    }
+                    // Check if note has stored witness index (from FIX #557 v45)
+                    if note.witnessIndex > 0 {
+                        let witnessIndex = note.witnessIndex
+                        print("   Using stored witness index: \(witnessIndex)")
 
-                    // Create witness using global tree (FAST - no P2P fetch!)
-                    guard let result = ZipherXFFI.treeCreateWitnessForCMU(
-                        cmuData: cachedData,
-                        targetCMU: cmu
-                    ) else {
-                        print("ERROR: treeCreateWitnessForCMU failed - CMU might not be in tree")
-                        throw TransactionError.proofGenerationFailed
-                    }
-
-                    witnessToUse = result.witness
-
-                    // Verify witness root matches current tree root
-                    if let wRoot = ZipherXFFI.witnessGetRoot(result.witness) {
-                        let wHex = wRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        let tHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        if wRoot == currentTreeRoot {
-                            print("SUCCESS: Witness created from global tree - root: \(wHex)...")
-                        } else {
-                            print("WARNING: Witness root (\(wHex)) != tree root (\(tHex))")
+                        // Get fresh witness from global tree using stored index
+                        guard let freshWitness = ZipherXFFI.treeGetWitness(index: witnessIndex) else {
+                            print("ERROR: treeGetWitness failed for index \(witnessIndex)")
+                            throw TransactionError.proofGenerationFailed
                         }
+
+                        witnessToUse = freshWitness
+
+                        // Verify witness root matches current tree root
+                        if let wRoot = ZipherXFFI.witnessGetRoot(freshWitness) {
+                            let wHex = wRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            let tHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            if wRoot == currentTreeRoot {
+                                print("✅ SUCCESS: Fresh witness from global tree - root: \(wHex)...")
+                            } else {
+                                print("⚠️ WARNING: Witness root (\(wHex)) != tree root (\(tHex))")
+                            }
+                        }
+                    } else {
+                        // Fallback: No stored index, need to rebuild
+                        print("   No stored index, rebuilding from CMU...")
+
+                        guard let cmu = noteCMU else {
+                            print("ERROR: Note CMU not available, cannot rebuild witness")
+                            throw TransactionError.proofGenerationFailed
+                        }
+
+                        // Use cached boost data for treeCreateWitnessForCMU
+                        guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                              let cachedData = try? Data(contentsOf: cachedPath) else {
+                            print("ERROR: Boost file not cached")
+                            throw TransactionError.proofGenerationFailed
+                        }
+
+                        guard let result = ZipherXFFI.treeCreateWitnessForCMU(
+                            cmuData: cachedData,
+                            targetCMU: cmu
+                        ) else {
+                            print("ERROR: treeCreateWitnessForCMU failed - CMU might not be in tree")
+                            throw TransactionError.proofGenerationFailed
+                        }
+
+                        witnessToUse = result.witness
+                        print("   Witness rebuilt from boost file (root may be outdated)")
                     }
                 }
 
