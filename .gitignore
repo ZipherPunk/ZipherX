@@ -64,6 +64,11 @@ Resources/commitment_tree.bin.zst
 Resources/commitment_tree_serialized.bin
 Resources/commitment_tree_manifest.json
 
+# Boost cache files (downloaded at runtime, not in repo)
+Resources/BoostCache/*.bin
+Resources/BoostCache/*.bin.zst
+Resources/BoostCache/headers.db
+
 # Large shielded outputs data files (hosted externally)
 Resources/shielded_outputs.bin
 Resources/shielded_outputs.bin.zst
