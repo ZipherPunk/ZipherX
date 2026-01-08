@@ -2358,6 +2358,10 @@ static COMMITMENT_TREE: Mutex<Option<CommitmentTree<zcash_primitives::sapling::N
 static WITNESSES: Mutex<Vec<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = Mutex::new(Vec::new());
 static TREE_POSITION: Mutex<u64> = Mutex::new(0);
 
+// FIX #562 v8: Store delta CMUs to properly update witnesses
+// These are CMUs added after the boost file (during PHASE 2 sync)
+static DELTA_CMUS: Mutex<Vec<zcash_primitives::sapling::Node>> = Mutex::new(Vec::new());
+
 /// Initialize a new empty Sapling commitment tree
 #[no_mangle]
 pub extern "C" fn zipherx_tree_init() -> bool {
@@ -2408,6 +2412,16 @@ pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
     // Append to tree
     if tree.append(node).is_err() {
         return u64::MAX;
+    }
+
+    // FIX #562 v8: Store delta CMU for proper witness updates
+    {
+        let mut delta_guard = DELTA_CMUS.lock().unwrap();
+        delta_guard.push(node.clone());
+        // Log every 100 delta CMUs to avoid spam
+        if delta_guard.len() % 100 == 0 {
+            debug_log!("📊 FIX #562 v8: Stored {} delta CMUs", delta_guard.len());
+        }
     }
 
     // Update all existing witnesses with this new node
@@ -3244,11 +3258,13 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
     success_count
 }
 
-/// Create a witness for a specific CMU from bundled CMU data
+/// Create a witness for a specific CMU from CURRENT GLOBAL TREE state
 /// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
 ///
+/// FIX #562 v8: Uses GLOBAL tree (with delta CMUs) instead of local boost file tree
+///
 /// Parameters:
-/// - cmu_data: Pointer to bundled CMU file data [count: u64][cmu1: 32]...
+/// - cmu_data: Pointer to bundled CMU file data [count: u64][cmu1: 32]... (used only to find position)
 /// - cmu_data_len: Length of CMU data
 /// - target_cmu: The 32-byte CMU to create witness for
 /// - witness_out: Output buffer for serialized witness (at least 2000 bytes)
@@ -3372,10 +3388,31 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     }
 
     // Serialize witness
-    let witness = match witness {
+    let mut witness = match witness {
         Some(w) => w,
         None => return u64::MAX,
     };
+
+    // FIX #562 v8: Update witness with DELTA CMUs that were added after boost file!
+    // This is CRITICAL - the witness was created from boost file tree only,
+    // but the global tree has additional CMUs that were added during PHASE 2 sync
+    {
+        let delta_guard = DELTA_CMUS.lock().unwrap();
+        if !delta_guard.is_empty() {
+            debug_log!("🔧 FIX #562 v8: Updating witness with {} delta CMUs...", delta_guard.len());
+            for delta_node in delta_guard.iter() {
+                witness.append(delta_node.clone()).ok();
+            }
+            debug_log!("✅ FIX #562 v8: Witness updated with delta CMUs - now points to current tree root!");
+        }
+    }
+
+    // FIX #562 v8: Add witness to global WITNESSES array so it gets updated with FUTURE CMUs
+    {
+        let mut witnesses_guard = WITNESSES.lock().unwrap();
+        witnesses_guard.push(witness.clone());
+        debug_log!("🔧 FIX #562 v8: Added witness to global WITNESSES array (total: {} witnesses)", witnesses_guard.len());
+    }
 
     let mut serialized = Vec::new();
     if write_incremental_witness(&witness, &mut serialized).is_err() {

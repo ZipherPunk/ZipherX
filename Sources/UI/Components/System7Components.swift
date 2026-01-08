@@ -1764,6 +1764,13 @@ struct CypherpunkSyncTaskRow: View {
                         .font(.system(size: taskRowDetailSize, design: .monospaced))
                         .foregroundColor(NeonColors.primaryDim)
                 }
+
+                // Progress percentage (e.g., "45%")
+                if let progress = task.progress, progress > 0 {
+                    Text("\(Int(progress * 100))%")
+                        .font(.system(size: taskRowDetailSize, weight: .bold, design: .monospaced))
+                        .foregroundColor(NeonColors.primary)
+                }
             }
 
             // Progress bar for in-progress tasks

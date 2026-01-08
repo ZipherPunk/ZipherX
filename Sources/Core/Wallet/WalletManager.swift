@@ -4493,11 +4493,59 @@ final class WalletManager: ObservableObject {
                     self.syncStatus = "Processing..."
                 }
             } else if case .completed = status {
-                // Update progress based on completed tasks
-                let completedCount = syncTasks.filter { if case .completed = $0.status { return true }; return false }.count
-                self.syncProgress = Double(completedCount) / Double(syncTasks.count)
+                // FIX #562: Calculate progress based on task progress values, not just completed count
+                self.recalculateSyncProgress()
             }
         }
+
+        // FIX #562: Also recalculate progress when inProgress with progress value
+        if case .inProgress = status, let progress = syncTasks.first(where: { $0.id == id })?.progress, progress > 0 {
+            self.recalculateSyncProgress()
+        }
+    }
+
+    /// FIX #562: Calculate sync progress from individual task progress values
+    /// In FAST START mode, only consider fast_* tasks (5 tasks)
+    /// In NORMAL START mode, consider all sync tasks
+    @MainActor
+    private func recalculateSyncProgress() {
+        // Filter tasks based on whether we're in FAST START mode
+        // FAST START mode: tree is loaded, initial sync is active, only fast_* tasks exist
+        let isFastStartMode = self.isTreeLoaded && syncTasks.contains(where: { $0.id.hasPrefix("fast_") })
+
+        let relevantTasks: [SyncTask]
+        if isFastStartMode {
+            // In FAST START, only consider fast_* tasks
+            relevantTasks = syncTasks.filter { $0.id.hasPrefix("fast_") }
+        } else {
+            // In NORMAL START, consider all sync tasks
+            relevantTasks = syncTasks
+        }
+
+        guard !relevantTasks.isEmpty else {
+            self.syncProgress = 0.0
+            return
+        }
+
+        // Calculate progress as average of task progress values
+        var totalProgress: Double = 0.0
+        for task in relevantTasks {
+            switch task.status {
+            case .completed:
+                totalProgress += 1.0
+            case .inProgress:
+                // Use progress value if available, otherwise assume 50%
+                if let progress = task.progress, progress > 0 {
+                    totalProgress += progress
+                } else {
+                    totalProgress += 0.5
+                }
+            case .pending, .failed:
+                totalProgress += 0.0
+            }
+        }
+
+        self.syncProgress = totalProgress / Double(relevantTasks.count)
     }
 
     /// Update a sync task with progress (keeps inProgress status)
@@ -4559,6 +4607,7 @@ final class WalletManager: ObservableObject {
     /// Update a sync task status, detail, and progress - called from ContentView for FAST START
     /// FIX #154: Added progress parameter for individual task progress bars
     /// FIX #497: Replace entire task struct to trigger SwiftUI @Published update
+    /// FIX #562: Recalculate overall progress when task status or progress changes
     @MainActor
     func updateSyncTask(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
         if let index = syncTasks.firstIndex(where: { $0.id == id }) {
@@ -4571,6 +4620,9 @@ final class WalletManager: ObservableObject {
                 task.progress = progress
             }
             syncTasks[index] = task
+
+            // FIX #562: Recalculate overall progress when task is updated
+            recalculateSyncProgress()
         }
     }
 

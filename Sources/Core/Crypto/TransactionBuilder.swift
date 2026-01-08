@@ -975,15 +975,95 @@ final class TransactionBuilder {
                     print("   ✅ Witness rebuilt from boost file (position: \(result.position))")
                 }
 
-                // Extract anchor FROM THE WITNESS for transaction
-                if witnessToUse.count >= 1028 {
-                    let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse)
+                // RESTORED DEC 12, 2025 WORKING APPROACH
+                // Get anchor from HeaderStore at NOTE HEIGHT (not current tree root!)
+                // The anchor MUST match the tree state at the height where the note was received
+                print("   🔍 Getting anchor from HeaderStore at note height \(noteHeight)...")
 
-                    if let witnessRoot = witnessRoot, witnessRoot.count == 32, !witnessRoot.allSatisfy({ $0 == 0 }) {
-                        // Witness has valid root - USE IT for transaction!
+                let headerStore = HeaderStore.shared
+                try? headerStore.open()
+
+                var anchorFromHeader: Data
+
+                if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
+                    anchorFromHeader = noteHeader.hashFinalSaplingRoot
+                    let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
+                    print("   📝 Using anchor from block header at height \(noteHeight)")
+                    print("   📝 Anchor: \(anchorHex)...")
+                    print("   ✅ This anchor matches blockchain's tree state at the note's block")
+                } else {
+                    print("   ⚠️ Block header not available at height \(noteHeight)")
+                    print("   📝 Will compute anchor from witness root...")
+                    anchorFromHeader = Data(count: 32) // placeholder
+                }
+
+                // Verify witness root matches header anchor
+                let haveHeaderAnchor = !anchorFromHeader.allSatisfy { $0 == 0 }
+
+                if haveHeaderAnchor {
+                    if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
+                        let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let headerAnchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+                        if witnessRoot == anchorFromHeader {
+                            print("   ✅ Witness root matches header anchor: \(witnessRootHex)... == \(headerAnchorHex)...")
+                            witnessAnchorForTx = anchorFromHeader
+                        } else {
+                            print("   ❌ WITNESS/ANCHOR MISMATCH!")
+                            print("      witnessRoot:   \(witnessRootHex)...")
+                            print("      headerAnchor:  \(headerAnchorHex)...")
+                            print("      This means witness was built with wrong tree state")
+                            print("      Need to rebuild witness to match header anchor")
+
+                            // Rebuild witness to match header anchor
+                            guard let cmu = noteCMU else {
+                                print("   ❌ Note CMU not available, cannot rebuild witness")
+                                throw TransactionError.proofGenerationFailed
+                            }
+
+                            guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                                  let cachedData = try? Data(contentsOf: cachedPath) else {
+                                print("   ❌ Boost file not cached")
+                                throw TransactionError.proofGenerationFailed
+                            }
+
+                            print("   🔧 Rebuilding witness to match header anchor...")
+
+                            guard let result = ZipherXFFI.treeCreateWitnessForCMU(
+                                cmuData: cachedData,
+                                targetCMU: cmu
+                            ) else {
+                                print("   ❌ Failed to rebuild witness")
+                                throw TransactionError.proofGenerationFailed
+                            }
+
+                            witnessToUse = result.witness
+
+                            // Verify again after rebuild
+                            if let rebuiltRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
+                                let rebuiltHex = rebuiltRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                if rebuiltRoot == anchorFromHeader {
+                                    print("   ✅ Rebuilt witness now matches header anchor: \(rebuiltHex)...")
+                                    witnessAnchorForTx = anchorFromHeader
+                                } else {
+                                    print("   ⚠️ Rebuilt witness still doesn't match - using header anchor anyway")
+                                    witnessAnchorForTx = anchorFromHeader
+                                }
+                            }
+                        }
+                    } else {
+                        print("   ⚠️ Could not extract witness root, using header anchor")
+                        witnessAnchorForTx = anchorFromHeader
+                    }
+                } else {
+                    // No header anchor available - use witness root
+                    if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
                         witnessAnchorForTx = witnessRoot
                         let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("✅ FIX #557 v42: Note \(index + 1) using WITNESS ANCHOR: \(rootHex)...")
+                        print("   📝 Using witness root as anchor: \(rootHex)...")
+                    } else {
+                        print("   ❌ No anchor available!")
+                        throw TransactionError.proofGenerationFailed
                     }
                 }
 
@@ -1033,32 +1113,30 @@ final class TransactionBuilder {
             return (result.txData, primaryNullifier)
 
         } else {
-            // SINGLE-INPUT TRANSACTION (existing logic)
+            // SINGLE-INPUT TRANSACTION
             let note = preparedSpends[0].note
             let witnessToUse = preparedSpends[0].witness
             let noteHeight = note.height
 
-            // CRITICAL FIX #557 v44: Use CURRENT global tree root as anchor
-            // The witness root is stale (updated earlier, tree has grown since)
-            // We MUST use the current tree root at transaction time
+            // RESTORED DEC 12, 2025 WORKING APPROACH
+            // Get anchor from HeaderStore at NOTE HEIGHT (not current tree root!)
             var anchorFromHeader: Data
-            if let currentTreeRoot = ZipherXFFI.treeRoot() {
-                // Use CURRENT global tree root (most recent state)
-                anchorFromHeader = currentTreeRoot
-                let anchorHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("✅ FIX #557 v44: Using CURRENT TREE ROOT as anchor: \(anchorHex)...")
-                if let witnessAnchor = witnessAnchorForTx {
-                    let witnessHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("   (witness root was stale: \(witnessHex)... now: \(anchorHex)...)")
-                }
-            } else if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
-                // Fallback: Use header anchor (note height root)
+            if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
                 anchorFromHeader = noteHeader.hashFinalSaplingRoot
                 let anchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("⚠️ FIX #557 v44: Using HEADER ANCHOR (no tree root): \(anchorHex)...")
+                print("📝 Using anchor from block header at height \(noteHeight): \(anchorHex)...")
+                print("✅ This anchor matches blockchain's tree state at the note's block")
             } else {
-                anchorFromHeader = Data(count: 32)
-                print("❌ FIX #557 v44: No anchor available!")
+                print("⚠️ Block header not available at height \(noteHeight)")
+                print("📝 Falling back to witness root...")
+                if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
+                    anchorFromHeader = witnessRoot
+                    let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("📝 Using witness root as anchor: \(rootHex)...")
+                } else {
+                    print("❌ No anchor available!")
+                    anchorFromHeader = Data(count: 32)
+                }
             }
 
             // VUL-002 FIX: Use encrypted key FFI for single-input transaction
