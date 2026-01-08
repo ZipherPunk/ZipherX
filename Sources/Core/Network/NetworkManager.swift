@@ -5102,29 +5102,122 @@ public final class NetworkManager: ObservableObject {
     // MARK: - FIX #516: Transaction Validation Helpers
 
     /// Extract anchor (Merkle root) from Sapling transaction
-    /// The anchor is the 32-byte value before the binding signature
+    /// FIX #562: Parse transaction properly to extract anchor from SpendDescription
     private func extractAnchorFromTransaction(_ txData: Data) async throws -> Data {
-        // Zcash transaction format (simplified):
-        // - Header (4 bytes): version + version group ID
-        // - Transparent inputs/outputs (variable)
-        // - Sapling spends/outputs (variable)
-        // - ValueBalance (8 bytes, signed little-endian)
-        // - Anchor (32 bytes): The Merkle tree root
-        // - BindingSig (64 bytes)
+        // Zcash v4 transaction format:
+        // - Header (4 bytes): version (4) + version group ID
+        // - Transparent inputs/outputs (variable, with compact size)
+        // - Sapling bundle:
+        //   - compactSize: number of spends
+        //   - For each spend: SpendDescription
+        //     - cv: ValueCommitment (32 bytes)
+        //     - anchor: bls12_381::Scalar (32 bytes) ← THIS IS WHAT WE NEED
+        //     - nullifier (32 bytes)
+        //     - rk (32 bytes)
+        //     - zkproof (192 bytes)
+        //     - spendAuthSig (64 bytes)
+        //   - compactSize: number of outputs
+        //   - Outputs...
+        //   - valueBalance (8 bytes)
+        //   - bindingSig (64 bytes)
 
-        // FIX #516 v2: Account for valueBalance (8 bytes) before anchor
-        // Zcash Sapling bundle ends with: [valueBalance (8)] [anchor (32)] [bindingSig (64)]
-        // So anchor is at offset: txData.count - 64 - 32 - 8
-
-        guard txData.count >= 104 else {
-            throw NetworkError.invalidTransaction("Transaction too short to contain anchor")
+        guard txData.count > 4 else {
+            throw NetworkError.invalidTransaction("Transaction too short")
         }
 
-        // Anchor is at offset: txData.count - 64 (bindingSig) - 32 (anchor) - 8 (valueBalance)
-        let anchorOffset = txData.count - 64 - 32 - 8
-        let anchor = txData.subdata(in: anchorOffset..<anchorOffset + 32)
+        // Read transaction version (first 4 bytes)
+        let version = txData.subdata(in: 0..<4)
+        let txVersion = version.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
 
-        print("🔍 FIX #516: Extracted anchor: \(anchor.map { String(format: "%02x", $0) }.joined())")
+        // Only parse v4+ transactions
+        guard txVersion >= 4 else {
+            throw NetworkError.invalidTransaction("Only v4+ transactions supported")
+        }
+
+        var offset = 4  // Skip header
+
+        // Skip transparent inputs (compact size + each input)
+        func readCompactSize(_ data: Data, _ offset: inout Int) -> UInt64? {
+            guard offset < data.count else { return nil }
+            let first = data[offset]
+            offset += 1
+            if first < 253 {
+                return UInt64(first)
+            } else if first == 253 {
+                guard offset + 2 <= data.count else { return nil }
+                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
+                offset += 2
+                return UInt64(value)
+            } else if first == 254 {
+                guard offset + 4 <= data.count else { return nil }
+                let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+                offset += 4
+                return UInt64(value)
+            } else { // 255
+                guard offset + 8 <= data.count else { return nil }
+                let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+                offset += 8
+                return value
+            }
+        }
+
+        // Skip transparent inputs
+        guard let numInputs = readCompactSize(txData, &offset) else {
+            throw NetworkError.invalidTransaction("Failed to read input count")
+        }
+        for _ in 0..<numInputs {
+            // Input: prevout (36) + scriptSig (compact size) + sequence (4)
+            offset += 36  // prevout
+            guard let scriptSize = readCompactSize(txData, &offset) else { break }
+            offset += Int(scriptSize)
+            offset += 4  // sequence
+        }
+
+        // Skip transparent outputs
+        guard let numOutputs = readCompactSize(txData, &offset) else {
+            throw NetworkError.invalidTransaction("Failed to read output count")
+        }
+        for _ in 0..<numOutputs {
+            // Output: value (8) + scriptPubKey (compact size)
+            offset += 8  // value
+            guard let scriptSize = readCompactSize(txData, &offset) else { break }
+            offset += Int(scriptSize)
+        }
+
+        // Lock time (4 bytes)
+        offset += 4
+
+        // Expiry height (4 bytes) for v4+
+        offset += 4
+
+        // Now we're at the sapling bundle
+        // Read number of sapling spends
+        guard let numSpends = readCompactSize(txData, &offset) else {
+            throw NetworkError.invalidTransaction("Failed to read sapling spend count")
+        }
+
+        // If no spends, no anchor to extract
+        guard numSpends > 0 else {
+            throw NetworkError.invalidTransaction("No sapling spends in transaction")
+        }
+
+        // Parse the first SpendDescription to get its anchor
+        // SpendDescription format:
+        // - cv (32 bytes)
+        // - anchor (32 bytes) ← THIS IS THE ANCHOR
+        // - nullifier (32 bytes)
+        // - rk (32 bytes)
+        // - zkproof (192 bytes)
+        // - spendAuthSig (64 bytes)
+
+        offset += 32  // Skip cv to get to anchor
+        guard offset + 32 <= txData.count else {
+            throw NetworkError.invalidTransaction("Transaction too short for anchor")
+        }
+
+        let anchor = txData.subdata(in: offset..<offset + 32)
+
+        print("🔍 FIX #562: Extracted anchor from SpendDescription: \(anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
         return anchor
     }
 

@@ -4647,7 +4647,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     to_address: *const u8,
     amount: u64,
     memo: *const u8,
-    _anchor: *const u8,
+    anchor: *const u8,  // FIX #562: Remove underscore to use this parameter!
     witness_data: *const u8,
     witness_len: usize,
     note_value: u64,
@@ -4691,6 +4691,22 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     debug_log!("🔐 VUL-002: Spending key decrypted in Rust (will zero after use)");
 
     // === Use the decrypted key ===
+
+    // FIX #562: Read the anchor parameter
+    let anchor_bytes = if anchor.is_null() {
+        eprintln!("❌ FIX #562: Anchor parameter is NULL!");
+        return false;
+    } else {
+        match safe_slice(anchor, 32) {
+            Some(s) => s.to_vec(),
+            None => {
+                eprintln!("❌ FIX #562: Invalid anchor pointer");
+                return false;
+            }
+        }
+    };
+
+    debug_log!("🔍 FIX #562: Anchor from Swift: {}...", hex::encode(&anchor_bytes[..8]));
 
     // FIX #230: Get the prover with safe_lock
     let prover_guard = match safe_lock!(PROVER) {
@@ -4839,6 +4855,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     let _ = witness_root.write(&mut witness_root_bytes);
     debug_log!("🔍 FIX #557 v43: Witness root from deserialized witness: {}...", hex::encode(&witness_root_bytes[..8]));
 
+    // FIX #562: Log note CMU and position for debugging
+    let note_cmu = note.cmu();
+    let cmu_bytes: [u8; 32] = note_cmu.to_bytes();
+    debug_log!("🔍 FIX #562: Note CMU: {}...", hex::encode(&cmu_bytes[..8]));
+    if let Some(path) = witness.path() {
+        debug_log!("🔍 FIX #562: Witness position: {}", u64::from(path.position()));
+    }
+
     // Get the merkle path from the witness
     let merkle_path = match witness.path() {
         Some(p) => p,
@@ -4858,12 +4882,22 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         extsk.clone(),
         diversifier,
         note.clone(),
-        merkle_path,
+        merkle_path.clone(),
     ) {
         secure_zero(&mut decrypted_sk);
         eprintln!("❌ Failed to add spend: {:?}", e);
         return false;
     }
+
+    // FIX #562: Log the anchor that the builder computed from the merkle_path
+    // The anchor is computed by merkle_path.root(node) inside add_sapling_spend
+    // We can check what the builder's anchor is by looking at the sapling_builder
+    // Note: We can't directly access builder.sapling_builder.anchor from here, but we can
+    // compute it ourselves to verify
+    let node = zcash_primitives::sapling::Node::from_cmu(&note.cmu());
+    let computed_anchor: bls12_381::Scalar = merkle_path.root(node).into();
+    let anchor_bytes = computed_anchor.to_bytes();
+    debug_log!("🔍 FIX #562: Computed anchor from merkle_path: {}...", hex::encode(&anchor_bytes[..8]));
 
     // FIX #230: Prepare memo with safe slice validation
     let memo_bytes = if memo.is_null() {
@@ -4951,6 +4985,12 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         eprintln!("❌ Failed to serialize transaction: {:?}", e);
         return false;
     }
+
+    // FIX #562: Log transaction summary
+    debug_log!("✅ FIX #562: Transaction built - {} bytes, chain height: {}", tx_bytes.len(), chain_height);
+    debug_log!("🔍 FIX #562: Swift passed anchor:       {}...", hex::encode(&anchor_bytes[..8]));
+    debug_log!("🔍 FIX #562: Witness root:              {}...", hex::encode(&witness_root_bytes[..8]));
+    debug_log!("🔍 FIX #562: Anchor extraction now uses SpendDescription offset (Swift FIX #562)");
 
     // Copy to output
     if tx_bytes.len() > 10000 {
