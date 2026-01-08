@@ -737,7 +737,7 @@ final class TransactionBuilder {
                         }
                     }
 
-                    preparedSpends.append((note: note, witness: witnessToUse))
+                    preparedSpends.append((note: note, witness: witnessToUse, anchor: commonAnchor!))
                 }
 
                 if rebuildCount > 0 {
@@ -823,7 +823,7 @@ final class TransactionBuilder {
                             // 5. Extract updated witnesses using tracked indices
                             for (note, witnessIndex) in witnessIndices {
                                 if let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) {
-                                    preparedSpends.append((note: note, witness: witness))
+                                    preparedSpends.append((note: note, witness: witness, anchor: newAnchor))
                                 } else {
                                     throw TransactionError.proofGenerationFailed
                                 }
@@ -893,7 +893,48 @@ final class TransactionBuilder {
                 }
                 print("✅ Created \(preparedSpends.count) witnesses with SAME anchor (at chain tip \(chainHeight))")
             }
-        } else {
+
+            // CRITICAL: After all witness preparation paths, ensure we have spends before building
+            guard !preparedSpends.isEmpty else {
+                print("❌ No prepared spends after witness building")
+                throw TransactionError.proofGenerationFailed
+            }
+
+            // Build multi-input transaction
+            onProgress("building", nil, nil)
+
+                // Convert preparedSpends to SpendInfoSwift array
+                let spends = preparedSpends.map { spend in
+                    ZipherXFFI.SpendInfoSwift(
+                        witness: spend.witness,
+                        value: spend.note.value,
+                        rcm: spend.note.rcm,
+                        diversifier: spend.note.diversifier
+                    )
+                }
+
+                // VUL-002 FIX: Use encrypted key FFI for multi-input transaction
+                let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
+                print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
+
+                guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
+                    encryptedSpendingKey: encryptedKey,
+                    encryptionKey: encryptionKey,
+                    toAddress: toAddressBytes,
+                    amount: amount,
+                    memo: memoData,
+                    spends: spends,
+                    chainHeight: chainHeight
+                ) else {
+                    throw TransactionError.proofGenerationFailed
+                }
+
+                print("✅ Multi-input transaction built: \(result.txData.count) bytes")
+                print("📝 Spent \(spends.count) notes")
+
+                // Return transaction and first nullifier (for tracking)
+                return (result.txData, result.nullifiers.first ?? Data())
+            } else {
             // SINGLE-INPUT TRANSACTION - Use rebuildWitnessesForNotes for consistent anchor
             print("🔨 Single-input: Rebuilding witness for consistent anchor...")
 
@@ -939,6 +980,7 @@ final class TransactionBuilder {
             print("✅ Transaction built: \(rawTx.count) bytes")
             return (rawTx, note.nullifier)
         }
+    }
 
     // MARK: - Note Management
 
