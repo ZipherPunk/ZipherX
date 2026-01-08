@@ -71,8 +71,11 @@ Resources/shielded_outputs_manifest.json
 Resources/block_timestamps.bin
 Sources/Resources/shielded_outputs.bin
 
-# Build artifacts for FFI (not needed in repo)
+# Build artifacts for FFI (not needed in repo - build from source)
 Libraries/zipherx-ffi/libzipherx_ffi_ios.a
+Libraries/libzipherx_ffi.a
+Libraries/ZipherXFFI.xcframework/*/libzipherx_ffi.a
+*.xcframework/*/*.a
 
 # Tools directory (private scripts, not for public repo)
 Tools/
@@ -99,6 +102,11 @@ ZipherX-iOS-Wallet-Architecture.md
 # Test Rust target directories
 test_decrypt_rust/target/
 **/target/
+
+# Local backup and test files (development only)
+*.backup
+validate_anchor.py
+zipherx_wallet.db
 
 # External Zclassic node (C++ fork of Zcash/Bitcoin - not ZipherX code)
 zclassic-fork/
