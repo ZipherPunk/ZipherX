@@ -5121,7 +5121,7 @@ public final class NetworkManager: ObservableObject {
         //   - valueBalance (8 bytes)
         //   - bindingSig (64 bytes)
 
-        guard txData.count > 4 else {
+        guard txData.count > 8 else {
             throw NetworkError.invalidTransaction("Transaction too short")
         }
 
@@ -5135,7 +5135,7 @@ public final class NetworkManager: ObservableObject {
                 throw NetworkError.invalidTransaction("Only v4+ transactions supported")
             }
 
-            var offset = 4  // Skip header
+            var offset = 8  // FIX #562 v4: Skip header (4 bytes version + 4 bytes version group ID)
 
             // FIX #562 v3: Safe compact size reading with overflow protection
             func readCompactSize(_ data: Data, _ offset: inout Int) throws -> UInt64 {
