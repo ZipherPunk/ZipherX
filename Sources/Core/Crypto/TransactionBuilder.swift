@@ -589,8 +589,7 @@ final class TransactionBuilder {
         try? headerStore.open()
 
         // Prepare witnesses for all selected notes
-        var preparedSpends: [(note: SpendableNote, witness: Data)] = []
-        var witnessAnchorForTx: Data? = nil  // CRITICAL FIX #557 v42: Store witness root for transaction
+        var preparedSpends: [(note: SpendableNote, witness: Data, anchor: Data)] = []
 
         // CRITICAL FIX: For multi-input transactions, ALL witnesses MUST have the same anchor.
         if isMultiInput {
@@ -856,7 +855,14 @@ final class TransactionBuilder {
                     )
 
                     for result in results {
-                        preparedSpends.append((note: result.note, witness: result.witness))
+                        // Store the anchor from the witness rebuild!
+                        preparedSpends.append((note: result.note, witness: result.witness, anchor: result.anchor))
+                    }
+
+                    // Use the anchor from the first result (all witnesses have same anchor)
+                    if let firstResult = results.first {
+                        let anchorHex = firstResult.anchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("📝 Using anchor from rebuilt witnesses: \(anchorHex)...")
                     }
                 }
                 print("✅ Created \(preparedSpends.count) witnesses")
@@ -876,268 +882,39 @@ final class TransactionBuilder {
                 )
 
                 for result in results {
-                    preparedSpends.append((note: result.note, witness: result.witness))
+                    // Store the anchor from the witness rebuild!
+                    preparedSpends.append((note: result.note, witness: result.witness, anchor: result.anchor))
+                }
+
+                // Use the anchor from the first result (all witnesses have same anchor)
+                if let firstResult = results.first {
+                    let anchorHex = firstResult.anchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("📝 Using anchor from rebuilt witnesses: \(anchorHex)...")
                 }
                 print("✅ Created \(preparedSpends.count) witnesses with SAME anchor (at chain tip \(chainHeight))")
             }
         } else {
-            // Single-input transaction - use existing logic
-            for (index, note) in selectedNotes.enumerated() {
-                print("📝 Preparing witness for note \(index + 1)/\(selectedNotes.count)")
+            // SINGLE-INPUT TRANSACTION - Use rebuildWitnessesForNotes for consistent anchor
+            print("🔨 Single-input: Rebuilding witness for consistent anchor...")
 
-                // FIX #557 v46: If tree state is not loaded, load it first
-                if ZipherXFFI.treeSize() == 0 {
-                    print("⚠️ FIX #557 v46: Global tree not loaded, loading from database...")
-                    if let treeState = try? WalletDatabase.shared.getTreeState() {
-                        if ZipherXFFI.treeDeserialize(data: treeState) {
-                            print("✅ FIX #557 v46: Tree state loaded (size: \(ZipherXFFI.treeSize()))")
-                        }
-                    }
-                }
-
-                // Use the stored witness initially
-                var witnessToUse = note.witness
-                var needsRebuild = witnessToUse.count < 1024 || witnessToUse.allSatisfy { $0 == 0 }
-
-                // FIX #557 v46: Check if witness is stale by comparing roots
-                if !needsRebuild && witnessToUse.count >= 1028 {
-                    let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse)
-                    let currentTreeRoot = ZipherXFFI.treeRoot()
-
-                    if let wRoot = witnessRoot, let tRoot = currentTreeRoot {
-                        let wHex = wRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        let tHex = tRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-
-                        if wRoot != tRoot {
-                            print("⚠️ FIX #557 v46: Witness is stale (witness: \(wHex)... tree: \(tHex)...), rebuilding...")
-                            needsRebuild = true
-                        } else {
-                            print("✅ FIX #557 v46: Witness is current (\(wHex)...)...")
-                        }
-                    }
-                }
-
-                let noteCMU = note.cmu
-                let noteHeight = note.height
-
-                // Rebuild witness if needed
-                if needsRebuild && noteHeight > downloadedTreeHeight {
-                    guard let cmu = noteCMU else {
-                        print("❌ Note \(index + 1) has no CMU for witness rebuild")
-                        throw TransactionError.proofGenerationFailed
-                    }
-
-                    print("⚠️ Rebuilding witness for note \(index + 1) at height \(noteHeight)")
-                    // FIX #115: Pass chainHeight for consistent anchor
-                    if let result = try await rebuildWitnessForNote(
-                        cmu: cmu,
-                        noteHeight: noteHeight,
-                        downloadedTreeHeight: downloadedTreeHeight,
-                        chainHeight: chainHeight
-                    ) {
-                        witnessToUse = result.witness
-                    } else {
-                        throw TransactionError.proofGenerationFailed
-                    }
-                } else if needsRebuild {
-                    // FIX #562 v5: ALWAYS rebuild witness from boost file instead of using stale treeGetWitness!
-                    print("FIX #562 v5: Witness is stale, rebuilding from boost file (NOT using stored index)...")
-
-                    // FIX #562 v5: treeGetWitness returns stale snapshots - NEVER use it!
-                    // Instead, always rebuild the witness from the boost file CMUs
-                    // This creates a fresh witness with the correct path structure
-
-                    guard let cmu = noteCMU else {
-                        print("ERROR: Note CMU not available, cannot rebuild witness")
-                        throw TransactionError.proofGenerationFailed
-                    }
-
-                    // Use cached boost data for treeCreateWitnessForCMU
-                    guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                          let cachedData = try? Data(contentsOf: cachedPath) else {
-                        print("ERROR: Boost file not cached")
-                        throw TransactionError.proofGenerationFailed
-                    }
-
-                    print("   Rebuilding witness for CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-
-                    guard let result = ZipherXFFI.treeCreateWitnessForCMU(
-                        cmuData: cachedData,
-                        targetCMU: cmu
-                    ) else {
-                        print("ERROR: treeCreateWitnessForCMU failed - CMU might not be in boost file")
-                        print("   This can happen if the note is from delta blocks (after boost file end)")
-                        print("   Solution: Run Settings → Repair Database → Full Rescan")
-                        throw TransactionError.proofGenerationFailed
-                    }
-
-                    witnessToUse = result.witness
-                    print("   ✅ Witness rebuilt from boost file (position: \(result.position))")
-                }
-
-                // RESTORED DEC 12, 2025 WORKING APPROACH
-                // Get anchor from HeaderStore at NOTE HEIGHT (not current tree root!)
-                // The anchor MUST match the tree state at the height where the note was received
-                print("   🔍 Getting anchor from HeaderStore at note height \(noteHeight)...")
-
-                let headerStore = HeaderStore.shared
-                try? headerStore.open()
-
-                var anchorFromHeader: Data
-
-                if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
-                    anchorFromHeader = noteHeader.hashFinalSaplingRoot
-                    let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
-                    print("   📝 Using anchor from block header at height \(noteHeight)")
-                    print("   📝 Anchor: \(anchorHex)...")
-                    print("   ✅ This anchor matches blockchain's tree state at the note's block")
-                } else {
-                    print("   ⚠️ Block header not available at height \(noteHeight)")
-                    print("   📝 Will compute anchor from witness root...")
-                    anchorFromHeader = Data(count: 32) // placeholder
-                }
-
-                // Verify witness root matches header anchor
-                let haveHeaderAnchor = !anchorFromHeader.allSatisfy { $0 == 0 }
-
-                if haveHeaderAnchor {
-                    if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-                        let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        let headerAnchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-
-                        if witnessRoot == anchorFromHeader {
-                            print("   ✅ Witness root matches header anchor: \(witnessRootHex)... == \(headerAnchorHex)...")
-                            witnessAnchorForTx = anchorFromHeader
-                        } else {
-                            print("   ❌ WITNESS/ANCHOR MISMATCH!")
-                            print("      witnessRoot:   \(witnessRootHex)...")
-                            print("      headerAnchor:  \(headerAnchorHex)...")
-                            print("      This means witness was built with wrong tree state")
-                            print("      Need to rebuild witness to match header anchor")
-
-                            // Rebuild witness to match header anchor
-                            guard let cmu = noteCMU else {
-                                print("   ❌ Note CMU not available, cannot rebuild witness")
-                                throw TransactionError.proofGenerationFailed
-                            }
-
-                            guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                                  let cachedData = try? Data(contentsOf: cachedPath) else {
-                                print("   ❌ Boost file not cached")
-                                throw TransactionError.proofGenerationFailed
-                            }
-
-                            print("   🔧 Rebuilding witness to match header anchor...")
-
-                            guard let result = ZipherXFFI.treeCreateWitnessForCMU(
-                                cmuData: cachedData,
-                                targetCMU: cmu
-                            ) else {
-                                print("   ❌ Failed to rebuild witness")
-                                throw TransactionError.proofGenerationFailed
-                            }
-
-                            witnessToUse = result.witness
-
-                            // Verify again after rebuild
-                            if let rebuiltRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-                                let rebuiltHex = rebuiltRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                                if rebuiltRoot == anchorFromHeader {
-                                    print("   ✅ Rebuilt witness now matches header anchor: \(rebuiltHex)...")
-                                    witnessAnchorForTx = anchorFromHeader
-                                } else {
-                                    print("   ⚠️ Rebuilt witness still doesn't match - using header anchor anyway")
-                                    witnessAnchorForTx = anchorFromHeader
-                                }
-                            }
-                        }
-                    } else {
-                        print("   ⚠️ Could not extract witness root, using header anchor")
-                        witnessAnchorForTx = anchorFromHeader
-                    }
-                } else {
-                    // No header anchor available - use witness root
-                    if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-                        witnessAnchorForTx = witnessRoot
-                        let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("   📝 Using witness root as anchor: \(rootHex)...")
-                    } else {
-                        print("   ❌ No anchor available!")
-                        throw TransactionError.proofGenerationFailed
-                    }
-                }
-
-                preparedSpends.append((note: note, witness: witnessToUse))
-            }
-        }
-
-        onProgress("proof", nil, nil)
-
-        if isMultiInput {
-            // MULTI-INPUT TRANSACTION
-            print("🔨 Building multi-input transaction with \(preparedSpends.count) spends...")
-
-            // Convert to SpendInfoSwift array
-            var spendInfos: [ZipherXFFI.SpendInfoSwift] = []
-            for (note, witness) in preparedSpends {
-                let info = ZipherXFFI.SpendInfoSwift(
-                    witness: witness,
-                    value: note.value,
-                    rcm: note.rcm,
-                    diversifier: note.diversifier
-                )
-                spendInfos.append(info)
-            }
-
-            // VUL-002 FIX: Use encrypted key FFI for multi-input transaction
-            let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
-            print("🔐 VUL-002: Using encrypted key FFI for multi-input (key decrypted only in Rust)")
-
-            guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
-                encryptedSpendingKey: encryptedKey,
-                encryptionKey: encryptionKey,
-                toAddress: toAddressBytes,
-                amount: amount,
-                memo: memoData,
-                spends: spendInfos,
+            let cachedBoostHeight = await CommitmentTreeUpdater.shared.getCachedBoostHeight() ?? 0
+            let results = try await rebuildWitnessesForNotes(
+                notes: selectedNotes,
+                downloadedTreeHeight: cachedBoostHeight,
                 chainHeight: chainHeight
-            ) else {
-                print("❌ Multi-input transaction build failed")
+            )
+
+            guard let firstResult = results.first else {
+                print("❌ Failed to rebuild witness")
                 throw TransactionError.proofGenerationFailed
             }
 
-            print("✅ Multi-input transaction built: \(result.txData.count) bytes, \(result.nullifiers.count) nullifiers")
+            let note = firstResult.note
+            let witnessToUse = firstResult.witness
+            let anchorForTx = firstResult.anchor
 
-            // Return first nullifier (for primary tracking) - TODO: track all nullifiers
-            let primaryNullifier = result.nullifiers.first ?? preparedSpends[0].note.nullifier
-            return (result.txData, primaryNullifier)
-
-        } else {
-            // SINGLE-INPUT TRANSACTION
-            let note = preparedSpends[0].note
-            let witnessToUse = preparedSpends[0].witness
-            let noteHeight = note.height
-
-            // RESTORED DEC 12, 2025 WORKING APPROACH
-            // Get anchor from HeaderStore at NOTE HEIGHT (not current tree root!)
-            var anchorFromHeader: Data
-            if let noteHeader = try? headerStore.getHeader(at: noteHeight) {
-                anchorFromHeader = noteHeader.hashFinalSaplingRoot
-                let anchorHex = anchorFromHeader.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("📝 Using anchor from block header at height \(noteHeight): \(anchorHex)...")
-                print("✅ This anchor matches blockchain's tree state at the note's block")
-            } else {
-                print("⚠️ Block header not available at height \(noteHeight)")
-                print("📝 Falling back to witness root...")
-                if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessToUse) {
-                    anchorFromHeader = witnessRoot
-                    let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("📝 Using witness root as anchor: \(rootHex)...")
-                } else {
-                    print("❌ No anchor available!")
-                    anchorFromHeader = Data(count: 32)
-                }
-            }
+            let anchorHex = anchorForTx.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("📝 Using anchor from rebuilt witness: \(anchorHex)...")
 
             // VUL-002 FIX: Use encrypted key FFI for single-input transaction
             let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
@@ -1149,7 +926,7 @@ final class TransactionBuilder {
                 toAddress: toAddressBytes,
                 amount: amount,
                 memo: memoData,
-                anchor: anchorFromHeader,
+                anchor: anchorForTx,
                 witness: witnessToUse,
                 noteValue: note.value,
                 noteRcm: note.rcm,
@@ -1162,7 +939,6 @@ final class TransactionBuilder {
             print("✅ Transaction built: \(rawTx.count) bytes")
             return (rawTx, note.nullifier)
         }
-    }
 
     // MARK: - Note Management
 
