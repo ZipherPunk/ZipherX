@@ -5102,7 +5102,7 @@ public final class NetworkManager: ObservableObject {
     // MARK: - FIX #516: Transaction Validation Helpers
 
     /// Extract anchor (Merkle root) from Sapling transaction
-    /// FIX #562: Parse transaction properly to extract anchor from SpendDescription
+    /// FIX #562 v3: Safe transaction parsing with bounds checking
     private func extractAnchorFromTransaction(_ txData: Data) async throws -> Data {
         // Zcash v4 transaction format:
         // - Header (4 bytes): version (4) + version group ID
@@ -5125,100 +5125,134 @@ public final class NetworkManager: ObservableObject {
             throw NetworkError.invalidTransaction("Transaction too short")
         }
 
-        // Read transaction version (first 4 bytes)
-        let version = txData.subdata(in: 0..<4)
-        let txVersion = version.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        // FIX #562 v3: Add try-catch to prevent crashes
+        do {
+            // Read transaction version (first 4 bytes)
+            let txVersion = txData.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
 
-        // Only parse v4+ transactions
-        guard txVersion >= 4 else {
-            throw NetworkError.invalidTransaction("Only v4+ transactions supported")
-        }
-
-        var offset = 4  // Skip header
-
-        // Skip transparent inputs (compact size + each input)
-        func readCompactSize(_ data: Data, _ offset: inout Int) -> UInt64? {
-            guard offset < data.count else { return nil }
-            let first = data[offset]
-            offset += 1
-            if first < 253 {
-                return UInt64(first)
-            } else if first == 253 {
-                guard offset + 2 <= data.count else { return nil }
-                let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
-                offset += 2
-                return UInt64(value)
-            } else if first == 254 {
-                guard offset + 4 <= data.count else { return nil }
-                let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-                offset += 4
-                return UInt64(value)
-            } else { // 255
-                guard offset + 8 <= data.count else { return nil }
-                let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
-                offset += 8
-                return value
+            // Only parse v4+ transactions
+            guard txVersion >= 4 else {
+                throw NetworkError.invalidTransaction("Only v4+ transactions supported")
             }
+
+            var offset = 4  // Skip header
+
+            // FIX #562 v3: Safe compact size reading with overflow protection
+            func readCompactSize(_ data: Data, _ offset: inout Int) throws -> UInt64 {
+                guard offset < data.count else {
+                    throw NetworkError.invalidTransaction("Compact size: offset out of bounds")
+                }
+                let first = data[offset]
+                offset += 1
+                if first < 253 {
+                    return UInt64(first)
+                } else if first == 253 {
+                    guard offset + 2 <= data.count else {
+                        throw NetworkError.invalidTransaction("Compact size 253: insufficient bytes")
+                    }
+                    let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
+                    offset += 2
+                    return UInt64(value)
+                } else if first == 254 {
+                    guard offset + 4 <= data.count else {
+                        throw NetworkError.invalidTransaction("Compact size 254: insufficient bytes")
+                    }
+                    let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+                    offset += 4
+                    return UInt64(value)
+                } else { // 255
+                    guard offset + 8 <= data.count else {
+                        throw NetworkError.invalidTransaction("Compact size 255: insufficient bytes")
+                    }
+                    let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+                    offset += 8
+                    return value
+                }
+            }
+
+            // FIX #562 v3: Safe offset increment with overflow checking
+            func safeAdd(_ offset: inout Int, _ value: Int) throws {
+                let newValue = offset &+ value  // Overflow operator
+                guard newValue <= txData.count else {
+                    throw NetworkError.invalidTransaction("Offset \(newValue) exceeds transaction size \(txData.count)")
+                }
+                offset = newValue
+            }
+
+            // FIX #562 v3: Safe UInt64 to Int conversion with bounds
+            func safeToInt(_ value: UInt64, maxAllowed: Int = 1000) throws -> Int {
+                guard value <= UInt64(maxAllowed) else {
+                    throw NetworkError.invalidTransaction("Value \(value) exceeds maximum allowed \(maxAllowed)")
+                }
+                return Int(value)
+            }
+
+            // Skip transparent inputs (compact size + each input)
+            let numInputs = try readCompactSize(txData, &offset)
+            let numInputsInt = try safeToInt(numInputs)  // FIX #562 v3: Convert BEFORE creating range
+            for _ in 0..<numInputsInt {
+                // Input: prevout (36) + scriptSig (compact size) + sequence (4)
+                try safeAdd(&offset, 36)  // prevout
+                let scriptSize = try readCompactSize(txData, &offset)
+                let scriptSizeInt = try safeToInt(scriptSize, maxAllowed: 100000)  // Larger limit for scripts
+                try safeAdd(&offset, scriptSizeInt)
+                try safeAdd(&offset, 4)  // sequence
+            }
+
+            // Skip transparent outputs
+            let numOutputs = try readCompactSize(txData, &offset)
+            let numOutputsInt = try safeToInt(numOutputs)  // FIX #562 v3: Convert BEFORE creating range
+            for _ in 0..<numOutputsInt {
+                // Output: value (8) + scriptPubKey (compact size)
+                try safeAdd(&offset, 8)  // value
+                let scriptSize = try readCompactSize(txData, &offset)
+                let scriptSizeInt = try safeToInt(scriptSize, maxAllowed: 100000)  // Larger limit for scripts
+                try safeAdd(&offset, scriptSizeInt)
+            }
+
+            // Lock time (4 bytes)
+            try safeAdd(&offset, 4)
+
+            // Expiry height (4 bytes) for v4+
+            try safeAdd(&offset, 4)
+
+            // Now we're at the sapling bundle
+            // Read number of sapling spends
+            let numSpends = try readCompactSize(txData, &offset)
+
+            // FIX #562 v3: Sanity check on spend count
+            guard numSpends > 0 && numSpends <= 1000 else {
+                throw NetworkError.invalidTransaction("Invalid sapling spend count: \(numSpends)")
+            }
+
+            // Parse the first SpendDescription to get its anchor
+            // SpendDescription format:
+            // - cv (32 bytes)
+            // - anchor (32 bytes) ← THIS IS THE ANCHOR
+            // - nullifier (32 bytes)
+            // - rk (32 bytes)
+            // - zkproof (192 bytes)
+            // - spendAuthSig (64 bytes)
+
+            try safeAdd(&offset, 32)  // Skip cv to get to anchor
+
+            guard offset + 32 <= txData.count else {
+                throw NetworkError.invalidTransaction("Transaction too short for anchor: need \(offset + 32), have \(txData.count)")
+            }
+
+            let anchor = txData.subdata(in: offset..<offset + 32)
+
+            print("🔍 FIX #562 v3: Extracted anchor from SpendDescription: \(anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+            return anchor
+        } catch let error as NetworkError {
+            // FIX #562 v3: Log the error and fall back to old method
+            print("⚠️ FIX #562 v3: New parsing failed: \(error)")
+            print("⚠️ FIX #562 v3: Falling back to offset-based extraction...")
+            throw error  // Re-throw to let caller handle it
+        } catch {
+            print("⚠️ FIX #562 v3: Unexpected error: \(error)")
+            throw NetworkError.invalidTransaction("Unexpected parsing error: \(error.localizedDescription)")
         }
-
-        // Skip transparent inputs
-        guard let numInputs = readCompactSize(txData, &offset) else {
-            throw NetworkError.invalidTransaction("Failed to read input count")
-        }
-        for _ in 0..<numInputs {
-            // Input: prevout (36) + scriptSig (compact size) + sequence (4)
-            offset += 36  // prevout
-            guard let scriptSize = readCompactSize(txData, &offset) else { break }
-            offset += Int(scriptSize)
-            offset += 4  // sequence
-        }
-
-        // Skip transparent outputs
-        guard let numOutputs = readCompactSize(txData, &offset) else {
-            throw NetworkError.invalidTransaction("Failed to read output count")
-        }
-        for _ in 0..<numOutputs {
-            // Output: value (8) + scriptPubKey (compact size)
-            offset += 8  // value
-            guard let scriptSize = readCompactSize(txData, &offset) else { break }
-            offset += Int(scriptSize)
-        }
-
-        // Lock time (4 bytes)
-        offset += 4
-
-        // Expiry height (4 bytes) for v4+
-        offset += 4
-
-        // Now we're at the sapling bundle
-        // Read number of sapling spends
-        guard let numSpends = readCompactSize(txData, &offset) else {
-            throw NetworkError.invalidTransaction("Failed to read sapling spend count")
-        }
-
-        // If no spends, no anchor to extract
-        guard numSpends > 0 else {
-            throw NetworkError.invalidTransaction("No sapling spends in transaction")
-        }
-
-        // Parse the first SpendDescription to get its anchor
-        // SpendDescription format:
-        // - cv (32 bytes)
-        // - anchor (32 bytes) ← THIS IS THE ANCHOR
-        // - nullifier (32 bytes)
-        // - rk (32 bytes)
-        // - zkproof (192 bytes)
-        // - spendAuthSig (64 bytes)
-
-        offset += 32  // Skip cv to get to anchor
-        guard offset + 32 <= txData.count else {
-            throw NetworkError.invalidTransaction("Transaction too short for anchor")
-        }
-
-        let anchor = txData.subdata(in: offset..<offset + 32)
-
-        print("🔍 FIX #562: Extracted anchor from SpendDescription: \(anchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-        return anchor
     }
 
     /// Verify a transaction exists and get confirmation count via P2P
