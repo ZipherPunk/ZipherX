@@ -134,6 +134,8 @@ public final class TorManager: ObservableObject {
     /// Lock to prevent multiple concurrent waitForSocksProxyReady() calls
     private var isWaitingForSocksProxy = false
     private let socksProxyLock = NSLock()
+    /// FIX #672: Track concurrent waiters to detect excessive calls
+    private var socksProxyWaiterCount = 0
 
     /// Timestamp when SOCKS proxy became connected (for .onion circuit warmup delay)
     private var connectedSinceTimestamp: Date?
@@ -952,20 +954,40 @@ public final class TorManager: ObservableObject {
     /// Wait for SOCKS proxy to become ready (up to maxWait seconds)
     /// Returns true if proxy became ready within the timeout
     /// OPTIMIZED: Prevents multiple concurrent waits and caches result
+    /// FIX #672: Added concurrency guard to prevent excessive concurrent calls
     public func waitForSocksProxyReady(maxWait: TimeInterval = 30) async -> Bool {
         // OPTIMIZATION: Return immediately if already verified
         if socksProxyVerified {
             return true
         }
 
-        // OPTIMIZATION: Prevent multiple concurrent callers from each creating 60 connections
+        // FIX #672: Track concurrent waiters and detect excessive calls
         socksProxyLock.lock()
+        let waiterId = UUID().uuidString.prefix(8)
+        let concurrentWaiters = socksProxyWaiterCount
+        socksProxyWaiterCount += 1
+
+        if concurrentWaiters > 100 {
+            socksProxyLock.unlock()
+            print("🚨 FIX #672: EXCESSIVE CONCURRENCY - \(concurrentWaiters) concurrent SOCKS proxy waiters!")
+            print("🚨 FIX #672: This indicates a bug - waitForSocksProxyReady() is being called too often")
+            print("🚨 FIX #672: Waiter ID: \(waiterId), returning false immediately")
+            socksProxyLock.lock()
+            socksProxyWaiterCount -= 1
+            socksProxyLock.unlock()
+            return false
+        }
+
         if isWaitingForSocksProxy {
             socksProxyLock.unlock()
             // Another caller is already waiting - just wait for the result
+            print("🧅 FIX #672: Waiter \(waiterId) joining existing wait (concurrent: \(concurrentWaiters))")
             while isWaitingForSocksProxy && !socksProxyVerified {
                 try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
             }
+            socksProxyLock.lock()
+            socksProxyWaiterCount -= 1
+            socksProxyLock.unlock()
             return socksProxyVerified
         }
         isWaitingForSocksProxy = true
@@ -974,16 +996,23 @@ public final class TorManager: ObservableObject {
         defer {
             socksProxyLock.lock()
             isWaitingForSocksProxy = false
+            socksProxyWaiterCount -= 1
             socksProxyLock.unlock()
         }
 
+        print("🧅 FIX #672: Waiter \(waiterId) starting SOCKS proxy wait (concurrent: \(concurrentWaiters))")
         let startTime = Date()
         var attempts = 0
 
         while Date().timeIntervalSince(startTime) < maxWait {
             attempts += 1
+            // FIX #672: Sanity check - if attempts are way too high, abort
+            if attempts > 100 {
+                print("🚨 FIX #672: ABNORMAL - \(attempts) attempts detected, aborting wait")
+                break
+            }
             if await isSocksProxyReady() {
-                print("🧅 SOCKS proxy ready after \(attempts) attempt(s)")
+                print("🧅 SOCKS proxy ready after \(attempts) attempt(s) (waiter: \(waiterId))")
                 return true
             }
 
@@ -991,7 +1020,7 @@ public final class TorManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
 
-        print("🧅 SOCKS proxy NOT ready after \(maxWait) seconds (\(attempts) attempts)")
+        print("🧅 SOCKS proxy NOT ready after \(maxWait) seconds (\(attempts) attempts, waiter: \(waiterId))")
         return false
     }
 

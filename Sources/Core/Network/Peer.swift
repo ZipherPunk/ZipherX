@@ -2,6 +2,23 @@ import Foundation
 import Network
 import CommonCrypto
 
+// MARK: - Zclassic Protocol Constants (FIX #565)
+
+/// Maximum number of headers returned in one getheaders response
+/// Matches Zclassic's MAX_HEADERS_RESULTS in main.h:92
+private let MAX_HEADERS_RESULTS = 160
+
+/// Maximum number of inv entries in one getdata message
+/// Matches Zclassic's MAX_INV_SZ in main.cpp:6033
+private let MAX_INV_SZ = 50000
+
+/// Message types (from Zclassic protocol.h)
+private enum MSGType: UInt32 {
+    case tx = 1
+    case block = 2
+    case filteredBlock = 3  // MSG_FILTERED_BLOCK
+}
+
 /// Async lock for serializing peer message access
 /// Prevents concurrent operations from interfering with each other's message streams
 actor PeerMessageLock {
@@ -31,10 +48,10 @@ actor PeerMessageLock {
         return await withTaskGroup(of: Bool.self) { group in
             // Task 1: Wait for lock
             group.addTask {
-                await withCheckedContinuation { continuation in
-                    Task { await self.addWaiter(continuation) }
-                }
-                return true  // Lock acquired
+                // FIX #565: Use a separate async context for acquiring
+                // This avoids the actor-isolation issue with withCheckedContinuation
+                let acquired = await self.waitForLock()
+                return acquired  // Lock acquired
             }
 
             // Task 2: Timeout
@@ -48,6 +65,15 @@ actor PeerMessageLock {
             group.cancelAll()
             return result
         }
+    }
+
+    /// Helper method to wait for lock acquisition
+    /// This runs in actor context so can call addWaiter safely
+    private func waitForLock() async -> Bool {
+        await withCheckedContinuation { continuation in
+            addWaiter(continuation)
+        }
+        return true  // Lock was acquired (continuation only returns when resumed)
     }
 
     /// Helper for acquireWithTimeout to add waiter from async context
@@ -2092,17 +2118,46 @@ public final class Peer {
             // Send ping with nonce
             try await sendMessage(command: "ping", payload: nonce)
 
-            // Wait for pong response (should echo our nonce)
-            let (command, responseNonce) = try await receiveMessageWithTimeout(seconds: timeoutSeconds)
+            // Loop to receive messages until we get matching pong or timeout
+            // Peers may send unsolicited messages (inv, addr, etc.) before pong
+            let startTime = Date()
+            var attempts = 0
+            let maxAttempts = 50  // Prevent infinite loop
 
-            if command == "pong" && responseNonce == nonce {
-                // Update last activity timestamp
-                lastActivity = Date()
-                return true
+            while attempts < maxAttempts {
+                attempts += 1
+
+                // Check timeout
+                if Date().timeIntervalSince(startTime) > timeoutSeconds {
+                    print("⚠️ FIX #246: [\(host)] Ping timeout after \(attempts) unsolicited messages")
+                    return false
+                }
+
+                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 1)
+
+                if command == "pong" && responseData == nonce {
+                    // Got matching pong response
+                    lastActivity = Date()
+                    return true
+                } else if command == "pong" {
+                    // Got pong with wrong nonce (old response) - keep waiting
+                    continue
+                } else if command == "ping" {
+                    // Respond to peer's ping (they might be checking us too)
+                    try? await sendMessage(command: "pong", payload: responseData)
+                    continue
+                } else if command == "inv" || command == "addr" || command == "addrv2" ||
+                          command == "headers" || command == "block" {
+                    // Drain unsolicited messages - peer is alive, just chatty
+                    continue
+                } else {
+                    // Other unsolicited message - keep waiting
+                    continue
+                }
             }
 
-            // Peer sent unexpected response
-            print("⚠️ FIX #246: [\(host)] Unexpected ping response: \(command)")
+            // Too many attempts without matching pong
+            print("⚠️ FIX #246: [\(host)] Ping gave up after \(maxAttempts) unsolicited messages")
             return false
         } catch {
             // Connection error - peer may be dead
@@ -2122,6 +2177,7 @@ public final class Peer {
 
         // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
         // Without this, the block listener can consume our TX response
+        // FIX #570: Optimize timeouts for faster P2P verification
         return try await withExclusiveAccess {
             // Build getdata message for MSG_TX (type 1)
             // Format: count (varint) + [type (4 bytes LE) + hash (32 bytes)]
@@ -2140,13 +2196,18 @@ public final class Peer {
             try await sendMessage(command: "getdata", payload: payload)
 
             // FIX #354: Loop to drain buffered messages until we get tx/notfound
+            // FIX #570: Reduced maxAttempts from 10 to 5 and timeout from 10s to 3s
+            // This gives maximum 15s per peer (5 × 3s) instead of 100s (10 × 10s)
+            // Much more responsive while still allowing time for network latency
             var attempts = 0
-            let maxAttempts = 10
+            let maxAttempts = 5  // FIX #570: was 10
 
             while attempts < maxAttempts {
                 attempts += 1
 
-                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+                // FIX #570: Reduced timeout from 10s to 3s for faster failure detection
+                // If peer has TX, it responds quickly. If not, we fail fast and try next peer.
+                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 3)
 
                 if command == "tx" && !responseData.isEmpty {
                     lastActivity = Date()
@@ -2176,6 +2237,7 @@ public final class Peer {
         }
 
         // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
+        // FIX #570: Optimize timeouts for faster P2P verification
         return try await withExclusiveAccess {
             // Build getdata message for MSG_TX (type 1)
             var payload = Data()
@@ -2188,13 +2250,15 @@ public final class Peer {
             try await sendMessage(command: "getdata", payload: payload)
 
             // FIX #354: Loop to drain buffered messages until we get tx/notfound
+            // FIX #570: Reduced maxAttempts from 10 to 5 and timeout from 10s to 3s
             var attempts = 0
-            let maxAttempts = 10
+            let maxAttempts = 5  // FIX #570: was 10
 
             while attempts < maxAttempts {
                 attempts += 1
 
-                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 10)
+                // FIX #570: Reduced timeout from 10s to 3s for faster failure detection
+                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 3)
 
                 if command == "tx" && !responseData.isEmpty {
                     lastActivity = Date()
@@ -2277,40 +2341,43 @@ public final class Peer {
     func broadcastTransaction(_ rawTx: Data) async throws -> String {
         // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
         return try await withExclusiveAccess {
-            try await sendMessage(command: "tx", payload: rawTx)
-
-            // NOTE: In Bitcoin/Zcash P2P protocol, successful tx broadcast has NO response!
-            // The node either:
-            // 1. Silently accepts (no response) - SUCCESS
-            // 2. Sends a "reject" message - FAILURE
-            //
-            // We do a SHORT wait (500ms) for potential reject message, then assume success.
+            // FIX #575: Send message and ALWAYS try to receive reject (even if send times out)
+            // Full nodes send reject after validating TX, so we must wait for it
+            do {
+                try await sendMessage(command: "tx", payload: rawTx)
+            } catch {
+                // Send timed out or failed, but peer might still send reject
+                // Continue to try receiving reject message
+                print("⚠️ Send failed (\(error.localizedDescription)), waiting for reject...")
+            }
 
             // TX ID is the double SHA256 hash of the raw transaction
             let txId = rawTx.doubleSHA256().reversed()
             let txIdString = txId.map { String(format: "%02x", $0) }.joined()
 
-            // Short wait for potential reject message (non-blocking)
+            // FIX #575: ALWAYS wait for reject message (15 seconds) to get validation result
+            // FIX #593: Increased from 5s to 15s - local nodes need time to validate Sapling proofs
+            // Full nodes need time to: 1) Receive TX 2) Validate proof (1-3s) 3) Send reject if invalid
+            // We must wait even if send "timed out" because peer might have received it
             do {
-                // Use a short timeout - if no reject within 500ms, assume accepted
+                // Wait for reject message with timeout
                 let checkForReject = Task {
-                    try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                    try await Task.sleep(nanoseconds: 15_000_000_000) // 15 seconds (FIX #593)
                 }
 
-                // Try to receive any immediate reject message
+                // Try to receive reject message
                 let receiveTask = Task {
-                    try await self.receiveMessage()
+                    try? await self.receiveMessage()
                 }
 
-                // Race: either timeout wins (success) or we get a message
+                // Race: either timeout wins (no reject) or we get a message
                 let result = try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
                     group.addTask {
                         try await checkForReject.value
-                        return nil // Timeout = no reject = success
+                        return nil // Timeout = no reject = ambiguous (might be in mempool)
                     }
                     group.addTask {
-                        let (cmd, resp) = try await receiveTask.value
-                        return (cmd, resp)
+                        return try await receiveTask.value
                     }
 
                     // First to complete wins
@@ -2346,17 +2413,20 @@ public final class Peer {
                             }
                         }
 
-                        // FIX #333 REVERTED: DUPLICATE can be a SYBIL ATTACK lie!
-                        // Malicious peers return DUPLICATE to make user think TX was sent.
-                        // The mempool verification (VUL-002) is the FINAL gate - it will
-                        // correctly catch fake DUPLICATE responses by checking if TX is
-                        // actually in the network mempool.
-                        //
-                        // Evidence from zmac.log: All 3 peers returned DUPLICATE, but
-                        // mempool verification showed peers=0, mempool=false → SYBIL ATTACK!
+                        // FIX #563 v8: DUPLICATE is NOT automatic success - could be malicious peer lying!
+                        // Peer 140.174.189.3 returned DUPLICATE but TX was NOT on blockchain
+                        // DUPLICATE means peer claims to have TX in mempool, but this could be:
+                        // 1. Honest: TX is actually in mempool (SUCCESS)
+                        // 2. Malicious: Peer is lying (SYBIL ATTACK)
+                        // We MUST verify by checking other peers before treating as success
                         print("❌ Transaction rejected: \(codeName) - \(reason)")
                         if rejectCode == 0x12 {
-                            print("⚠️ FIX #333: DUPLICATE rejection - could be Sybil attack! Mempool verification will confirm.")
+                            // DUPLICATE = peer claims to have TX in mempool
+                            // BUT we can't trust this - could be lie from malicious peer!
+                            // Throw specific error so caller can track DUPLICATE separately
+                            print("⚠️ FIX #563 v8: DUPLICATE rejection - peer claims TX in mempool but VERIFYING...")
+                            print("⚠️ FIX #563 v8: Previous DUPLICATE fix v7 was WRONG - peer 140.174.189.3 lied!")
+                            throw NetworkError.transactionDuplicateRejected
                         }
                         throw NetworkError.transactionRejected
                     }
@@ -2401,6 +2471,10 @@ public final class Peer {
     }
 
     private func getBlockHeadersInternal(from height: UInt64, count: Int) async throws -> [BlockHeader] {
+        // FIX #565: Cap request count at MAX_HEADERS_RESULTS to match Zclassic protocol
+        // This prevents overwhelming peers with excessive header requests
+        let cappedCount = min(count, MAX_HEADERS_RESULTS)
+
         // Build getheaders message with block locator
         var payload = Data()
 
@@ -2415,10 +2489,19 @@ public final class Peer {
         let locatorHeight = height > 0 ? height - 1 : 0
         var locatorHash: Data?
 
+        // FIX #671: If requesting beyond HeaderStore range, cap at latest available height
+        // This prevents falling back to ancient checkpoints
+        var actualLocatorHeight = locatorHeight
+        let headerStoreMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        if locatorHeight > headerStoreMaxHeight && headerStoreMaxHeight > 0 {
+            actualLocatorHeight = headerStoreMaxHeight
+            debugLog(.network, "📋 FIX #671: Requesting height \(locatorHeight) beyond HeaderStore (\(headerStoreMaxHeight)), using \(headerStoreMaxHeight)")
+        }
+
         // Try 1: HeaderStore (cached headers)
-        if let lastHeader = try? HeaderStore.shared.getHeader(at: locatorHeight) {
+        if let lastHeader = try? HeaderStore.shared.getHeader(at: actualLocatorHeight) {
             locatorHash = lastHeader.blockHash
-            debugLog(.network, "📋 getBlockHeaders: Using HeaderStore hash for locator at height \(locatorHeight)")
+            debugLog(.network, "📋 getBlockHeaders: Using HeaderStore hash for locator at height \(actualLocatorHeight)")
         }
 
         // Try 2: Checkpoints
@@ -2429,12 +2512,14 @@ public final class Peer {
             }
         }
 
-        // Try 3: BundledBlockHashes
+        // Try 3: BundledBlockHashes - FIX #669: DISABLED (data corruption bug)
         if locatorHash == nil {
             let bundledHashes = BundledBlockHashes.shared
             if bundledHashes.isLoaded, let hash = bundledHashes.getBlockHash(at: locatorHeight) {
-                locatorHash = hash  // Already in wire format
-                debugLog(.network, "📋 getBlockHeaders: Using BundledBlockHashes for locator at height \(locatorHeight)")
+                // FIX #669: DISABLED - Do not use BundledBlockHashes
+                debugLog(.network, "🚨 FIX #669: SKIPPING BundledBlockHashes (corrupted) for height \(locatorHeight)")
+                // locatorHash = hash  // DISABLED
+                // debugLog(.network, "📋 getBlockHeaders: Using BundledBlockHashes for locator at height \(locatorHeight)")
             }
         }
 
@@ -2491,14 +2576,18 @@ public final class Peer {
             var headers: [BlockHeader] = []
             var offset = 0
 
-            // First byte is varint count
+            // FIX #565: Read header count as varint (compact size), not single byte!
+            // Zclassic uses ReadCompactSize for the count (see main.cpp:6276)
             guard response.count >= 1 else { return [] }
-            let headerCount = Int(response[offset])
-            offset += 1
+            let (headerCountRaw, varintSize) = readCompactSize(response, at: offset)
+            let headerCount = Int(min(headerCountRaw, UInt64(count)))  // Cap at requested count
+            offset += varintSize
+
+            print("📋 [\(host)] getBlockHeaders: Read varint count=\(headerCountRaw) (requested \(count)), parsing \(headerCount) headers")
 
             // FIX #207: Parse headers with variable-length solution
             // Structure: 140 bytes header + varint + solution (400 bytes) + 1 byte tx_count
-            for _ in 0..<min(headerCount, count) {
+            for _ in 0..<headerCount {
                 // Need at least 140 bytes for base header
                 guard offset + 140 <= response.count else { break }
 
@@ -2645,78 +2734,113 @@ public final class Peer {
     }
 
     /// Get full blocks by height range using getheaders then getdata
+    /// FIX #565: Implements pagination to handle peers that return fewer headers than requested
     func getFullBlocks(from height: UInt64, count: Int) async throws -> [CompactBlock] {
-        // Step 1: Get block headers to obtain hashes
-        // getBlockHeaders already uses withExclusiveAccess (Fix #105)
-        let headers = try await getBlockHeaders(from: height, count: count)
+        var allBlocks: [CompactBlock] = []
+        var currentHeight = height
+        var remainingCount = count
+        let maxBatchSize = 2000  // FIX #565 v4: Increased to 2000 (was 200) for faster bulk fetching
 
-        guard !headers.isEmpty else {
-            print("⚠️ No headers received")
-            return []
-        }
+        while remainingCount > 0 {
+            // Step 1: Get block headers to obtain hashes (paginated)
+            let requestCount = min(remainingCount, maxBatchSize)
+            let headers = try await getBlockHeaders(from: currentHeight, count: requestCount)
 
-        // Extract block hashes from headers
-        let blockHashes = headers.map { $0.hash }
-
-        // Step 2: Request full blocks via getdata
-        var getdataPayload = Data()
-        getdataPayload.append(UInt8(blockHashes.count))
-
-        for hash in blockHashes {
-            // Type 2 = MSG_BLOCK
-            getdataPayload.append(contentsOf: withUnsafeBytes(of: UInt32(2).littleEndian) { Array($0) })
-            getdataPayload.append(hash)
-        }
-
-        // FIX #111: Wrap send+receive in withExclusiveAccess to prevent race conditions
-        // Without this, mempool scan could consume block messages meant for this operation
-        return try await withExclusiveAccess {
-            try await self.sendMessage(command: "getdata", payload: getdataPayload)
-
-            // Receive block messages
-            // FIX: Use while loop to handle unexpected messages (like leftover 'headers') without advancing block index
-            var blocks: [CompactBlock] = []
-            var blockIndex = 0
-            var unexpectedMessages = 0
-            let maxUnexpectedMessages = 10  // Prevent infinite loop if peer keeps sending wrong messages
-
-            while blockIndex < blockHashes.count && unexpectedMessages < maxUnexpectedMessages {
-                // FIX #112: Use receiveMessageWithTimeout to prevent infinite hang on block fetch
-                // 15s timeout per block message - if peer drops connection, we'll retry with next peer
-                let (command, response) = try await self.receiveMessageWithTimeout(seconds: 15)
-
-                // If we receive a non-block message, drain it and retry (don't advance blockIndex)
-                guard command == "block" else {
-                    print("⚠️ Expected block, got \(command) - draining and retrying")
-                    unexpectedMessages += 1
-                    continue  // Keep waiting for the actual block
-                }
-
-                let hash = blockHashes[blockIndex]
-
-                // Parse the full block
-                if var block = self.parseCompactBlock(response) {
-                    // Set correct height and preserve finalSaplingRoot
-                    block = CompactBlock(
-                        blockHeight: height + UInt64(blockIndex),
-                        blockHash: hash,
-                        prevHash: block.prevHash,
-                        finalSaplingRoot: block.finalSaplingRoot,
-                        time: block.time,
-                        transactions: block.transactions
-                    )
-                    blocks.append(block)
-                    print("📦 Got block \(height + UInt64(blockIndex))")
-                }
-                blockIndex += 1
+            guard !headers.isEmpty else {
+                print("⚠️ No headers received at height \(currentHeight), stopping pagination")
+                break
             }
 
-            if unexpectedMessages > 0 {
-                print("⚠️ Drained \(unexpectedMessages) unexpected messages during block fetch")
+            // If peer returned fewer headers than requested, we've hit their limit
+            // Continue with what we got
+            let receivedCount = headers.count
+            print("📦 [\(host)] getFullBlocks: Requested \(requestCount), got \(receivedCount) headers at height \(currentHeight)")
+
+            // Step 2: Get blocks for these headers
+            let blockHashes = headers.map { $0.hash }
+
+            // Build getdata payload
+            var getdataPayload = Data()
+            getdataPayload.append(UInt8(blockHashes.count))
+
+            for hash in blockHashes {
+                // Type 2 = MSG_BLOCK
+                getdataPayload.append(contentsOf: withUnsafeBytes(of: UInt32(2).littleEndian) { Array($0) })
+                getdataPayload.append(hash)
             }
 
-            return blocks
+            // FIX #111: Wrap send+receive in withExclusiveAccess to prevent race conditions
+            // Without this, mempool scan could consume block messages meant for this operation
+            let blocks = try await withExclusiveAccess {
+                try await self.sendMessage(command: "getdata", payload: getdataPayload)
+
+                // Receive block messages
+                // FIX: Use while loop to handle unexpected messages (like leftover 'headers') without advancing block index
+                var blocks: [CompactBlock] = []
+                var blockIndex = 0
+                var unexpectedMessages = 0
+                let maxUnexpectedMessages = 10  // Prevent infinite loop if peer keeps sending wrong messages
+
+                while blockIndex < blockHashes.count && unexpectedMessages < maxUnexpectedMessages {
+                    // FIX #565 v4: Reduced timeout from 3s to 1s per block - fail fast, use larger batches
+                    // With 2000 blocks per batch and faster responses, 1s timeout is sufficient
+                    let (command, response) = try await self.receiveMessageWithTimeout(seconds: 1)
+
+                    // If we receive a non-block message, drain it and retry (don't advance blockIndex)
+                    guard command == "block" else {
+                        print("⚠️ Expected block, got \(command) - draining and retrying")
+                        unexpectedMessages += 1
+                        continue  // Keep waiting for the actual block
+                    }
+
+                    let hash = blockHashes[blockIndex]
+
+                    // Parse the full block
+                    if var block = self.parseCompactBlock(response) {
+                        // Set correct height and preserve finalSaplingRoot
+                        block = CompactBlock(
+                            blockHeight: currentHeight + UInt64(blockIndex),
+                            blockHash: hash,
+                            prevHash: block.prevHash,
+                            finalSaplingRoot: block.finalSaplingRoot,
+                            time: block.time,
+                            transactions: block.transactions
+                        )
+                        blocks.append(block)
+                        // FIX #565 v4: Removed debug print for performance (2000 blocks = 2000 prints!)
+                    }
+                    blockIndex += 1
+                }
+
+                if unexpectedMessages > 0 {
+                    print("⚠️ Drained \(unexpectedMessages) unexpected messages during block fetch")
+                }
+
+                return blocks
+            }
+
+            allBlocks.append(contentsOf: blocks)
+
+            // Check if we need to continue pagination
+            if receivedCount < requestCount {
+                // Peer returned fewer headers than requested - we've hit their limit
+                print("⚠️ [\(host)] Peer returned only \(receivedCount)/\(requestCount) headers - pagination limit reached")
+                break
+            }
+
+            // Move to next batch
+            currentHeight += UInt64(receivedCount)
+            remainingCount -= receivedCount
+
+            // Safety check: prevent infinite loop if peer returns 0 blocks
+            if blocks.isEmpty {
+                print("⚠️ [\(host)] Got 0 blocks for \(receivedCount) headers, stopping pagination")
+                break
+            }
         }
+
+        print("✅ [\(host)] getFullBlocks returning \(allBlocks.count) blocks (requested \(count))")
+        return allBlocks
     }
 
     /// Parse a compact block from raw data

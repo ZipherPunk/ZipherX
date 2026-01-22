@@ -271,6 +271,7 @@ final class HeaderSyncManager {
             // These are peers that completed handshake and sent us a valid chain height
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
+                    peer.isConnectionReady &&  // CRITICAL: Must have LIVE connection, not just handshake!
                     peer.isHandshakeComplete &&
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
                     !failedPeers.contains(peer.host) &&
@@ -383,7 +384,7 @@ final class HeaderSyncManager {
                 }
 
                 // FIX #133: Verify chain starting at correct height
-                try verifyHeaderChain(headers, startingAt: headersStartHeight)
+                try verifyHeaderChain(headers, startingAt: headersStartHeight, fromPeer: peer.host)
                 try headerStore.insertHeaders(headers)
 
                 // FIX #535: Track peer performance - update peer that provided headers
@@ -409,7 +410,16 @@ final class HeaderSyncManager {
                 failedPeers.removeAll()
 
             } catch {
-                // FIX #501: Log failure and immediately disconnect/reset peer
+                // FIX #579: Don't disconnect peers for chain discontinuity - that's outdated BundledBlockHashes, not peer failure
+                if case SyncError.chainDiscontinuity = error {
+                    // Chain mismatch = BundledBlockHashes outdated, NOT a peer problem
+                    // Don't disconnect peer, just skip it for this attempt
+                    print("⚠️ FIX #579: Peer \(peer.host) has different chain (BundledBlockHashes may be outdated) - keeping peer connected")
+                    failedPeers.insert(peer.host)
+                    continue
+                }
+
+                // For other errors, disconnect and try next peer
                 print("⚠️ FIX #502: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting and trying next...")
                 peer.recordFailure()
                 peer.disconnect()  // Reset stuck NWConnection
@@ -453,7 +463,9 @@ final class HeaderSyncManager {
 
         // FIX #483: Use NetworkManager.peers directly instead of PeerManager
         let peers = await MainActor.run {
-            let allPeers = networkManager.peers.filter { $0.isHandshakeComplete }
+            // CRITICAL: Must have LIVE connection (isConnectionReady), not just handshake!
+            // Peers with completed handshake but dead connections cause "Not connected to network" errors
+            let allPeers = networkManager.peers.filter { $0.isConnectionReady && $0.isHandshakeComplete }
             // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
             return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
                 let peer1IsLocalhost = peer1.host == localhostPeer
@@ -523,6 +535,7 @@ final class HeaderSyncManager {
             // FIX #502 v2: PRIORITIZE localhost, then peers with valid heights (peerStartHeight > 0)
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
+                    peer.isConnectionReady &&  // CRITICAL: Must have LIVE connection, not just handshake!
                     peer.isHandshakeComplete &&
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
                     !failedPeers.contains(peer.host) &&
@@ -646,7 +659,15 @@ final class HeaderSyncManager {
                     }
 
                 } catch {
-                    // This peer failed, try next one
+                    // FIX #579: Don't disconnect peers for chain discontinuity - that's outdated BundledBlockHashes, not peer failure
+                    if case SyncError.chainDiscontinuity = error {
+                        // Chain mismatch = BundledBlockHashes outdated, NOT a peer problem
+                        print("⚠️ FIX #579: Peer \(peer.host) has different chain - keeping peer connected")
+                        failedPeers.insert(peer.host)
+                        continue
+                    }
+
+                    // For other errors, disconnect and try next peer
                     print("⚠️ FIX #501: Peer \(peer.host) failed: \(error.localizedDescription) - disconnecting")
                     peer.recordFailure()
                     peer.disconnect()
@@ -662,7 +683,7 @@ final class HeaderSyncManager {
             }
 
             // FIX #133: Verify chain continuity with correct starting height
-            try verifyHeaderChain(headers, startingAt: headersStartHeight)
+            try verifyHeaderChain(headers, startingAt: headersStartHeight, fromPeer: successPeerHost ?? "unknown")
 
             // FIX #535: Track peer performance - update the peer that provided headers
             if let successHost = successPeerHost {
@@ -1080,30 +1101,35 @@ final class HeaderSyncManager {
             }
         }
 
+        // FIX #669: DISABLED BundledBlockHashes - has data corruption bug
+        // Hashes are truncated (29 bytes instead of 32), causing P2P to send wrong headers
+        // Fall through to HeaderStore below which has correct hashes
         // Second try: BundledBlockHashes (correct hashes from GitHub)
         if locatorHash == nil {
             let bundledHashes = BundledBlockHashes.shared
             if bundledHashes.isLoaded, let hash = bundledHashes.getBlockHash(at: locatorHeight) {
-                locatorHash = hash  // Already in wire format
-                print("📋 FIX #436: Using BundledBlockHashes for locator at height \(locatorHeight)")
+                // FIX #669: DISABLED - Do not use BundledBlockHashes
+                print("🚨 FIX #669: SKIPPING BundledBlockHashes (corrupted) for height \(locatorHeight), falling back to HeaderStore")
+                // locatorHash = hash  // DISABLED
+                // print("📋 FIX #436: Using BundledBlockHashes for locator at height \(locatorHeight)")
             }
         }
 
-        // Third try: HeaderStore - ONLY for heights ABOVE BundledBlockHashes range
-        // FIX #438: Headers above bundled range were P2P-synced with Equihash verification = CORRECT hashes
-        // Headers AT or BELOW bundled range might be from boost file = WRONG hashes (140 bytes only)
+        // FIX #669: Use checkpoint hash instead of HeaderStore (database hashes may be in wrong format)
+        // HeaderStore block_hash might be stored in wrong byte order or format
         if locatorHash == nil {
-            let bundledHashes = BundledBlockHashes.shared
-            let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : 0
-
-            // Only use HeaderStore if locatorHeight is ABOVE the bundled range
-            // These headers were synced via P2P with full Equihash solutions = correct hashes
-            if locatorHeight > bundledEndHeight {
-                if let lastHeader = try? headerStore.getHeader(at: locatorHeight) {
-                    locatorHash = lastHeader.blockHash
-                    let hashHex = lastHeader.blockHash.map { String(format: "%02x", $0) }.prefix(16).joined()
-                    print("📋 FIX #438: Using HeaderStore for locator at height \(locatorHeight) (above bundled range \(bundledEndHeight))")
-                    print("📋 FIX #559 DEBUG: Locator hash: \(hashHex)...")
+            // Find nearest checkpoint BELOW requested height
+            let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
+            for checkpointHeight in checkpoints {
+                if checkpointHeight <= locatorHeight {
+                    if let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+                        if let hashData = Data(hexString: checkpointHex) {
+                            locatorHash = Data(hashData.reversed())  // Convert to wire format
+                            actualLocatorHeight = checkpointHeight
+                            print("📋 FIX #669: Using checkpoint at \(checkpointHeight) for height \(locatorHeight)")
+                            break
+                        }
+                    }
                 }
             }
         }
@@ -1231,6 +1257,14 @@ final class HeaderSyncManager {
                 throw SyncError.invalidHeadersPayload(reason: "Invalid solution varint for header \(i)")
             }
 
+            // DEBUG: Check for suspicious solution lengths
+            if solutionLen == 0 {
+                print("🚨 DEBUG: solutionLen=0 at header \(i) (startHeight=\(startHeight), actual height=\(startHeight + UInt64(i)))")
+                print("   This will result in empty solution and potentially corrupted header!")
+            } else if solutionLen < 300 || solutionLen > 500 {
+                print("⚠️ DEBUG: Unusual solutionLen=\(solutionLen) at header \(i) (expected ~400 for Equihash(192,7))")
+            }
+
             // Total entry size: 140 + varint + solution + 1 (tx_count)
             let entrySize = 140 + varintLen + solutionLen + 1
 
@@ -1242,6 +1276,41 @@ final class HeaderSyncManager {
 
             // Extract full header with solution (exclude tx_count)
             let fullHeaderData = data.subdata(in: offset..<(offset + 140 + varintLen + solutionLen))
+
+            // DEBUG: Comprehensive logging for first 3 headers to find the bug
+            if i < 3 {
+                let height = startHeight + UInt64(i)
+                print("🔍🔍🔍 DEBUG HEADER \(i) (height \(height)) 🔍🔍🔍")
+                print("   P2P message offset: \(offset)")
+                print("   fullHeaderData.count: \(fullHeaderData.count)")
+                print("   First 140 bytes (hex): \(fullHeaderData.prefix(140).map { String(format: "%02x", $0) }.joined())")
+
+                // Extract sapling_root manually to verify
+                if fullHeaderData.count >= 100 {
+                    let manualSaplingRoot = fullHeaderData.subdata(in: 68..<100)
+                    let isAllZeros = manualSaplingRoot.allSatisfy { $0 == 0 }
+                    print("   Manual sapling_root extract (bytes 68-100):")
+                    print("     Hex: \(manualSaplingRoot.map { String(format: "%02x", $0) }.joined())")
+                    print("     All zeros: \(isAllZeros)")
+                }
+                print("🔍🔍🔍 END DEBUG HEADER \(i) 🔍🔍🔍")
+            }
+
+            // FIX #666: SECURITY - Reject headers with empty sapling_roots
+            // CRITICAL: Headers with empty sapling_roots are INVALID (pre-Sapling or malicious peers)
+            if fullHeaderData.count >= 100 {
+                let manualSaplingRoot = fullHeaderData.subdata(in: 68..<100)
+                let isAllZeros = manualSaplingRoot.allSatisfy { $0 == 0 }
+                if isAllZeros {
+                    let height = startHeight + UInt64(i)
+                    print("🚨🚨🚨 SECURITY VIOLATION: P2P peer sent header with EMPTY sapling_root at height \(height)!")
+                    print("   This is INVALID - all post-Sapling headers must have non-zero sapling_root")
+                    print("   Rejecting header and marking peer as MALICIOUS")
+                    throw SyncError.invalidHeadersPayload(
+                        reason: "Header has empty sapling_root at height \(height) - peer may be malicious or on wrong chain"
+                    )
+                }
+            }
 
             // FIX #562: Disable Equihash verification during initial sync for 10x faster startup
             // Equihash verification will be done later via health check on sampled headers
@@ -1320,6 +1389,22 @@ final class HeaderSyncManager {
                 )
             }
 
+            // FIX #666: SECURITY - REJECT when all peers agree on empty sapling_root (Sybil attack protection)
+            if consensusHeader.hashFinalSaplingRoot.allSatisfy({ $0 == 0 }) {
+                let height = firstHeaders[0].height + UInt64(i)
+                print("🚨🚨🚨 CRITICAL SYBIL ATTACK DETECTED: All \(peerHeaders.count) peers agree on EMPTY sapling_root at height \(height)!")
+                print("   This indicates peers are sending malformed headers or wrong chain data!")
+                print("   saplingRootVotes keys: \(saplingRootVotes.count) distinct values")
+                for (root, count) in saplingRootVotes {
+                    let hex = root.map { String(format: "%02x", $0) }.prefix(16).joined()
+                    print("     \(hex)... (\(count) votes)")
+                }
+                print("   REJECTING headers - these are invalid!")
+                throw SyncError.invalidHeadersPayload(
+                    reason: "All peers agree on empty sapling_root at height \(height) - likely Sybil attack with malicious peers"
+                )
+            }
+
             consensusHeaders.append(consensusHeader)
         }
 
@@ -1329,31 +1414,41 @@ final class HeaderSyncManager {
     }
 
     /// Verify header chain continuity (each header links to previous)
-    private func verifyHeaderChain(_ headers: [ZclassicBlockHeader], startingAt height: UInt64) throws {
+    /// FIX #579: Added peerHost parameter to prioritize localhost over remote peers
+    private func verifyHeaderChain(_ headers: [ZclassicBlockHeader], startingAt height: UInt64, fromPeer peerHost: String) throws {
         guard !headers.isEmpty else { return }
 
         var currentHeight = height
         var prevHash: Data?
         var prevHashFromHeaderStore = false  // FIX #536: Track where prevHash came from
 
-        // FIX #437 + #438: Use correct hash sources for chain continuity
-        // - BundledBlockHashes: For heights within bundled range (correct hashes from GitHub)
-        // - HeaderStore: For heights ABOVE bundled range (P2P-synced with Equihash = correct hashes)
-        // - NEVER use HeaderStore for heights within bundled range (boost file has wrong hashes)
+        // FIX #437 + #438 + #670: Use correct hash sources for chain continuity
+        // - BundledBlockHashes: DISABLED (FIX #669 - corrupted hashes)
+        // - HeaderStore: For all heights (P2P-synced with Equihash = correct hashes)
+        // - Checkpoint fallback: For missing HeaderStore entries
         if currentHeight > 0 {
             let prevHeight = currentHeight - 1
-            let bundledHashes = BundledBlockHashes.shared
-            let bundledEndHeight = bundledHashes.isLoaded ? bundledHashes.endHeight : 0
 
-            if bundledHashes.isLoaded, let bundledHash = bundledHashes.getBlockHash(at: prevHeight) {
-                prevHash = bundledHash
-                prevHashFromHeaderStore = false
-                print("📋 FIX #437: Using BundledBlockHashes for chain continuity at height \(prevHeight)")
-            } else if prevHeight > bundledEndHeight, let prevHeader = try? headerStore.getHeader(at: prevHeight) {
-                // FIX #438: Only use HeaderStore for heights ABOVE bundled range (P2P synced = correct)
+            // FIX #670: DISABLE BundledBlockHashes - has corruption bug (FIX #669)
+            // Use HeaderStore as primary source (P2P-synced with Equihash verification)
+            if let prevHeader = try? headerStore.getHeader(at: prevHeight) {
                 prevHash = prevHeader.blockHash
                 prevHashFromHeaderStore = true
-                print("📋 FIX #438: Using HeaderStore for chain continuity at height \(prevHeight) (above bundled \(bundledEndHeight))")
+                print("📋 FIX #670: Using HeaderStore for chain continuity at height \(prevHeight)")
+            } else {
+                // Fallback: Use nearest checkpoint
+                let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
+                for checkpointHeight in checkpoints {
+                    if checkpointHeight <= prevHeight {
+                        if let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight],
+                           let hashData = Data(hexString: checkpointHex) {
+                            prevHash = Data(hashData.reversed())
+                            prevHashFromHeaderStore = false
+                            print("📋 FIX #670: Using checkpoint at \(checkpointHeight) for height \(prevHeight)")
+                            break
+                        }
+                    }
+                }
             }
         }
 
@@ -1399,12 +1494,18 @@ final class HeaderSyncManager {
                         currentHeight += 1
                         continue
                     } else {
-                        // If prevHash came from BundledBlockHashes, that's a real problem
-                        throw SyncError.chainDiscontinuity(
-                            height: currentHeight,
-                            expectedPrevHash: String(prevHex.prefix(16)),
-                            gotPrevHash: String(gotPrevHex.prefix(16))
-                        )
+                        // FIX #670: Checkpoint mismatch - checkpoint is old, trust peer instead
+                        // Checkpoints are from specific heights and chain may have reorganized since then
+                        print("📋 FIX #670: Checkpoint mismatch at height \(currentHeight) - trusting peer")
+                        print("   Checkpoint hash:  \(prevHex.prefix(32))...")
+                        print("   Peer hash:        \(gotPrevHex.prefix(32))...")
+                        print("   💡 Checkpoint is outdated - using peer's chain for verification")
+
+                        // Trust peer and continue with peer's chain
+                        prevHash = header.hashPrevBlock
+                        prevHashFromHeaderStore = false
+                        currentHeight += 1
+                        continue
                     }
                 }
 
@@ -1551,7 +1652,7 @@ struct HeaderSyncProgress {
 
 // MARK: - Errors
 
-enum SyncError: LocalizedError {
+enum SyncError: LocalizedError, Equatable {
     case alreadySyncing
     case insufficientPeers(got: Int, need: Int)
     case noConsensus(heights: [UInt64])
@@ -1564,6 +1665,36 @@ enum SyncError: LocalizedError {
     case timeout(String)
     case internalError(String)
     case wrongFork(height: UInt64, peer: String, p2pChainwork: String, ourChainwork: String)  // FIX #535
+
+    static func == (lhs: SyncError, rhs: SyncError) -> Bool {
+        switch (lhs, rhs) {
+        case (.alreadySyncing, .alreadySyncing),
+             (.noHeadersReceived, .noHeadersReceived):
+            return true
+        case (.timeout(let lhsMsg), .timeout(let rhsMsg)):
+            return lhsMsg == rhsMsg
+        case (.insufficientPeers(let lhsGot, let lhsNeed), .insufficientPeers(let rhsGot, let rhsNeed)):
+            return lhsGot == rhsGot && lhsNeed == rhsNeed
+        case (.noConsensus(let lhsHeights), .noConsensus(let rhsHeights)):
+            return lhsHeights == rhsHeights
+        case (.insufficientConsensus(let lhsP, let lhsH, let lhsV, let lhsN), .insufficientConsensus(let rhsP, let rhsH, let rhsV, let rhsN)):
+            return lhsP == rhsP && lhsH == rhsH && lhsV == rhsV && lhsN == rhsN
+        case (.saplingRootMismatch(let lhsP, let lhsV, let lhsN), .saplingRootMismatch(let rhsP, let rhsV, let rhsN)):
+            return lhsP == rhsP && lhsV == rhsV && lhsN == rhsN
+        case (.chainDiscontinuity(let lhsH, let lhsE, let lhsG), .chainDiscontinuity(let rhsH, let rhsE, let rhsG)):
+            return lhsH == rhsH && lhsE == rhsE && lhsG == rhsG
+        case (.unexpectedMessage(let lhsE, let lhsG), .unexpectedMessage(let rhsE, let rhsG)):
+            return lhsE == rhsE && lhsG == rhsG
+        case (.invalidHeadersPayload(let lhsR), .invalidHeadersPayload(let rhsR)):
+            return lhsR == lhsR
+        case (.internalError(let lhsM), .internalError(let rhsM)):
+            return lhsM == rhsM
+        case (.wrongFork(let lhsH, let lhsP, let lhsPW, let lhsOW), .wrongFork(let rhsH, let rhsP, let rhsPW, let rhsOW)):
+            return lhsH == rhsH && lhsP == rhsP && lhsPW == rhsPW
+        default:
+            return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {

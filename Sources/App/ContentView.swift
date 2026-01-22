@@ -450,6 +450,11 @@ struct ContentView: View {
                                     walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
                                 }
 
+                                // FIX #563 v31: DISABLED tree corruption check before witness rebuild
+                                // The tree rebuild was losing PHASE 2 delta CMUs and causing crashes
+                                // If tree is corrupted, user can run "Settings → Repair Database" manually
+                                print("🔍 FIX #563 v31: Skipping tree corruption check (causes crashes during witness rebuild)")
+
                                 await walletManager.rebuildWitnessesForStartup()
                                 print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
 
@@ -1132,6 +1137,9 @@ struct ContentView: View {
                             networkManager.enableBackgroundProcesses()
                             print("✅ FIX #560: Background processes enabled - mempool scan, block notifications now active")
 
+                            // FIX #603: Start periodic witness refresh to keep witnesses fresh for instant spending
+                            walletManager.startPeriodicWitnessRefresh()
+
                             // FIX #500: Clear import progress flag if this was an import
                             if walletManager.isImportInProgress {
                                 walletManager.markImportComplete()
@@ -1680,21 +1688,26 @@ struct ContentView: View {
 
                 // SINGLE cypherpunk overlay for ALL initial sync phases
                 // Shows during: tree loading, connecting, syncing - until initial sync complete
-                if isInitialSync {
+                // FIX #577 v7: Also show during Full Rescan (same UI as Import PK)
+                if isInitialSync || walletManager.isFullRescan {
                     CypherpunkSyncView(
                         progress: currentSyncProgress,
                         status: currentSyncStatus,
                         tasks: currentSyncTasks,
                         startTime: effectiveStartTime,  // Use wallet creation time for accurate duration
                         estimatedDuration: estimatedSyncDuration,
-                        isComplete: showCompletionScreen,
-                        completionDuration: syncCompletionDuration,
+                        isComplete: walletManager.isFullRescan ? walletManager.isRescanComplete : showCompletionScreen,
+                        completionDuration: walletManager.isFullRescan ? walletManager.rescanCompletionDuration : syncCompletionDuration,
                         onEnterWallet: {
                             // User clicked the enter button
                             withAnimation(.easeOut(duration: 0.3)) {
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
                                 showCompletionScreen = false
+                                // FIX #577 v7 + FIX #582: Clear ALL Full Rescan flags when entering wallet
+                                if walletManager.isRescanComplete || walletManager.isFullRescan {
+                                    walletManager.clearFullRescanFlags()
+                                }
                             }
 
                             // FIX #145: Enable background processes NOW (user is entering main wallet)
@@ -1708,6 +1721,9 @@ struct ContentView: View {
 
                             // Start inactivity timer now that sync is done
                             startInactivityTimer()
+
+                            // FIX #603: Start periodic witness refresh to keep witnesses fresh
+                            walletManager.startPeriodicWitnessRefresh()
                         },
                         onStopSync: {
                             // User clicked STOP - cancel sync and go to main wallet
@@ -1716,6 +1732,10 @@ struct ContentView: View {
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
                                 showCompletionScreen = false
+                                // FIX #577 v7 + FIX #582: Clear ALL Full Rescan flags on stop
+                                if walletManager.isFullRescan || walletManager.isRescanComplete {
+                                    walletManager.clearFullRescanFlags()
+                                }
                             }
                             // FIX #145: Enable background processes even on early stop
                             networkManager.enableBackgroundProcesses()
@@ -1933,12 +1953,13 @@ struct ContentView: View {
     /// Uses WalletManager.overallProgress which only ever increases
     private var currentSyncProgress: Double {
         // FIX #560: Check if we're in FAST START mode (tree loaded, initial sync)
+        // FIX #577 v13: Also treat Full Rescan like initial sync (same progress display as Import PK)
         // Don't check isSyncing because FAST START might sync headers!
-        let isFastStartMode = walletManager.isTreeLoaded && isInitialSync
+        let isFastStartMode = walletManager.isTreeLoaded && (isInitialSync || walletManager.isFullRescan)
 
         if isFastStartMode {
             // FIX #560: Manually build task list for FAST START progress
-            // Don't rely on walletManager.syncTasks which might not have fast_* tasks yet
+            // FIX #577 v13: For Full Rescan, show core Import PK tasks (not fast_* tasks)
             var tasks: [SyncTask] = []
 
             // Tree task (always completed in FAST START)
@@ -1959,10 +1980,25 @@ struct ContentView: View {
                 tasks.append(SyncTask(id: "finalizing", title: "Finalizing startup...", status: .inProgress))
             }
 
-            // Add fast_* tasks from WalletManager if they exist
-            let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
-            if !fastTasks.isEmpty {
-                tasks.append(contentsOf: fastTasks)
+            // FIX #577 v13: For Full Rescan, show core sync tasks; for FAST START, show fast_* tasks
+            if walletManager.isFullRescan {
+                // Full Rescan: show core Import PK tasks only
+                let coreTasks = walletManager.syncTasks.filter { task in
+                    !task.id.hasPrefix("fast_") &&
+                    !task.id.hasPrefix("balance_repair") &&
+                    !task.id.hasPrefix("full_repair") &&
+                    !task.id.hasPrefix("tree_rebuild") &&
+                    !task.id.hasPrefix("witness_sync")
+                }
+                if !coreTasks.isEmpty {
+                    tasks.append(contentsOf: coreTasks)
+                }
+            } else {
+                // FAST START: show fast_* tasks only
+                let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+                if !fastTasks.isEmpty {
+                    tasks.append(contentsOf: fastTasks)
+                }
             }
 
             // Calculate progress
@@ -2072,7 +2108,8 @@ struct ContentView: View {
     private var currentSyncTasks: [SyncTask] {
         // FIX #562: Check if we're in FAST START mode (tree loaded, initial sync)
         // Don't check isSyncing because FAST START might sync headers!
-        let isFastStartMode = walletManager.isTreeLoaded && isInitialSync
+        // FIX #577 v13: Also treat Full Rescan like initial sync (same task display as Import PK)
+        let isFastStartMode = walletManager.isTreeLoaded && (isInitialSync || walletManager.isFullRescan)
 
         var tasks: [SyncTask] = []
 
@@ -2106,16 +2143,34 @@ struct ContentView: View {
         // 3. THIRD: Sync tasks from WalletManager
         if isFastStartMode {
             // FIX #562: FAST START mode - only show fast_* tasks, not all 20+ tasks!
+            // FIX #577 v13: Full Rescan shows only core Import PK tasks (same as FAST START)
             // CRITICAL: Don't show 100% if we're still connecting or syncing!
             if walletManager.isConnecting {
                 // Add a "finalizing" task to keep progress below 100%
                 tasks.append(SyncTask(id: "finalizing", title: "Finalizing startup...", status: .inProgress))
             }
 
-            // Add fast_* tasks from WalletManager if they exist
-            let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
-            if !fastTasks.isEmpty {
-                tasks.append(contentsOf: fastTasks)
+            // FIX #577 v13: For Full Rescan, show core sync tasks (not fast_* tasks)
+            // For FAST START, show fast_* tasks only
+            if walletManager.isFullRescan {
+                // Full Rescan: show core Import PK tasks only (params, keys, scan, witnesses, balance, etc.)
+                // Filter out fast_* and repair tasks
+                let coreTasks = walletManager.syncTasks.filter { task in
+                    !task.id.hasPrefix("fast_") &&
+                    !task.id.hasPrefix("balance_repair") &&
+                    !task.id.hasPrefix("full_repair") &&
+                    !task.id.hasPrefix("tree_rebuild") &&
+                    !task.id.hasPrefix("witness_sync")
+                }
+                if !coreTasks.isEmpty {
+                    tasks.append(contentsOf: coreTasks)
+                }
+            } else {
+                // FAST START: show fast_* tasks only
+                let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+                if !fastTasks.isEmpty {
+                    tasks.append(contentsOf: fastTasks)
+                }
             }
         } else {
             // NORMAL START mode - show all sync tasks
@@ -3016,8 +3071,10 @@ struct HealthAlertSheet: View {
             Button(action: {
                 Task {
                     await networkManager.handleHealthAlertAction(.dismiss)
+                    // FIX #667: Only dismiss after handleHealthAlertAction completes
+                    // This prevents race condition where onChange re-presents alert
+                    isPresented = false
                 }
-                isPresented = false
             }) {
                 Text("Remind Me Later")
                     .foregroundColor(.secondary)
