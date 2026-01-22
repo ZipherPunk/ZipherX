@@ -21,6 +21,9 @@ final class HeaderSyncManager {
     private static let syncLock = NSLock()
     private let syncQueue = DispatchQueue(label: "com.zipherx.headersync", qos: .userInitiated)
 
+    // FIX #673: Track when we last deleted corrupted headers (for chainwork validation)
+    private var lastCorruptedHeaderDeletion: Date?
+
     // Progress tracking
     var onProgress: ((HeaderSyncProgress) -> Void)?
 
@@ -1421,6 +1424,7 @@ final class HeaderSyncManager {
         var currentHeight = height
         var prevHash: Data?
         var prevHashFromHeaderStore = false  // FIX #536: Track where prevHash came from
+        var checkpointWarningPrinted = false  // FIX #673: Only print checkpoint warning once
 
         // FIX #437 + #438 + #670: Use correct hash sources for chain continuity
         // - BundledBlockHashes: DISABLED (FIX #669 - corrupted hashes)
@@ -1490,16 +1494,22 @@ final class HeaderSyncManager {
                         print("✅ FIX #536: Peer headers are correct - using peer's chain for verification")
                         prevHash = header.hashPrevBlock  // Update to peer's prevHash (correct)
                         prevHashFromHeaderStore = false  // Now using peer's chain
+                        // FIX #673: Track when we deleted corrupted headers (for chainwork validation)
+                        lastCorruptedHeaderDeletion = Date()
                         // Skip rest of this iteration and continue with next header
                         currentHeight += 1
                         continue
                     } else {
                         // FIX #670: Checkpoint mismatch - checkpoint is old, trust peer instead
                         // Checkpoints are from specific heights and chain may have reorganized since then
-                        print("📋 FIX #670: Checkpoint mismatch at height \(currentHeight) - trusting peer")
-                        print("   Checkpoint hash:  \(prevHex.prefix(32))...")
-                        print("   Peer hash:        \(gotPrevHex.prefix(32))...")
-                        print("   💡 Checkpoint is outdated - using peer's chain for verification")
+                        // FIX #673: Only print warning once to avoid log spam
+                        if !checkpointWarningPrinted {
+                            print("📋 FIX #670: Checkpoint mismatch at height \(currentHeight) - trusting peer")
+                            print("   Checkpoint hash:  \(prevHex.prefix(32))...")
+                            print("   Peer hash:        \(gotPrevHex.prefix(32))...")
+                            print("   💡 Checkpoint is outdated - using peer's chain for verification")
+                            checkpointWarningPrinted = true
+                        }
 
                         // Trust peer and continue with peer's chain
                         prevHash = header.hashPrevBlock
@@ -1577,22 +1587,35 @@ final class HeaderSyncManager {
                     // Continue - will replace with higher chainwork headers
                 } else {
                     // Equal chainwork - same chain, different blocks at same height?
-                    // This shouldn't happen with valid Equihash proofs
-                    let p2pHash = header.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
-                    let existingHash = existingHeader.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
+                    // FIX #673: If we just deleted corrupted headers (FIX #536), trust P2P peer
+                    let timeSinceDeletion = Date().timeIntervalSince(lastCorruptedHeaderDeletion ?? Date.distantPast)
+                    let recentlyDeleted = timeSinceDeletion < 5.0
 
                     if header.blockHash != existingHeader.blockHash {
-                        print("⚠️ FIX #535: Same chainwork but different block hashes at height \(header.height)")
-                        print("   P2P: \(p2pHash)...")
-                        print("   Us:  \(existingHash)...")
-                        print("   This indicates a difficulty collision or invalid data")
-                        // Reject - same chainwork should mean same block
-                        throw SyncError.wrongFork(
-                            height: header.height,
-                            peer: peerHost,
-                            p2pChainwork: "same",
-                            ourChainwork: "same"
-                        )
+                        let p2pHash = header.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
+                        let existingHash = existingHeader.blockHash.map { String(format: "%02x", $0) }.joined().prefix(16)
+
+                        if recentlyDeleted {
+                            // FIX #673: We just deleted corrupted headers - trust P2P peer
+                            print("🔄 FIX #673: Different hash at height \(header.height) but we recently deleted corrupted headers")
+                            print("   P2P: \(p2pHash)...")
+                            print("   Us:  \(existingHash)...")
+                            print("   ✅ Trusting P2P peer - replacing with peer's chain")
+                            // Continue - will replace with peer's headers
+                        } else {
+                            // Not recently deleted - this is a real error
+                            print("⚠️ FIX #535: Same chainwork but different block hashes at height \(header.height)")
+                            print("   P2P: \(p2pHash)...")
+                            print("   Us:  \(existingHash)...")
+                            print("   This indicates a difficulty collision or invalid data")
+                            // Reject - same chainwork should mean same block
+                            throw SyncError.wrongFork(
+                                height: header.height,
+                                peer: peerHost,
+                                p2pChainwork: "same",
+                                ourChainwork: "same"
+                            )
+                        }
                     }
                 }
             }
