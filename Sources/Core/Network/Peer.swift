@@ -2524,16 +2524,27 @@ public final class Peer {
         }
 
         // Try 4: Find nearest checkpoint BELOW the requested height
+        // FIX #673: Skip checkpoint fallback if HeaderStore was recently cleared (wrong fork!)
         if locatorHash == nil {
-            let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
-            for checkpointHeight in checkpoints {
-                if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
-                    if let hashData = Data(hexString: checkpointHex) {
-                        locatorHash = Data(hashData.reversed())  // Convert to wire format
-                        debugLog(.network, "📋 getBlockHeaders: Using nearest checkpoint at \(checkpointHeight) for height \(locatorHeight)")
-                        break
+            // Check if HeaderStore was recently cleared (maxHeight < currentHeight - 10000)
+            let headerStoreMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            let headerStoreRecentlyCleared = (headerStoreMaxHeight > 0) && (height > headerStoreMaxHeight + 10000)
+
+            if !headerStoreRecentlyCleared {
+                let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)  // Descending
+                for checkpointHeight in checkpoints {
+                    if checkpointHeight < locatorHeight, let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+                        if let hashData = Data(hexString: checkpointHex) {
+                            locatorHash = Data(hashData.reversed())  // Convert to wire format
+                            debugLog(.network, "📋 getBlockHeaders: Using nearest checkpoint at \(checkpointHeight) for height \(locatorHeight)")
+                            break
+                        }
                     }
                 }
+            } else {
+                // FIX #673: HeaderStore recently cleared - checkpoint might be on wrong fork
+                // Use genesis block (zero hash) to force full resync from beginning
+                debugLog(.network, "📋 FIX #673: HeaderStore recently cleared (\(headerStoreMaxHeight) < \(height)), using genesis hash to force full resync")
             }
         }
 
@@ -2541,7 +2552,7 @@ public final class Peer {
         if let hash = locatorHash {
             payload.append(hash)
         } else {
-            debugLog(.error, "🚨 getBlockHeaders: No locator found for height \(locatorHeight), using zero hash!")
+            debugLog(.network, "📋 getBlockHeaders: No locator found for height \(locatorHeight), using zero hash (will sync from genesis)")
             payload.append(Data(count: 32))
         }
 
