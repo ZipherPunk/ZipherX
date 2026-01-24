@@ -2497,33 +2497,69 @@ final class WalletManager: ObservableObject {
                 let blocksToFetch = chainHeight - fetchStartHeight
                 print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
 
-                let batchSize: UInt64 = 1000
+                // FIX #710: Add timeout and retry logic to prevent indefinite hanging
+                let batchSize: UInt64 = 500  // Reduced from 1000 for better reliability
+                let maxRetries = 2
+                let batchTimeoutSeconds: UInt64 = 30  // 30 seconds per batch
                 var currentHeight = fetchStartHeight + 1
+                var consecutiveFailures = 0
+                let maxConsecutiveFailures = 3
 
                 while currentHeight <= chainHeight {
                     let endHeight = min(currentHeight + batchSize - 1, chainHeight)
+                    let count = Int(endHeight - currentHeight + 1)
+                    var batchSuccess = false
 
-                    do {
-                        // Fetch this batch via P2P
-                        let blocks = try await NetworkManager.shared.getBlocksDataP2P(
-                            from: currentHeight,
-                            count: Int(endHeight - currentHeight + 1)
-                        )
+                    for attempt in 1...maxRetries {
+                        do {
+                            // FIX #710: Wrap P2P fetch in timeout task
+                            let fetchTask = Task {
+                                try await NetworkManager.shared.getBlocksDataP2P(
+                                    from: currentHeight,
+                                    count: count
+                                )
+                            }
 
-                        for (height, _, _, txData) in blocks {
-                            for (txid, outputs, _) in txData {
-                                for output in outputs {
-                                    if let cmuData = Data(hexString: output.cmu) {
-                                        deltaCMUs.append(cmuData)
-                                        p2pCMUs += 1
+                            let timeoutTask = Task {
+                                try await Task.sleep(nanoseconds: batchTimeoutSeconds * 1_000_000_000)
+                                fetchTask.cancel()
+                            }
+
+                            let blocks = try await fetchTask.value
+                            timeoutTask.cancel()
+
+                            for (height, _, _, txData) in blocks {
+                                for (txid, outputs, _) in txData {
+                                    for output in outputs {
+                                        if let cmuData = Data(hexString: output.cmu) {
+                                            deltaCMUs.append(cmuData)
+                                            p2pCMUs += 1
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
-                    } catch {
-                        print("⚠️ FIX #571: Failed to fetch blocks from \(currentHeight): \(error)")
+                            print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
+                            batchSuccess = true
+                            consecutiveFailures = 0
+                            break  // Success, exit retry loop
+                        } catch {
+                            if attempt < maxRetries {
+                                print("⚠️ FIX #710: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s backoff
+                            } else {
+                                print("⚠️ FIX #710: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
+                            }
+                        }
+                    }
+
+                    if !batchSuccess {
+                        consecutiveFailures += 1
+                        if consecutiveFailures >= maxConsecutiveFailures {
+                            print("⚠️ FIX #710: \(maxConsecutiveFailures) consecutive failures - aborting P2P fetch")
+                            print("⚠️ FIX #710: Witnesses will be rebuilt on next app restart")
+                            break
+                        }
                     }
 
                     currentHeight = endHeight + 1
