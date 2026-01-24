@@ -6091,12 +6091,33 @@ public final class NetworkManager: ObservableObject {
                 if rangeCount <= 0 { break }
 
                 group.addTask {
-                    // Each peer fetches its range SEQUENTIALLY (no interleaving)
-                    return await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
+                    // FIX #713: Per-peer timeout to prevent one slow peer from blocking all
+                    // Each peer gets 20 seconds to complete its batch
+                    let peerHost = peer.host
+                    let peerTimeout: UInt64 = 20_000_000_000  // 20 seconds
+
+                    return await withTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { innerGroup in
+                        innerGroup.addTask {
+                            await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
+                        }
+
+                        innerGroup.addTask {
+                            try? await Task.sleep(nanoseconds: peerTimeout)
+                            print("⚠️ FIX #713: Peer \(peerHost) timed out after 20s")
+                            return nil
+                        }
+
+                        // Return whichever completes first
+                        if let result = await innerGroup.next() {
+                            innerGroup.cancelAll()
+                            return result
+                        }
+                        return nil
+                    }
                 }
             }
 
-            // Collect results from all peers
+            // Collect results from all peers (each with its own timeout)
             for await result in group {
                 if let blocks = result {
                     collected.append(contentsOf: blocks)
