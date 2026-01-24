@@ -2497,7 +2497,8 @@ final class WalletManager: ObservableObject {
                 let blocksToFetch = chainHeight - fetchStartHeight
                 print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
 
-                // FIX #710: Add timeout and retry logic to prevent indefinite hanging
+                // FIX #710 v2: Proper timeout using task group race pattern
+                // Previous implementation used fetchTask.cancel() which doesn't interrupt network I/O
                 let batchSize: UInt64 = 500  // Reduced from 1000 for better reliability
                 let maxRetries = 2
                 let batchTimeoutSeconds: UInt64 = 30  // 30 seconds per batch
@@ -2512,23 +2513,40 @@ final class WalletManager: ObservableObject {
 
                     for attempt in 1...maxRetries {
                         do {
-                            // FIX #710: Wrap P2P fetch in timeout task
-                            let fetchTask = Task {
-                                try await NetworkManager.shared.getBlocksDataP2P(
-                                    from: currentHeight,
-                                    count: count
-                                )
+                            // FIX #710 v2: Use task group to race fetch vs timeout
+                            // This ensures we abort waiting after timeout even if network is stuck
+                            let fetchHeight = currentHeight
+                            let fetchCount = count
+
+                            let blocks: [(UInt64, Data, UInt32, [(String, [SaplingOutput], [String])])]? = try await withThrowingTaskGroup(of: [(UInt64, Data, UInt32, [(String, [SaplingOutput], [String])])]?.self) { group in
+                                // Task 1: The actual fetch
+                                group.addTask {
+                                    try await NetworkManager.shared.getBlocksDataP2P(
+                                        from: fetchHeight,
+                                        count: fetchCount
+                                    )
+                                }
+
+                                // Task 2: Timeout - returns nil after delay
+                                group.addTask {
+                                    try await Task.sleep(nanoseconds: batchTimeoutSeconds * 1_000_000_000)
+                                    print("⚠️ FIX #710 v2: Batch \(fetchHeight)-\(fetchHeight + UInt64(fetchCount) - 1) timed out after \(batchTimeoutSeconds)s")
+                                    return nil
+                                }
+
+                                // Return whichever completes first
+                                if let result = try await group.next() {
+                                    group.cancelAll()  // Cancel the other task
+                                    return result
+                                }
+                                return nil
                             }
 
-                            let timeoutTask = Task {
-                                try await Task.sleep(nanoseconds: batchTimeoutSeconds * 1_000_000_000)
-                                fetchTask.cancel()
+                            guard let fetchedBlocks = blocks else {
+                                throw NSError(domain: "WalletManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Timeout"])
                             }
 
-                            let blocks = try await fetchTask.value
-                            timeoutTask.cancel()
-
-                            for (height, _, _, txData) in blocks {
+                            for (height, _, _, txData) in fetchedBlocks {
                                 for (txid, outputs, _) in txData {
                                     for output in outputs {
                                         if let cmuData = Data(hexString: output.cmu) {
@@ -2545,10 +2563,10 @@ final class WalletManager: ObservableObject {
                             break  // Success, exit retry loop
                         } catch {
                             if attempt < maxRetries {
-                                print("⚠️ FIX #710: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
                                 try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s backoff
                             } else {
-                                print("⚠️ FIX #710: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
+                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
                             }
                         }
                     }
@@ -2556,8 +2574,8 @@ final class WalletManager: ObservableObject {
                     if !batchSuccess {
                         consecutiveFailures += 1
                         if consecutiveFailures >= maxConsecutiveFailures {
-                            print("⚠️ FIX #710: \(maxConsecutiveFailures) consecutive failures - aborting P2P fetch")
-                            print("⚠️ FIX #710: Witnesses will be rebuilt on next app restart")
+                            print("⚠️ FIX #710 v2: \(maxConsecutiveFailures) consecutive failures - aborting P2P fetch")
+                            print("⚠️ FIX #710 v2: Witnesses will be rebuilt on next app restart")
                             break
                         }
                     }
