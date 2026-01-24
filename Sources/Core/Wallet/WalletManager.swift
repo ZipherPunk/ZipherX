@@ -8132,6 +8132,18 @@ final class WalletManager: ObservableObject {
     /// - Returns: Number of transactions recovered
     @discardableResult
     func autoRecoverMissingTransactions() async -> Int {
+        // FIX #709: Early return BEFORE any potentially crashing code
+        // FIX #688 v3: Disable auto-recovery due to crashes
+        // This feature needs to be completely rewritten to avoid overflow issues
+        // For now, just skip it - users can manually trigger rescan if needed
+        print("⏭️ FIX #709: Auto-recovery disabled (preventing crashes from MainActor.run and database access)")
+        return 0
+
+        // NOTE: All code below is disabled until auto-recovery is rewritten
+        // The crash was occurring between line 8149-8164 - likely in:
+        // - await MainActor.run { networkManager.chainHeight }
+        // - database.getVerifiedCheckpointHeight()
+
         // FIX #681 v4: Prevent concurrent executions that interfere with each other
         guard !isAutoRecovering else {
             print("⏭️ FIX #681: Auto-recovery already in progress, skipping duplicate call")
