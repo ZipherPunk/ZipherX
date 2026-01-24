@@ -6578,7 +6578,7 @@ final class WalletManager: ObservableObject {
         // After import, if delta bundle is incomplete (less CMUs than expected),
         // witnesses will be stale. Force an immediate rebuild to prevent corruption.
         Task {
-            let validation = DeltaCMUManager.shared.validateDeltaBundle()
+            let validation = DeltaCMUManager.shared.validateDeltaBundle(bundledEndHeight: ZipherXConstants.bundledTreeHeight)
             if !validation.isValid {
                 print("⚠️ FIX #711: Delta bundle invalid after import: \(validation.error ?? "unknown")")
                 print("⚠️ FIX #711: Forcing immediate witness rebuild to prevent stale witnesses...")
