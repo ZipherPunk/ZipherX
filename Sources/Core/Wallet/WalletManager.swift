@@ -2518,7 +2518,7 @@ final class WalletManager: ObservableObject {
                             let fetchHeight = currentHeight
                             let fetchCount = count
 
-                            let blocks: [(UInt64, Data, UInt32, [(String, [SaplingOutput], [String])])]? = try await withThrowingTaskGroup(of: [(UInt64, Data, UInt32, [(String, [SaplingOutput], [String])])]?.self) { group in
+                            let blocks: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? = try await withThrowingTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
                                 // Task 1: The actual fetch
                                 group.addTask {
                                     try await NetworkManager.shared.getBlocksDataP2P(
