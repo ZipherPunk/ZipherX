@@ -940,32 +940,57 @@ public class RPCClient: ObservableObject {
 
     /// FIX #286: Get all wallet transactions including z-address sends
     /// Uses both listtransactions and z_listunspent to build complete history
+    /// FIX #685: Now fetches ALL transactions using pagination (no limit)
     public func getAllWalletTransactions(limit: Int) async throws -> [WalletTransaction] {
         var allTransactions: [WalletTransaction] = []
         var seenTxids = Set<String>()
 
-        // 1. Get t-address transactions (includes some z transactions)
-        let tTxs = try await listTransactions(count: limit, from: 0)
-        for tx in tTxs {
-            if !seenTxids.contains(tx.txid) {
-                allTransactions.append(tx)
-                seenTxids.insert(tx.txid)
+        // FIX #685: Fetch ALL t-address transactions using pagination
+        // Keep fetching until we get fewer than requested (indicating we've got them all)
+        var fetchMoreTxs = true
+        var fromOffset = 0
+        let batchSize = 1000  // Fetch 1000 at a time
+
+        while fetchMoreTxs {
+            let tTxs = try await listTransactions(count: batchSize, from: fromOffset)
+            if tTxs.isEmpty {
+                fetchMoreTxs = false
+            } else {
+                for tx in tTxs {
+                    if !seenTxids.contains(tx.txid) {
+                        allTransactions.append(tx)
+                        seenTxids.insert(tx.txid)
+                    }
+                }
+                fromOffset += tTxs.count
+
+                // If we got fewer than requested, we've probably fetched them all
+                if tTxs.count < batchSize {
+                    fetchMoreTxs = false
+                }
             }
         }
-        // Verbose log removed
+        print("📜 FIX #685: Fetched \(allTransactions.count) total transactions via pagination")
 
         // 2. Get z-address received transactions for all z-addresses
         let zAddresses = try await getZAddresses()
+        print("📜 FIX #716: Found \(zAddresses.count) z-addresses in wallet")
+        var zTxCount = 0
         for zAddr in zAddresses {
             let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
+            let newTxs = zReceived.filter { !seenTxids.contains($0.txid) }
+            if !newTxs.isEmpty {
+                print("📜 FIX #716: z-addr \(zAddr.prefix(20))... has \(newTxs.count) new transactions")
+            }
             for tx in zReceived {
                 if !seenTxids.contains(tx.txid) {
                     allTransactions.append(tx)
                     seenTxids.insert(tx.txid)
+                    zTxCount += 1
                 }
             }
         }
-        // Verbose log removed
+        print("📜 FIX #716: Added \(zTxCount) z-address transactions (total now: \(allTransactions.count))")
 
         // 3. Get recent z_sendmany operation results (for sent z-address transactions)
         // This captures outgoing z-address transactions
@@ -991,11 +1016,10 @@ public class RPCClient: ObservableObject {
         }
         // Verbose log removed
 
-        // Sort by timestamp (newest first)
+        // FIX #685: Sort by timestamp (newest first) - return ALL transactions (no limit)
+        print("📜 FIX #685: Returning \(allTransactions.count) total transactions from Full Node RPC")
         return allTransactions
             .sorted { $0.timestamp > $1.timestamp }
-            .prefix(limit)
-            .map { $0 }
     }
 
     /// FIX #286: Get z-address operation results (completed send operations)
@@ -1328,6 +1352,67 @@ public class RPCClient: ObservableObject {
         let minor = (version / 10_000) % 100
         let patch = (version / 100) % 100
         return "\(major).\(minor).\(patch)"
+    }
+
+    // MARK: - FIX #698: Block Header Methods for Sapling Root Recovery
+
+    /// FIX #698: Get block hash at a specific height
+    /// Used for sapling root recovery when P2P headers have zeros
+    public func getBlockHash(height: UInt64) async throws -> String {
+        let result = try await call(method: "getblockhash", params: [Int(height)])
+        guard let hash = result as? String else {
+            throw RPCError.invalidResponse
+        }
+        return hash
+    }
+
+    /// FIX #698: Get block header with sapling root
+    /// Returns finalsaplingroot for anchor recovery
+    public func getBlockHeader(hash: String) async throws -> (height: UInt64, saplingRoot: String, prevHash: String) {
+        let result = try await call(method: "getblockheader", params: [hash])
+        guard let header = result as? [String: Any],
+              let height = header["height"] as? Int,
+              let saplingRoot = header["finalsaplingroot"] as? String,
+              let prevHash = header["previousblockhash"] as? String else {
+            throw RPCError.invalidResponse
+        }
+        return (UInt64(height), saplingRoot, prevHash)
+    }
+
+    /// FIX #698: Get sapling root at a specific height
+    /// Convenience method combining getBlockHash and getBlockHeader
+    public func getSaplingRoot(at height: UInt64) async throws -> String {
+        let hash = try await getBlockHash(height: height)
+        let header = try await getBlockHeader(hash: hash)
+        return header.saplingRoot
+    }
+
+    /// FIX #698: Recover sapling roots for a range of heights
+    /// Returns dictionary of height -> saplingRoot (in little-endian storage format)
+    public func recoverSaplingRoots(from startHeight: UInt64, to endHeight: UInt64, onProgress: ((Int, Int) -> Void)? = nil) async throws -> [UInt64: Data] {
+        var results: [UInt64: Data] = [:]
+        let total = Int(endHeight - startHeight + 1)
+
+        for height in startHeight...endHeight {
+            do {
+                let saplingRootHex = try await getSaplingRoot(at: height)
+
+                // Convert hex string to Data and reverse for little-endian storage
+                if let saplingData = Data(hexString: saplingRootHex) {
+                    let reversedData = Data(saplingData.reversed())
+                    results[height] = reversedData
+                }
+
+                let progress = Int(height - startHeight + 1)
+                onProgress?(progress, total)
+
+            } catch {
+                print("⚠️ FIX #698: Failed to get sapling root at height \(height): \(error)")
+                // Continue with other heights
+            }
+        }
+
+        return results
     }
 
     private func sanitizeError(_ message: String) -> String {
