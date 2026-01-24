@@ -6574,6 +6574,28 @@ final class WalletManager: ObservableObject {
         self.isImportInProgress = false
         print("✅ FIX #500: Import sync completed")
 
+        // FIX #711: Validate delta bundle and force witness rebuild if invalid
+        // After import, if delta bundle is incomplete (less CMUs than expected),
+        // witnesses will be stale. Force an immediate rebuild to prevent corruption.
+        Task {
+            let validation = DeltaCMUManager.shared.validateDeltaBundle()
+            if !validation.isValid {
+                print("⚠️ FIX #711: Delta bundle invalid after import: \(validation.error ?? "unknown")")
+                print("⚠️ FIX #711: Forcing immediate witness rebuild to prevent stale witnesses...")
+
+                // Clear the invalid delta bundle
+                DeltaCMUManager.shared.clearDeltaBundle()
+
+                // Trigger witness rebuild
+                if let account = try? WalletDatabase.shared.getAccount(index: 0) {
+                    await self.preRebuildWitnessesForInstantPayment(accountId: account.accountId)
+                    print("✅ FIX #711: Witness rebuild completed after import")
+                }
+            } else {
+                print("✅ FIX #711: Delta bundle valid after import (\(validation.outputCount) outputs)")
+            }
+        }
+
         // FIX #510: Trigger UI refresh for transaction history
         // Without this, history doesn't display after import until app restart
         self.transactionHistoryVersion += 1
