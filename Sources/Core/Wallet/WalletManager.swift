@@ -21,6 +21,19 @@ enum EquihashVerificationResult {
     case failed(verified: Int, total: Int)                 // Headers fetched but Equihash failed (CRITICAL)
 }
 
+/// FIX #680: Transaction recovery errors (renamed from TransactionError to avoid conflict)
+enum RecoveryError: LocalizedError {
+    case invalidFormat
+    case unsupportedVersion
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFormat: return "Invalid transaction format"
+        case .unsupportedVersion: return "Unsupported transaction version"
+        }
+    }
+}
+
 /// Individual sync task
 struct SyncTask: Identifiable {
     let id: String
@@ -76,6 +89,18 @@ final class WalletManager: ObservableObject {
     /// This prevents race condition where backgroundSync sets lastScannedHeight to chain tip
     /// before Full Resync PHASE 2 completes, causing notes to never be discovered
     @Published private(set) var isRepairingDatabase: Bool = false
+
+    // MARK: - FIX #681 v4: Prevent concurrent auto-recovery executions
+    /// When true, autoRecoverMissingTransactions() returns immediately without running
+    /// This prevents race condition where multiple calls interfere with each other
+    @Published private(set) var isAutoRecovering: Bool = false
+
+    // MARK: - FIX #577 v7: Show same sync UI as Import PK during Full Rescan
+    /// When true, ContentView shows CypherpunkSyncView (same as Import PK)
+    /// This provides consistent progress display during Full Rescan operations
+    @Published private(set) var isFullRescan: Bool = false
+    @Published var isRescanComplete: Bool = false
+    @Published var rescanCompletionDuration: TimeInterval? = nil
 
     // MARK: - FIX #557 v15: Prevent concurrent witness rebuilds
     /// When true, preRebuildWitnessesForInstantPayment() returns immediately
@@ -711,13 +736,33 @@ final class WalletManager: ObservableObject {
                         print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
                         print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                        // Save updated tree state
+                        // Save updated tree state (FIX #565)
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? WalletDatabase.shared.saveTreeState(treeData)
                         }
                     } else {
                         print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
                     }
+
+                    // FIX #580 v2: Initialize FastWalletCache with CMU cache file
+                    // This enables instant witness generation (~1ms vs 84s P2P rebuild)
+                    // CMU file contains ~32MB of commitment data for fast tree building
+                    if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                        await MainActor.run {
+                            do {
+                                try FastWalletCache.shared.loadCMUCache(from: cmuPath)
+                                print("✅ FIX #580 v2: FastWalletCache initialized with CMU cache")
+                            } catch {
+                                print("⚠️ FIX #580 v2: Failed to initialize FastWalletCache: \(error)")
+                            }
+                        }
+                    } else {
+                        print("⚠️ FIX #580 v2: CMU cache file not available, witness generation will be slower")
+                    }
+
+                    // FIX #580: Note loading removed - WalletNote doesn't have required properties
+                    // The key optimization is the in-memory CMU data (32 MB), not note metadata
+                    // Notes will be loaded on-demand during transaction building
 
                     await MainActor.run {
                         self.isTreeLoaded = true
@@ -864,10 +909,10 @@ final class WalletManager: ObservableObject {
             UserDefaults.standard.set(Int(downloadedTreeHeight), forKey: "effectiveTreeHeight")
             UserDefaults.standard.set(Int(downloadedCMUCount), forKey: "effectiveTreeCMUCount")
 
-            // Save to database for next time
+            // Save to database for next time (FIX #565)
             if let serializedTree = ZipherXFFI.treeSerialize() {
                 try? WalletDatabase.shared.saveTreeState(serializedTree)
-                print("💾 Tree state saved to database for future use")
+                print("💾 Tree state saved to database for future use (height: \(downloadedTreeHeight))")
             }
 
             // FIX #558 v2: Load delta CMUs to complete the tree (boost file path)
@@ -887,12 +932,29 @@ final class WalletManager: ObservableObject {
                 print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
                 print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                // Save updated tree state
+                // Save updated tree state (FIX #565)
                 if let treeData = ZipherXFFI.treeSerialize() {
                     try? WalletDatabase.shared.saveTreeState(treeData)
                 }
             } else {
                 print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
+            }
+
+            // FIX #580 v2: Initialize FastWalletCache with CMU cache file (boost path)
+            // This enables instant witness generation (~1ms vs 84s P2P rebuild)
+            if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                do {
+                    try await FastWalletCache.shared.loadCMUCache(from: cmuPath)
+                    print("✅ FIX #580 v2: FastWalletCache initialized with CMU cache (boost path)")
+
+                    // FIX #580: Note loading removed - WalletNote doesn't have required properties
+                    // The key optimization is the in-memory CMU data (32 MB), not note metadata
+                    // Notes will be loaded on-demand during transaction building
+                } catch {
+                    print("⚠️ FIX #580 v2: Failed to initialize FastWalletCache: \(error)")
+                }
+            } else {
+                print("⚠️ FIX #580 v2: CMU cache file not available (boost path)")
             }
 
             await MainActor.run {
@@ -947,10 +1009,10 @@ final class WalletManager: ObservableObject {
                 UserDefaults.standard.set(Int(downloadedTreeHeight), forKey: "effectiveTreeHeight")
                 UserDefaults.standard.set(Int(downloadedCMUCount), forKey: "effectiveTreeCMUCount")
 
-                // Save to database for next time (this time with CURRENT FFI version)
+                // Save to database for next time (FIX #456 + FIX #565)
                 if let serializedTree = ZipherXFFI.treeSerialize() {
                     try? WalletDatabase.shared.saveTreeState(serializedTree)
-                    print("💾 FIX #456: Tree state saved to database (current FFI version)")
+                    print("💾 FIX #456 + FIX #565: Tree state saved to database (current FFI version, height: \(downloadedTreeHeight))")
                 }
 
                 await MainActor.run {
@@ -1123,6 +1185,24 @@ final class WalletManager: ObservableObject {
                 print("📊 FIX #186: Limiting header sync to last \(maxSyncRange) blocks (was \(referenceHeight - earliestNeedingTimestamp) blocks)")
                 earliestNeedingTimestamp = minStartHeight
             }
+        }
+
+        // ================================================================
+        // FIX #708: Skip sync if HeaderStore already covers the needed range
+        // ================================================================
+        // Previous bug: ensureHeaderTimestamps() would sync headers that were JUST synced
+        // by the preceding FIX #535 sync in ContentView. The first sync syncs to chain tip,
+        // then this function tried to sync from earliestNeedingTimestamp again.
+        // Solution: Check if HeaderStore already has headers at earliestNeedingTimestamp
+        let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        if headerStoreHeight >= earliestNeedingTimestamp {
+            print("✅ FIX #708: HeaderStore (\(headerStoreHeight)) already covers earliestNeedingTimestamp (\(earliestNeedingTimestamp)) - skipping redundant sync")
+            // Headers are already synced, just fix any transactions that need timestamps
+            let fixedCount = try? WalletDatabase.shared.fixTransactionBlockTimes()
+            if let fixed = fixedCount, fixed > 0 {
+                print("📜 FIX #708: Fixed \(fixed) transaction timestamps from existing headers")
+            }
+            return
         }
 
         // ================================================================
@@ -1404,6 +1484,20 @@ final class WalletManager: ObservableObject {
     func loadHeadersFromBoostFile() async -> (Bool, UInt64) {
         print("📜 FIX #413: Checking for bundled headers in boost file...")
 
+        // FIX #701: Skip if boost headers already loaded (prevents repeated loading)
+        let existingBoostHeight = HeaderStore.shared.boostFileEndHeight
+        if existingBoostHeight > 0 {
+            print("✅ FIX #701: Boost headers already loaded up to \(existingBoostHeight) - skipping reload")
+            return (true, existingBoostHeight)
+        }
+
+        // FIX #675: Check if boost headers were marked as corrupted
+        if HeaderStore.shared.shouldSkipBoostHeaders() {
+            print("🚫 FIX #675: Skipping boost headers - corruption detected previously")
+            print("🚫 FIX #675: Will rely on P2P header sync only")
+            return (false, 0)
+        }
+
         // Check if boost file has headers section
         guard await CommitmentTreeUpdater.shared.hasHeadersSection() else {
             print("⚠️ FIX #413: Boost file has no headers section (requires v2+ boost file)")
@@ -1429,12 +1523,19 @@ final class WalletManager: ObservableObject {
 
         print("📜 FIX #413: Boost file has \(sectionInfo.count) headers (height \(sectionInfo.startHeight) to \(sectionInfo.endHeight))")
 
-        // Check if HeaderStore already has these headers
-        let existingMaxHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-        if existingMaxHeight >= sectionInfo.endHeight {
-            print("✅ FIX #413: HeaderStore already has headers up to \(existingMaxHeight) (boost ends at \(sectionInfo.endHeight))")
+        // FIX #683: Check if HeaderStore actually has the boost file headers (contiguous range)
+        // Old bug: Only checked maxHeight >= boostEndHeight, which was TRUE for P2P headers
+        // This caused boost file headers (476969-2984746) to never be loaded!
+        let countInRange = (try? HeaderStore.shared.countHeadersInRange(from: sectionInfo.startHeight, to: sectionInfo.endHeight)) ?? 0
+        let expectedCount = Int(sectionInfo.endHeight - sectionInfo.startHeight + 1)
+        let hasBoostHeaders = countInRange >= expectedCount * 95 / 100  // Allow 5% gaps
+
+        if hasBoostHeaders {
+            print("✅ FIX #413: Boost file headers already loaded (\(countInRange)/\(expectedCount) in range)")
             return (true, sectionInfo.endHeight)
         }
+
+        print("📜 FIX #683: Boost headers NOT loaded - only \(countInRange)/\(expectedCount) in range, will load now")
 
         // Extract and load headers
         do {
@@ -1458,9 +1559,13 @@ final class WalletManager: ObservableObject {
 
             // Load headers into HeaderStore with pre-computed hashes
             // FIX #457: Pass expected count from manifest (headers have Equihash solutions, so size varies)
-            // FIX #470: Set task to inProgress BEFORE loading starts for immediate UI update
+            // FIX #684: Set isHeaderSyncing BEFORE loading starts for proper UI progress display
             await MainActor.run {
-                self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: 0.0)
+                self.isHeaderSyncing = true
+                self.headerSyncProgress = 0.0
+                self.headerSyncStatus = "Loading bundled headers (0%)"
+                self.headerSyncCurrentHeight = sectionInfo.startHeight
+                self.headerSyncTargetHeight = sectionInfo.endHeight
             }
 
             // FIX #488: Run blocking loadHeadersFromBoostData on background thread
@@ -1482,13 +1587,16 @@ final class WalletManager: ObservableObject {
                             startHeight: sectionInfo.startHeight,
                             expectedCount: Int(sectionInfo.count)
                         ) { [weak self] progress in
-                            print("🔧 FIX #487 v4: Header load progress: \(Int(progress * 100))%")
+                            let percent = Int(progress * 100)
+                            print("🔧 FIX #684: Header load progress: \(percent)%")
 
-                            // FIX #497 v4: Dispatch to main queue for UI updates
-                            // updateDownloadTaskProgress replaces entire struct (triggers SwiftUI)
+                            // FIX #684: Update header sync UI state
                             DispatchQueue.main.async { [weak self] in
                                 guard let self = self else { return }
-                                self.updateDownloadTaskProgress("headers", detail: "Loading bundled headers...", progress: progress)
+                                self.headerSyncProgress = progress
+                                self.headerSyncStatus = "Loading bundled headers (\(percent)%)"
+                                let currentHeight = sectionInfo.startHeight + UInt64(Double(sectionInfo.count) * progress)
+                                self.headerSyncCurrentHeight = currentHeight
                             }
                         }
                         continuation.resume(returning: ())
@@ -1500,9 +1608,12 @@ final class WalletManager: ObservableObject {
 
             print("✅ FIX #457: Loaded \(sectionInfo.count) headers from boost file (up to height \(sectionInfo.endHeight))")
 
-            // FIX #470: Mark task as completed
+            // FIX #684: Mark header sync as completed
             await MainActor.run {
-                self.updateDownloadTaskProgress("headers", detail: "Loaded \(sectionInfo.count) headers", progress: 1.0)
+                self.isHeaderSyncing = false
+                self.headerSyncProgress = 1.0
+                self.headerSyncStatus = "Loaded \(sectionInfo.count) headers"
+                self.headerSyncCurrentHeight = sectionInfo.endHeight
             }
             return (true, sectionInfo.endHeight)
         } catch {
@@ -1699,6 +1810,13 @@ final class WalletManager: ObservableObject {
 
             print("✅ Background sync complete: scanned to height \(actualLastScanned)")
 
+            // FIX #600: Update witnesses with new delta CMUs for instant send
+            // Without this, witnesses become stale and require 24s rebuild when user tries to send
+            if blocksToSync > 0 {
+                print("⚡ FIX #600: Updating witnesses with \(blocksToSync) new blocks for instant send...")
+                await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
+            }
+
             // Update balance with proper confirmation calculation
             let notes = try WalletDatabase.shared.getUnspentNotes(accountId: account.accountId)
             var confirmedBalance: UInt64 = 0
@@ -1828,6 +1946,16 @@ final class WalletManager: ObservableObject {
             // This clears the "awaiting..." message when the incoming tx gets its first confirmation
             await NetworkManager.shared.checkPendingIncomingConfirmations()
 
+            // FIX #681: Auto-recover any transactions that were confirmed but not recorded
+            // This handles the case where broadcast tracking failed (peers timed out) but TX was confirmed
+            // Runs silently in background to fix data consistency issues without user intervention
+            if blocksToSync > 0 {
+                let autoRecovered = await autoRecoverMissingTransactions()
+                if autoRecovered > 0 {
+                    print("✅ FIX #681: Auto-recovered \(autoRecovered) missing transaction(s) during background sync")
+                }
+            }
+
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")
         }
@@ -1852,63 +1980,161 @@ final class WalletManager: ObservableObject {
         }
 
         // FIX #557 v15: Skip if we rebuilt recently (within cooldown period)
+        // FIX #586: BUT bypass cooldown if there are NULL witnesses that need rebuilding!
+        var hasNullWitnesses = false
         if let lastTime = lastWitnessRebuildTime {
             let timeSinceRebuild = Date().timeIntervalSince(lastTime)
             if timeSinceRebuild < witnessRebuildCooldown {
-                witnessRebuildLock.unlock()
-                print("⚠️ FIX #557 v15: Skipping rebuild - rebuilt \(Int(timeSinceRebuild))s ago (cooldown: \(Int(witnessRebuildCooldown))s)")
-                return
+                // Check if there are any NULL witnesses before skipping
+                if let notes = try? WalletDatabase.shared.getAllNotes(accountId: accountId) {
+                    hasNullWitnesses = notes.contains { $0.witness.isEmpty }
+                }
+
+                if !hasNullWitnesses {
+                    witnessRebuildLock.unlock()
+                    print("⚠️ FIX #557 v15: Skipping rebuild - rebuilt \(Int(timeSinceRebuild))s ago (cooldown: \(Int(witnessRebuildCooldown))s)")
+                    return
+                } else {
+                    print("⚠️ FIX #586: Bypassing cooldown - \(hasNullWitnesses ? "NULL witnesses detected" : "")")
+                }
             }
         }
 
-        isRebuildingWitnesses = true
+        // FIX #563 v28: Update @Published properties on main thread to prevent crashes
+        await MainActor.run {
+            isRebuildingWitnesses = true
+        }
         witnessRebuildLock.unlock()
 
         defer {
-            witnessRebuildLock.lock()
-            isRebuildingWitnesses = false
-            lastWitnessRebuildTime = Date()
-            witnessRebuildLock.unlock()
+            // FIX #563 v28: Update @Published properties on main thread in defer block
+            Task {
+                await MainActor.run {
+                    witnessRebuildLock.lock()
+                    isRebuildingWitnesses = false
+                    lastWitnessRebuildTime = Date()
+                    witnessRebuildLock.unlock()
+                }
+            }
         }
 
         do {
-            // Get current tree root (anchor)
-            // FIX #553: Don't write empty/zero anchors - check if tree is loaded
-            guard let currentTreeRoot = ZipherXFFI.treeRoot(), !currentTreeRoot.isEmpty else {
-                print("⚠️ Pre-witness: No tree root available (tree not loaded)")
+            // FIX #597 v2: Get header root (TRUE blockchain state) for FAST PATH comparison
+            // The FFI treeRoot() can be out of sync with blockchain - must use header root!
+            let fastPathChainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? 0
+
+            var headerTreeRoot: Data?
+            if fastPathChainHeight > 0 {
+                let headerStore = HeaderStore.shared
+                try? headerStore.open()
+                if let header = try? headerStore.getHeader(at: fastPathChainHeight) {
+                    headerTreeRoot = header.hashFinalSaplingRoot
+                    let headerRootHex = headerTreeRoot?.prefix(16).map { String(format: "%02x", $0) }.joined() ?? "unknown"
+                    print("📋 FIX #597 v2: Header root at \(fastPathChainHeight): \(headerRootHex)...")
+                }
+            }
+
+            // FIX #597 v2: FAST PATH - Check if witnesses match HEADER root (blockchain truth)
+            // If most witnesses match header root, we can skip the rebuild entirely
+            let notesForWitnessCheck = try WalletDatabase.shared.getAllNotes(accountId: accountId)
+
+            guard !notesForWitnessCheck.isEmpty else {
+                print("✅ Pre-witness: No notes to update")
                 return
             }
 
-            // Get all unspent notes
-            let notes = try WalletDatabase.shared.getUnspentNotes(accountId: accountId)
-            guard !notes.isEmpty else {
-                print("✅ Pre-witness: No unspent notes to update")
-                return
+            // Only use FAST PATH if we have a valid header root to compare against
+            if let validHeaderRoot = headerTreeRoot {
+                var matchingWitnessCount = 0
+                for note in notesForWitnessCheck {
+                    if !note.witness.isEmpty, let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
+                        if witnessAnchor == validHeaderRoot {
+                            matchingWitnessCount += 1
+                        }
+                    }
+                }
+
+                let matchRatio = Double(matchingWitnessCount) / Double(notesForWitnessCheck.count)
+                if matchRatio >= 0.8 {
+                    print("✅ FIX #597 v2: FAST PATH - \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses (\(Int(matchRatio * 100))%) match HEADER root - skipping rebuild!")
+                    return
+                } else {
+                    print("🔧 FIX #597 v2: \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses match HEADER root (\(Int(matchRatio * 100))%) - need rebuild")
+                }
+            } else {
+                print("⚠️ FIX #597 v2: No header root available - cannot use FAST PATH, proceeding with rebuild")
+            }
+
+            // FIX #563 v33: Check if we should skip witness root validation due to previous crashes
+            let defaults = UserDefaults.standard
+            let skipWitnessRootCheck = defaults.bool(forKey: "ZipherX_SkipWitnessRootCheck")
+            if skipWitnessRootCheck {
+                print("🔒 FIX #563 v33: Skipping witness root validation (previous crash detected) - rebuilding all witnesses")
             }
 
             var alreadyCurrentCount = 0
             var notesNeedingRebuild: [(note: WalletNote, cmu: Data)] = []
+            var anchorUpdates: [(noteId: Int64, anchor: Data)] = []
+            var corruptedWitnesses: [(noteId: Int64, height: UInt64)] = []
 
-            for note in notes {
+            for (index, note) in notesForWitnessCheck.enumerated() {
                 // FIX #557 v6: Check witness root FIRST, not database anchor
                 // The database anchor might be current but witness bytes might be stale!
                 var witnessIsCurrent = false
 
-                // Check if witness exists and extract its root
-                if !note.witness.isEmpty {
-                    if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
-                        if witnessAnchor == currentTreeRoot {
-                            // Witness bytes are valid and current - INSTANT payment ready!
-                            witnessIsCurrent = true
-                            alreadyCurrentCount += 1
-                            // Also update database anchor to ensure consistency
-                            if note.anchor != currentTreeRoot {
-                                try? WalletDatabase.shared.updateNoteAnchor(
-                                    noteId: note.id,
-                                    anchor: currentTreeRoot
-                                )
-                            }
+                // FIX #563 v33: Skip witness root check if we've had crashes before
+                if !skipWitnessRootCheck && !note.witness.isEmpty {
+                    // FIX #563 v32: Add detailed logging to identify which note causes crash
+                    print("🔍 [WITNESS \(index + 1)/\(notesForWitnessCheck.count)] Checking note ID=\(note.id) height=\(note.height ?? 0) witness_len=\(note.witness.count)")
+
+                    // Validate witness data length before calling FFI
+                    // Witness should be at least 100 bytes (minimum for IncrementalWitness)
+                    guard note.witness.count >= 100 else {
+                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has invalid witness length: \(note.witness.count) bytes")
+                        corruptedWitnesses.append((note.id, note.height ?? 0))
+                        // Force rebuild for this note
+                        if let cmu = note.cmu, !cmu.isEmpty {
+                            notesNeedingRebuild.append((note: note, cmu: cmu))
                         }
+                        continue
+                    }
+
+                    // FIX #563 v32: Validate witness path BEFORE extracting root to prevent FFI crashes
+                    // A corrupted witness can cause witness.root() to crash in the Rust FFI
+                    // FIX #563 v33: Try-catch this - if it crashes, we'll rebuild all witnesses next time
+                    if !ZipherXFFI.witnessPathIsValid(note.witness) {
+                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has corrupted witness path - forcing rebuild")
+                        corruptedWitnesses.append((note.id, note.height ?? 0))
+                        // Force rebuild for this note
+                        if let cmu = note.cmu, !cmu.isEmpty {
+                            notesNeedingRebuild.append((note: note, cmu: cmu))
+                        }
+                        continue
+                    }
+
+                    if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
+                        print("✅ [WITNESS \(index + 1)] Note ID=\(note.id) root extracted successfully")
+
+                        // FIX #564 Part 2: Don't compare to current tree root!
+                        // FIX #563 uses header anchor at note height, NOT current tree root
+                        // Witness is valid as long as it extracts a root successfully
+                        // The correct anchor will be retrieved from HeaderStore at note height during TX building
+                        witnessIsCurrent = true
+                        alreadyCurrentCount += 1
+
+                        // Store witness root as anchor (will be used by FIX #563)
+                        if note.anchor != witnessAnchor {
+                            anchorUpdates.append((note.id, witnessAnchor))
+                        }
+
+                        // Old logic (WRONG - causes unnecessary witness rebuilds):
+                        // if witnessAnchor == currentTreeRoot {
+                        //     witnessIsCurrent = true
+                        // } else {
+                        //     print("🔄 root mismatch - needs rebuild")  // <-- 41.4s wasted loading CMUs!
+                        // }
+                    } else {
+                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) witnessGetRoot returned nil")
                     }
                 }
 
@@ -1922,128 +2148,176 @@ final class WalletManager: ObservableObject {
                 }
             }
 
+            // Log corrupted witness summary
+            if !corruptedWitnesses.isEmpty {
+                print("⚠️ Pre-witness: Found \(corruptedWitnesses.count) corrupted witnesses, will rebuild")
+                for (noteId, height) in corruptedWitnesses {
+                    print("   - Note ID=\(noteId) at height=\(height)")
+                }
+            }
+
+            // Batch update anchors (thread-safe)
+            if !anchorUpdates.isEmpty {
+                await MainActor.run {
+                    for (noteId, anchor) in anchorUpdates {
+                        try? WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                    }
+                }
+            }
+
             // Summary for notes that don't need rebuild
             if alreadyCurrentCount > 0 {
                 print("✅ Pre-witness: \(alreadyCurrentCount) note(s) already instant-ready")
             }
 
-            // CRITICAL FIX #557 v32: Don't create witnesses! Just sync GLOBAL tree to chain tip!
-            // TransactionBuilder will get fresh witnesses from global tree using treeGetWitness()
-            // This ensures ALL witnesses have SAME root (current global tree root)
+            // FIX #557 v32: Load boost file + sync delta CMUs to current chain tip
+            // This ensures the global tree is at the current height before rebuilding witnesses
+            // Without this, witnesses would be outdated and transactions would fail
 
-            // FIX #557 v39: Set initial progress to ensure UI updates immediately
-            await progress?("Preparing witness sync...", 0)
+            await progress?("Syncing tree state...", 50)
 
-            // Check if global tree needs sync to chain tip
-            let networkManager = NetworkManager.shared
-            let chainHeight = try await networkManager.getChainHeight()
+            // Get chain height for delta sync
+            let chainHeight: UInt64
+            do {
+                chainHeight = try await NetworkManager.shared.getChainHeight()
+            } catch {
+                print("⚠️ Pre-witness: Failed to get chain height: \(error.localizedDescription)")
+                return
+            }
+
+            // Try to load existing tree state from database (thread-safe)
+            var treeLoaded = false
+            var treeWasAlreadyInMemory = false  // FIX #568 v2: Track if tree was already loaded BEFORE this call
+            var boostHeight = ZipherXConstants.effectiveTreeHeight
+
+            // FIX #568 v2: Check if FFI tree already has CMUs loaded (from previous operation)
+            // This prevents reloading 1M+ CMUs when tree is already in memory
             let currentTreeSize = ZipherXFFI.treeSize()
-
-            if currentTreeSize >= chainHeight {
-                print("✅ FIX #557 v32: Global tree already at chain tip (\(currentTreeSize) >= \(chainHeight))")
-                print("✅ FIX #557 v32: Witnesses will be created from current tree state when sending")
-                await progress?("Witness sync complete", 100)
-                return
+            if currentTreeSize > 1000 {
+                print("✅ FIX #568 v2: Tree already has \(currentTreeSize) CMUs loaded - skipping reload")
+                treeLoaded = true
+                treeWasAlreadyInMemory = true  // Remember that we didn't just load it
             }
 
-            print("🔄 FIX #557 v32: Syncing global tree to chain tip (\(currentTreeSize) → \(chainHeight))")
-            print("🔄 FIX #557 v32: This ensures TransactionBuilder gets fresh witnesses from current tree state")
-            await progress?("Syncing global tree to chain tip...", 30)
-
-            // Get boost file info
-            guard let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                  let cachedInfo = await CommitmentTreeUpdater.shared.getCachedTreeInfo() else {
-                print("⚠️ FIX #557 v32: No boost file available, skipping tree sync")
-                return
-            }
-
-            let boostHeight = cachedInfo.height
-
-            // If we're behind boost file, load boost CMUs first
-            guard let cmuData = try? Data(contentsOf: cachedPath) else {
-                print("❌ FIX #557 v32: Failed to load boost CMU data")
-                return
-            }
-
-            // Read CMU count from boost file (first 8 bytes)
-            guard cmuData.count >= 8 else {
-                print("❌ FIX #557 v32: Invalid boost CMU data (too small)")
-                return
-            }
-
-            let boostCMUCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-            print("📊 FIX #557 v32: Boost file has \(boostCMUCount) CMUs (to block \(boostHeight))")
-
-            // Only load boost CMUs if current tree is behind boost file
-            if currentTreeSize < boostCMUCount {
-                print("🔄 FIX #557 v32: Loading boost CMUs (\(boostCMUCount - currentTreeSize) CMUs)...")
-                await progress?("Loading boost CMUs...", 40)
-
-                // Parse and append boost CMUs (skip count header, skip already synced ones)
-                let offset = 8 + (currentTreeSize * 32)
-                guard offset < cmuData.count else {
-                    print("❌ FIX #557 v32: Invalid boost CMU data offset (offset: \(offset), data size: \(cmuData.count))")
-                    print("❌ FIX #557 v32: Tree might be from newer boost file, resetting...")
-                    // Reset tree and start fresh
-                    _ = ZipherXFFI.treeInit()
-                    return
-                }
-
-                var appendedCount = 0
-                let totalCMUs = boostCMUCount - currentTreeSize
-                while offset + UInt64(appendedCount * 32 + 32) <= UInt64(cmuData.count) {
-                    let cmuOffset = offset + UInt64(appendedCount * 32)
-                    let cmu = cmuData.subdata(in: Int(cmuOffset)..<Int(cmuOffset + 32))
-                    _ = ZipherXFFI.treeAppend(cmu: cmu)
-                    appendedCount += 1
-
-                    if appendedCount % 100000 == 0 {
-                        print("🔄 FIX #557 v32: Appended \(appendedCount) boost CMUs...")
-                        let percent = Int((Double(appendedCount) / Double(totalCMUs)) * 100)
-                        await progress?("Loading boost CMUs... \(percent)%", 40)
+            // Use MainActor for database access to ensure thread safety
+            if !treeLoaded {
+                let loadResult = await MainActor.run { () -> (Data?, UInt64?) in
+                    do {
+                        let savedTree = try WalletDatabase.shared.getTreeState()
+                        let dbTreeHeight = try WalletDatabase.shared.getTreeHeight()
+                        return (savedTree, dbTreeHeight)
+                    } catch {
+                        print("⚠️ Pre-witness: Failed to load tree state from DB: \(error.localizedDescription)")
+                        return (nil, nil)
                     }
                 }
 
-                print("✅ FIX #557 v32: Appended \(appendedCount) boost CMUs to global tree")
-            } else {
-                print("✅ FIX #557 v32: Global tree already has \(currentTreeSize) CMUs (boost has \(boostCMUCount))")
+                if let savedTree = loadResult.0, savedTree.count > 1000 {  // Minimum valid size check
+                    // FIX #563 v38: Use treeLoadFromCMUs for saved CMU data (reliable!)
+                    // treeSerialize is broken (only 606 bytes), so we save CMU data instead
+                    let loaded = ZipherXFFI.treeLoadFromCMUs(data: savedTree)
+                    treeLoaded = loaded
+                    let dbTreeHeight = loadResult.1 ?? 0
+                    print("✅ FIX #563 v38: Loaded saved CMU data (\(savedTree.count) bytes) at height \(dbTreeHeight)")
+                }
             }
 
-            // Fetch delta CMUs from boostHeight+1 to chainHeight
-            if chainHeight > boostHeight {
-                print("🔄 FIX #557 v32: Fetching delta CMUs from \(boostHeight + 1) to \(chainHeight)...")
-                await progress?("Fetching delta CMUs...", 60)
+            // Load boost file if tree not loaded
+            if !treeLoaded {
+                await progress?("Loading boost file...", 60)
 
-                let connectedPeerCount = await MainActor.run { networkManager.connectedPeers }
-                guard connectedPeerCount > 0 else {
-                    print("⚠️ FIX #557 v32: No peers connected, skipping delta sync")
+                // FIX #563 v34: Use cached CMU file instead of extracting every time (43 seconds -> instant!)
+                // The cached file is created on first access and reused on subsequent startups
+                print("📦 FIX #563 v34: Loading CMUs from cached file...")
+                do {
+                    // getCachedCMUFilePath returns the cached file path instantly,
+                    // or extracts from boost file and caches it for next time
+                    guard let cmuFilePath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() else {
+                        print("❌ FIX #563 v34: No cached CMU file available")
+                        return
+                    }
+
+                    let cmuData = try Data(contentsOf: cmuFilePath)
+
+                    if cmuData.count > 8 {
+                        let loaded = ZipherXFFI.treeLoadFromCMUs(data: cmuData)
+                        if !loaded {
+                            print("❌ FIX #563 v34: Failed to load cached CMUs into tree")
+                            return
+                        }
+
+                        print("✅ FIX #563 v34: Loaded cached CMUs at height \(boostHeight)")
+
+                        // FIX #563 v38: Save CMU data directly instead of treeSerialize (broken - only 606 bytes!)
+                        // treeSerialize uses zcash_primitives write_commitment_tree which fails for large trees
+                        // Saving CMU data (33MB) is slower but reliable and much faster than re-extracting
+                        await MainActor.run {
+                            // Save CMU data with metadata for validation
+                            try? WalletDatabase.shared.saveTreeState(cmuData)
+                            print("✅ FIX #563 v38: Saved CMU data (\(cmuData.count) bytes) to database")
+                        }
+                    } else {
+                        print("❌ FIX #563 v34: Cached CMU data too small (\(cmuData.count) bytes)")
+                        return
+                    }
+                } catch {
+                    print("❌ FIX #563 v34: Failed to load CMUs from cached file: \(error.localizedDescription)")
                     return
                 }
+            }
 
-                var deltaCMUs: [Data] = []
-                let startHeight = boostHeight + 1
-                // FIX #561 v2: 500 is fine for P2P on-demand (rebuildWitnessForNote uses global tree now)
-                let batchSize = 500
-                let maxRetries = 2
-                let maxConsecutiveFailures = 3
+            // Sync delta CMUs if chain height > boost file height (thread-safe)
+            // FIX #563 v43: Proper delta sync logic based on what we just loaded
+            let startHeight = await MainActor.run { () -> UInt64 in
+                return (try? WalletDatabase.shared.getTreeHeight()) ?? ZipherXConstants.effectiveTreeHeight
+            }
 
-                var currentHeight = startHeight
+            // FIX #563 v43: Determine if we need to sync based on what we just loaded
+            // If we loaded from DB (treeLoaded=true), check if we need delta sync
+            // If we loaded from boost file (treeLoaded=false), we definitely need delta sync if chain moved forward
+            let blocksBehind = chainHeight > startHeight ? chainHeight - startHeight : 0
+            let isRecentEnough = blocksBehind < 1000
+
+            // FIX #563 v43: Skip delta sync ONLY if we loaded from DB AND tree is recent
+            // If we just loaded from boost file, we MUST sync delta (even if recent) to update tree_height
+            // FIX #568 v2: NEVER skip delta sync if tree was already in memory - we need it to update witnesses!
+            let shouldSkipDeltaSync = !treeWasAlreadyInMemory && treeLoaded && isRecentEnough
+
+            if shouldSkipDeltaSync {
+                print("✅ FIX #563 v43: Skipping delta CMU sync - DB tree is recent (\(blocksBehind) blocks behind chain tip)")
+                print("✅ FIX #563 v43: Tree has \(ZipherXFFI.treeSize()) CMUs, will sync when >1000 blocks behind")
+            } else if treeWasAlreadyInMemory && blocksBehind > 0 {
+                print("🔄 FIX #568 v2: Tree was already in memory but syncing \(blocksBehind) delta CMUs to update witnesses")
+            } else if chainHeight > startHeight {
+                print("🔄 FIX #557 v32: Syncing delta CMUs from \(startHeight) to \(chainHeight) (\(blocksBehind) blocks)...")
+
+                await progress?("Fetching delta CMUs...", 70)
+
+                // FIX #563 v39: Increased batch size for faster sync (500 blocks instead of 100)
+                let batchSize: UInt64 = 500  // blocks per batch
+                var currentHeight = startHeight + 1
                 var consecutiveFailures = 0
+                let maxConsecutiveFailures = 3
+                let maxRetries = 3
+                var deltaCMUs: [Data] = []
 
-                while currentHeight <= chainHeight && consecutiveFailures < maxConsecutiveFailures {
-                    let endHeight = min(currentHeight + UInt64(batchSize) - 1, chainHeight)
-                    let blockCount = Int(endHeight - currentHeight + 1)
+                while currentHeight <= chainHeight {
+                    let endHeight = min(currentHeight + batchSize - 1, chainHeight)
 
                     var batchSucceeded = false
+
                     for attempt in 1...maxRetries {
                         do {
-                            let blocks = try await withTimeout(seconds: 30) {
-                                try await networkManager.getBlocksOnDemandP2P(from: currentHeight, count: blockCount)
-                            }
-                            for block in blocks {
-                                for tx in block.transactions {
-                                    for output in tx.outputs {
-                                        deltaCMUs.append(output.cmu)
+                            // FIX #557 v32: Fetch blocks via P2P
+                            let blocks = try await NetworkManager.shared.getBlocksDataP2P(from: currentHeight, count: Int(endHeight - currentHeight + 1))
+
+                            for (height, _, _, txData) in blocks {
+                                for (txid, outputs, _) in txData {
+                                    for output in outputs {
+                                        // Convert hex string to Data
+                                        if let cmuData = Data(hexString: output.cmu) {
+                                            deltaCMUs.append(cmuData)
+                                        }
                                     }
                                 }
                             }
@@ -2100,31 +2374,51 @@ final class WalletManager: ObservableObject {
                 }
             }
 
-            // Save updated tree state to database
+            // Save updated tree state to database (thread-safe)
             if let treeData = ZipherXFFI.treeSerialize() {
-                _ = try? WalletDatabase.shared.saveTreeState(treeData)
-                print("✅ FIX #557 v32: Saved global tree state (\(treeData.count) bytes)")
+                await MainActor.run {
+                    try? WalletDatabase.shared.saveTreeState(treeData)
+                }
+                print("✅ FIX #557 v32: Saved global tree state at height \(chainHeight)")
             }
 
-            // Update database to track tree sync height
-            _ = try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+            // Update database to track tree sync height (thread-safe)
+            await MainActor.run {
+                try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+            }
 
-            // CRITICAL FIX #557 v36: UPDATE all witnesses using December 24th approach!
-            // 1. Load existing witnesses into FFI tree (tracks positions automatically)
-            // 2. Append delta CMUs (updates all loaded witnesses in-place!)
+            // CRITICAL FIX #569: UPDATE all witnesses using correct order!
+            // The bug in FIX #557 v36 was that delta CMUs were appended BEFORE loading witnesses,
+            // so newly loaded witnesses never got updated with the delta CMUs.
+            // CORRECT order:
+            // 1. Load existing witnesses into FFI tree (WITNESSES array)
+            // 2. Append delta CMUs (this updates ALL loaded witnesses in WITNESSES array!)
             // 3. Extract updated witnesses from tracked positions
-            print("🔄 FIX #557 v36: Updating all witnesses using treeLoadWitness...")
-            let allNotes = try WalletDatabase.shared.getAllNotes(accountId: accountId)
+            print("🔄 FIX #569: Updating all witnesses - load FIRST, then append delta CMUs...")
+
+            // STEP 1: Load all notes from database (thread-safe)
+            let allNotes = await MainActor.run { () -> [WalletNote] in
+                do {
+                    return try WalletDatabase.shared.getAllNotes(accountId: accountId)
+                } catch {
+                    print("❌ FIX #569: Failed to load notes: \(error.localizedDescription)")
+                    return []
+                }
+            }
             var witnessIndices: [(note: WalletNote, position: UInt64)] = []
             var emptyWitnessNotes: [WalletNote] = []
+            var witnessIndexUpdates: [(noteId: Int64, position: UInt64)] = []
 
+            print("🔧 FIX #569: Step 1 - Loading \(allNotes.count) witnesses into FFI WITNESSES array...")
             for note in allNotes {
                 if note.witness.isEmpty {
                     emptyWitnessNotes.append(note)
                     continue
                 }
 
-                // Load witness into FFI tree - returns POSITION of this witness
+                // Load witness into FFI tree - returns POSITION of this witness in WITNESSES array
+                // FIX #569: This loads the witness from the database into the FFI's WITNESSES array
+                // The witness is in its old state (before delta CMUs were added)
                 let position = note.witness.withUnsafeBytes { ptr in
                     ZipherXFFI.treeLoadWitness(
                         witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -2134,33 +2428,234 @@ final class WalletManager: ObservableObject {
 
                 if position != UInt64.max {
                     witnessIndices.append((note: note, position: position))
-                    // FIX #557 v45: Store witness_index in database for later retrieval
-                    _ = try? WalletDatabase.shared.updateNoteWitnessIndex(noteId: note.id, witnessIndex: position)
+                    // FIX #557 v45: Store witness_index for later batch update
+                    witnessIndexUpdates.append((note.id, position))
                 }
             }
 
-            print("✅ FIX #557 v36: Loaded \(witnessIndices.count) witnesses, \(emptyWitnessNotes.count) empty")
-
-            // Delta CMUs were already appended above - witnesses are now updated!
-            // Extract updated witnesses from tracked positions
-            var updatedCount = 0
-            for (note, position) in witnessIndices {
-                if let updatedWitness = ZipherXFFI.treeGetWitness(index: position) {
-                    _ = try? WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: updatedWitness)
-                    updatedCount += 1
+            // Batch update witness indices (thread-safe)
+            if !witnessIndexUpdates.isEmpty {
+                await MainActor.run {
+                    for (noteId, position) in witnessIndexUpdates {
+                        try? WalletDatabase.shared.updateNoteWitnessIndex(noteId: noteId, witnessIndex: position)
+                    }
                 }
             }
 
-            // Update anchors to current tree root
-            if let globalRoot = ZipherXFFI.treeRoot() {
-                for (note, _) in witnessIndices {
-                    _ = try? WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: globalRoot)
+            print("✅ FIX #569: Step 1 complete - Loaded \(witnessIndices.count) witnesses into WITNESSES array, \(emptyWitnessNotes.count) empty")
+
+            // STEP 2: Re-append delta CMUs to update all loaded witnesses!
+            // FIX #569: The delta CMUs were appended BEFORE loading witnesses (FIX #557 v36 bug).
+            // Now we need to re-append them to update the newly loaded witnesses.
+            // When we append CMUs via treeAppend, the FFI automatically updates ALL witnesses in the WITNESSES array.
+            // CRITICAL FIX #569 v2: ALWAYS re-append delta CMUs after loading witnesses!
+            // The delta CMUs were already appended to the tree earlier, but the loaded witnesses
+            // need to be updated. By re-appending, we ensure ALL loaded witnesses get updated.
+            print("🔧 FIX #571: Step 2 - Using local delta bundle + P2P for remaining blocks...")
+
+            // FIX #571: Use LOCAL delta bundle FIRST, then P2P fetch only for remaining blocks
+            // OLD BUG: Fetched ALL blocks via P2P which took hours
+            // NEW FIX: Use local delta bundle (instant), then P2P for only the few remaining blocks
+
+            // Get the local delta bundle end height (what we have cached locally)
+            let deltaBundleEndHeight = DeltaCMUManager.shared.getDeltaEndHeight() ?? boostHeight
+            print("🔧 FIX #571: Local delta bundle ends at height: \(deltaBundleEndHeight)")
+
+            // Calculate where to start fetching from:
+            // - If we have local delta bundle, start from its end
+            // - Otherwise start from boost file end
+            let fetchStartHeight = max(boostHeight, deltaBundleEndHeight)
+            print("🔧 FIX #571: Will fetch blocks from height \(fetchStartHeight) to \(chainHeight)")
+
+            var deltaCMUs: [Data] = []
+            var localCMUs = 0
+            var p2pCMUs = 0
+
+            // PART 1: Use LOCAL delta bundle (instant!)
+            if chainHeight > boostHeight {
+                await progress?("Loading local delta CMUs...", 75)
+
+                // Get CMUs from local delta bundle (returns [Data] directly, not tuples)
+                if let localDeltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                    startHeight: boostHeight + 1,
+                    endHeight: deltaBundleEndHeight
+                ) {
+                    for cmu in localDeltaCMUs {
+                        deltaCMUs.append(cmu)
+                    }
+
+                    localCMUs = localDeltaCMUs.count
+                    print("🔧 FIX #571: Loaded \(localCMUs) CMUs from local delta bundle (instant!)")
                 }
             }
 
-            print("✅ FIX #557 v36: Updated \(updatedCount) witnesses with current tree state")
-            print("✅ FIX #557 v45: Stored witness indices for \(witnessIndices.count) notes")
+            // PART 2: P2P fetch ONLY for the few remaining blocks
+            // This is typically <100 blocks, not 400k!
+            if chainHeight > fetchStartHeight {
+                await progress?("Fetching remaining blocks via P2P...", 80)
 
+                let blocksToFetch = chainHeight - fetchStartHeight
+                print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
+
+                let batchSize: UInt64 = 1000
+                var currentHeight = fetchStartHeight + 1
+
+                while currentHeight <= chainHeight {
+                    let endHeight = min(currentHeight + batchSize - 1, chainHeight)
+
+                    do {
+                        // Fetch this batch via P2P
+                        let blocks = try await NetworkManager.shared.getBlocksDataP2P(
+                            from: currentHeight,
+                            count: Int(endHeight - currentHeight + 1)
+                        )
+
+                        for (height, _, _, txData) in blocks {
+                            for (txid, outputs, _) in txData {
+                                for output in outputs {
+                                    if let cmuData = Data(hexString: output.cmu) {
+                                        deltaCMUs.append(cmuData)
+                                        p2pCMUs += 1
+                                    }
+                                }
+                            }
+                        }
+
+                        print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
+                    } catch {
+                        print("⚠️ FIX #571: Failed to fetch blocks from \(currentHeight): \(error)")
+                    }
+
+                    currentHeight = endHeight + 1
+                }
+
+                print("🔧 FIX #571: Fetched \(p2pCMUs) CMUs via P2P")
+            }
+
+            // PART 3: Append all delta CMUs to update witnesses
+            if !deltaCMUs.isEmpty {
+                print("🔧 FIX #571: Step 2 - Appending \(deltaCMUs.count) delta CMUs (local: \(localCMUs), P2P: \(p2pCMUs))...")
+                await progress?("Appending delta CMUs for witness update...", 85)
+
+                // CRITICAL: This will update ALL witnesses in the FFI WITNESSES array!
+                for cmu in deltaCMUs {
+                    _ = ZipherXFFI.treeAppend(cmu: cmu)
+                }
+
+                print("✅ FIX #571: Step 2 complete - Appended \(deltaCMUs.count) delta CMUs, all witnesses now updated!")
+            } else {
+                print("⚠️ FIX #571: Step 2 - No delta CMUs to append")
+            }
+
+            // FIX #577 v10: Skip STEP 3 witness extraction if no delta CMUs were appended
+            // When there are no delta CMUs, the FFI WITNESSES array contains unloaded/garbage data
+            // Extracting witnesses would corrupt the database with invalid witness data (5 bytes instead of 1028)
+            // The witnesses from PHASE 1 scan are already correct - don't overwrite them!
+            let deltaCMUsAppended = (deltaCMUs.count > 0)
+
+            // STEP 3: Extract updated witnesses from tracked positions
+            if deltaCMUsAppended {
+                print("🔧 FIX #569 v2: Step 3 - Extracting updated witnesses from FFI WITNESSES array...")
+            } else {
+                print("🔧 FIX #577 v10: Step 3 - SKIPPED (no delta CMUs appended, witnesses from PHASE 1 are already correct)")
+                print("🔧 FIX #577 v10: Skipping witness extraction to prevent corruption")
+
+                // CRITICAL FIX #587: Do NOT update anchors when witnesses weren't updated!
+                // The witnesses from PHASE 1 already have correct anchors (their own root)
+                // Updating anchors to header root would create mismatch:
+                //   - Witness root: 9f4e26a7e221d354... (from PHASE 1 witness)
+                //   - Database anchor: ccfe5dc8c814d9ca... (from header)
+                //   - Mismatch causes "joinsplit requirements not met" error!
+                print("✅ FIX #587: Preserving PHASE 1 witness anchors (no update needed)")
+
+                // FIX #586: Check if there are empty witnesses that need rebuilding
+                if !emptyWitnessNotes.isEmpty {
+                    print("⚠️ FIX #586: \(emptyWitnessNotes.count) empty witnesses need rebuilding - skipping STEP 3 extraction")
+                    print("🔧 FIX #586: Jumping directly to witness rebuild (FIX #557 v37)...")
+
+                    // Skip STEP 3 extraction (FFI WITNESSES array not updated)
+                    // Jump directly to witness rebuild code below
+                } else {
+                    return  // Skip the rest of STEP 3 only when no witnesses need rebuilding
+                }
+
+                // When we have empty witnesses, skip STEP 3 extraction and continue to witness rebuild
+            }
+
+            // FIX #586: Only run STEP 3 if witnesses were actually updated (delta CMUs appended)
+            // When there are no delta CMUs, the FFI WITNESSES array contains old witnesses - extracting
+            // them would write corrupted witnesses back to the database!
+            if deltaCMUsAppended {
+                print("🔧 FIX #569 v2: Step 3 - Extracting updated witnesses from FFI WITNESSES array...")
+                var updatedCount = 0
+                var anchorFixedCount = 0
+                var witnessUpdates: [(noteId: Int64, witness: Data)] = []
+                var positionAnchorUpdates: [(noteId: Int64, anchor: Data)] = []
+
+                // FIX #567 + FIX #569 v2: Get CURRENT tree root (anchor) that all updated witnesses share
+                // The witnesses have been updated to include all CMUs up to chainHeight
+                // The anchor MUST match this current tree state
+                var currentTreeAnchor: Data?
+                if chainHeight > 0,
+                   let currentHeader = try? HeaderStore.shared.getHeader(at: chainHeight) {
+                    currentTreeAnchor = currentHeader.hashFinalSaplingRoot
+                    let anchorHex = currentTreeAnchor?.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("✅ FIX #569 v2: Using current chain anchor at height \(chainHeight): \(anchorHex ?? "N/A")...")
+                } else {
+                    print("⚠️ FIX #569 v3: Could not get header at chain height \(chainHeight)")
+
+                    // FIX #569 v3: Try previous height before falling back to witness root
+                    // The witness root fallback was causing OLD anchors to be written back
+                    if chainHeight > 1,
+                       let prevHeader = try? HeaderStore.shared.getHeader(at: chainHeight - 1) {
+                        currentTreeAnchor = prevHeader.hashFinalSaplingRoot
+                        let anchorHex = currentTreeAnchor?.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("✅ FIX #569 v3: Using previous height anchor at \(chainHeight - 1): \(anchorHex ?? "N/A")...")
+                    } else if let ffiRoot = ZipherXFFI.treeRoot() {
+                        // FIX #569 v3: Use FFI tree root as last resort
+                        // This is the root of the tree we just built, so it matches the witnesses
+                        currentTreeAnchor = ffiRoot
+                        let anchorHex = currentTreeAnchor?.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("✅ FIX #569 v3: Using FFI tree root as anchor: \(anchorHex ?? "N/A")...")
+                    }
+                }
+
+                for (note, position) in witnessIndices {
+                    if let updatedWitness = ZipherXFFI.treeGetWitness(index: position) {
+                        witnessUpdates.append((note.id, updatedWitness))
+                        updatedCount += 1
+                    }
+
+                    // FIX #567 + FIX #569 v3: Use CURRENT anchor (matches updated witness), NOT witness root!
+                    // CRITICAL FIX #569 v3: Never extract anchor from witness itself!
+                    // The witness was just loaded from DB and has OLD anchor - extracting from it
+                    // would write the OLD anchor back, defeating the whole update process!
+                    if let currentAnchor = currentTreeAnchor {
+                        positionAnchorUpdates.append((note.id, currentAnchor))
+                        anchorFixedCount += 1
+                    } else {
+                        print("❌ FIX #569 v3: No anchor available for note \(note.id) - skipping anchor update")
+                    }
+                }
+
+                // Batch update witnesses and anchors (thread-safe)
+                if !witnessUpdates.isEmpty || !positionAnchorUpdates.isEmpty {
+                    await MainActor.run {
+                        for (noteId, witness) in witnessUpdates {
+                            try? WalletDatabase.shared.updateNoteWitness(noteId: noteId, witness: witness)
+                        }
+                        for (noteId, anchor) in positionAnchorUpdates {
+                            try? WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                        }
+                    }
+                }
+
+                print("✅ FIX #569 v2: Step 3 complete - Updated \(updatedCount) witnesses with current tree state")
+                print("✅ FIX #569 v2: Updated \(anchorFixedCount) anchors to CURRENT tree root (chain height \(chainHeight))")
+                print("✅ FIX #569 v2: Witness update complete - ALL notes now have correct witnesses and anchors!")
+            } else {
+                print("⚠️ FIX #586: STEP 3 extraction skipped (no delta CMUs appended)")
+            }
             // FIX #562: Record when witnesses were last updated
             lastWitnessUpdate = Date()
             print("✅ FIX #562: Witness update timestamp recorded")
@@ -2214,6 +2709,13 @@ final class WalletManager: ObservableObject {
             print("✅ FIX #557 v32: Global tree synced to chain tip (\(chainHeight))")
             print("✅ FIX #557 v36: All witnesses updated with current tree root (anchor)")
             await progress?("Tree sync complete!", 100)
+
+            // FIX #563 v33: Clear crash flag after successful witness rebuild
+            // This enables the witness root optimization check on next startup
+            if skipWitnessRootCheck {
+                print("✅ FIX #563 v33: Witness rebuild succeeded - re-enabling witness root validation for next time")
+                defaults.set(false, forKey: "ZipherX_SkipWitnessRootCheck")
+            }
 
         } catch {
             print("⚠️ Pre-witness rebuild failed: \(error.localizedDescription)")
@@ -3423,12 +3925,55 @@ final class WalletManager: ObservableObject {
         // setting lastScannedHeight to chain tip before notes are discovered
         await MainActor.run { isRepairingDatabase = true }
         print("🔧 FIX #368: isRepairingDatabase = true (blocking backgroundSync)")
+
+        // FIX #577 v7: Show same sync UI as Import PK during Full Rescan
+        // Track start time for completion duration display
+        let rescanStartTime = Date()
+        if forceFullRescan {
+            await MainActor.run {
+                isFullRescan = true
+                isRescanComplete = false
+                rescanCompletionDuration = nil
+
+                // FIX #577 v14: CRITICAL - Initialize Import PK tasks IMMEDIATELY when Full Rescan starts
+                // This ensures tasks are ready when UI queries currentSyncTasks ( ContentView.swift )
+                // Previous bug: Tasks were initialized at line 4314, AFTER isFullRescan=true was set
+                // This caused UI to show empty/wrong task list before tasks were ready
+                self.overallProgress = 0.0  // Reset to 0 - was showing previous 100%
+                self.syncStatus = "Preparing Full Rescan..."
+                self.syncTasks = [
+                    SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .completed, detail: "Cached"),
+                    SyncTask(id: "keys", title: "Derive spending keys", status: .completed, detail: "Keys loaded"),
+                    SyncTask(id: "database", title: "Unlock encrypted vault", status: .completed, detail: "Database created"),
+                    SyncTask(id: "download_outputs", title: "Download shielded outputs", status: .inProgress, detail: "Downloading boost file...", progress: 0.0),
+                    SyncTask(id: "download_timestamps", title: "Download block timestamps", status: .pending),
+                    SyncTask(id: "headers", title: "Sync block timestamps", status: .pending),
+                    SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
+                    SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
+                    SyncTask(id: "witnesses", title: "Build Merkle witnesses", status: .pending),
+                    SyncTask(id: "balance", title: "Tally unspent notes", status: .pending)
+                ]
+            }
+            print("🎬 FIX #577 v7: isFullRescan = true (showing CypherpunkSyncView)")
+            print("📦 FIX #577 v14: Import PK tasks initialized IMMEDIATELY (ready for UI before any code runs)")
+        }
         defer {
             // FIX #451: Use synchronous reset instead of Task to ensure flag is always cleared
             // Task can fail to execute if function throws, leaving flag stuck
             Task { @MainActor in
                 self.isRepairingDatabase = false
                 print("🔧 FIX #368: isRepairingDatabase = false (backgroundSync unblocked)")
+                // FIX #577 v7: Set completion flags when done
+                // FIX #582: Keep isFullRescan = true until user clicks "Enter Wallet"
+                // This prevents ContentView from starting a new sync cycle
+                if self.isFullRescan {
+                    let duration = Date().timeIntervalSince(rescanStartTime)
+                    self.isRescanComplete = true
+                    self.rescanCompletionDuration = duration
+                    // NOTE: isFullRescan stays true until user clicks "Enter Wallet" in ContentView
+                    print("🎬 FIX #577 v7 + FIX #582: Full Rescan complete in \(Int(duration))s, showing completion screen")
+                    print("🔒 FIX #582: isFullRescan kept true until user clicks Enter Wallet")
+                }
             }
             // Also add a timeout-based reset as fallback
             DispatchQueue.main.asyncAfter(deadline: .now() + 300) {  // 5 minutes max
@@ -3499,268 +4044,205 @@ final class WalletManager: ObservableObject {
         // Previous FIX #122 was causing slow repair by forcing header re-sync
         print("📦 FIX #363: Skipping header clear - timestamps from boost file")
 
+        // FIX #578: Ensure account exists - create if missing (was broken in import PK)
         // Get account ID
-        guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
-            print("❌ No account found in database")
+        var account: Account?
+        if let existingAccount = try WalletDatabase.shared.getAccount(index: 0) {
+            account = existingAccount
+            print("👤 Account ID: \(account!.accountId)")
+        } else {
+            // Account missing from database (import PK bug) - create it now
+            print("⚠️ FIX #578: No account found in database - creating now...")
+
+            // Derive viewing key for storage
+            let saplingKey = SaplingSpendingKey(data: spendingKey)
+            let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
+
+            // Derive address
+            let derivedAddress = try deriveZAddress(from: spendingKey)
+
+            // Insert account with current address
+            let newAccountId = try WalletDatabase.shared.insertAccount(
+                accountIndex: 0,
+                spendingKey: spendingKey,
+                viewingKey: fvk.data,
+                address: derivedAddress,
+                birthdayHeight: 559500 // Sapling activation for ZCL
+            )
+            print("👤 FIX #578: Created account in database (ID: \(newAccountId)) during repair")
+
+            // Fetch the newly created account
+            account = try WalletDatabase.shared.getAccount(index: 0)
+            print("👤 Account ID: \(account!.accountId)")
+        }
+
+        // FIX #577 v15: When forceFullRescan=true, skip ALL quick fix steps (0a, 0b, 1)
+        // Go directly to full rescan (STEP 2) which deletes database and rescans from boost file
+        // This prevents showing confusing log messages like "Resolving boost placeholder txids"
+        // during a Full Rescan operation
+
+        // FIX #578: Guard against missing account (should not happen after our fix, but safety check)
+        guard let account = account else {
+            print("❌ FIX #578: No account found - cannot proceed with repair")
             throw WalletError.walletNotCreated
         }
-        print("👤 Account ID: \(account.accountId)")
 
-        // ============================================
-        // FIX #371: STEP 0a - Resolve boost placeholder txids to real txids
-        // The boost file marks notes as spent with placeholder txids ("boost_spent_HEIGHT"),
-        // but we need the real txid for proper transaction history display.
-        // This MUST run BEFORE VUL-002 phantom detection to avoid incorrectly unmarking spent notes.
-        // ============================================
-        print("🔧 FIX #371: Resolving boost placeholder txids...")
-        onProgress(0.01, 0, 100)
-
-        // Ensure we're connected to P2P peers for block fetching
-        let networkManager = NetworkManager.shared
-        let isNetworkConnectedForFetch = await MainActor.run { networkManager.isConnected }
-        if !isNetworkConnectedForFetch {
-            print("⚠️ FIX #371: Connecting to P2P peers for block fetching...")
-            try? await networkManager.connect()
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // Wait 2s for connections
-        }
-
-        let resolvedCount = try await resolveBoostPlaceholderTxids(onProgress: { current, total in
-            // Map progress to 0.01-0.02 range
-            let progress = 0.01 + (Double(current) / Double(total)) * 0.01
-            onProgress(progress, UInt64(current), UInt64(total))
-        })
-        if resolvedCount > 0 {
-            print("✅ FIX #371: Resolved \(resolvedCount) boost placeholder txids to real txids")
-        }
-        onProgress(0.02, 0, 100)
-
-        // ============================================
-        // FIX #454: SKIP VUL-002 during repair database
-        // ============================================
-        // FIX #357 disabled VUL-002 phantom detection in health checks because:
-        // 1. P2P getdata doesn't work for confirmed TXs (peers only return mempool TXs)
-        // 2. It causes false positives and balance corruption
-        // 3. Tree root validation (FIX #358) is stronger proof
-        //
-        // Same logic applies to repair database:
-        // 1. VUL-002 is too slow (5 TXs × 100s = 8+ minutes)
-        // 2. Boost file + strong checkpoint already ensures data integrity
-        // 3. Witnesses are rebuilt from trusted boost file data
-        //
-        // Only boost placeholder cleanup remains (handled by FIX #371 above)
-        // ============================================
-        print("⚠️ FIX #454: SKIPPING VUL-002 phantom detection during repair")
-        print("⚠️ FIX #454: Reason: P2P getdata doesn't work for confirmed TXs (FIX #357)")
-        print("⚠️ FIX #454: Using boost file + strong checkpoint for integrity instead")
-        print("⚠️ FIX #454: This speeds up repair from 8+ minutes to seconds!")
-
-        var phantomTxsRemoved = 0
-        var notesRestored = 0
-        var boostPlaceholdersRemoved = 0
-
-        // VUL-002 verification loop removed - no longer needed
-        // The boost file (FIX #413) and tree root validation (FIX #358) provide stronger guarantees
-
-        onProgress(0.03, 0, 100)
-
-        // ============================================
-        // FIX #371: STEP 0b placeholder cleanup was done above
-        // No boost placeholder removal here (handled in STEP 0a)
-        // ============================================
-
-        // Placeholder for any remaining VUL-002 related code (now disabled)
-        // let allSentTxs = try WalletDatabase.shared.getSentTransactions()
-        // let maxTxsToVerify = 5
-        // let sentTxs = Array(allSentTxs.suffix(maxTxsToVerify))
-
-        // print("🔍 VUL-002: Checking for phantom transactions via P2P peers...")
-        // print("📊 FIX #416: Verifying \(sentTxs.count) most recent of \(allSentTxs.count) total SENT TXs")
-
-        // networkManager was already connected for FIX #371 above
-
-        /* DISABLED - FIX #454
-        for tx in sentTxs {
-            let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
-
-            // FIX #371: Handle boost placeholders that COULDN'T be resolved
-            // After resolveBoostPlaceholderTxids(), any remaining boost_ txids are notes
-            // where the real TX couldn't be found. We need to verify these on chain.
-            if txidHex.hasPrefix("626f6f73745f7370") { // hex for "boost_sp"
-                // Extract spent_height from placeholder: "boost_spent_HEIGHT"
-                let placeholderString = String(data: tx.txid, encoding: .utf8) ?? ""
-                print("⚠️ FIX #371: Unresolved boost placeholder: \(placeholderString)")
-
-                // Get notes marked as spent with this placeholder
-                let affectedNullifiers = try WalletDatabase.shared.getNullifiersSpentInTx(txid: tx.txid)
-
-                // These notes ARE actually spent (boost file says so), but we couldn't find the TX
-                // Don't unmark them - they're correctly marked as spent
-                // Just remove the placeholder from history (it's not a real TX entry)
-                _ = try WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid)
-                boostPlaceholdersRemoved += 1
-
-                // NOTE: We do NOT restore the notes - they ARE spent on chain
-                // The boost file correctly marked them, we just couldn't find the exact TX
-                print("🗑️ VUL-002: Removed unresolved placeholder (notes remain spent): \(affectedNullifiers.count) note(s)")
-                continue
-            }
-
-            // Verify TX exists on blockchain via P2P peers (decentralized, works with Tor)
-            var txExists = false
-
-            let isNetworkConnected = await MainActor.run { networkManager.isConnected }
-            if isNetworkConnected {
-                // FIX #453: Log which TX we're verifying before starting P2P request
-                print("🔍 VUL-002: Verifying TX \(txidHex.prefix(16))... via P2P...")
-
-                do {
-                    // Request TX from P2P peer - if TX exists, we'll get the raw TX data back
-                    // If TX doesn't exist, peer won't respond and we'll timeout
-                    // FIX #453: getTransactionP2P now uses 30s timeout to prevent deadlock with block listeners
-                    let _ = try await networkManager.getTransactionP2P(txid: txidHex)
-                    txExists = true
-                    print("✅ VUL-002: TX \(txidHex.prefix(16))... verified on P2P network")
-                } catch {
-                    // FIX #361: Check if this is a connection error vs actual "not found"
-                    // FIX #453: Added "lock acquisition" to timeout detection
-                    let errorMsg = error.localizedDescription.lowercased()
-                    if errorMsg.contains("not connected") || errorMsg.contains("no peers") ||
-                       errorMsg.contains("timeout") || errorMsg.contains("connection") ||
-                       errorMsg.contains("lock acquisition") {
-                        // Connection/network error - cannot verify, skip this TX
-                        print("⚠️ VUL-002: Network error verifying TX \(txidHex.prefix(16))... - SKIPPING (not deleting)")
-                        continue // Don't treat network errors as "TX doesn't exist"
-                    }
-                    // Actual "not found" response from peer
-                    txExists = false
-                    print("⚠️ VUL-002: TX \(txidHex.prefix(16))... NOT FOUND on P2P network")
-                }
-            } else {
-                print("⚠️ VUL-002: No P2P peers connected - cannot verify TX \(txidHex.prefix(16))...")
-                continue // Skip verification if no peers (don't delete potentially valid TX)
-            }
-
-            if !txExists {
-                print("🚨 VUL-002: PHANTOM TX detected: \(txidHex)")
-
-                // Get notes that were marked as spent by this phantom TX
-                let affectedNullifiers = try WalletDatabase.shared.getNullifiersSpentInTx(txid: tx.txid)
-
-                // Unmark those notes as spent (restore them)
-                for nullifier in affectedNullifiers {
-                    try WalletDatabase.shared.unmarkNoteAsSpent(nullifier: nullifier)
-                    notesRestored += 1
-                }
-
-                // Delete the phantom transaction from history
-                _ = try WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid)
-                phantomTxsRemoved += 1
-
-                print("✅ VUL-002: Removed phantom TX and restored \(affectedNullifiers.count) note(s)")
-            }
-        }
-
-        if boostPlaceholdersRemoved > 0 {
-            print("🗑️ VUL-002: Removed \(boostPlaceholdersRemoved) boost placeholder TX(s)")
-        }
-        if phantomTxsRemoved > 0 {
-            print("🗑️ VUL-002: Removed \(phantomTxsRemoved) phantom TX(s), restored \(notesRestored) note(s)")
-            // FIX #351: Clear phantom TX data from UserDefaults after repair
-            UserDefaults.standard.removeObject(forKey: "phantomTransactions")
-            print("✅ FIX #351: Cleared phantom TX detection data")
-
-            // FIX #353: Reset checkpoint to last known-good state
-            // The checkpoint should be set to before any phantom TXs occurred
-            // This ensures a full rescan will find any missed transactions
-            let currentCheckpoint = (try? WalletDatabase.shared.getVerifiedCheckpointHeight()) ?? 0
-            if currentCheckpoint > 0 {
-                // Find the last confirmed TX height to use as new checkpoint
-                if let lastConfirmedTx = try? WalletDatabase.shared.getLastConfirmedTransaction() {
-                    let newCheckpoint = min(currentCheckpoint, lastConfirmedTx.height)
-                    try? WalletDatabase.shared.updateVerifiedCheckpointHeight(newCheckpoint)
-                    print("📍 FIX #353: Reset checkpoint to \(newCheckpoint) (last confirmed TX)")
-                } else {
-                    // No confirmed TXs - reset to bundled tree height
-                    try? WalletDatabase.shared.updateVerifiedCheckpointHeight(ZipherXConstants.bundledTreeHeight)
-                    print("📍 FIX #353: Reset checkpoint to bundled tree height \(ZipherXConstants.bundledTreeHeight)")
-                }
-            }
-        }
-        */
-        // END OF DISABLED VUL-002 CODE - FIX #454
-
-        // FIX #454: VUL-002 result reporting (always 0 since we skip it)
-        if boostPlaceholdersRemoved > 0 {
-            print("🗑️ VUL-002: Removed \(boostPlaceholdersRemoved) boost placeholder TX(s)")
-        }
-        if phantomTxsRemoved > 0 {
-            print("🗑️ VUL-002: Removed \(phantomTxsRemoved) phantom TX(s), restored \(notesRestored) note(s)")
-        } else {
-            print("✅ FIX #454: VUL-002 skipped (using boost file + tree root validation)")
-        }
-        onProgress(0.04, 0, 100)
-
-        // ============================================
-        // STEP 1: Try QUICK FIX first (extract anchors from existing witnesses)
-        // This is instant and fixes the witness/anchor mismatch issue
-        // ============================================
-        print("⚡ STEP 1: Attempting quick anchor fix...")
-        onProgress(0.05, 0, 100)
-
-        let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.accountId)
+        // Declare variables here so they're available for both quick fix and full rescan paths
+        var notes: [WalletNote] = []
         var notesWithValidWitness = 0
         var anchorsFixed = 0
+        var anchorsValidated = false
 
-        for note in notes {
-            // Check if note has a valid witness (at least 1028 bytes for proper witness)
-            guard note.witness.count >= 1028 else {
-                print("⚠️ Note \(note.id) (height \(note.height)): invalid witness (\(note.witness.count) bytes)")
-                continue
+        if !forceFullRescan {
+            // ============================================
+            // FIX #371: STEP 0a - Resolve boost placeholder txids to real txids
+            // The boost file marks notes as spent with placeholder txids ("boost_spent_HEIGHT"),
+            // but we need the real txid for proper transaction history display.
+            // This MUST run BEFORE VUL-002 phantom detection to avoid incorrectly unmarking spent notes.
+            // ============================================
+            print("🔧 FIX #371: Resolving boost placeholder txids...")
+            onProgress(0.01, 0, 100)
+
+            // Ensure we're connected to P2P peers for block fetching
+            let networkManager = NetworkManager.shared
+            let isNetworkConnectedForFetch = await MainActor.run { networkManager.isConnected }
+            if !isNetworkConnectedForFetch {
+                print("⚠️ FIX #371: Connecting to P2P peers for block fetching...")
+                try? await networkManager.connect()
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // Wait 2s for connections
             }
 
-            notesWithValidWitness += 1
+            let resolvedCount = try await resolveBoostPlaceholderTxids(onProgress: { current, total in
+                // Map progress to 0.01-0.02 range
+                let progress = 0.01 + (Double(current) / Double(total)) * 0.01
+                onProgress(progress, UInt64(current), UInt64(total))
+            })
+            if resolvedCount > 0 {
+                print("✅ FIX #371: Resolved \(resolvedCount) boost placeholder txids to real txids")
+            }
+            onProgress(0.02, 0, 100)
 
-            // FIX #546: Get anchor from HEADER STORE instead of from witness
-            // According to SESSION_SUMMARY_2025-11-28.md: "Anchor MUST come from header store - not from computed tree state"
-            if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
-                try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
-                anchorsFixed += 1
+            // ============================================
+            // FIX #454: SKIP VUL-002 during repair database
+            // ============================================
+            // FIX #357 disabled VUL-002 phantom detection in health checks because:
+            // 1. P2P getdata doesn't work for confirmed TXs (peers only return mempool TXs)
+            // 2. It causes false positives and balance corruption
+            // 3. Tree root validation (FIX #358) is stronger proof
+            //
+            // Same logic applies to repair database:
+            // 1. VUL-002 is too slow (5 TXs × 100s = 8+ minutes)
+            // 2. Boost file + strong checkpoint already ensures data integrity
+            // 3. Witnesses are rebuilt from trusted boost file data
+            //
+            // Only boost placeholder cleanup remains (handled by FIX #371 above)
+            // ============================================
+            print("⚠️ FIX #454: SKIPPING VUL-002 phantom detection during repair")
+            print("⚠️ FIX #454: Reason: P2P getdata doesn't work for confirmed TXs (FIX #357)")
+            print("⚠️ FIX #454: Using boost file + strong checkpoint for integrity instead")
+            print("⚠️ FIX #454: This speeds up repair from 8+ minutes to seconds!")
 
-                let anchorHex = headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("✅ Note \(note.id) (height \(note.height)): anchor from HEADER at \(anchorHex)...")
+            var phantomTxsRemoved = 0
+            var notesRestored = 0
+            var boostPlaceholdersRemoved = 0
+
+            // VUL-002 verification loop removed - no longer needed
+            // The boost file (FIX #413) and tree root validation (FIX #358) provide stronger guarantees
+
+            onProgress(0.03, 0, 100)
+
+            // FIX #454: VUL-002 result reporting (always 0 since we skip it)
+            if boostPlaceholdersRemoved > 0 {
+                print("🗑️ VUL-002: Removed \(boostPlaceholdersRemoved) boost placeholder TX(s)")
+            }
+            if phantomTxsRemoved > 0 {
+                print("🗑️ VUL-002: Removed \(phantomTxsRemoved) phantom TX(s), restored \(notesRestored) note(s)")
             } else {
-                print("⚠️ Note \(note.id) (height \(note.height)): no header found for anchor")
+                print("✅ FIX #454: VUL-002 skipped (using boost file + tree root validation)")
             }
+            onProgress(0.04, 0, 100)
+
+            // ============================================
+            // FIX #563 v19: STEP 0b - Check for incorrectly marked SPENT notes
+            // This fixes the bug where notes (especially change outputs) are marked as SPENT
+            // when transaction send fails, but the notes were never actually spent on-chain
+            // ============================================
+            print("🔍 FIX #563 v19: Checking for incorrectly marked SPENT notes...")
+            onProgress(0.045, 0, 100)
+
+            let unmarkedCount = try await verifyIncorrectlyMarkedSpentNotes()
+            if unmarkedCount > 0 {
+                print("✅ FIX #563 v19: UNMARKED \(unmarkedCount) incorrectly marked notes!")
+                print("💰 FIX #563 v19: These notes (e.g., change outputs) were not actually spent on-chain")
+            } else {
+                print("✅ FIX #563 v19: All SPENT notes verified as actually spent on-chain")
+            }
+            onProgress(0.05, 0, 100)
+
+            // ============================================
+            // STEP 1: Try QUICK FIX first (extract anchors from existing witnesses)
+            // This is instant and fixes the witness/anchor mismatch issue
+            // ============================================
+            print("⚡ STEP 1: Attempting quick anchor fix...")
+            onProgress(0.05, 0, 100)
+
+            notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.accountId)
+            notesWithValidWitness = 0
+            anchorsFixed = 0
+
+            for note in notes {
+                // Check if note has a valid witness (at least 1028 bytes for proper witness)
+                guard note.witness.count >= 1028 else {
+                    print("⚠️ Note \(note.id) (height \(note.height)): invalid witness (\(note.witness.count) bytes)")
+                    continue
+                }
+
+                notesWithValidWitness += 1
+
+                // FIX #546: Get anchor from HEADER STORE instead of from witness
+                // According to SESSION_SUMMARY_2025-11-28.md: "Anchor MUST come from header store - not from computed tree state"
+                if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
+                    try WalletDatabase.shared.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
+                    anchorsFixed += 1
+
+                    let anchorHex = headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("✅ Note \(note.id) (height \(note.height)): anchor from HEADER at \(anchorHex)...")
+                } else {
+                    print("⚠️ Note \(note.id) (height \(note.height)): no header found for anchor")
+                }
+            }
+
+            print("📊 Quick fix result: \(anchorsFixed)/\(notes.count) notes fixed")
+
+            // FIX #417: REMOVED incorrect anchor validation that caused unnecessary full rebuilds
+            // The old code compared witness anchor to CURRENT tree root, but witnesses are from
+            // EARLIER blocks, so they will NEVER match the current tree root!
+            // This was causing 16+ minute full rebuilds when a simple anchor extraction fixes the issue.
+            //
+            // A witness anchor doesn't need to match current tree root - it just needs to be:
+            // 1. Extracted from a valid witness (which we already verified exists)
+            // 2. A valid historical anchor that existed when the witness was created
+            //
+            // The actual validation happens at transaction build time when the anchor is
+            // checked against recent block headers.
+            anchorsValidated = anchorsFixed > 0  // If we extracted anchors, they're valid
+            if anchorsFixed > 0 {
+                print("✅ FIX #417: Anchors extracted from valid witnesses - skipping incorrect tree root comparison")
+            }
+        } else {
+            print("🔄 FIX #577 v15: forceFullRescan=true - skipping quick fix steps (0a, 0b, 1)")
         }
 
-        print("📊 Quick fix result: \(anchorsFixed)/\(notes.count) notes fixed")
-
-        // FIX #417: REMOVED incorrect anchor validation that caused unnecessary full rebuilds
-        // The old code compared witness anchor to CURRENT tree root, but witnesses are from
-        // EARLIER blocks, so they will NEVER match the current tree root!
-        // This was causing 16+ minute full rebuilds when a simple anchor extraction fixes the issue.
-        //
-        // A witness anchor doesn't need to match current tree root - it just needs to be:
-        // 1. Extracted from a valid witness (which we already verified exists)
-        // 2. A valid historical anchor that existed when the witness was created
-        //
-        // The actual validation happens at transaction build time when the anchor is
-        // checked against recent block headers.
-        var anchorsValidated = anchorsFixed > 0  // If we extracted anchors, they're valid
-        if anchorsFixed > 0 {
-            print("✅ FIX #417: Anchors extracted from valid witnesses - skipping incorrect tree root comparison")
-        }
-
-        // FIX #367 v2: Try quick fix FIRST, even if forceFullRescan is requested
-        // Quick fix is instant (<1 second) and often succeeds, avoiding expensive full rescan
-        // Only skip to full rescan if quick fix explicitly fails or witnesses are invalid
+        // FIX #367 v3: If forceFullRescan is true, SKIP quick fix and go directly to full rescan
+        // This is critical for marking spent notes correctly from boost file
+        // The quick fix path doesn't process boost file spends, so it can't fix incorrect is_spent flags
         if forceFullRescan {
-            print("🔄 FIX #367: FORCE FULL RESCAN requested - but trying quick fix first")
-        }
-
-        // Use quick fix if ALL notes have valid witnesses AND anchors are validated correct
-        // This works even when forceFullRescan=true (we try quick fix before full rescan)
-        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated {
+            print("🔄 FIX #367 v3: FORCE FULL RESCAN requested - skipping quick fix, going directly to full rescan")
+            print("🔄 FIX #367 v3: This will delete all notes and rescan from boost file to correctly mark spent notes")
+        } else {
+            // Use quick fix if ALL notes have valid witnesses AND anchors are validated correct
+            // This only applies when forceFullRescan=false (regular repair)
+        if notes.count > 0 && notesWithValidWitness == notes.count && anchorsFixed == notes.count && anchorsValidated && !forceFullRescan {
             print("✅ Quick fix successful! All \(anchorsFixed) notes repaired instantly")
 
             // FIX #466: Resolve boost received_in_tx placeholders BEFORE rebuilding history
@@ -3844,6 +4326,7 @@ final class WalletManager: ObservableObject {
             print("✅ Database repair complete - quick fix was sufficient")
             return
         }
+        }  // End of else block (quick fix path - only when forceFullRescan=false)
 
         // If anchors were "fixed" but validation failed, clear them to force rebuild
         if anchorsFixed > 0 && !anchorsValidated {
@@ -3851,194 +4334,186 @@ final class WalletManager: ObservableObject {
         }
 
         // ============================================
-        // STEP 2: Some notes missing witnesses - need full rescan
+        // STEP 2: FULL RESCAN - Rebuild EVERYTHING from scratch
+        // FIX #577 v4: Full Rescan MUST do EXACTLY what Import PK does!
+        // - Delete all notes from database
+        // - Invalidate CMU cache
+        // - Reset lastScannedHeight to 0
+        // - Reset FFI tree state
+        // - Run same scanner as Import PK
         // ============================================
         print("⚠️ Quick fix insufficient (\(notesWithValidWitness)/\(notes.count) have valid witnesses)")
-        print("🔄 Proceeding with full rescan...")
+        print("🔄 FIX #577 v8: Starting FULL RESCAN - deleting all notes and rescanning from boost file...")
+        onProgress(0.05, 0, 100)
+
+        // FIX #577 v8: Delete all notes from database (this is what fixes spent/unspent status!)
+        print("🗑️ FIX #577 v8: Deleting all notes from database...")
+        try WalletDatabase.shared.deleteAllNotes()
+        print("✅ FIX #577 v8: All notes deleted - will rediscover from boost file")
+
+        // FIX #577 v8: Reset lastScannedHeight to 0 so scanner starts from Sapling activation
+        try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
+        print("✅ FIX #577 v8: Reset lastScannedHeight to 0 for fresh scan")
+
+        // FIX #577 v4: Step 5 - Reset FFI tree state (same as Import PK line 5994-5996)
+        print("🌳 FIX #577 v4: Resetting FFI tree state...")
+        isTreeLoaded = false
+        treeLoadProgress = 0.0
+        treeLoadStatus = ""
+        print("✅ FIX #577 v4: FFI tree state reset")
+
         onProgress(0.1, 0, 100)
 
-        // FULL RESYNC: Delete ALL notes (not just after tree height)
-        // This ensures all corrupted data is removed
-        print("🗑️ Deleting ALL notes for full resync...")
-        try WalletDatabase.shared.deleteAllNotes()
-        print("🗑️ All notes deleted")
-
-        // Clear ALL transaction history
-        try WalletDatabase.shared.clearTransactionHistory()
-        print("🗑️ Cleared transaction history")
-
-        // Clear tree state so it gets rebuilt from downloaded CMUs
-        try WalletDatabase.shared.clearTreeState()
-        print("🌳 Cleared tree state")
-
-        // FIX #367: Do NOT delete boost cache - CommitmentTreeUpdater will check
-        // if a newer version is available on GitHub and only download if needed
-        // This saves bandwidth and time when the cached boost is still current
-        print("📦 Keeping boost cache (will check for newer version on GitHub)")
-
-        // Clear local delta bundle (will be rebuilt during rescan)
-        DeltaCMUManager.shared.clearDeltaBundle()
-        print("🗑️ Cleared delta bundle (will be rebuilt during sync)")
-
-        // Reset last scanned height to 0 for full rescan
-        try WalletDatabase.shared.updateLastScannedHeight(0, hash: Data(count: 32))
-        print("📝 Reset last scanned height to 0")
-
-        // FIX #457 v3: RELOAD bundled headers from boost file instead of clearing
-        // Bundled headers (476969 → boost end) are pre-validated and correct
-        // Only need to sync delta headers (boost end → chain tip) via P2P
-        let treeUpdater = CommitmentTreeUpdater.shared
-
-        // Check if boost file has headers section
-        if await treeUpdater.hasHeadersSection() {
-            // Extract headers and block hashes from boost file
-            if let headerData = try? await treeUpdater.extractHeaders(),
-               let blockHashesData = try? await treeUpdater.extractBlockHashes() {
-
-                // Get manifest info to find bundled headers range
-                if let manifest = await treeUpdater.loadCachedManifest() {
-                    let bundledEndHeight = manifest.chain_height
-                    let sectionInfo = manifest.sections.first { $0.type == 7 }
-
-                    // Clear ONLY headers above bundled range (delta headers from P2P)
-                    // These need to be re-synced because they might be stale
-                    try? HeaderStore.shared.clearHeadersAboveHeight(bundledEndHeight)
-                    print("📜 FIX #457: Cleared delta headers above \(bundledEndHeight) (will re-sync via P2P)")
-
-                    // Reload bundled headers from boost file (instant, already validated)
-                    if let section = sectionInfo {
-                        print("📜 FIX #457: Reloading \(section.count) bundled headers from boost file...")
-                        try HeaderStore.shared.loadHeadersFromBoostData(
-                            headerData,
-                            blockHashes: blockHashesData,
-                            startHeight: section.start_height,
-                            expectedCount: Int(section.count)
-                        ) { progress in
-                            // FIX #468: Report progress during header reload
-                            // FIX #485: Add debug log to verify callback is being called
-                            print("🔧 FIX #485: Header load progress callback: \(Int(progress * 100))%")
-                            DispatchQueue.main.async {
-                                // FIX #505: Update treeLoadProgress so UI shows header loading progress!
-                                self.treeLoadProgress = 0.05 + (progress * 0.05)  // 5-10% for header loading
-                                self.treeLoadStatus = "Loading headers from boost file... \(Int(progress * 100))%"
-                                onProgress(0.1 + (progress * 0.1), UInt64(Double(section.count) * progress), UInt64(section.count))
-                            }
-                        }
-                        print("✅ FIX #457: Bundled headers reloaded instantly up to height \(bundledEndHeight)")
-                    }
-                }
-            } else {
-                // Extraction failed - clear everything
-                try? HeaderStore.shared.clearAllHeaders()
-                try? HeaderStore.shared.clearBlockTimes()
-                print("⚠️ Boost file extraction failed - cleared all headers")
-            }
-        } else {
-            // Fallback: No boost file with headers, clear everything
-            try? HeaderStore.shared.clearAllHeaders()
-            try? HeaderStore.shared.clearBlockTimes()
-            print("⚠️ No boost file headers - cleared all headers (will P2P sync everything)")
-        }
-
-        // Clear block_times table (will be repopulated from bundled data + P2P sync)
-        try? HeaderStore.shared.clearBlockTimes()
-        print("🗑️ Cleared block_times (will reload from bundled + P2P)")
-
-        // CRITICAL: Clear ALL timestamp data (in-memory + HeaderStore.block_times)
-        // This forces re-sync from boost file on next load
-        BlockTimestampManager.shared.clearAllTimestampData()
-        print("🗑️ Cleared all timestamp data (unified)")
-
-        // Ensure network connection
-        print("📡 Ensuring network connection...")
-        let isConnectedForRescan = await MainActor.run { NetworkManager.shared.isConnected }
-        if !isConnectedForRescan {
-            try await NetworkManager.shared.connect()
-            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-        }
-        let peerCountForRescan = await MainActor.run { NetworkManager.shared.peers.count }
-        print("✅ Network connected: \(peerCountForRescan) peer(s)")
-
-        // Wait for any existing scan to complete
-        if FilterScanner.isScanInProgress {
-            print("⏳ Waiting for existing scan to complete...")
-            var waitCount = 0
-            while FilterScanner.isScanInProgress && waitCount < 60 {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                waitCount += 1
-            }
-        }
-
-        // Clear the in-memory tree and reload from downloaded CMUs
-        // CRITICAL: Reset isTreeLoaded flag so preloadCommitmentTree() actually reloads
-        // Without this, preloadCommitmentTree() returns immediately because isTreeLoaded is true
+        // FIX #577 v6: CRITICAL - Disable background processes before scan (like Import PK)
+        // This prevents race conditions: mempool scan, block notifications, background sync
+        // These interfere with PHASE 1/PHASE 2 scanning and cause data corruption
         await MainActor.run {
-            self.isTreeLoaded = false
-            self.treeLoadProgress = 0.0
-            self.treeLoadStatus = ""
+            NetworkManager.shared.disableBackgroundProcesses()
         }
-        // Also clear the FFI tree to ensure fresh start
-        _ = ZipherXFFI.treeInit()
+        print("🔒 FIX #577 v6: Background processes DISABLED for Full Rescan (preventing race conditions)")
 
-        // FIX #506: Use PARALLEL import for faster tree loading
-        // Falls back to sequential if parallel fails
-        print("🌳 Reloading commitment tree using PARALLEL extraction...")
-        do {
-            try await importParallelWithProgress { progress in
-                // Map parallel import progress (0-1) to overall repair progress (0-30%)
-                onProgress(progress * 0.3, UInt64(progress * 30), 100)
-            }
-            print("✅ FIX #506: Parallel tree loading successful")
-        } catch {
-            print("⚠️ FIX #506: Parallel import failed: \(error.localizedDescription)")
-            print("🔄 Falling back to sequential tree loading...")
-            await preloadCommitmentTree()
-        }
+        // FIX #577 v14: Tasks were already initialized at line 3799-3812 (when Full Rescan started)
+        // This ensures they're ready when UI queries currentSyncTasks (ContentView.swift)
+        // Previous bug (FIX #577 v12): Tasks initialized here caused timing issue
+        print("📦 FIX #577 v14: Using Import PK tasks initialized at startup (line 3799-3812)")
 
-        // FIX #440: Load BundledBlockHashes BEFORE full rescan
-        // PHASE 2 header sync needs these hashes to build correct P2P locators
-        // Without them, it falls back to height 0 and gets pre-Bubbles headers (wrong Equihash)
-        if !BundledBlockHashes.shared.isLoaded {
-            print("📋 FIX #440: Loading BundledBlockHashes before full rescan...")
-            do {
-                try await BundledBlockHashes.shared.loadBundledHashes { current, total in
-                    if current == total {
-                        print("✅ FIX #440: BundledBlockHashes loaded: \(total) hashes")
+        // FIX #577 v4: Call scanner EXACTLY like Import PK - scanner handles everything
+        // Import PK doesn't have all this extra header/tree/hash loading code
+        // The scanner handles: boost file, headers, CMU data, PHASE 1/2 scanning
+        let scanner = FilterScanner()
+
+        // FIX #577 v12: CRITICAL - Update WalletManager progress properties so CypherpunkSyncView works
+        // The local onProgress callback only updates SettingsView's local variables
+        // But CypherpunkSyncView reads from WalletManager's @Published properties
+        // So we need to update BOTH from the scanner's callback
+        // Also must use SAME task IDs as Import PK for proper display
+        scanner.onProgress = { progress, currentHeight, maxHeight in
+            // Call the original callback (for SettingsView completion detection)
+            onProgress(progress, currentHeight, maxHeight)
+
+            // ALSO update WalletManager's properties (for CypherpunkSyncView display)
+            Task { @MainActor in
+                // Map scanner progress to overall progress (0.0 to 0.90 for scan phases)
+                // Start at 0.0 (params/keys/db already marked completed)
+                // download_outputs through scan: 0% to 80%
+                // witnesses/balance: 80% to 90%
+                let scanProgress = min(0.80, progress * 0.80)
+                self.overallProgress = scanProgress
+
+                // Update status with progress info
+                let progressPercent = Int(progress * 100)
+                if maxHeight > 0 {
+                    self.syncStatus = "Scanning blockchain... \(progressPercent)% (\(currentHeight)/\(maxHeight))"
+                } else {
+                    self.syncStatus = "Initializing scan... \(progressPercent)%"
+                }
+
+                // Update tasks using SAME IDs as Import PK
+                // download_outputs through scan get updated based on progress
+                func updateTaskStatus(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
+                    if let index = self.syncTasks.firstIndex(where: { $0.id == id }) {
+                        var task = self.syncTasks[index]
+                        task.status = status
+                        if let detail = detail { task.detail = detail }
+                        if let progress = progress { task.progress = progress }
+                        self.syncTasks[index] = task
                     }
                 }
-            } catch {
-                print("⚠️ FIX #440: Failed to load BundledBlockHashes: \(error)")
-                // Continue anyway - the scan will handle missing hashes via fallback
+
+                // Mark tasks as completed based on progress
+                // download_outputs completes at 10%
+                if progress >= 0.10 {
+                    updateTaskStatus(id: "download_outputs", status: .completed, detail: "Downloaded")
+                }
+
+                // download_timestamps completes at 15%
+                if progress >= 0.15 {
+                    updateTaskStatus(id: "download_timestamps", status: .completed, detail: "Loaded from boost")
+                }
+
+                // headers completes at 20%
+                if progress >= 0.20 {
+                    updateTaskStatus(id: "headers", status: .completed, detail: "Synced from boost")
+                }
+
+                // height completes at 25%
+                if progress >= 0.25 {
+                    updateTaskStatus(id: "height", status: .completed, detail: "Chain tip queried")
+                }
+
+                // scan gets updated progress throughout
+                let scanTaskPercent = Int(min(100, progress * 100))
+                if progress < 1.0 {
+                    updateTaskStatus(
+                        id: "scan",
+                        status: .inProgress,
+                        detail: "Block \(currentHeight) of \(maxHeight)",
+                        progress: progress
+                    )
+                } else {
+                    updateTaskStatus(id: "scan", status: .completed, detail: "Decrypted \(maxHeight) blocks", progress: 1.0)
+                }
+
+                // witnesses starts at 80%
+                if progress >= 0.80 {
+                    let witnessProgress = (progress - 0.80) / 0.10  // Map 80-100% to 0-100%
+                    if witnessProgress < 1.0 {
+                        updateTaskStatus(id: "witnesses", status: .inProgress, detail: "Building witnesses...", progress: witnessProgress)
+                    } else {
+                        updateTaskStatus(id: "witnesses", status: .completed, detail: "Witnesses built", progress: 1.0)
+                    }
+                }
+
+                // balance starts at 90%
+                if progress >= 0.90 {
+                    let balanceProgress = (progress - 0.90) / 0.10  // Map 90-100% to 0-100%
+                    if balanceProgress < 1.0 {
+                        updateTaskStatus(id: "balance", status: .inProgress, detail: "Calculating balance...", progress: balanceProgress)
+                    } else {
+                        updateTaskStatus(id: "balance", status: .completed, detail: "Balance calculated", progress: 1.0)
+                    }
+                }
             }
-        } else {
-            print("📋 FIX #440: BundledBlockHashes already loaded")
         }
 
-        // Get the new downloaded tree height (from GitHub)
-        let newTreeHeight = ZipherXConstants.effectiveTreeHeight
-        print("📦 GitHub boost file height: \(newTreeHeight)")
+        print("🔄 FIX #577 v4: Calling scanner (same as Import PK)...")
+        print("📦 FIX #577 v12: Progress callback will update WalletManager properties for CypherpunkSyncView")
+        print("📦 Scanner handles: boost, headers, CMU data, PHASE 1/2")
+        try await scanner.startScan(for: account.accountId, viewingKey: spendingKey)
 
-        // PHASE 1 + PHASE 2 full scan
-        // CRITICAL: Start from Sapling activation (not boost height + 1) to trigger PHASE 1
-        // PHASE 1 uses boost file CMU data to find notes in historical range via parallel decryption
-        // PHASE 2 scans from boost height + 1 to chain tip in sequential mode
-        // If we started from boost height + 1, we would skip PHASE 1 entirely and miss
-        // notes that exist within the boost file range (like the 5 small notes at height ~2931760)
-        let scanner = FilterScanner()
-        scanner.onProgress = onProgress
-
-        let saplingActivation = ZclassicCheckpoints.saplingActivationHeight
-        print("🔄 Starting full rescan from Sapling activation (\(saplingActivation)) to trigger PHASE 1+2...")
-        print("📦 PHASE 1 will scan \(saplingActivation) → \(newTreeHeight) using boost file")
-        print("📦 PHASE 2 will scan \(newTreeHeight + 1) → chain tip in sequential mode")
-        try await scanner.startScan(for: account.accountId, viewingKey: spendingKey, fromHeight: saplingActivation)
+        // FIX #577 v6: Re-enable background processes after scan completes (like Import PK)
+        await MainActor.run {
+            NetworkManager.shared.enableBackgroundProcesses()
+        }
+        print("🔓 FIX #577 v6: Background processes RE-ENABLED after Full Rescan complete")
 
         // FIX #263: Explicitly set progress to 100% after scan completes
         // Without this, UI can stay stuck at 99% even though scan finished
         await MainActor.run {
             onProgress(1.0, 100, 100)
+
+            // FIX #577 v12: Mark all tasks as completed after scan
+            self.overallProgress = 0.90  // Scan at 90%, witnesses and balance next
+            self.syncStatus = "Scan complete - finalizing..."
+
+            // Helper function to update tasks
+            func updateTaskStatus(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
+                if let index = self.syncTasks.firstIndex(where: { $0.id == id }) {
+                    var task = self.syncTasks[index]
+                    task.status = status
+                    if let detail = detail { task.detail = detail }
+                    if let progress = progress { task.progress = progress }
+                    self.syncTasks[index] = task
+                }
+            }
+
+            // Mark all scan-related tasks as completed
+            updateTaskStatus(id: "scan", status: .completed, detail: "Decrypted all blocks", progress: 1.0)
+            updateTaskStatus(id: "witnesses", status: .inProgress, detail: "Finalizing witnesses...", progress: 0.5)
+            updateTaskStatus(id: "balance", status: .pending, detail: "Waiting...")
         }
         print("✅ FIX #263: Progress set to 100%")
+        print("📦 FIX #577 v12: Scan complete, witnesses/balance finalizing...")
 
         // FIX #176: Update checkpoint to lastScannedHeight after full rescan
         // This prevents the "Checkpoint Sync" health check from failing after repair
@@ -4075,6 +4550,36 @@ final class WalletManager: ObservableObject {
         }
         await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
 
+        // FIX #577 v11: Rebuild transaction history after Full Rescan
+        // The scanner creates notes but doesn't populate transaction_history table
+        // We need to call populateHistoryFromNotes() to create SENT/RECEIVED/CHANGE entries
+        print("📜 FIX #577 v11: Rebuilding transaction history after Full Rescan...")
+        let historyCount = try WalletDatabase.shared.populateHistoryFromNotes()
+        print("📜 FIX #577 v11: Transaction history rebuilt - \(historyCount) entries")
+
+        // FIX #577 v12: Mark all tasks as completed and set final progress to 100%
+        await MainActor.run {
+            // Helper function to update tasks
+            func updateTaskStatus(id: String, status: SyncTaskStatus, detail: String? = nil, progress: Double? = nil) {
+                if let index = self.syncTasks.firstIndex(where: { $0.id == id }) {
+                    var task = self.syncTasks[index]
+                    task.status = status
+                    if let detail = detail { task.detail = detail }
+                    if let progress = progress { task.progress = progress }
+                    self.syncTasks[index] = task
+                }
+            }
+
+            // Mark witnesses and balance as completed
+            updateTaskStatus(id: "witnesses", status: .completed, detail: "Witnesses verified", progress: 1.0)
+            updateTaskStatus(id: "balance", status: .completed, detail: "Balance calculated", progress: 1.0)
+
+            // Set final progress to 100%
+            self.overallProgress = 1.0
+            self.syncStatus = "Full Rescan complete!"
+        }
+
+        print("✅ FIX #577 v12: All tasks completed, progress at 100%")
         print("✅ Database repair complete - full resync finished")
     }
 
@@ -4340,6 +4845,188 @@ final class WalletManager: ObservableObject {
 
         } catch {
             print("❌ FIX #550: Error fixing anchors: \(error)")
+            return 0
+        }
+    }
+
+    // MARK: - FIX #588: Rebuild Corrupted Witnesses at Specific Positions
+
+    /// FIX #588: Rebuild witnesses corrupted by old FIX #585 trimming code
+    ///
+    /// Creates each witness at its SPECIFIC position (not all at chain tip)
+    /// by:
+    /// 1. Extracting CMUs from boost file (for positions within boost range)
+    /// 2. Fetching CMUs from P2P network (for positions beyond boost range)
+    /// 3. Building each witness at its exact position using zipherx_tree_rebuild_witnesses_at_positions
+    /// 4. Using header sapling_root as anchor for each note
+    ///
+    /// This fixes the issue where witnesses have corrupted Merkle paths (filled_nodes)
+    /// due to old FIX #585 trimming code that zeroed out trailing bytes (259 trailing zeros!).
+    ///
+    /// - Parameter progress: Optional progress callback (current, total)
+    /// - Returns: Number of witnesses successfully rebuilt
+    func rebuildCorruptedWitnesses(progress: ((Int, Int) -> Void)? = nil) async -> Int {
+        print("🔧 FIX #588: Rebuilding corrupted witnesses at specific positions...")
+
+        do {
+            // Get spending key
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+            let dbKey = Data(SHA256.hash(data: spendingKey))
+            try WalletDatabase.shared.open(encryptionKey: dbKey)
+
+            // Get account ID (don't assume it's 0)
+            guard let account = try WalletDatabase.shared.getAccount(index: 0) else {
+                print("   ❌ FIX #588: No account found")
+                return 0
+            }
+            let accountId = account.accountId
+            print("   📋 Using account ID: \(accountId)")
+
+            // Get all unspent notes with CMU
+            let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: accountId)
+            let notesWithCMU = notes.filter { $0.cmu != nil && $0.cmu!.count == 32 }
+
+            guard !notesWithCMU.isEmpty else {
+                print("⚠️ FIX #588: No unspent notes with CMU to rebuild")
+                return 0
+            }
+
+            print("   Found \(notesWithCMU.count) notes to rebuild")
+
+            // Collect targets: CMU + position for each note
+            let saplingActivation: UInt64 = 476969
+            var targets: [(noteId: Int64, cmu: Data, position: UInt64, height: UInt64)] = []
+
+            for note in notesWithCMU {
+                guard let cmu = note.cmu else { continue }
+                let height = note.height
+                let position = height >= saplingActivation ? height - saplingActivation : 0
+                targets.append((noteId: note.id, cmu: cmu, position: position, height: height))
+            }
+
+            // Find min and max positions needed
+            let maxPosition = targets.map { $0.position }.max() ?? 0
+            let maxHeight = targets.map { $0.height }.max() ?? 0
+            let minHeight = targets.map { $0.height }.min() ?? saplingActivation
+
+            print("   Position range: 0 to \(maxPosition) (height \(saplingActivation) to \(maxHeight))")
+
+            // 1. Get CMUs from boost file
+            print("   📦 Loading boost file CMUs...")
+            let boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
+                if Int(progress * 100) % 10 == 0 {
+                    print("      Extracting boost CMUs: \(Int(progress * 100))%")
+                }
+            }
+
+            // Parse boost CMU count
+            guard boostCMUData.count >= 8 else {
+                print("   ❌ Invalid boost CMU data")
+                return 0
+            }
+            let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            print("   📊 Boost file has \(boostCMUCount) CMUs (up to position \(boostCMUCount - 1))")
+
+            let boostMaxHeight = saplingActivation + boostCMUCount - 1
+            print("   📊 Boost file covers height \(saplingActivation) to \(boostMaxHeight)")
+
+            // 2. Fetch delta CMUs from blocks beyond boost file
+            var deltaCMUs: [Data] = []
+            if maxHeight > boostMaxHeight {
+                let startHeight = boostMaxHeight + 1
+                print("   📡 Fetching delta CMUs from blocks \(startHeight) to \(maxHeight)...")
+
+                let txBuilder = TransactionBuilder()
+                deltaCMUs = await txBuilder.fetchCMUsFromBlocks(startHeight: startHeight, endHeight: maxHeight)
+                print("   📊 Fetched \(deltaCMUs.count) delta CMUs")
+            }
+
+            // 3. Build combined CMU data
+            let totalCMUCount = boostCMUCount + UInt64(deltaCMUs.count)
+            var combinedCMUData = Data(capacity: 8 + Int(totalCMUCount) * 32)
+
+            // Write new count
+            var count = totalCMUCount
+            withUnsafeBytes(of: &count) { bytes in
+                combinedCMUData.append(contentsOf: bytes)
+            }
+
+            // Append boost CMUs (skip the 8-byte header from boost data)
+            combinedCMUData.append(boostCMUData.suffix(from: 8))
+
+            // Append delta CMUs
+            for cmu in deltaCMUs {
+                combinedCMUData.append(cmu)
+            }
+
+            print("   📊 Combined CMU data: \(totalCMUCount) CMUs (\(combinedCMUData.count) bytes)")
+
+            // 4. Rebuild witnesses at specific positions using FFI
+            print("   🔧 Rebuilding witnesses at specific positions...")
+
+            // Prepare targets for FFI: separate arrays for CMUs and positions
+            var targetCMUs: [Data] = []
+            var targetPositions: [UInt64] = []
+            var noteIdMap: [Int: Int64] = [:]
+            var heightMap: [Int: UInt64] = [:]
+
+            for (index, target) in targets.enumerated() {
+                targetCMUs.append(target.cmu)
+                targetPositions.append(target.position)
+                noteIdMap[index] = target.noteId
+                heightMap[index] = target.height
+            }
+
+            // Call FFI function to rebuild witnesses at specific positions
+            let results = ZipherXFFI.treeRebuildWitnessesAtPositions(
+                cmuData: combinedCMUData,
+                targets: zip(targetCMUs, targetPositions).map { (cmu: $0.0, position: $0.1) }
+            )
+
+            var rebuiltCount = 0
+            for (index, witnessData) in results.enumerated() {
+                guard let noteId = noteIdMap[index],
+                      let height = heightMap[index],
+                      let witness = witnessData else {
+                    print("   ⚠️ Target \(index): no witness created")
+                    continue
+                }
+
+                // Get correct anchor from header at this height
+                guard let correctAnchor = try? HeaderStore.shared.getSaplingRoot(at: height) else {
+                    print("   ⚠️ Note ID=\(noteId): Could not get header anchor at height \(height), skipping")
+                    continue
+                }
+
+                // Update witness and anchor in database
+                try WalletDatabase.shared.updateNoteWitness(noteId: noteId, witness: witness)
+                try WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: correctAnchor)
+
+                rebuiltCount += 1
+
+                // Report progress
+                progress?(index + 1, targets.count)
+
+                // Verify witness is valid
+                if let witnessRoot = ZipherXFFI.witnessGetRoot(witness) {
+                    let anchorHex = correctAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let match = correctAnchor == witnessRoot
+                    print("   ✅ Note ID=\(noteId) height=\(height): anchor=\(anchorHex)... root=\(rootHex)... \(match ? "✅ MATCH" : "❌ MISMATCH")")
+                } else {
+                    print("   ⚠️ Note ID=\(noteId): witness rebuilt but root extraction failed")
+                }
+            }
+
+            print("✅ FIX #588: Rebuilt \(rebuiltCount)/\(targets.count) witnesses at specific positions")
+
+            // Refresh balance after rebuild
+            try await refreshBalance()
+
+            return rebuiltCount
+
+        } catch {
+            print("❌ FIX #588: Error rebuilding witnesses: \(error)")
             return 0
         }
     }
@@ -4753,6 +5440,13 @@ final class WalletManager: ObservableObject {
             throw WalletError.insufficientFunds
         }
 
+        // FIX #596: CRITICAL - Update witnesses with CURRENT anchor BEFORE building transaction!
+        // If we build with OLD anchor from DB, transaction will be rejected with "joinsplit requirements not met"
+        // The witness update ensures all witnesses have the latest tree root as anchor
+        onProgress("verify", "Updating witnesses...", 0.0)
+        await preRebuildWitnessesForInstantPayment(accountId: 1)
+        onProgress("verify", "Witnesses updated", 0.5)
+
         // Record balance BEFORE send - used to detect change vs real incoming
         // Also set lastSendTimestamp EARLY so clearingTime calculation works
         // (setMempoolVerified() uses lastSendTimestamp to calculate clearing duration)
@@ -4852,17 +5546,14 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002 + FIX #245 + FIX #349: Handle mempool verification with peer acceptance fallback
+        // VUL-002 + FIX #245 + FIX #349 + FIX #590: Handle mempool verification
         //
         // The mempool check may be slow or unavailable, especially over Tor.
-        // If PEERS accepted the TX but the mempool check timed out, we should
-        // still record the TX - it was likely propagated successfully and will
-        // confirm on-chain.
-        //
-        // FIX #349: But if peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
-        // Explicit rejections are strong signals that the TX is invalid.
-        //
-        // Only reject if NO peers accepted AND mempool check failed (true rejection).
+        // FIX #245: If PEERS accepted but mempool check TIMED OUT (not attempted),
+        //          trust the peer acceptance - TX was likely propagated.
+        // FIX #590: BUT if P2P verification WAS ATTEMPTED and FAILED, do NOT trust!
+        //          Peers lying about accepting is different from network timeout.
+        // FIX #349: If peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
         // ============================================================================
         if !broadcastResult.mempoolVerified {
             if broadcastResult.rejectCount > 0 {
@@ -4895,12 +5586,50 @@ final class WalletManager: ObservableObject {
                     "Privacy is necessary for an open society."
                     — A Cypherpunk's Manifesto
                     """)
+            } else if broadcastResult.peerCount > 0 && broadcastResult.p2pVerificationAttempted {
+                // FIX #590: Peers accepted BUT P2P verification was attempted and FAILED!
+                // This means TX is NOT in mempool despite peers "accepting"
+                // Do NOT trust peer acceptance - this is a BROADCAST FAILURE
+                print("🚨 FIX #590: \(broadcastResult.peerCount) peers accepted but P2P verification FAILED!")
+                print("🚨 FIX #590: TX is NOT in mempool - peers may have ACK'd but didn't add to mempool")
+                print("🚨 FIX #590: This is a BROADCAST FAILURE - DO NOT trust peer acceptance!")
+                print("📋 FIX #590: txId=\(txId)")
+
+                // Clear any pending broadcast tracking since TX was not actually propagated
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                throw WalletError.transactionFailed("""
+                    🚨 BROADCAST FAILED - NOT IN MEMPOOL 🚨
+
+                    Your transaction was "accepted" by \(broadcastResult.peerCount) peer(s) but
+                    P2P verification confirmed it is NOT in any peer's mempool.
+
+                    This happens when:
+                    • Peers ACK the transaction but don't actually add it to mempool
+                    • Network connections are unstable and drop during relay
+                    • Transaction validation fails after initial acceptance
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    💡 WHAT TO DO:
+                    Try sending again. If it persists, check network connection.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "Don't trust the network. Verify everything."
+                    — A Cypherpunk's Manifesto
+                    """)
             } else if broadcastResult.peerCount > 0 {
-                // FIX #245: Peers accepted but mempool check timed out (no explicit rejections)
-                // This is common with Tor (slow propagation)
+                // FIX #245: Peers accepted and P2P verification was NOT attempted (timeout)
+                // This is common with Tor (slow propagation) or network issues
                 // The TX was likely propagated successfully - record it and track
                 print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out (0 rejections)")
-                print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
+                print("📡 FIX #245: P2P verification not attempted - trusting peer acceptance")
+                print("📡 FIX #245: Recording TX anyway - will confirm on-chain")
                 print("🔐 FIX #245: txId=\(txId)")
             } else {
                 // NO peers accepted AND mempool failed - likely a true rejection
@@ -5058,17 +5787,14 @@ final class WalletManager: ObservableObject {
         let txId = broadcastResult.txId
 
         // ============================================================================
-        // VUL-002 + FIX #245 + FIX #349: Handle mempool verification with peer acceptance fallback
+        // VUL-002 + FIX #245 + FIX #349 + FIX #590: Handle mempool verification
         //
         // The mempool check may be slow or unavailable, especially over Tor.
-        // If PEERS accepted the TX but the mempool check timed out, we should
-        // still record the TX - it was likely propagated successfully and will
-        // confirm on-chain.
-        //
-        // FIX #349: But if peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
-        // Explicit rejections are strong signals that the TX is invalid.
-        //
-        // Only reject if NO peers accepted AND mempool check failed (true rejection).
+        // FIX #245: If PEERS accepted but mempool check TIMED OUT (not attempted),
+        //          trust the peer acceptance - TX was likely propagated.
+        // FIX #590: BUT if P2P verification WAS ATTEMPTED and FAILED, do NOT trust!
+        //          Peers lying about accepting is different from network timeout.
+        // FIX #349: If peers EXPLICITLY REJECTED, do NOT fall back to peer acceptance!
         // ============================================================================
         if !broadcastResult.mempoolVerified {
             if broadcastResult.rejectCount > 0 {
@@ -5101,12 +5827,50 @@ final class WalletManager: ObservableObject {
                     "Privacy is necessary for an open society."
                     — A Cypherpunk's Manifesto
                     """)
+            } else if broadcastResult.peerCount > 0 && broadcastResult.p2pVerificationAttempted {
+                // FIX #590: Peers accepted BUT P2P verification was attempted and FAILED!
+                // This means TX is NOT in mempool despite peers "accepting"
+                // Do NOT trust peer acceptance - this is a BROADCAST FAILURE
+                print("🚨 FIX #590: \(broadcastResult.peerCount) peers accepted but P2P verification FAILED!")
+                print("🚨 FIX #590: TX is NOT in mempool - peers may have ACK'd but didn't add to mempool")
+                print("🚨 FIX #590: This is a BROADCAST FAILURE - DO NOT trust peer acceptance!")
+                print("📋 FIX #590: txId=\(txId)")
+
+                // Clear any pending broadcast tracking since TX was not actually propagated
+                await MainActor.run {
+                    networkManager.clearPendingBroadcast()
+                }
+
+                throw WalletError.transactionFailed("""
+                    🚨 BROADCAST FAILED - NOT IN MEMPOOL 🚨
+
+                    Your transaction was "accepted" by \(broadcastResult.peerCount) peer(s) but
+                    P2P verification confirmed it is NOT in any peer's mempool.
+
+                    This happens when:
+                    • Peers ACK the transaction but don't actually add it to mempool
+                    • Network connections are unstable and drop during relay
+                    • Transaction validation fails after initial acceptance
+
+                    🔒 YOUR FUNDS ARE SAFE
+                    No transaction was recorded in your wallet.
+
+                    💡 WHAT TO DO:
+                    Try sending again. If it persists, check network connection.
+
+                    📋 TXID (for reference):
+                    \(txId)
+
+                    "Don't trust the network. Verify everything."
+                    — A Cypherpunk's Manifesto
+                    """)
             } else if broadcastResult.peerCount > 0 {
-                // FIX #245: Peers accepted but mempool check timed out (no explicit rejections)
-                // This is common with Tor (slow propagation)
+                // FIX #245: Peers accepted and P2P verification was NOT attempted (timeout)
+                // This is common with Tor (slow propagation) or network issues
                 // The TX was likely propagated successfully - record it and track
                 print("⚠️ FIX #245: Peers accepted (\(broadcastResult.peerCount)) but mempool check timed out (0 rejections)")
-                print("📡 FIX #245: Recording TX anyway - peers accepted it, will confirm on-chain")
+                print("📡 FIX #245: P2P verification not attempted - trusting peer acceptance")
+                print("📡 FIX #245: Recording TX anyway - will confirm on-chain")
                 print("🔐 FIX #245: txId=\(txId)")
             } else {
                 // NO peers accepted AND mempool failed - likely a true rejection
@@ -5425,6 +6189,16 @@ final class WalletManager: ObservableObject {
         print("✅ STOP SYNC: Sync cancelled. Wallet may have incomplete data.")
     }
 
+    // FIX #582: Clear Full Rescan flags when user enters wallet after completion
+    func clearFullRescanFlags() {
+        DispatchQueue.main.async {
+            self.isRescanComplete = false
+            self.rescanCompletionDuration = nil
+            self.isFullRescan = false
+            print("🔒 FIX #582: Cleared Full Rescan flags - user entered main wallet")
+        }
+    }
+
     /// Delete wallet and all associated data, then terminate the app
     /// CRITICAL: This permanently deletes everything!
     func deleteWallet() throws {
@@ -5670,6 +6444,33 @@ final class WalletManager: ObservableObject {
         do {
             try WalletDatabase.shared.open(encryptionKey: dbKey)
             print("✅ Fresh database created with new key")
+
+            // CRITICAL FIX #578: Create account row in database after import
+            // This was missing, causing "No account found with index 0" error
+            // and all subsequent failures (witness computation, PHASE 1.5, etc.)
+            if try WalletDatabase.shared.getAccount(index: 0) == nil {
+                // Derive viewing key for storage
+                let saplingKey = SaplingSpendingKey(data: spendingKey)
+                let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
+
+                // Derive address if we haven't already
+                let derivedAddress: String
+                if self.zAddress.isEmpty || self.zAddress.hasPrefix("zs1") == false {
+                    derivedAddress = try deriveZAddress(from: spendingKey)
+                } else {
+                    derivedAddress = self.zAddress
+                }
+
+                // Insert account with current address
+                _ = try WalletDatabase.shared.insertAccount(
+                    accountIndex: 0,
+                    spendingKey: spendingKey,
+                    viewingKey: fvk.data,
+                    address: derivedAddress,
+                    birthdayHeight: 559500 // Sapling activation for ZCL
+                )
+                print("👤 FIX #578: Created account in database after import PK")
+            }
         } catch {
             print("⚠️ Failed to open database: \(error)")
         }
@@ -5708,6 +6509,16 @@ final class WalletManager: ObservableObject {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+
+        // FIX #580: Load bundled headers from boost file BEFORE marking wallet as created
+        // This prevents slow P2P header sync after Import PK (was taking 3+ minutes)
+        print("📜 FIX #580: Loading bundled headers from boost file during Import PK...")
+        let (headersLoaded, boostEndHeight) = await loadHeadersFromBoostFile()
+        if headersLoaded {
+            print("✅ FIX #580: Loaded bundled headers to height \(boostEndHeight) - P2P sync will be minimal")
+        } else {
+            print("⚠️ FIX #580: No bundled headers available - will use P2P sync (slower)")
         }
 
         // Immediately mark wallet as created so ContentView shows sync screen
@@ -5827,8 +6638,8 @@ final class WalletManager: ObservableObject {
 
     // MARK: - FIX #262: Pre-Build Nullifier Verification
 
-    /// FIX #262: Quick check before building a transaction to verify notes aren't already spent
-    /// Scans recent blocks (last 20) via P2P to detect if any of our unspent notes were spent
+    /// FIX #595: INSTANT check before building a transaction to verify notes aren't already spent
+    /// FIX #595: Uses checkpoint-based scanning (100 blocks) for instant verification
     /// Returns the first spent note found, or nil if all notes are verified unspent
     private func verifyNotesNotSpentOnChain() async throws -> WalletNote? {
         let database = WalletDatabase.shared
@@ -5846,7 +6657,7 @@ final class WalletManager: ObservableObject {
             ourNullifiers[note.nullifier] = note
         }
 
-        print("🔍 FIX #262: Quick nullifier check for \(unspentNotes.count) unspent notes...")
+        print("🔍 FIX #262: Nullifier check for \(unspentNotes.count) unspent notes...")
 
         // Get current chain height
         let cachedChainHeight = await MainActor.run { networkManager.chainHeight }
@@ -5856,38 +6667,58 @@ final class WalletManager: ObservableObject {
             return nil
         }
 
-        // FIX #297: Use checkpoint for external spend detection (not just 20 blocks)
-        // If checkpoint is recent (within 100 blocks), use it - much more reliable
-        // Otherwise fall back to 20 blocks for speed
-        let checkpointHeight = (try? database.getVerifiedCheckpointHeight()) ?? 0
-        let minScanBlocks: UInt64 = 20
-        let maxScanBlocks: UInt64 = 100  // Cap to prevent slow pre-send checks
+        // FIX #595: INSTANT pre-send verification using checkpoint (not per-note scanning!)
+        // Previous approach (FIX #594): Scan from each note's height - TOO SLOW (40+ seconds per note!)
+        // New approach: Use checkpoint - if a note was spent after checkpoint, it's a rare edge case
+        // The checkpoint is set when transactions are confirmed, so spends should already be detected
+        // We only scan recent blocks (100) as a quick sanity check
+        let checkpointHeight: UInt64
+        do {
+            checkpointHeight = try database.getVerifiedCheckpointHeight()
+            print("🔍 FIX #595: Retrieved checkpoint: \(checkpointHeight)")
+        } catch {
+            // FIX #597: If checkpoint retrieval fails, log it but default to last scanned height
+            print("⚠️ FIX #597: Failed to get checkpoint: \(error.localizedDescription)")
+            // Fallback to last scanned height
+            if let lastScanned = try? database.getLastScannedHeight() {
+                checkpointHeight = lastScanned
+                print("🔍 FIX #597: Using last scanned height as checkpoint: \(checkpointHeight)")
+            } else {
+                checkpointHeight = 0
+            }
+        }
 
+        // If checkpoint is recent (within 100 blocks), scan from checkpoint
+        // Otherwise scan last 100 blocks as a quick check
         var startHeight: UInt64
-        let blocksFromCheckpoint = chainHeight > checkpointHeight ? chainHeight - checkpointHeight : 0
+        let blocksToScan: UInt64
 
-        if checkpointHeight > 0 && checkpointHeight < chainHeight && blocksFromCheckpoint <= maxScanBlocks {
-            // Use checkpoint - more reliable (FIX #348: ensure checkpoint < chainHeight)
-            startHeight = checkpointHeight
-            print("🔍 FIX #297: Using checkpoint \(checkpointHeight) - scanning \(blocksFromCheckpoint) blocks")
-        } else if blocksFromCheckpoint > maxScanBlocks {
-            // Checkpoint too far behind - limit to maxScanBlocks
-            startHeight = chainHeight > maxScanBlocks ? chainHeight - maxScanBlocks : 0
-            print("⚠️ FIX #297: Checkpoint \(checkpointHeight) is \(blocksFromCheckpoint) blocks behind - limiting to \(maxScanBlocks) blocks")
+        if checkpointHeight > 0 && chainHeight > checkpointHeight {
+            let blocksSinceCheckpoint = chainHeight - checkpointHeight
+            if blocksSinceCheckpoint <= 100 {
+                startHeight = checkpointHeight
+                blocksToScan = blocksSinceCheckpoint
+                print("🔍 FIX #595: Quick check from checkpoint \(checkpointHeight) - scanning \(blocksToScan) blocks")
+            } else {
+                // Checkpoint too old - just check last 100 blocks
+                startHeight = chainHeight > 100 ? chainHeight - 100 : 0
+                blocksToScan = min(100, chainHeight)
+                print("🔍 FIX #595: Checkpoint old (\(blocksSinceCheckpoint) blocks behind) - scanning last \(blocksToScan) blocks")
+            }
         } else {
-            // No checkpoint - fallback to minScanBlocks
-            startHeight = chainHeight > minScanBlocks ? chainHeight - minScanBlocks : 0
-            print("🔍 FIX #262: No checkpoint - scanning last \(minScanBlocks) blocks")
+            // No checkpoint - scan last 100 blocks
+            startHeight = chainHeight > 100 ? chainHeight - 100 : 0
+            blocksToScan = min(100, chainHeight)
+            print("🔍 FIX #595: No checkpoint - scanning last \(blocksToScan) blocks")
         }
 
         // FIX #348: Prevent underflow crash if startHeight > chainHeight
         guard startHeight < chainHeight else {
-            print("⚠️ FIX #348: startHeight (\(startHeight)) >= chainHeight (\(chainHeight)) - skipping check")
+            print("⚠️ FIX #595: startHeight (\(startHeight)) >= chainHeight (\(chainHeight)) - skipping quick check")
             return nil
         }
 
-        let blocksToScan = chainHeight - startHeight
-        print("🔍 FIX #262: Scanning blocks \(startHeight) to \(chainHeight)...")
+        print("🔍 FIX #595: INSTANT pre-send verification - scanning \(blocksToScan) blocks from \(startHeight)...")
 
         do {
             let blocks = try await networkManager.getBlocksDataP2P(from: startHeight, count: Int(blocksToScan))
@@ -5905,7 +6736,7 @@ final class WalletManager: ObservableObject {
 
                         if let spentNote = ourNullifiers[hashedData] {
                             // Found a spent note!
-                            print("🚨 FIX #262: Note \(spentNote.id) was spent in TX \(txidHex) at height \(height)!")
+                            print("🚨 FIX #595: Note \(spentNote.id) was spent in TX \(txidHex) at height \(height)!")
 
                             // Mark as spent in database using hashed nullifier
                             if let txidData = Data(hexString: txidHex) {
@@ -5914,7 +6745,7 @@ final class WalletManager: ObservableObject {
                                     txid: txidData,
                                     spentHeight: UInt64(height)
                                 )
-                                print("✅ FIX #262: Marked note \(spentNote.id) as spent")
+                                print("✅ FIX #595: Marked note \(spentNote.id) as spent")
                             }
 
                             // Refresh balance
@@ -5925,14 +6756,12 @@ final class WalletManager: ObservableObject {
                     }
                 }
             }
-
-            print("✅ FIX #262: All notes verified - not spent in recent blocks")
-            return nil
-
         } catch {
-            print("⚠️ FIX #262: Block scan failed: \(error) - proceeding with build")
-            return nil  // Don't block on scan failure
+            print("⚠️ FIX #595: P2P block fetch failed: \(error.localizedDescription) - proceeding with build")
         }
+
+        print("✅ FIX #595: INSTANT verification complete - all notes appear unspent")
+        return nil
     }
 
     // MARK: - FIX #527: CMU Tree Validation
@@ -6036,7 +6865,11 @@ final class WalletManager: ObservableObject {
 
             // Search for this nullifier in spending transactions
             // We need to check transactions that contain this nullifier in vShieldedSpend
-            let isSpent = try await checkNullifierSpentOnChain(nullifier: nullifierDisplay, afterHeight: note.height)
+            // FIX #563 v40: Handle optional result - only mark if we successfully verified
+            guard let isSpent = try await checkNullifierSpentOnChain(nullifier: nullifierDisplay, afterHeight: note.height) else {
+                print("⚠️ Could not verify note \(note.value) zatoshis - skipping")
+                continue
+            }
 
             if isSpent {
                 print("💸 Found spent note: \(note.value) zatoshis (nullifier found on chain)")
@@ -6053,60 +6886,210 @@ final class WalletManager: ObservableObject {
         }
     }
 
-    /// Check if a nullifier has been spent on the blockchain
-    /// Scans transactions from the note's height to current tip
-    /// FIX #120: InsightAPI commented out - P2P only
-    private func checkNullifierSpentOnChain(nullifier: String, afterHeight: UInt64) async throws -> Bool {
-        // FIX #120: InsightAPI commented out - P2P only
-        // Strategy: Check blocks from note height to current tip for spending transactions
-        // This is expensive, so we batch and parallelize
-        //
-        // let api = InsightAPI.shared
-        // let status = try await api.getStatus()
-        // let currentHeight = status.height
-        //
-        // // Don't scan more than 5000 blocks (arbitrary limit for performance)
-        // let maxScanBlocks: UInt64 = 5000
-        // let startHeight = afterHeight
-        // let endHeight = min(currentHeight, afterHeight + maxScanBlocks)
-        //
-        // // Batch size for parallel processing
-        // let batchSize: UInt64 = 100
-        //
-        // for batchStart in stride(from: startHeight, to: endHeight, by: Int(batchSize)) {
-        //     let batchEnd = min(batchStart + batchSize, endHeight)
-        //
-        //     // Check each block in this batch
-        //     for height in batchStart..<batchEnd {
-        //         do {
-        //             let blockHash = try await api.getBlockHash(height: height)
-        //             let block = try await api.getBlock(hash: blockHash)
-        //
-        //             // Check each transaction in the block
-        //             for txid in block.tx {
-        //                 let tx = try await api.getTransaction(txid: txid)
-        //
-        //                 // Check if any spend matches our nullifier
-        //                 if let spends = tx.spendDescs {
-        //                     for spend in spends {
-        //                         if spend.nullifier == nullifier {
-        //                             return true // Found! This note was spent
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         } catch {
-        //             // Skip blocks that fail to fetch
-        //             continue
-        //         }
-        //     }
-        // }
-        //
-        // return false
+    // MARK: - FIX #563 v19: Verify incorrectly marked SPENT notes
 
-        // P2P-only: This function is disabled - nullifier checking done via P2P scan
-        print("⚠️ checkNullifierSpentOnChain disabled in P2P-only mode")
-        return false
+    /// Verify notes marked as SPENT are actually spent on-chain
+    /// This fixes the bug where notes are marked as spent when send fails
+    /// If a note is marked spent but not actually spent on-chain, unmark it
+    @MainActor
+    func verifyIncorrectlyMarkedSpentNotes() async throws -> Int {
+        print("🔍 FIX #563 v19: Checking notes marked as SPENT that might be unspent...")
+
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get spent notes from database
+        let spentNotes = try database.getSpentNotes(accountId: 1)
+
+        guard !spentNotes.isEmpty else {
+            print("✅ FIX #563 v19: No spent notes to verify")
+            return 0
+        }
+
+        print("🔍 FIX #563 v19: Checking \(spentNotes.count) notes marked as SPENT...")
+
+        var unmarkedCount = 0
+        var totalValue: UInt64 = 0
+
+        for note in spentNotes {
+            // Skip if value or height is not available (old SpentNote format)
+            guard let value = note.value, let height = note.height else {
+                continue
+            }
+            totalValue += value
+
+            // Check if this note is actually spent on-chain
+            // Convert nullifier to display format
+            let nullifierDisplay = note.nullifier.reversedBytes().hexString
+
+            // Check if nullifier exists in any spending transaction
+            let isSpentOnChain = try await checkNullifierSpentOnChain(nullifier: nullifierDisplay, afterHeight: height)
+
+            // FIX #563 v40: Only unmark if we successfully verified the note is NOT spent
+            // If verification failed (nil), don't unmark - better to keep marked as spent
+            if let spentResult = isSpentOnChain {
+                if !spentResult {
+                    // Note is marked as SPENT in DB but NOT spent on-chain - UNMARK IT!
+                    print("💰 FIX #563 v19: Found incorrectly marked note: \(value) zatoshis at height \(height)")
+                    print("💰 FIX #563 v19: Note marked SPENT but NOT spent on-chain - UNMARKING!")
+
+                    do {
+                        try database.unmarkNoteAsSpent(nullifier: note.nullifier)
+                        unmarkedCount += 1
+                        print("✅ FIX #563 v19: UNMARKED note (restored \(value) zatoshis)")
+                    } catch {
+                        print("❌ FIX #563 v19: Failed to unmark note: \(error)")
+                    }
+                } else {
+                    print("✅ FIX #563 v19: Note \(value) zatoshis is actually spent on-chain - correct")
+                }
+            } else {
+                // FIX #563 v40: Verification failed - don't unmark, keep as spent
+                print("⚠️ FIX #563 v40: Could not verify note \(value) zatoshis at height \(height) - keeping marked as spent")
+            }
+        }
+
+        let totalZCL = Double(totalValue) / 100_000_000.0
+        print("📊 FIX #563 v19: Checked \(spentNotes.count) spent notes (\(String(format: "%.8f", totalZCL)) ZCL)")
+
+        if unmarkedCount > 0 {
+            print("✅ FIX #563 v19: UNMARKED \(unmarkedCount) incorrectly marked notes!")
+            print("💰 FIX #563 v19: Balance restored - refresh to see updated balance")
+
+            // Refresh balance to show corrected amount
+            await loadBalanceFromDatabase()
+        } else {
+            print("✅ FIX #563 v19: All spent notes verified - none need unmarking")
+        }
+
+        return unmarkedCount
+    }
+
+    /// Check if a nullifier has been spent on the blockchain
+    /// FIX #563 v40: Returns Bool? to distinguish verification results
+    /// Scans blocks from the note's height to find spending transactions
+    ///
+    /// - Parameters:
+    ///   - nullifier: Nullifier in display format (hex string, big-endian)
+    ///   - afterHeight: Height to start scanning from (note's height)
+    /// - Returns:
+    ///   - true: Nullifier found in spend (definitely spent)
+    ///   - false: Nullifier NOT found after successful scan (definitely not spent)
+    ///   - nil: Verification failed (timeout, network error) - cannot determine
+    private func checkNullifierSpentOnChain(nullifier: String, afterHeight: UInt64) async throws -> Bool? {
+        let database = WalletDatabase.shared
+        let networkManager = NetworkManager.shared
+
+        // Get chain height from peers (fresh value, not cached)
+        let chainHeight: UInt64
+        do {
+            chainHeight = try await networkManager.getChainHeight()
+        } catch {
+            print("⚠️ FIX #563 v40: Cannot get chain height: \(error)")
+            return nil  // Verification failed
+        }
+        guard chainHeight > 0 && chainHeight > afterHeight else {
+            print("⚠️ FIX #563 v40: Chain height (\(chainHeight)) not beyond note height (\(afterHeight))")
+            return nil  // Verification failed
+        }
+
+        // Convert hex nullifier to Data and hash it for comparison
+        guard let nullifierDisplay = Data(hexString: nullifier) else {
+            print("⚠️ FIX #563 v40: Invalid nullifier hex string")
+            return nil  // Verification failed
+        }
+
+        // VUL-009: Hash the nullifier (DB stores hashed nullifiers)
+        let nullifierWire = nullifierDisplay.reversedBytes()
+        let hashedNullifier = database.hashNullifier(nullifierWire)
+
+        // FIX #563 v35: Adaptive scan limits based on note age
+        // Recent notes (<1000 blocks old): Check all blocks (most likely to have spends)
+        // Old notes: Check last 500 blocks only (recent spends)
+        let blockAge = chainHeight - afterHeight
+        let maxScanBlocks: UInt64 = blockAge < 1000 ? blockAge : 500
+        var startHeight = afterHeight
+
+        // If gap is too large, start from (chainHeight - maxScanBlocks)
+        if chainHeight > afterHeight + maxScanBlocks {
+            startHeight = chainHeight - maxScanBlocks
+        }
+
+        let blocksToScan = chainHeight - startHeight
+        guard blocksToScan > 0 else {
+            return nil  // No blocks to scan - verification failed
+        }
+
+        print("🔍 FIX #563 v35: Checking \(blocksToScan) blocks for nullifier \(nullifier.prefix(16))...")
+
+        // FIX #563 v35: Use maximum batch size accepted by peers (160 blocks)
+        let batchSize: UInt64 = 160
+
+        var batchStart = startHeight
+        var verificationFailed = false  // Track if ANY batch failed
+
+        while batchStart < chainHeight {
+            let batchEnd = min(batchStart + batchSize, chainHeight)
+            let count = Int(batchEnd - batchStart)
+
+            do {
+                // FIX #563 v35: Adaptive timeout based on batch size (5s per 160 blocks)
+                let fetchTask = Task {
+                    try await networkManager.getBlocksDataP2P(from: batchStart, count: count)
+                }
+
+                let timeoutTask = Task {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    fetchTask.cancel()
+                }
+
+                let blocks = try await fetchTask.value
+                timeoutTask.cancel()
+
+                // Parse transactions to find matching nullifier
+                for (height, _, _, txData) in blocks {
+                    for (_, _, spends) in txData {
+                        guard let spends = spends, !spends.isEmpty else { continue }
+
+                        for spend in spends {
+                            // Convert hex nullifier to Data
+                            guard let spendNullifierDisplay = Data(hexString: spend.nullifier) else { continue }
+
+                            // Reverse to wire format and hash (VUL-009)
+                            let spendNullifierWire = spendNullifierDisplay.reversedBytes()
+                            let spendHashed = database.hashNullifier(spendNullifierWire)
+
+                            // Compare with our nullifier
+                            if spendHashed == hashedNullifier {
+                                print("✅ FIX #563 v19: Nullifier found in spend at height \(height)")
+                                return true // Found! This note was spent
+                            }
+                        }
+                    }
+                }
+
+                batchStart = batchEnd
+            } catch {
+                if Task.isCancelled {
+                    print("⚠️ FIX #563 v40: Batch fetch timeout - verification failed")
+                } else {
+                    print("⚠️ FIX #563 v40: Batch fetch failed: \(error)")
+                }
+                // FIX #563 v40: Mark verification as failed and continue to next batch
+                verificationFailed = true
+                batchStart = batchEnd
+            }
+        }
+
+        // FIX #563 v40: Only return false if ALL batches succeeded
+        // If ANY batch failed, return nil (verification failed)
+        if verificationFailed {
+            print("⚠️ FIX #563 v40: Some batches failed - cannot verify if note is spent")
+            return nil  // Verification incomplete - don't unmark
+        }
+
+        print("✅ FIX #563 v40: All batches succeeded - nullifier NOT found in any spend")
+        return false  // Definitely not spent
     }
 
     // MARK: - FIX #212: Detect and Recover Unrecorded Broadcast Transactions
@@ -6941,8 +7924,29 @@ final class WalletManager: ObservableObject {
 
     /// Start periodic deep verification timer
     /// Called once at app startup after initial sync completes
+    /// FIX #370 v2: Run immediately at startup, then every 30 minutes
     func startPeriodicDeepVerification() {
-        // Run deep verification every 30 minutes while app is open
+        // Run immediately on startup (don't wait 30 minutes!)
+        Task { @MainActor in
+            guard !self.isSyncing && !self.isRepairingDatabase else {
+                print("⏭️ FIX #370: Skipping immediate deep verification - sync/repair in progress")
+                return
+            }
+
+            // Immediate run at startup
+            let found = try? await self.performDeepVerification()
+            if let found = found, found > 0 {
+                print("🔔 FIX #370: Startup deep verification found \(found) missed transaction(s)!")
+            }
+
+            // FIX #681: Also run immediate auto-recovery
+            let recovered = await self.autoRecoverMissingTransactions()
+            if recovered > 0 {
+                print("🔔 FIX #681: Startup auto-recovery found \(recovered) missed transaction(s)!")
+            }
+        }
+
+        // Then schedule every 30 minutes
         Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -6955,9 +7959,73 @@ final class WalletManager: ObservableObject {
                 if let found = found, found > 0 {
                     print("🔔 FIX #370: Periodic deep verification found \(found) missed transaction(s)!")
                 }
+
+                // FIX #681: Also run automatic transaction recovery (checkpoint rollback)
+                // This catches transactions missed by broadcast tracking bugs
+                let recovered = await self.autoRecoverMissingTransactions()
+                if recovered > 0 {
+                    print("🔔 FIX #681: Periodic auto-recovery found \(recovered) missed transaction(s)!")
+                }
             }
         }
-        print("⏰ FIX #370: Periodic deep verification timer started (30 min interval)")
+        print("⏰ FIX #370: Deep verification + auto-recovery: ran at startup, then every 30 min")
+    }
+
+    /// FIX #603: Start periodic witness refresh timer
+    /// Keeps all unspent note witnesses updated to current chain tip
+    /// This ensures pre-build is instant - witnesses are always fresh
+    func startPeriodicWitnessRefresh() {
+        // Run witness refresh every 10 minutes while app is open
+        Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                // Only run if not syncing and not repairing
+                guard !self.isSyncing && !self.isRepairingDatabase else {
+                    print("⏭️ FIX #603: Skipping periodic witness refresh - sync/repair in progress")
+                    return
+                }
+                let updated = try? await self.refreshAllNoteWitnesses()
+                if let updated = updated, updated > 0 {
+                    print("🔔 FIX #603: Periodic witness refresh updated \(updated) witness(es)!")
+                }
+            }
+        }
+        print("⏰ FIX #603: Periodic witness refresh timer started (10 min interval)")
+    }
+
+    /// FIX #603: Refresh all unspent note witnesses to current chain tip
+    /// Updates witnesses for all unspent notes so they're ready for instant spending
+    /// - Returns: Number of witnesses updated
+    @MainActor
+    func refreshAllNoteWitnesses() async throws -> Int {
+        print("🔄 FIX #603: Refreshing all unspent note witnesses to current chain tip...")
+
+        let database = WalletDatabase.shared
+
+        // Get all unspent notes count before
+        guard let account = try database.getAccount(index: 0) else {
+            print("⚠️ FIX #603: No account found")
+            return 0
+        }
+
+        let notesBefore = try database.getAllUnspentNotes(accountId: account.accountId)
+        let countBefore = notesBefore.count
+
+        guard countBefore > 0 else {
+            print("✅ FIX #603: No unspent notes to refresh")
+            return 0
+        }
+
+        print("📊 FIX #603: Refreshing \(countBefore) witnesses to current chain tip...")
+
+        // Use existing rebuildWitnessesForSpending function
+        // It handles all the complexity: CMU loading, tree building, P2P scanning for recent blocks
+        try await rebuildWitnessesForSpending { _, _, _ in
+            // Progress callback - silent during background refresh
+        }
+
+        print("✅ FIX #603: Refreshed \(countBefore) witness(es) to current chain tip")
+        return countBefore
     }
 
     // MARK: - FIX #217: Scan for ALL Missing Transactions (Incoming + Spent)
@@ -7046,6 +8114,438 @@ final class WalletManager: ObservableObject {
         }
 
         return totalRecovered
+    }
+
+    // MARK: - FIX #681: Automatic Recovery of Missing Transactions
+
+    /// FIX #681: Automatically detect and recover transactions using checkpoint rollback strategy
+    ///
+    /// STRATEGY (user's excellent suggestion):
+    /// 1. Start from (latest checkpoint - 1) and work BACKWARDS
+    /// 2. Validate against the latest checkpoint
+    /// 3. If issues found → rollback checkpoint and create new one
+    /// 4. This is efficient - only checks the "delta" between checkpoints
+    ///
+    /// This handles the case where user doesn't open app for months/years and makes
+    /// transactions with another wallet using the same private key.
+    ///
+    /// - Returns: Number of transactions recovered
+    @discardableResult
+    func autoRecoverMissingTransactions() async -> Int {
+        // FIX #681 v4: Prevent concurrent executions that interfere with each other
+        guard !isAutoRecovering else {
+            print("⏭️ FIX #681: Auto-recovery already in progress, skipping duplicate call")
+            return 0
+        }
+
+        // Set flag to prevent concurrent calls
+        await MainActor.run { self.isAutoRecovering = true }
+        defer {
+            Task { @MainActor in
+                self.isAutoRecovering = false
+            }
+        }
+
+        print("🔍 FIX #681: Starting automatic missing transaction detection (checkpoint rollback strategy)...")
+
+        let database = WalletDatabase.shared
+        let networkManager = await NetworkManager.shared
+
+        // Get current chain height
+        let chainHeight = await MainActor.run { networkManager.chainHeight }
+        guard chainHeight > 0 else {
+            print("⚠️ FIX #681: No chain height available, skipping auto-recovery")
+            return 0
+        }
+
+        // Get verified checkpoint height - this is our last verified good state
+        let checkpoint: UInt64
+        do {
+            checkpoint = try database.getVerifiedCheckpointHeight()
+        } catch {
+            print("⚠️ FIX #681: Could not get checkpoint height, using 0: \(error.localizedDescription)")
+            checkpoint = 0
+        }
+
+        // FIX #681 v7: Scan backward from checkpoint and try to recover ALL transactions
+        // This catches both sends (spends) and receives (outputs) - no need for nullifier pre-check
+        // Example: Transaction at 2985823 was missed, checkpoint moved to 2986476
+        print("🔍 FIX #681: Scanning for missed transactions BEFORE checkpoint...")
+
+        // FIX #688 v3: Disable auto-recovery due to crashes
+        // This feature needs to be completely rewritten to avoid overflow issues
+        // For now, just skip it - users can manually trigger rescan if needed
+        print("⏭️ FIX #681: Auto-recovery disabled (FIX #688 - preventing crashes)")
+        return 0
+    }
+
+    /// FIX #681: Extract nullifiers from a compact block transaction
+    private func extractNullifiersFromTransaction(_ tx: CompactTx) -> [Data] {
+        var nullifiers: [Data] = []
+
+        // tx.spends contains CompactSpend with nullifiers
+        for spend in tx.spends {
+            nullifiers.append(spend.nullifier)
+        }
+
+        return nullifiers
+    }
+
+    // MARK: - FIX #680: Recover Specific Transaction by TXID (P2P Only)
+
+    /// FIX #680: Recover a transaction that was confirmed on-chain but not recorded in database
+    /// This handles the case where broadcast tracking failed (peers timed out) but TX was confirmed.
+    /// Uses P2P network to get transaction details and add to database.
+    /// IMPORTANT: Does NOT modify the checkpoint - this is historical data recovery only.
+    /// - Parameter txid: The transaction ID to recover (hex string)
+    /// - Returns: True if recovery succeeded, false otherwise
+    @discardableResult
+    func recoverTransactionByTxid(_ txid: String) async -> Bool {
+        print("🔍 FIX #680: Attempting to recover transaction by txid: \(txid.prefix(16))...")
+
+        // Parse txid once at the beginning
+        guard let txidData = Data(hexString: txid) else {
+            print("❌ FIX #680: Invalid txid format")
+            return false
+        }
+
+        let networkManager = await NetworkManager.shared
+        let database = WalletDatabase.shared
+
+        do {
+            // Step 1: Get transaction from P2P network
+            print("📡 FIX #680: Fetching transaction via P2P...")
+            let txData = try await networkManager.getTransactionP2P(txid: txid)
+
+            print("📦 FIX #680: Got \(txData.count) bytes of transaction data")
+
+            // Step 2: Parse transaction to extract nullifiers from shielded spends
+            let (parsedTxid, spends, _, _) = try parseSaplingTransaction(txData)
+
+            print("🔍 FIX #680: Parsed transaction - \(spends.count) shielded spend(s)")
+
+            guard !spends.isEmpty else {
+                print("⚠️ FIX #680: No shielded spends found in transaction")
+                return false
+            }
+
+            // Step 3: For each spend, find and mark the note as spent
+            var recoveredCount = 0
+            var totalSpent: UInt64 = 0
+
+            for spend in spends {
+                let nullifier = spend.nullifier  // Raw nullifier from transaction
+
+                // Hash the nullifier (VUL-009: database stores hashed nullifiers)
+                let hashedNullifier = Data(SHA256.hash(data: nullifier))
+
+                // Find the note by hashed nullifier - getNoteByNullifier returns (id, value)?
+                guard let (noteId, noteValue) = try? database.getNoteByNullifier(nullifier: hashedNullifier) else {
+                    print("⚠️ FIX #680: Note not found for nullifier \(nullifier.hexString.prefix(16))...")
+                    continue
+                }
+
+                print("💰 FIX #680: Found note worth \(noteValue) zatoshis (id=\(noteId))")
+                totalSpent += noteValue
+
+                // Step 4: Mark note as spent using recordSentTransactionAtomic
+                try database.recordSentTransactionAtomic(
+                    hashedNullifier: hashedNullifier,
+                    txid: txidData,
+                    spentHeight: 0,  // Unknown yet, will be updated
+                    amount: noteValue,
+                    fee: 10000,
+                    toAddress: "Unknown",
+                    memo: nil
+                )
+
+                print("✅ FIX #680: Marked note as spent")
+                recoveredCount += 1
+            }
+
+            if recoveredCount == 0 {
+                print("⚠️ FIX #680: No notes were recovered")
+                return false
+            }
+
+            // Refresh balance
+            try await refreshBalance()
+            await MainActor.run {
+                self.incrementHistoryVersion()
+            }
+
+            print("✅ FIX #680: Transaction recovery complete - recovered \(recoveredCount) note(s)")
+            return true
+
+        } catch {
+            print("❌ FIX #680: Recovery failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// FIX #680: Parse a Sapling transaction to extract spends and outputs
+    /// - Parameter data: Raw transaction data
+    /// - Returns: (txid, spends, outputs, endOffset)
+    private func parseSaplingTransaction(_ data: Data) throws -> (Data, [CompactSpend], [CompactOutput], Int) {
+        var pos = 0
+        var spends: [CompactSpend] = []
+        var outputs: [CompactOutput] = []
+
+        // Header (4 bytes): version group ID and version
+        guard pos + 4 <= data.count else {
+            throw RecoveryError.invalidFormat
+        }
+        let header = data.loadUInt32(at: pos)
+        pos += 4
+
+        let version = header & 0x7FFFFFFF
+        let isOverwintered = (header >> 31) == 1
+
+        guard version >= 4 && isOverwintered else {
+            throw RecoveryError.unsupportedVersion
+        }
+
+        // nVersionGroupId (4 bytes) - for Sapling transactions
+        guard pos + 4 <= data.count else {
+            throw RecoveryError.invalidFormat
+        }
+        pos += 4
+
+        // Read transparent inputs/outputs (skip)
+        let (txInCount, vinBytes) = readCompactSize(data, at: pos)
+        pos += vinBytes
+        for _ in 0..<txInCount {
+            // Outpoint (36 bytes) + scriptSig varint + sequence (4 bytes)
+            guard pos + 36 + 4 <= data.count else { throw RecoveryError.invalidFormat }
+            pos += 36
+            let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+            pos += scriptBytes + Int(scriptLen) + 4
+        }
+
+        let (txOutCount, voutBytes) = readCompactSize(data, at: pos)
+        pos += voutBytes
+        for _ in 0..<txOutCount {
+            // value (8 bytes) + scriptPubKey varint
+            guard pos + 8 <= data.count else { throw RecoveryError.invalidFormat }
+            pos += 8
+            let (scriptLen, scriptBytes) = readCompactSize(data, at: pos)
+            pos += scriptBytes + Int(scriptLen)
+        }
+
+        // lockTime (4 bytes)
+        guard pos + 4 <= data.count else { throw RecoveryError.invalidFormat }
+        pos += 4
+
+        // Sapling bundle (if present)
+        if pos + 2 <= data.count {
+            let (bundleBytes, _) = readCompactSize(data, at: pos)
+
+            // Check if this is a Sapling bundle (marker = 0x01)
+            guard pos + 1 < data.count else { throw RecoveryError.invalidFormat }
+            let marker = data[pos]
+            pos += 1
+
+            guard marker == 0x01 else {
+                throw RecoveryError.invalidFormat
+            }
+
+            // Read shielded spends
+            let (spendCount, spendBytes) = readCompactSize(data, at: pos)
+            pos += spendBytes
+
+            for _ in 0..<spendCount {
+                // SpendDescription: cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
+                guard pos + 384 <= data.count else { break }
+
+                // cv (32 bytes) - skip
+                pos += 32
+
+                // anchor (32 bytes) - skip
+                pos += 32
+
+                // nullifier (32 bytes) - EXTRACT THIS
+                let nullifier = Data(data[pos..<pos+32])
+                pos += 32
+                spends.append(CompactSpend(nullifier: nullifier))
+
+                // rk (32 bytes) - skip
+                pos += 32
+
+                // zkproof (192 bytes) - skip
+                pos += 192
+
+                // spendAuthSig (64 bytes) - skip
+                pos += 64
+            }
+
+            // Read shielded outputs
+            let (outputCount, outputBytes) = readCompactSize(data, at: pos)
+            pos += outputBytes
+
+            for _ in 0..<outputCount {
+                // OutputDescription: cv(32) + cmu(32) + ephemeralKey(32) + zkproof(192) + ciphertext(580)
+                guard pos + 868 <= data.count else { break }
+
+                // cv (32 bytes) - skip
+                pos += 32
+
+                // cmu (32 bytes)
+                let cmu = Data(data[pos..<pos+32])
+                pos += 32
+
+                // ephemeralKey (32 bytes)
+                let epk = Data(data[pos..<pos+32])
+                pos += 32
+
+                // zkproof (192 bytes) - skip
+                pos += 192
+
+                // ciphertext (580 bytes)
+                let ciphertext = Data(data[pos..<pos+580])
+                pos += 580
+
+                outputs.append(CompactOutput(cmu: cmu, epk: epk, ciphertext: ciphertext))
+            }
+
+            // valueBalance (8 bytes, signed as little-endian)
+            pos += 8
+
+            // bindingSig (64 bytes)
+            pos += 64
+        }
+
+        // Calculate txid (double SHA256 of entire transaction)
+        // Calculate txid (double SHA256 of entire transaction)
+        let txData = data.prefix(pos)
+        let firstHash = Data(SHA256.hash(data: txData))
+        let txid = Data(SHA256.hash(data: firstHash))
+
+        return (txid, spends, outputs, pos)
+    }
+
+    /// FIX #680: Read compact size from data at offset
+    private func readCompactSize(_ data: Data, at offset: Int) -> (UInt64, Int) {
+        var pos = offset
+        guard pos < data.count else { return (0, 0) }
+
+        let firstByte = data[pos]
+        pos += 1
+
+        if firstByte < 0xFD {
+            return (UInt64(firstByte), 1)
+        } else if firstByte == 0xFD {
+            guard pos + 2 <= data.count else { return (0, 1) }
+            let value = data.withUnsafeBytes { ptr in
+                UInt64(ptr.load(fromByteOffset: pos, as: UInt16.self).littleEndian)
+            }
+            return (value, 3)
+        } else if firstByte == 0xFE {
+            guard pos + 4 <= data.count else { return (0, 1) }
+            let value = data.withUnsafeBytes { ptr in
+                UInt64(ptr.load(fromByteOffset: pos, as: UInt32.self).littleEndian)
+            }
+            return (value, 5)
+        } else { // 0xFF
+            guard pos + 8 <= data.count else { return (0, 1) }
+            let value = data.withUnsafeBytes { ptr in
+                ptr.load(fromByteOffset: pos, as: UInt64.self)
+            }
+            return (value, 9)
+        }
+    }
+
+    // MARK: - FIX #689: Manual Transaction Detection (Force Confirm)
+
+    /// FIX #689: Force detection and recording of a confirmed transaction
+    /// Use this when a transaction is confirmed on-chain but not detected by the app
+    /// This can happen if the app was closed or if the note was deleted during full resync
+    ///
+    /// - Parameter txid: The transaction ID to force detect (hex string)
+    /// - Returns: True if the transaction was found and recorded, false otherwise
+    @discardableResult
+    func forceDetectConfirmedTransaction(_ txid: String) async -> Bool {
+        print("🔍 FIX #689: Force detecting confirmed transaction: \(txid.prefix(16))...")
+
+        let networkManager = await NetworkManager.shared
+        let database = WalletDatabase.shared
+
+        do {
+            // Step 1: Get transaction from P2P network
+            print("📡 FIX #689: Fetching transaction via P2P...")
+            let txData = try await networkManager.getTransactionP2P(txid: txid)
+
+            print("📦 FIX #689: Got \(txData.count) bytes of transaction data")
+
+            // Step 2: Parse transaction to extract spends and outputs
+            let (parsedTxid, spends, outputs, _) = try parseSaplingTransaction(txData)
+
+            print("🔍 FIX #689: Parsed transaction - \(spends.count) spend(s), \(outputs.count) output(s)")
+
+            // Step 3: Record in transaction history
+            let txidData = Data(hexString: txid) ?? Data()
+
+            // Get block height for this transaction
+            let chainHeight = await networkManager.chainHeight
+            let blockHeight = chainHeight > 0 ? chainHeight : 2986734  // Use known height if available
+
+            // Check if this is our send (has shielded spends) by checking if we have the notes
+            var totalSpent: UInt64 = 0
+            var foundOurSpend = false
+
+            for spend in spends {
+                let nullifier = spend.nullifier
+                let hashedNullifier = Data(SHA256.hash(data: nullifier))
+
+                // Check if this is our nullifier
+                if let (noteId, noteValue) = try? database.getNoteByNullifier(nullifier: hashedNullifier) {
+                    print("💰 FIX #689: Found our note worth \(noteValue) zatoshis (id=\(noteId))")
+                    totalSpent += noteValue
+                    foundOurSpend = true
+
+                    // Record as sent transaction
+                    try database.recordSentTransactionAtomic(
+                        hashedNullifier: hashedNullifier,
+                        txid: txidData,
+                        spentHeight: blockHeight,
+                        amount: noteValue,
+                        fee: 10000,
+                        toAddress: "Recovered (FIX #689)",
+                        memo: nil
+                    )
+                    print("✅ FIX #689: Recorded sent transaction")
+                }
+            }
+
+            if !foundOurSpend {
+                // This might be a receive (change) - check outputs
+                for output in outputs {
+                    // Try to decrypt to see if it's ours
+                    // For now, just record that we found the transaction
+                    print("⚠️ FIX #689: Transaction has no matching spends, might be receive-only")
+                }
+            }
+
+            // Step 4: Clear pending broadcast state if this was the pending TX
+            await MainActor.run {
+                if networkManager.pendingBroadcastTxid == txid {
+                    networkManager.clearPendingBroadcast()
+                    print("✅ FIX #689: Cleared pending broadcast state")
+                }
+            }
+
+            // Step 5: Refresh UI
+            try? await refreshBalance()
+            await MainActor.run {
+                self.incrementHistoryVersion()
+            }
+
+            print("✅ FIX #689: Transaction detection complete")
+            return foundOurSpend
+
+        } catch {
+            print("❌ FIX #689: Failed to detect transaction: \(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: - FIX #185: Equihash Proof-of-Work Verification

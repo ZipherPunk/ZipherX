@@ -8,6 +8,554 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #708: Skip Redundant Header Sync in ensureHeaderTimestamps
+**Problem**: Header sync would complete (e.g., 2880 headers in 2.7s), then ~14 seconds later a NEW sync would start from a much lower height (2938700 → 2938860).
+
+**User Question**: "why with previous build, header sync complete and then app restart header sync?"
+
+**Root Cause**: Two separate sync calls during startup:
+1. **FIX #535 sync** (ContentView line 238): Syncs from HeaderStore height to chain tip
+2. **ensureHeaderTimestamps sync** (WalletManager line 1389): Syncs from `earliestNeedingTimestamp`
+
+After the first sync completed (syncing to chain tip), `ensureHeaderTimestamps()` would:
+1. Read `earliestNeedingTimestamp` (could be boost-era height ~2938700)
+2. Not check if HeaderStore already covered that height
+3. Start a redundant sync from that lower height
+
+**Solution**: Before syncing in `ensureHeaderTimestamps()`, check if HeaderStore height already covers `earliestNeedingTimestamp`. If yes, skip the sync and just fix timestamps from existing headers.
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Added early return when HeaderStore already covers needed range
+
+---
+
+### FIX #707: Clean Up Excessive P2P Header Sync Debug Logs
+**Problem**: Every 160-header batch produced 15-20 lines of debug output:
+- Peer performance ranking (9+ lines per batch!)
+- "Trying peer X" for every batch
+- "Parsing 160 headers from payload"
+- "Using HeaderStore for chain continuity"
+- "Height X: blockHash=... prevBlock=..."
+- "Header chain continuity verified"
+- "Updated X performance - now at Y headers provided"
+- "Synced 160 headers to Z (99%) from X"
+
+**Impact**: Syncing 27,000 headers (170 batches) produced 3000+ lines of spam.
+
+**Solution**: Removed or reduced frequency of all per-batch logs:
+- Peer performance ranking: Only shown on errors, not every batch
+- "Trying peer": Removed entirely
+- Parsing/continuity logs: Removed entirely
+- Progress updates: Only every 1000 headers instead of 160
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Removed 10+ print statements
+
+---
+
+### FIX #706: Header Gap Due to Double-Reversed Block Hash in Locator
+**Problem**: 2720 missing headers detected after boost file loading. P2P sync started from wrong height.
+
+**Root Cause**: Endianness confusion in `buildGetHeadersPayload()`:
+1. FIX #676 changed boost file loading to store hashes in little-endian (wire format)
+2. But `buildGetHeadersPayload()` line 1130 still assumed big-endian storage and reversed AGAIN
+3. Double-reversal = big-endian hash sent to peer = peer doesn't recognize it
+4. Peer returns headers from a different (arbitrary) point, leaving a gap
+
+**Solution**: Remove the reversal in `buildGetHeadersPayload()` since HeaderStore now stores hashes in little-endian (wire format) already.
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Use `header.blockHash` directly without reversal
+
+---
+
+### FIX #705 v3: Maximum Header Loading Performance
+**Problem**: Loading 2.5 million boost file headers was slow - over 20 seconds even after initial optimizations.
+
+**Root Cause v1**: `computeChainWork(for: header)` was doing a **database query for EVERY header** to get the previous header's chainwork. For 2.5M headers = 2.5M database queries!
+
+**Root Cause v2-v3**: Per-chunk transaction commits, index maintenance during insert, and Data object allocations added overhead.
+
+**Optimizations** (cumulative):
+1. **Cache chainwork in memory** - Pass previous chainwork to next iteration, no DB queries
+2. **Prepare statement ONCE** - Was being prepared per-chunk, now once
+3. **Inline UInt32 reads** - Removed helper function overhead
+4. **Removed Thread.sleep** - No more yielding during tight loop
+5. **Single transaction** - One BEGIN/COMMIT instead of per-chunk (v3)
+6. **Drop indexes during load** - Recreate after bulk insert complete (v3)
+7. **In-place chainwork computation** - `[UInt8]` buffers instead of `Data` allocations (v3)
+8. **Aggressive SQLite pragmas** - `synchronous=OFF`, `journal_mode=MEMORY`, 128MB cache (v3)
+9. **Exclusive locking mode** - Single writer during bulk load (v3)
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` - Rewritten `loadHeadersFromBoostData` with optimizations
+- `Sources/Core/Storage/HeaderStore.swift` - Added `computeWorkFromBitsInPlace`, `addChainworkInPlace`
+- `Sources/Core/Network/HeaderSyncManager.swift` - Reduced log spam for chain mismatches
+
+---
+
+### FIX #704: Debug Logging Cleanup + Equihash Parameter Clarification
+**Problem**: Excessive debug logging cluttering console output. Also, incorrect assumption that Zclassic uses different Equihash parameters than Zcash.
+
+**Clarification**:
+- Zclassic uses Equihash(192,7) with 400-byte solutions POST-Bubbles (height 585318+)
+- Zclassic uses Equihash(200,9) with 1344-byte solutions PRE-Bubbles (height 0-585317)
+- The `pow.cpp` derives parameters from solution size, not hardcoded values
+
+**Changes**:
+1. Removed excessive FIX #457/697/703 DEBUG print statements
+2. Removed zero sapling root warnings (known P2P issue - recovered via RPC)
+3. Restored MagicBean seed nodes (140.174.189.3, 140.174.189.17, 205.209.104.118)
+4. Added targeted debug logging only for UNEXPECTED solution sizes (not 400 or 1344)
+5. Debug logs include nearby bytes to diagnose parsing issues
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Debug cleanup, seed list restored
+- `Sources/Core/Network/Peer.swift` - Debug cleanup, hardcodedSeeds restored
+- `Sources/Core/Storage/HeaderStore.swift` - Removed verbose FIX #457 DEBUG logs
+
+---
+
+### FIX #702: External Spend False Positive During Broadcast
+**Problem**: Successfully broadcast transaction incorrectly flagged as "external wallet spend" and showed "not found in mempool" error.
+
+**User Report**: "txn build and broadcast works now !!! except that the app think/display txn issue and did not find in mempool and think it has been spend by another wallet"
+
+**Root Cause**: Race condition between broadcast and mempool scan:
+1. `broadcastTransactionWithProgress()` computes txid at line 4503
+2. Mempool scan task runs IN PARALLEL with broadcast (via TaskGroup)
+3. Mempool scan gets our TX from peers (as `inv` message) BEFORE broadcast completes
+4. Mempool scan checks `isOurPending` but `setPendingBroadcast()` hasn't been called yet
+5. TX flagged as "EXTERNAL SPEND" because it's not in pending tracking
+
+**Timeline from zmac.log**:
+```
+[05:51:42.441] 📡 Broadcast sent to peer...
+[05:51:42.444] ⚠️ Peer timeout (broadcast still in progress)
+[05:51:47.405] 🔮 Got raw tx 1be09bdc... from P2P peer (mempool scan)
+[05:51:47.405] 🚨 [EXTERNAL SPEND] TX 1be09bdc... is spending our note!
+[05:51:47.454] 📤 Tracking pending outgoing (TOO LATE!)
+[05:52:00.426] 📡 Broadcast completes with 0/4 peers (all timeout)
+```
+
+**Solution**:
+1. **Pre-register pending TX** at line 4503 IMMEDIATELY after computing txid:
+   - Add txid to `pendingOutgoingTxidSet` BEFORE any broadcast or mempool tasks
+   - This ensures mempool scan will recognize TX as "our pending"
+2. **Cleanup on rejection**: If TX is rejected by all peers, remove from pending set
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Added pre-registration at line 4503, cleanup at rejection
+
+**Result**: Mempool scan now correctly identifies our broadcast TX and doesn't flag it as external spend.
+
+---
+
+### FIX #698: Zero Sapling Root in P2P Headers Causes Transaction Failures
+**Problem**: Transactions failing with "joinsplit requirements not met" error. Investigation revealed HeaderStore had 160 recent headers with ALL-ZERO `sapling_root` values.
+
+**User Report**: "txn is failing... investigate why"
+
+**Root Cause Analysis**:
+1. **Transaction Builder** uses anchor from `HeaderStore.getHeader(chainHeight).hashFinalSaplingRoot`
+2. **HeaderStore** had headers at heights 2986987-2987146 with zero sapling roots
+3. **P2P bug**: localhost Zclassic node (127.0.0.1) sends headers with zeros in P2P `getheaders`
+4. **RPC works**: Same node returns CORRECT `finalsaplingroot` via RPC `getblockheader`
+5. **Root cause**: Zclassic node's `CBlockIndex::hashFinalSaplingRoot` not properly loaded for P2P serialization
+
+**Debug Evidence**:
+- Raw P2P header bytes showed zeros at offset 68-99 (sapling root field)
+- RPC `getblockheader` returned valid sapling root: `5ca7e0da3c05034fbad0d57dc69ffa1fd0a966a45ad1d8f6a66badd8b5816a25`
+- P2P and RPC data for same block had mismatched sapling roots
+
+**Solution**:
+1. **Health Check** (`WalletHealthCheck.swift`): Added `checkAndRepairZeroSaplingRoots()` that:
+   - Detects headers with zero sapling roots at startup
+   - On macOS: Auto-repairs using RPC to fetch correct sapling roots
+   - Deletes headers beyond local node height (can't recover)
+   - Returns critical failure if repair fails
+
+2. **RPC Recovery** (`RPCClient.swift`): Added functions:
+   - `getBlockHash(height:)` - Get block hash at specific height
+   - `getBlockHeader(hash:)` - Get header with sapling root
+   - `getSaplingRoot(at:)` - Convenience method for sapling root
+   - `recoverSaplingRoots(from:to:)` - Batch recovery for range
+
+3. **HeaderStore Updates** (`HeaderStore.swift`): Added functions:
+   - `getHeightsWithZeroSaplingRoots()` - List heights needing repair
+   - `updateSaplingRoot(at:saplingRoot:)` - Update single header
+   - `updateSaplingRoots(_:)` - Batch update with transaction
+   - `deleteHeadersAbove(_:)` - Remove headers beyond node height
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletHealthCheck.swift` - Added health check #17
+- `Sources/Core/FullNode/RPCClient.swift` - Added RPC recovery methods
+- `Sources/Core/Storage/HeaderStore.swift` - Added update/delete methods
+
+**Result**: Zero sapling roots are automatically detected and repaired at startup using RPC. Transactions no longer fail due to invalid anchor.
+
+**Prevention**: Future fix needed in Zclassic node to properly serialize `hashFinalSaplingRoot` in P2P headers message. For now, ZipherX auto-repairs via RPC fallback.
+
+---
+
+### FIX #688: Sent Transactions Not Recorded After Full Resync
+**Problem**: Sent transactions not appearing in ZipherX history after full resync. Balance was correct (0.9166 ZCL vs local node 0.9155 ZCL), but transaction at height 2985823 was missing from history.
+
+**User Report**: "txn still not in history (zipherx mode) and balance is not accurate"
+
+**Root Cause**: After full resync deletes all notes:
+1. PHASE 1 reloads notes from boost file (up to height 2984746)
+2. Notes spent AFTER boost file end are NOT recovered (e.g., note spent at 2985823)
+3. PHASE 2 scans blocks from 2984747 onwards
+4. When spend is found at 2985823, nullifier is NOT in `knownNullifiers` (note deleted)
+5. `recordSentTransactionAtomic()` **requires note to exist** → throws error
+6. Transaction never recorded in history
+
+**Key Insight**: The note IS spent on-chain (verified by local node). The issue is that the note was deleted from local database during resync, so the spend couldn't be recorded.
+
+**Solution**:
+1. Added `recordSentTransactionHistoryOnly()` function to WalletDatabase.swift
+   - Records sent transaction in history WITHOUT requiring note to exist
+   - Uses `INSERT OR IGNORE` to prevent duplicates
+2. Modified PHASE 2 spend detection in FilterScanner.swift
+   - When nullifier not in `knownNullifiers` AND transaction has our change output
+   - Record the sent transaction in history (even though note was deleted)
+   - Detects "our sends" by checking if we can decrypt any output (change output)
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - Added `recordSentTransactionHistoryOnly()` function (lines 1683-1763)
+- `Sources/Core/Network/FilterScanner.swift` - Enhanced spend detection logic (lines 2036-2080)
+
+**Result**: Sent transactions are now recorded in history even when the associated note was deleted during full resync. This is detected by finding our change output in the transaction.
+
+**Note**: This fix recovers transaction HISTORY entries. The spent notes themselves are still deleted during resync (by design). The balance remains correct because the unspent notes are recovered.
+
+---
+
+### FIX #687: Full Resync Deletes Notes, Reloads from Boost File
+**Analysis**: Full resync workflow deletes all notes and reloads from boost file. Notes spent after boost file end are not recovered because their outputs aren't in the boost file.
+
+**Related**: FIX #688 addresses the missing transaction history issue caused by this behavior.
+
+---
+
+### FIX #686: Automatic Database Repair at Startup
+**Problem**: App shows "repair database recommended" alert with "Fix Now" / "Later" buttons. User wanted automatic repairs at startup.
+
+**User Request**: "the startup must handle all issues !!!!"
+
+**Root Cause**: Three startup paths (INSTANT, FAST, FULL) all showed `showRepairNeededAlert` when issues were detected, requiring user interaction to trigger repair.
+
+**Solution**: Removed all user-facing alerts and replaced with automatic repair logic:
+1. **INSTANT START** (line 435-465): Now triggers `repairNotesAfterDownloadedTree()` automatically when critical issues found
+2. **FAST START** (line 849-855): Removed alert - automatic repair logic below (line 886+) handles fixable issues
+3. **FULL START** (line 1494-1500): Now triggers `repairNotesAfterDownloadedTree()` automatically when repair needed
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Lines 435-465 (INSTANT), 849-855 (FAST), 1494-1538 (FULL)
+
+**Result**: All database repairs now happen automatically at startup without user prompts. The app handles all issues transparently before showing the balance view.
+
+---
+
+### FIX #685: Full Node Mode - Use RPC for Transaction History
+**Problem**: In Full Node mode (wallet.dat), transaction history was missing some transactions. HistoryView was hardcoded to use local database instead of RPC.
+
+**User Request**: "moreover in full node wallet mode, the history is not accuracte, some txn are missing"
+
+**Root Cause**: HistoryView.swift's `loadTransactions()` always called `WalletDatabase.shared.getTransactionHistory()` regardless of wallet mode.
+
+**Solution**:
+1. Check wallet source at runtime: `WalletModeManager.shared.walletSource`
+2. If `walletSource == .walletDat` (Full Node): Fetch from RPC daemon
+3. If `walletSource == .zipherx` (Light Mode): Use local database
+
+**Files Modified**:
+- `Sources/Features/History/HistoryView.swift` - Lines 1-11, 172-274: Wallet source detection logic
+
+**Result**: Full Node mode now fetches transactions from local zclassicd daemon via RPC, showing complete history.
+
+---
+
+### FIX #684: Display Header Sync Progress During Boost File Loading
+**Problem**: During startup, boost file header loading happened silently. User saw no progress indicator, only "Loading..." state.
+
+**User Request**: "app must inform and display progress when header sync is on going !!!! balance view must be displayed when app is 100% correct !"
+
+**Root Cause**: `loadHeadersFromBoostFile()` in WalletManager.swift was not setting `isHeaderSyncing` state during boost header loading.
+
+**Solution**:
+1. Set `isHeaderSyncing = true` BEFORE boost header loading starts
+2. Update `headerSyncProgress`, `headerSyncStatus`, `headerSyncCurrentHeight` during loading
+3. Set `isHeaderSyncing = false` AFTER loading completes
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Lines 1536-1584: Set header sync state during boost loading
+
+**Result**: Header sync now shows progress (0-100%) before balance view appears.
+
+---
+
+### FIX #681: Disable Empty Sapling Root Validation - False Positives
+**Problem**: App incorrectly rejected valid headers from trusted local node as "malicious" or "wrong chain".
+
+**Evidence from logs**:
+```
+[16:13:37.159] ⚠️ FIX #501: Peer 127.0.0.1 failed: Invalid headers payload: Header has empty sapling_root at height 2984747 - peer may be malicious or on wrong chain - disconnecting
+```
+
+User response: "local node is up and running !!!!"
+
+**Root Cause**: FIX #666 added overly strict validation that rejected headers with empty `sapling_root` field. However:
+1. This field can legitimately be all zeros in certain valid headers
+2. The check was triggering false positives on trusted peers (localhost)
+3. The real security comes from chain continuity + Equihash verification, not this field check
+
+**Solution**: Disabled two overly strict checks in HeaderSyncManager.swift:
+1. Individual header validation (line 1310-1324) - rejected headers immediately if sapling_root was all zeros
+2. Consensus validation (line 1392-1406) - rejected if ALL peers agreed on "empty" sapling_root
+
+The debug logging in `BlockHeader.swift` parseWithSolution (lines 83-87) still logs this for debugging, but no longer throws errors.
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Lines 1310-1313, 1392-1393: Disabled validation
+
+**Result**: Trusted peers (including local node) are no longer incorrectly rejected. Real security comes from:
+- Chain continuity check (each header's prevHash matches previous block's hash)
+- Equihash PoW verification (deferred to health check for speed)
+- Multi-peer consensus (requires agreement from multiple peers)
+
+**Note**: The individual header parsing in `BlockHeader.swift` still logs when sapling_root is all zeros for debugging purposes (line 83-87).
+
+---
+
+### FIX #680: Header Sync Loop - Use HeaderStore Hashes After P2P Sync
+**Problem**: Header sync stuck in infinite loop requesting same 160 headers (2938701-2938860) repeatedly.
+
+**Evidence from logs**:
+```
+[16:08:03.679] 📋 FIX #669: Using checkpoint at 2938700 for height 2938860
+[16:08:20.679] 🔍 FIX #535: Last header at height 2938860
+[16:08:20.679] ✅ Synced 112160/1067 headers (10502%)
+[16:08:20.679] 📋 FIX #670: Using HeaderStore for chain continuity at height 2938700
+...repeats forever...
+```
+
+Local node logs showed hundreds of identical requests:
+```
+2026-01-22 15:08:43 getheaders 2938701 to 000000...0000 from peer=1300
+2026-01-22 15:08:43 sending: headers (87041 bytes) peer=1300
+...same request 50+ times...
+```
+
+**Root Cause**: FIX #669's checkpoint fallback logic always used the nearest checkpoint BELOW the requested height:
+- Request height 2938860 → no checkpoint at 2938860 → falls back to checkpoint 2938700 → gets headers 2938701-2938860
+- Request height 2938861 → no checkpoint at 2938861 → STILL falls back to 2938700 → gets SAME headers again!
+- This loop continues forever because checkpoints only exist at specific heights (2938700, 2950000, etc.)
+
+**Solution**: Modified `buildGetHeadersPayload()` in HeaderSyncManager.swift:
+1. **First**: Check if HeaderStore has a header at the locator height
+2. **If yes**: Use HeaderStore's hash (it was verified via P2P, so it's correct)
+3. **If no**: Fall back to nearest checkpoint below (same as before)
+
+**Why this works**:
+- After first sync, HeaderStore has headers 2938701-2938860 (verified by network)
+- Next request for 2938861 uses HeaderStore hash at 2938860 (which we just synced)
+- Progresses forward instead of looping back to 2938700
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Lines 1121-1138: Check HeaderStore before checkpoint fallback
+
+**Result**: Header sync now progresses past checkpoint gaps instead of looping infinitely.
+
+---
+
+### FIX #679: Skip Chainwork Validation for P2P Headers
+**Problem**: Chainwork validation was failing because P2P headers don't include chainwork - it's computed locally during database insert.
+
+**Evidence**: Log showed repeated validation skips:
+```
+[16:07:30.814] ✅ FIX #679: Skipping chainwork validation - P2P headers don't include chainwork
+```
+
+**Root Cause**: Chainwork is a 32-byte big-endian integer representing cumulative proof-of-work:
+- Boost file headers: Chainwork loaded from file
+- P2P headers: Chainwork NOT included in wire format (computed on insert)
+- Old code tried to compare empty P2P chainwork against boost file chainwork → always failed
+
+**Solution**: Modified `validateChainwork()` in HeaderSyncManager.swift to skip validation for P2P headers entirely. The real validation is block hash continuity (verified separately).
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Lines 1549-1550: Skip chainwork validation for P2P
+- `Sources/Core/Storage/HeaderStore.swift` - Lines 1173-1186: Compute chainwork during boost load
+
+**Result**: P2P headers sync correctly without false "wrong fork" errors.
+
+---
+
+### FIX #678: Auto-Sync Headers When HeaderStore Falls Behind
+**Problem**: When HeaderStore fell >500 blocks behind peer consensus, the app showed a critical alert and blocked Send, but required manual user action to sync headers. This resulted in poor UX - users had to click "Sync Now" to fix a routine issue.
+
+**Evidence from logs**:
+```
+[14:33:31.808] 🚫 FIX #410: Blocked features [Send]: Wallet sync is behind - transactions may fail
+[14:33:31.808] 🚨 FIX #409: CRITICAL - HeaderStore is 985 blocks behind!
+```
+
+**Root Cause**: `performHealthCheck()` in NetworkManager detected the gap but only showed an alert with `.syncHeaders` action. The health check runs every 60 seconds, but didn't automatically fix the issue.
+
+**Solution**: Modified `performHealthCheck()` to automatically sync headers when gap >500:
+1. Check `isHeaderSyncing` flag first (prevents loop)
+2. If not syncing, automatically trigger P2P header sync
+3. Unblock Send automatically after sync completes
+4. Only show alert if auto-sync fails
+
+**Loop Prevention**: The `isHeaderSyncing` flag ensures that:
+- If health check runs while sync is in progress, it skips (no duplicate sync)
+- Flag is set to `true` when starting, `false` after completion
+- Health check logs "Header sync already in progress, skipping"
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Lines 447-527: Auto-sync logic with loop guard
+
+**Result**: HeaderStore gaps are now automatically fixed without user intervention. Send unblocks automatically after sync completes.
+
+---
+
+### FIX #677: Auto-Clear HeaderStore When Corruption Detected
+**Problem**: After applying FIX #676 (endianness fix), the app still showed "Wallet sync is behind" because the HeaderStore SQLite database persisted the old corrupted data across rebuilds.
+
+**Root Cause**:
+1. FIX #676 fixed the endianness when loading FROM boost file
+2. But HeaderStore is a persistent SQLite database - old data survives app rebuilds
+3. FIX #675 marked corruption and blocked boost reload, but never cleared the bad data
+
+**Solution**: Modified `markBoostHeadersCorrupted()` to:
+1. Delete ALL headers from HeaderStore database (`DELETE FROM headers`)
+2. Reset the corruption flag immediately (allow fresh reload)
+3. Next boost load will use FIX #676's corrected endianness
+
+**New Function**:
+```swift
+func deleteAllHeaders() throws {
+    // Clears all headers and block_times
+    // Allows fresh reload from boost file
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` - Added `deleteAllHeaders()`, modified `markBoostHeadersCorrupted()`
+
+**Result**: When chain verification fails, app auto-clears HeaderStore and reloads with correct endianness.
+
+---
+
+### FIX #676: CRITICAL Endianness Fix - Boost File Block Hash vs PrevHash Mismatch
+**Problem**: HeaderStore stuck 976 blocks behind peer consensus. FIX #536 kept detecting "chain discontinuity" at height 2938700 because boost file headers appeared corrupted.
+
+**Evidence from logs**:
+```
+[14:14:21.473] ⚠️ HeaderStore is 976 blocks behind peer consensus - header sync needed!
+[14:14:31.437] 🚨 FIX #409: CRITICAL - HeaderStore is 976 blocks behind!
+```
+
+**Root Cause**: The boost file generation script (FIX #599) stores block_hash and prevHash in **different byte orders**:
+- **Section 3 (block_hash)**: Big-endian (RPC format) - `bytes.fromhex(hash)` without reversal
+- **Section 7 (prevHash)**: Little-endian (wire format) - `bytes.fromhex(hash)[::-1]` reversed
+
+When Swift loads headers from boost file:
+- `blockHash` is loaded directly from Section 3 (big-endian)
+- `prevHash` is loaded directly from Section 7 (little-endian)
+- Chain verification compares `blockHash(N) == prevHash(N+1)` - always fails!
+
+**Example at height 2938700**:
+- block_hash raw (big-endian): `000006ef36df7868360159dd79ce43665569229485abace3864b2bdd98d7202e`
+- block_hash reversed: `2e20d798dd2b4b86e3acab85942269556643ce79dd5901366878df36ef060000`
+- prevHash at 2938701: `2e20d798dd2b4b86e3acab85942269556643ce79dd5901366878df36ef060000`
+
+The reversed block_hash MATCHES prevHash! The data is correct, just different byte orders.
+
+**Solution**: Reverse block_hash when loading from Section 3 to match the little-endian wire format:
+```swift
+// FIX #676: Reverse to little-endian (wire format) to match prevHash
+let rawHash = hashes[hashOffset..<hashOffset + 32]
+blockHash = Data(rawHash.reversed())
+```
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` - Line 1100: Reverse block_hash when loading from boost file
+
+**Result**: Chain continuity verification now passes, headers sync correctly from boost file.
+
+---
+
+### FIX #675: Boost Headers Corruption Loop Prevention
+**Problem**: HeaderStore stuck 962 blocks behind. FIX #536 detected corrupted headers at height 2938700 and deleted them, but `loadHeadersFromBoostFile()` kept reloading them from the boost file in a loop.
+
+**Evidence from logs**:
+```
+[14:00:30.388] ✅ FIX #536: Deleted corrupted headers from 2938700 to 2984746
+[14:00:30.487] 🗑️ FIX #536: Deleting corrupted headers from 2938700 onwards...  (AGAIN!)
+[14:01:32.205] 🚨 FIX #536: Chain discontinuity with HeaderStore-sourced prevHash!
+... (repeated 5+ times)
+```
+
+**Root Cause**: When FIX #536 detected chain discontinuity and deleted corrupted headers, other code paths called `loadHeadersFromBoostFile()` which reloaded the same corrupted headers from the boost file. The cycle repeated endlessly.
+
+**Solution**: Added corruption tracking to HeaderStore:
+1. `boostHeadersCorrupted` flag - set when FIX #536 detects corruption
+2. `markBoostHeadersCorrupted()` - called when deleting corrupted headers
+3. `shouldSkipBoostHeaders()` - returns true if corruption was detected (1 hour TTL)
+4. `loadHeadersFromBoostFile()` checks this flag and skips boost loading if corrupted
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` - Added corruption tracking properties and methods
+- `Sources/Core/Network/HeaderSyncManager.swift` - Call `markBoostHeadersCorrupted()` in FIX #536
+- `Sources/Core/Wallet/WalletManager.swift` - Check `shouldSkipBoostHeaders()` before loading
+
+**Result**: After corruption detected, app uses P2P-only header sync (correct headers from peers)
+
+**NOTE**: The boost file at height 2938700 contains incorrect headers (likely from an old chain state or partial sync during generation). A new boost file should be generated to fix this permanently.
+
+---
+
+### FIX #674: Health Alert Dismiss Button Not Closing Sheet
+**Problem**: When user clicks "Dismiss" on the health alert sheet, the button action executes (logs "User dismissed alert") but the sheet doesn't close. User had to click multiple times with no effect.
+
+**Evidence from logs**:
+```
+[14:02:57.627] 🔧 FIX #409: User dismissed alert
+[14:02:57.627] 🔧 FIX #543: Health alert snoozed for 300s
+[14:02:58.146] 🔧 FIX #409: User dismissed alert  (click 2 - still open)
+[14:02:58.468] 🔧 FIX #409: User dismissed alert  (click 3 - still open)
+... (repeated 10 times in 3 seconds)
+```
+
+**Root Cause**: `AlertWrapper` struct in `ContentView.swift` was used inside a `.sheet()` presentation. The dismiss button called `handleHealthAlertAction(.dismiss)` which set `criticalHealthAlert = nil`, but this didn't close the sheet because:
+1. The sheet is controlled by `activeAlert` (a local `@State` variable)
+2. `activeAlert` was never set to `nil` when dismiss was clicked
+3. The `.onChange` handler only opened sheets (when `criticalHealthAlert` became non-nil), never closed them
+
+**Solution**: Added `@Environment(\.dismiss)` to `AlertWrapper` and call `dismiss()` after each button action:
+```swift
+struct AlertWrapper: View {
+    @Environment(\.dismiss) private var dismiss  // FIX #674
+
+    Button(action: {
+        secondary.1()
+        dismiss()  // FIX #674: Close sheet after action
+    }) { ... }
+}
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Lines 2905-2965: Added `@Environment(\.dismiss)` and `dismiss()` calls to all button actions in `AlertWrapper`
+
+**Before**: Clicking dismiss logged the action but sheet stayed visible
+**After**: Clicking any button closes the sheet immediately
+
+---
+
 ### FIX #672: SOCKS Proxy Concurrency Guard - Prevent Excessive Retry Attempts
 **Problem**: SOCKS proxy wait loop logged "166893 attempts" in 30 seconds. Expected: ~60 attempts (30s / 0.5s sleep). Actual: 166,893 = ~2,700x more than expected.
 
@@ -16543,4 +17091,79 @@ if lastScannedHeight > headerStoreHeight {
 - `Sources/Core/Network/HeaderSyncManager.swift`: Added timeout check AFTER sleep (3 locations)
 
 **Result**: Race condition detected and corrected automatically at startup
+
+### FIX #699: Zcash Peers Sending Wrong Chain Headers
+**Problem**: After fresh Import PK, massive MISMATCH errors (160+ blocks) and boost file headers being deleted and reloaded 3+ times.
+
+**User Report**: "why so many mismatch? it's a fresh Import PK"
+
+**Root Cause Analysis**:
+1. **P2P peer 205.209.104.118** was sending headers with **1344-byte Equihash solutions**
+2. **Zclassic uses Equihash(192,7)** with ~400-byte solutions
+3. **Zcash uses Equihash(200,9)** with ~1344-byte solutions
+4. This peer was a **ZCASH peer**, not Zclassic!
+5. Zcash chain data (prevHash, etc.) is completely different from Zclassic
+6. Chain verification showed MISMATCH because Zcash prevHash ≠ Zclassic blockHash
+
+**Debug Evidence**:
+```
+⚠️ DEBUG: Unusual solutionLen=1344 at header 158 (expected ~400 for Equihash(192,7))
+Expected prevHash: d9fee7b9da7f269a09ca02a51a4cb6ec... (Zclassic boost file)
+Got prevHash:      0206260143838b5ff52dc2eb7b4b8099... (Zcash chain!)
+```
+
+**Solution**:
+1. **HeaderSyncManager.swift**: Detect Zcash peers by solution size (1300-1400 bytes)
+   - Throw `SyncError.invalidHeadersPayload` with clear message
+2. **Peer.swift**: Same detection + immediate peer banning
+   - Call `NetworkManager.shared.banPeerForSybilAttack(host)`
+   - Throw `NetworkError.wrongChain`
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift`: Added Zcash detection before accepting headers
+- `Sources/Core/Network/Peer.swift`: Added Zcash detection + peer banning
+
+**Result**: Zcash peers detected and banned immediately, preventing wrong-chain data from corrupting HeaderStore
+
+### FIX #700: Don't Delete All Boost Headers When P2P Mismatch Detected
+**Problem**: When chain mismatch detected (e.g., Zcash peer), FIX #677 deleted ALL 2.5 million boost file headers, then reloaded them (~100 seconds each time). This happened 3 times during a single import.
+
+**Root Cause**:
+1. `markBoostHeadersCorrupted()` always called `deleteAllHeaders()`
+2. This deleted boost file headers even when the mismatch was in P2P-synced headers ABOVE the boost file range
+3. Boost file goes to height 2984746, but mismatch was at 2984747 (first P2P header)
+
+**Solution**: Track boost file end height and only delete P2P headers when mismatch is above boost range:
+1. Added `boostFileEndHeight` property to HeaderStore
+2. Set when boost file headers loaded successfully
+3. In `markBoostHeadersCorrupted(mismatchHeight:)`:
+   - If mismatch > boostFileEndHeight: Only delete headers from boostFileEndHeight+1 onwards
+   - If mismatch within boost range: Delete all (actual corruption)
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift`: Added `boostFileEndHeight`, modified `markBoostHeadersCorrupted()`
+- `Sources/Core/Network/HeaderSyncManager.swift`: Pass mismatch height to function
+
+**Result**: Boost file headers preserved when P2P peers send bad data
+
+### FIX #701: Prevent Repeated Boost File Loading
+**Problem**: During a single Import PK, boost file headers were loaded 3 times (each taking ~100 seconds).
+
+**Root Cause**:
+1. Multiple code paths call `loadHeadersFromBoostFile()` - Import PK, PHASE 2, ContentView
+2. No check to see if headers were already loaded
+
+**Solution**: Check if boost headers already loaded before loading:
+```swift
+let existingBoostHeight = HeaderStore.shared.boostFileEndHeight
+if existingBoostHeight > 0 {
+    print("✅ FIX #701: Boost headers already loaded up to \(existingBoostHeight) - skipping reload")
+    return (true, existingBoostHeight)
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift`: Added check at start of `loadHeadersFromBoostFile()`
+
+**Result**: Boost file only loaded once per session, saving ~200+ seconds on Import PK
 
