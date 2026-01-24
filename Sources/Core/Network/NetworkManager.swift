@@ -6015,9 +6015,18 @@ public final class NetworkManager: ObservableObject {
     /// All peers work in PARALLEL for maximum throughput
     /// Returns: [(height, blockHash, timestamp, txData)]
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        // Ensure at least some peers are connected before checking
-        // This prevents race condition where peers are reconnecting
-        var availablePeers = peers.filter { $0.isConnectionReady }
+        // FIX #715: Better peer selection - check both connection state AND recent activity
+        // Peers can show isConnectionReady=true but still be dead (TCP state lag)
+        // hasRecentActivity is more reliable - means peer responded recently
+        var availablePeers = peers.filter { $0.isConnectionReady && $0.hasRecentActivity }
+
+        // FIX #715: If no peers with recent activity, fall back to just connection ready
+        if availablePeers.isEmpty {
+            availablePeers = peers.filter { $0.isConnectionReady }
+        }
+
+        // FIX #715: SHUFFLE peers to avoid always picking same (possibly bad) ones first
+        availablePeers.shuffle()
 
         if availablePeers.isEmpty && !peers.isEmpty {
             // No ready peers but we have peers - try to reconnect them

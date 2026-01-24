@@ -2286,14 +2286,36 @@ public final class Peer {
             throw NetworkError.notConnected
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
+        // FIX #714: Check connection state before sending
+        // If connection is cancelled/failed, completion handler may never be called
+        // causing "continuation leaked" error
+        guard connection.state == .ready else {
+            throw NetworkError.notConnected
+        }
+
+        // FIX #714: Add timeout to prevent continuation leak
+        // If completion handler is never called (cancelled connection), timeout fires
+        return try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    })
                 }
-            })
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: 10_000_000_000)  // 10 second timeout
+                throw NetworkError.timeout
+            }
+
+            // Return when first task completes (or throws)
+            try await group.next()
+            group.cancelAll()
         }
     }
 
@@ -2302,16 +2324,38 @@ public final class Peer {
             throw NetworkError.notConnected
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else if let data = data {
-                    continuation.resume(returning: data)
-                } else {
-                    continuation.resume(throwing: NetworkError.timeout)
+        // FIX #714: Check connection state before receiving
+        guard connection.state == .ready else {
+            throw NetworkError.notConnected
+        }
+
+        // FIX #714: Add timeout to prevent continuation leak
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                        } else if let data = data {
+                            continuation.resume(returning: data)
+                        } else {
+                            continuation.resume(throwing: NetworkError.timeout)
+                        }
+                    }
                 }
             }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000)  // 30 second timeout for receive
+                throw NetworkError.timeout
+            }
+
+            // Return when first task completes
+            if let result = try await group.next() {
+                group.cancelAll()
+                return result
+            }
+            throw NetworkError.timeout
         }
     }
 
@@ -2637,6 +2681,18 @@ public final class Peer {
                     break
                 }
                 offset += varintSize
+
+                // Zclassic post-Bubbles uses Equihash(192,7) with 400-byte solutions
+                // Pre-Bubbles uses Equihash(200,9) with 1344-byte solutions
+                // Debug: Log unexpected solution sizes to diagnose parsing bugs
+                if solutionLen != 400 && solutionLen != 1344 {
+                    let rawOffset = offset - varintSize
+                    let nearbyBytes = response[max(0, rawOffset - 4)..<min(response.count, rawOffset + 10)]
+                    let hexBytes = nearbyBytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+                    print("🔍 DEBUG Peer[\(host)]: Unexpected solutionLen=\(solutionLen) at header \(headers.count)")
+                    print("   varintSize=\(varintSize), offset=\(offset), response.count=\(response.count)")
+                    print("   Nearby bytes: \(hexBytes)")
+                }
 
                 // Read solution
                 guard offset + solutionLen <= response.count else { break }
@@ -3652,8 +3708,6 @@ public final class Peer {
 
         // Debug: print payload hex
         let payloadHex = payload.map { String(format: "%02x", $0) }.joined()
-        print("🧅 DEBUG addrv2 payload (\(payload.count) bytes): \(payloadHex)")
-
         // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
         try await withExclusiveAccess {
             // Send addrv2 message
