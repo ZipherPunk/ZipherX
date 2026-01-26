@@ -1174,7 +1174,9 @@ struct ContentView: View {
                             // FIX #557 v8: Rebuild all stale witnesses BEFORE showing UI!
                             // This ensures when the balance is shown, all witnesses are current
                             // and transactions can be built instantly without rejection.
+                            // FIX #770: witness_sync task now included in FAST START progress calculation
                             print("🔄 FIX #557 v8: Rebuilding stale witnesses before showing UI...")
+                            print("🔄 FIX #770: Adding witness_sync task to FAST START progress")
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
                                 walletManager.syncTasks.append(SyncTask(id: "witness_sync", title: "Sync Merkle witnesses", status: .inProgress, progress: 0.0))
@@ -2084,8 +2086,16 @@ struct ContentView: View {
                     tasks.append(contentsOf: coreTasks)
                 }
             } else {
-                // FAST START: show fast_* tasks only
-                let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+                // FIX #770: FAST START - include fast_* tasks PLUS additional repair/sync tasks
+                // Previous bug: witness_sync, balance_repair, tree_rebuild etc. were not included
+                // causing progress to show ~83% when these tasks were running
+                let fastStartTaskIds: Set<String> = [
+                    "witness_sync", "balance_repair", "balance_repair_early",
+                    "tree_rebuild", "instant_repair", "fast_repair"
+                ]
+                let fastTasks = walletManager.syncTasks.filter { task in
+                    task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)
+                }
                 if !fastTasks.isEmpty {
                     tasks.append(contentsOf: fastTasks)
                 }
@@ -2258,8 +2268,16 @@ struct ContentView: View {
                     tasks.append(contentsOf: coreTasks)
                 }
             } else {
-                // FAST START: show fast_* tasks only
-                let fastTasks = walletManager.syncTasks.filter { $0.id.hasPrefix("fast_") }
+                // FIX #770: FAST START - include fast_* tasks PLUS additional repair/sync tasks
+                // Previous bug: witness_sync, balance_repair, tree_rebuild etc. were not displayed
+                // and not counted in progress, causing progress to show ~83% when these tasks were running
+                let fastStartTaskIds: Set<String> = [
+                    "witness_sync", "balance_repair", "balance_repair_early",
+                    "tree_rebuild", "instant_repair", "fast_repair"
+                ]
+                let fastTasks = walletManager.syncTasks.filter { task in
+                    task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)
+                }
                 if !fastTasks.isEmpty {
                     tasks.append(contentsOf: fastTasks)
                 }

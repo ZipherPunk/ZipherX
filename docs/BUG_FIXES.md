@@ -8,6 +8,39 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #770: FAST START Progress Stuck at ~83% During Witness Sync
+**Problem**: App stuck at 83% overall progress while header sync shows 99%. Progress doesn't complete even though startup tasks are running.
+
+**Root Cause Analysis**:
+1. In FAST START mode, `currentSyncProgress` and `currentSyncTasks` only include tasks with `fast_*` prefix
+2. But several tasks added during FAST START don't have this prefix:
+   - `witness_sync` - added at line 1180 for witness rebuild
+   - `balance_repair` / `balance_repair_early` - for transaction history rebuild
+   - `tree_rebuild` - for commitment tree rebuild
+   - `instant_repair` - for automatic repair
+3. These tasks were running but NOT counted in progress calculation
+4. Progress showed ~83% because only fast_* tasks were counted
+
+**Log Evidence** (before fix):
+```
+✅ FAST START: All health checks passed! (100% complete)
+🔄 FIX #557 v8: Rebuilding stale witnesses before showing UI...
+[Progress bar shows 83% - stuck here while witness_sync runs]
+[UI shows "Finalizing startup..." but witness_sync task not visible]
+```
+
+**Solution**:
+1. Added `fastStartTaskIds` set containing additional FAST START task IDs
+2. Modified filter in both `currentSyncProgress` and `currentSyncTasks`:
+   - Old: `task.id.hasPrefix("fast_")`
+   - New: `task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)`
+3. Task IDs added: `witness_sync`, `balance_repair`, `balance_repair_early`, `tree_rebuild`, `instant_repair`, `fast_repair`
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - `currentSyncProgress` and `currentSyncTasks` computed properties
+
+---
+
 ### FIX #769: False "Sync lag detected: 2403174" from HeaderStore Lag
 **Problem**: Team orchestrator monitoring script reports massive false sync lag (e.g., "Sync lag detected: 2990268" or "2403174") when HeaderStore is empty/stale during normal startup.
 
