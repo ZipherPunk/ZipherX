@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-FIX #546: Anchor Verification Script
+Zcash Sapling Anchor Verification Script (FIXED)
 
-This script tests that witness anchors match blockchain headers at their respective heights.
-It verifies the fix for the anchor mismatch bug where all witnesses had the same final anchor.
+CRITICAL: In Zcash Sapling, ALL witnesses should have the SAME anchor - the CURRENT tree root!
+A witness is a Merkle path from the note's CMU position to the CURRENT tree root.
+
+When you build a transaction, you need the witness to point to the current tree state,
+so the transaction can be verified against the current blockchain.
+
+This script verifies that all witnesses have been updated to the current tree root.
 """
 
 import sqlite3
@@ -55,6 +60,9 @@ def normalize_anchor(anchor: str) -> str:
 def verify_anchors() -> Tuple[int, int, List[dict]]:
     """Verify that witness anchors match blockchain headers.
 
+    CRITICAL: In Zcash Sapling, ALL witnesses should have the SAME anchor - the CURRENT tree root!
+    A witness is a Merkle path from note position to CURRENT tree root, NOT historical root.
+
     Returns:
         (total_notes, matching_notes, mismatches)
     """
@@ -66,39 +74,50 @@ def verify_anchors() -> Tuple[int, int, List[dict]]:
 
     print(f"📝 Found {len(notes)} unspent notes with anchors")
 
-    # Get sapling roots from headers database
-    heights = [note[1] for note in notes]
-    sapling_roots = get_sapling_roots(heights)
+    # Get CURRENT (latest) sapling root from headers database
+    conn = sqlite3.connect(HEADERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT height, hex(sapling_root) FROM headers ORDER BY height DESC LIMIT 1")
+    result = cursor.fetchone()
+    conn.close()
+
+    if not result:
+        print("❌ No headers found in database!")
+        return 0, 0, []
+
+    current_height, current_root = result
+    print(f"📊 Current chain height: {current_height}")
+    print(f"📊 Current tree root: {current_root[:16]}...")
+
+    # All witnesses should have the same anchor - the CURRENT tree root
+    current_root_norm = normalize_anchor(current_root)
 
     mismatches = []
     matching = 0
 
     for note_id, height, witness_anchor in notes:
-        # Get sapling root from headers database
-        header_root = sapling_roots.get(height)
-
-        if not header_root:
-            print(f"⚠️  Height {height}: No header found")
-            continue
-
-        # Normalize both to uppercase for comparison
+        # Normalize witness anchor to uppercase for comparison
         witness_anchor_norm = normalize_anchor(witness_anchor)
-        header_root_norm = normalize_anchor(header_root)
 
-        # Compare
-        if witness_anchor_norm == header_root_norm:
+        # Compare against CURRENT tree root (not note's height!)
+        if witness_anchor_norm == current_root_norm:
             matching += 1
-            print(f"✅ Height {height}: MATCH ({witness_anchor_norm[:16]}...)")
+            if matching <= 5:  # Only print first 5 to avoid spam
+                print(f"✅ Note {note_id} (height {height}): MATCH ({witness_anchor_norm[:16]}...)")
         else:
             mismatches.append({
                 'note_id': note_id,
                 'height': height,
                 'witness_anchor': witness_anchor_norm,
-                'header_root': header_root_norm
+                'current_root': current_root_norm,
+                'current_height': current_height
             })
-            print(f"❌ Height {height}: MISMATCH!")
-            print(f"   Witness: {witness_anchor_norm[:16]}...")
-            print(f"   Header:  {header_root_norm[:16]}...")
+            print(f"❌ Note {note_id} (height {height}): MISMATCH!")
+            print(f"   Witness anchor: {witness_anchor_norm[:16]}...")
+            print(f"   Current root:  {current_root_norm[:16]}... (height {current_height})")
+
+    if matching > 5:
+        print(f"   ... and {matching - 5} more matches")
 
     return len(notes), matching, mismatches
 
@@ -111,45 +130,39 @@ def analyze_mismatches(mismatches: List[dict]) -> None:
     print("🔍 MISMATCH ANALYSIS")
     print("="*70)
 
-    # Check if all witnesses have the same anchor (the bug!)
-    anchors = [m['witness_anchor'] for m in mismatches]
-    unique_anchors = set(anchors)
+    # Group mismatched notes by their witness anchor
+    anchors = {}
+    for m in mismatches:
+        anchor = m['witness_anchor']
+        if anchor not in anchors:
+            anchors[anchor] = []
+        anchors[anchor].append(m)
 
-    if len(unique_anchors) == 1:
-        print(f"\n❌ BUG CONFIRMED: All {len(mismatches)} witnesses have the SAME anchor!")
-        print(f"   Anchor: {anchors[0][:16]}...")
-        print("\n   This means witnesses are being created with the FINAL tree root")
-        print("   instead of their position-specific tree root.")
+    print(f"\n❌ Found {len(mismatches)} witnesses with stale anchors")
+    print(f"   {len(anchors)} different stale anchor(s) detected")
 
-        # Find which height this anchor belongs to
-        print("\n   Finding which height this anchor actually belongs to...")
+    for anchor, notes in anchors.items():
+        print(f"\n   Stale anchor: {anchor[:16]}...")
+        print(f"   Affects {len(notes)} note(s)")
+        # Show a few sample heights
+        sample_heights = [n['height'] for n in notes[:3]]
+        print(f"   Sample heights: {sample_heights}...")
+        if len(notes) > 3:
+            print(f"   ... and {len(notes) - 3} more")
 
-        # The mismatching entries include the correct header root, so we can find
-        # which height's witness anchor matches its header
-        conn = sqlite3.connect(HEADERS_DB)
-        cursor = conn.cursor()
-
-        # Get a sample of the anchor (full 64 hex chars)
-        sample_anchor = anchors[0]
-        cursor.execute(
-            "SELECT height FROM headers WHERE hex(sapling_root) = ? LIMIT 1",
-            [sample_anchor]
-        )
-        result = cursor.fetchone()
-        conn.close()
-
-        if result:
-            actual_height = result[0]
-            print(f"   → This anchor belongs to height {actual_height}")
-            print(f"   → But it's being used for ALL witness heights!")
-    else:
-        print(f"\n⚠️  Found {len(unique_anchors)} different anchors (not all the same)")
-        print("   This might be a different issue...")
+    # Get current root info from first mismatch
+    current_root = mismatches[0]['current_root']
+    current_height = mismatches[0]['current_height']
+    print(f"\n   Expected anchor (current root at height {current_height}):")
+    print(f"   {current_root[:16]}...")
 
 def main():
     print("="*70)
-    print("FIX #546: Anchor Verification Script")
+    print("Zcash Sapling Anchor Verification Script (FIXED)")
     print("="*70)
+    print()
+    print("⚠️  IMPORTANT: In Zcash Sapling, ALL witnesses should have the SAME anchor!")
+    print("   The anchor is the CURRENT tree root, not the historical root at note height.")
     print()
 
     total, matching, mismatches = verify_anchors()
@@ -158,14 +171,14 @@ def main():
     print("SUMMARY")
     print("="*70)
     print(f"Total notes: {total}")
-    print(f"Matching: {matching} ✅")
-    print(f"Mismatching: {len(mismatches)} ❌")
+    print(f"Matching current anchor: {matching} ✅")
+    print(f"Mismatching (stale): {len(mismatches)} ❌")
 
     if mismatches:
         analyze_mismatches(mismatches)
         sys.exit(1)
     else:
-        print("\n🎉 SUCCESS! All anchors match their blockchain headers!")
+        print("\n🎉 SUCCESS! All witnesses have the correct current anchor!")
         sys.exit(0)
 
 if __name__ == "__main__":

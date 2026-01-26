@@ -3439,6 +3439,61 @@ return firstValidResult  // Return stored result, not calling next() again
 
 ---
 
+### FIX #469: Invalid State - Stale CMU Cache + Incomplete Peer Handshake
+**Problem**: Two related "invalid state" issues causing witness creation failures and unreliable peer operations:
+1. **CMU Cache Mismatch**: Cached CMU data doesn't match current boost file or tree state, causing 0/N witnesses created
+2. **Incomplete Peer Handshake**: Peers showing `isConnectionReady=true` but haven't completed P2P version exchange, causing operations to fail
+
+**Root Cause Analysis**:
+
+**Part A - CMU Cache Stale**:
+- CMU cache persists across boost file updates (cache not invalidated)
+- When new boost file downloaded, cached CMUs are from OLD version
+- Witness creation fails because target CMUs don't exist in cached data
+- Log shows: "⚠️ FIX #469: CMU cache size mismatch (cache has X CMUs, tree has Y)"
+
+**Part B - Peer Handshake Incomplete**:
+- TCP socket connects successfully → `isConnectionReady = true`
+- But P2P version/verack exchange not yet complete → `isHandshakeComplete = false`
+- `getReadyPeers()` returned these incomplete peers
+- Operations (header fetch, block fetch, broadcast) fail on incomplete peers
+
+**Solution**:
+
+**Part A - CMU Cache Invalidation** (4 locations):
+1. `CommitmentTreeUpdater.swift:468-470`: Invalidate cache when new boost file downloaded
+2. `FilterScanner.swift:3464-3478`: Check cache size matches tree size before witness creation
+3. `FilterScanner.swift:3521-3558`: Auto-invalidate and retry if witness creation fails completely
+4. `WalletManager.swift:3207,3243,6783`: Invalidate cache on wallet restore/new/import
+
+**Part B - Peer Filtering** (4 methods in PeerManager.swift):
+1. `getReadyPeers()`: Filter to `isConnectionReady && isHandshakeComplete`
+2. `getBestPeer()`: Require `isHandshakeComplete`
+3. `getPeersForBroadcast()`: Require `isHandshakeComplete`
+4. `getPeersForConsensus()`: Require `isConnectionReady && isHandshakeComplete`
+
+**Debug Logging Added**:
+```
+⚠️ FIX #469: CMU cache size mismatch (cache has X CMUs, tree has Y) - invalidating cache...
+✅ FIX #469: Reloaded fresh CMU data (X bytes)
+⚠️ FIX #469: Witness creation failed - invalidating stale CMU cache and retrying...
+🔄 FIX #469: Retrying witness creation with fresh CMU data...
+✅ FIX #469: Retry succeeded - N/M witnesses created
+❌ FIX #469: Retry also failed - CMUs may not be in bundled data
+🗑️ FIX #469: Invalidated CMU cache (will re-extract from current boost file)
+⚠️ FIX #469: Filtered out N peers with incomplete handshake (TCP connected but no version message)
+```
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - Cache invalidation on download + public API
+- `Sources/Core/Network/FilterScanner.swift` - Pre-check + retry logic for witness creation
+- `Sources/Core/Wallet/WalletManager.swift` - Invalidate on wallet operations (3 locations)
+- `Sources/Core/Network/PeerManager.swift` - Filter incomplete handshake peers (4 methods)
+
+**Result**: Witnesses now created reliably after boost file updates, and peer operations only use fully-connected peers.
+
+---
+
 ### FIX #470: Header Loading Progress Bar Not Showing
 **Problem**: No visible progress bar during "Loading 2.48M headers from boost file" phase of Import PK. Progress task was created but never appeared in UI.
 

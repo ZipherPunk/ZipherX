@@ -119,3 +119,17 @@ zclassic-fork/
 # Claude-generated fix documentation (local only)
 ZIPHERX_FIXES_SUMMARY.md
 ZIPHERX_FIXES_SUMMARY.html
+
+# Claude Code Team Manager (private orchestration scripts)
+scripts/claude_team.sh
+scripts/team_orchestrator.py
+scripts/orchestrator_dashboard.py
+scripts/dashboard.html
+logs/
+logs/claude_team/
+logs/orchestrator/
+~/.claude/teams/
+
+# Orchestrator agent output files
+*.agent_output
+.orchestrator_state.json
