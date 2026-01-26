@@ -1215,20 +1215,16 @@ final class HeaderStore {
         print("🗑️ Cleared all headers")
     }
 
-    /// FIX #677: Mark boost headers as corrupted and clear for fresh reload
-    /// Called when chain mismatch detected - deletes ALL headers so boost file can reload fresh
+    /// FIX #677 v2: Mark boost headers as corrupted (flag only, no deletion)
+    /// Called when chain mismatch detected - sets flag to skip boost file on next startup
+    /// NOTE: Header deletion is handled separately by the caller via deleteHeadersInRange()
+    /// DO NOT delete all headers here - that causes infinite P2P resync loop!
     func markBoostHeadersCorrupted(mismatchHeight: UInt64) {
-        print("⚠️ FIX #677: Chain mismatch at height \(mismatchHeight) - marking boost headers corrupted")
-        print("🗑️ FIX #677: Deleting ALL headers from HeaderStore for fresh reload...")
-
-        do {
-            try clearAllHeaders()
-            // Set corruption flag in UserDefaults
-            UserDefaults.standard.set(true, forKey: "HeaderStore.boostHeadersCorrupted")
-            print("✅ FIX #677: Headers cleared - boost file will reload on next startup")
-        } catch {
-            print("❌ FIX #677: Failed to clear headers: \(error)")
-        }
+        print("⚠️ FIX #677 v2: Chain mismatch at height \(mismatchHeight) - setting boost corruption flag")
+        // FIX #766: ONLY set flag, do NOT delete all headers
+        // Header deletion is done separately by the caller
+        UserDefaults.standard.set(true, forKey: "HeaderStore.boostHeadersCorrupted")
+        print("✅ FIX #677 v2: Corruption flag set - boost file will be skipped on next startup")
     }
 
     /// FIX #675: Check if boost headers should be skipped due to corruption

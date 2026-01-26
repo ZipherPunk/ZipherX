@@ -4918,6 +4918,16 @@ final class WalletManager: ObservableObject {
 
         print("✅ FIX #577 v12: All tasks completed, progress at 100%")
         print("✅ Database repair complete - full resync finished")
+
+        // FIX #766: Trigger immediate catch-up sync after Full Rescan completes
+        // Problem: After Full Rescan finishes, wallet stays behind chain tip (e.g., 451 blocks)
+        // Root Cause: backgroundSyncToHeight() only runs from fetchNetworkStats() on 15s timer
+        //   - Full Rescan scans to peer consensus height at SCAN START
+        //   - Chain advances during scan → wallet behind when scan completes
+        //   - No immediate catch-up trigger → user sees sync lag
+        // Solution: Call checkAndCatchUp() immediately after repair completes
+        print("🔄 FIX #766: Triggering immediate catch-up sync after Full Rescan...")
+        await checkAndCatchUp()
     }
 
     /// Quick fix: Extract anchors from existing witnesses

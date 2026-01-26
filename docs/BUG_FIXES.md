@@ -8,6 +8,35 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #766: Trigger Immediate Catch-Up Sync After Full Rescan Completes
+**Problem**: After Full Rescan completes, wallet stays behind chain tip by hundreds of blocks (e.g., "Sync lag detected: 451"). Background sync doesn't trigger immediately.
+
+**Root Cause Analysis**:
+1. Full Rescan scans to peer consensus height at **scan start time**
+2. During the scan (which takes minutes), chain advances (new blocks mined)
+3. When scan completes, `lastScannedHeight` is behind `chainHeight`
+4. `enableBackgroundProcesses()` is called, which sets `suppressBackgroundSync = false`
+5. BUT `fetchNetworkStats()` (which triggers `backgroundSyncToHeight()`) runs on 15-second timer
+6. User sees wallet behind chain for up to 15 seconds, or longer if timer phase is unfavorable
+
+**Log Evidence**:
+```
+[17:23:35.276] 📍 FIX #206: Final lastScannedHeight saved: 2990286
+[17:23:35.386] 🔓 FIX #577 v6: Background processes RE-ENABLED after Full Rescan complete
+[17:23:35.425] ⚠️ FIX #409: WARNING - Wallet is 1489 blocks behind chain
+```
+
+**Solution**:
+After `repairNotesAfterDownloadedTree()` completes successfully:
+- Call `checkAndCatchUp()` immediately
+- This triggers `backgroundSyncToHeight()` to scan remaining blocks
+- Wallet catches up to chain tip without waiting for periodic timer
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Added `checkAndCatchUp()` call at end of `repairNotesAfterDownloadedTree()`
+
+---
+
 ### FIX #765: Auto-Clear Corrupted Delta Bundle When P2P Scan Misses Outputs
 **Problem**: Tree root mismatch persists even after FIX #524 repair. App stuck in repair loop because delta CMUs are incomplete.
 
