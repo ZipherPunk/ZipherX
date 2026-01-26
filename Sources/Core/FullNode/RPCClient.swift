@@ -369,6 +369,32 @@ public class RPCClient: ObservableObject {
         return try await waitForOperation(opid)
     }
 
+    /// FIX #717: Send raw transaction via RPC
+    /// This broadcasts through the local zclassicd node and returns clear error if TX is invalid
+    /// Useful as fallback when P2P broadcast fails with unclear DUPLICATE/timeout errors
+    public func sendRawTransaction(_ rawTxHex: String) async throws -> String {
+        let result = try await call(method: "sendrawtransaction", params: [rawTxHex])
+
+        guard let txid = result as? String else {
+            throw RPCError.invalidResponse
+        }
+
+        print("✅ FIX #717: RPC sendrawtransaction success: \(txid)")
+        return txid
+    }
+
+    /// FIX #717: Verify if a transaction exists in mempool via RPC
+    /// Returns true if TX is in mempool, false otherwise
+    public func checkMempoolForTx(_ txid: String) async throws -> Bool {
+        do {
+            let result = try await call(method: "getrawtransaction", params: [txid, false])
+            return result as? String != nil
+        } catch {
+            // TX not found in mempool
+            return false
+        }
+    }
+
     /// Shield transparent funds to z-address
     public func shieldFunds(toZAddress: String) async throws -> String {
         let params: [Any] = ["*", toZAddress, 0.0001]
@@ -945,95 +971,282 @@ public class RPCClient: ObservableObject {
         var allTransactions: [WalletTransaction] = []
         var seenTxids = Set<String>()
 
-        // FIX #685: Fetch ALL t-address transactions using pagination
-        // Keep fetching until we get fewer than requested (indicating we've got them all)
-        var fetchMoreTxs = true
-        var fromOffset = 0
-        let batchSize = 1000  // Fetch 1000 at a time
-
-        while fetchMoreTxs {
-            let tTxs = try await listTransactions(count: batchSize, from: fromOffset)
-            if tTxs.isEmpty {
-                fetchMoreTxs = false
-            } else {
-                for tx in tTxs {
-                    if !seenTxids.contains(tx.txid) {
-                        allTransactions.append(tx)
-                        seenTxids.insert(tx.txid)
-                    }
+        // FIX #725: Use listsinceblock for complete t-address history (more reliable than pagination)
+        // This gets ALL transactions since genesis block
+        print("📜 FIX #725: Fetching all transactions via listsinceblock...")
+        do {
+            let sinceTxs = try await listSinceBlock()
+            for tx in sinceTxs {
+                if !seenTxids.contains(tx.txid) {
+                    allTransactions.append(tx)
+                    seenTxids.insert(tx.txid)
                 }
-                fromOffset += tTxs.count
+            }
+            print("📜 FIX #725: listsinceblock returned \(sinceTxs.count) transactions (\(allTransactions.count) unique)")
+        } catch {
+            // Fallback to pagination if listsinceblock fails
+            print("⚠️ FIX #725: listsinceblock failed, falling back to pagination: \(error)")
+            var fetchMoreTxs = true
+            var fromOffset = 0
+            let batchSize = 1000
 
-                // If we got fewer than requested, we've probably fetched them all
-                if tTxs.count < batchSize {
+            while fetchMoreTxs {
+                let tTxs = try await listTransactions(count: batchSize, from: fromOffset)
+                if tTxs.isEmpty {
                     fetchMoreTxs = false
+                } else {
+                    for tx in tTxs {
+                        if !seenTxids.contains(tx.txid) {
+                            allTransactions.append(tx)
+                            seenTxids.insert(tx.txid)
+                        }
+                    }
+                    fromOffset += tTxs.count
+                    if tTxs.count < batchSize {
+                        fetchMoreTxs = false
+                    }
                 }
             }
         }
-        print("📜 FIX #685: Fetched \(allTransactions.count) total transactions via pagination")
+        print("📜 FIX #725: After t-address fetch: \(allTransactions.count) transactions")
 
         // 2. Get z-address received transactions for all z-addresses
+        // z_listreceivedbyaddress returns RECEIVED z-transactions with full details
         let zAddresses = try await getZAddresses()
-        print("📜 FIX #716: Found \(zAddresses.count) z-addresses in wallet")
-        var zTxCount = 0
+        print("📜 FIX #725: Found \(zAddresses.count) z-addresses in wallet")
+        var zReceivedCount = 0
         for zAddr in zAddresses {
             let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
-            let newTxs = zReceived.filter { !seenTxids.contains($0.txid) }
-            if !newTxs.isEmpty {
-                print("📜 FIX #716: z-addr \(zAddr.prefix(20))... has \(newTxs.count) new transactions")
-            }
             for tx in zReceived {
                 if !seenTxids.contains(tx.txid) {
                     allTransactions.append(tx)
                     seenTxids.insert(tx.txid)
-                    zTxCount += 1
+                    zReceivedCount += 1
                 }
             }
         }
-        print("📜 FIX #716: Added \(zTxCount) z-address transactions (total now: \(allTransactions.count))")
+        print("📜 FIX #725: Added \(zReceivedCount) z-address RECEIVED transactions")
 
-        // 3. Get recent z_sendmany operation results (for sent z-address transactions)
-        // This captures outgoing z-address transactions
+        // 3. Get z-address SENT transactions from operation status
+        // FIX #725: Use z_getoperationstatus (non-destructive) to get recent sends
+        // Note: This only captures operations from current daemon session
         let opResults = try await getZOperationResults()
+        var zSentCount = 0
         for opResult in opResults {
-            if let txid = opResult["result"] as? [String: Any],
-               let txidStr = txid["txid"] as? String,
-               !seenTxids.contains(txidStr) {
-                // This is a sent transaction from z_sendmany
-                let timestamp = Date()  // Operation time not available
-                allTransactions.append(WalletTransaction(
-                    txid: txidStr,
-                    address: "",  // To address not easily available
-                    amount: 0,    // Amount needs to be fetched separately
-                    fee: 0,
-                    type: .sent,
-                    timestamp: timestamp,
-                    confirmations: 0,
-                    height: nil
-                ))
-                seenTxids.insert(txidStr)
+            // Check if operation is complete and has a txid
+            guard let status = opResult["status"] as? String, status == "success",
+                  let result = opResult["result"] as? [String: Any],
+                  let txidStr = result["txid"] as? String,
+                  !seenTxids.contains(txidStr) else {
+                continue
+            }
+
+            // Get creation time if available
+            let creationTime = opResult["creation_time"] as? Double ?? Date().timeIntervalSince1970
+
+            // Try to get amount from params
+            var totalAmount: UInt64 = 0
+            var toAddress = ""
+            if let params = opResult["params"] as? [String: Any],
+               let amounts = params["amounts"] as? [[String: Any]] {
+                for amt in amounts {
+                    if let amtDouble = amt["amount"] as? Double {
+                        totalAmount += UInt64(amtDouble * 100_000_000)
+                    }
+                    if let addr = amt["address"] as? String, toAddress.isEmpty {
+                        toAddress = addr
+                    }
+                }
+            }
+
+            allTransactions.append(WalletTransaction(
+                txid: txidStr,
+                address: toAddress,
+                amount: totalAmount,
+                fee: 0,
+                type: .sent,
+                timestamp: Date(timeIntervalSince1970: creationTime),
+                confirmations: 0,
+                height: nil
+            ))
+            seenTxids.insert(txidStr)
+            zSentCount += 1
+        }
+        print("📜 FIX #725: Added \(zSentCount) z-address SENT transactions from operations")
+
+        // 4. For any transaction we found, try to enrich with full details
+        // This helps get accurate timestamps and heights for z-transactions
+        print("📜 FIX #725: Enriching \(allTransactions.count) transactions with full details...")
+        var enrichedTransactions: [WalletTransaction] = []
+        for tx in allTransactions {
+            // If transaction is missing height or has zero timestamp, try to get details
+            if tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 {
+                do {
+                    let details = try await getTransaction(txid: tx.txid)
+                    var enrichedTx = tx
+
+                    if let height = details["height"] as? Int, tx.height == nil {
+                        enrichedTx = WalletTransaction(
+                            txid: tx.txid,
+                            address: tx.address,
+                            amount: tx.amount,
+                            fee: tx.fee,
+                            type: tx.type,
+                            timestamp: tx.timestamp,
+                            confirmations: tx.confirmations,
+                            memo: tx.memo,
+                            height: UInt64(height)
+                        )
+                    }
+
+                    if let blocktime = details["blocktime"] as? Int {
+                        enrichedTx = WalletTransaction(
+                            txid: enrichedTx.txid,
+                            address: enrichedTx.address,
+                            amount: enrichedTx.amount,
+                            fee: enrichedTx.fee,
+                            type: enrichedTx.type,
+                            timestamp: Date(timeIntervalSince1970: TimeInterval(blocktime)),
+                            confirmations: enrichedTx.confirmations,
+                            memo: enrichedTx.memo,
+                            height: enrichedTx.height
+                        )
+                    }
+
+                    enrichedTransactions.append(enrichedTx)
+                } catch {
+                    // Keep original if enrichment fails
+                    enrichedTransactions.append(tx)
+                }
+            } else {
+                enrichedTransactions.append(tx)
             }
         }
-        // Verbose log removed
 
-        // FIX #685: Sort by timestamp (newest first) - return ALL transactions (no limit)
-        print("📜 FIX #685: Returning \(allTransactions.count) total transactions from Full Node RPC")
-        return allTransactions
-            .sorted { $0.timestamp > $1.timestamp }
+        // FIX #725: Sort by block height DESC (most recent first), then by timestamp for unconfirmed
+        // This gives proper chronological order
+        print("📜 FIX #725: Returning \(enrichedTransactions.count) total transactions from Full Node RPC")
+        return enrichedTransactions.sorted { tx1, tx2 in
+            // First sort by height (higher = more recent)
+            if let h1 = tx1.height, let h2 = tx2.height {
+                if h1 != h2 { return h1 > h2 }
+            } else if tx1.height != nil {
+                return true  // tx1 has height, tx2 doesn't - tx1 is confirmed, comes first
+            } else if tx2.height != nil {
+                return false  // tx2 has height, tx1 doesn't
+            }
+            // If same height or both unconfirmed, sort by timestamp
+            return tx1.timestamp > tx2.timestamp
+        }
     }
 
     /// FIX #286: Get z-address operation results (completed send operations)
+    /// FIX #725: Use z_getoperationstatus instead of z_getoperationresult
+    /// z_getoperationresult is DESTRUCTIVE - it clears the operation list after returning!
+    /// z_getoperationstatus returns the same data but keeps it for future queries
     public func getZOperationResults() async throws -> [[String: Any]] {
         do {
-            let result = try await call(method: "z_getoperationresult", params: [] as [Any])
+            // FIX #725: Use z_getoperationstatus (non-destructive) instead of z_getoperationresult
+            let result = try await call(method: "z_getoperationstatus", params: [] as [Any])
             if let results = result as? [[String: Any]] {
                 return results
             }
             return []
         } catch {
-            // z_getoperationresult may fail if no operations pending
+            // z_getoperationstatus may fail if no operations exist
             return []
         }
+    }
+
+    /// FIX #725: Get ALL wallet transactions using listsinceblock
+    /// This is more reliable than listtransactions pagination for getting complete history
+    /// Returns transactions since genesis block (all history)
+    public func listSinceBlock() async throws -> [WalletTransaction] {
+        // Use empty string for blockhash to get all transactions since genesis
+        // Parameters: blockhash, target_confirmations, include_watchonly
+        let result = try await call(method: "listsinceblock", params: ["", 1, true])
+
+        guard let response = result as? [String: Any],
+              let txList = response["transactions"] as? [[String: Any]] else {
+            print("⚠️ FIX #725: listsinceblock returned invalid format")
+            return []
+        }
+
+        print("📜 FIX #725: listsinceblock returned \(txList.count) transactions")
+
+        var transactions: [WalletTransaction] = []
+
+        for tx in txList {
+            guard let txid = tx["txid"] as? String,
+                  let category = tx["category"] as? String else {
+                continue
+            }
+
+            let address = tx["address"] as? String ?? ""
+            let amountDouble = tx["amount"] as? Double ?? 0
+            let amount = UInt64(abs(amountDouble) * 100_000_000)
+            let feeDouble = tx["fee"] as? Double ?? 0
+            let fee = UInt64(abs(feeDouble) * 100_000_000)
+
+            // Parse confirmations
+            let confirmations: Int
+            if let conf = tx["confirmations"] as? Int {
+                confirmations = conf
+            } else if let conf = tx["confirmations"] as? Int64 {
+                confirmations = Int(conf)
+            } else {
+                confirmations = 0
+            }
+
+            // Parse time
+            let time: Int
+            if let t = tx["time"] as? Int {
+                time = t
+            } else if let t = tx["blocktime"] as? Int {
+                time = t
+            } else if let t = tx["timereceived"] as? Int {
+                time = t
+            } else {
+                time = Int(Date().timeIntervalSince1970)
+            }
+
+            // Parse blockheight
+            let blockheight: Int?
+            if let h = tx["blockheight"] as? Int {
+                blockheight = h
+            } else if let h = tx["blockindex"] as? Int {
+                // Some versions use blockindex
+                blockheight = nil  // blockindex is position in block, not height
+            } else {
+                blockheight = nil
+            }
+
+            // Handle transaction categories
+            let type: WalletTransactionType
+            switch category {
+            case "send":
+                type = .sent
+            case "receive", "generate":
+                type = .received
+            default:
+                // Skip orphan/immature transactions
+                continue
+            }
+
+            transactions.append(WalletTransaction(
+                txid: txid,
+                address: address,
+                amount: amount,
+                fee: fee,
+                type: type,
+                timestamp: Date(timeIntervalSince1970: TimeInterval(time)),
+                confirmations: confirmations,
+                height: blockheight != nil ? UInt64(blockheight!) : nil
+            ))
+        }
+
+        print("📜 FIX #725: Parsed \(transactions.count) valid transactions from listsinceblock")
+        return transactions
     }
 
     // MARK: - FIX #286 v17: Mempool and Pending Transaction Monitoring

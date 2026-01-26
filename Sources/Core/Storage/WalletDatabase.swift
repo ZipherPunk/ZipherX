@@ -545,7 +545,11 @@ final class WalletDatabase {
             "CREATE INDEX IF NOT EXISTS idx_history_height ON transaction_history(block_height DESC);",
             "CREATE INDEX IF NOT EXISTS idx_history_type ON transaction_history(tx_type);",
             "CREATE INDEX IF NOT EXISTS idx_tree_checkpoints_height ON tree_checkpoints(height DESC);",
-            "CREATE INDEX IF NOT EXISTS idx_trusted_peers_host ON trusted_peers(host);"
+            "CREATE INDEX IF NOT EXISTS idx_trusted_peers_host ON trusted_peers(host);",
+            // FIX #754: Performance indexes for frequently queried columns
+            "CREATE INDEX IF NOT EXISTS idx_notes_spent_in_tx ON notes(spent_in_tx);",
+            "CREATE INDEX IF NOT EXISTS idx_notes_received_in_tx ON notes(received_in_tx);",
+            "CREATE INDEX IF NOT EXISTS idx_history_txid ON transaction_history(txid);"
         ]
 
         for schema in schemas {
@@ -1097,6 +1101,119 @@ final class WalletDatabase {
         return insertedId
     }
 
+    /// Struct for batch note insertion (FIX #754)
+    struct BatchNote {
+        let accountId: Int64
+        let diversifier: Data
+        let value: UInt64
+        let rcm: Data
+        let memo: Data?
+        let nullifier: Data
+        let txid: Data
+        let height: UInt64
+        let witness: Data?
+        let cmu: Data?
+    }
+
+    /// FIX #754: Batch insert notes with single transaction for better performance
+    /// Uses prepared statement reuse + transaction wrapping for ~50x speedup
+    /// - Parameter notes: Array of notes to insert
+    /// - Returns: Number of notes successfully inserted
+    @discardableResult
+    func insertNotesBatch(_ notes: [BatchNote]) throws -> Int {
+        guard !notes.isEmpty else { return 0 }
+
+        let sql = """
+            INSERT OR IGNORE INTO notes (account_id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, witness_height, cmu)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        // Start transaction
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.transactionFailed("BEGIN failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        var insertedCount = 0
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        do {
+            for note in notes {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+
+                // Encrypt sensitive fields
+                let encryptedDiversifier = try encryptBlob(note.diversifier)
+                let encryptedRcm = try encryptBlob(note.rcm)
+                let encryptedMemo = note.memo != nil ? try encryptBlob(note.memo!) : nil
+
+                sqlite3_bind_int64(stmt, 1, note.accountId)
+                encryptedDiversifier.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_bind_int64(stmt, 3, Int64(note.value))
+                encryptedRcm.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
+                }
+                if let encMemo = encryptedMemo {
+                    encMemo.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(encMemo.count), SQLITE_TRANSIENT)
+                    }
+                } else {
+                    sqlite3_bind_null(stmt, 5)
+                }
+                // VUL-009: Hash nullifier
+                let hashedNullifier = hashNullifier(note.nullifier)
+                hashedNullifier.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
+                }
+                note.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_bind_int64(stmt, 8, Int64(note.height))
+                if let witness = note.witness {
+                    let encryptedWitness = try encryptBlob(witness)
+                    encryptedWitness.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(encryptedWitness.count), SQLITE_TRANSIENT)
+                    }
+                    sqlite3_bind_int64(stmt, 10, Int64(note.height))
+                } else {
+                    sqlite3_bind_null(stmt, 9)
+                    sqlite3_bind_null(stmt, 10)
+                }
+                if let cmu = note.cmu {
+                    cmu.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
+                    }
+                } else {
+                    sqlite3_bind_null(stmt, 11)
+                }
+
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    if sqlite3_changes(db) > 0 {
+                        insertedCount += 1
+                    }
+                }
+            }
+
+            // Commit transaction
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.transactionFailed("COMMIT failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+
+            return insertedCount
+        } catch {
+            // Rollback on error
+            _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
     /// Debug: Get all notes (spent and unspent) with detailed info
     func debugListAllNotes(accountId: Int64) throws {
         let sql = """
@@ -1596,11 +1713,15 @@ final class WalletDatabase {
             }
 
             let changedRows = sqlite3_changes(db)
+            // FIX #688: Don't throw error if note doesn't exist - still record transaction in history!
+            // The note may have been deleted during full resync, but we still need to record the TX
             if changedRows == 0 {
-                throw DatabaseError.updateFailed("No note found with given nullifier")
+                print("⚠️ FIX #688: Note not found for nullifier (deleted during resync?), recording TX history anyway")
+            } else {
+                print("✅ FIX #688: Note marked as spent (changedRows=\(changedRows))")
             }
 
-            // STEP 2: Insert transaction history
+            // STEP 2: Insert transaction history (ALWAYS do this, even if note was missing)
             let insertSql = """
                 INSERT OR REPLACE INTO transaction_history
                 (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status)
@@ -1769,7 +1890,9 @@ final class WalletDatabase {
                 }
             }
 
-            notes.append(SpentNote(nullifier: nullifier, spentInTx: spentInTx))
+            // FIX #688: SpentNote now includes value and height (optional for backward compatibility)
+            // These are not returned by current SQL query, so pass nil for now
+            notes.append(SpentNote(nullifier: nullifier, spentInTx: spentInTx, value: nil, height: nil))
         }
 
         return notes
@@ -2283,8 +2406,15 @@ final class WalletDatabase {
     // MARK: - Tree State
 
     /// Save commitment tree state
-    func saveTreeState(_ treeData: Data) throws {
-        let sql = "UPDATE sync_state SET tree_state = ? WHERE id = 1;"
+    /// FIX #741: Added height parameter - CRITICAL for persisting delta sync progress!
+    /// Without saving tree_height, every startup re-syncs from boost file end (984 blocks)
+    func saveTreeState(_ treeData: Data, height: UInt64? = nil) throws {
+        let sql: String
+        if let height = height {
+            sql = "UPDATE sync_state SET tree_state = ?, tree_height = ? WHERE id = 1;"
+        } else {
+            sql = "UPDATE sync_state SET tree_state = ? WHERE id = 1;"
+        }
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -2296,9 +2426,37 @@ final class WalletDatabase {
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(treeData.count), nil)
         }
 
+        if let height = height {
+            sqlite3_bind_int64(stmt, 2, Int64(height))
+        }
+
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        if let height = height {
+            print("💾 FIX #741: Saved tree state with height \(height)")
+        }
+    }
+
+    /// FIX #741: Update tree height without modifying tree_state
+    /// Called after delta CMU sync to persist the new height
+    func updateTreeHeight(_ height: UInt64) throws {
+        let sql = "UPDATE sync_state SET tree_height = ? WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("💾 FIX #741: Updated tree height to \(height)")
     }
 
     /// Clear commitment tree state (set to NULL)
@@ -2339,6 +2497,24 @@ final class WalletDatabase {
         }
 
         return Data(bytes: ptr, count: Int(len))
+    }
+
+    /// Get the tree height (block height that the saved tree_state corresponds to)
+    /// FIX #688: Added this function to support tree height queries
+    func getTreeHeight() throws -> UInt64 {
+        let sql = "SELECT tree_height FROM sync_state WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0  // Default to 0 if no record found
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
     }
 
     /// Clear tree state and scan height to force rebuild on next scan
@@ -5247,6 +5423,8 @@ struct WalletNote {
 struct SpentNote {
     let nullifier: Data
     let spentInTx: Data? // nil if transaction broadcast failed
+    let value: UInt64? // Note value (optional for backward compatibility)
+    let height: UInt64? // Note height (optional for backward compatibility)
 }
 
 enum TransactionType: String {

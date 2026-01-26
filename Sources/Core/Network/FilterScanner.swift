@@ -244,7 +244,44 @@ final class FilterScanner {
             let isImportedWallet = WalletManager.shared.isImportedWallet
             let customScanHeight = WalletManager.shared.importScanStartHeight
 
-            if lastScanned > 0 {
+            // FIX #726: Check if this is a Full Rescan (lastScanned=0 but wallet exists with tree)
+            // In this case, we MUST scan from Sapling activation and enable PHASE 1
+            // FIX #728: Also trigger for database repair (isRepairingDatabase) regardless of isImportedWallet
+            let isRepairing = WalletManager.shared.isRepairingDatabase
+            let isFullRescan = lastScanned == 0 && (treeExists || hasDownloadedTree) && (!isImportedWallet || isRepairing)
+
+            // FIX #728: Debug logging to diagnose why PHASE 1 might be skipped
+            print("🔍 FIX #728: Start height determination:")
+            print("   lastScanned=\(lastScanned), treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree)")
+            print("   isImportedWallet=\(isImportedWallet), isRepairing=\(isRepairing), isFullRescan=\(isFullRescan)")
+            print("   effectiveTreeHeight=\(effectiveTreeHeight)")
+
+            if isFullRescan {
+                // FIX #726: CRITICAL - Full Rescan must start from Sapling activation
+                // This ensures PHASE 1 runs to rediscover ALL historical notes
+                startHeight = ZclassicCheckpoints.saplingActivationHeight
+                scanWithinDownloadedRange = true
+                print("🔄 FIX #726: Full Rescan detected - starting from Sapling activation (\(startHeight)) with PHASE 1 enabled")
+
+                // FIX #726: Load boost file data (should already be cached from previous use)
+                let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile(onProgress: { progress, status in
+                    self.onProgress?(progress * 0.10, startHeight, latestHeight)
+                    self.onStatusUpdate?("download", "📥 \(status)")
+                })
+                // Extract CMUs in legacy format for position lookup
+                if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
+                   let cmuData = try? Data(contentsOf: cmuPath) {
+                    self.cmuDataForPositionLookup = cmuData
+                    self.cmuDataHeight = boostHeight
+                    self.cmuDataCount = boostOutputCount
+                    print("📦 FIX #726: Loaded CMU data for PHASE 1 - \(boostOutputCount) CMUs up to height \(boostHeight)")
+                }
+
+                // Load block hashes if not already loaded
+                if !BundledBlockHashes.shared.isLoaded {
+                    try? await BundledBlockHashes.shared.loadBundledHashes { _, _ in }
+                }
+            } else if lastScanned > 0 {
                 startHeight = lastScanned + 1
                 // FIX #178: CRITICAL - Set scanWithinDownloadedRange if notes may exist in downloaded tree range
                 // This ensures PHASE 1 runs for consecutive startups where notes need to be discovered
@@ -1365,38 +1402,40 @@ final class FilterScanner {
             notesNeedingNullifierFix.removeAll()
         }
 
-        // Save tree checkpoint after scan completes
-        let checkpointSaved = await saveTreeCheckpointAfterSync()
-
-        // FIX #524: If checkpoint wasn't saved due to tree root mismatch, fix the tree!
-        // This happens when FFI tree state becomes corrupted during PHASE 2
-        // Symptoms: witnesses are 37 bytes (invalid), tree root doesn't match blockchain
-        if !checkpointSaved {
-            print("🔧 FIX #524: Tree root mismatch detected - attempting repair...")
-            if await fixTreeRootMismatch(lastScannedHeight: targetHeight) {
-                print("✅ FIX #524: Tree root mismatch repaired - witnesses updated")
-            } else {
-                print("⚠️ FIX #524: Could not repair tree root mismatch - may need full rescan")
-            }
-        }
-
+        // FIX #736: Save delta CMUs BEFORE FIX #524 repair, so repair can load them!
+        // Previously delta save was AFTER FIX #524, causing "No delta CMUs found" error
         // DELTA BUNDLE: Save collected outputs for instant witness generation
         // FIX #558 v4: Debug logging
         print("📦 FIX #558 v4: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count)")
         if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
             if let treeRoot = ZipherXFFI.treeRoot() {
                 let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
-                DeltaCMUManager.shared.appendOutputs(
-                    deltaOutputsCollected,
-                    fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
-                    toHeight: lastScanned,
-                    treeRoot: treeRoot
-                )
-                print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
 
-                // Update delta sync status to synced
-                await MainActor.run {
-                    WalletManager.shared.updateDeltaSyncStatus(.synced)
+                // FIX #759: Validate height range before saving delta bundle
+                // If deltaCollectionStartHeight > lastScanned, the range is backwards/invalid
+                // This happens when Full Rescan resets lastScanned but delta uses old manifest
+                if deltaCollectionStartHeight > lastScanned {
+                    print("⚠️ FIX #759: INVALID delta range \(deltaCollectionStartHeight)-\(lastScanned) (backwards)")
+                    print("⚠️ FIX #759: Clearing corrupted delta bundle and NOT saving invalid data")
+                    DeltaCMUManager.shared.clearDeltaBundle()
+                } else {
+                    DeltaCMUManager.shared.appendOutputs(
+                        deltaOutputsCollected,
+                        fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
+                        toHeight: lastScanned,
+                        treeRoot: treeRoot
+                    )
+                    print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
+
+                    // Update delta sync status to synced
+                    await MainActor.run {
+                        WalletManager.shared.updateDeltaSyncStatus(.synced)
+                        // FIX #737 v2: Clear pendingDeltaRescan flag - delta bundle rebuilt successfully
+                        if WalletManager.shared.pendingDeltaRescan {
+                            WalletManager.shared.pendingDeltaRescan = false
+                            print("🔧 FIX #737 v2: Cleared pendingDeltaRescan flag - delta bundle rebuilt")
+                        }
+                    }
                 }
             }
             deltaOutputsCollected.removeAll()
@@ -1406,18 +1445,42 @@ final class FilterScanner {
             // Still need to update manifest height so system knows we've scanned these blocks
             if let treeRoot = ZipherXFFI.treeRoot() {
                 let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
-                DeltaCMUManager.shared.appendOutputs(
-                    [],  // Empty outputs
-                    fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
-                    toHeight: lastScanned,
-                    treeRoot: treeRoot
-                )
-                print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+
+                // FIX #759: Validate height range before updating manifest
+                if deltaCollectionStartHeight > lastScanned {
+                    print("⚠️ FIX #759: INVALID delta range \(deltaCollectionStartHeight)-\(lastScanned) (backwards, no outputs)")
+                    print("⚠️ FIX #759: Clearing corrupted delta bundle")
+                    DeltaCMUManager.shared.clearDeltaBundle()
+                } else {
+                    DeltaCMUManager.shared.appendOutputs(
+                        [],  // Empty outputs
+                        fromHeight: deltaCollectionStartHeight,  // Track the full scanned range!
+                        toHeight: lastScanned,
+                        treeRoot: treeRoot
+                    )
+                    print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+                }
             }
             await MainActor.run {
                 WalletManager.shared.updateDeltaSyncStatus(.synced)
             }
             deltaCollectionEnabled = false
+        }
+
+        // Save tree checkpoint after scan completes
+        let checkpointSaved = await saveTreeCheckpointAfterSync()
+
+        // FIX #524: If checkpoint wasn't saved due to tree root mismatch, fix the tree!
+        // This happens when FFI tree state becomes corrupted during PHASE 2
+        // Symptoms: witnesses are 37 bytes (invalid), tree root doesn't match blockchain
+        // FIX #736: Delta CMUs are now saved BEFORE this runs, so repair can load them!
+        if !checkpointSaved {
+            print("🔧 FIX #524: Tree root mismatch detected - attempting repair...")
+            if await fixTreeRootMismatch(lastScannedHeight: targetHeight) {
+                print("✅ FIX #524: Tree root mismatch repaired - witnesses updated")
+            } else {
+                print("⚠️ FIX #524: Could not repair tree root mismatch - may need full rescan")
+            }
         }
 
         // FIX #176: Update verified checkpoint after successful scan
@@ -1535,19 +1598,57 @@ final class FilterScanner {
                 let treeSize = ZipherXFFI.treeSize()
                 print("🔧 FIX #524: Loaded tree from boost file: \(treeSize) CMUs")
 
+                // FIX #744: Diagnostic - check tree root immediately after deserialize
+                if let boostTreeRoot = ZipherXFFI.treeRoot() {
+                    let rootHex = boostTreeRoot.map { String(format: "%02x", $0) }.joined()
+                    print("🔍 FIX #744: Tree root AFTER deserialize (before delta): \(rootHex.prefix(32))...")
+
+                    // Check against expected boost file root
+                    if let header = try? HeaderStore.shared.getHeader(at: effectiveHeight) {
+                        let headerRootHex = header.hashFinalSaplingRoot.map { String(format: "%02x", $0) }.joined()
+                        print("🔍 FIX #744: Expected header root at \(effectiveHeight): \(headerRootHex.prefix(32))...")
+                        if boostTreeRoot == header.hashFinalSaplingRoot {
+                            print("✅ FIX #744: Boost tree root MATCHES header at \(effectiveHeight)!")
+                        } else {
+                            print("❌ FIX #744: Boost tree root MISMATCH at \(effectiveHeight)!")
+                        }
+                    }
+                }
+
                 // Step 3: If we scanned beyond boost file, append delta CMUs
                 if lastScannedHeight > effectiveHeight {
                     print("🔧 FIX #524: Appending delta CMUs from height \(effectiveHeight + 1) to \(lastScannedHeight)...")
 
-                    // Get delta CMUs from DeltaCMUManager
-                    let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
+                    // FIX #739 v4: Get delta CMUs from Rust memory (DELTA_CMUS array)
+                    // This contains ALL CMUs appended via treeAppend() during this session,
+                    // including those from FIX #571 P2P fetch which aren't in the file-based delta bundle
+                    let memoryDeltaCMUs = ZipherXFFI.getDeltaCMUsFromMemory()
+                    let memoryCount = memoryDeltaCMUs.count
+
+                    // Also try file-based delta bundle as fallback
+                    let fileDeltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
                         startHeight: effectiveHeight + 1,
                         endHeight: lastScannedHeight
                     )
+                    let fileCount = fileDeltaCMUs?.count ?? 0
 
-                    if let cmus = deltaCMUs, !cmus.isEmpty {
+                    print("🔧 FIX #524 v4: Delta CMUs - memory: \(memoryCount), file: \(fileCount)")
+
+                    // Use whichever source has more CMUs (memory is usually more complete)
+                    let deltaCMUs: [Data]
+                    if memoryCount >= fileCount && memoryCount > 0 {
+                        deltaCMUs = memoryDeltaCMUs
+                        print("🔧 FIX #524 v4: Using memory delta CMUs (\(memoryCount))")
+                    } else if let fileCMUs = fileDeltaCMUs, !fileCMUs.isEmpty {
+                        deltaCMUs = fileCMUs
+                        print("🔧 FIX #524 v4: Using file delta CMUs (\(fileCount))")
+                    } else {
+                        deltaCMUs = []
+                    }
+
+                    if !deltaCMUs.isEmpty {
                         var appendedCount = 0
-                        for cmu in cmus {
+                        for cmu in deltaCMUs {
                             let position = ZipherXFFI.treeAppend(cmu: cmu)
                             if position != UInt64.max {
                                 appendedCount += 1
@@ -1570,35 +1671,85 @@ final class FilterScanner {
                         if newTreeRoot == header.hashFinalSaplingRoot {
                             print("✅ FIX #524: Tree root now matches blockchain at height \(lastScannedHeight)!")
 
-                            // Step 5: Force rebuild ALL witnesses
-                            print("🔧 FIX #524: Rebuilding all witnesses with correct tree state...")
+                            // Step 5: Force rebuild ALL witnesses using GLOBAL tree
+                            // FIX #739: CRITICAL - Use GLOBAL tree (which FIX #524 just fixed) instead of batch function
+                            // The batch function builds its OWN tree from raw CMU data, producing a different root!
+                            // The global COMMITMENT_TREE has the correct root after FIX #524 appended delta CMUs
+                            print("🔧 FIX #524+#739: Rebuilding all witnesses from GLOBAL tree (correct root)...")
 
                             let accountId = (try? database.getAccount(index: 0)?.accountId) ?? 0
                             let allNotes = (try? database.getAllNotes(accountId: accountId)) ?? []
 
-                            var rebuiltCount = 0
+                            // Collect all notes with valid CMUs and positions
+                            var validNotes: [(note: WalletNote, cmu: Data)] = []
                             for note in allNotes {
-                                if let cmu = note.cmu, !cmu.isEmpty {
-                                    // Try to create witness from boost file CMU data
-                                    if let cachedPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
-                                       let cachedData = try? Data(contentsOf: cachedPath) {
-                                        if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: cachedData, targetCMU: cmu) {
-                                            if result.witness.count >= 1028 {  // Valid witness
-                                                try? database.updateNoteWitness(noteId: note.id, witness: result.witness)
+                                if let cmu = note.cmu, cmu.count == 32 {
+                                    validNotes.append((note: note, cmu: cmu))
+                                }
+                            }
 
-                                                // Get anchor from witness
-                                                if let witnessAnchor = ZipherXFFI.witnessGetRoot(result.witness) {
-                                                    try? database.updateNoteAnchor(noteId: note.id, anchor: witnessAnchor)
-                                                }
+                            print("🔧 FIX #739: Processing \(validNotes.count) notes using GLOBAL tree...")
 
-                                                rebuiltCount += 1
-                                            }
+                            // Get the global tree's correct root for verification
+                            let globalTreeRoot = ZipherXFFI.treeRoot()
+                            if let root = globalTreeRoot {
+                                print("🔧 FIX #739: Global tree root (correct): \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                            }
+
+                            // FIX #739 v3: After FIX #524 fixes the global tree, sync witnesses with delta CMUs
+                            // The global tree now has the correct root. We need to:
+                            // 1. Load existing witnesses into FFI
+                            // 2. Append delta CMUs to update them
+                            // 3. Save updated witnesses back to database
+                            print("🔧 FIX #739 v3: Syncing witnesses with corrected global tree...")
+
+                            // Load all witnesses into FFI WITNESSES array
+                            // Track mapping: FFI index -> note ID for extraction
+                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64)] = []
+                            for noteData in validNotes {
+                                if !noteData.note.witness.isEmpty {
+                                    let index = ZipherXFFI.treeLoadWitness(
+                                        witnessData: noteData.note.witness.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) },
+                                        witnessLen: noteData.note.witness.count
+                                    )
+                                    if index != UInt64.max {
+                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
+                                    }
+                                }
+                            }
+                            print("🔧 FIX #739 v3: Loaded \(loadedNotes.count)/\(validNotes.count) witnesses into FFI")
+
+                            // The global tree already has all CMUs (boost + delta) appended by FIX #524
+                            // Now we need to update witnesses to match the current tree state
+                            // Get delta CMUs and append them to all loaded witnesses
+                            let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+                            if !deltaCMUs.isEmpty {
+                                print("🔧 FIX #739 v3: Appending \(deltaCMUs.count) delta CMUs to all witnesses...")
+                                // Pack delta CMUs into contiguous data for batch update
+                                var packedCMUs = Data()
+                                for cmu in deltaCMUs {
+                                    packedCMUs.append(cmu)
+                                }
+                                let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
+                                print("🔧 FIX #739 v3: Updated \(updatedCount) witnesses with delta CMUs")
+                            }
+
+                            // Extract updated witnesses and save to database using correct FFI indices
+                            var rebuiltCount = 0
+                            for (ffiIndex, noteId) in loadedNotes {
+                                if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
+                                    if updatedWitness.count >= 100 {
+                                        try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
+
+                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
+                                            try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
                                         }
+                                        rebuiltCount += 1
                                     }
                                 }
                             }
 
-                            print("✅ FIX #524: Rebuilt \(rebuiltCount)/\(allNotes.count) witnesses")
+                            print("✅ FIX #524+#739: Rebuilt \(rebuiltCount)/\(loadedNotes.count) witnesses (delta sync mode)")
 
                             // Save the corrected tree state
                             if let treeData = ZipherXFFI.treeSerialize() {
@@ -1965,6 +2116,10 @@ final class FilterScanner {
         ivk: Data,
         height: UInt64
     ) throws {
+        // FIX #690: Track if we detected any of our spends in this transaction
+        // If we find our outputs later but didn't detect any spends, it's likely our transaction with a deleted note
+        var detectedOurSpendInThisTx = false
+
         // FIX #288: Check for spent notes (nullifier detection) FIRST
         // DEBUG: Log spend detection attempts
         if let spends = spends, !spends.isEmpty {
@@ -1983,6 +2138,7 @@ final class FilterScanner {
                 let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
                 if knownNullifiers.contains(hashedNullifier) {
                     print("💸 FIX #367: MATCH! Nullifier \(shortNf)... found - marking note as spent")
+                    detectedOurSpendInThisTx = true  // FIX #690: Track that we detected our spend
                     if let txidData = txidData {
                         try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
                     } else {
@@ -2103,6 +2259,25 @@ final class FilterScanner {
             // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
             if !isChangeOutput {
                 isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+            }
+
+            // FIX #690: If we found our outputs but didn't detect any spends in this transaction,
+            // and the transaction HAS spends, it's likely our sent transaction with a deleted note.
+            // The spent note was deleted during full resync, but we can still detect our change outputs.
+            if !isChangeOutput && !detectedOurSpendInThisTx && (spends?.isEmpty == false) {
+                // This transaction has spends that we didn't detect (note deleted during resync)
+                // But we found our outputs (change), so this must be our sent transaction
+                print("💸 FIX #690: Recording as SENT - found our change output but spend was deleted")
+                try database.recordSentTransactionAtomic(
+                    hashedNullifier: Data(),  // Empty - we don't have the nullifier
+                    txid: txidData,
+                    spentHeight: height,
+                    amount: value,  // This is the CHANGE amount, not the sent amount
+                    fee: 10000,
+                    toAddress: "Change (FIX #690)",
+                    memo: nil
+                )
+                isChangeOutput = true  // Mark as change so we don't record as received
             }
 
             if !isChangeOutput {

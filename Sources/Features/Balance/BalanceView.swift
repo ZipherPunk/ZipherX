@@ -1682,7 +1682,6 @@ struct BalanceView: View {
                 .foregroundColor(theme.textPrimary)
                 .lineLimit(1)
         }
-        .minimumScaleFactor(0.7)
     }
 }
 

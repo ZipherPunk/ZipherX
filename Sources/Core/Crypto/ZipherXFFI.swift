@@ -867,6 +867,53 @@ enum ZipherXFFI {
         return zipherx_tree_load_witness(witnessData, witnessLen)
     }
 
+    /// FIX #739: Update ALL loaded witnesses with a single CMU (without modifying tree)
+    /// Returns number of witnesses updated
+    static func updateAllWitnessesWithCMU(cmu: Data) -> UInt64 {
+        return cmu.withUnsafeBytes { ptr in
+            guard let basePtr = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return zipherx_update_all_witnesses_with_cmu(basePtr)
+        }
+    }
+
+    /// FIX #739: Batch update ALL loaded witnesses with multiple CMUs (without modifying tree)
+    /// Returns number of witnesses fully updated
+    static func updateAllWitnessesBatch(cmus: Data, count: Int) -> UInt64 {
+        return cmus.withUnsafeBytes { ptr in
+            guard let basePtr = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return zipherx_update_all_witnesses_batch(basePtr, count)
+        }
+    }
+
+    /// FIX #739 v4: Get delta CMUs count from memory (not file)
+    static func getDeltaCMUsCount() -> UInt64 {
+        return zipherx_get_delta_cmus_count()
+    }
+
+    /// FIX #739 v4: Get delta CMUs from memory (not file)
+    /// Returns array of 32-byte CMUs that were appended during this session
+    static func getDeltaCMUsFromMemory() -> [Data] {
+        let count = Int(zipherx_get_delta_cmus_count())
+        if count == 0 {
+            return []
+        }
+
+        var buffer = [UInt8](repeating: 0, count: count * 32)
+        let actualCount = Int(zipherx_get_delta_cmus(&buffer, count))
+
+        var result: [Data] = []
+        for i in 0..<actualCount {
+            let offset = i * 32
+            let cmu = Data(buffer[offset..<offset + 32])
+            result.append(cmu)
+        }
+        return result
+    }
+
     /// Create a witness for the current position in the tree
     /// Call this right after appending a note that belongs to us
     /// Returns the witness index, or UInt64.max on error
@@ -1092,6 +1139,35 @@ enum ZipherXFFI {
         return (position: position, witness: Data(witnessBuffer.prefix(witnessLen)))
     }
 
+    /// FIX #580: Create witness from tree data + CMU position (instant, no P2P needed)
+    /// This is the KEY optimization - generates witness in ~1ms instead of 84s P2P rebuild
+    ///
+    /// - Parameters:
+    ///   - treeData: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - position: Position of CMU in tree (0-indexed)
+    /// - Returns: Tuple of (position, witness data) or nil on error
+    static func treeCreateWitnessForPosition(treeData: Data, position: UInt64) -> (position: UInt64, witness: Data)? {
+        var witnessBuffer = [UInt8](repeating: 0, count: 1028)
+        var witnessLen: Int = 0
+
+        let success = treeData.withUnsafeBytes { ptr in
+            zipherx_tree_create_witness_for_position(
+                ptr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                treeData.count,
+                position,
+                &witnessBuffer,
+                &witnessLen
+            )
+        }
+
+        guard success, witnessLen > 0 else {
+            print("❌ FIX #580: Failed to create witness for position \(position)")
+            return nil
+        }
+
+        return (position: position, witness: Data(witnessBuffer.prefix(witnessLen)))
+    }
+
     /// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
     /// This is MUCH faster than calling treeCreateWitnessForCMU multiple times
     /// because it only builds the tree ONCE instead of N times.
@@ -1148,6 +1224,82 @@ enum ZipherXFFI {
                 let witnessData = Data(witnesses[witnessStart..<(witnessStart + 1028)])
                 results.append((position: positions[i], witness: witnessData))
             } else {
+                results.append(nil)
+            }
+        }
+
+        return results
+    }
+
+    // MARK: - FIX #588: Rebuild Corrupted Witnesses
+
+    /// FIX #588: Rebuild corrupted witnesses at SPECIFIC positions
+    ///
+    /// Unlike treeCreateWitnessesBatch which builds ALL witnesses to the end of the boost file
+    /// (giving them the same root), this function creates each witness at its specific position.
+    /// This is critical for notes with different received_heights.
+    ///
+    /// This fixes the issue where witnesses have corrupted Merkle paths (filled_nodes)
+    /// due to old FIX #585 trimming code that zeroed out trailing bytes.
+    ///
+    /// - Parameters:
+    ///   - cmuData: The bundled CMU file data [count: u64][cmu1: 32]...
+    ///   - targets: Array of (cmu: Data, position: UInt64) tuples
+    /// - Returns: Array of witness Data, or nil for CMUs not found
+    static func treeRebuildWitnessesAtPositions(cmuData: Data, targets: [(cmu: Data, position: UInt64)]) -> [Data?] {
+        guard !targets.isEmpty else { return [] }
+
+        // Validate all CMUs are 32 bytes
+        for (cmu, _) in targets {
+            guard cmu.count == 32 else {
+                print("❌ FIX #588: Invalid CMU size: \(cmu.count)")
+                return targets.map { _ in nil }
+            }
+        }
+
+        let targetCount = targets.count
+
+        // Pack CMUs and positions into separate contiguous buffers
+        var packedCMUs = Data(capacity: targetCount * 32)
+        var positions = [UInt64](repeating: 0, count: targetCount)
+
+        for (i, (cmu, pos)) in targets.enumerated() {
+            packedCMUs.append(cmu)
+            positions[i] = pos
+        }
+
+        // Allocate output buffer for witnesses
+        var witnesses = [UInt8](repeating: 0, count: targetCount * 1028)
+
+        print("🔧 FIX #588: Rebuilding \(targetCount) witnesses at specific positions")
+
+        let successCount = cmuData.withUnsafeBytes { cmuDataPtr in
+            packedCMUs.withUnsafeBytes { targetsPtr in
+                positions.withUnsafeMutableBufferPointer { positionsPtr in
+                    zipherx_tree_rebuild_witnesses_at_positions(
+                        cmuDataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        cmuData.count,
+                        targetsPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        positionsPtr.baseAddress,
+                        targetCount,
+                        &witnesses
+                    )
+                }
+            }
+        }
+
+        print("✅ FIX #588: Rebuilt \(successCount)/\(targetCount) witnesses")
+
+        // Parse results
+        var results: [Data?] = []
+        for i in 0..<targetCount {
+            let witnessStart = i * 1028
+            let witnessData = Data(witnesses[witnessStart..<(witnessStart + 1028)])
+            // Check if witness is valid (not all zeros)
+            if witnessData.dropFirst(100).contains(where: { $0 != 0 }) {
+                results.append(witnessData)
+            } else {
+                print("⚠️ FIX #588: Witness[\(i)] appears to be all zeros - CMU not found")
                 results.append(nil)
             }
         }

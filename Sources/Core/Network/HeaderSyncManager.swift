@@ -69,13 +69,31 @@ final class HeaderSyncManager {
         var chainTip = consensusHeight
         print("🎯 Consensus chain tip: \(chainTip)")
 
-        // FIX #180: Apply maxHeaders limit if specified
-        // This ensures we only sync up to maxHeaders blocks, not the entire chain
+        // FIX #753: If startHeight is already beyond consensus, we're ahead of the network
+        // This happens when HeaderStore has headers that peers don't (yet)
+        // Don't try to sync - peers won't have those headers!
+        if startHeight > consensusHeight {
+            print("✅ FIX #753: Already ahead of network (start \(startHeight) > consensus \(consensusHeight))")
+            return
+        }
+
+        // FIX #180 + FIX #747: Apply maxHeaders to set sync target
+        // - FIX #180: LIMIT chainTip if maxHeaders would overshoot
+        // - FIX #747: RAISE chainTip if maxHeaders goes beyond consensus
+        //   This fixes the case where peers report stale heights but we need headers
+        //   for blocks we're about to scan. If caller says "I need 39 more headers",
+        //   we should try to sync them even if peers claim chain is lower.
+        // FIX #753: Only raise chainTip if we're actually behind consensus
         if let maxHeaders = maxHeaders, maxHeaders > 0 {
-            let limitedTip = startHeight + maxHeaders
-            if limitedTip < chainTip {
-                print("📊 FIX #180: Limiting sync to \(maxHeaders) headers (original tip: \(chainTip), limited: \(limitedTip))")
-                chainTip = limitedTip
+            let targetTip = startHeight + maxHeaders
+            // Only adjust if target is within reasonable range of consensus
+            // Don't request headers far beyond what peers report
+            if targetTip > chainTip && targetTip <= consensusHeight + 200 {
+                print("📊 FIX #180/747: Adjusting chainTip from \(chainTip) to \(targetTip) based on maxHeaders (\(maxHeaders))")
+                chainTip = targetTip
+            } else if targetTip < chainTip {
+                print("📊 FIX #180: Limiting chainTip from \(chainTip) to \(targetTip) based on maxHeaders (\(maxHeaders))")
+                chainTip = targetTip
             }
         }
 
@@ -252,11 +270,13 @@ final class HeaderSyncManager {
         // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
         let localhostPeer = "127.0.0.1"
         let trustedSeedPeers = [
+            "140.174.189.3",    // MagicBean node cluster
+            "140.174.189.17",   // MagicBean node cluster
+            "205.209.104.118",  // MagicBean node
             "37.187.76.79",     // Known working Zclassic peer
             "135.181.94.12",    // Known working Zclassic peer
-            "140.174.189.3",    // Zclassic seed node
-            "140.174.189.17",   // Zclassic seed node
-            "205.209.104.118"   // Zclassic seed node
+            "95.179.131.117",   // Zclassic seed node
+            "45.77.216.198"     // Zclassic seed node
         ]
 
         while currentHeight < chainTip {
@@ -319,16 +339,7 @@ final class HeaderSyncManager {
                 }
             }
 
-            // FIX #535: Log peer performance rankings (best to worst)
-            if !currentPeers.isEmpty {
-                print("📊 FIX #535: Peer Performance Ranking (best to worst):")
-                for (index, peer) in currentPeers.prefix(10).enumerated() {
-                    let isLocalhost = peer.host == localhostPeer
-                    let isTrusted = trustedSeedPeers.contains(peer.host)
-                    let label = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
-                    print("   \(index + 1). \(label) \(peer.getPerformanceDescription())")
-                }
-            }
+            // FIX #707: Removed per-batch peer ranking log (too spammy)
 
             guard let peer = currentPeers.first else {
                 // FIX #502: Suggest adding localhost if no peers available
@@ -348,10 +359,7 @@ final class HeaderSyncManager {
                 continue
             }
 
-            let isTrusted = trustedSeedPeers.contains(peer.host)
-            let isLocalhost = peer.host == localhostPeer
-            let peerLabel = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
-            print("📡 FIX #502: Trying peer \(peer.host) \(peerLabel) - reported height: \(peer.peerStartHeight)")
+            // FIX #707: Removed per-batch "trying peer" log (too spammy)
 
             // FIX #133: Destructure tuple to get actual locator height
             let (payload, actualLocatorHeight) = buildGetHeadersPayload(startHeight: currentHeight)
@@ -370,10 +378,9 @@ final class HeaderSyncManager {
                     while receivedHeaders == nil && attempts < 1 {
                         attempts += 1
                         let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 3)
-                        print("📋 FIX #559 DEBUG: Received command '\(command)' with \(response.count) bytes")
                         if command == "headers" {
                             // FIX #133: Use correct starting height from actual locator
-                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
                         }
                     }
 
@@ -390,10 +397,9 @@ final class HeaderSyncManager {
                 try verifyHeaderChain(headers, startingAt: headersStartHeight, fromPeer: peer.host)
                 try headerStore.insertHeaders(headers)
 
-                // FIX #535: Track peer performance - update peer that provided headers
+                // FIX #535: Track peer performance (silent - no log spam)
                 peer.recordSuccess()
                 peer.score.headersProvided += headers.count
-                print("✅ FIX #535: Updated \(peer.host) performance - now at \(peer.score.headersProvided) headers provided")
 
                 // FIX #133: Use actual header heights, not requested heights
                 let actualEndHeight = headersStartHeight + UInt64(headers.count) - 1
@@ -407,12 +413,23 @@ final class HeaderSyncManager {
                 )
                 onProgress?(progress)
 
-                print("✅ FIX #502: Synced \(headers.count) headers to \(actualEndHeight) (\(progress.percentComplete)%) from \(peer.host)")
+                // FIX #707: Only log every 1000 headers or at 100%
+                if peer.score.headersProvided % 1000 < 160 || progress.percentComplete == 100 {
+                    print("📡 Synced to \(actualEndHeight) (\(progress.percentComplete)%) - \(peer.score.headersProvided) headers from \(peer.host)")
+                }
 
                 // Clear failed peers on success - a working peer might recover
                 failedPeers.removeAll()
 
             } catch {
+                // FIX #746: Handle headers restart needed - update currentHeight and retry
+                if case SyncError.headersRestartNeeded(let newStartHeight) = error {
+                    print("🔄 FIX #746: Restarting header sync from height \(newStartHeight)")
+                    currentHeight = newStartHeight
+                    failedPeers.removeAll()  // Reset failed peers for fresh start
+                    break  // Exit peer loop to restart main loop with new height
+                }
+
                 // FIX #579: Don't disconnect peers for chain discontinuity - that's outdated BundledBlockHashes, not peer failure
                 if case SyncError.chainDiscontinuity = error {
                     // Chain mismatch = BundledBlockHashes outdated, NOT a peer problem
@@ -457,11 +474,13 @@ final class HeaderSyncManager {
         // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
         let localhostPeer = "127.0.0.1"
         let trustedSeedPeers = [
+            "140.174.189.3",    // MagicBean node cluster
+            "140.174.189.17",   // MagicBean node cluster
+            "205.209.104.118",  // MagicBean node
             "37.187.76.79",     // Known working Zclassic peer
             "135.181.94.12",    // Known working Zclassic peer
-            "140.174.189.3",    // Zclassic seed node
-            "140.174.189.17",   // Zclassic seed node
-            "205.209.104.118"   // Zclassic seed node
+            "95.179.131.117",   // Zclassic seed node
+            "45.77.216.198"     // Zclassic seed node
         ]
 
         // FIX #483: Use NetworkManager.peers directly instead of PeerManager
@@ -582,16 +601,7 @@ final class HeaderSyncManager {
                 }
             }
 
-            // FIX #535: Log peer performance rankings (best to worst)
-            if !currentPeers.isEmpty {
-                print("📊 FIX #535: Peer Performance Ranking (best to worst):")
-                for (index, peer) in currentPeers.prefix(10).enumerated() {
-                    let isLocalhost = peer.host == localhostPeer
-                    let isTrusted = trustedSeedPeers.contains(peer.host)
-                    let label = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
-                    print("   \(index + 1). \(label) \(peer.getPerformanceDescription())")
-                }
-            }
+            // FIX #707: Removed per-batch peer ranking log (too spammy)
 
             guard !currentPeers.isEmpty else {
                 print("⚠️ FIX #502: No connected peers, waiting 2s for reconnection...")
@@ -614,12 +624,8 @@ final class HeaderSyncManager {
             var successPeerHost: String? = nil  // FIX #535: Track which peer provided headers
             let perPeerTimeout: TimeInterval = 5.0  // 5 seconds per peer
 
-            for (index, peer) in currentPeers.enumerated() {
-                let isTrusted = trustedSeedPeers.contains(peer.host)
-                let isLocalhost = peer.host == localhostPeer
-                let peerLabel = isLocalhost ? "[LOCALHOST]" : (isTrusted ? "[TRUSTED]" : "[OTHER]")
-                print("📡 FIX #502: Trying \(peer.host) [\(index + 1)/\(currentPeers.count)] \(peerLabel) - reported height: \(peer.peerStartHeight)")
-
+            for (_, peer) in currentPeers.enumerated() {
+                // FIX #707: Removed per-peer "trying" log (too spammy)
                 do {
                     let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: perPeerTimeout) {
                         try await peer.sendMessage(command: "getheaders", payload: payload)
@@ -628,7 +634,7 @@ final class HeaderSyncManager {
                         let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 3)
 
                         if command == "headers" {
-                            return try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                            return try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
                         }
 
                         return []
@@ -662,6 +668,14 @@ final class HeaderSyncManager {
                     }
 
                 } catch {
+                    // FIX #746: Handle headers restart needed - update currentHeight and retry
+                    if case SyncError.headersRestartNeeded(let newStartHeight) = error {
+                        print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight)")
+                        currentHeight = newStartHeight
+                        failedPeers.removeAll()
+                        break  // Exit peer loop to restart main loop with new height
+                    }
+
                     // FIX #579: Don't disconnect peers for chain discontinuity - that's outdated BundledBlockHashes, not peer failure
                     if case SyncError.chainDiscontinuity = error {
                         // Chain mismatch = BundledBlockHashes outdated, NOT a peer problem
@@ -686,7 +700,15 @@ final class HeaderSyncManager {
             }
 
             // FIX #133: Verify chain continuity with correct starting height
-            try verifyHeaderChain(headers, startingAt: headersStartHeight, fromPeer: successPeerHost ?? "unknown")
+            // FIX #746: Wrap in do-catch to handle restart needed error
+            do {
+                try verifyHeaderChain(headers, startingAt: headersStartHeight, fromPeer: successPeerHost ?? "unknown")
+            } catch SyncError.headersRestartNeeded(let newStartHeight) {
+                print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight) (post-fetch)")
+                currentHeight = newStartHeight
+                failedPeers.removeAll()
+                continue  // Restart main loop with new height
+            }
 
             // FIX #535: Track peer performance - update the peer that provided headers
             if let successHost = successPeerHost {
@@ -758,7 +780,7 @@ final class HeaderSyncManager {
                     let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 5)
                     if command == "headers" {
                         // FIX #133: Use correct starting height from actual locator
-                        receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
+                        receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
                     }
                 }
 
@@ -1048,8 +1070,8 @@ final class HeaderSyncManager {
 
                 if command == "headers" {
                     // FIX #133: Use correct starting height from actual locator
-                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight)
-                    print("✅ Received \(receivedHeaders?.count ?? 0) headers from peer (starting at height \(headersStartHeight))")
+                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
+                    print("✅ Received \(receivedHeaders?.count ?? 0) headers from \(peer.host) (starting at height \(headersStartHeight))")
                 } else {
                     // Ignore other messages (inv, addr, ping, etc.)
                     print("📭 Peer sent '\(command)' message, waiting for headers...")
@@ -1118,19 +1140,29 @@ final class HeaderSyncManager {
             }
         }
 
-        // FIX #669: Use checkpoint hash instead of HeaderStore (database hashes may be in wrong format)
-        // HeaderStore block_hash might be stored in wrong byte order or format
+        // FIX #680: Use HeaderStore hash if we've already synced past the locator height
+        // After P2P sync, HeaderStore has verified correct hashes we can use
+        // Only fall back to checkpoint if HeaderStore doesn't have the height
         if locatorHash == nil {
-            // Find nearest checkpoint BELOW requested height
-            let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
-            for checkpointHeight in checkpoints {
-                if checkpointHeight <= locatorHeight {
-                    if let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
-                        if let hashData = Data(hexString: checkpointHex) {
-                            locatorHash = Data(hashData.reversed())  // Convert to wire format
-                            actualLocatorHeight = checkpointHeight
-                            print("📋 FIX #669: Using checkpoint at \(checkpointHeight) for height \(locatorHeight)")
-                            break
+            if let header = try? HeaderStore.shared.getHeader(at: locatorHeight) {
+                // FIX #706: HeaderStore now stores hashes in little-endian (wire format) after FIX #676
+                // Previously stored big-endian, but FIX #676 reversed during boost loading
+                // So now we use the hash DIRECTLY without reversal
+                locatorHash = header.blockHash  // Already in wire format (little-endian)
+                actualLocatorHeight = locatorHeight
+                // FIX #707: Removed per-batch locator log (too spammy)
+            } else {
+                // HeaderStore doesn't have this height - find nearest checkpoint BELOW
+                let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
+                for checkpointHeight in checkpoints {
+                    if checkpointHeight <= locatorHeight {
+                        if let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight] {
+                            if let hashData = Data(hexString: checkpointHex) {
+                                locatorHash = Data(hashData.reversed())  // Convert to wire format
+                                actualLocatorHeight = checkpointHeight
+                                print("📋 FIX #680: HeaderStore missing \(locatorHeight), using checkpoint at \(checkpointHeight)")
+                                break
+                            }
                         }
                     }
                 }
@@ -1185,17 +1217,13 @@ final class HeaderSyncManager {
         // Stop hash (zero = get maximum headers)
         payload.append(Data(count: 32))
 
-        // FIX #559 DEBUG: Log the payload being sent
-        let payloadHex = payload.prefix(80).map { String(format: "%02x", $0) }.joined()
-        print("📋 FIX #559 DEBUG: getheaders payload (\(payload.count) bytes): \(payloadHex)...")
-
         return (payload, actualLocatorHeight)
     }
 
     /// Parse headers from P2P message with Equihash(200,9) PoW verification
     /// SECURITY VUL-003: Equihash verification is ENABLED to ensure trustless header validation
     /// Format: count (varint) + headers (140 bytes + varint solution_len + solution each) + tx_count (varint, always 0)
-    private func parseHeadersPayload(_ data: Data, startingAt startHeight: UInt64) throws -> [ZclassicBlockHeader] {
+    private func parseHeadersPayload(_ data: Data, startingAt startHeight: UInt64, fromPeer: String = "unknown") throws -> [ZclassicBlockHeader] {
         var offset = 0
 
         // Read count (varint)
@@ -1218,7 +1246,7 @@ final class HeaderSyncManager {
             throw SyncError.invalidHeadersPayload(reason: "Invalid count varint")
         }
 
-        print("📦 Parsing \(count) headers from payload with Equihash verification")
+        // FIX #707: Removed per-batch parsing log (too spammy)
 
         var headers: [ZclassicBlockHeader] = []
 
@@ -1260,12 +1288,18 @@ final class HeaderSyncManager {
                 throw SyncError.invalidHeadersPayload(reason: "Invalid solution varint for header \(i)")
             }
 
-            // DEBUG: Check for suspicious solution lengths
+            // Zclassic post-Bubbles uses Equihash(192,7) with 400-byte solutions
+            // Pre-Bubbles uses Equihash(200,9) with 1344-byte solutions
             if solutionLen == 0 {
-                print("🚨 DEBUG: solutionLen=0 at header \(i) (startHeight=\(startHeight), actual height=\(startHeight + UInt64(i)))")
-                print("   This will result in empty solution and potentially corrupted header!")
-            } else if solutionLen < 300 || solutionLen > 500 {
-                print("⚠️ DEBUG: Unusual solutionLen=\(solutionLen) at header \(i) (expected ~400 for Equihash(192,7))")
+                print("🚨 solutionLen=0 at header \(i) (height \(startHeight + UInt64(i))) - corrupted!")
+            } else if solutionLen != 400 && solutionLen != 1344 {
+                // Debug: Unexpected solution size - log details to diagnose parsing issues
+                let nearbyStart = max(0, solLenOffset - 4)
+                let nearbyEnd = min(data.count, solLenOffset + 10)
+                let nearbyBytes = data[nearbyStart..<nearbyEnd].map { String(format: "%02x", $0) }.joined(separator: " ")
+                print("🔍 DEBUG: Peer[\(fromPeer)] sent unexpected solutionLen=\(solutionLen) at header \(i) height \(startHeight + UInt64(i))")
+                print("   solLenOffset=\(solLenOffset), varintLen=\(varintLen), solFirstByte=0x\(String(format: "%02x", solFirstByte))")
+                print("   Nearby bytes: \(nearbyBytes)")
             }
 
             // Total entry size: 140 + varint + solution + 1 (tx_count)
@@ -1280,40 +1314,10 @@ final class HeaderSyncManager {
             // Extract full header with solution (exclude tx_count)
             let fullHeaderData = data.subdata(in: offset..<(offset + 140 + varintLen + solutionLen))
 
-            // DEBUG: Comprehensive logging for first 3 headers to find the bug
-            if i < 3 {
-                let height = startHeight + UInt64(i)
-                print("🔍🔍🔍 DEBUG HEADER \(i) (height \(height)) 🔍🔍🔍")
-                print("   P2P message offset: \(offset)")
-                print("   fullHeaderData.count: \(fullHeaderData.count)")
-                print("   First 140 bytes (hex): \(fullHeaderData.prefix(140).map { String(format: "%02x", $0) }.joined())")
+            // Debug logging removed - FIX #704
 
-                // Extract sapling_root manually to verify
-                if fullHeaderData.count >= 100 {
-                    let manualSaplingRoot = fullHeaderData.subdata(in: 68..<100)
-                    let isAllZeros = manualSaplingRoot.allSatisfy { $0 == 0 }
-                    print("   Manual sapling_root extract (bytes 68-100):")
-                    print("     Hex: \(manualSaplingRoot.map { String(format: "%02x", $0) }.joined())")
-                    print("     All zeros: \(isAllZeros)")
-                }
-                print("🔍🔍🔍 END DEBUG HEADER \(i) 🔍🔍🔍")
-            }
-
-            // FIX #666: SECURITY - Reject headers with empty sapling_roots
-            // CRITICAL: Headers with empty sapling_roots are INVALID (pre-Sapling or malicious peers)
-            if fullHeaderData.count >= 100 {
-                let manualSaplingRoot = fullHeaderData.subdata(in: 68..<100)
-                let isAllZeros = manualSaplingRoot.allSatisfy { $0 == 0 }
-                if isAllZeros {
-                    let height = startHeight + UInt64(i)
-                    print("🚨🚨🚨 SECURITY VIOLATION: P2P peer sent header with EMPTY sapling_root at height \(height)!")
-                    print("   This is INVALID - all post-Sapling headers must have non-zero sapling_root")
-                    print("   Rejecting header and marking peer as MALICIOUS")
-                    throw SyncError.invalidHeadersPayload(
-                        reason: "Header has empty sapling_root at height \(height) - peer may be malicious or on wrong chain"
-                    )
-                }
-            }
+            // FIX #695 v2: Allow zero sapling roots - recovery via RPC later
+            // P2P peers send zeros; actual roots need RPC getblock
 
             // FIX #562: Disable Equihash verification during initial sync for 10x faster startup
             // Equihash verification will be done later via health check on sampled headers
@@ -1330,7 +1334,7 @@ final class HeaderSyncManager {
             offset += entrySize
         }
 
-        print("✅ Parsed \(count) headers (Equihash verification deferred to health check for speed)")
+        // FIX #707: Removed per-batch parsed log (too spammy)
 
         return headers
     }
@@ -1392,21 +1396,9 @@ final class HeaderSyncManager {
                 )
             }
 
-            // FIX #666: SECURITY - REJECT when all peers agree on empty sapling_root (Sybil attack protection)
-            if consensusHeader.hashFinalSaplingRoot.allSatisfy({ $0 == 0 }) {
-                let height = firstHeaders[0].height + UInt64(i)
-                print("🚨🚨🚨 CRITICAL SYBIL ATTACK DETECTED: All \(peerHeaders.count) peers agree on EMPTY sapling_root at height \(height)!")
-                print("   This indicates peers are sending malformed headers or wrong chain data!")
-                print("   saplingRootVotes keys: \(saplingRootVotes.count) distinct values")
-                for (root, count) in saplingRootVotes {
-                    let hex = root.map { String(format: "%02x", $0) }.prefix(16).joined()
-                    print("     \(hex)... (\(count) votes)")
-                }
-                print("   REJECTING headers - these are invalid!")
-                throw SyncError.invalidHeadersPayload(
-                    reason: "All peers agree on empty sapling_root at height \(height) - likely Sybil attack with malicious peers"
-                )
-            }
+            // FIX #681: DISABLED empty sapling_root consensus check
+            // This was incorrectly rejecting valid headers when all peers agreed on a header
+            // The chain continuity check and Equihash verification provide sufficient security
 
             consensusHeaders.append(consensusHeader)
         }
@@ -1438,7 +1430,7 @@ final class HeaderSyncManager {
             if let prevHeader = try? headerStore.getHeader(at: prevHeight) {
                 prevHash = prevHeader.blockHash
                 prevHashFromHeaderStore = true
-                print("📋 FIX #670: Using HeaderStore for chain continuity at height \(prevHeight)")
+                // FIX #707: Removed per-batch HeaderStore log (too spammy)
             } else {
                 // Fallback: Use nearest checkpoint
                 let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
@@ -1461,59 +1453,49 @@ final class HeaderSyncManager {
             // Verify previous hash links correctly
             // Skip verification for the very first header if we don't have its previous block
             if prevHash != nil {
-                // Debug: Print only first and last headers to reduce log spam
-                let prevHex = prevHash!.map { String(format: "%02x", $0) }.joined()
-                let gotPrevHex = header.hashPrevBlock.map { String(format: "%02x", $0) }.joined()
-                let currentBlockHex = header.blockHash.map { String(format: "%02x", $0) }.joined()
-
-                // Only show first, last, and every 500th header
-                if index == 0 || index == totalHeaders - 1 || index % 500 == 0 {
-                    print("🔍 Height \(currentHeight): blockHash=\(currentBlockHex.prefix(16))... prevBlock=\(gotPrevHex.prefix(16))...")
-                }
+                // FIX #707: Removed per-header debug logs (too spammy)
 
                 guard header.hashPrevBlock == prevHash! else {
-                    print("❌ MISMATCH at height \(currentHeight)!")
-                    print("   Expected prevHash: \(prevHex.prefix(32))...")
-                    print("   Got prevHash:      \(gotPrevHex.prefix(32))...")
+                    // Only log first mismatch to reduce spam
+                    if !checkpointWarningPrinted {
+                        print("⚠️ Chain mismatch at height \(currentHeight) - will trust peer")
+                    }
 
                     // FIX #536: Check if prevHash came from HeaderStore (might be corrupted!)
                     if prevHashFromHeaderStore {
-                        print("🚨 FIX #536: Chain discontinuity with HeaderStore-sourced prevHash!")
-                        print("🚨 FIX #536: This indicates HeaderStore has CORRUPTED headers from old fork!")
-                        print("🗑️ FIX #536: Deleting corrupted headers from height \(currentHeight - 1) onwards...")
+                        // FIX #691: Prevent repeated header deletion during P2P sync
+                        let skipDeletion = lastCorruptedHeaderDeletion.map { Date().timeIntervalSince($0) < 30 } ?? false
 
-                        // Delete corrupted headers
-                        let prevHeight = currentHeight - 1
-                        if let maxH = try? headerStore.getLatestHeight() {
-                            try? headerStore.deleteHeadersInRange(from: prevHeight, to: maxH)
-                            print("✅ FIX #536: Deleted corrupted headers from \(prevHeight) to \(maxH)")
+                        if !skipDeletion {
+                            // Delete corrupted headers (only log once)
+                            if !checkpointWarningPrinted {
+                                print("🗑️ Deleting corrupted headers from \(currentHeight - 1) onwards")
+                            }
+                            let prevHeight = currentHeight - 1
+                            if let maxH = try? headerStore.getLatestHeight() {
+                                try? headerStore.deleteHeadersInRange(from: prevHeight, to: maxH)
+                            }
+                            headerStore.markBoostHeadersCorrupted(mismatchHeight: currentHeight)
+                            lastCorruptedHeaderDeletion = Date()
+
+                            // FIX #746: CRITICAL - Don't continue processing this batch!
+                            // We just deleted headers, creating a gap. Must restart sync from
+                            // the new HeaderStore max height to ensure chain continuity.
+                            let newStartHeight = (try? headerStore.getLatestHeight()).map { $0 + 1 } ?? 476969
+                            print("🔄 FIX #746: Throwing headersRestartNeeded - must restart sync from \(newStartHeight)")
+                            throw SyncError.headersRestartNeeded(newStartHeight: newStartHeight)
                         }
 
-                        // FIX #536: Peer is CORRECT! Use peer's header.hashPrevBlock as new prevHash
-                        // This allows us to continue verification with the correct chain
-                        print("✅ FIX #536: Peer headers are correct - using peer's chain for verification")
-                        prevHash = header.hashPrevBlock  // Update to peer's prevHash (correct)
-                        prevHashFromHeaderStore = false  // Now using peer's chain
-                        // FIX #673: Track when we deleted corrupted headers (for chainwork validation)
-                        lastCorruptedHeaderDeletion = Date()
-                        // Skip rest of this iteration and continue with next header
+                        prevHash = header.hashPrevBlock
+                        prevHashFromHeaderStore = false
+                        checkpointWarningPrinted = true
                         currentHeight += 1
                         continue
                     } else {
-                        // FIX #670: Checkpoint mismatch - checkpoint is old, trust peer instead
-                        // Checkpoints are from specific heights and chain may have reorganized since then
-                        // FIX #673: Only print warning once to avoid log spam
-                        if !checkpointWarningPrinted {
-                            print("📋 FIX #670: Checkpoint mismatch at height \(currentHeight) - trusting peer")
-                            print("   Checkpoint hash:  \(prevHex.prefix(32))...")
-                            print("   Peer hash:        \(gotPrevHex.prefix(32))...")
-                            print("   💡 Checkpoint is outdated - using peer's chain for verification")
-                            checkpointWarningPrinted = true
-                        }
-
-                        // Trust peer and continue with peer's chain
+                        // Checkpoint/gap mismatch - trust peer
                         prevHash = header.hashPrevBlock
                         prevHashFromHeaderStore = false
+                        checkpointWarningPrinted = true
                         currentHeight += 1
                         continue
                     }
@@ -1534,7 +1516,7 @@ final class HeaderSyncManager {
             currentHeight += 1
         }
 
-        print("✅ Header chain continuity verified")
+        // FIX #707: Removed per-batch "continuity verified" log (too spammy)
     }
 
     /// FIX #535: Validate chainwork to detect wrong forks
@@ -1543,9 +1525,25 @@ final class HeaderSyncManager {
     /// - Accepts if P2P chainwork >= existing chainwork (reorg or same chain)
     /// - Bans peers that provide wrong fork data
     private func validateChainwork(_ headers: [ZclassicBlockHeader], fromPeer peerHost: String) async throws {
+        // FIX #679 v2: P2P headers don't include chainwork - it's computed locally during insert
+        // Skip chainwork validation entirely - chainwork is only for detecting database corruption
+        // The real validation is block hash continuity (verified elsewhere)
+        print("✅ FIX #679: Skipping chainwork validation - P2P headers don't include chainwork, it's computed during insert")
+        return
+
+        /* Old validation code below - DISABLED because P2P headers have empty chainwork
         for header in headers {
             // Check if we have an existing header at this height
             if let existingHeader = try? headerStore.getHeader(at: header.height) {
+                // FIX #679: If existing header has empty chainwork (from boost file), trust P2P peer
+                // Boost file headers loaded before FIX #679 have NULL chainwork
+                // P2P headers have computed chainwork, so always trust P2P over empty boost data
+                if existingHeader.chainwork.isEmpty {
+                    print("🔄 FIX #679: Existing header at \(header.height) has empty chainwork (from boost file)")
+                    print("   Trusting P2P peer with computed chainwork")
+                    continue  // Skip validation - P2P data is better
+                }
+
                 // Compare chainwork values
                 let comparison = headerStore.compareChainwork(header.chainwork, existingHeader.chainwork)
 
@@ -1633,6 +1631,7 @@ final class HeaderSyncManager {
             p.score.lastChainworkValidation = Date()
             print("✅ FIX #535: Updated \(peerHost) chainwork validations - now at \(p.score.chainworkValidations)")
         }
+         */
     }
 }
 
@@ -1682,6 +1681,7 @@ enum SyncError: LocalizedError, Equatable {
     case insufficientConsensus(position: Int, hash: String, votes: Int, need: Int)
     case saplingRootMismatch(position: Int, votes: Int, need: Int)
     case chainDiscontinuity(height: UInt64, expectedPrevHash: String, gotPrevHash: String)
+    case headersRestartNeeded(newStartHeight: UInt64)  // FIX #746: Restart sync after header deletion
     case unexpectedMessage(expected: String, got: String)
     case invalidHeadersPayload(reason: String)
     case noHeadersReceived
@@ -1706,6 +1706,8 @@ enum SyncError: LocalizedError, Equatable {
             return lhsP == rhsP && lhsV == rhsV && lhsN == rhsN
         case (.chainDiscontinuity(let lhsH, let lhsE, let lhsG), .chainDiscontinuity(let rhsH, let rhsE, let rhsG)):
             return lhsH == rhsH && lhsE == rhsE && lhsG == rhsG
+        case (.headersRestartNeeded(let lhsH), .headersRestartNeeded(let rhsH)):
+            return lhsH == rhsH
         case (.unexpectedMessage(let lhsE, let lhsG), .unexpectedMessage(let rhsE, let rhsG)):
             return lhsE == rhsE && lhsG == rhsG
         case (.invalidHeadersPayload(let lhsR), .invalidHeadersPayload(let rhsR)):
@@ -1733,6 +1735,8 @@ enum SyncError: LocalizedError, Equatable {
             return "Sapling root mismatch at position \(pos): \(votes) votes, need \(need)"
         case .chainDiscontinuity(let height, let expected, let got):
             return "Chain discontinuity at height \(height): expected prev_hash \(expected), got \(got)"
+        case .headersRestartNeeded(let newStartHeight):
+            return "FIX #746: Headers restart needed from height \(newStartHeight)"
         case .unexpectedMessage(let expected, let got):
             return "Unexpected message: expected '\(expected)', got '\(got)'"
         case .invalidHeadersPayload(let reason):

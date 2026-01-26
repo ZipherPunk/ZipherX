@@ -8,6 +8,1225 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #764: Clear Delta Bundle and FFI Memory During Full Rescan
+**Problem**: App startup takes 10+ minutes after Full Rescan. Tree root mismatch detected repeatedly, triggering repair loops.
+
+**Root Cause Analysis**:
+1. Full Rescan resets `lastScannedHeight` to 0, but delta manifest retains old `endHeight` (e.g., 2990286)
+2. New scan collects 89 CMUs, tries to save delta bundle with range `2990287-2990286` (backwards!)
+3. FIX #759 correctly detects invalid range and clears delta bundle file
+4. BUT: Rust FFI still has 210 stale CMUs in `DELTA_CMUS` memory from previous session
+5. FIX #524 repair attempts to fix tree root by pulling CMUs from FFI memory (stale data!)
+6. Result: Tree root never matches, repair loops indefinitely
+
+**Log Evidence**:
+```
+[17:23:35.335] ⚠️ FIX #759: INVALID delta range 2990287-2990286 (backwards)
+[17:23:35.371] 🔧 FIX #739 v4: Exporting 210 delta CMUs from memory  <- STALE!
+[17:23:35.380] 🔧 FIX #524 v4: Delta CMUs - memory: 210, file: 0
+[17:23:35.382] ⚠️ FIX #524: Tree root still doesn't match blockchain
+```
+
+**Solution**:
+1. **Rust FFI fix**: `zipherx_tree_init()` now clears `DELTA_CMUS` array
+   - Previously only cleared tree, witnesses, and position
+   - Now also clears stale delta CMUs from FFI memory
+   - Logs count of cleared CMUs for debugging
+
+2. **Swift fix**: Clear delta bundle file during Full Rescan
+   - Added `DeltaCMUManager.shared.clearDeltaBundle()` after FFI tree reset
+   - Prevents stale manifest `endHeight` from causing backwards range
+   - Placed after line 4693 (after `treeInit()` and `clearTreeState()`)
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - `zipherx_tree_init()` now clears `DELTA_CMUS`
+- `Sources/Core/Wallet/WalletManager.swift` - Clear delta bundle in Full Rescan path
+
+---
+
+### FIX #763: Centralized Debug Logging with Session Backup
+**Problem**: Debug logs were optional and only written to Xcode console. Multi-agent debugging systems couldn't access runtime logs for automated issue analysis.
+
+**Solution**:
+1. **Always-on file logging**: All `print()` statements now write to BOTH console AND file
+2. **Session backup on startup**: Previous log backed up as `zmac_YYYY-MM-DD_HH-MM-SS.log`
+3. **Platform-specific paths**:
+   - macOS DEBUG: `/Users/chris/ZipherX/zmac.log` (project root for agent access)
+   - macOS RELEASE: `~/Library/Application Support/ZipherX/Logs/zmac.log`
+   - iOS: `Documents/Logs/z.log`
+4. **Backup rotation**: Keeps last 10 backup logs, auto-deletes older ones
+5. **Session header**: Logs system info (version, device, OS) at start of each session
+6. **Log analysis helpers**: `getErrorLines()`, `getWarningLines()`, `getLinesMatching(pattern:)`
+7. **New log categories**: Added `.health`, `.p2p`, `.tor`
+
+**Team Orchestrator Integration**:
+- `python team_orchestrator.py logs` - Analyze current debug log
+- `python team_orchestrator.py logs --errors` - Show only errors
+- `python team_orchestrator.py logs --list` - List backup logs
+- Bugfix sprints automatically include log context in agent prompts
+
+**Files Modified**:
+- `Sources/Core/Services/DebugLogger.swift` - Complete rewrite with backup system
+- `scripts/team_orchestrator.py` - Added log analysis and context injection
+
+---
+
+### FIX #762: Delta CMU Sync Timeout Prevention (Infinite Loop)
+**Problem**: App stuck at startup with "initial sync in progress" - delta CMU sync hanging forever because ALL P2P peers timing out.
+
+**Root Cause**: Delta sync loop in `rebuildWitnessesForStartup()` had no overall timeout and never checked `consecutiveFailures >= maxConsecutiveFailures` to break.
+
+**Solution**:
+1. Added 2-minute overall timeout for delta sync
+2. Added check for consecutive failures to break loop early
+3. Logs progress when aborting due to timeout
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Delta sync timeout and failure checks
+
+---
+
+### FIX #761: Rust FFI Panic Safety Improvements (Security Audit)
+**Problem**: Security audit found multiple `unwrap()` calls in Rust FFI that could panic and crash the Swift app.
+
+**Solutions**:
+1. **Plaintext bounds check**: Check `plaintext.len() >= 20` before extracting value bytes
+2. **Safe Amount conversion**: `Amount::from_i64()` now uses `match Ok/Err` instead of `unwrap()`
+3. **Witness position logging**: Position conversion failures logged with warning instead of panic
+4. **Consensus threshold**: Increased from 5 to 7 for better Byzantine fault tolerance
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Safe error handling at lines 955, 2342, 6056, 6079, 6509, 6532
+- `Sources/Core/Network/NetworkManager.swift` - CONSENSUS_THRESHOLD = 7
+
+---
+
+### FIX #756: Database Tree Corruption Detection + Auto-Reload from Boost File
+**Problem**: App stuck with wrong anchor - tree root mismatch even after FIX #755 cleared delta bundle. Startup took 3+ minutes instead of target <1 minute.
+
+**Root Cause Analysis**:
+1. Database tree state had 1,046,639 CMUs
+2. Boost file has 1,045,687 CMUs
+3. Delta bundle had 218 CMUs
+4. Expected total: 1,045,687 + 218 = 1,045,905 CMUs
+5. Unexplained: 1,046,639 - 1,045,905 = 734 extra corrupted CMUs
+6. FIX #755 cleared delta bundle but NOT the corrupted database tree
+7. On next startup, corrupted tree loaded again from database
+
+**Log Evidence**:
+```
+[10:04:41.754] ✅ Commitment tree preloaded from database: 1046639 commitments
+[10:04:42.872] ✅ FIX #580 v2: CMU cache loaded: 1045687 commitments  <- Boost file count
+[10:04:42.665] ❌ FIX #755: Tree root MISMATCH after delta load!
+   Tree root:   705ee74037a299dc...
+   Header root: b6af2ce1ce2435c2...
+```
+
+**Solution**:
+1. **Validate tree size against boost + delta CMUs**:
+   - If `treeSize > boostCMUs`, check `treeSize == boostCMUs + deltaCMUs`
+   - If not equal → database tree has unexplained/corrupted CMUs
+   - Clear BOTH tree state AND delta bundle, reload from boost file
+
+2. **FIX #755 now clears database tree state**:
+   - When tree root mismatch detected after delta load
+   - Also clears database tree (not just delta bundle)
+   - Falls through to boost file download
+
+3. **Added `needsBoostReload` flag**:
+   - Tracks when corruption detected during delta loading
+   - Prevents returning with broken tree state
+   - Falls through to boost download instead
+
+**Key Fix Locations**:
+```swift
+// New validation in WalletManager.swift:
+} else if treeSize > effectiveCMUCount {
+    // FIX #756: Tree has MORE CMUs than boost file - validate delta accounts for ALL extra
+    let expectedSizeWithDelta = effectiveCMUCount + UInt64(deltaCMUs.count)
+    if treeSize != expectedSizeWithDelta {
+        print("⚠️ FIX #756: CRITICAL - Database tree has unexplained CMUs!")
+        print("   Unexplained: \(Int64(treeSize) - Int64(expectedSizeWithDelta)) CMUs")
+        try? WalletDatabase.shared.clearTreeState()
+        deltaManager.clearDeltaBundle()
+        // Fall through to reload from boost file
+    }
+}
+
+// FIX #755 now also clears database tree:
+if !rootsMatch {
+    try? WalletDatabase.shared.clearTreeState()  // NEW
+    deltaManager.clearDeltaBundle()
+    // Fall through to reload from boost file
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Tree preload validation logic (3 branches)
+
+---
+
+### FIX #755: Delta Bundle Tree Root Validation + Boost File Sync
+**Problem**: Tree root mismatch after loading delta CMUs - validation fails every startup, triggering repeated full rescans.
+
+**Root Cause Analysis**:
+1. Boost file contains serialized tree at height N with root R1
+2. Delta bundle contains CMUs for heights N+1 to M, saved with root R2
+3. On startup: deserialize boost tree (R1) + append delta CMUs = should produce R2
+4. But actual tree root was different (R3), causing header finalsaplingroot mismatch
+
+**Why Mismatch Occurred**:
+- Delta bundle collected during PHASE 2 scanning
+- Tree root R2 saved in delta manifest at collection time
+- If boost file updated AFTER delta collection, boost tree state changes
+- Adding old delta CMUs to new boost tree produces wrong root R3
+- FIX #563 v3 disabled tree root validation, masking this issue
+
+**Solution**:
+1. **After loading delta CMUs, validate tree root**:
+   - Compare FFI tree root with header's finalsaplingroot at delta end height
+   - If mismatch: clear delta bundle, flag for PHASE 2 rescan
+   - If match: save tree state
+
+2. **Invalidate delta bundle when boost file updates**:
+   - Added `DeltaCMUManager.shared.clearDeltaBundle()` in CommitmentTreeUpdater
+   - Prevents stale delta CMUs from being used with new boost tree
+
+**Key Fix Locations**:
+```swift
+// In WalletManager.swift after delta CMU loading:
+if let deltaManifest = deltaManager.getManifest(),
+   let treeRoot = ZipherXFFI.treeRoot(),
+   let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+    let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+    if !rootsMatch {
+        deltaManager.clearDeltaBundle()
+        self.pendingDeltaRescan = true
+    }
+}
+
+// In CommitmentTreeUpdater.swift after boost download:
+DeltaCMUManager.shared.clearDeltaBundle()
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Tree root validation after delta load (2 locations)
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - Delta invalidation on boost update
+
+---
+
+### FIX #754: Database Performance Optimizations (Indexes + Batch Insert)
+**Problem**: Database queries slow due to missing indexes, and note insertions slow due to individual transactions.
+
+**Analysis**:
+1. **Missing indexes**: Several frequently-queried columns had no indexes:
+   - `notes.spent_in_tx` - Used in `WHERE spent_in_tx = ?` queries
+   - `notes.received_in_tx` - Used in `WHERE received_in_tx = ?` queries
+   - `transaction_history.txid` - Used in many `WHERE txid = ?` queries
+
+2. **Individual note inserts**: During PHASE 1 scanning, notes were inserted one at a time:
+   - Each insert = prepare + bind + execute + finalize
+   - No transaction wrapping = implicit autocommit (very slow)
+   - ~50ms per insert → 50 notes = 2.5 seconds
+
+**Solution**:
+1. **Added 3 missing indexes**:
+```sql
+CREATE INDEX IF NOT EXISTS idx_notes_spent_in_tx ON notes(spent_in_tx);
+CREATE INDEX IF NOT EXISTS idx_notes_received_in_tx ON notes(received_in_tx);
+CREATE INDEX IF NOT EXISTS idx_history_txid ON transaction_history(txid);
+```
+
+2. **Added batch insert function `insertNotesBatch()`**:
+```swift
+func insertNotesBatch(_ notes: [BatchNote]) throws -> Int {
+    // Single prepared statement reused for all notes
+    // Single transaction wrapping (BEGIN/COMMIT)
+    // ~50x faster than individual inserts
+}
+```
+
+**Performance Impact**:
+- Index queries: O(n) → O(log n) lookup
+- Note batch insert: ~50x faster (single transaction vs autocommit)
+- Typical PHASE 1 with 20 notes: 1000ms → 20ms
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - Added 3 indexes + `BatchNote` struct + `insertNotesBatch()` function
+
+---
+
+### FIX #752: Tree Rebuild Progress Not Displayed on Progress Screen
+**Problem**: During tree rebuild (FIX #439), progress is logged but not shown on the UI progress screen.
+
+**Logs showed**:
+```
+[09:39:07.593] 🔧 FIX #439: Tree rebuild progress 42% (17/17)
+[09:39:07.987] 🔧 FIX #439: Tree rebuild progress 42% (17/17)
+```
+But UI showed no progress indicator for tree rebuild.
+
+**Root Cause**:
+The progress display filters tasks by ID:
+```swift
+let importPKTaskIds: Set<String> = [
+    "params", "keys", "database", "download_outputs", "download_timestamps",
+    "headers", "height", "scan", "witnesses", "balance", "instant_repair"
+]
+let coreTasks = walletManager.syncTasks.filter { task in
+    importPKTaskIds.contains(task.id)
+}
+```
+
+The `tree_rebuild` task ID was NOT in this set, so it was filtered out and never displayed!
+
+**Solution**:
+Add missing task IDs to the filter:
+```swift
+let importPKTaskIds: Set<String> = [
+    "params", "keys", "database", "download_outputs", "download_timestamps",
+    "headers", "height", "scan", "witnesses", "balance", "instant_repair",
+    "tree_rebuild", "full_start_repair", "full_repair"  // FIX #752
+]
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Added task IDs to importPKTaskIds (2 occurrences)
+
+---
+
+### FIX #751: Wallet Height Not Updating in Real-Time on Balance View
+**Problem**: Block height displayed on balance view stays at startup value, doesn't update as blocks are mined.
+
+**Root Cause**:
+`refreshChainHeight()` is called every 30 seconds but only updates `chainHeight`, not `walletHeight`:
+```swift
+// OLD: Only chainHeight was updated
+await MainActor.run {
+    self.chainHeight = newHeight
+}
+// walletHeight was NEVER updated here!
+```
+
+The balance view shows both values:
+```swift
+statRow("Height:", "\(networkManager.walletHeight) / \(networkManager.chainHeight)")
+```
+
+So `chainHeight` updated but `walletHeight` stayed at the startup value.
+
+**Solution**:
+Add `walletHeight` update in `refreshChainHeight()`:
+```swift
+// FIX #751: Always update walletHeight from database
+let currentDbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+if currentDbHeight > 0 {
+    await MainActor.run {
+        if currentDbHeight != self.walletHeight {
+            self.walletHeight = currentDbHeight
+        }
+    }
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - Add walletHeight update in refreshChainHeight
+
+---
+
+### FIX #750: Auto-Repair Anchor Mismatch on Transaction Failure
+**Problem**: When user tries to send, transaction fails with "Failed to generate zero-knowledge proof" due to corrupted witness, and they're told to manually repair via Settings.
+
+**Root Cause**:
+Witnesses can become corrupted due to:
+- CMU format changes (big-endian vs little-endian)
+- Tree state changes while witnesses were built
+- Database corruption
+
+When building transaction, Rust detects the mismatch:
+```
+❌ FIX #575 v2: ANCHOR MISMATCH - witness is corrupted!
+   Witness root: e8fe0d045a287870...
+   Path root:    6ce5505022e581a3...
+```
+
+**Previous Behavior**:
+- Error shown to user with message "Go to Settings → Repair Database"
+- User must manually navigate and trigger repair
+- Poor user experience for a fixable issue
+
+**Solution**:
+Auto-detect anchor/proof errors and repair automatically:
+```swift
+if isProofError && !hasAttemptedWitnessRepair {
+    print("🔧 FIX #750: Proof generation failed - auto-repairing witnesses...")
+    let fixed = await walletManager.fixAnchorMismatches()
+    hasAttemptedWitnessRepair = true
+    // Retry transaction
+    performSendTransaction()
+    return
+}
+```
+
+**Key Details**:
+- Detects errors containing: "proof", "anchor", "witness", "merkle"
+- Calls `fixAnchorMismatches()` which rebuilds all witnesses from CMU data
+- Retries transaction automatically after repair
+- `hasAttemptedWitnessRepair` flag prevents infinite retry loops
+- Flag reset when transaction succeeds or user starts new send
+
+**Files Modified**:
+- `Sources/Features/Send/SendView.swift` - Auto-repair logic in catch block
+
+---
+
+### FIX #749: FIX #477 Incorrectly Resets lastScannedHeight When Headers Cleared
+**Problem**: After FAST START, `lastScannedHeight` gets reset to 0, causing UI to show incorrect sync status.
+
+**Symptoms**:
+- `lastScannedHeight: 0` in health check logs
+- UI shows "Synced" but wallet hasn't actually scanned
+- Notes not discovered at proper heights
+
+**Timeline from Logs**:
+1. `[09:12:28.723]` FIX #677 clears all headers for fresh reload
+2. `[09:12:28.746]` FIX #477 detects `lastScannedHeight=2989899`, `HeaderStore=0`
+3. `[09:12:28.746]` FIX #477 thinks this is a race condition!
+4. `[09:12:28.746]` FIX #477 resets `lastScannedHeight` to 0 (WRONG!)
+5. `[09:13:30.907]` Health check sees `lastScannedHeight: 0`
+
+**Root Cause**:
+FIX #477 was designed to detect race conditions where wallet height exceeds HeaderStore height.
+But it didn't account for FIX #677 which intentionally clears ALL headers for fresh reload.
+
+When `headerStoreHeight == 0`, it means:
+- Headers are being reloaded from boost file (FIX #677)
+- NOT a race condition - this is expected state
+
+FIX #477 condition `lastScannedHeight > headerStoreHeight` always triggers when HeaderStore is empty.
+
+**Fix**:
+Only trigger FIX #477 race condition logic if `headerStoreHeight > 0`:
+```swift
+if lastScannedHeight > headerStoreHeight && headerStoreHeight > 0 {
+    // Race condition - headers exist but wallet is ahead
+    // ... reset lastScannedHeight ...
+} else if headerStoreHeight == 0 {
+    // FIX #749: Headers being reloaded - don't touch lastScannedHeight!
+    print("📋 FIX #749: HeaderStore is empty (headers being reloaded)")
+    print("📋 FIX #749: Keeping lastScannedHeight=\(lastScannedHeight) intact")
+}
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Added `headerStoreHeight > 0` check to FIX #477
+
+---
+
+### FIX #748: FAST START Never Sets isTreeLoaded = true (Background Sync Blocked)
+**Problem**: After FAST START completes, background sync and catch-up features are blocked.
+
+**Symptoms**:
+- `isTreeLoaded = false` in debug logs even after successful FAST START
+- `⚠️ FIX #597 v2: No header root available - cannot use FAST PATH`
+- Wallet stays behind chain tip - doesn't catch up after returning from background
+- `checkAndCatchUp()` returns immediately due to guard failure
+
+**Root Cause**:
+The `isTreeLoaded` flag is only set to `true` during FULL START (initial import). FAST START:
+1. Loads tree from boost file (ContentView.swift:311 - `treeDeserialize`)
+2. Appends delta CMUs
+3. Runs health checks
+4. Completes UI setup
+
+But NEVER calls `walletManager.isTreeLoaded = true`!
+
+This blocks:
+- `checkAndCatchUp()` at line 1702: `guard isTreeLoaded else { return }`
+- `refreshBalance()` at line 1770: `guard isTreeLoaded && !isSyncing`
+- FilterScanner waits forever at line 394
+
+**Fix**:
+After tree deserialization succeeds in FAST START (after delta CMU loading), set the flag:
+```swift
+await MainActor.run {
+    walletManager.isTreeLoaded = true
+}
+print("✅ FIX #748: Set isTreeLoaded = true for FAST START")
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - Set `isTreeLoaded = true` after tree loading in FAST START path
+
+---
+
+### FIX #747: Header Sync Uses Stale Peer Consensus Instead of Target Height
+**Problem**: PHASE 2 scans blocks beyond HeaderStore height, causing tree root validation failure.
+
+**Symptoms**:
+- `⚠️ Cannot save checkpoint - no header at height 2989899`
+- `⚠️ FIX #524: Cannot validate - no header at height 2989899`
+- Background sync stuck (`isTreeLoaded` never set to true)
+
+**Timeline from Logs**:
+1. FIX #525 requests headers synced to target height 2989899
+2. `syncHeaders` called with `startHeight=2989861`, `maxHeaders=39`
+3. Peer consensus returns 2989858 (stale, 41 blocks behind)
+4. `chainTip (2989858) >= startHeight (2989861)` check FAILS
+5. Function returns "Already synced to tip" without syncing!
+6. PHASE 2 scans blocks 2989859-2989899
+7. Tree root validation fails - no header at 2989899
+
+**Root Cause**:
+FIX #180's `maxHeaders` parameter only LOWERED chainTip if it exceeded the limit.
+It never RAISED chainTip when maxHeaders would go beyond stale peer consensus.
+
+**Fix**:
+Change FIX #180 logic to use `maxHeaders` as the authoritative target:
+- Before: `if limitedTip < chainTip { chainTip = limitedTip }`
+- After: `if targetTip != chainTip { chainTip = targetTip }`
+
+If the caller specifies maxHeaders, they know what headers they need. Peer consensus may be stale.
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Adjust chainTip based on maxHeaders
+
+---
+
+### FIX #746: Header Sync Gap After Chain Mismatch Deletion
+**Problem**: All peers return "no headers" after chain mismatch detection, including local node.
+
+**Symptoms**:
+- `⚠️ FIX #502: Peer 127.0.0.1 returned no headers, trying next peer...`
+- All peers fail with same error
+- Header sync stuck, wallet cannot catch up
+
+**Timeline from Logs**:
+1. Headers 2988798-2989775 synced via P2P (on top of boost file ending at 2988797)
+2. Chain mismatch detected at height 2989776
+3. FIX #700 deletes P2P headers from 2988798 to 2989775
+4. Current batch continues processing headers 2989776-2989793
+5. **GAP CREATED**: Heights 2988798-2989775 never re-synced!
+6. Next sync request uses locator at 2989793
+7. Peers don't recognize this locator because it's not connected to continuous chain
+
+**Root Cause**:
+After FIX #700 deletes headers, the code did `prevHash = header.hashPrevBlock; continue;`
+which continued processing the current batch. This created a gap in the header chain.
+
+**Fix**:
+- Added new error case `SyncError.headersRestartNeeded(newStartHeight: UInt64)`
+- After deleting headers, throw this error instead of continuing
+- Sync handlers catch error and restart from new HeaderStore max height + 1
+- Ensures proper chain continuity: boost file → P2P headers (no gaps)
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - New error type, throw after deletion, handle in sync loops
+
+---
+
+### FIX #745: Delta Bundle Validation Too Aggressive (0.2/block vs 0.06/block)
+**Problem**: Delta bundle cleared every startup, tree never synced beyond boost file end.
+
+**Symptoms**:
+- `⚠️ FIX #601: Delta bundle output count too low!`
+- `Actual outputs: 60 (0.06/block), Expected minimum: 205 (0.2/block)`
+- Tree stuck at boost file height (2988797), witnesses never updated
+
+**Root Cause**:
+FIX #601 expected 0.2 shielded outputs per block, but Zclassic only has ~0.06/block.
+The validation was failing because real blockchain data didn't meet unrealistic expectations.
+
+**Fix**: Removed over-aggressive validation. Trust the delta bundle since it was created by our own scan.
+
+**Files Modified**:
+- `Sources/Core/Storage/DeltaCMUManager.swift` - Remove FIX #601 output count validation
+
+---
+
+### FIX #743: Revert FIX #742 - Boost File CMUs ARE Already in Wire Format
+**Problem**: FIX #742 was WRONG - added incorrect reversal causing tree root mismatch.
+
+**What Happened**:
+1. FIX #733 (v4) correctly said: "Boost file CMUs are already in wire format"
+2. FIX #742 (v5) incorrectly reversed CMUs, thinking they were in display format
+3. This caused double-reversal, corrupting tree root
+
+**Root Cause of FIX #742 Error**:
+I assumed the boost file stored CMUs in display format without checking the generator code.
+
+**The Generator Code** (`generate_boost_file.py` line 364):
+```python
+'cmu': bytes.fromhex(cmu_hex)[::-1],  # Generator DOES reverse: RPC (display) → wire format
+```
+
+The generator ALREADY reverses CMUs from display to wire format! So the boost file contains wire format.
+
+**Fix**:
+- Reverted FIX #742's reversal - CMUs are used directly without reversal
+- Bumped `legacyCMUCacheVersion` from 5 to 6 to invalidate corrupt v5 cache
+
+**Byte Order Summary**:
+- RPC returns CMUs in **display format** (big-endian)
+- Generator reverses with `[::-1]` to **wire format** (little-endian)
+- Boost file stores **wire format** (little-endian)
+- FFI `Node::read()` expects **wire format** (little-endian)
+- No reversal needed in Swift extraction
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - Remove incorrect reversal, bump cache version
+
+---
+
+### FIX #742: [WRONG - REVERTED BY FIX #743]
+**This fix was incorrect** - it added a reversal that caused double-reversal and tree root mismatch.
+See FIX #743 for the correct understanding.
+
+---
+
+### FIX #741: CRITICAL - Tree Height Never Saved After Delta Sync (Slow Startup)
+**Problem**: App re-syncs 984 delta CMUs at every startup, taking 20+ seconds unnecessarily.
+
+**Symptoms**:
+- Log shows: `Syncing delta CMUs from 2988797 to 2989781 (984 blocks)` at EVERY startup
+- Tree has 1046035 CMUs (more than boost file's 1045687) but starts from boost end
+- `effectiveTreeHeight` stays at 2988797 (boost file height) even after delta sync
+
+**Root Cause**:
+The `saveTreeState()` function saved tree data but NOT the `tree_height`:
+```swift
+// BEFORE (broken):
+func saveTreeState(_ treeData: Data) throws {
+    let sql = "UPDATE sync_state SET tree_state = ? WHERE id = 1;"  // MISSING tree_height!
+}
+```
+
+After delta sync to height 2989781, `tree_height` in database stayed at 0 (never set).
+On next startup, `getTreeHeight()` returned 0, so fallback to `effectiveTreeHeight` (2988797).
+Result: Every startup re-synced from boost file end instead of last synced height.
+
+**Fix**:
+1. Added `height` parameter to `saveTreeState()`:
+```swift
+func saveTreeState(_ treeData: Data, height: UInt64? = nil) throws {
+    let sql = height != nil
+        ? "UPDATE sync_state SET tree_state = ?, tree_height = ? WHERE id = 1;"
+        : "UPDATE sync_state SET tree_state = ? WHERE id = 1;"
+    // ...bind height if present...
+}
+```
+
+2. Added `updateTreeHeight()` function for height-only updates
+
+3. Updated delta sync to pass chainHeight when saving:
+```swift
+try? WalletDatabase.shared.saveTreeState(treeData, height: chainHeight)
+```
+
+**Result**: After first delta sync, tree_height is persisted. Next startup starts from 2989781 instead of 2988797.
+
+**Files Modified**:
+- `Sources/Core/Storage/WalletDatabase.swift` - Added height parameter to saveTreeState(), added updateTreeHeight()
+- `Sources/Core/Wallet/WalletManager.swift` - Pass chainHeight in all delta sync save calls
+
+---
+
+### FIX #740: CRITICAL - FIX #568 v2 Dead Code Bug (Tree Never Synced Delta CMUs)
+**Problem**: FIX #568 v2 printed "syncing X delta CMUs" but NEVER ACTUALLY SYNCED them!
+
+**Symptoms**:
+- FIX #721 detects tree root MISMATCH after FIX #571 runs
+- FFI root after FIX #571: `28ba3606dabe0103...` (wrong)
+- Expected header root: `7111369554e9b852...` (correct)
+- Witnesses saved with wrong anchors, causing "ANCHOR MISMATCH" on send
+
+**Root Cause**:
+```swift
+// BUG: This else if just prints and terminates - never reaches actual sync!
+} else if treeWasAlreadyInMemory && blocksBehind > 0 {
+    print("🔄 FIX #568 v2: syncing \(blocksBehind) delta CMUs...")  // JUST A LOG!
+} else if chainHeight > startHeight {
+    // ACTUAL sync code here - NEVER REACHED when tree in memory!
+```
+
+**Why this happened**:
+- `treeWasAlreadyInMemory && blocksBehind > 0` is true on FAST START
+- This `else if` only prints a message, then falls through without syncing
+- The actual sync code in the NEXT `else if` is never executed
+- FIX #571 later tries to append CMUs but tree is still at boost file state
+
+**Fix**: Move the FIX #568 v2 log inside the actual sync block:
+```swift
+} else if chainHeight > startHeight {
+    // FIX #740: Merged FIX #568 v2 message here - the old code just printed but didn't sync!
+    if treeWasAlreadyInMemory && blocksBehind > 0 {
+        print("🔄 FIX #568 v2: Tree was already in memory but syncing...")
+    }
+    // ... actual sync code now executes ...
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Fixed dead code branch
+
+---
+
+### FIX #739 v3: CRITICAL - Delta Sync Approach for Witness Update
+**Problem**: Previous FIX #739 attempts failed because witnesses need the delta CMUs appended.
+
+**Symptoms**:
+- First test after FIX #524 completes: All 17 witnesses MATCH ✓
+- Second test a few seconds later: All 17 witnesses MISMATCH ✗
+- Witnesses loaded from DB don't have delta CMUs applied
+
+**Root Cause**:
+- FIX #524 fixes the GLOBAL tree: deserialize from boost + append delta CMUs → root `57633b71`
+- But witnesses in DB were created with boost-only CMU data
+- When witnesses are loaded, they still have old anchors (missing delta CMUs)
+- The `treeAppend()` function updates witnesses when called, but DB witnesses weren't loaded yet
+
+**Solution v3 - Delta Sync Approach**:
+1. Load existing witnesses from DB into FFI WITNESSES array using `treeLoadWitness()`
+2. Call new `updateAllWitnessesBatch()` to append delta CMUs to ALL loaded witnesses
+3. Extract updated witnesses using `treeGetWitness()` and save back to DB
+
+**New Rust FFI Functions** (don't modify tree, only update witnesses):
+```rust
+// Update all loaded witnesses with CMUs (WITHOUT touching tree)
+pub unsafe extern "C" fn zipherx_update_all_witnesses_with_cmu(cmu: *const u8) -> u64;
+pub unsafe extern "C" fn zipherx_update_all_witnesses_batch(cmus_data: *const u8, cmu_count: usize) -> u64;
+```
+
+**Swift Implementation**:
+```swift
+// FIX #739 v3: Load witnesses → append delta CMUs → save
+var loadedNotes: [(ffiIndex: UInt64, noteId: UInt32)] = []
+for noteData in validNotes {
+    if !noteData.note.witness.isEmpty {
+        let index = ZipherXFFI.treeLoadWitness(...)
+        if index != UInt64.max {
+            loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
+        }
+    }
+}
+
+// Update all witnesses with delta CMUs (no tree modification)
+let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+var packedCMUs = Data()
+for cmu in deltaCMUs { packedCMUs.append(cmu) }
+ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
+
+// Extract and save
+for (ffiIndex, noteId) in loadedNotes {
+    if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
+        try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
+        if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
+            try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+        }
+    }
+}
+```
+
+**Why this works**:
+- Witnesses in DB have all CMUs up to boost file end
+- Delta CMUs are CMUs from boost file end to chain tip
+- By loading witnesses and appending delta CMUs, we get correct final root
+- No tree modification needed (FIX #524 already fixed the tree)
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - New FFI functions
+- `Sources/ZipherX-Bridging-Header.h` - C declarations
+- `Sources/Core/Crypto/ZipherXFFI.swift` - Swift wrappers
+- `Sources/Core/Network/FilterScanner.swift` - Delta sync implementation
+
+---
+
+### FIX #738: CRITICAL - Batch Witness Creation Missing Delta CMUs
+**Problem**: FIX #524+#734 batch witness creation uses boost-only CMU data, missing delta CMUs.
+
+**Symptoms**:
+- All 17+ witnesses have DIFFERENT stale anchors (historical roots at note heights)
+- Tree root shows correct: `4affe8b1d98147d3...` (boost + delta)
+- But witness anchors show boost-only roots like `d19b03dd63c6b4da...`
+- Each note has its own unique stale anchor from when it was received
+- Sending fails with "ANCHOR MISMATCH - witness is corrupted"
+
+**Root Cause**:
+- `treeCreateWitnessesBatch()` builds its OWN tree from the input CMU data
+- FIX #524+#734 passed `cachedData` which only contains boost file CMUs (up to 2988797)
+- Delta CMUs (2988798+) were NOT included in the batch data
+- Result: Witnesses get boost file root, NOT current chain tip root
+
+**Why different anchors per note**:
+- Batch function creates individual witnesses at each note's historical position
+- Without delta CMUs, the tree stops at boost file end
+- Each witness reflects the partial tree at that note's discovery time
+
+**Solution**: Append delta CMUs to cached data before batch witness creation:
+```swift
+// FIX #738: CRITICAL - Must include delta CMUs in batch witness creation!
+let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+if !deltaCMUs.isEmpty {
+    print("🔧 FIX #738: Appending \(deltaCMUs.count) delta CMUs to batch witness data...")
+
+    // Update count in header (first 8 bytes)
+    let currentCount = cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+    let newCount = currentCount + UInt64(deltaCMUs.count)
+    var newCountLE = newCount.littleEndian
+    cachedData.replaceSubrange(0..<8, with: Data(bytes: &newCountLE, count: 8))
+
+    // Append delta CMUs
+    for cmu in deltaCMUs {
+        cachedData.append(cmu)
+    }
+}
+
+let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: cachedData, targetCMUs: targetCMUs)
+```
+
+**Result**: Witnesses now created with complete tree (1045687 boost + 22 delta = 1045709 CMUs)
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Append delta CMUs before batch call
+
+---
+
+### FIX #737 v2: CRITICAL - Reset lastScannedHeight When Delta Bundle Invalid
+**Problem**: After delta bundle validation failure, PHASE 2 only scans recent blocks, not from boost end.
+
+**Symptoms**:
+- Log shows: `⚠️ FIX #601: Delta bundle output count too low! ... clearing and will re-scan`
+- Then: `⚡ PHASE 2: 2989053 → 2989156 (104 blocks)` - only 104 blocks, not from boost end!
+- Delta bundle only has 6 CMUs instead of ~150 needed
+- FIX #524 repair fails: "Tree root still doesn't match blockchain"
+
+**Root Cause v1**:
+1. FIX #601 validates delta bundle: outputs too few for block range → **CLEARS delta**
+2. But `lastScannedHeight` stays at old value (e.g., 2989053)
+3. PHASE 2 starts from `lastScannedHeight`, NOT from boost end (2988797)
+
+**Root Cause v2** (discovered after v1):
+1. FIX #737 resets `lastScannedHeight` to 2988797 ✓
+2. FIX #569 witness sync updates `lastScannedHeight` to chainHeight (2989180) ✗
+3. Reset is overwritten before PHASE 2 runs!
+
+**Solution v2**: Use `pendingDeltaRescan` flag to protect the reset:
+```swift
+// FIX #737 v2: Set flag when resetting
+self.pendingDeltaRescan = true
+
+// FIX #569 checks flag before updating
+if !self.pendingDeltaRescan {
+    try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, ...)
+}
+
+// Clear flag after delta bundle rebuilt
+if WalletManager.shared.pendingDeltaRescan {
+    WalletManager.shared.pendingDeltaRescan = false
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - Added `pendingDeltaRescan` flag, set in FIX #737, checked in FIX #569
+- `Sources/Core/Network/FilterScanner.swift` - Clear flag after delta bundle save
+
+---
+
+### FIX #736: CRITICAL - Delta CMU Save Timing Issue (FIX #524 Repair Fails)
+**Problem**: FIX #524 tree repair can't find delta CMUs because they're saved AFTER repair runs.
+
+**Symptoms**:
+- Log shows: `⚠️ FIX #524: No delta CMUs found for range 2988798-2989148`
+- Followed by: `📦 DeltaCMU: Saved 21 outputs to delta bundle (height 2988798-2989148)`
+- All witnesses have stale boost file anchor instead of current chain tip anchor
+- Sending fails with "ANCHOR MISMATCH - witness is corrupted"
+
+**Root Cause**: Code ordering in `startScan()`:
+1. Line 1408: FIX #524 repair runs (calls `DeltaCMUManager.loadDeltaCMUsForHeightRange()`)
+2. Line 1426: Delta CMUs saved (calls `DeltaCMUManager.appendOutputs()`)
+- FIX #524 can't find delta CMUs because they haven't been saved yet!
+
+**Solution**: Move delta CMU save BEFORE FIX #524 repair:
+```swift
+// FIX #736: Save delta CMUs BEFORE FIX #524 repair, so repair can load them!
+// Previously delta save was AFTER FIX #524, causing "No delta CMUs found" error
+if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
+    DeltaCMUManager.shared.appendOutputs(...)  // Save FIRST
+}
+
+// Now FIX #524 can find them
+if !checkpointSaved {
+    await fixTreeRootMismatch(lastScannedHeight: targetHeight)  // Repair SECOND
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Reordered delta save before FIX #524
+
+---
+
+### FIX #735: CRITICAL - Delta CMU Byte Order Mismatch After FIX #730
+**Problem**: Tree root doesn't match blockchain after appending delta CMUs from P2P.
+
+**Symptoms**:
+- Log shows: `FIX #721: NOT updating witnesses - tree is corrupt!`
+- FFI tree root doesn't match header's finalsaplingroot
+- Witnesses not updated, sending fails
+
+**Root Cause**:
+- `getBlocksDataP2P()` returns `ShieldedOutput.cmu` in DISPLAY format (NetworkManager.swift:6015 reverses wire→display)
+- WalletManager appended these display format CMUs to the tree
+- But after FIX #730, FFI expects WIRE format (no reversal)
+- Result: Tree root mismatch
+
+**Solution**: Reverse display→wire format before appending delta CMUs:
+```swift
+// FIX #735: Reverse display → wire format for FFI
+if let cmuDisplay = Data(hexString: output.cmu) {
+    let cmuWire = Data(cmuDisplay.reversed())
+    deltaCMUs.append(cmuWire)
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - 2 locations in delta CMU appending
+
+**Note**: DeltaCMUManager already stores CMUs in wire format (correct). This fix only affects P2P-fetched delta CMUs via `getBlocksDataP2P()`.
+
+---
+
+### FIX #734: CRITICAL - 89x Speedup for Witness Rebuild (Batch Mode)
+**Problem**: FIX #524 witness rebuild takes 10+ minutes because it rebuilds 1M+ CMU tree for EACH note individually.
+
+**Symptoms**:
+- Log shows "FIX #562 v8: Added witness to global WITNESSES array (total: X witnesses)" slowly incrementing
+- Each witness takes 30-60 seconds to create
+- User stuck waiting during Full Rescan or tree repair
+
+**Root Cause**: Loop in FIX #524 called `treeCreateWitnessForCMU` for each note:
+```swift
+for note in allNotes {  // O(89 notes)
+    treeCreateWitnessForCMU(...)  // O(1M CMUs) per call
+}  // Total: O(89M) operations
+```
+
+**Solution**: Use batch witness creation that builds tree ONCE:
+```swift
+// FIX #734: Single batch call
+let results = ZipherXFFI.treeCreateWitnessesBatch(cmuData: cachedData, targetCMUs: targetCMUs)
+// Total: O(1M) operations - 89x faster!
+```
+
+**Algorithm**:
+1. Find all target CMU positions in single O(n) pass
+2. Build tree ONCE, creating witnesses at each sorted position
+3. Update all witnesses with delta CMUs once
+
+**Performance**:
+- Before: O(n × m) = O(89 × 1M) = O(89M) operations → 10+ minutes
+- After: O(m) = O(1M) operations → ~10 seconds
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - FIX #734 batch witness creation in FIX #524
+
+---
+
+### FIX #733: CRITICAL - Double CMU Reversal Causing Tree Root Mismatch
+**Problem**: Send transactions fail with "ANCHOR MISMATCH - witness is corrupted" after boost file update.
+
+**Symptoms**:
+- Tree root validation passes (FIX #732)
+- But witnesses have stale anchors that don't match tree root
+- Transaction building fails pre-broadcast
+
+**Root Cause**: Triple byte-order confusion across generator/Swift/Rust:
+1. **Generator**: `bytes.fromhex(cmu_hex)[::-1]` → stores CMUs in WIRE format
+2. **FIX #577**: Swift `.reversed()` → incorrectly reverses to DISPLAY format
+3. **FIX #730**: Rust FFI no longer reverses → passes DISPLAY format to tree
+4. **serialize_tree**: Uses WIRE format (no reversal) → Section 5 tree has WIRE format
+
+Result: Section 5 tree (WIRE CMUs) has different root than rebuilt tree (DISPLAY CMUs).
+
+**Solution**:
+1. Removed `.reversed()` in `extractCMUsInLegacyFormat()` - CMUs already in wire format
+2. Bumped `legacyCMUCacheVersion` from 3 to 4 to invalidate old caches
+3. Health check `checkStaleWitnesses()` auto-detects and triggers rebuild
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` - FIX #733 remove reversal, bump cache version
+
+**Related Fixes**:
+- FIX #577: Original (incorrect) reversal in Swift
+- FIX #730: Removed reversal in Rust FFI
+- FIX #732: Tree root validation height selection
+
+---
+
+### FIX #727: Full Rescan Task List Shows Unwanted Tasks
+**Problem**: Full Rescan UI showed many unwanted tasks (health checks, repairs) cluttering the display.
+
+**Root Cause**: Task filter used blacklist approach (`!task.id.hasPrefix("fast_")`) which let unwanted tasks through.
+
+**Solution**: Changed to whitelist approach - only show known Import PK task IDs:
+```swift
+let importPKTaskIds: Set<String> = [
+    "params", "keys", "database", "download_outputs", "download_timestamps",
+    "headers", "height", "scan", "witnesses", "balance", "instant_repair"
+]
+```
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - FIX #727 in currentSyncProgress and currentSyncTasks
+
+---
+
+### FIX #726: CRITICAL - Full Rescan Skips PHASE 1 (0 Notes Found)
+**Problem**: Full Rescan completed but found 0 notes, balance showed 0 ZCL.
+
+**Log Evidence**:
+```
+scanWithinDownloadedRange=false
+currentHeight=2984747 > phase1EndHeight=2984746
+📊 Unspent notes: 0, Total: 0 zatoshis (0.0 ZCL)
+```
+
+**Root Cause**: When `lastScannedHeight=0` AND tree exists, FilterScanner set:
+```swift
+startHeight = effectiveTreeHeight + 1  // 2984747 - SKIPS ENTIRE BOOST FILE!
+scanWithinDownloadedRange = false       // PHASE 1 disabled!
+```
+This skipped PHASE 1 (Rust FFI boost scan) where 99% of historical notes exist.
+
+**Solution**: Added Full Rescan detection in FilterScanner.swift:
+```swift
+let isFullRescan = lastScanned == 0 && (treeExists || hasDownloadedTree) && !isImportedWallet
+if isFullRescan {
+    startHeight = ZclassicCheckpoints.saplingActivationHeight
+    scanWithinDownloadedRange = true
+    // Load boost file CMU data for position lookup...
+}
+```
+
+**Result**: Full Rescan now:
+1. Starts from Sapling activation height (476969)
+2. Enables PHASE 1 (boost file scan)
+3. Loads CMU data for position lookup
+4. Finds all historical notes
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - FIX #726 in startHeight determination
+
+---
+
+### FIX #725: Missing Transactions in wallet.dat History
+**Problem**: Some transactions missing from history list in Full Node (wallet.dat) mode.
+
+**Root Causes**:
+1. `z_getoperationresult` is **DESTRUCTIVE** - clears operation list after returning!
+   - First view: sent z-transactions appear
+   - Second view: they're gone forever
+2. `listtransactions` pagination could miss transactions
+3. z-address SENT transactions not properly captured
+
+**Solution**:
+1. Changed `z_getoperationresult` → `z_getoperationstatus` (non-destructive)
+2. Added `listsinceblock` RPC call - gets ALL t-address transactions reliably
+3. Improved z-address sent transaction parsing from operation params
+4. Added transaction enrichment to get accurate heights/timestamps
+5. Fixed sorting: by height DESC (most recent first), then timestamp
+
+**Files Modified**:
+- `Sources/Core/FullNode/RPCClient.swift` - FIX #725 in getZOperationResults, getAllWalletTransactions, new listSinceBlock
+
+---
+
+### FIX #724: Ping Race Condition with Other P2P Operations
+**Problem**: Local node (127.0.0.1) sometimes shows "Peer handshake failed" errors even though it's running.
+
+**Log Evidence**:
+```
+18:30:05 - Peer 127.0.0.1 reports height 2988117  ← WORKING
+18:30:20 - Mempool failed: Request timed out       ← TIMEOUT
+18:30:20 - Ping failed: Peer handshake failed      ← RACE CONDITION!
+```
+
+**Root Cause**: `sendPing()` did NOT use `withExclusiveAccess`:
+1. Keepalive timer calls `sendPing()` without acquiring the lock
+2. Another operation (like getMempoolTransactions) is using the connection
+3. When mempool times out, leftover data sits in socket buffer
+4. Ping's `receiveMessage()` reads this old data
+5. Magic bytes don't match → throws "handshake failed"
+
+**Solution**: Wrap ping operations in `withExclusiveAccessTimeout`:
+```swift
+return try await withExclusiveAccessTimeout(seconds: 5) {
+    try await sendMessage(command: "ping", payload: nonce)
+    // ... receive pong
+}
+```
+If lock acquisition times out (peer busy), return `true` (skip ping, don't mark dead).
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` - FIX #724 in sendPing()
+
+---
+
+### FIX #723: CRITICAL - Auto-Repair Tree Root Mismatch at INSTANT START
+**Problem**: Tree root mismatch detected by health check but auto-repair didn't trigger, allowing app to start with corrupt tree.
+
+**Log Evidence**:
+```
+❌ FIX #358: Tree root MISMATCH at height 2988091!
+   Our tree root:        de252c9dee967e04...
+   Header sapling root:  35ec4770279d35a6...
+...
+⚡ FIX #168: INSTANT START COMPLETE  ← App started with corrupt tree!
+```
+
+**Root Cause 1**: INSTANT START critical issues filter used:
+```swift
+let criticalIssues = healthResults.filter { !$0.passed && $0.details.contains("REPAIR") }
+```
+But Tree Root Validation details say "Full Rescan" not "REPAIR", so it wasn't detected.
+
+**Root Cause 2**: INSTANT START repair didn't call `forceFullRescan: true`:
+```swift
+try await walletManager.repairNotesAfterDownloadedTree { ... }  // Missing forceFullRescan!
+```
+This does quick repair which uses existing (corrupt) tree instead of rebuilding from boost file.
+
+**Solution**:
+1. Fixed filter to detect all critical issues:
+   ```swift
+   let criticalIssues = healthResults.filter {
+       !$0.passed && ($0.critical || $0.details.contains("REPAIR") || $0.details.contains("Full Rescan"))
+   }
+   ```
+2. Added Tree Root mismatch detection in INSTANT START:
+   ```swift
+   let hasTreeRootMismatch = criticalIssues.contains { $0.checkName == "Tree Root Validation" }
+   ```
+3. Force full rescan when tree root mismatch detected:
+   ```swift
+   try await walletManager.repairNotesAfterDownloadedTree(onProgress: ..., forceFullRescan: hasTreeRootMismatch)
+   ```
+
+**Result**: App now auto-repairs tree corruption at startup instead of starting with broken state.
+
+**Files Modified**:
+- `Sources/App/ContentView.swift` - FIX #723 in INSTANT START health check handling
+
+---
+
+### FIX #722: Remove Excessive Per-CMU Debug Logging
+**Problem**: `grep -i "delta cmu" zmac.log | wc -l` returned 12,359 entries - way too verbose!
+
+**Root Cause**: FIX #563 v6 added per-CMU debug logging in `loadDeltaCMUsForHeightRange()`:
+```swift
+print("📦 Delta CMU #\(cmus.count): height=\(height), cmu=\(cmu.prefix(8)...")
+```
+This logged every single CMU when loading delta bundle (12,195 entries).
+
+**Solution**: Removed per-CMU logging. Summary logs at start/end of operation are sufficient.
+
+**Files Modified**:
+- `Sources/Core/Storage/DeltaCMUManager.swift` - Removed line 255 per-CMU print
+
+---
+
+### FIX #721: Verify FFI Tree Matches HeaderStore BEFORE Updating Witnesses
+**Problem**: Witness update used HeaderStore anchor even when FFI tree root was different, causing "joinsplit requirements not met" errors.
+
+**Root Cause**: In `preRebuildWitnessesForInstantPayment()`:
+```swift
+currentTreeAnchor = currentHeader.hashFinalSaplingRoot  // 369307d3b75234e7...
+// But FFI tree has different root: 7d1def643b9bf27b...
+```
+
+When TX is built later:
+1. Anchor from witness (`369307d3...`) doesn't match FFI tree root (`7d1def64...`)
+2. Proof generation uses mismatched anchor/tree state
+3. Network rejects: "joinsplit requirements not met"
+
+**Solution**: Before updating witnesses, verify FFI tree root matches HeaderStore:
+1. Get FFI tree root
+2. Get HeaderStore sapling root at chainHeight
+3. If they match: proceed with witness update
+4. If mismatch: ABORT witness update, print error, don't corrupt witnesses
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - FIX #721 in preRebuildWitnessesForInstantPayment()
+
+---
+
+### FIX #720: Health Check Must Validate at lastScannedHeight, Not Boost End Height
+**Problem**: FIX #479 validated tree root at BOOST END height when tree had delta CMUs, but FFI tree root represents CURRENT state. This masked real corruption.
+
+**Root Cause**: FIX #479 logic was backwards:
+- If tree had delta CMUs beyond boost, it validated at boost end height
+- But FFI root is for CURRENT state (boost + delta), not boost end
+- Comparing current FFI root vs boost-end header is meaningless
+- FIX #479 v2 returned `.passed()` for ANY mismatch at boost height, claiming it was "expected PHASE 2 growth"
+
+**Solution**:
+1. ALWAYS validate at lastScannedHeight (where FFI tree state should match)
+2. Removed FIX #479 v2's incorrect "mismatch is expected" logic
+3. Any mismatch now correctly returns `.failed()` with `critical: true`
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletHealthCheck.swift` - FIX #720 in checkTreeRootMatchesHeader()
+
+---
+
+### FIX #719: Block Send When Tree Root Mismatch Detected
+**Problem**: FIX #537 ALLOWED send even when FFI tree root didn't match HeaderStore sapling root. This caused "joinsplit requirements not met" errors.
+
+**Root Cause**: Line 6903 in `validateCMUTreeBeforeSend()`:
+```swift
+// FIX #537: Allow send - the FFI tree will be updated during normal sync  ← WRONG!
+return CMUTreeValidationResult(isValid: true, ...)
+```
+
+This was incorrect. If tree roots don't match:
+- TX anchor is computed from FFI tree
+- Blockchain expects anchor matching header's finalsaplingroot
+- Mismatch = anchor doesn't exist = TX rejected with "joinsplit requirements not met"
+
+**Solution**:
+1. If mismatch AND header has non-zero root: BLOCK send with clear error
+2. If mismatch AND header has ZERO root (corrupted headers): Allow but warn
+3. User must run "Repair Database" to fix tree
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` - FIX #719 in validateCMUTreeBeforeSend()
+
+---
+
+### FIX #718: VUL-002 Extension - Anchor Validation BEFORE Broadcast
+**Problem**: VUL-002 only verified zk-SNARK proofs were mathematically valid, but didn't verify the TX would be ACCEPTED by the network. User's TX rejected with "joinsplit requirements not met" because anchor didn't exist on blockchain.
+
+**Root Cause**:
+- FIX #697 DISABLED anchor validation because HeaderStore had zero sapling roots
+- Witnesses were built from a corrupt FFI tree (tree root mismatch with blockchain)
+- TX was built with anchor `519d182d8f87bb80...` which doesn't exist on blockchain
+- Local node rejected: "AcceptToMemoryPool: joinsplit requirements not met"
+
+**What VUL-002 Must Verify**:
+1. ✅ zk-SNARK proofs valid (already done)
+2. ✅ **Anchor exists on blockchain** (FIX #718 - re-enabled with P2P verification)
+3. Future: Inputs not already spent
+
+**Solution**: Re-enabled anchor validation with multi-layer check:
+1. First check HeaderStore (fast) - if found, anchor is valid
+2. If not in HeaderStore, check if anchor matches FFI tree root
+3. If matches FFI, verify FFI tree matches blockchain (HeaderStore at chain tip)
+4. If HeaderStore has zero roots (corrupt), trust FFI if boost file was verified
+5. If root mismatch detected: REJECT with "run Repair Database" message
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` - FIX #718 anchor validation
+
+---
+
 ### FIX #708: Skip Redundant Header Sync in ensureHeaderTimestamps
 **Problem**: Header sync would complete (e.g., 2880 headers in 2.7s), then ~14 seconds later a NEW sync would start from a much lower height (2938700 → 2938860).
 

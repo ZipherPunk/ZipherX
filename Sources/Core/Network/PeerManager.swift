@@ -151,7 +151,7 @@ public final class PeerManager: ObservableObject {
     public let HARDCODED_SEEDS: Set<String> = [
         // FIX #507: Local node - highest priority (always fastest when available)
         "127.0.0.1",          // Local zclassicd node on port 8033
-        // Original seeds
+        // Original seeds - ZCL and ZEC both use Equihash(200,9)!
         "140.174.189.3",
         "140.174.189.17",
         "205.209.104.118",
@@ -282,9 +282,9 @@ public final class PeerManager: ObservableObject {
         let peerSnapshot = peers
         peersLock.unlock()
 
-        // FIX #469: ONLY return peers with completed handshake!
-        // Peers with isConnectionReady=true but handshake incomplete will fail when used
-        let readyPeers = peerSnapshot.filter { $0.isHandshakeComplete }
+        // FIX #469: ONLY return peers with completed handshake AND live connection!
+        // Peers with isHandshakeComplete=true but isConnectionReady=false will fail when used
+        let readyPeers = peerSnapshot.filter { $0.isConnectionReady && $0.isHandshakeComplete }
 
         let notReady = peerSnapshot.filter { $0.isConnectionReady && !$0.isHandshakeComplete }
         if !notReady.isEmpty {
@@ -317,15 +317,26 @@ public final class PeerManager: ObservableObject {
     /// FIX #469: Only return peers with COMPLETED P2P handshake
     /// FIX #434: Only return valid Zclassic peers
     /// FIX #458: Added lock to protect peers array
+    /// FIX #592: ALWAYS include hardcoded seeds (especially 127.0.0.1) - they're verified good nodes!
     public func getPeersForBroadcast() -> [Peer] {
         peersLock.lock()
         let peerSnapshot = peers
         peersLock.unlock()
 
-        return peerSnapshot.filter {
-            !isBanned($0.host) &&
-            $0.isHandshakeComplete &&
-            $0.hasRecentActivity
+        return peerSnapshot.filter { peer in
+            // Must not be banned and must have completed handshake
+            guard !isBanned(peer.host) && peer.isHandshakeComplete else {
+                return false
+            }
+
+            // FIX #592: Hardcoded seeds are ALWAYS included (verified good nodes)
+            // Especially 127.0.0.1 - the local node which user says is working 100%
+            if HARDCODED_SEEDS.contains(peer.host) {
+                return true  // Skip recent activity check for hardcoded seeds
+            }
+
+            // Other peers must have recent activity
+            return peer.hasRecentActivity
         }
     }
 
@@ -338,7 +349,8 @@ public final class PeerManager: ObservableObject {
         let peerSnapshot = peers
         peersLock.unlock()
 
-        let ready = peerSnapshot.filter { $0.isHandshakeComplete && !isBanned($0.host) }
+        // CRITICAL: Must have LIVE connection (isConnectionReady), not just handshake!
+        let ready = peerSnapshot.filter { $0.isConnectionReady && $0.isHandshakeComplete && !isBanned($0.host) }
         return Array(ready.prefix(count))
     }
 
@@ -1098,14 +1110,15 @@ public final class PeerManager: ObservableObject {
 
         print("🔍 FIX #387: Testing \(candidates.count) peers with quick ping...")
 
-        // Step 2: Parallel ping test with 2-second timeout
+        // FIX #563 v8: Use 5-second timeout instead of 2 seconds
+        // 2s is too aggressive - only 1/6 peers responded, causing DUPLICATE false positive
         var respondingPeers: [Peer] = []
 
         await withTaskGroup(of: (Peer, Bool).self) { group in
             for peer in candidates {
                 group.addTask {
-                    // Quick 2-second ping test using sendPing
-                    let success = await peer.sendPing(timeoutSeconds: 2)
+                    // 5-second ping test to accommodate Tor/remote latency
+                    let success = await peer.sendPing(timeoutSeconds: 5)
                     return (peer, success)
                 }
             }
@@ -1113,21 +1126,23 @@ public final class PeerManager: ObservableObject {
             for await (peer, success) in group {
                 if success {
                     respondingPeers.append(peer)
-                    print("✅ FIX #387: Peer \(peer.host) responds to ping")
+                    print("✅ FIX #563 v8: Peer \(peer.host) responds to ping")
                 } else {
-                    print("❌ FIX #387: Peer \(peer.host) failed ping (zombie)")
+                    print("❌ FIX #563 v8: Peer \(peer.host) failed ping (zombie)")
                 }
             }
         }
 
-        if respondingPeers.isEmpty {
-            print("⚠️ FIX #387: ALL \(candidates.count) peers failed ping! Zombie connections.")
-            // Return candidates anyway - let broadcast attempt and fail naturally
-            // This prevents blocking forever if network is flaky
+        // FIX #563 v8: If < 50% respond, use candidates anyway
+        // Don't let aggressive ping filtering reduce broadcast to too few peers
+        let responseRate = Double(respondingPeers.count) / Double(candidates.count)
+        if respondingPeers.isEmpty || responseRate < 0.5 {
+            print("⚠️ FIX #563 v8: Only \(respondingPeers.count)/\(candidates.count) peers responded (\(Int(responseRate * 100))%)")
+            print("⚠️ FIX #563 v8: Using all \(candidates.count) candidates - ping timeout too aggressive")
             return candidates
         }
 
-        print("⚡ FIX #387: \(respondingPeers.count)/\(candidates.count) peers verified responsive")
+        print("⚡ FIX #563 v8: \(respondingPeers.count)/\(candidates.count) peers verified responsive")
         return respondingPeers
     }
 

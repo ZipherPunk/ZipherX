@@ -77,6 +77,10 @@ path = "src/bin/bench_decrypt.rs"
 name = "verify_balance"
 path = "src/bin/verify_balance.rs"
 
+[[bin]]
+name = "build_tree_from_cmus"
+path = "src/bin/build_tree_from_cmus.rs"
+
 [profile.release]
 lto = true
 # FIX #199: Use opt-level 3 for maximum speed (Groth16 proofs, witness computation)

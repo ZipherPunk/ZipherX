@@ -30,70 +30,195 @@ private func getCurrentTimestamp() -> String {
 }
 
 /// Global print override - uses os_log for reliable device logging with timestamps
+/// FIX #763: Now writes to BOTH console AND file for complete debugging
 /// NOTE: Only use os_log OR Swift.print, not both, to avoid duplicate log lines
 public func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
     let output = items.map { "\($0)" }.joined(separator: separator)
     let timestamp = getCurrentTimestamp()
     let formattedOutput = "[\(timestamp)] DEBUGZIPHERX: \(output)"
-    // Use Swift.print only - os_log can cause duplicate lines when both stdout and os_log
-    // are captured in the same log file (common on macOS)
+
+    // Write to Xcode console
     Swift.print(formattedOutput, terminator: terminator)
+
+    // FIX #763: Also write to debug log file (always enabled)
+    DebugLogger.shared.writeToFile(formattedOutput + (terminator == "\n" ? "" : "\n"))
 }
 
 /// Debug logging system that writes to a file for export
-/// Enable/disable via Settings or UserDefaults "debugLoggingEnabled"
+/// FIX #763: Always enabled - logs to both console and file
+/// On app start, previous log is backed up with timestamp
+///
+/// Log locations:
+/// - macOS DEBUG: /Users/chris/ZipherX/zmac.log (project dir for agent access)
+/// - macOS RELEASE: ~/Library/Application Support/ZipherX/Logs/zmac.log
+/// - iOS: Documents/Logs/z.log
 final class DebugLogger {
     static let shared = DebugLogger()
 
-    private let logFileName = "debug.log"
+    // Platform-specific log file names matching user's convention
+    #if os(macOS)
+    private let currentLogName = "zmac.log"
+    private let backupPrefix = "zmac_"
+    #else
+    private let currentLogName = "z.log"
+    private let backupPrefix = "z_"
+    #endif
+
     private var logFileURL: URL
     private let dateFormatter: DateFormatter
+    private let backupDateFormatter: DateFormatter
     private let queue = DispatchQueue(label: "com.zipherx.debuglogger", qos: .utility)
     private var fileHandle: FileHandle?
+    private var isInitialized = false
 
-    /// Check if debug logging is enabled
+    /// Session start time for this app launch
+    let sessionStartTime: Date
+
+    /// Get the logs directory
+    /// FIX #763: On macOS DEBUG, use project directory for multi-agent access
+    var logsDirectory: URL {
+        #if os(macOS) && DEBUG
+        // Use project directory for easy agent access during development
+        // This path is known to Claude Code agents via CLAUDE.md
+        let projectLogDir = URL(fileURLWithPath: "/Users/chris/ZipherX")
+        if FileManager.default.isWritableFile(atPath: projectLogDir.path) {
+            return projectLogDir
+        }
+        #endif
+        return AppDirectories.logs
+    }
+
+    /// Check if debug logging is enabled (always true now - FIX #763)
     var isEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "debugLoggingEnabled") }
+        get { true }  // FIX #763: Always enabled
         set {
+            // Kept for backward compatibility with Settings UI
             UserDefaults.standard.set(newValue, forKey: "debugLoggingEnabled")
-            if newValue {
-                log("🔧 Debug logging ENABLED")
-            }
         }
     }
 
     private init() {
-        logFileURL = AppDirectories.logs.appendingPathComponent(logFileName)
+        sessionStartTime = Date()
+        logFileURL = AppDirectories.logs.appendingPathComponent(currentLogName)
 
         dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
 
-        // Create or open the log file
-        setupLogFile()
+        backupDateFormatter = DateFormatter()
+        backupDateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+
+        // FIX #763: Backup previous log and create fresh one on app start
+        backupPreviousLogAndCreateNew()
+        isInitialized = true
+
+        // Log session start header
+        logSessionStart()
     }
 
-    private func setupLogFile() {
-        if !FileManager.default.fileExists(atPath: logFileURL.path) {
-            FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
+    // MARK: - FIX #763: Log Backup System
+
+    /// Backup the previous log file with timestamp and create a fresh one
+    private func backupPreviousLogAndCreateNew() {
+        let fm = FileManager.default
+
+        // Check if current log exists and has content
+        if fm.fileExists(atPath: logFileURL.path) {
+            do {
+                let attrs = try fm.attributesOfItem(atPath: logFileURL.path)
+                let fileSize = (attrs[.size] as? Int) ?? 0
+
+                if fileSize > 0 {
+                    // Create backup filename with timestamp
+                    let backupTimestamp = backupDateFormatter.string(from: Date())
+                    let backupName = "\(backupPrefix)\(backupTimestamp).log"
+                    let backupURL = logsDirectory.appendingPathComponent(backupName)
+
+                    // Move current log to backup
+                    try fm.moveItem(at: logFileURL, to: backupURL)
+                    Swift.print("[FIX #763] 📁 Previous log backed up to: \(backupName)")
+
+                    // Clean up old backups (keep last 10)
+                    cleanupOldBackups(keepCount: 10)
+                }
+            } catch {
+                Swift.print("[FIX #763] ⚠️ Failed to backup previous log: \(error.localizedDescription)")
+            }
+        }
+
+        // Create fresh log file
+        fm.createFile(atPath: logFileURL.path, contents: nil)
+    }
+
+    /// Remove old backup logs, keeping only the most recent ones
+    private func cleanupOldBackups(keepCount: Int) {
+        let fm = FileManager.default
+
+        do {
+            let files = try fm.contentsOfDirectory(at: logsDirectory, includingPropertiesForKeys: [.creationDateKey])
+
+            // Filter backup files (matching prefix pattern)
+            let backupFiles = files.filter { url in
+                let name = url.lastPathComponent
+                return name.hasPrefix(backupPrefix) && name.hasSuffix(".log") && name != currentLogName
+            }
+
+            // Sort by creation date (newest first)
+            let sortedBackups = backupFiles.sorted { url1, url2 in
+                let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+                let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+                return date1 > date2
+            }
+
+            // Delete old backups beyond keepCount
+            if sortedBackups.count > keepCount {
+                for url in sortedBackups.dropFirst(keepCount) {
+                    try fm.removeItem(at: url)
+                    Swift.print("[FIX #763] 🗑️ Deleted old log backup: \(url.lastPathComponent)")
+                }
+            }
+        } catch {
+            Swift.print("[FIX #763] ⚠️ Failed to cleanup old backups: \(error.localizedDescription)")
         }
     }
 
-    /// Log a message with timestamp
-    /// All logs are prefixed with "DEBUGZIPHERX" for easy filtering in Xcode console
-    func log(_ message: String, file: String = #file, function: String = #function, line: Int = #line) {
-        // Always print to console with timestamp (print() already adds DEBUGZIPHERX prefix)
-        print(message)
+    /// Log session start header with system info
+    private func logSessionStart() {
+        let bundle = Bundle.main
+        let separator = "═══════════════════════════════════════════════════════════════════════════════"
 
-        // Only write to file if enabled
-        guard isEnabled else { return }
+        writeToFile("\n\(separator)")
+        writeToFile("ZipherX Debug Log - Session Started: \(dateFormatter.string(from: sessionStartTime))")
+        writeToFile(separator)
+        writeToFile("App Version: \(bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+        writeToFile("Build: \(bundle.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
 
-        let timestamp = dateFormatter.string(from: Date())
-        let fileName = (file as NSString).lastPathComponent
-        let logMessage = "[\(timestamp)] [\(fileName):\(line)] \(message)\n"
+        #if os(iOS)
+        let device = UIDevice.current
+        writeToFile("Platform: iOS")
+        writeToFile("Device: \(device.model)")
+        writeToFile("iOS Version: \(device.systemVersion)")
+        writeToFile("Device Name: \(device.name)")
+        #elseif os(macOS)
+        writeToFile("Platform: macOS")
+        writeToFile("macOS Version: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        writeToFile("Host Name: \(ProcessInfo.processInfo.hostName)")
+        writeToFile("Process ID: \(ProcessInfo.processInfo.processIdentifier)")
+        #endif
 
+        writeToFile("Log File: \(logFileURL.path)")
+        writeToFile(separator + "\n")
+    }
+
+    // MARK: - File Writing (Thread-Safe)
+
+    /// Write directly to log file (called by global print override)
+    /// This is the core method that ensures all output goes to file
+    func writeToFile(_ message: String) {
         queue.async { [weak self] in
-            guard let self = self,
-                  let data = logMessage.data(using: .utf8) else { return }
+            guard let self = self else { return }
+
+            let logMessage = message.hasSuffix("\n") ? message : message + "\n"
+            guard let data = logMessage.data(using: .utf8) else { return }
 
             do {
                 let handle = try FileHandle(forWritingTo: self.logFileURL)
@@ -110,6 +235,20 @@ final class DebugLogger {
                 }
             }
         }
+    }
+
+    /// Log a message with timestamp (for explicit debugLog calls)
+    /// All logs are prefixed with "DEBUGZIPHERX" for easy filtering in Xcode console
+    func log(_ message: String, file: String = #file, function: String = #function, line: Int = #line) {
+        let timestamp = getCurrentTimestamp()
+        let fileName = (file as NSString).lastPathComponent
+        let formattedMessage = "[\(timestamp)] [\(fileName):\(line)] \(message)"
+
+        // Print to console (which also writes to file via global override)
+        Swift.print(formattedMessage)
+
+        // Also write to file directly to ensure it's captured
+        writeToFile(formattedMessage)
     }
 
     /// Log with category prefix
@@ -136,44 +275,122 @@ final class DebugLogger {
         }
     }
 
+    /// Get log file size as human-readable string
+    func getLogFileSizeFormatted() -> String {
+        let bytes = getLogFileSize()
+        if bytes < 1024 {
+            return "\(bytes) B"
+        } else if bytes < 1024 * 1024 {
+            return String(format: "%.1f KB", Double(bytes) / 1024.0)
+        } else {
+            return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0))
+        }
+    }
+
     /// Get log file URL for sharing
     func getLogFileURL() -> URL {
         return logFileURL
     }
 
-    /// Clear the log file
+    /// Get all backup log files (sorted newest first)
+    func getBackupLogFiles() -> [URL] {
+        let fm = FileManager.default
+
+        do {
+            let files = try fm.contentsOfDirectory(at: logsDirectory, includingPropertiesForKeys: [.creationDateKey])
+
+            let backupFiles = files.filter { url in
+                let name = url.lastPathComponent
+                return name.hasPrefix(backupPrefix) && name.hasSuffix(".log") && name != currentLogName
+            }
+
+            return backupFiles.sorted { url1, url2 in
+                let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+                let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+                return date1 > date2
+            }
+        } catch {
+            return []
+        }
+    }
+
+    /// Clear the current log file (starts fresh within same session)
     func clearLog() {
         queue.async { [weak self] in
             guard let self = self else { return }
             try? "".write(to: self.logFileURL, atomically: true, encoding: .utf8)
         }
-        log("🗑️ Debug log cleared")
+        // Use Swift.print to avoid recursion
+        Swift.print("[FIX #763] 🗑️ Debug log cleared")
+        logSessionStart()
     }
 
-    /// Add system info header to log
+    /// Add system info header to log (legacy method - now called automatically)
     func logSystemInfo() {
-        guard isEnabled else { return }
+        logSessionStart()
+    }
 
-        let bundle = Bundle.main
+    // MARK: - Log Analysis Helpers (for multi-agent debugging)
 
-        log("═══════════════════════════════════════════════════════════")
-        log("ZipherX Debug Log")
-        log("═══════════════════════════════════════════════════════════")
-        log("App Version: \(bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-        log("Build: \(bundle.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
-        #if os(iOS)
-        let device = UIDevice.current
-        log("Device: \(device.model)")
-        log("iOS Version: \(device.systemVersion)")
-        log("Device Name: \(device.name)")
-        log("Identifier: \(device.identifierForVendor?.uuidString ?? "?")")
-        #elseif os(macOS)
-        log("Platform: macOS")
-        log("macOS Version: \(ProcessInfo.processInfo.operatingSystemVersionString)")
-        log("Host Name: \(ProcessInfo.processInfo.hostName)")
-        #endif
-        log("Date: \(Date())")
-        log("═══════════════════════════════════════════════════════════")
+    /// Get lines containing errors from current log
+    func getErrorLines() -> [String] {
+        let contents = getLogContents()
+        return contents.components(separatedBy: "\n").filter { line in
+            line.contains("❌") || line.contains("ERROR") || line.contains("CRITICAL") ||
+            line.contains("failed") || line.contains("Failed") || line.contains("FAILED")
+        }
+    }
+
+    /// Get lines containing warnings from current log
+    func getWarningLines() -> [String] {
+        let contents = getLogContents()
+        return contents.components(separatedBy: "\n").filter { line in
+            line.contains("⚠️") || line.contains("WARNING") || line.contains("WARN")
+        }
+    }
+
+    /// Get lines matching a pattern (for agent analysis)
+    func getLinesMatching(pattern: String) -> [String] {
+        let contents = getLogContents()
+        return contents.components(separatedBy: "\n").filter { line in
+            line.localizedCaseInsensitiveContains(pattern)
+        }
+    }
+
+    /// Get the last N lines from log
+    func getLastLines(count: Int) -> [String] {
+        let contents = getLogContents()
+        let lines = contents.components(separatedBy: "\n")
+        return Array(lines.suffix(count))
+    }
+
+    /// Get log entries within time range
+    func getEntriesSince(_ date: Date) -> String {
+        let targetTimestamp = dateFormatter.string(from: date)
+        let contents = getLogContents()
+        let lines = contents.components(separatedBy: "\n")
+
+        var result: [String] = []
+        var capturing = false
+
+        for line in lines {
+            // Check if line has timestamp and compare
+            if line.contains("[") && line.contains("]") {
+                if let timestampEnd = line.firstIndex(of: "]"),
+                   let timestampStart = line.firstIndex(of: "[") {
+                    let timestamp = String(line[line.index(after: timestampStart)..<timestampEnd])
+                    if timestamp >= targetTimestamp.prefix(19) {
+                        capturing = true
+                    }
+                }
+            }
+
+            if capturing {
+                result.append(line)
+            }
+        }
+
+        return result.joined(separator: "\n")
     }
 }
 
@@ -189,6 +406,9 @@ enum LogCategory: String {
     case ui = "UI"
     case error = "ERROR"
     case params = "PARAMS"
+    case health = "HEALTH"   // FIX #763: Added for health checks
+    case p2p = "P2P"         // FIX #763: Added for P2P operations
+    case tor = "TOR"         // FIX #763: Added for Tor operations
 }
 
 // MARK: - Global Debug Log Function

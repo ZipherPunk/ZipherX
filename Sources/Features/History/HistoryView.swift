@@ -169,17 +169,109 @@ struct HistoryView: View {
         isLoading = true
         errorMessage = nil
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        Task {
             do {
+                // FIX #685: Use correct data source based on wallet source
+                // - walletDat: Use RPC to get transactions from Full Node daemon
+                // - zipherx: Use local database (Light mode)
+                let walletSource = WalletModeManager.shared.walletSource
+
+                #if os(macOS)
+                if walletSource == .walletDat {
+                    // Full Node mode with wallet.dat - fetch from RPC
+                    print("📜 FIX #685: Loading transactions from Full Node RPC (wallet.dat)...")
+
+                    // Get transactions from RPC (no limit - fetch ALL)
+                    let rpcTxns = try await RPCWalletOperations.shared.getTransactionHistory(address: nil, limit: 10000)
+
+                    // Convert RPC transactions to TransactionHistoryItem
+                    let items = rpcTxns.compactMap { tx -> TransactionHistoryItem? in
+                        // Convert txid hex string to Data (little-endian)
+                        guard let txidData = Data(hex: tx.txid) else {
+                            print("⚠️ FIX #685: Failed to convert txid: \(tx.txid)")
+                            return nil
+                        }
+
+                        // Convert WalletTransactionType to TransactionType
+                        let txType: TransactionType = tx.type == .sent ? .sent : .received
+
+                        // Determine status based on confirmations
+                        let status: TransactionStatus
+                        if tx.confirmations == 0 {
+                            status = .mempool
+                        } else if tx.confirmations < 6 {
+                            status = .confirming
+                        } else {
+                            status = .confirmed
+                        }
+
+                        // Get block time from timestamp (Unix timestamp in seconds)
+                        let blockTime = UInt64(tx.timestamp.timeIntervalSince1970)
+
+                        return TransactionHistoryItem(
+                            txid: txidData,
+                            height: tx.height ?? 0,
+                            blockTime: blockTime,
+                            type: txType,
+                            value: tx.amount,
+                            fee: tx.fee > 0 ? tx.fee : nil,
+                            toAddress: tx.address.isEmpty ? nil : tx.address,
+                            memo: tx.memo,
+                            status: status,
+                            confirmations: tx.confirmations
+                        )
+                    }
+
+                    await MainActor.run {
+                        self.transactions = items
+                        self.isLoading = false
+                    }
+                } else {
+                    // Light mode or ZipherX wallet - use local database
+                    print("📜 FIX #685: Loading transactions from local database (ZipherX wallet)...")
+
+                    // FIX #462: Skip populateHistoryFromNotes() during ANY database repair
+                    // FIX #457 just rebuilt the history, don't undo it by re-inserting change TXs!
+                    // Check isRepairingDatabase flag, not isRepairingHistory
+                    let isRepairing = WalletManager.shared.isRepairingDatabase
+                    if isRepairing {
+                        print("📜 HistoryView: Skipping populateHistoryFromNotes (database repair in progress)")
+                    } else {
+                        // FIX #462: Only populate if history is empty (first load after app restart)
+                        // This prevents re-inserting change TXs that were just filtered out
+                        let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
+                        if currentCount == 0 {
+                            print("📜 HistoryView: History empty, populating from notes...")
+                            let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                            if populatedCount > 0 {
+                                print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
+                            }
+                        } else {
+                            print("📜 HistoryView: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                        }
+                    }
+
+                    // FIX #129: Show ALL transactions (up to 1000) - was limit:100 which cut off older transactions
+                    let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
+
+                    // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)
+                    // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
+                    // No additional deduplication needed here - just use items directly to preserve order
+
+                    await MainActor.run {
+                        self.transactions = items
+                        self.isLoading = false
+                    }
+                }
+                #else
+                // iOS - always use local database
+                print("📜 FIX #685: Loading transactions from local database (iOS)...")
+
                 // FIX #462: Skip populateHistoryFromNotes() during ANY database repair
-                // FIX #457 just rebuilt the history, don't undo it by re-inserting change TXs!
-                // Check isRepairingDatabase flag, not isRepairingHistory
                 let isRepairing = WalletManager.shared.isRepairingDatabase
                 if isRepairing {
                     print("📜 HistoryView: Skipping populateHistoryFromNotes (database repair in progress)")
                 } else {
-                    // FIX #462: Only populate if history is empty (first load after app restart)
-                    // This prevents re-inserting change TXs that were just filtered out
                     let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
                     if currentCount == 0 {
                         print("📜 HistoryView: History empty, populating from notes...")
@@ -188,23 +280,19 @@ struct HistoryView: View {
                             print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
                         }
                     } else {
-                        print("📜 HistoryView: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                        print("📜 HistoryView: History has \(currentCount) entries, skipping populate")
                     }
                 }
 
-                // FIX #129: Show ALL transactions (up to 1000) - was limit:100 which cut off older transactions
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
 
-                // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)
-                // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
-                // No additional deduplication needed here - just use items directly to preserve order
-
-                DispatchQueue.main.async {
+                await MainActor.run {
                     self.transactions = items
                     self.isLoading = false
                 }
+                #endif
             } catch {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     self.errorMessage = error.localizedDescription
                     self.isLoading = false
                 }

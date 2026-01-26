@@ -71,7 +71,9 @@ struct RPCSendView: View {
         guard let from = selectedFromAddress else { return false }
         guard !toAddress.isEmpty else { return false }
         guard isValidReceiverAddress else { return false }  // FIX #286: Validate address
-        guard let amountValue = Double(amount), amountValue > 0 else { return false }
+        // FIX #696: Normalize decimal separator for European locales (1,5 → 1.5)
+        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
+        guard let amountValue = Double(normalizedAmount), amountValue > 0 else { return false }
         let amountZatoshis = UInt64(amountValue * 100_000_000)
         return amountZatoshis <= from.balance
     }
@@ -529,8 +531,16 @@ struct RPCSendView: View {
     // MARK: - Actions
 
     private func sendTransaction() async {
-        guard let from = selectedFromAddress,
-              let amountValue = Double(amount) else { return }
+        guard let from = selectedFromAddress else { return }
+        // FIX #696: Normalize decimal separator for European locales (1,5 → 1.5)
+        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
+        guard let amountValue = Double(normalizedAmount) else {
+            await MainActor.run {
+                errorMessage = "Invalid amount"
+                isSending = false
+            }
+            return
+        }
 
         await MainActor.run {
             isSending = true

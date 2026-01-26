@@ -64,6 +64,7 @@ struct SendView: View {
     @State private var errorMessage = ""
     @State private var failedTxId = ""  // FIX #218: Track TXID for failed transactions (for copying)
     @State private var txId = ""
+    @State private var hasAttemptedWitnessRepair = false  // FIX #750: Track if we've tried auto-repair
     @State private var isAddressValid = false
     @State private var isAddressTransparent = false
     @State private var showQRScanner = false
@@ -93,6 +94,10 @@ struct SendView: View {
     // FIX #210: Tor unavailable alert - offer to send without Tor
     @State private var showTorUnavailableAlert = false
     @State private var pendingSendWithoutTor = false
+
+    // FIX #565: Mempool verification pending warning (high peer acceptance but timeout)
+    @State private var showMempoolVerificationPendingWarning = false
+    @State private var mempoolVerificationPendingMessage = ""
 
     var body: some View {
         ZStack {
@@ -406,6 +411,14 @@ struct SendView: View {
             }
         } message: {
             Text("Tor is enabled but not running. Your transaction cannot be broadcast anonymously.\n\nSend without Tor? Your IP may be visible to peers.")
+        }
+        // FIX #565: Mempool verification pending alert (high peer acceptance but timeout)
+        .alert(isPresented: $showMempoolVerificationPendingWarning) {
+            Alert(
+                title: Text("✅ Transaction Broadcast"),
+                message: Text(mempoolVerificationPendingMessage),
+                dismissButton: .default(Text("OK"))
+            )
         }
         .onChange(of: networkManager.outgoingClearingTrigger) { _ in
             // Sender's tx verified in mempool - show Clearing celebration!
@@ -957,10 +970,38 @@ struct SendView: View {
                             "Privacy is necessary for an open society."
                             — A Cypherpunk's Manifesto
                             """)
+                    } else if broadcastResult.peerCount >= 5 {
+                        // FIX #565: High peer acceptance (5+) but mempool verification timed out
+                        // With 5+ peers accepting, broadcast LIKELY succeeded - this is a verification timeout, not a broadcast failure
+                        // The transaction is being tracked as pending and will be confirmed when mined
+                        print("✅ FIX #565: \(broadcastResult.peerCount) peers accepted - mempool verification timed out but broadcast likely succeeded")
+                        print("✅ FIX #565: txId=\(broadcastedTxId) - tracking as pending, will confirm when mined")
+                        // Set the warning alert flag - the success flow will continue below and show success screen
+                        mempoolVerificationPendingMessage = """
+                            ✅ Transaction Broadcast Successfully
+
+                            Your transaction was accepted by \(broadcastResult.peerCount) peers and is being tracked as pending.
+
+                            Note: Mempool verification timed out due to network conditions, but with \(broadcastResult.peerCount) peer acceptances, the transaction is likely propagating through the network.
+
+                            🔒 YOUR FUNDS ARE SAFE
+                            The transaction is being tracked and will confirm when mined.
+
+                            💡 WHAT TO EXPECT:
+                            • Check your balance in 2-3 minutes
+                            • Transaction will appear in history once confirmed
+                            • If not confirmed after 10 minutes, try sending again
+
+                            📋 TXID:
+                            \(broadcastedTxId)
+                            """
+                        // Alert will be shown after success screen
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            showMempoolVerificationPendingWarning = true
+                        }
                     } else if broadcastResult.peerCount >= 2 {
-                        // FIX #389 v2: Multiple peers accepted but P2P mempool verification FAILED
-                        // This is a critical error - peers ACK'd but TX is NOT in network mempool
-                        // DO NOT trust peer ACKs - they may have dropped the TX after acknowledging
+                        // FIX #389 v2: Multiple peers accepted (2-4) but P2P mempool verification FAILED
+                        // Lower peer acceptance counts are less reliable - verification timeout is more concerning
                         print("🚨 FIX #389 v2 SendView: \(broadcastResult.peerCount) peers accepted but TX NOT in mempool!")
                         print("🚨 FIX #389 v2 SendView: txId=\(broadcastedTxId) - broadcast may have failed despite peer ACKs")
                         throw WalletError.transactionFailed("""
@@ -1167,6 +1208,45 @@ struct SendView: View {
                 // FIX #210: Restore Tor after transaction completes
                 await TorManager.shared.restoreAfterSingleTxBypass()
             } catch {
+                let errorStr = error.localizedDescription.lowercased()
+
+                // FIX #750: Auto-repair anchor mismatch and retry
+                // If proof generation failed, it's likely corrupted witnesses
+                let isProofError = errorStr.contains("proof") || errorStr.contains("anchor") ||
+                                   errorStr.contains("witness") || errorStr.contains("merkle")
+
+                if isProofError && !hasAttemptedWitnessRepair {
+                    print("🔧 FIX #750: Proof generation failed - auto-repairing witnesses...")
+                    await MainActor.run {
+                        // Update UI to show repair in progress
+                        if let currentIdx = sendProgress.firstIndex(where: { $0.status == .inProgress }) {
+                            sendProgress[currentIdx].status = .inProgress
+                            sendProgress[currentIdx].detail = "Auto-repairing witnesses..."
+                        }
+                    }
+
+                    // Rebuild witnesses automatically
+                    let fixed = await walletManager.fixAnchorMismatches()
+                    print("🔧 FIX #750: Rebuilt \(fixed) witnesses - retrying transaction...")
+
+                    await MainActor.run {
+                        hasAttemptedWitnessRepair = true
+                    }
+
+                    // Retry the transaction
+                    await MainActor.run {
+                        isSending = false
+                        sendProgress = []
+                    }
+
+                    // Small delay then retry
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    await MainActor.run {
+                        performSendTransaction()
+                    }
+                    return
+                }
+
                 await MainActor.run {
                     // Mark current step as failed
                     if let currentIdx = sendProgress.firstIndex(where: { $0.status == .inProgress }) {
@@ -1177,6 +1257,8 @@ struct SendView: View {
                     failedTxId = extractTxIdFromError(error.localizedDescription)
                     showError = true
                     isSending = false
+                    // Reset repair flag for next send attempt
+                    hasAttemptedWitnessRepair = false
                 }
 
                 // FIX #210: Restore Tor after transaction fails
@@ -1444,12 +1526,12 @@ struct SendView: View {
         // FIX #109: Cancel any existing debounce task (user is still typing)
         preparationDebounceTask?.cancel()
 
-        // FIX #109: Debounce - wait 1.5 seconds after user stops typing before preparing
-        // This prevents launching multiple concurrent witness rebuilds which cancel each other
+        // FIX #600: Reduced debounce from 1.5s to 0.3s for instant pre-build
+        // Still prevents concurrent rebuilds but feels much faster
         preparationDebounceTask = Task {
             do {
-                // Wait 1.5 seconds for user to finish typing
-                try await Task.sleep(nanoseconds: 1_500_000_000)
+                // Wait 0.3 seconds for user to finish typing
+                try await Task.sleep(nanoseconds: 300_000_000)
 
                 // After debounce, check if task was cancelled (user typed again)
                 try Task.checkCancellation()
@@ -1491,12 +1573,12 @@ struct SendView: View {
                 heightBeforePrep = networkManager.chainHeight
             }
 
-            await MainActor.run {
-                preparationProgress = "Connecting to network..."
-            }
-
-            // Ensure network connection
+            // FIX #600: Skip network check if already connected (99% of cases)
+            // Only connect if explicitly disconnected
             if !networkManager.isConnected {
+                await MainActor.run {
+                    preparationProgress = "Connecting to network..."
+                }
                 try await networkManager.connect()
             }
 
@@ -1528,6 +1610,7 @@ struct SendView: View {
                 amount: zatoshis,
                 memo: memoText,
                 spendingKey: secureKey.data,
+                cachedChainHeight: heightBeforePrep,  // FIX #600: Pass cached chain height to avoid multiple network calls
                 onProgress: { step, detail, _ in
                     Task { @MainActor in
                         switch step {

@@ -260,7 +260,10 @@ struct ContentView: View {
                             // CRITICAL: If last_scanned_height is ahead of HeaderStore, we have a problem
                             // The scanner will try to scan blocks we don't have headers for!
                             var effectiveStartHeight = lastScannedHeight
-                            if lastScannedHeight > headerStoreHeight {
+                            if lastScannedHeight > headerStoreHeight && headerStoreHeight > 0 {
+                                // FIX #749: Only trigger race condition fix if HeaderStore has SOME headers
+                                // If headerStoreHeight == 0, headers were just cleared by FIX #677 for fresh reload
+                                // Don't reset lastScannedHeight - boost file will reload headers soon
                                 let heightGap = lastScannedHeight - headerStoreHeight
                                 print("🚨 FIX #477: RACE CONDITION DETECTED!")
                                 print("🚨   Database says we're at height \(lastScannedHeight)")
@@ -271,11 +274,15 @@ struct ContentView: View {
                                 print("🔧 FIX #477: Database last_scanned_height will be corrected after header sync")
 
                                 // Use HeaderStore height as effective start
-                                // Use HeaderStore height as effective start
                                 effectiveStartHeight = headerStoreHeight
 
                                 // Reset database to match HeaderStore
                                 try? WalletDatabase.shared.updateLastScannedHeight(headerStoreHeight, hash: Data(count: 32))
+                            } else if headerStoreHeight == 0 {
+                                // FIX #749: HeaderStore is empty (just cleared by FIX #677)
+                                // Don't reset lastScannedHeight - headers will be reloaded from boost file
+                                print("📋 FIX #749: HeaderStore is empty (headers being reloaded)")
+                                print("📋 FIX #749: Keeping lastScannedHeight=\(lastScannedHeight) intact")
                             }
 
                             // ================================================================
@@ -409,6 +416,14 @@ struct ContentView: View {
                                                 print("🌳 FIX #530: Tree size after delta: \(newTreeSize) commitments")
                                             }
                                         }
+
+                                        // FIX #748: Set isTreeLoaded for FAST START so background sync works
+                                        // Previously the flag was only set during FULL START (import)
+                                        // causing background sync to be blocked after FAST START
+                                        await MainActor.run {
+                                            walletManager.setTreeLoaded(true)
+                                        }
+                                        print("✅ FIX #748: Set isTreeLoaded = true for FAST START")
                                     } else {
                                         print("⚠️ FIX #530: Failed to deserialize tree - will initialize fresh")
                                         _ = ZipherXFFI.treeInit()
@@ -430,15 +445,52 @@ struct ContentView: View {
 
                                 // Quick health check - only critical checks
                                 let healthResults = await WalletHealthCheck.shared.runAllChecks()
-                                let criticalIssues = healthResults.filter { !$0.passed && $0.details.contains("REPAIR") }
+                                // FIX #723: Filter critical issues properly - check .critical flag OR keywords
+                                // Tree Root Validation returns critical=true but details say "Full Rescan" not "REPAIR"
+                                let criticalIssues = healthResults.filter {
+                                    !$0.passed && ($0.critical || $0.details.contains("REPAIR") || $0.details.contains("Full Rescan"))
+                                }
 
+                                // FIX #686: Automatic repair at startup - NO user prompts
                                 if !criticalIssues.isEmpty {
-                                    print("⚠️ FIX #409: INSTANT START detected issues - need repair")
+                                    print("⚠️ FIX #686: INSTANT START detected issues - triggering automatic repair")
+                                    for issue in criticalIssues {
+                                        print("⚠️ Critical Issue: \(issue.checkName) - \(issue.details)")
+                                    }
+
+                                    // FIX #723: Check for Tree Root mismatch specifically - needs FULL rescan
+                                    let hasTreeRootMismatch = criticalIssues.contains {
+                                        $0.checkName == "Tree Root Validation"
+                                    }
+
+                                    // Trigger automatic repair instead of showing alert
                                     await MainActor.run {
-                                        if let firstIssue = criticalIssues.first {
-                                            repairNeededReason = firstIssue.details
-                                            showRepairNeededAlert = true
+                                        if hasTreeRootMismatch {
+                                            walletManager.setConnecting(true, status: "Tree mismatch - rebuilding from scratch...")
+                                        } else {
+                                            walletManager.setConnecting(true, status: "Repairing wallet state...")
                                         }
+                                        walletManager.syncTasks.append(SyncTask(id: "instant_repair", title: hasTreeRootMismatch ? "Rebuilding Commitment Tree" : "Automatic Repair", status: .inProgress, progress: 0.0))
+                                    }
+
+                                    do {
+                                        // FIX #723: For tree root mismatch, force FULL rescan to rebuild tree from boost file
+                                        if hasTreeRootMismatch {
+                                            print("🔧 FIX #723: Tree root mismatch detected - triggering FULL RESCAN")
+                                        }
+                                        try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
+                                            print("🔧 FIX #686/723: Instant repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                            Task { @MainActor in
+                                                walletManager.updateSyncTask(id: "instant_repair", status: .inProgress, detail: "\(current)/\(total)", progress: progress)
+                                            }
+                                        }, forceFullRescan: hasTreeRootMismatch)
+                                        await MainActor.run {
+                                            walletManager.updateSyncTask(id: "instant_repair", status: .completed)
+                                        }
+                                        print("✅ FIX #686/723: Instant repair complete")
+                                    } catch {
+                                        print("❌ FIX #686/723: Instant repair failed: \(error.localizedDescription)")
+                                        // Even on failure, continue to UI - user can manually trigger repair from Settings
                                     }
                                 }
 
@@ -477,11 +529,17 @@ struct ContentView: View {
                                     walletManager.updateSyncTask(id: "fast_headers", status: .completed)
                                     walletManager.updateSyncTask(id: "fast_health", status: .completed)
                                     print("✅ FIX #560: All FAST START tasks marked as completed - progress should show 100%")
-                                    
+
                                     // FIX #560: Enable background processes for INSTANT START
                                     // User is going directly to main view, need background processes active
                                     networkManager.enableBackgroundProcesses()
                                     print("✅ FIX #560: Background processes enabled for INSTANT START")
+
+                                    // FIX #603: Start periodic witness refresh
+                                    walletManager.startPeriodicWitnessRefresh()
+
+                                    // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
+                                    walletManager.startPeriodicDeepVerification()
                                 }
 
                                 // FIX #560: DO NOT enable background processes yet!
@@ -820,12 +878,10 @@ struct ContentView: View {
                             let repairNeededCheck = healthResults.first {
                                 $0.checkName == "Checkpoint Sync" && !$0.passed && $0.details.contains("REPAIR NEEDED")
                             }
+                            // FIX #686: Log repair needed but don't show alert - automatic repair below will handle it
                             if let repair = repairNeededCheck {
-                                print("⚠️ FIX #164 v4: Repair needed detected - will show alert to user")
-                                await MainActor.run {
-                                    repairNeededReason = repair.details
-                                    showRepairNeededAlert = true
-                                }
+                                print("⚠️ FIX #686: Repair needed detected - will trigger automatic repair below")
+                                print("⚠️ Issue: \(repair.checkName) - \(repair.details)")
                             }
 
                             // FIX #120 DEBUG: Log what we found
@@ -1139,6 +1195,10 @@ struct ContentView: View {
 
                             // FIX #603: Start periodic witness refresh to keep witnesses fresh for instant spending
                             walletManager.startPeriodicWitnessRefresh()
+
+                            // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
+                            // Runs every 30 minutes to catch missed transactions (including those from broadcast bugs)
+                            walletManager.startPeriodicDeepVerification()
 
                             // FIX #500: Clear import progress flag if this was an import
                             if walletManager.isImportInProgress {
@@ -1461,11 +1521,31 @@ struct ContentView: View {
                         let fullStartRepairNeededCheck = fullStartHealthResults.first {
                             $0.checkName == "Checkpoint Sync" && !$0.passed && $0.details.contains("REPAIR NEEDED")
                         }
+                        // FIX #686: Automatic repair at startup - NO user prompts
                         if let repair = fullStartRepairNeededCheck {
-                            print("⚠️ FIX #164 v4: Repair needed detected (FULL START) - will show alert to user")
+                            print("⚠️ FIX #686: Repair needed detected (FULL START) - triggering automatic repair")
+                            print("⚠️ Issue: \(repair.checkName) - \(repair.details)")
+
+                            // Trigger automatic repair instead of showing alert
                             await MainActor.run {
-                                repairNeededReason = repair.details
-                                showRepairNeededAlert = true
+                                walletManager.setConnecting(true, status: "Repairing wallet state...")
+                                walletManager.syncTasks.append(SyncTask(id: "full_start_repair", title: "Automatic Repair", status: .inProgress, progress: 0.0))
+                            }
+
+                            do {
+                                try await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
+                                    print("🔧 FIX #686: Full start repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                    Task { @MainActor in
+                                        walletManager.updateSyncTask(id: "full_start_repair", status: .inProgress, detail: "\(current)/\(total)", progress: progress)
+                                    }
+                                }
+                                await MainActor.run {
+                                    walletManager.updateSyncTask(id: "full_start_repair", status: .completed)
+                                }
+                                print("✅ FIX #686: Full start repair complete")
+                            } catch {
+                                print("❌ FIX #686: Full start repair failed: \(error.localizedDescription)")
+                                // Even on failure, continue to import - user can manually trigger repair from Settings
                             }
                         }
 
@@ -1724,6 +1804,9 @@ struct ContentView: View {
 
                             // FIX #603: Start periodic witness refresh to keep witnesses fresh
                             walletManager.startPeriodicWitnessRefresh()
+
+                            // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
+                            walletManager.startPeriodicDeepVerification()
                         },
                         onStopSync: {
                             // User clicked STOP - cancel sync and go to main wallet
@@ -1982,13 +2065,16 @@ struct ContentView: View {
 
             // FIX #577 v13: For Full Rescan, show core sync tasks; for FAST START, show fast_* tasks
             if walletManager.isFullRescan {
-                // Full Rescan: show core Import PK tasks only
+                // FIX #727: Full Rescan - use WHITELIST of known Import PK task IDs only
+                // Previous blacklist approach let unwanted health check/repair tasks through
+                // FIX #752: Added tree_rebuild to display list so progress is visible
+                let importPKTaskIds: Set<String> = [
+                    "params", "keys", "database", "download_outputs", "download_timestamps",
+                    "headers", "height", "scan", "witnesses", "balance", "instant_repair",
+                    "tree_rebuild", "full_start_repair", "full_repair"
+                ]
                 let coreTasks = walletManager.syncTasks.filter { task in
-                    !task.id.hasPrefix("fast_") &&
-                    !task.id.hasPrefix("balance_repair") &&
-                    !task.id.hasPrefix("full_repair") &&
-                    !task.id.hasPrefix("tree_rebuild") &&
-                    !task.id.hasPrefix("witness_sync")
+                    importPKTaskIds.contains(task.id)
                 }
                 if !coreTasks.isEmpty {
                     tasks.append(contentsOf: coreTasks)
@@ -2153,14 +2239,16 @@ struct ContentView: View {
             // FIX #577 v13: For Full Rescan, show core sync tasks (not fast_* tasks)
             // For FAST START, show fast_* tasks only
             if walletManager.isFullRescan {
-                // Full Rescan: show core Import PK tasks only (params, keys, scan, witnesses, balance, etc.)
-                // Filter out fast_* and repair tasks
+                // FIX #727: Full Rescan - use WHITELIST of known Import PK task IDs only
+                // Previous blacklist approach let unwanted health check/repair tasks through
+                // FIX #752: Added tree_rebuild to display list so progress is visible
+                let importPKTaskIds: Set<String> = [
+                    "params", "keys", "database", "download_outputs", "download_timestamps",
+                    "headers", "height", "scan", "witnesses", "balance", "instant_repair",
+                    "tree_rebuild", "full_start_repair", "full_repair"
+                ]
                 let coreTasks = walletManager.syncTasks.filter { task in
-                    !task.id.hasPrefix("fast_") &&
-                    !task.id.hasPrefix("balance_repair") &&
-                    !task.id.hasPrefix("full_repair") &&
-                    !task.id.hasPrefix("tree_rebuild") &&
-                    !task.id.hasPrefix("witness_sync")
+                    importPKTaskIds.contains(task.id)
                 }
                 if !coreTasks.isEmpty {
                     tasks.append(contentsOf: coreTasks)
@@ -2902,7 +2990,10 @@ struct UnifiedAlertSheet: View {
 }
 
 // MARK: - Alert Wrapper (replaces .alert() for use in .sheet)
+// FIX #674: Added @Environment(\.dismiss) to properly close sheet when buttons are clicked
 struct AlertWrapper: View {
+    @Environment(\.dismiss) private var dismiss
+
     let title: String
     let message: String
     let primaryButton: (String, () -> Void)
@@ -2921,7 +3012,10 @@ struct AlertWrapper: View {
 
             HStack(spacing: 16) {
                 if let secondary = secondaryButton {
-                    Button(action: secondary.1) {
+                    Button(action: {
+                        secondary.1()
+                        dismiss()  // FIX #674: Close sheet after action
+                    }) {
                         Text(secondary.0)
                             .padding(.horizontal, 20)
                             .padding(.vertical, 10)
@@ -2929,7 +3023,10 @@ struct AlertWrapper: View {
                     .buttonStyle(.bordered)
                     .foregroundColor(.white)
 
-                    Button(action: primaryButton.1) {
+                    Button(action: {
+                        primaryButton.1()
+                        dismiss()  // FIX #674: Close sheet after action
+                    }) {
                         Text(primaryButton.0)
                             .padding(.horizontal, 20)
                             .padding(.vertical, 10)
@@ -2937,7 +3034,10 @@ struct AlertWrapper: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
                 } else {
-                    Button(action: primaryButton.1) {
+                    Button(action: {
+                        primaryButton.1()
+                        dismiss()  // FIX #674: Close sheet after action
+                    }) {
                         Text(primaryButton.0)
                             .padding(.horizontal, 30)
                             .padding(.vertical, 10)

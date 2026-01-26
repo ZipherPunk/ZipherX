@@ -1215,6 +1215,168 @@ final class HeaderStore {
         print("🗑️ Cleared all headers")
     }
 
+    /// FIX #677: Mark boost headers as corrupted and clear for fresh reload
+    /// Called when chain mismatch detected - deletes ALL headers so boost file can reload fresh
+    func markBoostHeadersCorrupted(mismatchHeight: UInt64) {
+        print("⚠️ FIX #677: Chain mismatch at height \(mismatchHeight) - marking boost headers corrupted")
+        print("🗑️ FIX #677: Deleting ALL headers from HeaderStore for fresh reload...")
+
+        do {
+            try clearAllHeaders()
+            // Set corruption flag in UserDefaults
+            UserDefaults.standard.set(true, forKey: "HeaderStore.boostHeadersCorrupted")
+            print("✅ FIX #677: Headers cleared - boost file will reload on next startup")
+        } catch {
+            print("❌ FIX #677: Failed to clear headers: \(error)")
+        }
+    }
+
+    /// FIX #675: Check if boost headers should be skipped due to corruption
+    /// Returns true if boost headers were previously marked as corrupted
+    func shouldSkipBoostHeaders() -> Bool {
+        return UserDefaults.standard.bool(forKey: "HeaderStore.boostHeadersCorrupted")
+    }
+
+    /// FIX #675: Clear the boost headers corruption flag (after successful P2P sync)
+    func clearBoostHeadersCorruptionFlag() {
+        UserDefaults.standard.removeObject(forKey: "HeaderStore.boostHeadersCorrupted")
+        print("✅ FIX #675: Cleared boost headers corruption flag")
+    }
+
+    /// FIX #701: Get the end height of boost file headers loaded in database
+    /// Returns the max height from headers table, or 0 if no headers exist
+    var boostFileEndHeight: UInt64 {
+        do {
+            return try getLatestHeight() ?? 0
+        } catch {
+            print("⚠️ HeaderStore.boostFileEndHeight: Error getting latest height: \(error)")
+            return 0
+        }
+    }
+
+    /// FIX #698: Get the range of heights that have zero sapling roots
+    /// Returns (minHeight, maxHeight) tuple or nil if no zero roots found
+    func getZeroSaplingRootRange() throws -> (UInt64, UInt64)? {
+        // Ensure database is open
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
+        // Zero sapling root is 32 bytes of zeros
+        let zeroRoot = Data(repeating: 0, count: 32)
+
+        let sql = "SELECT MIN(height), MAX(height) FROM headers WHERE sapling_root = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        zeroRoot.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        // Check if MIN/MAX returned NULL (no matching rows)
+        if sqlite3_column_type(stmt, 0) == SQLITE_NULL {
+            return nil
+        }
+
+        let minHeight = UInt64(sqlite3_column_int64(stmt, 0))
+        let maxHeight = UInt64(sqlite3_column_int64(stmt, 1))
+
+        return (minHeight, maxHeight)
+    }
+
+    /// FIX #698: Get list of heights with zero sapling roots
+    func getHeightsWithZeroSaplingRoots() throws -> [UInt64] {
+        // Ensure database is open
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return [] }
+
+        let zeroRoot = Data(repeating: 0, count: 32)
+
+        let sql = "SELECT height FROM headers WHERE sapling_root = ? ORDER BY height ASC;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        zeroRoot.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
+        }
+
+        var heights: [UInt64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            heights.append(UInt64(sqlite3_column_int64(stmt, 0)))
+        }
+
+        return heights
+    }
+
+    /// FIX #698: Update sapling roots for multiple headers
+    /// roots: Dictionary mapping height -> sapling root data
+    func updateSaplingRoots(_ roots: [UInt64: Data]) throws {
+        guard !roots.isEmpty else { return }
+
+        // Ensure database is open
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
+        guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.insertFailed("Failed to begin transaction")
+        }
+
+        let sql = "UPDATE headers SET sapling_root = ? WHERE height = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        do {
+            for (height, saplingRoot) in roots {
+                sqlite3_reset(stmt)
+
+                saplingRoot.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(saplingRoot.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_bind_int64(stmt, 2, Int64(height))
+
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+                }
+            }
+
+            sqlite3_finalize(stmt)
+
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.insertFailed("Failed to commit transaction")
+            }
+
+            print("✅ FIX #698: Updated \(roots.count) sapling roots in HeaderStore")
+        } catch {
+            sqlite3_finalize(stmt)
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
     /// FIX #120: Clear headers above a specific height
     /// Used to clear corrupted P2P-synced headers above the boost file range
     func clearHeadersAboveHeight(_ height: UInt64) throws {

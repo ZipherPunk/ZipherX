@@ -124,6 +124,11 @@ final class WalletManager: ObservableObject {
         }
     }
 
+    // MARK: - FIX #737: Pending Delta Rescan Flag
+    /// Set when delta bundle was cleared and lastScannedHeight was reset to boost end
+    /// Prevents FIX #569 witness sync from overwriting the reset before PHASE 2 runs
+    var pendingDeltaRescan: Bool = false
+
     // MARK: - FIX #231: Reduced Verification Warning
     /// Set when Equihash PoW couldn't be verified due to insufficient peers
     /// User should be warned before accessing wallet
@@ -422,6 +427,26 @@ final class WalletManager: ObservableObject {
 
         if !validation.isValid && validation.error != nil {
             print("⚠️ Delta bundle invalid: \(validation.error!) - will rebuild on next sync")
+
+            // FIX #737: CRITICAL - Reset lastScannedHeight to boost file end!
+            // Without this, PHASE 2 starts from old lastScannedHeight (e.g., 2989053)
+            // instead of boost end (2988797), missing all CMUs in between.
+            // The delta bundle won't have CMUs for the skipped range → tree root mismatch!
+            let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+            if currentLastScanned > bundledEndHeight {
+                print("🔧 FIX #737: Resetting lastScannedHeight from \(currentLastScanned) to \(bundledEndHeight)")
+                print("   This ensures PHASE 2 re-scans all blocks from boost end to rebuild delta bundle")
+                // Get block hash from HeaderStore for the boost end height
+                if let header = try? HeaderStore.shared.getHeader(at: bundledEndHeight) {
+                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: header.blockHash)
+                } else {
+                    // Fallback: use empty hash if header not available (will be validated on next sync)
+                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: Data(count: 32))
+                }
+                // FIX #737 v2: Set flag to prevent FIX #569 from overwriting the reset
+                self.pendingDeltaRescan = true
+                print("🔧 FIX #737 v2: Set pendingDeltaRescan flag to block FIX #569 height update")
+            }
             return
         }
 
@@ -436,6 +461,20 @@ final class WalletManager: ObservableObject {
         if !rootValid {
             print("⚠️ Delta tree root mismatch - clearing for rebuild")
             deltaManager.clearDeltaBundle()
+
+            // FIX #737: Reset lastScannedHeight to boost file end for full rescan
+            let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+            if currentLastScanned > bundledEndHeight {
+                print("🔧 FIX #737: Resetting lastScannedHeight from \(currentLastScanned) to \(bundledEndHeight)")
+                if let header = try? HeaderStore.shared.getHeader(at: bundledEndHeight) {
+                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: header.blockHash)
+                } else {
+                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: Data(count: 32))
+                }
+                // FIX #737 v2: Set flag to prevent FIX #569 from overwriting the reset
+                self.pendingDeltaRescan = true
+                print("🔧 FIX #737 v2: Set pendingDeltaRescan flag to block FIX #569 height update")
+            }
 
             // FIX #533: CRITICAL - Reload FFI tree from boost file WITHOUT corrupt delta CMUs
             // The delta CMUs corrupted the tree state, causing anchor validation to fail
@@ -644,6 +683,12 @@ final class WalletManager: ObservableObject {
         await preloadCommitmentTree()
     }
 
+    /// FIX #748: Public method to mark tree as loaded
+    /// Called from ContentView after FAST START loads tree from boost file
+    func setTreeLoaded(_ loaded: Bool) {
+        self.isTreeLoaded = loaded
+    }
+
     private func preloadCommitmentTree() async {
         // Prevent concurrent tree loading
         treeLoadLock.lock()
@@ -710,14 +755,86 @@ final class WalletManager: ObservableObject {
 
                 if treeSize < effectiveCMUCount || treeSize > maxExpectedCMUs {
                     print("⚠️ Tree size \(treeSize) seems invalid (expected \(effectiveCMUCount)-\(maxExpectedCMUs))")
-                    print("🔄 Clearing corrupted tree state, will reload from GitHub...")
-                    // Clear the corrupted state from database
-                    try? WalletDatabase.shared.clearTreeState()
-                    try? WalletDatabase.shared.updateLastScannedHeight(effectiveHeight, hash: Data(count: 32))
+                    print("🔄 FIX #756 v2: Clearing corrupted tree, witnesses, will reload from GitHub...")
+                    // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
+                    try? WalletDatabase.shared.clearTreeStateForRebuild()
                     // Fall through to reload from GitHub
                     // (treeLoadFromCMUs will replace the tree in FFI memory)
+                } else if treeSize > effectiveCMUCount {
+                    // FIX #756: Tree has MORE CMUs than boost file - validate delta bundle accounts for ALL extra CMUs
+                    // If tree has unexplained CMUs, the database tree is corrupted
+                    let deltaManager = DeltaCMUManager.shared
+                    let deltaCMUs = deltaManager.loadDeltaCMUs() ?? []
+                    let expectedSizeWithDelta = effectiveCMUCount + UInt64(deltaCMUs.count)
+
+                    if treeSize != expectedSizeWithDelta {
+                        print("⚠️ FIX #756: CRITICAL - Database tree has unexplained CMUs!")
+                        print("   DB tree size: \(treeSize)")
+                        print("   Boost file:   \(effectiveCMUCount) CMUs")
+                        print("   Delta bundle: \(deltaCMUs.count) CMUs")
+                        print("   Expected:     \(expectedSizeWithDelta) CMUs")
+                        print("   Unexplained:  \(Int64(treeSize) - Int64(expectedSizeWithDelta)) CMUs")
+                        print("🔄 FIX #756: Clearing corrupted tree, witnesses, AND delta bundle...")
+                        // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
+                        // Witnesses were computed with wrong tree state and are now invalid
+                        try? WalletDatabase.shared.clearTreeStateForRebuild()
+                        deltaManager.clearDeltaBundle()
+                        // Fall through to reload from GitHub
+                    } else {
+                        // FIX #756: Tree size matches boost + delta - delta CMUs already in tree
+                        // Just validate the root directly without trying to load delta again
+                        print("✅ FIX #756: Tree size validated (\(treeSize) = \(effectiveCMUCount) boost + \(deltaCMUs.count) delta)")
+                        print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
+
+                        // Validate tree root against header at delta end height
+                        var treeValidated = false
+                        if let deltaManifest = deltaManager.getManifest(),
+                           let treeRoot = ZipherXFFI.treeRoot(),
+                           let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                            let headerRoot = header.hashFinalSaplingRoot
+                            let headerRootReversed = Data(headerRoot.reversed())
+                            let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                            if rootsMatch {
+                                print("✅ FIX #756: Tree root validated at delta end height \(deltaManifest.endHeight)")
+                                treeValidated = true
+                            } else {
+                                print("❌ FIX #756: Tree root MISMATCH despite matching size!")
+                                print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                                print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                                print("🔄 FIX #756: Clearing corrupted tree, witnesses, AND delta bundle...")
+                                // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
+                                try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                deltaManager.clearDeltaBundle()
+                                // Fall through to reload from boost file
+                            }
+                        }
+
+                        // FIX #756: If tree validated, initialize cache and return
+                        if treeValidated {
+                            if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                                await MainActor.run {
+                                    do {
+                                        try FastWalletCache.shared.loadCMUCache(from: cmuPath)
+                                        print("✅ FIX #756: FastWalletCache initialized with CMU cache")
+                                    } catch {
+                                        print("⚠️ FIX #756: Failed to initialize FastWalletCache: \(error)")
+                                    }
+                                }
+                            }
+                            await MainActor.run {
+                                self.isTreeLoaded = true
+                                self.treeLoadProgress = 1.0
+                                self.treeLoadStatus = "Privacy state restored\n\(ZipherXFFI.treeSize().formatted()) commitments ready"
+                            }
+                            return
+                        }
+                    }
                 } else {
                     print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
+
+                    // FIX #756: Track if we need to reload from boost file
+                    var needsBoostReload = false
 
                     // FIX #558 v2: Load delta CMUs to complete the tree
                     // The delta CMUs are saved from previous scans but NOT loaded into the tree
@@ -736,40 +853,74 @@ final class WalletManager: ObservableObject {
                         print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
                         print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                        // Save updated tree state (FIX #565)
-                        if let treeData = ZipherXFFI.treeSerialize() {
-                            try? WalletDatabase.shared.saveTreeState(treeData)
+                        // FIX #755: Validate tree root after delta load against header's finalsaplingroot
+                        // This catches corrupted/incomplete delta bundles that produce wrong tree state
+                        if let deltaManifest = deltaManager.getManifest(),
+                           let treeRoot = ZipherXFFI.treeRoot(),
+                           let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                            let headerRoot = header.hashFinalSaplingRoot
+                            let headerRootReversed = Data(headerRoot.reversed())
+                            let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                            if rootsMatch {
+                                print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
+                                // Save updated tree state (FIX #565)
+                                if let treeData = ZipherXFFI.treeSerialize() {
+                                    try? WalletDatabase.shared.saveTreeState(treeData)
+                                }
+                            } else {
+                                print("❌ FIX #755: Tree root MISMATCH after delta load!")
+                                print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                                print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                                print("🗑️ FIX #755/756 v2: Clearing corrupted tree, witnesses, AND delta bundle...")
+                                // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
+                                // Witnesses were computed with wrong tree state and are now invalid
+                                try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                deltaManager.clearDeltaBundle()
+                                needsBoostReload = true  // FIX #756: Flag to fall through to boost download
+                            }
+                        } else {
+                            // No header available for validation - save tree anyway
+                            if let treeData = ZipherXFFI.treeSerialize() {
+                                try? WalletDatabase.shared.saveTreeState(treeData)
+                            }
                         }
                     } else {
                         print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
                     }
 
-                    // FIX #580 v2: Initialize FastWalletCache with CMU cache file
-                    // This enables instant witness generation (~1ms vs 84s P2P rebuild)
-                    // CMU file contains ~32MB of commitment data for fast tree building
-                    if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
-                        await MainActor.run {
-                            do {
-                                try FastWalletCache.shared.loadCMUCache(from: cmuPath)
-                                print("✅ FIX #580 v2: FastWalletCache initialized with CMU cache")
-                            } catch {
-                                print("⚠️ FIX #580 v2: Failed to initialize FastWalletCache: \(error)")
-                            }
-                        }
+                    // FIX #756: If tree corruption detected, fall through to boost download
+                    if needsBoostReload {
+                        print("🔄 FIX #756: Tree corruption detected - falling through to boost file download")
+                        // Don't return - fall through to download from GitHub
                     } else {
-                        print("⚠️ FIX #580 v2: CMU cache file not available, witness generation will be slower")
-                    }
+                        // FIX #580 v2: Initialize FastWalletCache with CMU cache file
+                        // This enables instant witness generation (~1ms vs 84s P2P rebuild)
+                        // CMU file contains ~32MB of commitment data for fast tree building
+                        if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                            await MainActor.run {
+                                do {
+                                    try FastWalletCache.shared.loadCMUCache(from: cmuPath)
+                                    print("✅ FIX #580 v2: FastWalletCache initialized with CMU cache")
+                                } catch {
+                                    print("⚠️ FIX #580 v2: Failed to initialize FastWalletCache: \(error)")
+                                }
+                            }
+                        } else {
+                            print("⚠️ FIX #580 v2: CMU cache file not available, witness generation will be slower")
+                        }
 
-                    // FIX #580: Note loading removed - WalletNote doesn't have required properties
-                    // The key optimization is the in-memory CMU data (32 MB), not note metadata
-                    // Notes will be loaded on-demand during transaction building
+                        // FIX #580: Note loading removed - WalletNote doesn't have required properties
+                        // The key optimization is the in-memory CMU data (32 MB), not note metadata
+                        // Notes will be loaded on-demand during transaction building
 
-                    await MainActor.run {
-                        self.isTreeLoaded = true
-                        self.treeLoadProgress = 1.0
-                        self.treeLoadStatus = "Privacy state restored\n\(ZipherXFFI.treeSize().formatted()) commitments ready"
+                        await MainActor.run {
+                            self.isTreeLoaded = true
+                            self.treeLoadProgress = 1.0
+                            self.treeLoadStatus = "Privacy state restored\n\(ZipherXFFI.treeSize().formatted()) commitments ready"
+                        }
+                        return
                     }
-                    return
                 }
             }
         }
@@ -932,9 +1083,33 @@ final class WalletManager: ObservableObject {
                 print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
                 print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                // Save updated tree state (FIX #565)
-                if let treeData = ZipherXFFI.treeSerialize() {
-                    try? WalletDatabase.shared.saveTreeState(treeData)
+                // FIX #755: Validate tree root after delta load (boost path)
+                if let deltaManifest = deltaManager.getManifest(),
+                   let treeRoot = ZipherXFFI.treeRoot(),
+                   let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                    let headerRoot = header.hashFinalSaplingRoot
+                    let headerRootReversed = Data(headerRoot.reversed())
+                    let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                    if rootsMatch {
+                        print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
+                        if let treeData = ZipherXFFI.treeSerialize() {
+                            try? WalletDatabase.shared.saveTreeState(treeData)
+                        }
+                    } else {
+                        print("❌ FIX #755: Tree root MISMATCH after delta load! (boost path)")
+                        print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                        print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                        print("🗑️ FIX #755: Clearing corrupted delta bundle - will trigger PHASE 2 rescan")
+                        deltaManager.clearDeltaBundle()
+                        await MainActor.run {
+                            self.pendingDeltaRescan = true
+                        }
+                    }
+                } else {
+                    if let treeData = ZipherXFFI.treeSerialize() {
+                        try? WalletDatabase.shared.saveTreeState(treeData)
+                    }
                 }
             } else {
                 print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
@@ -2122,9 +2297,22 @@ final class WalletManager: ObservableObject {
                         witnessIsCurrent = true
                         alreadyCurrentCount += 1
 
-                        // Store witness root as anchor (will be used by FIX #563)
-                        if note.anchor != witnessAnchor {
-                            anchorUpdates.append((note.id, witnessAnchor))
+                        // FIX #757: Anchor MUST come from HeaderStore, not from witness root!
+                        // The witness root is computed from the tree state, but anchor must match
+                        // the blockchain's finalsaplingroot at the note's height for TX validation.
+                        // This fixes anchor mismatch after tree corruption + rebuild.
+                        let noteHeight = note.height
+                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
+                            if note.anchor != headerAnchor {
+                                anchorUpdates.append((note.id, headerAnchor))
+                                print("   🔧 FIX #757: Note \(note.id) anchor from HEADER at height \(noteHeight)")
+                            }
+                        } else {
+                            // Fallback to witness root only if header not available
+                            if note.anchor != witnessAnchor {
+                                anchorUpdates.append((note.id, witnessAnchor))
+                                print("   ⚠️ FIX #757: Note \(note.id) using witness root (no header at \(noteHeight))")
+                            }
                         }
 
                         // Old logic (WRONG - causes unnecessary witness rebuilds):
@@ -2251,10 +2439,11 @@ final class WalletManager: ObservableObject {
                         // FIX #563 v38: Save CMU data directly instead of treeSerialize (broken - only 606 bytes!)
                         // treeSerialize uses zcash_primitives write_commitment_tree which fails for large trees
                         // Saving CMU data (33MB) is slower but reliable and much faster than re-extracting
+                        // FIX #741: Include boost height so delta sync knows where to start
                         await MainActor.run {
                             // Save CMU data with metadata for validation
-                            try? WalletDatabase.shared.saveTreeState(cmuData)
-                            print("✅ FIX #563 v38: Saved CMU data (\(cmuData.count) bytes) to database")
+                            try? WalletDatabase.shared.saveTreeState(cmuData, height: boostHeight)
+                            print("✅ FIX #563 v38 + FIX #741: Saved CMU data (\(cmuData.count) bytes) at height \(boostHeight)")
                         }
                     } else {
                         print("❌ FIX #563 v34: Cached CMU data too small (\(cmuData.count) bytes)")
@@ -2286,9 +2475,11 @@ final class WalletManager: ObservableObject {
             if shouldSkipDeltaSync {
                 print("✅ FIX #563 v43: Skipping delta CMU sync - DB tree is recent (\(blocksBehind) blocks behind chain tip)")
                 print("✅ FIX #563 v43: Tree has \(ZipherXFFI.treeSize()) CMUs, will sync when >1000 blocks behind")
-            } else if treeWasAlreadyInMemory && blocksBehind > 0 {
-                print("🔄 FIX #568 v2: Tree was already in memory but syncing \(blocksBehind) delta CMUs to update witnesses")
             } else if chainHeight > startHeight {
+                // FIX #740: Merged FIX #568 v2 message here - the old code just printed but didn't sync!
+                if treeWasAlreadyInMemory && blocksBehind > 0 {
+                    print("🔄 FIX #568 v2: Tree was already in memory but syncing \(blocksBehind) delta CMUs to update witnesses")
+                }
                 print("🔄 FIX #557 v32: Syncing delta CMUs from \(startHeight) to \(chainHeight) (\(blocksBehind) blocks)...")
 
                 await progress?("Fetching delta CMUs...", 70)
@@ -2300,8 +2491,16 @@ final class WalletManager: ObservableObject {
                 let maxConsecutiveFailures = 3
                 let maxRetries = 3
                 var deltaCMUs: [Data] = []
+                let syncStartTime = Date()  // FIX #762: Track overall sync time
+                let maxSyncDuration: TimeInterval = 120  // FIX #762: Max 2 minutes for delta sync
 
                 while currentHeight <= chainHeight {
+                    // FIX #762: Check for overall timeout to prevent infinite hanging
+                    if Date().timeIntervalSince(syncStartTime) > maxSyncDuration {
+                        print("⚠️ FIX #762: Delta sync timeout after \(Int(maxSyncDuration))s - aborting to prevent hang")
+                        print("   Progress: \(currentHeight)/\(chainHeight) (\(deltaCMUs.count) CMUs collected)")
+                        break
+                    }
                     let endHeight = min(currentHeight + batchSize - 1, chainHeight)
 
                     var batchSucceeded = false
@@ -2314,9 +2513,13 @@ final class WalletManager: ObservableObject {
                             for (height, _, _, txData) in blocks {
                                 for (txid, outputs, _) in txData {
                                     for output in outputs {
-                                        // Convert hex string to Data
-                                        if let cmuData = Data(hexString: output.cmu) {
-                                            deltaCMUs.append(cmuData)
+                                        // FIX #735: Convert hex string to Data AND reverse to wire format
+                                        // ShieldedOutput.cmu is in DISPLAY format (NetworkManager reverses P2P wire data)
+                                        // But after FIX #730, FFI expects WIRE format (no reversal)
+                                        // So we must reverse display → wire before appending to tree
+                                        if let cmuDisplay = Data(hexString: output.cmu) {
+                                            let cmuWire = Data(cmuDisplay.reversed())
+                                            deltaCMUs.append(cmuWire)
                                         }
                                     }
                                 }
@@ -2335,6 +2538,12 @@ final class WalletManager: ObservableObject {
 
                     if !batchSucceeded {
                         consecutiveFailures += 1
+                        // FIX #762: Break on too many consecutive failures to prevent infinite loop
+                        if consecutiveFailures >= maxConsecutiveFailures {
+                            print("⚠️ FIX #762: \(maxConsecutiveFailures) consecutive failures - aborting delta sync")
+                            print("   Progress: \(currentHeight)/\(chainHeight) (\(deltaCMUs.count) CMUs collected)")
+                            break
+                        }
                     }
 
                     currentHeight = endHeight + 1
@@ -2365,6 +2574,11 @@ final class WalletManager: ObservableObject {
                             print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                             print("   Delta CMUs: \(deltaCMUs.count), Expected: ~\(chainHeight - boostHeight)")
                             print("   Boost file may have wrong CMUs OR delta CMUs are incomplete!")
+
+                            // FIX #758: Clear corrupted delta bundle to force re-collection
+                            // The delta CMUs produced wrong tree root - they need to be re-collected
+                            print("🗑️ FIX #758: Clearing corrupted delta bundle to force re-collection...")
+                            DeltaCMUManager.shared.clearDeltaBundle()
                         }
                     } else {
                         print("⚠️ FIX #557 v35: Could not fetch header at \(chainHeight) for verification")
@@ -2375,16 +2589,31 @@ final class WalletManager: ObservableObject {
             }
 
             // Save updated tree state to database (thread-safe)
+            // FIX #741: Pass chainHeight to saveTreeState - CRITICAL for persisting delta sync progress!
+            // Without this, every startup re-syncs from boost file end because tree_height stays at 2988797
             if let treeData = ZipherXFFI.treeSerialize() {
                 await MainActor.run {
-                    try? WalletDatabase.shared.saveTreeState(treeData)
+                    try? WalletDatabase.shared.saveTreeState(treeData, height: chainHeight)
                 }
-                print("✅ FIX #557 v32: Saved global tree state at height \(chainHeight)")
+                print("✅ FIX #557 v32 + FIX #741: Saved global tree state at height \(chainHeight)")
+            } else {
+                // FIX #741: Even if serialization fails, at least update the tree height
+                // This ensures delta sync knows where to start on next startup
+                await MainActor.run {
+                    try? WalletDatabase.shared.updateTreeHeight(chainHeight)
+                }
+                print("⚠️ FIX #741: Tree serialization failed, but updated height to \(chainHeight)")
             }
 
             // Update database to track tree sync height (thread-safe)
-            await MainActor.run {
-                try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+            // FIX #737 v2: Skip if pendingDeltaRescan flag is set - PHASE 2 needs to start from boost end
+            if !self.pendingDeltaRescan {
+                await MainActor.run {
+                    try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
+                }
+            } else {
+                print("🔧 FIX #737 v2: Skipping lastScannedHeight update - pendingDeltaRescan flag is set")
+                print("   PHASE 2 will start from boost end to rebuild delta bundle")
             }
 
             // CRITICAL FIX #569: UPDATE all witnesses using correct order!
@@ -2549,8 +2778,10 @@ final class WalletManager: ObservableObject {
                             for (height, _, _, txData) in fetchedBlocks {
                                 for (txid, outputs, _) in txData {
                                     for output in outputs {
-                                        if let cmuData = Data(hexString: output.cmu) {
-                                            deltaCMUs.append(cmuData)
+                                        // FIX #735: Reverse display → wire format for FFI
+                                        if let cmuDisplay = Data(hexString: output.cmu) {
+                                            let cmuWire = Data(cmuDisplay.reversed())
+                                            deltaCMUs.append(cmuWire)
                                             p2pCMUs += 1
                                         }
                                     }
@@ -2649,10 +2880,50 @@ final class WalletManager: ObservableObject {
                 // FIX #567 + FIX #569 v2: Get CURRENT tree root (anchor) that all updated witnesses share
                 // The witnesses have been updated to include all CMUs up to chainHeight
                 // The anchor MUST match this current tree state
+                //
+                // FIX #721: CRITICAL - Verify FFI tree root matches HeaderStore BEFORE using HeaderStore anchor!
+                // If they don't match, the FFI tree is corrupt and we should NOT update witnesses.
+                // Using mismatched anchor causes "joinsplit requirements not met" errors.
                 var currentTreeAnchor: Data?
+
+                // FIX #721: Get FFI tree root first
+                let ffiTreeRoot = ZipherXFFI.treeRoot()
+                let ffiRootHex = ffiTreeRoot?.map { String(format: "%02x", $0) }.joined() ?? "nil"
+
                 if chainHeight > 0,
                    let currentHeader = try? HeaderStore.shared.getHeader(at: chainHeight) {
-                    currentTreeAnchor = currentHeader.hashFinalSaplingRoot
+                    let headerRoot = currentHeader.hashFinalSaplingRoot
+                    let headerRootHex = headerRoot.map { String(format: "%02x", $0) }.joined()
+
+                    // FIX #721: Check if header root is zero (corrupted)
+                    let isZeroRoot = headerRoot.allSatisfy { $0 == 0 }
+                    if isZeroRoot {
+                        print("⚠️ FIX #721: Header has ZERO sapling root (corrupted) - using FFI tree root instead")
+                        currentTreeAnchor = ffiTreeRoot
+                    } else if let ffi = ffiTreeRoot, ffi == headerRoot {
+                        // Roots match - safe to use
+                        currentTreeAnchor = headerRoot
+                        print("✅ FIX #721: FFI tree root matches HeaderStore - safe to update witnesses")
+                    } else if let ffi = ffiTreeRoot, ffi == Data(headerRoot.reversed()) {
+                        // Roots match with byte order reversal
+                        currentTreeAnchor = ffiTreeRoot  // Use FFI root (consistent with how TX builds proofs)
+                        print("✅ FIX #721: FFI tree root matches HeaderStore (reversed) - using FFI root")
+                    } else {
+                        // MISMATCH! Tree is corrupt - don't update witnesses
+                        print("❌ FIX #721: CRITICAL - FFI tree root MISMATCH with HeaderStore!")
+                        print("   FFI root:    \(ffiRootHex.prefix(32))...")
+                        print("   Header root: \(headerRootHex.prefix(32))...")
+                        print("❌ FIX #721: NOT updating witnesses - tree is corrupt!")
+                        print("❌ FIX #721: Run 'Repair Database' to rebuild tree")
+
+                        // FIX #758: Clear corrupted delta bundle to force re-collection
+                        print("🗑️ FIX #758: Clearing corrupted delta bundle...")
+                        DeltaCMUManager.shared.clearDeltaBundle()
+
+                        // Return early - don't corrupt witnesses with wrong anchor
+                        return
+                    }
+
                     let anchorHex = currentTreeAnchor?.prefix(8).map { String(format: "%02x", $0) }.joined()
                     print("✅ FIX #569 v2: Using current chain anchor at height \(chainHeight): \(anchorHex ?? "N/A")...")
                 } else {
@@ -4410,11 +4681,23 @@ final class WalletManager: ObservableObject {
         print("✅ FIX #577 v8: Reset lastScannedHeight to 0 for fresh scan")
 
         // FIX #577 v4: Step 5 - Reset FFI tree state (same as Import PK line 5994-5996)
-        print("🌳 FIX #577 v4: Resetting FFI tree state...")
+        // FIX #729: CRITICAL - Must actually call treeInit() to reset Rust FFI tree!
+        // Previous bug: Only reset Swift flags but FFI tree still had old data
+        // This caused FilterScanner to skip PHASE 1 thinking tree was already loaded
+        print("🌳 FIX #729: Resetting FFI tree state...")
+        _ = ZipherXFFI.treeInit()  // Reset Rust FFI tree to empty state
+        try? WalletDatabase.shared.clearTreeState()  // FIX #729: Also clear DB tree state
         isTreeLoaded = false
         treeLoadProgress = 0.0
         treeLoadStatus = ""
-        print("✅ FIX #577 v4: FFI tree state reset")
+        print("✅ FIX #729: FFI tree reset (treeInit + DB cleared + flags reset)")
+
+        // FIX #764: CRITICAL - Clear delta bundle during Full Rescan
+        // The delta manifest retains old endHeight from previous session
+        // Without clearing, delta range becomes backwards (e.g., 2990287-2990286)
+        // This causes tree root mismatch and 10+ minute startup loops
+        DeltaCMUManager.shared.clearDeltaBundle()
+        print("🗑️ FIX #764: Cleared delta bundle (prevents stale endHeight causing backwards range)")
 
         onProgress(0.1, 0, 100)
 
@@ -6891,16 +7174,31 @@ final class WalletManager: ObservableObject {
             let headerRoot = header.hashFinalSaplingRoot.hexString
             print("🔧 FIX #527: HeaderStore sapling_root at \(lastScanned): \(headerRoot.prefix(16))...")
 
-            // FIX #537: Log mismatch but don't block - user already deleted corrupted headers
-            // After P2P re-sync, the tree roots should match
+            // FIX #719: CRITICAL - Block send if tree root mismatch detected
+            // FIX #537 was WRONG - it allowed send even when roots didn't match
+            // This caused "joinsplit requirements not met" errors because:
+            // - TX anchor is computed from FFI tree
+            // - Blockchain expects anchor matching header's finalsaplingroot
+            // - Mismatch = anchor doesn't exist on blockchain = TX rejected
             if ourRootHex != headerRoot {
-                print("⚠️ FIX #537: Tree root mismatch detected")
+                // FIX #719: Check if header has ZERO root (corrupted headers)
+                let isZeroRoot = header.hashFinalSaplingRoot.allSatisfy { $0 == 0 }
+                if isZeroRoot {
+                    // Header is corrupted (zero sapling root) - can't validate
+                    // Allow send but warn - this happens when headers need repair
+                    print("⚠️ FIX #719: Header has ZERO sapling root (corrupted) - cannot validate")
+                    print("⚠️ FIX #719: Allowing send but transaction MAY be rejected")
+                    print("⚠️ FIX #719: Run 'Repair Database' to fix headers")
+                    return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: "zero_root", height: lastScanned)
+                }
+
+                // Real mismatch - FFI tree is corrupt, TX WILL be rejected
+                print("❌ FIX #719: Tree root MISMATCH - TX WILL BE REJECTED!")
                 print("   FFI root:    \(ourRootHex.prefix(16))...")
                 print("   Header root: \(headerRoot.prefix(16))...")
                 print("   Height:      \(lastScanned)")
-                print("   NOTE: This is expected after deleting corrupted headers - P2P sync will fix it")
-                // Allow send - the FFI tree will be updated during normal sync
-                return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: headerRoot, height: lastScanned)
+                print("❌ FIX #719: Blocking send - run 'Repair Database' to rebuild tree")
+                return CMUTreeValidationResult(isValid: false, ourRoot: ourRootHex, headerRoot: headerRoot, height: lastScanned)
             }
 
             // Roots match - safe to send

@@ -21,14 +21,25 @@ macro_rules! debug_log {
     };
 }
 
-// FIX #557 v49: Helper function to reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
-// Cache file stores CMUs in DISPLAY format, but note.cmu() returns WIRE format
-// We must reverse cache CMUs before creating Nodes to ensure consistency
+// FIX #730: CMU format clarification - boost file already stores CMUs in WIRE format!
+//
+// HISTORY OF THE BUG:
+// - FIX #557 v49 INCORRECTLY assumed cache file stores CMUs in DISPLAY format
+// - But generate_boost_file.py does: bytes.fromhex(cmu_hex)[::-1] which REVERSES to wire format
+// - So boost file has WIRE format, and FIX #557 v49 was reversing them AGAIN → double reversal!
+// - This caused tree root mismatch: computed tree root ≠ header's finalsaplingroot
+//
+// THE FIX:
+// - Boost file CMUs are ALREADY in wire format (Python reversed them from RPC display format)
+// - Node::read() expects wire format
+// - So we must NOT reverse - just copy the bytes directly
+//
+// This function is now an IDENTITY function (no reversal) for boost file loading.
+// Kept for backward compatibility with all call sites.
 fn reverse_cmu_display_to_wire(cmu_bytes: &[u8]) -> [u8; 32] {
+    // FIX #730: NO REVERSAL! Boost file CMUs are already in wire format
     let mut wire_cmu = [0u8; 32];
-    for i in 0..32 {
-        wire_cmu[i] = cmu_bytes[31 - i];
-    }
+    wire_cmu.copy_from_slice(&cmu_bytes[0..32]);
     wire_cmu
 }
 
@@ -941,7 +952,12 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
             }
 
             // Extract value (bytes 12-20, little-endian u64)
-            let value = u64::from_le_bytes(plaintext[12..20].try_into().unwrap());
+            // FIX #761: Safe bounds check instead of unwrap panic
+            if plaintext.len() < 20 {
+                debug_log!("DEBUG: ❌ Plaintext too short for value extraction: {} bytes", plaintext.len());
+                return 0;
+            }
+            let value = u64::from_le_bytes(plaintext[12..20].try_into().unwrap_or([0u8; 8]));
             debug_log!("DEBUG: Decrypted value: {} zatoshis ({} ZCL)", value, value as f64 / 100_000_000.0);
 
             // Check if diversifier matches our address
@@ -2323,7 +2339,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
 
     for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
         // Get position from merkle path
-        let position = u64::try_from(merkle_path.position()).unwrap_or(0);
+        // FIX #761: Log warning if position conversion fails (should never happen with valid witnesses)
+        let position = match u64::try_from(merkle_path.position()) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("⚠️ FIX #761: Invalid witness position for spend {}: {:?}, using 0", i, e);
+                0
+            }
+        };
 
         // Compute nullifier using proper PRF_nf
         let nf_result = note.nf(&nk, position);
@@ -2525,6 +2548,16 @@ pub extern "C" fn zipherx_tree_init() -> bool {
 
     let mut pos_guard = TREE_POSITION.lock().unwrap();
     *pos_guard = 0;
+
+    // FIX #764: CRITICAL - Clear delta CMUs when tree is reset
+    // Without this, stale CMUs from previous session remain in memory
+    // This caused 210 stale CMUs to be used after Full Rescan, corrupting tree root
+    let mut delta_guard = DELTA_CMUS.lock().unwrap();
+    let old_count = delta_guard.len();
+    delta_guard.clear();
+    if old_count > 0 {
+        debug_log!("🗑️ FIX #764: Cleared {} stale delta CMUs from FFI memory", old_count);
+    }
 
     true
 }
@@ -2787,6 +2820,158 @@ pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     true
+}
+
+/// FIX #739: Update ALL loaded witnesses with a CMU (WITHOUT modifying the tree)
+/// This is used when witnesses were loaded from DB after delta CMUs were already appended to tree.
+/// cmu: New commitment to append (32 bytes)
+/// Returns number of witnesses updated
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_update_all_witnesses_with_cmu(cmu: *const u8) -> u64 {
+    if cmu.is_null() {
+        return 0;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in update_all_witnesses_with_cmu");
+            return 0;
+        }
+    };
+
+    // Parse CMU into Node
+    let mut cmu_bytes = [0u8; 32];
+    cmu_bytes.copy_from_slice(cmu_slice);
+
+    let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+        Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+        None => {
+            eprintln!("❌ Invalid scalar in update_all_witnesses_with_cmu");
+            return 0;
+        }
+    };
+
+    // Update all loaded witnesses
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return 0,
+    };
+
+    let mut updated = 0u64;
+    for witness in witnesses_guard.iter_mut() {
+        if witness.append(node.clone()).is_ok() {
+            updated += 1;
+        }
+    }
+
+    updated
+}
+
+/// FIX #739: Batch update ALL loaded witnesses with multiple CMUs (WITHOUT modifying the tree)
+/// cmus_data: Packed CMU data (32 bytes per CMU)
+/// cmu_count: Number of CMUs to append
+/// Returns number of witnesses fully updated (all CMUs appended)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_update_all_witnesses_batch(
+    cmus_data: *const u8,
+    cmu_count: usize,
+) -> u64 {
+    if cmus_data.is_null() || cmu_count == 0 {
+        return 0;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(cmus_data, cmu_count * 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMUs data pointer in update_all_witnesses_batch");
+            return 0;
+        }
+    };
+
+    // Parse all CMUs into Nodes
+    let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+    for i in 0..cmu_count {
+        let offset = i * 32;
+        let mut cmu_bytes = [0u8; 32];
+        cmu_bytes.copy_from_slice(&data[offset..offset + 32]);
+
+        let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+            Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+            None => continue,
+        };
+        nodes.push(node);
+    }
+
+    debug_log!("🔧 FIX #739: Updating all witnesses with {} CMUs (no tree modification)", nodes.len());
+
+    // Update all loaded witnesses with all CMUs
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return 0,
+    };
+
+    let witness_count = witnesses_guard.len();
+    for witness in witnesses_guard.iter_mut() {
+        for node in &nodes {
+            witness.append(node.clone()).ok();
+        }
+    }
+
+    debug_log!("✅ FIX #739: Updated {} witnesses with {} CMUs", witness_count, nodes.len());
+    witness_count as u64
+}
+
+/// FIX #739 v4: Get delta CMUs count from memory (not file)
+/// Returns number of delta CMUs stored in DELTA_CMUS array
+#[no_mangle]
+pub extern "C" fn zipherx_get_delta_cmus_count() -> u64 {
+    let delta_guard = match DELTA_CMUS.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    delta_guard.len() as u64
+}
+
+/// FIX #739 v4: Get delta CMUs from memory (not file)
+/// These are all CMUs appended via treeAppend() during this session
+/// cmus_out: Output buffer for CMUs (32 bytes per CMU)
+/// max_count: Maximum number of CMUs to return
+/// Returns actual number of CMUs written
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_get_delta_cmus(
+    cmus_out: *mut u8,
+    max_count: usize,
+) -> u64 {
+    if cmus_out.is_null() || max_count == 0 {
+        return 0;
+    }
+
+    let delta_guard = match DELTA_CMUS.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+
+    let count = std::cmp::min(delta_guard.len(), max_count);
+    debug_log!("🔧 FIX #739 v4: Exporting {} delta CMUs from memory", count);
+
+    for (i, node) in delta_guard.iter().take(count).enumerate() {
+        // Serialize node to bytes
+        let mut node_bytes = Vec::new();
+        if node.write(&mut node_bytes).is_err() {
+            continue;
+        }
+        if node_bytes.len() != 32 {
+            continue;
+        }
+
+        let out_ptr = cmus_out.add(i * 32);
+        std::ptr::copy_nonoverlapping(node_bytes.as_ptr(), out_ptr, 32);
+    }
+
+    count as u64
 }
 
 /// Update a witness with a new CMU
@@ -3099,11 +3284,9 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let mut wire_cmu = [0u8; 32];
-        for j in 0..32 {
-            wire_cmu[j] = cmu_bytes[31 - j];
-        }
+        wire_cmu.copy_from_slice(cmu_bytes);
 
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
             Ok(n) => n,
@@ -3184,13 +3367,13 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
     // Initialize empty tree
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
 
-    // FIX #557 v49: Append all CMUs - Reverse from DISPLAY to WIRE format
+    // FIX #730: Append all CMUs - already in WIRE format (no reversal needed)
     let mut offset = 8;
     for i in 0..count {
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
 
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
@@ -3338,8 +3521,7 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
-        // Cache file stores CMUs in DISPLAY format, but note.cmu() returns WIRE format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
 
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
@@ -3439,7 +3621,7 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
             while local_offset + 32 <= data_len {
                 let cmu_bytes = &bytes[local_offset..local_offset + 32];
                 local_offset += 32;
-                // FIX #557 v49: Reverse CMU from DISPLAY to WIRE format before creating Node
+                // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
                 let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
                 if let Ok(node) = zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
                     witness.append(node).ok();
@@ -3624,7 +3806,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
             Ok(n) => n,
@@ -3984,14 +4166,13 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
-        // Cache file stores CMUs in DISPLAY format, but note.cmu() returns WIRE format
+        // FIX #730: Boost file already stores CMUs in WIRE format (Python reversed from RPC display)
+        // No reversal needed - just copy the bytes directly
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
 
-        // DEBUG: Log first CMU to verify reversal
+        // DEBUG: Log first CMU to verify format
         if i == 0 {
-            debug_log!("🔍 FIX #557 v49 DEBUG: First CMU (DISPLAY from cache): {}...", hex::encode(&cmu_bytes[..8]));
-            debug_log!("🔍 FIX #557 v49 DEBUG: First CMU (WIRE after reverse): {}...", hex::encode(&wire_cmu[..8]));
+            debug_log!("🔍 FIX #730: First CMU from cache (WIRE format): {}...", hex::encode(&wire_cmu[..8]));
         }
 
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
@@ -4027,7 +4208,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
             Ok(n) => n,
@@ -4235,7 +4416,7 @@ pub unsafe extern "C" fn zipherx_tree_rebuild_witnesses_at_positions(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
             Ok(n) => n,
@@ -4536,7 +4717,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
             Ok(n) => n,
@@ -4601,7 +4782,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
             let cmu_bytes = &bytes[update_offset..update_offset + 32];
             update_offset += 32;
 
-            // FIX #557 v49: Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+            // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
             let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
             if let Ok(node) = zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
                 witness.append(node).ok();
@@ -4726,7 +4907,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
     let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
     let mut offset = 8;
 
-    // FIX #557 v49: CMUs in tree data are DISPLAY format, need WIRE format
+    // FIX #730: CMUs in tree data already in WIRE format (no reversal needed)
     for i in 0..=position {
         if offset + 32 > tree_data_len {
             eprintln!("❌ FIX #580: Offset {} exceeds data length at position {}", offset, i);
@@ -4736,7 +4917,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
         let cmu_bytes = &bytes[offset..offset + 32];
         offset += 32;
 
-        // Reverse CMU from DISPLAY (big-endian) to WIRE (little-endian) format
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
         let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
 
         let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
@@ -5801,6 +5982,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
 
     // Create transaction builder
     let target_height = BlockHeight::from_u32(chain_height as u32);
+
+    // FIX #693: Debug branch ID calculation
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔍 FIX #693: Building transaction at height {}", chain_height);
+    debug_log!("🔍 FIX #693: Expected branch ID: 0x{:08x} (ZclassicButtercup = 0x930b540d)", branch_id_u32);
+    debug_log!("🔍 FIX #693: Branch ID match: {}", if branch_id_u32 == 0x930b540d { "✅ YES" } else { "❌ NO" });
+
     let mut builder = Builder::new(ZclassicNetwork, target_height, None);
 
     // Add spend
@@ -5874,7 +6063,15 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     let change = note_value - amount - fee;
     if change > 0 {
         let change_memo = MemoBytes::empty();
-        let change_amount = Amount::from_i64(change as i64).unwrap();
+        // FIX #761: Safe Amount conversion with error handling
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(amt) => amt,
+            Err(_) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ FIX #761: Invalid change amount: {}", change);
+                return false;
+            }
+        };
         let (_, change_addr) = extsk.default_address();
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
@@ -5889,7 +6086,16 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     }
 
     // Build the transaction with proofs
-    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+    // FIX #761: Safe fee Amount conversion
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(amt) => amt,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", fee);
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
         Ok(result) => result,
         Err(e) => {
             secure_zero(&mut decrypted_sk);
@@ -6310,7 +6516,16 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     }
 
     // Build the transaction with proofs
-    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(Amount::from_i64(fee as i64).unwrap())) {
+    // FIX #761: Safe fee Amount conversion
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(amt) => amt,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", fee);
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
         Ok(result) => result,
         Err(e) => {
             secure_zero(&mut decrypted_sk);
@@ -6324,7 +6539,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     let nk = dfvk.fvk().vk.nk;
 
     for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
-        let position = u64::try_from(merkle_path.position()).unwrap_or(0);
+        // FIX #761: Log warning if position conversion fails
+        let position = match u64::try_from(merkle_path.position()) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("⚠️ FIX #761: Invalid witness position for nullifier {}: {:?}, using 0", i, e);
+                0
+            }
+        };
         let nf_result = note.nf(&nk, position);
         let nf_bytes = nf_result.0;
         let offset = i * 32;

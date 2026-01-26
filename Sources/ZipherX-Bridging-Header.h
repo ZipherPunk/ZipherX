@@ -140,6 +140,23 @@ uint64_t zipherx_find_cmu_position(
     const uint8_t *target_cmu
 );
 
+// FIX #580: Create witness from tree data + CMU position (instant, no P2P needed)
+// This is the KEY optimization - generates witness in ~1ms instead of 84s P2P rebuild
+// Parameters:
+// - tree_data: Bundled CMU data [count: u64][cmu1: 32]...
+// - tree_data_len: Length of tree data
+// - position: Position of CMU in tree (0-indexed)
+// - witness_out: Output buffer for witness (1028 bytes minimum)
+// - witness_out_len: Output for actual witness length
+// Returns: true on success, false on failure
+bool zipherx_tree_create_witness_for_position(
+    const uint8_t *tree_data,
+    size_t tree_data_len,
+    uint64_t position,
+    uint8_t *witness_out,
+    size_t *witness_out_len
+);
+
 // Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
 // Much faster than calling zipherx_tree_create_witness_for_cmu multiple times
 // because it only builds the tree ONCE instead of N times.
@@ -174,6 +191,32 @@ size_t zipherx_tree_create_witnesses_parallel(
     const uint8_t *cmu_data,
     size_t cmu_data_len,
     uint64_t *positions_out,
+    uint8_t *witnesses_out
+);
+
+// FIX #588: Rebuild corrupted witnesses at SPECIFIC positions
+// Unlike zipherx_tree_create_witnesses_batch which builds ALL witnesses to the end
+// of the boost file (giving them the same root), this function creates each witness
+// at its specific position. This is critical for notes with different received_heights.
+//
+// This fixes the issue where witnesses have corrupted Merkle paths (filled_nodes)
+// due to old FIX #585 trimming code that zeroed out trailing bytes.
+//
+// Parameters:
+// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+// - cmu_data_len: Length of CMU data
+// - target_cmus: Array of 32-byte CMUs to rebuild witnesses for
+// - target_positions: Array of positions (u64) for each CMU in the tree
+// - target_count: Number of target CMUs
+// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+//
+// Returns: Number of witnesses successfully created
+size_t zipherx_tree_rebuild_witnesses_at_positions(
+    const uint8_t *cmu_data,
+    size_t cmu_data_len,
+    const uint8_t *target_cmus,
+    const uint64_t *target_positions,
+    size_t target_count,
     uint8_t *witnesses_out
 );
 
@@ -656,6 +699,25 @@ bool zipherx_validate_address(const char *addr_str);
 /// Load witness from serialized data (1028 bytes)
 /// Returns witness index or u64::MAX on error
 uint64_t zipherx_tree_load_witness(const uint8_t *witness_data, size_t witness_len);
+
+/// FIX #739: Update ALL loaded witnesses with a CMU (WITHOUT modifying the tree)
+/// Returns number of witnesses updated
+uint64_t zipherx_update_all_witnesses_with_cmu(const uint8_t *cmu);
+
+/// FIX #739: Batch update ALL loaded witnesses with multiple CMUs (WITHOUT modifying the tree)
+/// cmus_data: Packed CMU data (32 bytes per CMU)
+/// cmu_count: Number of CMUs to append
+/// Returns number of witnesses fully updated
+uint64_t zipherx_update_all_witnesses_batch(const uint8_t *cmus_data, size_t cmu_count);
+
+/// FIX #739 v4: Get delta CMUs count from memory (not file)
+uint64_t zipherx_get_delta_cmus_count(void);
+
+/// FIX #739 v4: Get delta CMUs from memory (not file)
+/// cmus_out: Output buffer for CMUs (32 bytes per CMU)
+/// max_count: Maximum number of CMUs to return
+/// Returns actual number of CMUs written
+uint64_t zipherx_get_delta_cmus(uint8_t *cmus_out, size_t max_count);
 
 /// Load commitment tree and create witnesses for multiple CMUs in one pass
 /// Returns number of witnesses created

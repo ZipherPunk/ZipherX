@@ -13,6 +13,18 @@ actor CommitmentTreeUpdater {
 
     // MARK: - Configuration
 
+    // ============================================================
+    // TESTING MODE: Set to true to use local boost file instead of downloading from GitHub
+    // ============================================================
+    // When true, the app will look for a local boost file at:
+    // 1. ~/Library/Application Support/ZipherX/BoostCache/zipherx_boost_v1.bin (already decompressed)
+    // 2. ~/Library/Application Support/ZipherX/BoostCache/zipherx_boost_v1.bin.zst (will decompress)
+    // 3. ~/Downloads/zipherx_boost_v1.bin (decompressed)
+    // This is for testing purposes only - set back to false for production!
+    // ============================================================
+    // FIX #599: Set to false to download corrected boost file from GitHub (block hashes were reversed)
+    private static let USE_LOCAL_BOOST_FILE_FOR_TESTING = false
+
     /// GitHub API URL for latest release (dynamically fetches newest boost file)
     private static let latestReleaseURL = "https://api.github.com/repos/VictorLux/ZipherX_Boost/releases/latest"
 
@@ -61,6 +73,11 @@ actor CommitmentTreeUpdater {
     /// Path to cached core boost file COMPRESSED (.zst)
     private var cachedCorePathZst: URL {
         boostCacheDirectory.appendingPathComponent("zipherx_boost_core.bin.zst")
+    }
+
+    /// Path to cached extracted CMU data (FIX #564: Cache to avoid re-extraction)
+    private var cachedCMUDataPath: URL {
+        boostCacheDirectory.appendingPathComponent("zipherx_boost_cmus.bin")
     }
 
     /// Path to cached equihash file (three-file format v3+)
@@ -201,6 +218,146 @@ actor CommitmentTreeUpdater {
 
         onProgress?(0.0, "Checking for boost data...")
 
+        // ============================================================
+        // TESTING MODE: Check for local boost file (skip GitHub download)
+        // ============================================================
+        // When USE_LOCAL_BOOST_FILE_FOR_TESTING = true:
+        // 1. Check if decompressed file exists in boost cache -> use it
+        // 2. Check if .zst file exists in boost cache -> decompress it
+        // 3. Check Downloads for either file
+        // If found, skip ALL GitHub network operations!
+        // ============================================================
+        if Self.USE_LOCAL_BOOST_FILE_FOR_TESTING {
+            print("🧪 TESTING MODE: Looking for local boost file (skipping GitHub download)")
+
+            // Helper function to check and return a valid boost file
+            func findLocalBoostFile() -> (URL, Int)? {
+                // Check 1: Decompressed file in boost cache
+                let decompressedPath = cachedBoostPath
+                if FileManager.default.fileExists(atPath: decompressedPath.path) {
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: decompressedPath.path)
+                    let fileSize = attrs?[.size] as? Int ?? 0
+                    if fileSize > 500_000_000 {
+                        print("🧪 TESTING MODE: Found decompressed file in cache: \(decompressedPath.path) (\(fileSize / 1024 / 1024) MB)")
+                        return (decompressedPath, fileSize)
+                    }
+                }
+
+                // Check 2: Compressed .zst file in boost cache
+                let compressedPath = boostCacheDirectory.appendingPathComponent("zipherx_boost_v1.bin.zst")
+                if FileManager.default.fileExists(atPath: compressedPath.path) {
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: compressedPath.path)
+                    let fileSize = attrs?[.size] as? Int ?? 0
+                    if fileSize > 100_000_000 { // At least 100MB compressed
+                        print("🧪 TESTING MODE: Found compressed file in cache: \(compressedPath.path) (\(fileSize / 1024 / 1024) MB)")
+                        print("🧪 TESTING MODE: Decompressing...")
+
+                        // Decompress using Rust FFI (actor-safe)
+                        let success = ZipherXFFI.decompressZst(
+                            source: compressedPath.path,
+                            target: decompressedPath.path
+                        )
+
+                        if success, FileManager.default.fileExists(atPath: decompressedPath.path) {
+                            let decompressedSize = try? FileManager.default.attributesOfItem(atPath: decompressedPath.path)[.size] as? Int ?? 0
+                            if (decompressedSize ?? 0) > 500_000_000 {
+                                print("🧪 TESTING MODE: Decompressed to \(decompressedPath.path) (\(decompressedSize ?? 0) / 1024 / 1024) MB)")
+                                return (decompressedPath, decompressedSize ?? 0)
+                            } else {
+                                print("⚠️ TESTING MODE: Decompressed file too small")
+                            }
+                        } else {
+                            print("⚠️ TESTING MODE: Decompression failed")
+                        }
+                    }
+                }
+
+                // Check 3: Known boost file locations (prioritize correct directory)
+                let knownPaths = [
+                    "/Users/chris/Documents/BoostCache/zipherx_boost_v1.bin",  // PRIMARY - latest files
+                    "/Users/chris/ZipherX/Resources/BoostCache/zipherx_boost_v1.bin",
+                    "/Users/chris/ZipherX_Boost/zipherx_boost_v1.bin"  // OLD - may be outdated
+                ]
+
+                for knownPath in knownPaths {
+                    if FileManager.default.fileExists(atPath: knownPath) {
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: knownPath)
+                        let fileSize = attrs?[.size] as? Int ?? 0
+                        if fileSize > 2_000_000_000 { // At least 2GB
+                            print("🧪 TESTING MODE: Found file at known location: \(knownPath) (\(fileSize / 1024 / 1024) MB)")
+
+                            // Copy to boost cache
+                            try? FileManager.default.createDirectory(at: boostCacheDirectory, withIntermediateDirectories: true)
+                            try? FileManager.default.copyItem(at: URL(fileURLWithPath: knownPath), to: decompressedPath)
+
+                            // Also copy the manifest file if it exists in the same directory
+                            let knownDir = (knownPath as NSString).deletingLastPathComponent
+                            let manifestPath = "\(knownDir)/zipherx_boost_manifest.json"
+                            if FileManager.default.fileExists(atPath: manifestPath) {
+                                let cachedManifestPath = boostCacheDirectory.appendingPathComponent("zipherx_boost_manifest.json")
+                                try? FileManager.default.copyItem(at: URL(fileURLWithPath: manifestPath), to: cachedManifestPath)
+                                print("🧪 TESTING MODE: Also copied manifest file")
+                            }
+
+                            return (decompressedPath, fileSize)
+                        }
+                    }
+                }
+
+                // Check 4: Decompressed file in Downloads (check both standard and backup names)
+                let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+                let downloadsPaths = [
+                    downloadsDir.appendingPathComponent("zipherx_boost_v1.bin"),
+                    downloadsDir.appendingPathComponent("zipherx_boost_v1_backup.bin")
+                ]
+
+                for downloadsPath in downloadsPaths {
+                    if FileManager.default.fileExists(atPath: downloadsPath.path) {
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: downloadsPath.path)
+                        let fileSize = attrs?[.size] as? Int ?? 0
+                        if fileSize > 500_000_000 {
+                            print("🧪 TESTING MODE: Found file in Downloads: \(downloadsPath.path) (\(fileSize / 1024 / 1024) MB)")
+
+                            // Copy to boost cache
+                            try? FileManager.default.createDirectory(at: boostCacheDirectory, withIntermediateDirectories: true)
+                            try? FileManager.default.copyItem(at: downloadsPath, to: decompressedPath)
+                            return (decompressedPath, fileSize)
+                        }
+                    }
+                }
+
+                return nil
+            }
+
+            // Try to find local boost file
+            if let (filePath, fileSize) = findLocalBoostFile() {
+                print("🧪 TESTING MODE: Using local boost file - SKIPPING GITHUB DOWNLOAD")
+                print("🧪 TESTING MODE: File: \(filePath.path)")
+                print("🧪 TESTING MODE: Size: \(fileSize / 1024 / 1024) MB")
+
+                // Try to load existing manifest for height/output count
+                if let manifest = loadCachedManifest() {
+                    print("🧪 TESTING MODE: Using cached manifest: height=\(manifest.chain_height), outputs=\(manifest.output_count)")
+                    onProgress?(1.0, "Using local boost file")
+                    return (filePath, manifest.chain_height, manifest.output_count)
+                } else {
+                    // No manifest - use default values (will be detected from file)
+                    print("🧪 TESTING MODE: No manifest found, using defaults (will detect from file)")
+                    onProgress?(1.0, "Using local boost file")
+                    // Return default height 2973646 with actual file - the scanner will detect real values
+                    return (filePath, 2973646, 1044718)
+                }
+            } else {
+                let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+                print("⚠️ TESTING MODE: No local boost file found!")
+                print("⚠️ TESTING MODE: Checked:")
+                print("   1. \(cachedBoostPath.path)")
+                print("   2. \(boostCacheDirectory.appendingPathComponent("zipherx_boost_v1.bin.zst").path)")
+                print("   3. \(downloadsDir.appendingPathComponent("zipherx_boost_v1.bin").path)")
+                print("   4. \(downloadsDir.appendingPathComponent("zipherx_boost_v1_backup.bin").path)")
+            }
+        }
+
         // FIX #526: Validate cached manifest before using it
         // If manifest is stale (old height from 2025-12-29), delete it to force re-download
         _ = await validateAndFixCachedManifest()
@@ -312,6 +469,11 @@ actor CommitmentTreeUpdater {
         // This ensures CMUs in cache match the current boost file version
         invalidateCMUCache()
 
+        // FIX #755: Also invalidate delta bundle when boost file is updated
+        // Delta CMUs are for heights after boost file - if boost file changes, delta is invalid
+        DeltaCMUManager.shared.clearDeltaBundle()
+        print("🗑️ FIX #755: Cleared delta bundle (boost file updated)")
+
         // Update UserDefaults for effective tree height
         await MainActor.run {
             ZipherXConstants.updateTreeInfo(
@@ -359,6 +521,7 @@ actor CommitmentTreeUpdater {
     /// Extract CMUs from outputs section in legacy format for FFI functions
     /// The legacy format is: [count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
     /// This is needed for treeLoadFromCMUs and treeCreateWitnessForCMU FFI functions
+    /// FIX #564: Caches extracted CMU data to disk for instant loading on subsequent startups
     func extractCMUsInLegacyFormat(onProgress: ((Double) -> Void)? = nil) async throws -> Data {
         guard let manifest = loadCachedManifest() else {
             throw BoostFileError.noManifest
@@ -367,6 +530,14 @@ actor CommitmentTreeUpdater {
         guard let outputSection = manifest.sections.first(where: { $0.type == SectionType.outputs.rawValue }) else {
             throw BoostFileError.sectionNotFound("outputs")
         }
+
+        // FIX #564: Check if we have valid cached CMU data
+        if let cachedData = try? loadCachedCMUData(manifest: manifest) {
+            print("✅ FIX #564: Loading CMUs from cache (\(cachedData.count) bytes) - instant!")
+            return cachedData
+        }
+
+        print("📦 FIX #564: No valid cached CMU data, extracting from boost file...")
 
         print("🔍 CMU EXTRACTION DEBUG: Found outputs section in manifest:")
         print("   type: \(outputSection.type)")
@@ -421,6 +592,9 @@ actor CommitmentTreeUpdater {
             }
 
             // Extract CMU (32 bytes at offset 8)
+            // FIX #743: Boost file CMUs are already in WIRE format (little-endian)
+            // The generator does `bytes.fromhex(cmu_hex)[::-1]` which reverses RPC display → wire
+            // No reversal needed here - use CMU directly as-is
             let cmu = recordData.subdata(in: cmuOffset..<(cmuOffset + 32))
 
             // Write CMU to result buffer
@@ -435,8 +609,79 @@ actor CommitmentTreeUpdater {
 
         onProgress?(1.0)
         print("✅ Extracted \(outputCount) CMUs in legacy format (\(result.count) bytes)")
+
+        // FIX #564: Save extracted CMU data to cache for next startup
+        try? saveCMUDataToCache(data: result, manifest: manifest)
+
         return result
     }
+
+    // MARK: - FIX #564: CMU Data Caching
+
+    /// Load cached CMU data if it matches the current boost manifest
+    /// Returns nil if cache doesn't exist, is corrupted, or doesn't match manifest
+    private func loadCachedCMUData(manifest: BoostManifest) throws -> Data? {
+        // Check if cache file exists
+        guard FileManager.default.fileExists(atPath: cachedCMUDataPath.path) else {
+            return nil
+        }
+
+        // Read the cached data
+        let cachedData = try Data(contentsOf: cachedCMUDataPath)
+
+        // Validate the cached data matches the manifest
+        guard cachedData.count >= 8 else {
+            print("⚠️ FIX #564: Cached CMU data too small, ignoring")
+            return nil
+        }
+
+        // Read count from first 8 bytes
+        let cachedCount = cachedData.prefix(8).withUnsafeBytes { raw in
+            raw.load(as: UInt64.self)
+        }
+
+        // Validate count matches manifest
+        guard let outputSection = manifest.sections.first(where: { $0.type == SectionType.outputs.rawValue }) else {
+            return nil
+        }
+
+        if cachedCount != outputSection.count {
+            print("⚠️ FIX #564: Cached CMU count (\(cachedCount)) != manifest count (\(outputSection.count)), ignoring")
+            return nil
+        }
+
+        // Expected size: 8 bytes + count * 32 bytes
+        let expectedSize = 8 + Int(outputSection.count) * 32
+        guard cachedData.count == expectedSize else {
+            print("⚠️ FIX #564: Cached CMU size (\(cachedData.count)) != expected (\(expectedSize)), ignoring")
+            return nil
+        }
+
+        print("✅ FIX #564: Cached CMU data validated (\(cachedCount) CMUs, \(cachedData.count) bytes)")
+        return cachedData
+    }
+
+    /// Save extracted CMU data to cache
+    private func saveCMUDataToCache(data: Data, manifest: BoostManifest) throws {
+        // Create cache directory if needed
+        let cacheDir = cachedCMUDataPath.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+
+        // Write data to cache file
+        try data.write(to: cachedCMUDataPath)
+
+        print("💾 FIX #564: Saved CMU data to cache (\(data.count) bytes)")
+    }
+
+    /// Clear cached CMU data (call when boost file is updated)
+    func clearCMUCache() {
+        if FileManager.default.fileExists(atPath: cachedCMUDataPath.path) {
+            try? FileManager.default.removeItem(at: cachedCMUDataPath)
+            print("🗑️ FIX #564: Cleared cached CMU data")
+        }
+    }
+
+    // MARK: - Shielded Outputs Extraction
 
     /// Extract shielded outputs section for parallel note decryption
     /// - Parameter onProgress: Progress callback
@@ -744,7 +989,12 @@ actor CommitmentTreeUpdater {
 
     /// Version for legacy CMU cache format - bump this when format changes
     /// Version 2: Fixed CMU offset from 36 to 8 (December 2025)
-    private static let legacyCMUCacheVersion = 2
+    /// Version 3: FIX #577 - Reverse CMU byte order from display (big-endian) to wire (little-endian)
+    /// Version 4: FIX #733 - REVERTS FIX #577! Boost file CMUs are already in wire format (generator does [::-1])
+    ///            Combined with FIX #730 (FFI no longer reverses), double-reversal was causing tree root mismatch
+    /// Version 5: FIX #742 - WRONG! Added reversal again, causing double-reversal
+    /// Version 6: FIX #743 - REVERTS FIX #742! Verified generator does [::-1], so CMUs are already wire format
+    private static let legacyCMUCacheVersion = 6
 
     /// Path to cached legacy CMU file (extracted from boost file)
     private var cachedLegacyCMUPath: URL {
@@ -1128,6 +1378,10 @@ actor CommitmentTreeUpdater {
             if savedManifest.chain_height == manifest.chain_height &&
                savedManifest.output_count == manifest.output_count {
                 print("✅ FIX #526: Manifest saved and verified successfully")
+
+                // FIX #564: Clear CMU cache when boost manifest is updated
+                // This ensures we don't use stale cached CMU data with new boost file
+                clearCMUCache()
             } else {
                 print("⚠️ FIX #526: WARNING - Saved manifest doesn't match expected!")
             }
@@ -1137,6 +1391,58 @@ actor CommitmentTreeUpdater {
     }
 
     private func downloadBoostFile(manifest: BoostManifest, onProgress: ((Double) -> Void)?) async throws {
+        // ============================================================
+        // TESTING MODE: Skip download if local boost file exists
+        // ============================================================
+        if Self.USE_LOCAL_BOOST_FILE_FOR_TESTING {
+            print("🧪 TESTING MODE: downloadBoostFile called - checking for local file...")
+
+            // Check if decompressed file exists in boost cache
+            if FileManager.default.fileExists(atPath: cachedBoostPath.path) {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: cachedBoostPath.path)
+                let fileSize = attrs?[.size] as? Int ?? 0
+
+                if fileSize > 500_000_000 { // At least 500MB
+                    print("🧪 TESTING MODE: Found decompressed file in cache - SKIPPING DOWNLOAD")
+                    print("🧪 TESTING MODE: File: \(cachedBoostPath.path)")
+                    print("🧪 TESTING MODE: Size: \(fileSize / 1024 / 1024) MB")
+                    onProgress?(1.0)
+                    return // Skip download!
+                }
+            }
+
+            // Check if .zst file exists and decompress it
+            let compressedPath = boostCacheDirectory.appendingPathComponent("zipherx_boost_v1.bin.zst")
+            if FileManager.default.fileExists(atPath: compressedPath.path) {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: compressedPath.path)
+                let fileSize = attrs?[.size] as? Int ?? 0
+
+                if fileSize > 100_000_000 { // At least 100MB compressed
+                    print("🧪 TESTING MODE: Found compressed file - decompressing...")
+                    print("🧪 TESTING MODE: File: \(compressedPath.path)")
+
+                    // Decompress using Rust FFI
+                    let decompressedPath = cachedBoostPath.path
+                    let success = ZipherXFFI.decompressZst(
+                        source: compressedPath.path,
+                        target: decompressedPath
+                    )
+
+                    if success, FileManager.default.fileExists(atPath: decompressedPath) {
+                        let decompressedSize = try? FileManager.default.attributesOfItem(atPath: decompressedPath)[.size] as? Int ?? 0
+                        print("🧪 TESTING MODE: Decompressed successfully!")
+                        print("🧪 TESTING MODE: Size: \(decompressedSize ?? 0) / 1024 / 1024) MB")
+                        onProgress?(1.0)
+                        return // Skip download!
+                    } else {
+                        print("⚠️ TESTING MODE: Decompression failed - falling back to download")
+                    }
+                }
+            }
+
+            print("⚠️ TESTING MODE: No local file found - proceeding with download")
+        }
+
         // Get latest release from GitHub to find boost file URL
         let release = try await fetchLatestRelease()
 

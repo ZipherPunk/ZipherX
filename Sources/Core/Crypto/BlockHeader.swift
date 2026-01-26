@@ -79,6 +79,12 @@ struct ZclassicBlockHeader {
 
         // Read final Sapling root (32 bytes) - THIS IS THE ANCHOR!
         let hashFinalSaplingRoot = data.subdata(in: offset..<offset+32)
+        // DEBUG: Check if saplingRoot is all zeros
+        if hashFinalSaplingRoot.allSatisfy({ $0 == 0 }) {
+            print("🚨 DEBUG: saplingRoot is all zeros at height \(height) in parseWithSolution!")
+            print("   data.count=\(data.count), offset=\(offset)")
+            print("   First 100 bytes: \(data.prefix(min(100, data.count)).map { String(format: "%02x", $0) }.joined())")
+        }
         offset += 32
 
         // Read time (4 bytes, little-endian)

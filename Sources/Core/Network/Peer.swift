@@ -2115,50 +2115,61 @@ public final class Peer {
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 8, $0.baseAddress!) }
 
         do {
-            // Send ping with nonce
-            try await sendMessage(command: "ping", payload: nonce)
+            // FIX #724: Wrap ping in withExclusiveAccessTimeout to prevent race condition
+            // Without this, ping can interleave with other P2P operations (like getMempoolTransactions)
+            // causing corrupted reads and "handshake failed" errors
+            // Use 5 second timeout - if another operation holds lock longer, skip this ping
+            return try await withExclusiveAccessTimeout(seconds: 5) {
+                // Send ping with nonce
+                try await sendMessage(command: "ping", payload: nonce)
 
-            // Loop to receive messages until we get matching pong or timeout
-            // Peers may send unsolicited messages (inv, addr, etc.) before pong
-            let startTime = Date()
-            var attempts = 0
-            let maxAttempts = 50  // Prevent infinite loop
+                // Loop to receive messages until we get matching pong or timeout
+                // Peers may send unsolicited messages (inv, addr, etc.) before pong
+                let startTime = Date()
+                var attempts = 0
+                let maxAttempts = 50  // Prevent infinite loop
 
-            while attempts < maxAttempts {
-                attempts += 1
+                while attempts < maxAttempts {
+                    attempts += 1
 
-                // Check timeout
-                if Date().timeIntervalSince(startTime) > timeoutSeconds {
-                    print("⚠️ FIX #246: [\(host)] Ping timeout after \(attempts) unsolicited messages")
-                    return false
+                    // Check timeout
+                    if Date().timeIntervalSince(startTime) > timeoutSeconds {
+                        print("⚠️ FIX #246: [\(host)] Ping timeout after \(attempts) unsolicited messages")
+                        return false
+                    }
+
+                    let (command, responseData) = try await receiveMessageWithTimeout(seconds: 1)
+
+                    if command == "pong" && responseData == nonce {
+                        // Got matching pong response
+                        lastActivity = Date()
+                        return true
+                    } else if command == "pong" {
+                        // Got pong with wrong nonce (old response) - keep waiting
+                        continue
+                    } else if command == "ping" {
+                        // Respond to peer's ping (they might be checking us too)
+                        try? await sendMessage(command: "pong", payload: responseData)
+                        continue
+                    } else if command == "inv" || command == "addr" || command == "addrv2" ||
+                              command == "headers" || command == "block" {
+                        // Drain unsolicited messages - peer is alive, just chatty
+                        continue
+                    } else {
+                        // Other unsolicited message - keep waiting
+                        continue
+                    }
                 }
 
-                let (command, responseData) = try await receiveMessageWithTimeout(seconds: 1)
-
-                if command == "pong" && responseData == nonce {
-                    // Got matching pong response
-                    lastActivity = Date()
-                    return true
-                } else if command == "pong" {
-                    // Got pong with wrong nonce (old response) - keep waiting
-                    continue
-                } else if command == "ping" {
-                    // Respond to peer's ping (they might be checking us too)
-                    try? await sendMessage(command: "pong", payload: responseData)
-                    continue
-                } else if command == "inv" || command == "addr" || command == "addrv2" ||
-                          command == "headers" || command == "block" {
-                    // Drain unsolicited messages - peer is alive, just chatty
-                    continue
-                } else {
-                    // Other unsolicited message - keep waiting
-                    continue
-                }
+                // Too many attempts without matching pong
+                print("⚠️ FIX #246: [\(host)] Ping gave up after \(maxAttempts) unsolicited messages")
+                return false
             }
-
-            // Too many attempts without matching pong
-            print("⚠️ FIX #246: [\(host)] Ping gave up after \(maxAttempts) unsolicited messages")
-            return false
+        } catch NetworkError.timeout {
+            // FIX #724: Lock acquisition timed out - another operation is using the peer
+            // This is not a connection failure, just skip this ping cycle
+            print("⚠️ FIX #724: [\(host)] Ping skipped - peer busy with another operation")
+            return true  // Return true since peer might be fine, just busy
         } catch {
             // Connection error - peer may be dead
             print("❌ FIX #246: [\(host)] Ping failed: \(error.localizedDescription)")
