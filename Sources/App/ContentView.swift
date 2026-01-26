@@ -247,7 +247,9 @@ struct ContentView: View {
                         let isFastStart = lastScannedHeight > 0 && cachedChainHeight > 0 && blocksBehind <= 50 && !cacheIsStale
 
                         if isFastStart {
-                            print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(blocksBehind) blocks behind)")
+                            // FIX #768: Only show "blocks behind" if actually behind, otherwise show "synced"
+                            let lagInfo = blocksBehind > 0 ? "\(blocksBehind) blocks behind" : "synced"
+                            print("⚡ FAST START MODE: Wallet synced to \(lastScannedHeight), chain at \(cachedChainHeight) (\(lagInfo))")
 
                             // ================================================================
                             // FIX #477: VALIDATE last_scanned_height vs HeaderStore
@@ -557,7 +559,8 @@ struct ContentView: View {
                             } else if isCheckpointValid && !isHeaderStoreHealthy {
                                 // FIX #408: Checkpoint is valid but HeaderStore is stale
                                 // Fall through to REGULAR FAST START which will sync headers
-                                print("⚠️ FIX #408: Checkpoint valid but HeaderStore is \(headersBehind) blocks behind!")
+                                // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
+                                print("⚠️ FIX #408: Checkpoint valid but HeaderStore is \(headersBehind) headers behind!")
                                 print("⚠️ FIX #408: Falling back to REGULAR FAST START for header sync")
                             }
 
@@ -612,7 +615,8 @@ struct ContentView: View {
                             if lastScanned412 > 0 && headerStoreHeight412 < lastScanned412 {
                                 let headerGap412 = lastScanned412 - headerStoreHeight412
                                 if headerGap412 > 100 {  // More than 100 headers behind
-                                    print("⚠️ FIX #412: HeaderStore is \(headerGap412) blocks behind lastScannedHeight (\(lastScanned412))")
+                                    // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
+                                    print("⚠️ FIX #412: HeaderStore is \(headerGap412) headers behind lastScannedHeight (\(lastScanned412))")
                                     print("⚠️ FIX #412: Need P2P network FIRST for header sync (Tree Root Validation requires it)")
                                     needsHeaderSync = true
                                 }

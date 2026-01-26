@@ -1042,7 +1042,8 @@ final class FilterScanner {
 
                 headerSyncAttempts += 1
                 let headersBehind = targetHeight - effectiveHeaderHeight
-                print("⚠️ FIX #406: HeaderStore (\(headerStoreHeight)) is \(headersBehind) blocks behind target (\(targetHeight))")
+                // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
+                print("⚠️ FIX #406: HeaderStore (\(headerStoreHeight)) is \(headersBehind) headers behind target (\(targetHeight))")
                 print("🔄 FIX #406: Syncing headers (attempt \(headerSyncAttempts)/\(maxHeaderSyncAttempts))...")
                 onStatusUpdate?("headers", "Syncing headers (attempt \(headerSyncAttempts))...")
 

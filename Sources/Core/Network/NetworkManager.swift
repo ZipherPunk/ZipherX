@@ -454,7 +454,8 @@ public final class NetworkManager: ObservableObject {
                 ],
                 timestamp: Date()
             )
-            print("🚨 FIX #409: CRITICAL - HeaderStore is \(headersBehind) blocks behind!")
+            // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
+            print("🚨 FIX #409: CRITICAL - HeaderStore is \(headersBehind) headers behind!")
             return
         }
 
@@ -5582,7 +5583,8 @@ public final class NetworkManager: ObservableObject {
 
         // WARNING: If peer consensus is significantly higher than HeaderStore, headers are lagging
         if headerHeight > 0 && peerConsensusHeight > headerHeight + 50 {
-            print("⚠️ HeaderStore is \(peerConsensusHeight - headerHeight) blocks behind peer consensus - header sync needed!")
+            // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
+            print("⚠️ HeaderStore is \(peerConsensusHeight - headerHeight) headers behind peer consensus - header sync needed!")
         }
 
         // 4. Determine best height - PEER CONSENSUS is PRIMARY (decentralized!)

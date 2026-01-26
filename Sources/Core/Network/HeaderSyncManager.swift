@@ -150,6 +150,14 @@ final class HeaderSyncManager {
         }
 
         print("🎉 Header sync complete! Synced to height \(chainTip)")
+
+        // FIX #767 v3: Clear boost corruption flag after successful P2P sync
+        // This allows boost file to be loaded again on next startup
+        // Without this, the flag persists forever once set
+        if headerStore.shouldSkipBoostHeaders() {
+            headerStore.clearBoostHeadersCorruptionFlag()
+            print("✅ FIX #767 v3: Boost corruption flag cleared - boost file can load on next startup")
+        }
     }
 
     /// FIX #122: Fill header gaps - detects and fills missing headers in the store
@@ -1467,15 +1475,43 @@ final class HeaderSyncManager {
                         let skipDeletion = lastCorruptedHeaderDeletion.map { Date().timeIntervalSince($0) < 30 } ?? false
 
                         if !skipDeletion {
-                            // Delete corrupted headers (only log once)
-                            if !checkpointWarningPrinted {
-                                print("🗑️ Deleting corrupted headers from \(currentHeight - 1) onwards")
-                            }
+                            // FIX #767: CRITICAL - Protect boost file headers from deletion!
+                            // Only delete P2P headers (above boost file end height)
+                            // Deleting boost headers causes infinite resync loop:
+                            // 1. Mismatch detected → delete all headers (including boost)
+                            // 2. Next startup → reload boost file
+                            // 3. Mismatch again → delete → infinite loop!
+                            //
+                            // Note: If effectiveTreeHeight is 0 (first launch, no boost yet),
+                            // we can delete all headers since there's no boost file to protect.
+                            let boostFileEndHeight = ZipherXConstants.effectiveTreeHeight
                             let prevHeight = currentHeight - 1
-                            if let maxH = try? headerStore.getLatestHeight() {
-                                try? headerStore.deleteHeadersInRange(from: prevHeight, to: maxH)
+                            print("🔍 FIX #767: Chain mismatch at height \(currentHeight), boostFileEndHeight=\(boostFileEndHeight)")
+
+                            // Only delete headers ABOVE the boost file end height
+                            let safeDeleteStart = max(prevHeight, boostFileEndHeight + 1)
+
+                            if let maxH = try? headerStore.getLatestHeight(), safeDeleteStart <= maxH {
+                                if !checkpointWarningPrinted {
+                                    if prevHeight <= boostFileEndHeight {
+                                        print("🛡️ FIX #767: Protecting boost file headers (height <= \(boostFileEndHeight))")
+                                        print("🗑️ FIX #767: Only deleting P2P headers from \(safeDeleteStart) to \(maxH)")
+                                    } else {
+                                        print("🗑️ Deleting corrupted headers from \(safeDeleteStart) to \(maxH)")
+                                    }
+                                }
+                                try? headerStore.deleteHeadersInRange(from: safeDeleteStart, to: maxH)
+                            } else if !checkpointWarningPrinted {
+                                print("🛡️ FIX #767: No headers to delete (mismatch at \(prevHeight) is within boost range <= \(boostFileEndHeight))")
                             }
-                            headerStore.markBoostHeadersCorrupted(mismatchHeight: currentHeight)
+
+                            // FIX #767 v2: Only mark as corrupted if mismatch is WITHIN boost file range
+                            // If mismatch is in P2P range, don't mark boost as corrupted (it's not!)
+                            if prevHeight <= boostFileEndHeight {
+                                headerStore.markBoostHeadersCorrupted(mismatchHeight: currentHeight)
+                            } else {
+                                print("ℹ️ FIX #767: Mismatch in P2P range - NOT marking boost as corrupted")
+                            }
                             lastCorruptedHeaderDeletion = Date()
 
                             // FIX #746: CRITICAL - Don't continue processing this batch!

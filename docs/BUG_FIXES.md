@@ -8,6 +8,121 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #769: False "Sync lag detected: 2403174" from HeaderStore Lag
+**Problem**: Team orchestrator monitoring script reports massive false sync lag (e.g., "Sync lag detected: 2990268" or "2403174") when HeaderStore is empty/stale during normal startup.
+
+**Root Cause Analysis**:
+1. Log messages like "⚠️ FIX #408: HeaderStore is 2990270 blocks behind!" use "blocks behind" wording
+2. Log messages like "⚠️ FIX #412: HeaderStore is 2990268 blocks behind lastScannedHeight" also match
+3. Monitor regex `([1-9]\d*) blocks behind` matches HeaderStore lag messages
+4. But HeaderStore lag is EXPECTED behavior during startup (empty → reload boost → sync P2P)
+5. HeaderStore lag is NOT the same as wallet sync lag - conflating them causes false alerts
+
+**Log Evidence** (before fix):
+```
+📍 FIX #477: lastScannedHeight=2990268, HeaderStore=0, gap=2990268
+⚠️ FIX #408: Checkpoint valid but HeaderStore is 2990270 blocks behind!
+⚠️ FIX #412: HeaderStore is 2990268 blocks behind lastScannedHeight (2990268)
+[Monitor script]: "Sync lag detected: 2990268" ← FALSE POSITIVE!
+```
+
+**Solution**:
+1. **Monitor script fix**: Changed regex to only match wallet-related sync lag
+   - Old: `([1-9]\d*) blocks behind`
+   - New: `(?:wallet|Wallet).*?([1-9]\d*) blocks behind`
+   - Only matches "Wallet synced to X, chain at Y (N blocks behind)" patterns
+   - Ignores "HeaderStore is N blocks behind" (expected startup behavior)
+2. **Swift code fix**: Changed "blocks behind" to "headers behind" for HeaderStore messages
+   - Semantic distinction: "blocks behind" = wallet sync lag, "headers behind" = HeaderStore lag
+   - Makes log messages more accurate and prevents regex false matches
+
+**Files Modified**:
+- `scripts/team_orchestrator.py` (regex pattern)
+- `Sources/App/ContentView.swift` (FIX #408, FIX #412 logs)
+- `Sources/Core/Network/NetworkManager.swift` (FIX #409, peer consensus log)
+- `Sources/Core/Network/FilterScanner.swift` (FIX #406 log)
+
+---
+
+### FIX #768: False "Sync lag detected: 0" Alert from Monitoring Script
+**Problem**: Team orchestrator monitoring script reports "Sync lag detected: 0" when wallet is fully synced.
+
+**Root Cause Analysis**:
+1. Script uses regex `(\d+) blocks behind` to detect sync lag issues
+2. Log messages like "⚡ FAST START MODE: ... (0 blocks behind)" match the regex
+3. The regex captures "0" as a valid sync lag, but 0 blocks behind = fully synced (not an issue!)
+
+**Solution**:
+1. **Monitor script fix**: Changed regex from `(\d+) blocks behind` to `([1-9]\d*) blocks behind`
+   - `[1-9]` ensures first digit is 1-9, not 0
+   - Only triggers for actual lag (1+ blocks behind)
+2. **Swift code fix**: Updated log messages to show "synced" or "at tip" instead of "0 blocks behind"
+   - ContentView.swift: FAST START log now shows "(synced)" instead of "(0 blocks behind)"
+   - TransactionBuilder.swift: FAST PATH log now shows "(synced)" instead of "(0 blocks behind)"
+   - WalletManager.swift: Delta CMU sync log now shows "(at chain tip)" instead of "(0 blocks behind chain tip)"
+
+**Files Modified**:
+- `scripts/team_orchestrator.py` (regex pattern)
+- `Sources/App/ContentView.swift` (FAST START log)
+- `Sources/Core/Crypto/TransactionBuilder.swift` (FAST PATH log)
+- `Sources/Core/Wallet/WalletManager.swift` (delta sync skip log)
+
+---
+
+### FIX #767: Protect Boost File Headers from Deletion During P2P Mismatch
+**Problem**: Infinite P2P resync loop when chain mismatch is detected within boost file range. App would delete ALL headers (including 2.5M+ boost file headers), reload boost file, detect mismatch again, delete again - loop forever.
+
+**Root Cause Analysis**:
+1. When P2P header verification detects a `prevHash` mismatch in HeaderSyncManager
+2. Code at line ~1476 deleted headers from `currentHeight - 1` to `maxHeight`
+3. If mismatch was within boost file range (e.g., height 2,000,000), this deleted ALL boost headers
+4. On next startup, boost file was reloaded (took minutes)
+5. Same mismatch detected → headers deleted → reload → infinite loop
+
+**Log Evidence** (before fix):
+```
+🗑️ Deleting corrupted headers from 2847321 onwards
+⚠️ FIX #677 v2: Chain mismatch at height 2847322 - setting boost corruption flag
+[Next startup]
+📜 FIX #457: Loading 2507778 headers from boost file (heights 476969 to 2984746)
+⚠️ Chain mismatch at height 2847322 - will trust peer
+🗑️ Deleting corrupted headers from 2847321 onwards
+[Loop repeats forever...]
+```
+
+**Solution**:
+1. Get boost file end height from `ZipherXConstants.effectiveTreeHeight`
+2. Calculate `safeDeleteStart = max(prevHeight, boostFileEndHeight + 1)`
+3. Only delete headers ABOVE the boost file end height (P2P headers only)
+4. If mismatch is within boost range: protect boost headers, only mark corruption flag
+5. If mismatch is in P2P range: delete corrupted P2P headers, DON'T mark boost as corrupted
+
+**Key Protection Logic**:
+```swift
+let boostFileEndHeight = ZipherXConstants.effectiveTreeHeight
+let safeDeleteStart = max(prevHeight, boostFileEndHeight + 1)
+// Only delete P2P headers above boost file end
+try? headerStore.deleteHeadersInRange(from: safeDeleteStart, to: maxH)
+// Only mark boost corrupted if mismatch is WITHIN boost range
+if prevHeight <= boostFileEndHeight {
+    headerStore.markBoostHeadersCorrupted(mismatchHeight: currentHeight)
+}
+```
+
+**FIX #767 v2**: Only mark boost as corrupted if mismatch is WITHIN boost file range
+- If mismatch is in P2P range (above boost end height), don't mark boost as corrupted
+- This prevents unnecessary boost file skipping when P2P headers have issues
+
+**FIX #767 v3**: Clear corruption flag after successful P2P header sync
+- Once P2P sync completes successfully, clear the `boostHeadersCorrupted` flag
+- This allows boost file to load again on next startup
+- Without this, the flag persisted forever once set, permanently disabling boost file loading
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Protected boost file headers in chain mismatch handler, clear flag after sync
+
+---
+
 ### FIX #766: Trigger Immediate Catch-Up Sync After Full Rescan Completes
 **Problem**: After Full Rescan completes, wallet stays behind chain tip by hundreds of blocks (e.g., "Sync lag detected: 451"). Background sync doesn't trigger immediately.
 

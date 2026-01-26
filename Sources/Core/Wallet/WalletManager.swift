@@ -2473,7 +2473,9 @@ final class WalletManager: ObservableObject {
             let shouldSkipDeltaSync = !treeWasAlreadyInMemory && treeLoaded && isRecentEnough
 
             if shouldSkipDeltaSync {
-                print("✅ FIX #563 v43: Skipping delta CMU sync - DB tree is recent (\(blocksBehind) blocks behind chain tip)")
+                // FIX #768: Only show "blocks behind" if actually behind, otherwise show "at tip"
+                let lagInfo = blocksBehind > 0 ? "\(blocksBehind) blocks behind chain tip" : "at chain tip"
+                print("✅ FIX #563 v43: Skipping delta CMU sync - DB tree is recent (\(lagInfo))")
                 print("✅ FIX #563 v43: Tree has \(ZipherXFFI.treeSize()) CMUs, will sync when >1000 blocks behind")
             } else if chainHeight > startHeight {
                 // FIX #740: Merged FIX #568 v2 message here - the old code just printed but didn't sync!

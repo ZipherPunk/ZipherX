@@ -786,7 +786,9 @@ final class TransactionBuilder {
 
                 let blocksBehind = chainHeight > lastScanned ? chainHeight - lastScanned : 0
 
-                print("⚡ FAST PATH: Checkpoint at \(lastScanned), chain at \(chainHeight) (\(blocksBehind) blocks behind)")
+                // FIX #768: Only show "blocks behind" if actually behind, otherwise show "synced"
+                let lagInfo = blocksBehind > 0 ? "\(blocksBehind) blocks behind" : "synced"
+                print("⚡ FAST PATH: Checkpoint at \(lastScanned), chain at \(chainHeight) (\(lagInfo))")
 
                 if blocksBehind <= 50 && blocksBehind > 0 && lastScanned > 0 {
                     // FAST: Delta sync from checkpoint (max 50 blocks)
