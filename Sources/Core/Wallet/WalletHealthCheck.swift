@@ -1157,7 +1157,7 @@ final class WalletHealthCheck {
 
             if !unrepairableHeights.isEmpty {
                 print("⚠️ FIX #698: \(unrepairableHeights.count) headers above node height (\(nodeHeight)) - will delete")
-                try HeaderStore.shared.deleteHeadersAbove(nodeHeight)
+                try HeaderStore.shared.deleteHeadersAbove(height: nodeHeight)
             }
 
             if repairableHeights.isEmpty {

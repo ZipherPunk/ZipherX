@@ -1617,7 +1617,9 @@ final class FilterScanner {
 
                 // Step 3: If we scanned beyond boost file, append delta CMUs
                 if lastScannedHeight > effectiveHeight {
+                    let blockRange = lastScannedHeight - effectiveHeight
                     print("🔧 FIX #524: Appending delta CMUs from height \(effectiveHeight + 1) to \(lastScannedHeight)...")
+                    print("🔧 FIX #765: Block range spans \(blockRange) blocks - checking for missing CMUs...")
 
                     // FIX #739 v4: Get delta CMUs from Rust memory (DELTA_CMUS array)
                     // This contains ALL CMUs appended via treeAppend() during this session,
@@ -1762,6 +1764,27 @@ final class FilterScanner {
                             print("⚠️ FIX #524: Tree root still doesn't match blockchain")
                             print("   Our root:    \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                             print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+
+                            // FIX #765: Delta CMUs are incomplete/corrupted - P2P scan missed some outputs
+                            // Clear the corrupted delta bundle so next PHASE 2 scan will rebuild it properly
+                            let currentDeltaCount = DeltaCMUManager.shared.loadDeltaCMUs()?.count ?? 0
+                            print("🔧 FIX #765: Delta CMUs incomplete - clearing corrupted delta bundle")
+                            print("   Delta had \(currentDeltaCount) CMUs but produced wrong tree root")
+                            print("   Clearing delta bundle to force rebuild during next PHASE 2 scan")
+                            DeltaCMUManager.shared.clearDeltaBundle()
+
+                            // Also reset lastScannedHeight to boost file end so PHASE 2 rescans the full range
+                            // This ensures we re-fetch all blocks and properly collect ALL shielded outputs
+                            let boostEndHeight = ZipherXConstants.effectiveTreeHeight
+                            print("🔧 FIX #765: Resetting lastScannedHeight from \(lastScannedHeight) to \(boostEndHeight)")
+                            try? database.updateLastScannedHeight(boostEndHeight, hash: Data(count: 32))
+
+                            // Set flag to trigger PHASE 2 rescan
+                            await MainActor.run {
+                                WalletManager.shared.pendingDeltaRescan = true
+                            }
+                            print("🔧 FIX #765: Set pendingDeltaRescan=true - will rescan from boost file end")
+
                             return false
                         }
                     } else {

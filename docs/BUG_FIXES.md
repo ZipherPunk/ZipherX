@@ -8,6 +8,45 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #765: Auto-Clear Corrupted Delta Bundle When P2P Scan Misses Outputs
+**Problem**: Tree root mismatch persists even after FIX #524 repair. App stuck in repair loop because delta CMUs are incomplete.
+
+**Root Cause Analysis**:
+1. PHASE 2 P2P block fetch uses parallel batches for speed
+2. Some batches may timeout or fail silently (peer disconnections, Tor issues)
+3. Missing shielded outputs from failed batches means delta bundle is incomplete
+4. FIX #524 repair appends incomplete delta CMUs → wrong tree root
+5. Repair fails, but corrupted delta bundle persists → next attempt also fails
+
+**Log Evidence**:
+```
+[18:35:09.674] 📦 DeltaCMU: Loaded 93 outputs from local delta bundle
+[18:35:09.679] 🔧 FIX #524: Appended 93 delta CMUs
+[18:35:09.680] 🔧 FIX #524: New tree root: f602085390f4df83...
+[18:35:09.680]    Header root: 8fb6df230b8a2653...
+[18:35:09.680] ⚠️ FIX #524: Tree root still doesn't match blockchain
+```
+
+**Solution**:
+1. When FIX #524 repair fails (tree root still doesn't match after appending delta):
+   - Clear the corrupted delta bundle via `DeltaCMUManager.shared.clearDeltaBundle()`
+   - Reset `lastScannedHeight` to boost file end height
+   - Set `pendingDeltaRescan = true` to trigger PHASE 2 rescan
+2. Next PHASE 2 scan will re-fetch ALL blocks in the delta range
+3. Fresh scan collects ALL shielded outputs properly
+4. Delta bundle rebuilt with complete CMU set → correct tree root
+
+**Why This Works**:
+- P2P parallel fetch can have transient failures (timeouts, peer drops)
+- Rescan with fresh peer connections usually succeeds
+- Complete delta CMU set produces correct tree root
+- One-time rescan fixes the issue permanently
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift` - Added FIX #765 auto-clear logic in `fixTreeRootMismatch()`
+
+---
+
 ### FIX #764: Clear Delta Bundle and FFI Memory During Full Rescan
 **Problem**: App startup takes 10+ minutes after Full Rescan. Tree root mismatch detected repeatedly, triggering repair loops.
 
