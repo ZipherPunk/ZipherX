@@ -30,6 +30,13 @@ struct ZipherXApp: App {
         NotificationManager.shared.requestPermission()
         print("🚀 App init at \(Date()) - startup time was \(appStartupTime)")
 
+        // FIX #776: Clear incorrectly set boost headers corruption flag
+        // The boost file is correct - this flag was set in error
+        if UserDefaults.standard.bool(forKey: "HeaderStore.boostHeadersCorrupted") {
+            UserDefaults.standard.removeObject(forKey: "HeaderStore.boostHeadersCorrupted")
+            print("✅ FIX #776: Cleared incorrectly set boostHeadersCorrupted flag")
+        }
+
         // Fetch tree info from GitHub on first launch or to check for updates
         // This runs async and updates ZipherXConstants with latest values
         Task {

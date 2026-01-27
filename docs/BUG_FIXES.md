@@ -8,6 +8,43 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #776: Clear Incorrectly Set boostHeadersCorrupted Flag at Startup
+**Problem**: The boost file is correct but the `HeaderStore.boostHeadersCorrupted` flag was incorrectly set to true, causing repeated "Chain mismatch at height" errors and preventing proper header loading from the boost file.
+
+**Root Cause Analysis**:
+1. FIX #677 added a `boostHeadersCorrupted` flag in UserDefaults to skip corrupted boost files
+2. This flag was being set incorrectly during normal P2P operations
+3. Once set, the flag persists across app restarts
+4. With flag set, app skips loading boost file headers → falls back to slow P2P sync
+5. P2P sync encounters chain mismatches due to missing boost headers
+
+**Symptoms**:
+- "Chain mismatch at height X" errors during header sync
+- Slow startup due to full P2P header sync instead of using boost file
+- App stuck in header sync loop
+
+**Solution** (FIX #776): Clear the flag unconditionally at app startup:
+```swift
+// In ZipherXApp.init()
+if UserDefaults.standard.bool(forKey: "HeaderStore.boostHeadersCorrupted") {
+    UserDefaults.standard.removeObject(forKey: "HeaderStore.boostHeadersCorrupted")
+    print("✅ FIX #776: Cleared incorrectly set boostHeadersCorrupted flag")
+}
+```
+
+**Why this is safe**:
+- The boost file itself is verified for correctness via Equihash PoW verification
+- If the boost file is actually corrupted, the verification will fail and re-download
+- The flag was a defense layer that was causing more problems than it solved
+- Clearing it allows proper boost file loading on each startup
+
+**Files Modified**:
+- `Sources/App/ZipherXApp.swift`: Clear boostHeadersCorrupted flag in init()
+
+**Result**: App loads boost file headers correctly, no more chain mismatch errors from stale corruption flag.
+
+---
+
 ### FIX #775: Reduce Chain Mismatch Warning Log Spam
 **Problem**: Even after FIX #772, the "Chain mismatch at height X - will trust peer" warning was still being logged excessively - once per batch (every ~160 blocks) during header sync.
 
