@@ -2266,8 +2266,26 @@ final class WalletManager: ObservableObject {
             // The FFI treeRoot() can be out of sync with blockchain - must use header root!
             let fastPathChainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? 0
 
+            // FIX #799: Get boost file end height - P2P headers above this are UNRELIABLE
+            let boostFileEndHeight = ZipherXConstants.effectiveTreeHeight
+
             var headerTreeRoot: Data?
-            if fastPathChainHeight > 0 {
+            var useFFIRootInstead = false
+
+            // FIX #799: Check if we're above boost file end - P2P headers have corrupted sapling roots
+            if fastPathChainHeight > boostFileEndHeight && boostFileEndHeight > 0 {
+                // P2P headers above boost file end have DUPLICATED/WRONG sapling roots
+                // (same root appears for 50+ blocks due to P2P protocol limitation)
+                // Use FFI computed tree root instead - it's built from verified CMUs
+                print("⚠️ FIX #799: Height \(fastPathChainHeight) > boost file end \(boostFileEndHeight)")
+                print("   P2P headers have unreliable sapling roots - using FFI tree root for comparison")
+                useFFIRootInstead = true
+                headerTreeRoot = ZipherXFFI.treeRoot()
+                if let root = headerTreeRoot {
+                    let rootHex = root.prefix(16).map { String(format: "%02x", $0) }.joined()
+                    print("📋 FIX #799: Using FFI tree root: \(rootHex)...")
+                }
+            } else if fastPathChainHeight > 0 {
                 let headerStore = HeaderStore.shared
                 try? headerStore.open()
                 if let header = try? headerStore.getHeader(at: fastPathChainHeight) {
@@ -2278,7 +2296,8 @@ final class WalletManager: ObservableObject {
             }
 
             // FIX #597 v2: FAST PATH - Check if witnesses match HEADER root (blockchain truth)
-            // If most witnesses match header root, we can skip the rebuild entirely
+            // FIX #799: For heights above boost file, use FFI tree root (more reliable than P2P headers)
+            // If most witnesses match the comparison root, we can skip the rebuild entirely
             let notesForWitnessCheck = try WalletDatabase.shared.getAllNotes(accountId: accountId)
 
             guard !notesForWitnessCheck.isEmpty else {
@@ -2286,26 +2305,28 @@ final class WalletManager: ObservableObject {
                 return
             }
 
-            // Only use FAST PATH if we have a valid header root to compare against
-            if let validHeaderRoot = headerTreeRoot {
+            // Only use FAST PATH if we have a valid root to compare against
+            if let validComparisonRoot = headerTreeRoot {
                 var matchingWitnessCount = 0
                 for note in notesForWitnessCheck {
                     if !note.witness.isEmpty, let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
-                        if witnessAnchor == validHeaderRoot {
+                        // FIX #799: Compare against FFI root if above boost file, header root otherwise
+                        if witnessAnchor == validComparisonRoot {
                             matchingWitnessCount += 1
                         }
                     }
                 }
 
                 let matchRatio = Double(matchingWitnessCount) / Double(notesForWitnessCheck.count)
+                let sourceLabel = useFFIRootInstead ? "FFI" : "HEADER"
                 if matchRatio >= 0.8 {
-                    print("✅ FIX #597 v2: FAST PATH - \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses (\(Int(matchRatio * 100))%) match HEADER root - skipping rebuild!")
+                    print("✅ FIX #597 v2 + FIX #799: FAST PATH - \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses (\(Int(matchRatio * 100))%) match \(sourceLabel) root - skipping rebuild!")
                     return
                 } else {
-                    print("🔧 FIX #597 v2: \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses match HEADER root (\(Int(matchRatio * 100))%) - need rebuild")
+                    print("🔧 FIX #597 v2 + FIX #799: \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses match \(sourceLabel) root (\(Int(matchRatio * 100))%) - need rebuild")
                 }
             } else {
-                print("⚠️ FIX #597 v2: No header root available - cannot use FAST PATH, proceeding with rebuild")
+                print("⚠️ FIX #597 v2: No comparison root available - cannot use FAST PATH, proceeding with rebuild")
             }
 
             // FIX #563 v33: Check if we should skip witness root validation due to previous crashes
@@ -2630,8 +2651,20 @@ final class WalletManager: ObservableObject {
                     print("✅ FIX #557 v32: Appended \(deltaCMUs.count) delta CMUs")
 
                     // CRITICAL FIX #557 v35: Verify tree root matches header at chainHeight
+                    // FIX #799: SKIP header verification for heights above boost file end!
+                    // P2P headers above boost file have CORRUPTED/DUPLICATED sapling roots
                     let ourRoot = ZipherXFFI.treeRoot()
-                    if let header = try? HeaderStore.shared.getHeader(at: chainHeight) {
+                    let boostEndForVerify = ZipherXConstants.effectiveTreeHeight
+
+                    if chainHeight > boostEndForVerify && boostEndForVerify > 0 {
+                        // FIX #799: Skip header comparison for P2P-range heights
+                        print("✅ FIX #799: Height \(chainHeight) > boost file end \(boostEndForVerify)")
+                        print("   Skipping header comparison - P2P headers have unreliable sapling roots")
+                        print("   Trusting FFI computed tree root (built from verified CMUs)")
+                        if let root = ourRoot {
+                            print("   FFI root: \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        }
+                    } else if let header = try? HeaderStore.shared.getHeader(at: chainHeight) {
                         if let root = ourRoot, root == header.hashFinalSaplingRoot {
                             print("✅ FIX #557 v35: Tree root VERIFIED at height \(chainHeight)")
                         } else {
@@ -2954,13 +2987,28 @@ final class WalletManager: ObservableObject {
                 // FIX #721: CRITICAL - Verify FFI tree root matches HeaderStore BEFORE using HeaderStore anchor!
                 // If they don't match, the FFI tree is corrupt and we should NOT update witnesses.
                 // Using mismatched anchor causes "joinsplit requirements not met" errors.
+                //
+                // FIX #799: SKIP header comparison for heights above boost file end!
+                // P2P headers above boost file have CORRUPTED/DUPLICATED sapling roots
+                // (same root appears for 50+ blocks due to P2P protocol limitation)
                 var currentTreeAnchor: Data?
 
                 // FIX #721: Get FFI tree root first
                 let ffiTreeRoot = ZipherXFFI.treeRoot()
                 let ffiRootHex = ffiTreeRoot?.map { String(format: "%02x", $0) }.joined() ?? "nil"
 
-                if chainHeight > 0,
+                // FIX #799: Get boost file end height
+                let boostFileEndForAnchor = ZipherXConstants.effectiveTreeHeight
+
+                // FIX #799: For heights above boost file, trust FFI tree root (built from verified CMUs)
+                if chainHeight > boostFileEndForAnchor && boostFileEndForAnchor > 0 {
+                    // P2P headers unreliable - use FFI tree root directly
+                    print("✅ FIX #799: Height \(chainHeight) > boost file end \(boostFileEndForAnchor)")
+                    print("   Using FFI tree root (P2P headers have corrupted sapling roots)")
+                    currentTreeAnchor = ffiTreeRoot
+                    let anchorHex = currentTreeAnchor?.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("✅ FIX #799: Using FFI tree anchor at height \(chainHeight): \(anchorHex ?? "N/A")...")
+                } else if chainHeight > 0,
                    let currentHeader = try? HeaderStore.shared.getHeader(at: chainHeight) {
                     let headerRoot = currentHeader.hashFinalSaplingRoot
                     let headerRootHex = headerRoot.map { String(format: "%02x", $0) }.joined()
