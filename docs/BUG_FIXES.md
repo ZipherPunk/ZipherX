@@ -8,6 +8,76 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #800: CRITICAL - Stale Witness Detection Was Using Wrong Comparison (42x Loop Fix)
+**Problem**: All 17/17 witnesses falsely detected as "stale" even when they are valid for spending
+
+**Symptoms**:
+- `❌ Note 2285 (height 2929119): STALE witness`
+- `🚨 FIX #574: Found 17/17 STALE witnesses!`
+- `🛑 FIX #783: Tree repair exhausted - SKIPPING auto-rebuild to prevent infinite loop`
+- All witnesses show same root `feb2f42469f3d67f...` but different "expected" roots at each note height
+
+**Root Cause Analysis**:
+1. **FIX #785 was WRONG!** It assumed witnesses are anchored at their confirmation height
+2. **But `treeCreateWitnessesBatch` builds ALL witnesses to the SAME root** (current tree state)
+   - Documented in lib.rs:4345: `"Created {}/{} witnesses (all with same root)"`
+3. **FIX #785 compared**: `witness root == header root at NOTE HEIGHT`
+   - This ALWAYS fails because witness root = current tree root (same for all)
+   - But header root at note height = different historical root for each note
+4. **TransactionBuilder.swift (FIX #557 v38)** correctly uses witness root as anchor
+   - Sapling accepts ANY valid historical tree root, not specifically the note height root
+
+**Evidence from logs**:
+```
+Witness root: feb2f42469f3d67f...  (SAME for all 17 notes)
+Expected (header at 2929119): 828fd453b71ce834...
+Expected (header at 2930021): 4d3bd741074a3f87...
+Expected (header at 2931770): 9d00e5e6ebb0a198...
+...etc (all different)
+```
+
+**Solution**: Revert FIX #785 logic - check witness validity, not historical height match
+- Witness is VALID if `witnessGetRoot()` succeeds (returns a root)
+- A different root from current tree is STILL VALID for Sapling transactions
+- Only mark as stale if witness is corrupted (can't extract root)
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletHealthCheck.swift`:
+  - `checkStaleWitnesses()`: Compare witness root to CURRENT tree root, accept different historical roots
+  - Post-rebuild verification: Check if root can be extracted, not if it matches header
+
+**Key Insight**: The witnesses were ALWAYS valid!
+- All 17 witnesses had extractable roots (`feb2f42469f3d67f...`)
+- TransactionBuilder would have used them successfully
+- FIX #785's flawed comparison caused false "stale" detection → 42x repair loop
+
+---
+
+### FIX #801: Auto-Clear Exhaustion Flags When FIX #798 Validates P2P Tree Root
+**Problem**: Stale witnesses not auto-fixed at startup because `TreeRepairExhausted` flag blocks repair
+
+**Symptoms**:
+- `🛑 FIX #783: Tree repair exhausted - SKIPPING auto-rebuild to prevent infinite loop`
+- `🛑 FIX #783: P2P delta sync has failed repeatedly - witnesses cannot be fixed automatically`
+- `🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild tree and witnesses`
+- 17/17 stale witnesses detected but never auto-repaired
+
+**Root Cause**:
+1. FIX #782/783 set exhaustion flags after 5 failed repair attempts (before FIX #798 existed)
+2. FIX #798 now trusts computed tree root for P2P heights → repairs would succeed
+3. But old exhaustion flags persist in UserDefaults → block auto-repair
+
+**Solution**: When FIX #798 successfully validates tree root at P2P height, auto-clear:
+- `TreeRepairExhausted` → false
+- `DeltaBundleGlobalRepairAttempts` → 0
+- `StaleWitnessGlobalAttempts` → 0
+
+**Files Modified**: `Sources/Core/Network/FilterScanner.swift` (saveTreeCheckpointAfterSync)
+
+**Result**: Stale witness auto-repair will run on next health check after FIX #798 validation succeeds
+
+---
+
 ### FIX #799: CRITICAL - Skip P2P Header Comparison in Witness Validation (0/89 Match Fix)
 **Problem**: All 89 witnesses show 0% match against header root, triggering unnecessary witness rebuild every time
 

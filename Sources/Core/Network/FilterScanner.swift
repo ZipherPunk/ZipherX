@@ -1599,6 +1599,18 @@ final class FilterScanner {
                 print("✅ FIX #798: Height \(lastScanned) > boost file end \(boostEndHeight) - trusting computed tree root")
                 print("   Our tree root: \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                 print("   (Skipping header comparison - P2P headers don't have reliable sapling roots)")
+
+                // FIX #801: Auto-clear exhaustion flags when FIX #798 successfully validates tree root
+                // These flags were set from previous failed repairs (before FIX #798 existed)
+                // Now that FIX #798 trusts computed tree root for P2P heights, repairs will succeed
+                let wasExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
+                if wasExhausted {
+                    UserDefaults.standard.set(false, forKey: "TreeRepairExhausted")
+                    UserDefaults.standard.set(0, forKey: "DeltaBundleGlobalRepairAttempts")
+                    UserDefaults.standard.set(0, forKey: "StaleWitnessGlobalAttempts")
+                    print("✅ FIX #801: Cleared exhaustion flags - P2P tree root validation now works!")
+                    print("   Stale witness auto-repair will run on next health check")
+                }
             } else {
                 // For heights within boost file range, header sapling roots are reliable - validate normally
                 if treeRoot != header.hashFinalSaplingRoot {
