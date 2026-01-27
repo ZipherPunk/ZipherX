@@ -786,27 +786,81 @@ final class WalletManager: ObservableObject {
                         print("✅ FIX #756: Tree size validated (\(treeSize) = \(effectiveCMUCount) boost + \(deltaCMUs.count) delta)")
                         print("✅ Commitment tree preloaded from database: \(treeSize) commitments")
 
-                        // Validate tree root against header at delta end height
+                        // FIX #790: Validate tree root against MANIFEST root first (authoritative)
+                        // Then validate against header root as secondary check
                         var treeValidated = false
                         if let deltaManifest = deltaManager.getManifest(),
-                           let treeRoot = ZipherXFFI.treeRoot(),
-                           let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
-                            let headerRoot = header.hashFinalSaplingRoot
-                            let headerRootReversed = Data(headerRoot.reversed())
-                            let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+                           let treeRoot = ZipherXFFI.treeRoot() {
 
-                            if rootsMatch {
-                                print("✅ FIX #756: Tree root validated at delta end height \(deltaManifest.endHeight)")
-                                treeValidated = true
-                            } else {
-                                print("❌ FIX #756: Tree root MISMATCH despite matching size!")
-                                print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
-                                print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                                print("🔄 FIX #756: Clearing corrupted tree, witnesses, AND delta bundle...")
-                                // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
-                                try? WalletDatabase.shared.clearTreeStateForRebuild()
+                            // FIX #791: Validate delta manifest is compatible with current boost file
+                            // Delta must start at boost end + 1, otherwise it's from a different boost file version
+                            let expectedDeltaStartHeight = effectiveHeight + 1
+                            if deltaManifest.startHeight != expectedDeltaStartHeight {
+                                print("⚠️ FIX #791: Delta manifest is STALE (startHeight \(deltaManifest.startHeight) != expected \(expectedDeltaStartHeight))")
+                                print("   Delta was created for boost file ending at \(deltaManifest.startHeight - 1)")
+                                print("   Current boost file ends at \(effectiveHeight)")
+                                print("🗑️ FIX #791: Clearing stale delta bundle...")
                                 deltaManager.clearDeltaBundle()
-                                // Fall through to reload from boost file
+                                // Clear corrupted tree state and rebuild from scratch
+                                try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                // Fall through to reload from boost file (treeValidated stays false)
+                            }
+                            // FIX #790: Primary validation - manifest root is authoritative
+                            // The manifest stores the exact tree root from when delta CMUs were appended
+                            else if let manifestRootData = Data(hexString: deltaManifest.treeRoot) {
+                                let manifestRootReversed = Data(manifestRootData.reversed())
+                                let matchesManifest = treeRoot == manifestRootData || treeRoot == manifestRootReversed
+
+                                if matchesManifest {
+                                    print("✅ FIX #790: Tree root matches delta manifest at height \(deltaManifest.endHeight)")
+
+                                    // Secondary validation - check header agreement (optional but good)
+                                    if let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                                        let headerRoot = header.hashFinalSaplingRoot
+                                        let headerRootReversed = Data(headerRoot.reversed())
+                                        let matchesHeader = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                                        if matchesHeader {
+                                            print("✅ FIX #790: Tree root also matches header - blockchain verified")
+                                        } else {
+                                            // Tree matches manifest but not header - header may be stale/corrupted
+                                            print("⚠️ FIX #790: Tree matches manifest but not header (header may need sync)")
+                                            print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                                            print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                                        }
+                                    }
+                                    treeValidated = true
+                                } else {
+                                    // Tree doesn't match manifest - delta CMUs are wrong/missing/reordered
+                                    print("❌ FIX #790: Tree root doesn't match delta manifest!")
+                                    print("   Tree root:     \(treeRoot.prefix(16).hexString)...")
+                                    print("   Manifest root: \(manifestRootData.prefix(16).hexString)...")
+                                    print("🔄 FIX #790: DB tree is stale - clearing for rebuild...")
+                                    // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
+                                    try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                    deltaManager.clearDeltaBundle()
+                                    // Fall through to reload from boost file
+                                }
+                            } else {
+                                print("⚠️ FIX #790: Invalid manifest root hex, falling back to header validation")
+                                // Fall back to header validation if manifest root is invalid
+                                if let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                                    let headerRoot = header.hashFinalSaplingRoot
+                                    let headerRootReversed = Data(headerRoot.reversed())
+                                    let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                                    if rootsMatch {
+                                        print("✅ FIX #790: Tree root validated against header at \(deltaManifest.endHeight)")
+                                        treeValidated = true
+                                    } else {
+                                        print("❌ FIX #790: Tree root MISMATCH!")
+                                        print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                                        print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                                        print("🔄 FIX #790: Clearing corrupted tree, witnesses, AND delta bundle...")
+                                        try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                        deltaManager.clearDeltaBundle()
+                                    }
+                                }
                             }
                         }
 
@@ -840,6 +894,20 @@ final class WalletManager: ObservableObject {
                     // The delta CMUs are saved from previous scans but NOT loaded into the tree
                     // This causes PHASE 2 to refetch blocks on every startup!
                     let deltaManager = DeltaCMUManager.shared
+
+                    // FIX #791: Validate delta manifest is compatible with current boost file BEFORE loading
+                    // Delta must start at boost end + 1, otherwise it's from a different boost file version
+                    if let deltaManifest = deltaManager.getManifest() {
+                        let expectedDeltaStartHeight = effectiveHeight + 1
+                        if deltaManifest.startHeight != expectedDeltaStartHeight {
+                            print("⚠️ FIX #791: Delta manifest is STALE (startHeight \(deltaManifest.startHeight) != expected \(expectedDeltaStartHeight))")
+                            print("   Delta was created for boost file ending at \(deltaManifest.startHeight - 1)")
+                            print("   Current boost file ends at \(effectiveHeight)")
+                            print("🗑️ FIX #791: Clearing stale delta bundle before loading...")
+                            deltaManager.clearDeltaBundle()
+                        }
+                    }
+
                     if let deltaCMUs = deltaManager.loadDeltaCMUs(), !deltaCMUs.isEmpty {
                         print("📦 FIX #558 v2: Loading \(deltaCMUs.count) delta CMUs into tree...")
                         var appendedCount = 0
@@ -4257,6 +4325,16 @@ final class WalletManager: ObservableObject {
         // Track start time for completion duration display
         let rescanStartTime = Date()
         if forceFullRescan {
+            // FIX #782: Clear global repair exhausted flags when user explicitly requests Full Rescan
+            // This resets the counters so automatic repair can be attempted again after the rescan
+            UserDefaults.standard.set(false, forKey: "TreeRepairExhausted")
+            UserDefaults.standard.set(0, forKey: "DeltaBundleGlobalRepairAttempts")
+            UserDefaults.standard.set(0, forKey: "DeltaBundleRepairAttempts")
+            // FIX #783: Also clear stale witness repair counters
+            UserDefaults.standard.set(0, forKey: "StaleWitnessGlobalAttempts")
+            UserDefaults.standard.set(false, forKey: "StaleWitnessRepairAttempted")
+            print("🔧 FIX #782/#783: Cleared global repair counters - automatic repair re-enabled after rescan")
+
             await MainActor.run {
                 isFullRescan = true
                 isRescanComplete = false

@@ -247,6 +247,12 @@ final class HeaderStore {
     /// FIX #188: Now includes Equihash solution for local verification
     /// FIX #535: Now includes chainwork for fork detection
     func insertHeader(_ header: ZclassicBlockHeader) throws {
+        // FIX #794: Ensure database is open before inserting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = """
             INSERT OR REPLACE INTO headers
             (height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork)
@@ -305,6 +311,12 @@ final class HeaderStore {
     /// FIX #476: Prepare statement ONCE and reuse for massive speedup (100+ headers/sec)
     func insertHeaders(_ headers: [ZclassicBlockHeader]) throws {
         guard !headers.isEmpty else { return }
+
+        // FIX #794: Ensure database is open before inserting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
 
         // Use a transaction for batch inserts
         guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
@@ -385,6 +397,12 @@ final class HeaderStore {
 
     /// Get header at specific height
     func getHeader(at height: UInt64) throws -> ZclassicBlockHeader? {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
@@ -408,6 +426,12 @@ final class HeaderStore {
 
     /// Get header by block hash
     func getHeader(hash: Data) throws -> ZclassicBlockHeader? {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
@@ -435,6 +459,12 @@ final class HeaderStore {
     /// Get anchor (finalsaplingroot) for a specific height
     /// This is the critical method for transaction building!
     func getAnchor(at height: UInt64) throws -> Data? {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         let sql = "SELECT sapling_root FROM headers WHERE height = ?;"
 
         var stmt: OpaquePointer?
@@ -458,6 +488,12 @@ final class HeaderStore {
 
     /// Get latest height in database
     func getLatestHeight() throws -> UInt64? {
+        // FIX #794: Ensure database is open before querying (prevents "out of memory" error when db is nil)
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         let sql = "SELECT MAX(height) FROM headers;"
 
         var stmt: OpaquePointer?
@@ -479,6 +515,12 @@ final class HeaderStore {
 
     /// Get minimum height in database
     func getMinHeight() throws -> UInt64? {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return nil }
+
         let sql = "SELECT MIN(height) FROM headers;"
 
         var stmt: OpaquePointer?
@@ -500,6 +542,12 @@ final class HeaderStore {
 
     /// Get total header count
     func getHeaderCount() throws -> Int {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return 0 }
+
         let sql = "SELECT COUNT(*) FROM headers;"
 
         var stmt: OpaquePointer?
@@ -517,6 +565,12 @@ final class HeaderStore {
 
     /// Count headers in a specific range (for checking if boost file headers are loaded)
     func countHeadersInRange(from startHeight: UInt64, to endHeight: UInt64) throws -> Int {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return 0 }
+
         let sql = "SELECT COUNT(*) FROM headers WHERE height >= ? AND height <= ?;"
 
         var stmt: OpaquePointer?
@@ -537,6 +591,12 @@ final class HeaderStore {
 
     /// Get headers in a range (for syncing)
     func getHeaders(from startHeight: UInt64, to endHeight: UInt64) throws -> [ZclassicBlockHeader] {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return [] }
+
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
             FROM headers
@@ -838,6 +898,14 @@ final class HeaderStore {
     /// Samples every Nth header to detect corruption without full scan
     /// Returns CorruptionCheckResult with isCorrupted=true if duplicates found
     func checkSaplingRootCorruptionInRange(_ startHeight: UInt64, _ endHeight: UInt64) throws -> CorruptionCheckResult {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else {
+            return CorruptionCheckResult(isCorrupted: false, sampledCount: 0, uniqueRoots: 0)
+        }
+
         // Sample every 1000th header for efficiency (still catches massive corruption)
         let step = max(1000, Int((endHeight - startHeight) / 1000))
 
@@ -878,6 +946,12 @@ final class HeaderStore {
 
     /// Delete all headers in a specific height range
     func deleteHeadersInRange(from: UInt64, to: UInt64) throws {
+        // FIX #794: Ensure database is open before deleting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = "DELETE FROM headers WHERE height >= ? AND height <= ?;"
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
@@ -921,6 +995,12 @@ final class HeaderStore {
         //
         // FIX #536: Check for HEADER CORRUPTION (duplicated sapling_roots) before skipping load
         // If headers are corrupted, force reload even if contiguous range exists
+        //
+        // FIX #777: CRITICAL - Require 100% of boost headers, not 95%
+        // Old bug: P2P-synced headers with gaps passed 95% check, boost file never loaded
+        // Result: App synced from scratch via P2P instead of using boost file (fast) + delta (small)
+        // Root cause: Previous P2P sync left partial headers, countInRange found enough to pass 95%
+        // Solution: Require EXACTLY 100% of boost headers. If any are missing, delete all and reload.
         let hasContiguousBoostHeaders: Bool
         if let existingMax = try? getLatestHeight() {
             // Check if we have a CONTIGUOUS range covering the boost file
@@ -934,7 +1014,8 @@ final class HeaderStore {
             // FIX #536: Check for corruption (duplicated sapling_roots)
             // Sample 1000 headers in the boost range - if many have duplicate sapling_roots, headers are corrupted
             var hasCorruption = false
-            if hasMin && hasMax && countInRange >= expectedCount * 95 / 100 {
+            // FIX #777: Only check corruption if we have 100% of headers (not 95%)
+            if hasMin && hasMax && countInRange == expectedCount {
                 // Quick corruption check: count unique sapling_roots vs total headers
                 let corruptionCheck = try? checkSaplingRootCorruptionInRange(startHeight, endHeight)
                 if let check = corruptionCheck, check.isCorrupted {
@@ -945,7 +1026,8 @@ final class HeaderStore {
                 }
             }
 
-            hasContiguousBoostHeaders = hasMin && hasMax && (countInRange >= expectedCount * 95 / 100) && !hasCorruption
+            // FIX #777: Require 100% of boost headers - any gap means we need to reload
+            hasContiguousBoostHeaders = hasMin && hasMax && (countInRange == expectedCount) && !hasCorruption
 
             if hasContiguousBoostHeaders {
                 print("📜 FIX #457: Headers already loaded (contiguous range \(existingMin)-\(existingMax), skipping)")
@@ -958,7 +1040,20 @@ final class HeaderStore {
                     try? deleteHeadersInRange(from: minH, to: maxH)
                 }
             } else {
-                print("📜 FIX #457: Need boost headers - existing: \(existingMin)-\(existingMax) (\(countInRange)/\(expectedCount) in range)")
+                // FIX #777: If we have partial headers in boost range, delete them and reload
+                // Boost file provides complete verified headers - no reason to keep partial P2P headers
+                let hasPartialHeaders = countInRange > 0 && countInRange < expectedCount
+                if hasPartialHeaders {
+                    print("🚨 FIX #777: CRITICAL - Partial headers detected in boost range!")
+                    print("🚨 FIX #777: Have \(countInRange)/\(expectedCount) headers - missing \(expectedCount - countInRange)")
+                    print("🚨 FIX #777: Deleting all headers to reload complete boost file...")
+                    if let minH = try? getMinHeight(), let maxH = try? getLatestHeight() {
+                        try? deleteHeadersInRange(from: minH, to: maxH)
+                        print("🗑️ FIX #777: Deleted headers from height \(minH) to \(maxH)")
+                    }
+                } else {
+                    print("📜 FIX #457: Need boost headers - existing: \(existingMin)-\(existingMax) (\(countInRange)/\(expectedCount) in range)")
+                }
             }
         } else {
             hasContiguousBoostHeaders = false
@@ -1174,6 +1269,12 @@ final class HeaderStore {
 
     /// Check if header exists at height
     func hasHeader(at height: UInt64) throws -> Bool {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return false }
+
         let sql = "SELECT 1 FROM headers WHERE height = ? LIMIT 1;"
 
         var stmt: OpaquePointer?
@@ -1189,6 +1290,12 @@ final class HeaderStore {
 
     /// Delete headers above a certain height (for reorg handling)
     func deleteHeadersAbove(height: UInt64) throws {
+        // FIX #794: Ensure database is open before deleting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = "DELETE FROM headers WHERE height > ?;"
 
         var stmt: OpaquePointer?
@@ -1206,6 +1313,12 @@ final class HeaderStore {
 
     /// Clear all headers (for full resync)
     func clearAllHeaders() throws {
+        // FIX #794: Ensure database is open before deleting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = "DELETE FROM headers;"
 
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
@@ -1376,6 +1489,12 @@ final class HeaderStore {
     /// FIX #120: Clear headers above a specific height
     /// Used to clear corrupted P2P-synced headers above the boost file range
     func clearHeadersAboveHeight(_ height: UInt64) throws {
+        // FIX #794: Ensure database is open before deleting
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         let sql = "DELETE FROM headers WHERE height > ?;"
         var stmt: OpaquePointer?
 
@@ -1497,6 +1616,12 @@ final class HeaderStore {
     /// Returns the last N headers that have solutions stored
     /// - Parameter count: Number of headers to retrieve (default 100)
     func getHeadersWithSolutions(count: Int = 100) throws -> [ZclassicBlockHeader] {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return [] }
+
         // FIX #535: Now includes chainwork for fork detection
         let sql = """
             SELECT height, block_hash, prev_hash, merkle_root, sapling_root, time, bits, nonce, version, solution, chainwork
@@ -1577,6 +1702,12 @@ final class HeaderStore {
     /// This saves storage while maintaining verification capability for recent blocks
     /// - Parameter keepCount: Number of recent solutions to keep (default 100)
     func cleanupOldSolutions(keepCount: Int = 100) throws {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
         // First, find the cutoff height
         let findCutoffSQL = """
             SELECT MIN(height) FROM (
@@ -1622,6 +1753,12 @@ final class HeaderStore {
 
     /// Get count of headers with Equihash solutions stored
     func getSolutionCount() throws -> Int {
+        // FIX #794: Ensure database is open before querying
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return 0 }
+
         let sql = "SELECT COUNT(*) FROM headers WHERE solution IS NOT NULL AND length(solution) > 0;"
 
         var stmt: OpaquePointer?

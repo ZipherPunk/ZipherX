@@ -1130,22 +1130,36 @@ final class FilterScanner {
             // These outputs will be saved locally for instant witness generation
             let deltaBundledEndHeight = cmuDataHeight > 0 ? cmuDataHeight : ZipherXConstants.bundledTreeHeight
             if currentHeight > deltaBundledEndHeight {
-                deltaCollectionEnabled = true
                 // SMART START: Continue from existing delta if valid, otherwise from boost end
                 if let manifest = DeltaCMUManager.shared.getManifest(), manifest.endHeight >= deltaBundledEndHeight {
-                    // Delta exists and is valid - continue from where it left off
-                    deltaCollectionStartHeight = manifest.endHeight + 1
-                    print("📦 DeltaCMU: Continuing from existing delta (height \(manifest.endHeight) → \(currentHeight))")
+                    // FIX #795: Check if delta already covers our target - if so, skip collection
+                    // This prevents backwards ranges when delta was pre-synced at startup
+                    // Scenario: Delta synced to 2991352, PHASE 2 scans 2991302→2991352
+                    // Old bug: deltaCollectionStartHeight=2991353 > lastScanned=2991352 → backwards!
+                    if manifest.endHeight >= targetHeight {
+                        // Delta already covers everything we're about to scan - no need to collect
+                        deltaCollectionEnabled = false
+                        print("📦 FIX #795: Delta already covers target \(targetHeight) (manifest.endHeight=\(manifest.endHeight)) - skipping collection")
+                    } else {
+                        // Delta exists and is valid but doesn't cover target - continue from where it left off
+                        deltaCollectionEnabled = true
+                        deltaCollectionStartHeight = manifest.endHeight + 1
+                        print("📦 DeltaCMU: Continuing from existing delta (height \(manifest.endHeight) → \(currentHeight))")
+                    }
                 } else {
                     // No delta or invalid - start fresh from boost end
+                    deltaCollectionEnabled = true
                     deltaCollectionStartHeight = deltaBundledEndHeight + 1
                     print("📦 DeltaCMU: Starting fresh from boost end (height \(deltaBundledEndHeight + 1))")
                 }
-                deltaOutputsCollected.removeAll()
 
-                // Update delta sync status to syncing
-                await MainActor.run {
-                    WalletManager.shared.updateDeltaSyncStatus(.syncing)
+                if deltaCollectionEnabled {
+                    deltaOutputsCollected.removeAll()
+
+                    // Update delta sync status to syncing
+                    await MainActor.run {
+                        WalletManager.shared.updateDeltaSyncStatus(.syncing)
+                    }
                 }
             }
 

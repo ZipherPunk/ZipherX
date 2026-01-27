@@ -669,7 +669,7 @@ final class WalletHealthCheck {
 
             // FIX #732: Validate at the height where tree state ACTUALLY represents!
             // - If tree has 0 delta CMUs → tree only has boost file CMUs → validate at boost END height
-            // - If tree has delta CMUs → tree has grown beyond boost → validate at lastScannedHeight
+            // - If tree has delta CMUs → tree has grown beyond boost → validate at delta END height
             //
             // Previous FIX #720 was WRONG - it always validated at lastScannedHeight even when
             // tree only contained boost file CMUs. This caused mismatch because header at
@@ -682,8 +682,49 @@ final class WalletHealthCheck {
                 treeValidationHeight = boostEndHeight
                 print("📦 FIX #732: deltaCMUs=0, validating at BOOST END height \(boostEndHeight)")
             } else {
-                // Tree has grown beyond boost - validate at lastScannedHeight
-                print("📦 FIX #732: deltaCMUs=\(deltaCMUs), validating at lastScannedHeight \(lastScannedHeight)")
+                // FIX #778 v2: Tree has grown beyond boost - need delta manifest to know validation height
+                // The tree root is deterministic: root(CMU[0..N]) where N = boost + delta CMUs
+                // Without knowing WHICH HEIGHT those delta CMUs correspond to, we can't validate.
+                //
+                // CRITICAL FIX: When deltaCMUs > 0 but no manifest exists:
+                // - We CANNOT validate because we don't know which header to compare against
+                // - Validating at boost end height would ALWAYS fail (tree has extra CMUs)
+                // - Validating at lastScannedHeight is wrong if it equals boost end height
+                // - The only safe option is to SKIP validation (non-critical)
+                //
+                // This prevents the infinite repair loop where:
+                // 1. Tree has delta CMUs → mismatch at boost height → repair
+                // 2. Repair can't fix because delta CMUs are in FFI memory, not file
+                // 3. Health check fails again → repair → loop forever
+                if let deltaManifest = DeltaCMUManager.shared.getManifest(), deltaManifest.endHeight > boostEndHeight {
+                    treeValidationHeight = deltaManifest.endHeight
+                    print("📦 FIX #778: Using delta manifest endHeight \(deltaManifest.endHeight) for validation")
+                } else {
+                    // FIX #778: Tree has delta CMUs but NO manifest - ORPHAN STATE
+                    // This happens when:
+                    // 1. FIX #524 repair appended delta CMUs to FFI tree
+                    // 2. FIX #765 cleared the delta manifest (detecting incomplete CMUs)
+                    // 3. FFI tree still has the extra CMUs in memory
+                    //
+                    // We CANNOT validate because:
+                    // - Validating at boost height fails (tree has extra CMUs → different root)
+                    // - Validating at lastScannedHeight fails (manifest cleared, we don't know which header)
+                    //
+                    // CRITICAL: Return non-critical failure to prevent repair loop!
+                    // The old code returned .failed(critical: true) which triggered repair,
+                    // repair failed again, health check ran again → infinite loop
+                    //
+                    // FIX #778: Return non-critical pass with warning instead
+                    // The tree state is unknown - user should run Full Rescan if issues persist
+                    print("📦 FIX #778: ORPHAN STATE - Tree has \(deltaCMUs) delta CMUs but NO manifest")
+                    print("📦 FIX #778: Cannot determine correct validation height - skipping to prevent loop")
+                    print("📦 FIX #778: Tree state is unknown - recommend Full Rescan if TX fails")
+
+                    // Return passed (non-critical) to break the loop
+                    // User can manually Full Rescan if they encounter TX failures
+                    return .passed("Tree Root Validation",
+                                  details: "⚠️ Orphan delta CMUs (\(deltaCMUs)) - validation skipped. Try Full Rescan if TX fails.")
+                }
             }
 
             // Track that we started from boost file (for diagnostics)
@@ -796,22 +837,61 @@ final class WalletHealthCheck {
             // FIX #732: If we reach here, there's a REAL mismatch!
             // The validation height was chosen correctly based on deltaCMUs:
             // - deltaCMUs=0 → validated at boost end height
-            // - deltaCMUs>0 → validated at lastScannedHeight
+            // - deltaCMUs>0 → validated at delta manifest endHeight
             //
             // A mismatch here means tree state doesn't match blockchain.
             // This could be caused by:
             // 1. Corrupted tree data in database
             // 2. Wrong CMU byte order in boost file
-            // 3. Delta CMUs not properly appended
+            // 3. Delta CMUs not properly appended (P2P missed some outputs)
             if validatingAgainstBoostFile {
                 print("❌ FIX #732: Tree root mismatch at boost validation height!")
                 print("❌ FIX #732: This indicates tree corruption or byte order issue")
                 print("❌ FIX #732: deltaCMUs=\(deltaCMUs), treeValidationHeight=\(treeValidationHeight)")
             }
 
+            // FIX #778: Check if repair has already been attempted this session
+            // If repair was already tried (FIX #779 limit reached), don't return critical
+            // This prevents repair → health check → repair → health check infinite loop
+            let repairAttemptKey = "TreeRootRepairAttempted"
+            let repairSessionKey = "TreeRootRepairSession"
+            let currentSession = Int(Date().timeIntervalSince1970 / 300) // 5-minute sessions
+            let lastSession = UserDefaults.standard.integer(forKey: repairSessionKey)
+            let repairAttempted = UserDefaults.standard.bool(forKey: repairAttemptKey)
+
+            // Reset flag if new session
+            if currentSession != lastSession {
+                UserDefaults.standard.set(false, forKey: repairAttemptKey)
+                UserDefaults.standard.set(currentSession, forKey: repairSessionKey)
+            }
+
+            // FIX #782: Check if global repair attempts have been exhausted
+            // If so, return non-critical to prevent infinite repair loops across app restarts
+            let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
+            if repairExhausted {
+                print("🛑 FIX #782: Global tree repair attempts exhausted - returning non-critical")
+                print("🛑 FIX #782: P2P cannot fetch all CMUs - user MUST run 'Full Resync' in Settings")
+                return .failed("Tree Root Validation",
+                              details: "⚠️ Auto-repair exhausted. Run 'Full Resync' in Settings to fix.",
+                              critical: false)  // Non-critical to prevent infinite repair loop
+            }
+
+            // If repair was already attempted this session, return non-critical to break loop
+            if repairAttempted && currentSession == lastSession {
+                print("🛑 FIX #778: Repair already attempted this session - returning non-critical to break loop")
+                print("🛑 FIX #778: User should try 'Full Rescan' in Settings")
+                return .failed("Tree Root Validation",
+                              details: "⚠️ Tree root mismatch persists. Try Full Rescan in Settings.",
+                              critical: false)  // Non-critical to prevent repair loop
+            }
+
+            // Mark that repair will be attempted
+            UserDefaults.standard.set(true, forKey: repairAttemptKey)
+            UserDefaults.standard.set(currentSession, forKey: repairSessionKey)
+
             // This is CRITICAL - balance calculations will be wrong!
             return .failed("Tree Root Validation",
-                          details: "🚨 Tree root mismatch at height \(treeValidationHeight)! Byte order mismatch detected - try Full Rescan.",
+                          details: "🚨 Tree root mismatch at height \(treeValidationHeight)! Try Full Rescan in Settings.",
                           critical: true)
         }
     }
@@ -950,6 +1030,8 @@ final class WalletHealthCheck {
     /// FIX #550: Auto-detect and fix anchor mismatches at startup
     /// Compares stored note anchors with blockchain headers
     /// If mismatches found, auto-rebuilds witnesses with correct HeaderStore anchors
+    ///
+    /// FIX #783: Skip auto-fix when tree repair is exhausted to prevent infinite loop
     private func checkNoteAnchorsMatchHeaders() async -> HealthCheckResult {
         do {
             // FIX #760: Get all unspent notes with anchors (use accountId: 1)
@@ -984,6 +1066,21 @@ final class WalletHealthCheck {
                 return .passed("Anchor Validation", details: "All \(unspentNotes.count) note anchors match blockchain headers ✓")
             }
 
+            // FIX #783: Check if tree repair is exhausted BEFORE attempting auto-fix
+            // When TreeRepairExhausted is true, fixAnchorMismatches will call preRebuildWitnessesForInstantPayment
+            // which tries P2P delta sync → timeout → tree mismatch → repair → loop
+            let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
+            if repairExhausted {
+                print("🛑 FIX #783: Tree repair exhausted - SKIPPING auto-fix to prevent infinite loop")
+                print("🛑 FIX #783: \(mismatchedNotes.count) anchor mismatches detected but cannot auto-fix")
+                print("🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild tree and anchors")
+
+                // Return non-critical to allow app to continue
+                return .failed("Anchor Validation",
+                              details: "⚠️ \(mismatchedNotes.count) mismatched anchors. Auto-repair exhausted. Run 'Full Resync' in Settings.",
+                              critical: false)  // Non-critical to break the repair loop
+            }
+
             // FIX #550: AUTO-FIX - Rebuild witnesses with correct HeaderStore anchors
             print("🔧 FIX #550: Found \(mismatchedNotes.count) mismatched anchors - AUTO-FIXING...")
             print("   This will rebuild witnesses with correct anchors from HeaderStore...")
@@ -1013,6 +1110,12 @@ final class WalletHealthCheck {
     /// FIX #574: Detect stale witnesses at startup
     /// Checks if witness anchors match CURRENT tree root
     /// This is critical after FIX #572/573 - stale witnesses cause "joinsplit requirements not met" rejections
+    ///
+    /// FIX #783: Skip auto-rebuild when tree repair is exhausted to prevent infinite loop:
+    /// - Tree root mismatch → FIX #524 repair → P2P timeout → mismatch persists
+    /// - FIX #782 sets TreeRepairExhausted after 5 global attempts
+    /// - FIX #574 sees stale witnesses → tries rebuild → P2P timeout → triggers more repairs
+    /// - Loop continues forever unless we break it here
     private func checkStaleWitnesses() async -> HealthCheckResult {
         do {
             // Get current tree root from FFI
@@ -1036,21 +1139,40 @@ final class WalletHealthCheck {
             var validCount = 0
             var staleNoteIds: [Int64] = []
 
-            // Check each witness's anchor against current tree root
+            // FIX #785: Check witness anchors against HeaderStore roots at NOTE HEIGHT, not current tree root!
+            // After FIX #564, witnesses are anchored at their confirmation height, not chain tip.
+            // Previous check compared witness root vs FFI tree root (chain tip) which was ALWAYS mismatched
+            // because witnesses at height 2929119 won't match tree at height 2991136.
+            // The correct check: witness root must match HeaderStore's finalsaplingroot at NOTE'S height.
+            let headerStore = HeaderStore.shared
+            try? headerStore.open()
+
             for note in unspentNotes {
                 // Extract anchor from the witness itself (not from DB stored anchor)
                 // The witness internal root is what matters for transaction validity
                 if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
-                    if witnessRoot == currentTreeRoot {
-                        validCount += 1
-                    } else {
-                        staleCount += 1
-                        staleNoteIds.append(note.id)
+                    // FIX #785: Get expected root from HeaderStore at NOTE HEIGHT, not current height
+                    let noteHeight = note.height
+                    if let expectedHeader = try? headerStore.getHeader(at: noteHeight),
+                       !expectedHeader.hashFinalSaplingRoot.isEmpty {
+                        let expectedRoot = expectedHeader.hashFinalSaplingRoot
+                        if witnessRoot == expectedRoot {
+                            validCount += 1
+                        } else {
+                            staleCount += 1
+                            staleNoteIds.append(note.id)
 
-                        let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("   ❌ Note \(note.id) (height \(note.height)): STALE witness")
-                        print("      Witness root: \(witnessRootHex)...")
-                        print("      Current root: \(currentRootHex)...")
+                            let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            let expectedRootHex = expectedRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            print("   ❌ Note \(note.id) (height \(noteHeight)): STALE witness")
+                            print("      Witness root: \(witnessRootHex)...")
+                            print("      Expected (header at \(noteHeight)): \(expectedRootHex)...")
+                        }
+                    } else {
+                        // FIX #785: No header at note height - can't validate, consider valid
+                        // This is safe because TX builder will also use the witness root if no header available
+                        print("   ⚠️ Note \(note.id) (height \(noteHeight)): No header available, assuming valid")
+                        validCount += 1
                     }
                 } else {
                     // Could not extract root - consider it invalid
@@ -1067,31 +1189,117 @@ final class WalletHealthCheck {
 
             print("🚨 FIX #574: Found \(staleCount)/\(unspentNotes.count) STALE witnesses!")
 
+            // FIX #783: Check if tree repair is exhausted BEFORE attempting auto-rebuild
+            // When TreeRepairExhausted is true, P2P cannot fetch delta CMUs (persistent network issue)
+            // Auto-rebuild will timeout and fail, triggering more repair attempts → infinite loop
+            // The only solution is Full Resync which uses a different code path (downloads complete boost file)
+            let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
+            if repairExhausted {
+                print("🛑 FIX #783: Tree repair exhausted - SKIPPING auto-rebuild to prevent infinite loop")
+                print("🛑 FIX #783: P2P delta sync has failed repeatedly - witnesses cannot be fixed automatically")
+                print("🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild tree and witnesses")
+
+                // Return non-critical to allow app to continue
+                // User can still see balance (may be incorrect) and attempt Full Resync
+                return .failed("Stale Witness Check",
+                              details: "⚠️ \(staleCount) stale witnesses. Auto-repair exhausted. Run 'Full Resync' in Settings.",
+                              critical: false)  // Non-critical to break the repair loop
+            }
+
+            // FIX #783: Check stale witness-specific repair counter to prevent loop
+            // This is SEPARATE from TreeRepairExhausted (which tracks tree root mismatch)
+            // Stale witnesses can loop independently even when tree is correct
+            let staleWitnessAttemptKey = "StaleWitnessRepairAttempted"
+            let staleWitnessSessionKey = "StaleWitnessRepairSession"
+            let staleWitnessGlobalKey = "StaleWitnessGlobalAttempts"
+
+            let currentSession = Int(Date().timeIntervalSince1970 / 300) // 5-minute sessions
+            let lastSession = UserDefaults.standard.integer(forKey: staleWitnessSessionKey)
+            let repairAttempted = UserDefaults.standard.bool(forKey: staleWitnessAttemptKey)
+            var globalAttempts = UserDefaults.standard.integer(forKey: staleWitnessGlobalKey)
+
+            // Reset session flag if new session
+            if currentSession != lastSession {
+                UserDefaults.standard.set(false, forKey: staleWitnessAttemptKey)
+                UserDefaults.standard.set(currentSession, forKey: staleWitnessSessionKey)
+            }
+
+            // FIX #783: If repair was already attempted this session, return non-critical to break loop
+            let maxGlobalAttempts = 5
+            if repairAttempted && currentSession == lastSession {
+                print("🛑 FIX #783: Stale witness repair already attempted this session - breaking loop")
+                print("🛑 FIX #783: Global attempts: \(globalAttempts)/\(maxGlobalAttempts)")
+                return .failed("Stale Witness Check",
+                              details: "⚠️ \(staleCount) stale witnesses persist. Try Full Resync in Settings.",
+                              critical: false)  // Non-critical to break the loop
+            }
+
+            // FIX #783: If global attempts exhausted, return non-critical
+            if globalAttempts >= maxGlobalAttempts {
+                print("🛑 FIX #783: Max global stale witness repair attempts (\(maxGlobalAttempts)) exceeded!")
+                print("🛑 FIX #783: User MUST run 'Full Resync' in Settings")
+                return .failed("Stale Witness Check",
+                              details: "⚠️ Auto-repair exhausted after \(maxGlobalAttempts) attempts. Run Full Resync.",
+                              critical: false)
+            }
+
+            // Mark repair attempt
+            UserDefaults.standard.set(true, forKey: staleWitnessAttemptKey)
+            globalAttempts += 1
+            UserDefaults.standard.set(globalAttempts, forKey: staleWitnessGlobalKey)
+            print("🔧 FIX #783: Stale witness repair attempt \(globalAttempts)/\(maxGlobalAttempts) (global)")
+
             // FIX #574: AUTO-FIX - Trigger witness rebuild
             print("🔧 FIX #574: AUTO-FIXING stale witnesses - rebuilding witnesses...")
 
             // Trigger witness rebuild
             await WalletManager.shared.rebuildWitnessesForStartup()
 
-            // Verify fix worked
+            // FIX #783: Verify fix worked by fetching FRESH data from database
+            // CRITICAL BUG FIX: Previous code used old `notes` array loaded BEFORE the rebuild!
+            // The old array still contained stale witness data → verification always failed → infinite loop
+            // Must re-fetch notes from database to get the REBUILT witness data
+            // FIX #785: Use HeaderStore roots at note height for verification (same as initial check)
             var stillStale = 0
+            let freshNotes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
             for noteId in staleNoteIds {
-                if let note = notes.first(where: { $0.id == noteId }),
-                   let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
-                    if witnessRoot != currentTreeRoot {
-                        stillStale += 1
+                // FIX #783: Use freshNotes (just fetched from DB) instead of stale `notes` array
+                // FIX #785: Compare against HeaderStore root at note height, not current tree root
+                if let freshNote = freshNotes.first(where: { $0.id == noteId }),
+                   !freshNote.witness.isEmpty,
+                   let witnessRoot = ZipherXFFI.witnessGetRoot(freshNote.witness) {
+                    let noteHeight = freshNote.height
+                    // FIX #785: Get expected root from HeaderStore at note height
+                    if let expectedHeader = try? headerStore.getHeader(at: noteHeight),
+                       !expectedHeader.hashFinalSaplingRoot.isEmpty {
+                        let expectedRoot = expectedHeader.hashFinalSaplingRoot
+                        if witnessRoot != expectedRoot {
+                            stillStale += 1
+                            let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            print("   ⚠️ FIX #785: Note \(noteId) still stale (witness vs header at \(noteHeight))")
+                        }
                     }
+                    // If no header available, consider it fixed (TX builder handles this case)
+                } else {
+                    // Fresh note has empty witness - rebuild didn't work for this note
+                    stillStale += 1
+                    print("   ⚠️ FIX #783: Note \(noteId) has no witness after rebuild")
                 }
             }
 
             if stillStale == 0 {
                 print("✅ FIX #574: Successfully fixed all \(staleCount) stale witnesses!")
+                // FIX #783: Reset global counter on success - repair worked!
+                UserDefaults.standard.set(0, forKey: staleWitnessGlobalKey)
                 return .passed("Stale Witness Check", details: "Fixed \(staleCount) stale witnesses ✓")
             } else {
                 print("⚠️ FIX #574: \(stillStale)/\(staleCount) witnesses still stale after rebuild")
+                // FIX #783: Return NON-CRITICAL since repair was already attempted
+                // This breaks the repair → health check → repair loop
+                // User will see the warning and can manually run Full Resync
                 return .failed("Stale Witness Check",
-                              details: "\(stillStale)/\(staleCount) witnesses still stale. Try Settings → Repair Database → Full Rescan.",
-                              critical: true)
+                              details: "\(stillStale)/\(staleCount) witnesses still stale. Try Settings → Full Resync.",
+                              critical: false)  // FIX #783: Changed from true to false to break loop
             }
 
         } catch {

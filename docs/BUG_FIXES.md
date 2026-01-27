@@ -8,6 +8,59 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #795: Skip Delta Collection When Manifest Already Covers Target Height
+**Problem**: Backwards delta range (e.g., 2991353-2991352) causing FIX #759 to trigger repeatedly
+**Symptoms**:
+- `⚠️ FIX #759: INVALID delta range 2991353-2991352 (backwards)`
+- Delta bundle cleared repeatedly
+- FIX #524 repair fails with "No delta CMUs found"
+- Stale witnesses (17/17 STALE) detected by FIX #574
+- Tree repair exhausted (FIX #783)
+
+**Root Cause Analysis**:
+1. At startup, delta bundle is pre-synced to chain tip (e.g., 2991352)
+2. PHASE 2 starts with `currentHeight=2991302, targetHeight=2991352`
+3. Line 1135-1137: `deltaCollectionStartHeight = manifest.endHeight + 1 = 2991353`
+4. But scan only goes up to `targetHeight=2991352`
+5. At save time: `deltaCollectionStartHeight (2991353) > lastScanned (2991352)` = BACKWARDS!
+6. FIX #759 clears delta bundle (correctly rejecting invalid range)
+7. FIX #524 repair can't find delta CMUs → witnesses stay stale
+8. Loop detected by monitoring script (19 occurrences)
+
+**Why This Scenario Occurs**:
+- Delta sync at startup fetches missing blocks to catch up to chain tip
+- Then PHASE 2 runs as part of health check / sync completion
+- PHASE 2 assumes it needs to collect delta CMUs, but delta is already synced
+
+**Solution**: Check if delta manifest already covers the target height before enabling collection
+- If `manifest.endHeight >= targetHeight`: delta already covers everything → skip collection
+- Added explicit check at line 1135-1137 before enabling deltaCollectionEnabled
+- Avoids backwards range by not collecting CMUs that are already in the delta bundle
+
+**Files Modified**: `Sources/Core/Network/FilterScanner.swift` (lines 1129-1155)
+
+---
+
+### FIX #794: Ensure HeaderStore Database Is Open Before Querying (Prevents "out of memory" Error)
+**Problem**: "out of memory" error when calling HeaderStore functions
+**Symptoms**:
+- `⚠️ HeaderStore.boostFileEndHeight: Error getting latest height: prepareFailed("out of memory")`
+- SQLite returns misleading "out of memory" when database handle is nil
+
+**Root Cause Analysis**:
+- `sqlite3_errmsg(nil)` returns "out of memory" as a generic error message
+- This happens when the database handle (`db`) is nil because the database wasn't opened
+- Various HeaderStore query functions (getLatestHeight, getSaplingRoot, etc.) didn't ensure database was open before use
+- The "out of memory" message is misleading - the real issue is a nil database handle
+
+**Solution**: Add `if db == nil { try open() }` guard at the start of all HeaderStore query functions
+- Applied to 19 functions: getLatestHeight, getMinHeight, getSaplingRoot, getHeader, countInRange, etc.
+- Also added `guard db != nil else { return nil }` after open attempt as a safety check
+
+**Files Modified**: `Sources/Core/Storage/HeaderStore.swift` (19 function locations)
+
+---
+
 ### FIX #793: PHASE 1.5 Anchor Extraction Should Prefer HeaderStore Over Witness Root
 **Problem**: PHASE 1.5 witness computation extracted anchors from witness root instead of HeaderStore
 **Symptoms**:
