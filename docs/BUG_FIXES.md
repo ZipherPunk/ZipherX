@@ -8,6 +8,50 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #775: Reduce Chain Mismatch Warning Log Spam
+**Problem**: Even after FIX #772, the "Chain mismatch at height X - will trust peer" warning was still being logged excessively - once per batch (every ~160 blocks) during header sync.
+
+**Root Cause Analysis**:
+1. FIX #772 fixed the checkpoint fallback logic for chain verification
+2. But the warning message was still printed for every batch where:
+   - HeaderStore has a header at the locator height
+   - But the stored hash doesn't match the incoming header's `hashPrevBlock`
+3. This happens when HeaderStore has gaps or corrupted data from previous sessions
+4. The code correctly trusts the peer and continues, but logs a warning each time
+5. With 2.5M+ headers to sync, this produced thousands of warning messages
+
+**Log Evidence** (before fix):
+```
+[06:25:27.813] ⚠️ Chain mismatch at height 525130 - will trust peer
+[06:25:27.833] ⚠️ Chain mismatch at height 525290 - will trust peer
+[06:25:27.884] ⚠️ Chain mismatch at height 525450 - will trust peer
+...every 160 blocks...
+```
+
+**Solution** (FIX #775): Suppress repeated warnings and print summary at end:
+1. Added static counters `chainMismatchCount` and `chainMismatchFirstHeight`
+2. Only print first occurrence with "(further warnings suppressed)" message
+3. Print summary at sync completion: "X occurrences starting at height Y"
+4. Reset counters at start of each new sync session
+
+**Log Output** (after fix):
+```
+[06:25:27.813] ℹ️ FIX #775: Chain mismatch at height 525130 - will trust peer (further warnings suppressed)
+...sync continues silently...
+[06:30:15.500] 🎉 Header sync complete! Synced to height 2990892
+[06:30:15.500] ℹ️ FIX #775: Chain mismatch summary - 15547 occurrences starting at height 525130 (all trusted peer)
+```
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift`:
+  - Added static counters for tracking mismatches
+  - Modified warning logic to suppress after first occurrence
+  - Added summary at sync completion
+
+**Result**: Clean log output - one initial warning plus summary at end, instead of thousands of repeated warnings.
+
+---
+
 ### FIX #772: Chain Mismatch Spam from Wrong Checkpoint Fallback Logic
 **Problem**: Repeated "Chain mismatch at height X - will trust peer" warnings every ~320 blocks during header sync. The app logs massive chain mismatch spam but continues syncing.
 

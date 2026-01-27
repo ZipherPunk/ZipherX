@@ -24,6 +24,11 @@ final class HeaderSyncManager {
     // FIX #673: Track when we last deleted corrupted headers (for chainwork validation)
     private var lastCorruptedHeaderDeletion: Date?
 
+    // FIX #775: Track chain mismatch warnings to reduce log spam
+    // Only print summary, not every occurrence
+    private static var chainMismatchCount: Int = 0
+    private static var chainMismatchFirstHeight: UInt64 = 0
+
     // Progress tracking
     var onProgress: ((HeaderSyncProgress) -> Void)?
 
@@ -57,6 +62,10 @@ final class HeaderSyncManager {
         }
 
         print("🔄 Starting header sync from height \(startHeight)")
+
+        // FIX #775: Reset chain mismatch counter at start of new sync session
+        Self.chainMismatchCount = 0
+        Self.chainMismatchFirstHeight = 0
 
         // P2P-only consensus: get from NetworkManager
         let consensusHeight = try await networkManager.getChainHeight()
@@ -150,6 +159,13 @@ final class HeaderSyncManager {
         }
 
         print("🎉 Header sync complete! Synced to height \(chainTip)")
+
+        // FIX #775: Print summary of chain mismatches if any occurred
+        if Self.chainMismatchCount > 0 {
+            print("ℹ️ FIX #775: Chain mismatch summary - \(Self.chainMismatchCount) occurrences starting at height \(Self.chainMismatchFirstHeight) (all trusted peer)")
+            Self.chainMismatchCount = 0
+            Self.chainMismatchFirstHeight = 0
+        }
 
         // FIX #767 v3: Clear boost corruption flag after successful P2P sync
         // This allows boost file to be loaded again on next startup
@@ -762,6 +778,13 @@ final class HeaderSyncManager {
         let totalTime = Date().timeIntervalSince(startTime)
         let finalRate = totalTime > 0 ? Double(totalSynced) / totalTime : 0
         print("🎉 FIX #502: Header sync complete: \(totalSynced) headers in \(String(format: "%.1f", totalTime))s (\(Int(finalRate)) headers/sec)")
+
+        // FIX #775: Print summary of chain mismatches if any occurred
+        if Self.chainMismatchCount > 0 {
+            print("ℹ️ FIX #775: Chain mismatch summary - \(Self.chainMismatchCount) occurrences starting at height \(Self.chainMismatchFirstHeight) (all trusted peer)")
+            Self.chainMismatchCount = 0
+            Self.chainMismatchFirstHeight = 0
+        }
     }
 
     /// Fetch headers from a single peer for a specific range
@@ -1472,10 +1495,13 @@ final class HeaderSyncManager {
                 // FIX #707: Removed per-header debug logs (too spammy)
 
                 guard header.hashPrevBlock == prevHash! else {
-                    // Only log first mismatch to reduce spam
-                    if !checkpointWarningPrinted {
-                        print("⚠️ Chain mismatch at height \(currentHeight) - will trust peer")
+                    // FIX #775: Track mismatch count instead of printing every occurrence
+                    // Only print first occurrence per sync session
+                    if Self.chainMismatchCount == 0 {
+                        Self.chainMismatchFirstHeight = currentHeight
+                        print("ℹ️ FIX #775: Chain mismatch at height \(currentHeight) - will trust peer (further warnings suppressed)")
                     }
+                    Self.chainMismatchCount += 1
 
                     // FIX #536: Check if prevHash came from HeaderStore (might be corrupted!)
                     if prevHashFromHeaderStore {
@@ -1494,7 +1520,10 @@ final class HeaderSyncManager {
                             // we can delete all headers since there's no boost file to protect.
                             let boostFileEndHeight = ZipherXConstants.effectiveTreeHeight
                             let prevHeight = currentHeight - 1
-                            print("🔍 FIX #767: Chain mismatch at height \(currentHeight), boostFileEndHeight=\(boostFileEndHeight)")
+                            // FIX #775: Only log occasionally to reduce spam
+                            if Self.chainMismatchCount % 100 == 1 {
+                                print("🔍 FIX #767: Chain mismatch at height \(currentHeight), boostFileEndHeight=\(boostFileEndHeight)")
+                            }
 
                             // Only delete headers ABOVE the boost file end height
                             let safeDeleteStart = max(prevHeight, boostFileEndHeight + 1)
