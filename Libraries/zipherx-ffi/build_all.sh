@@ -39,15 +39,15 @@ cargo build --release --lib > /tmp/build_macos_arm64.log 2>&1 &
 PID1=$!
 
 echo "🔨 [2/4] macOS (x86_64)..."
-cargo build --release --lib --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
+cargo build --release --target x86_64-apple-darwin > /tmp/build_macos_x86.log 2>&1 &
 PID2=$!
 
 echo "🔨 [3/4] iOS Device (arm64)..."
-cargo build --release --lib --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
+cargo build --release --target aarch64-apple-ios > /tmp/build_ios.log 2>&1 &
 PID3=$!
 
 echo "🔨 [4/4] iOS Simulator (arm64)..."
-cargo build --release --lib --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
+cargo build --release --target aarch64-apple-ios-sim > /tmp/build_sim.log 2>&1 &
 PID4=$!
 
 echo ""
@@ -84,6 +84,38 @@ fi
 
 echo ""
 echo "✅ All 4 library targets built successfully!"
+
+# Verify build artifacts exist before proceeding
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "🔍 Verifying build artifacts exist..."
+echo "═══════════════════════════════════════════════════════════════"
+
+MISSING=0
+if [ ! -f "target/release/libzipherx_ffi.a" ]; then
+    echo "❌ MISSING: target/release/libzipherx_ffi.a"
+    MISSING=1
+fi
+if [ ! -f "target/x86_64-apple-darwin/release/libzipherx_ffi.a" ]; then
+    echo "❌ MISSING: target/x86_64-apple-darwin/release/libzipherx_ffi.a"
+    MISSING=1
+fi
+if [ ! -f "target/aarch64-apple-ios/release/libzipherx_ffi.a" ]; then
+    echo "❌ MISSING: target/aarch64-apple-ios/release/libzipherx_ffi.a"
+    MISSING=1
+fi
+if [ ! -f "target/aarch64-apple-ios-sim/release/libzipherx_ffi.a" ]; then
+    echo "❌ MISSING: target/aarch64-apple-ios-sim/release/libzipherx_ffi.a"
+    MISSING=1
+fi
+
+if [ $MISSING -eq 1 ]; then
+    echo ""
+    echo "❌ BUILD FAILED - Missing build artifacts!"
+    echo "   Check build logs at /tmp/build_*.log"
+    exit 1
+fi
+echo "✅ All build artifacts present"
 
 # Create universal macOS library
 echo ""
@@ -124,9 +156,17 @@ echo "  → iOS Simulator (arm64)..."
 cp target/aarch64-apple-ios-sim/release/libzipherx_ffi.a \
    "$XCFRAMEWORK_DIR/ios-arm64-simulator/libzipherx_ffi.a"
 
-cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/macos-arm64_x86_64/Headers/
-cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/ios-arm64/Headers/
-cp /Users/chris/ZipherX/Libraries/zipherx-ffi/include/zipherx_ffi.h /Users/chris/ZipherX/Libraries/ZipherXFFI.xcframework/ios-arm64-simulator/Headers/
+# Copy header files to XCFramework (using variables, not hardcoded paths)
+echo "  → Copying header files..."
+cp "$SCRIPT_DIR/include/zipherx_ffi.h" "$XCFRAMEWORK_DIR/macos-arm64_x86_64/Headers/"
+cp "$SCRIPT_DIR/include/zipherx_ffi.h" "$XCFRAMEWORK_DIR/ios-arm64/Headers/"
+cp "$SCRIPT_DIR/include/zipherx_ffi.h" "$XCFRAMEWORK_DIR/ios-arm64-simulator/Headers/"
+
+# Clean up stale/duplicate library files
+if [ -f "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos.a" ]; then
+    echo "  → Removing stale libzipherx_ffi_macos.a..."
+    rm -f "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzipherx_ffi_macos.a"
+fi
 
 
 # Verify libraries
