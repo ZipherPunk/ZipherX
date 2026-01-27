@@ -29,8 +29,13 @@ final class BundledShieldedOutputs {
 
     static let shared = BundledShieldedOutputs()
 
-    // Boost file output record format (652 bytes each)
-    private static let OUTPUT_SIZE = 652
+    // Boost file output record format
+    // OLD FORMAT (without txid): 652 bytes per record
+    // NEW FORMAT (with txid - FIX #374): 684 bytes per record
+    // FIX #787: Detect format dynamically from data.count / count
+    private static let OUTPUT_SIZE_OLD = 652
+    private static let OUTPUT_SIZE_NEW = 684
+    private static var OUTPUT_SIZE = 652  // Default, updated dynamically
 
     // Cached outputs data (extracted from boost file)
     private var outputsData: Data?
@@ -129,12 +134,42 @@ final class BundledShieldedOutputs {
         return (false, 0, 0)
     }
 
-    /// Load outputs from boost file section (652 bytes per record)
+    /// Load outputs from boost file section (652 or 684 bytes per record)
+    /// FIX #787: Detect record size dynamically to fix endHeight reading corruption
     private func loadFromBoostSection(_ data: Data, startHeight: UInt64, count: UInt64) throws {
-        // Validate data size (652 bytes per output)
+        guard count > 0 else {
+            throw NSError(domain: "BundledShieldedOutputs", code: 1, userInfo: [NSLocalizedDescriptionKey: "Zero output count"])
+        }
+
+        // FIX #787: Detect actual record size from data
+        // OLD FORMAT (without txid): 652 bytes per record
+        // NEW FORMAT (with txid - FIX #374): 684 bytes per record
+        let actualRecordSize = data.count / Int(count)
+
+        // Validate and set record size based on known formats
+        if actualRecordSize == Self.OUTPUT_SIZE_OLD || actualRecordSize == Self.OUTPUT_SIZE_NEW {
+            // Use detected record size directly
+            Self.OUTPUT_SIZE = actualRecordSize
+            print("🔧 FIX #787: Detected record size: \(actualRecordSize) bytes (\(actualRecordSize == Self.OUTPUT_SIZE_NEW ? "with txid" : "without txid"))")
+        } else {
+            print("⚠️ FIX #787: Unexpected record size \(actualRecordSize) (data=\(data.count), count=\(count))")
+            // Fall back to detecting based on which format fits
+            if data.count == Int(count) * Self.OUTPUT_SIZE_NEW {
+                Self.OUTPUT_SIZE = Self.OUTPUT_SIZE_NEW
+            } else if data.count == Int(count) * Self.OUTPUT_SIZE_OLD {
+                Self.OUTPUT_SIZE = Self.OUTPUT_SIZE_OLD
+            } else {
+                throw NSError(domain: "BundledShieldedOutputs", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid boost section size: \(data.count) for \(count) outputs"])
+            }
+            print("🔧 FIX #787: Using fallback record size \(Self.OUTPUT_SIZE) bytes")
+        }
+
+        // Validate data size
         let expectedSize = Int(count) * Self.OUTPUT_SIZE
         guard data.count >= expectedSize else {
-            throw NSError(domain: "BundledShieldedOutputs", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid boost section size"])
+            throw NSError(domain: "BundledShieldedOutputs", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid boost section size: \(data.count) < \(expectedSize)"])
         }
 
         // Clear previous index
@@ -145,15 +180,39 @@ final class BundledShieldedOutputs {
         self.outputCount = count
         self.startHeight = startHeight
 
-        // Determine end height from last record
-        if count > 0 {
-            let lastOffset = Int(count - 1) * Self.OUTPUT_SIZE
-            self.endHeight = UInt64(readUInt32(from: data, at: lastOffset))
-        } else {
-            self.endHeight = startHeight
+        // FIX #787: Determine end height from last record using CORRECT offset
+        let lastOffset = Int(count - 1) * Self.OUTPUT_SIZE
+        self.endHeight = UInt64(readUInt32(from: data, at: lastOffset))
+
+        // FIX #787: Sanity check - endHeight should be reasonable
+        // Sapling activation is 476969, max reasonable height is ~5M (for many years)
+        let maxReasonableHeight: UInt64 = 5_000_000
+        if self.endHeight > maxReasonableHeight || self.endHeight < startHeight {
+            print("⚠️ FIX #787: SUSPICIOUS endHeight \(self.endHeight) - expected between \(startHeight) and \(maxReasonableHeight)")
+            print("⚠️ FIX #787: lastOffset=\(lastOffset), data.count=\(data.count), recordSize=\(Self.OUTPUT_SIZE)")
+            // Try to recover by reading first few records to understand format
+            if count > 1 {
+                let firstHeight = UInt64(readUInt32(from: data, at: 0))
+                let secondHeight = UInt64(readUInt32(from: data, at: Self.OUTPUT_SIZE))
+                print("🔍 FIX #787: First record height: \(firstHeight), Second record height: \(secondHeight)")
+
+                // If heights look reasonable, the record size might be wrong
+                // Try the other format
+                let alternateSize = (Self.OUTPUT_SIZE == Self.OUTPUT_SIZE_OLD) ? Self.OUTPUT_SIZE_NEW : Self.OUTPUT_SIZE_OLD
+                let alternateLastOffset = Int(count - 1) * alternateSize
+                if alternateLastOffset + 4 <= data.count {
+                    let alternateEndHeight = UInt64(readUInt32(from: data, at: alternateLastOffset))
+                    print("🔧 FIX #787: Trying alternate record size \(alternateSize): endHeight would be \(alternateEndHeight)")
+                    if alternateEndHeight >= startHeight && alternateEndHeight <= maxReasonableHeight {
+                        print("✅ FIX #787: Alternate format looks correct! Switching to \(alternateSize) bytes per record")
+                        Self.OUTPUT_SIZE = alternateSize
+                        self.endHeight = alternateEndHeight
+                    }
+                }
+            }
         }
 
-        print("⏰ BundledShieldedOutputs: Loaded \(count) outputs (heights \(startHeight) to \(endHeight))")
+        print("⏰ BundledShieldedOutputs: Loaded \(count) outputs (heights \(startHeight) to \(endHeight)) [recordSize=\(Self.OUTPUT_SIZE)]")
     }
 
     /// Clear loaded data
@@ -269,19 +328,17 @@ final class BundledShieldedOutputs {
     }
 
     /// Parse a single output at the given offset
-    /// Boost file format (652 bytes):
-    ///   - height: UInt32 (4 bytes)
-    ///   - index: UInt32 (4 bytes)
-    ///   - cmu: [UInt8; 32]
-    ///   - epk: [UInt8; 32]
-    ///   - ciphertext: [UInt8; 580]
+    /// FIX #787: Handle both record formats:
+    /// OLD (652 bytes): height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
+    /// NEW (684 bytes): height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) + txid(32)
     private func parseOutput(at offset: Int, in data: Data) -> ShieldedOutputData {
         let height = readUInt32(from: data, at: offset)
 
-        // Boost format: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
+        // Boost format: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) [+ txid(32) in new format]
         // CRITICAL: Order is CMU first, then EPK (matches Rust benchmark)
         let cmu = data.subdata(in: (offset + 8)..<(offset + 40))
         let epk = data.subdata(in: (offset + 40)..<(offset + 72))
+        // Ciphertext is always 580 bytes regardless of format (txid is at the end if present)
         let encCiphertext = data.subdata(in: (offset + 72)..<(offset + 652))
 
         return ShieldedOutputData(

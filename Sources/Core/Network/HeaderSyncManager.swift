@@ -1542,12 +1542,21 @@ final class HeaderSyncManager {
                                 print("🛡️ FIX #767: No headers to delete (mismatch at \(prevHeight) is within boost range <= \(boostFileEndHeight))")
                             }
 
-                            // FIX #767 v2: Only mark as corrupted if mismatch is WITHIN boost file range
-                            // If mismatch is in P2P range, don't mark boost as corrupted (it's not!)
+                            // FIX #792: NEVER mark boost file as corrupted from P2P chain mismatch
+                            // The boost file is Equihash-verified and trustworthy.
+                            // Chain mismatches happen because HeaderStore has stale/wrong P2P headers,
+                            // NOT because the boost file is corrupted.
+                            //
+                            // Previous logic (FIX #767 v2) was BACKWARDS - it marked boost as corrupted
+                            // when mismatch was WITHIN boost range, but that's exactly when the boost
+                            // file is CORRECT and HeaderStore is WRONG.
+                            //
+                            // Solution: Don't set the corruption flag at all. The boost file will be
+                            // reloaded on restart and Equihash verification will confirm its validity.
                             if prevHeight <= boostFileEndHeight {
-                                headerStore.markBoostHeadersCorrupted(mismatchHeight: currentHeight)
+                                print("ℹ️ FIX #792: Chain mismatch at \(currentHeight) within boost range - HeaderStore has stale headers (boost file is correct)")
                             } else {
-                                print("ℹ️ FIX #767: Mismatch in P2P range - NOT marking boost as corrupted")
+                                print("ℹ️ FIX #792: Mismatch in P2P range at \(currentHeight) - will resync from peers")
                             }
                             lastCorruptedHeaderDeletion = Date()
 

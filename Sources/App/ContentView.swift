@@ -453,8 +453,35 @@ struct ContentView: View {
                                     !$0.passed && ($0.critical || $0.details.contains("REPAIR") || $0.details.contains("Full Rescan"))
                                 }
 
+                                // FIX #778: Track repair attempts to break infinite loop
+                                // Root cause: After repair, tree root still mismatches because delta CMUs are wrong
+                                // This causes: health check → repair → same mismatch → repair → loop
+                                let repairAttemptsKey = "TreeRootRepairAttempts"
+                                let repairSessionKey = "TreeRootRepairSession"
+                                let currentSession = Int(Date().timeIntervalSince1970 / 300) // 5-minute sessions
+                                let lastSession = UserDefaults.standard.integer(forKey: repairSessionKey)
+                                var repairAttempts = UserDefaults.standard.integer(forKey: repairAttemptsKey)
+
+                                // Reset counter if new session
+                                if currentSession != lastSession {
+                                    repairAttempts = 0
+                                    UserDefaults.standard.set(currentSession, forKey: repairSessionKey)
+                                }
+
+                                let maxRepairAttempts = 2
+                                let hasTreeRootIssue = criticalIssues.contains { $0.checkName == "Tree Root Validation" }
+
+                                // FIX #778: Skip repair if we've already tried max times this session
+                                if hasTreeRootIssue && repairAttempts >= maxRepairAttempts {
+                                    print("🛑 FIX #778: Max repair attempts (\(maxRepairAttempts)) reached for tree root mismatch")
+                                    print("🛑 FIX #778: Breaking loop - user must manually resync via Settings → Repair Database")
+                                    // Clear the counter so next app restart can try again
+                                    UserDefaults.standard.set(0, forKey: repairAttemptsKey)
+                                    // Continue to UI without repair - user can manually fix
+                                }
+
                                 // FIX #686: Automatic repair at startup - NO user prompts
-                                if !criticalIssues.isEmpty {
+                                if !criticalIssues.isEmpty && !(hasTreeRootIssue && repairAttempts >= maxRepairAttempts) {
                                     print("⚠️ FIX #686: INSTANT START detected issues - triggering automatic repair")
                                     for issue in criticalIssues {
                                         print("⚠️ Critical Issue: \(issue.checkName) - \(issue.details)")
@@ -479,6 +506,9 @@ struct ContentView: View {
                                         // FIX #723: For tree root mismatch, force FULL rescan to rebuild tree from boost file
                                         if hasTreeRootMismatch {
                                             print("🔧 FIX #723: Tree root mismatch detected - triggering FULL RESCAN")
+                                            // FIX #778: Increment repair attempt counter
+                                            UserDefaults.standard.set(repairAttempts + 1, forKey: repairAttemptsKey)
+                                            print("🔧 FIX #778: Tree root repair attempt \(repairAttempts + 1)/\(maxRepairAttempts)")
                                         }
                                         try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
                                             print("🔧 FIX #686/723: Instant repair progress \(Int(progress * 100))% (\(current)/\(total))")
@@ -490,6 +520,21 @@ struct ContentView: View {
                                             walletManager.updateSyncTask(id: "instant_repair", status: .completed)
                                         }
                                         print("✅ FIX #686/723: Instant repair complete")
+
+                                        // FIX #778: Post-repair verification for tree root mismatch
+                                        if hasTreeRootMismatch {
+                                            print("🔍 FIX #778: Verifying tree root after repair...")
+                                            let postRepairResults = await WalletHealthCheck.shared.runAllChecks()
+                                            let stillHasTreeRootIssue = postRepairResults.contains {
+                                                $0.checkName == "Tree Root Validation" && !$0.passed
+                                            }
+                                            if stillHasTreeRootIssue {
+                                                print("⚠️ FIX #778: Tree root still mismatches after repair - will retry on next startup")
+                                            } else {
+                                                print("✅ FIX #778: Tree root now matches - resetting repair counter")
+                                                UserDefaults.standard.set(0, forKey: repairAttemptsKey)
+                                            }
+                                        }
                                     } catch {
                                         print("❌ FIX #686/723: Instant repair failed: \(error.localizedDescription)")
                                         // Even on failure, continue to UI - user can manually trigger repair from Settings

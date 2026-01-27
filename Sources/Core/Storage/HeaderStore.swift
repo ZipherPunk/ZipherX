@@ -1365,6 +1365,7 @@ final class HeaderStore {
 
     /// FIX #698: Get the range of heights that have zero sapling roots
     /// Returns (minHeight, maxHeight) tuple or nil if no zero roots found
+    /// FIX #797: Only checks POST-Sapling blocks (>= 476969) - pre-Sapling blocks have zero roots by design
     func getZeroSaplingRootRange() throws -> (UInt64, UInt64)? {
         // Ensure database is open
         if db == nil {
@@ -1375,7 +1376,11 @@ final class HeaderStore {
         // Zero sapling root is 32 bytes of zeros
         let zeroRoot = Data(repeating: 0, count: 32)
 
-        let sql = "SELECT MIN(height), MAX(height) FROM headers WHERE sapling_root = ?;"
+        // FIX #797: Sapling activation height - blocks before this have zero sapling roots BY DESIGN
+        let saplingActivationHeight: UInt64 = 476_969
+
+        // FIX #797: Only check POST-Sapling blocks - pre-Sapling blocks have zero roots and that's correct!
+        let sql = "SELECT MIN(height), MAX(height) FROM headers WHERE sapling_root = ? AND height >= ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1387,6 +1392,8 @@ final class HeaderStore {
         zeroRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
         }
+        // FIX #797: Bind the sapling activation height
+        sqlite3_bind_int64(stmt, 2, Int64(saplingActivationHeight))
 
         guard sqlite3_step(stmt) == SQLITE_ROW else {
             return nil
@@ -1404,6 +1411,7 @@ final class HeaderStore {
     }
 
     /// FIX #698: Get list of heights with zero sapling roots
+    /// FIX #797: Only checks POST-Sapling blocks (>= 476969) - pre-Sapling have zero roots by design
     func getHeightsWithZeroSaplingRoots() throws -> [UInt64] {
         // Ensure database is open
         if db == nil {
@@ -1413,7 +1421,11 @@ final class HeaderStore {
 
         let zeroRoot = Data(repeating: 0, count: 32)
 
-        let sql = "SELECT height FROM headers WHERE sapling_root = ? ORDER BY height ASC;"
+        // FIX #797: Sapling activation height - blocks before this have zero sapling roots BY DESIGN
+        let saplingActivationHeight: UInt64 = 476_969
+
+        // FIX #797: Only check POST-Sapling blocks
+        let sql = "SELECT height FROM headers WHERE sapling_root = ? AND height >= ? ORDER BY height ASC;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1425,6 +1437,8 @@ final class HeaderStore {
         zeroRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
         }
+        // FIX #797: Bind the sapling activation height
+        sqlite3_bind_int64(stmt, 2, Int64(saplingActivationHeight))
 
         var heights: [UInt64] = []
         while sqlite3_step(stmt) == SQLITE_ROW {

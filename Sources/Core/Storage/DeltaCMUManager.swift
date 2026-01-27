@@ -207,57 +207,118 @@ class DeltaCMUManager {
         }
     }
 
+    /// FIX #781: Helper struct to store CMU with its ordering key
+    private struct OrderedCMU {
+        let height: UInt32
+        let index: UInt32
+        let cmu: Data
+    }
+
     /// Load all CMUs from the delta bundle (32 bytes each, wire format)
     /// For tree building - extracts just the CMU field from each 652-byte record
+    /// FIX #781: CMUs are sorted by (height, index) to ensure correct tree root computation
+    /// FIX #785: De-duplicates CMUs by (height, index) key to fix tree root mismatch (137 vs 134 CMUs)
     func loadDeltaCMUs() -> [Data]? {
         guard let rawData = loadDeltaOutputsRaw() else { return nil }
 
         let outputCount = rawData.count / Self.OUTPUT_SIZE
-        var cmus: [Data] = []
-        cmus.reserveCapacity(outputCount)
+        var orderedCMUs: [OrderedCMU] = []
+        orderedCMUs.reserveCapacity(outputCount)
+
+        // FIX #785: Track (height, index) keys to detect and skip duplicates
+        var seenKeys = Set<String>()
+        var duplicateCount = 0
 
         for i in 0..<outputCount {
             let offset = i * Self.OUTPUT_SIZE
+            // Parse height (bytes 0-4) and index (bytes 4-8)
+            let height = rawData.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
+                $0.load(as: UInt32.self).littleEndian
+            }
+            let index = rawData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
+                $0.load(as: UInt32.self).littleEndian
+            }
+
+            // FIX #785: Skip duplicates - same (height, index) means same CMU
+            let key = "\(height)_\(index)"
+            if seenKeys.contains(key) {
+                duplicateCount += 1
+                continue
+            }
+            seenKeys.insert(key)
+
             // CMU is at bytes 8-40 (after height and index)
             let cmu = rawData.subdata(in: (offset + 8)..<(offset + 40))
-            cmus.append(cmu)
+            orderedCMUs.append(OrderedCMU(height: height, index: index, cmu: cmu))
         }
 
-        return cmus
+        if duplicateCount > 0 {
+            print("🔧 FIX #785: Filtered \(duplicateCount) duplicate CMUs on load (was \(outputCount), now \(orderedCMUs.count))")
+        }
+
+        // FIX #781: CRITICAL - Sort by (height, index) for correct tree root
+        // Commitment tree is order-dependent - CMUs must be in exact blockchain order
+        orderedCMUs.sort { ($0.height, $0.index) < ($1.height, $1.index) }
+
+        return orderedCMUs.map { $0.cmu }
     }
 
     /// Load CMUs from the delta bundle filtered by block height range
     /// Returns CMUs in blockchain order for outputs in [startHeight...endHeight]
+    /// FIX #781: CMUs are sorted by (height, index) to ensure correct tree root computation
+    /// FIX #785: De-duplicates CMUs by (height, index) key to fix tree root mismatch (137 vs 134 CMUs)
     /// - Parameters:
     ///   - startHeight: First block height to include
     ///   - endHeight: Last block height to include
-    /// - Returns: Array of 32-byte CMUs in wire format, or nil if delta bundle not available
+    /// - Returns: Array of 32-byte CMUs in wire format, sorted by (height, index), or nil if delta bundle not available
     func loadDeltaCMUsForHeightRange(startHeight: UInt64, endHeight: UInt64) -> [Data]? {
         guard let rawData = loadDeltaOutputsRaw() else { return nil }
 
         let outputCount = rawData.count / Self.OUTPUT_SIZE
-        var cmus: [Data] = []
-        cmus.reserveCapacity(outputCount / 10)  // Estimate ~10% of outputs in range
+        var orderedCMUs: [OrderedCMU] = []
+        orderedCMUs.reserveCapacity(outputCount / 10)  // Estimate ~10% of outputs in range
+
+        // FIX #785: Track (height, index) keys to detect and skip duplicates
+        var seenKeys = Set<String>()
+        var duplicateCount = 0
 
         for i in 0..<outputCount {
             let offset = i * Self.OUTPUT_SIZE
-            // Parse height from first 4 bytes
+            // Parse height (bytes 0-4) and index (bytes 4-8)
             let height = rawData.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
-                UInt64($0.load(as: UInt32.self).littleEndian)
+                $0.load(as: UInt32.self).littleEndian
             }
 
             // Only include outputs in our height range
-            if height >= startHeight && height <= endHeight {
+            if UInt64(height) >= startHeight && UInt64(height) <= endHeight {
+                let index = rawData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
+                    $0.load(as: UInt32.self).littleEndian
+                }
+
+                // FIX #785: Skip duplicates - same (height, index) means same CMU
+                let key = "\(height)_\(index)"
+                if seenKeys.contains(key) {
+                    duplicateCount += 1
+                    continue
+                }
+                seenKeys.insert(key)
+
                 // CMU is at bytes 8-40 (after height and index)
                 let cmu = rawData.subdata(in: (offset + 8)..<(offset + 40))
-                cmus.append(cmu)
-                // FIX #722: Removed per-CMU debug logging (was 12K+ entries!)
-                // FIX #563 v6 added this log but it's way too verbose
+                orderedCMUs.append(OrderedCMU(height: height, index: index, cmu: cmu))
             }
         }
 
-        print("📦 Delta bundle: Returning \(cmus.count) CMUs for range \(startHeight)-\(endHeight)")
-        return cmus
+        if duplicateCount > 0 {
+            print("🔧 FIX #785: Filtered \(duplicateCount) duplicate CMUs on load for range \(startHeight)-\(endHeight)")
+        }
+
+        // FIX #781: CRITICAL - Sort by (height, index) for correct tree root
+        // Commitment tree is order-dependent - CMUs must be in exact blockchain order
+        orderedCMUs.sort { ($0.height, $0.index) < ($1.height, $1.index) }
+
+        print("📦 FIX #781: Delta bundle returning \(orderedCMUs.count) CMUs for range \(startHeight)-\(endHeight) (sorted by height,index)")
+        return orderedCMUs.map { $0.cmu }
     }
 
     /// Get outputs for parallel decryption (same format as BundledShieldedOutputs)
@@ -289,6 +350,7 @@ class DeltaCMUManager {
     }
 
     /// Append new outputs to the delta bundle (or just update height if no outputs)
+    /// FIX #784: De-duplicates outputs to prevent tree root mismatch caused by duplicate CMUs
     /// - Parameters:
     ///   - outputs: Array of DeltaOutput (must have all 652 bytes of data), can be empty
     ///   - fromHeight: Starting block height of the scanned range (important for gap tracking!)
@@ -297,26 +359,57 @@ class DeltaCMUManager {
     func appendOutputs(_ outputs: [DeltaOutput], fromHeight: UInt64? = nil, toHeight: UInt64, treeRoot: Data) {
         queue.sync {
             do {
-                var fileData: Data
-                var currentOutputCount: UInt64 = 0
+                var existingOutputs: [DeltaOutput] = []
                 var startHeight: UInt64
+
+                // FIX #784: Track existing (height, index) keys to detect duplicates
+                var existingKeys = Set<String>()
 
                 // Load existing data if file exists
                 if FileManager.default.fileExists(atPath: deltaFileURL.path),
                    let existingData = try? Data(contentsOf: deltaFileURL),
                    let manifest = getManifest() {
-                    fileData = existingData
-                    currentOutputCount = manifest.outputCount
                     startHeight = manifest.startHeight
+
+                    // FIX #784: Parse existing outputs and build key set
+                    let outputCount = existingData.count / Self.OUTPUT_SIZE
+                    for i in 0..<outputCount {
+                        let offset = i * Self.OUTPUT_SIZE
+                        if let output = DeltaOutput.parse(from: existingData, at: offset) {
+                            existingOutputs.append(output)
+                            let key = "\(output.height)_\(output.index)"
+                            existingKeys.insert(key)
+                        }
+                    }
                 } else {
-                    fileData = Data()
                     // CRITICAL: Use fromHeight if provided (ensures gap is tracked!)
                     // This allows the caller to specify "I scanned from X to Y, even if no outputs found"
                     startHeight = fromHeight ?? outputs.first.map { UInt64($0.height) } ?? toHeight
                 }
 
-                // Append new outputs
+                // FIX #784: Filter out duplicates from new outputs
+                var duplicateCount = 0
+                var newUniqueOutputs: [DeltaOutput] = []
                 for output in outputs {
+                    let key = "\(output.height)_\(output.index)"
+                    if existingKeys.contains(key) {
+                        duplicateCount += 1
+                    } else {
+                        newUniqueOutputs.append(output)
+                        existingKeys.insert(key)  // Track so we don't add the same output twice from new batch
+                    }
+                }
+
+                if duplicateCount > 0 {
+                    print("🔧 FIX #784: Filtered \(duplicateCount) duplicate CMUs (prevented tree root mismatch)")
+                }
+
+                // Rebuild file data with existing + new unique outputs
+                var fileData = Data(capacity: (existingOutputs.count + newUniqueOutputs.count) * Self.OUTPUT_SIZE)
+                for output in existingOutputs {
+                    fileData.append(output.serialize())
+                }
+                for output in newUniqueOutputs {
                     fileData.append(output.serialize())
                 }
 
@@ -324,7 +417,7 @@ class DeltaCMUManager {
                 try fileData.write(to: deltaFileURL)
 
                 // Update manifest
-                let newOutputCount = currentOutputCount + UInt64(outputs.count)
+                let newOutputCount = UInt64(existingOutputs.count + newUniqueOutputs.count)
                 let newManifest = DeltaManifest(
                     startHeight: startHeight,
                     endHeight: toHeight,
@@ -341,7 +434,7 @@ class DeltaCMUManager {
                 cachedOutputCount = newOutputCount
                 cachedEndHeight = toHeight
 
-                print("📦 DeltaCMU: Appended \(outputs.count) outputs (total: \(newOutputCount), height \(startHeight)-\(toHeight))")
+                print("📦 DeltaCMU: Appended \(newUniqueOutputs.count) outputs (total: \(newOutputCount), height \(startHeight)-\(toHeight))")
 
             } catch {
                 print("⚠️ DeltaCMU: Failed to append outputs: \(error)")
