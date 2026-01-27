@@ -379,12 +379,22 @@ final class FilterScanner {
         let initialTreeSize = ZipherXFFI.treeSize()
         let treeHasProgress = initialTreeSize > effectiveTreeCMUCount
 
+        // FIX #780: Check if pendingDeltaRescan flag is set
+        // When FIX #765 clears delta bundle and sets this flag, we MUST reset the tree
+        // Otherwise the tree accumulates stale CMUs from previous scans
+        let hasPendingDeltaRescan = await MainActor.run { WalletManager.shared.pendingDeltaRescan }
+
         // Only force fresh tree if:
         // 1. Custom height provided AND starting exactly from effective+1 (rescan scenario)
         // 2. AND tree doesn't already have progress (hasn't appended CMUs beyond effective)
-        let needsFreshTree = customStartHeight != nil
+        // FIX #780: OR if pendingDeltaRescan is set (delta was cleared, need fresh tree)
+        let needsFreshTree = (customStartHeight != nil
             && customStartHeight! == effectiveTreeHeight + 1
-            && !treeHasProgress
+            && !treeHasProgress) || hasPendingDeltaRescan
+
+        if hasPendingDeltaRescan {
+            print("🔧 FIX #780: pendingDeltaRescan detected - forcing fresh tree from boost file")
+        }
 
         // Wait for WalletManager to finish loading tree before proceeding
         if !needsFreshTree {
@@ -439,6 +449,12 @@ final class FilterScanner {
 
         // Force reload tree for rescans
         if needsFreshTree {
+            // FIX #780: Clear FFI tree when forcing fresh tree
+            // This ensures we don't accumulate CMUs from previous failed scans
+            if hasPendingDeltaRescan {
+                print("🔧 FIX #780: Clearing FFI tree before fresh scan")
+                _ = ZipherXFFI.treeInit()
+            }
             treeInitialized = false
         }
 
@@ -1230,7 +1246,20 @@ final class FilterScanner {
 
             let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
             let fetchRate = Double(prefetchedBlocks.count) / max(prefetchDuration, 0.001)
+
+            // FIX #789: Count total shielded outputs fetched for debugging delta collection
+            var totalOutputsFetched = 0
+            var blocksWithOutputs = 0
+            for (_, txList) in prefetchedBlocks {
+                for (_, outputs, _) in txList {
+                    totalOutputsFetched += outputs.count
+                    if !outputs.isEmpty {
+                        blocksWithOutputs += 1
+                    }
+                }
+            }
             print("✅ FIX #190 v6: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+            print("📊 FIX #789: Fetched \(totalOutputsFetched) shielded outputs across \(blocksWithOutputs) blocks")
 
             // PROCESSING PHASE: Build commitment tree from pre-fetched blocks
             print("🔧 FIX #190: Processing \(prefetchedBlocks.count) blocks for commitment tree...")
@@ -1253,6 +1282,12 @@ final class FilterScanner {
                 for (height, txList) in blockData {
                     guard isScanning else { break }
 
+                    // FIX #786: Track per-block output index to avoid duplicate (height, index) keys
+                    // Problem: outputIndex from outputs.enumerated() is per-transaction, not per-block
+                    // If block has TX A (2 outputs) and TX B (1 output), both TX A[0] and TX B[0] got index=0
+                    // Solution: Use blockOutputIndex that increments across ALL transactions in a block
+                    var blockOutputIndex: UInt32 = 0
+
                     for (txid, outputs, spends) in txList {
                         // Process if there are outputs OR spends (for nullifier detection)
                         let hasOutputs = !outputs.isEmpty
@@ -1268,9 +1303,12 @@ final class FilterScanner {
                                         accountId: accountId,
                                         spendingKey: spendingKey,
                                         ivk: ivk,
-                                        height: height
+                                        height: height,
+                                        blockOutputStartIndex: blockOutputIndex  // FIX #786: Pass per-block index
                                     )
                                 }
+                                // FIX #786: Increment by number of outputs processed
+                                blockOutputIndex += UInt32(outputs.count)
                             } catch {
                                 print("⚠️ Error processing tx \(txid): \(error)")
                             }
@@ -1407,7 +1445,12 @@ final class FilterScanner {
         // Previously delta save was AFTER FIX #524, causing "No delta CMUs found" error
         // DELTA BUNDLE: Save collected outputs for instant witness generation
         // FIX #558 v4: Debug logging
-        print("📦 FIX #558 v4: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count)")
+        // FIX #789: Enhanced logging for delta collection debugging
+        print("📦 FIX #789: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count), startHeight=\(deltaCollectionStartHeight)")
+        if deltaOutputsCollected.isEmpty && deltaCollectionEnabled {
+            print("⚠️ FIX #789: WARNING - Delta collection was enabled but NO outputs collected!")
+            print("⚠️ FIX #789: This could mean P2P fetch failed or blocks had no shielded outputs")
+        }
         if deltaCollectionEnabled && !deltaOutputsCollected.isEmpty {
             if let treeRoot = ZipherXFFI.treeRoot() {
                 let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
@@ -1707,8 +1750,9 @@ final class FilterScanner {
                             print("🔧 FIX #739 v3: Syncing witnesses with corrected global tree...")
 
                             // Load all witnesses into FFI WITNESSES array
-                            // Track mapping: FFI index -> note ID for extraction
-                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64)] = []
+                            // Track mapping: FFI index -> note ID + height for extraction
+                            // FIX #793: Track height so we can get anchor from HeaderStore
+                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64, noteHeight: UInt64)] = []
                             for noteData in validNotes {
                                 if !noteData.note.witness.isEmpty {
                                     let index = ZipherXFFI.treeLoadWitness(
@@ -1716,7 +1760,7 @@ final class FilterScanner {
                                         witnessLen: noteData.note.witness.count
                                     )
                                     if index != UInt64.max {
-                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
+                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id, noteHeight: noteData.note.height ?? 0))
                                     }
                                 }
                             }
@@ -1739,13 +1783,19 @@ final class FilterScanner {
 
                             // Extract updated witnesses and save to database using correct FFI indices
                             var rebuiltCount = 0
-                            for (ffiIndex, noteId) in loadedNotes {
+                            for (ffiIndex, noteId, noteHeight) in loadedNotes {
                                 if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
                                     if updatedWitness.count >= 100 {
                                         try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
 
-                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
+                                        // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
+                                        // Same pattern as FIX #757: HeaderStore is primary, witness root is fallback
+                                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
+                                            try? database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
+                                        } else if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
+                                            // Fallback to witness root only if header not available
                                             try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+                                            print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                                         }
                                         rebuiltCount += 1
                                     }
@@ -1767,12 +1817,78 @@ final class FilterScanner {
                             print("   Header root: \(header.hashFinalSaplingRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
 
                             // FIX #765: Delta CMUs are incomplete/corrupted - P2P scan missed some outputs
+                            // FIX #779: Prevent infinite loop - limit delta clearing attempts per session
+                            // FIX #782: Add GLOBAL limit across ALL sessions to break persistent loops
+                            let deltaRepairKey = "DeltaBundleRepairAttempts"
+                            let deltaRepairSessionKey = "DeltaBundleRepairSession"
+                            let globalRepairKey = "DeltaBundleGlobalRepairAttempts"  // FIX #782
+
+                            let currentSession = Int(Date().timeIntervalSince1970 / 300) // 5-minute sessions
+                            let lastSession = UserDefaults.standard.integer(forKey: deltaRepairSessionKey)
+                            var repairAttempts = UserDefaults.standard.integer(forKey: deltaRepairKey)
+                            var globalAttempts = UserDefaults.standard.integer(forKey: globalRepairKey)  // FIX #782
+
+                            // Reset session counter if new session
+                            if currentSession != lastSession {
+                                repairAttempts = 0
+                                UserDefaults.standard.set(currentSession, forKey: deltaRepairSessionKey)
+                            }
+
+                            // FIX #782: Check GLOBAL limit first (persists across app restarts)
+                            // After 5 total attempts, STOP trying - user must manually Full Rescan
+                            let maxGlobalAttempts = 5
+                            if globalAttempts >= maxGlobalAttempts {
+                                print("🛑 FIX #782: Max GLOBAL delta repair attempts (\(maxGlobalAttempts)) exceeded!")
+                                print("🛑 FIX #782: Breaking infinite loop - will NOT attempt any more repairs")
+                                print("🛑 FIX #782: P2P likely cannot fetch all CMUs - user MUST run 'Full Resync' in Settings")
+                                // Mark that we've given up on automatic repair
+                                UserDefaults.standard.set(true, forKey: "TreeRepairExhausted")
+                                // Don't clear delta or reset - just return and let app continue with boost-only tree
+                                return false
+                            }
+
+                            let maxRepairAttempts = 2
+                            if repairAttempts >= maxRepairAttempts {
+                                print("🛑 FIX #779: Max delta repair attempts (\(maxRepairAttempts)) reached this session")
+                                print("🛑 FIX #779: Skipping repair for this session (global attempts: \(globalAttempts)/\(maxGlobalAttempts))")
+                                // Don't clear delta or reset - just return and let app continue
+                                return false
+                            }
+
+                            repairAttempts += 1
+                            globalAttempts += 1  // FIX #782
+                            UserDefaults.standard.set(repairAttempts, forKey: deltaRepairKey)
+                            UserDefaults.standard.set(globalAttempts, forKey: globalRepairKey)  // FIX #782
+                            print("🔧 FIX #779: Delta repair attempt \(repairAttempts)/\(maxRepairAttempts) this session")
+                            print("🔧 FIX #782: Global repair attempt \(globalAttempts)/\(maxGlobalAttempts) total")
+
                             // Clear the corrupted delta bundle so next PHASE 2 scan will rebuild it properly
                             let currentDeltaCount = DeltaCMUManager.shared.loadDeltaCMUs()?.count ?? 0
                             print("🔧 FIX #765: Delta CMUs incomplete - clearing corrupted delta bundle")
                             print("   Delta had \(currentDeltaCount) CMUs but produced wrong tree root")
                             print("   Clearing delta bundle to force rebuild during next PHASE 2 scan")
                             DeltaCMUManager.shared.clearDeltaBundle()
+
+                            // FIX #778: CRITICAL - Reset the FFI tree to boost file state!
+                            // Without this, the FFI tree still has delta CMUs in memory even though:
+                            // 1. Delta manifest was cleared
+                            // 2. lastScannedHeight was reset to boost end
+                            // This causes WalletHealthCheck to see tree size > boost file but no manifest,
+                            // leading to validation at wrong height → mismatch → repair loop forever.
+                            print("🔧 FIX #778: Resetting FFI tree to boost file state...")
+                            if let serializedTree = try? await CommitmentTreeUpdater.shared.extractSerializedTree() {
+                                _ = ZipherXFFI.treeInit()  // Clear tree and delta CMUs (FIX #764, #771)
+                                if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                                    let resetTreeSize = ZipherXFFI.treeSize()
+                                    print("✅ FIX #778: FFI tree reset to boost file state (\(resetTreeSize) CMUs)")
+                                } else {
+                                    print("⚠️ FIX #778: Could not deserialize boost tree - treeInit already cleared delta CMUs")
+                                }
+                            } else {
+                                // Fallback: Just init the tree to clear delta CMUs
+                                _ = ZipherXFFI.treeInit()
+                                print("⚠️ FIX #778: Could not load boost tree - cleared delta CMUs via treeInit")
+                            }
 
                             // Also reset lastScannedHeight to boost file end so PHASE 2 rescans the full range
                             // This ensures we re-fetch all blocks and properly collect ALL shielded outputs
@@ -2130,6 +2246,8 @@ final class FilterScanner {
     /// Process shielded outputs from Insight API transaction (synchronous version for MainActor)
     /// IMPORTANT: Must be called sequentially per block to maintain tree order
     /// Also checks spends for nullifiers to detect spent notes
+    /// FIX #786: blockOutputStartIndex is the starting index for outputs in THIS transaction within the BLOCK
+    ///          (not per-transaction index) to avoid duplicate (height, index) keys in delta bundle
     @MainActor
     private func processShieldedOutputsSync(
         outputs: [ShieldedOutput],
@@ -2138,7 +2256,8 @@ final class FilterScanner {
         accountId: Int64,
         spendingKey: Data,
         ivk: Data,
-        height: UInt64
+        height: UInt64,
+        blockOutputStartIndex: UInt32 = 0  // FIX #786: Per-block output index (not per-tx)
     ) throws {
         // FIX #690: Track if we detected any of our spends in this transaction
         // If we find our outputs later but didn't detect any spends, it's likely our transaction with a deleted note
@@ -2195,17 +2314,28 @@ final class FilterScanner {
             let epk = epkDisplay.reversedBytes()
             let cmu = cmuDisplay.reversedBytes()
 
+            // FIX #786: Calculate per-BLOCK output index (not per-transaction)
+            // blockOutputStartIndex is where this TX's outputs start within the block
+            // outputIndex is the position within THIS transaction
+            // Combined = unique index within the BLOCK for the delta bundle key
+            let blockOutputIndex = blockOutputStartIndex + UInt32(outputIndex)
+
             // DELTA BUNDLE: Collect output for local caching (enables instant witness generation)
             // Format: 652 bytes = height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
             if deltaCollectionEnabled {
                 let deltaOutput = DeltaCMUManager.DeltaOutput(
                     height: UInt32(height),
-                    index: UInt32(outputIndex),
+                    index: blockOutputIndex,  // FIX #786: Use per-block index, not per-tx
                     cmu: cmu,
                     epk: epk,
                     ciphertext: encCiphertext
                 )
                 deltaOutputsCollected.append(deltaOutput)
+
+                // FIX #789: Log delta collection progress every 100 outputs
+                if deltaOutputsCollected.count % 100 == 1 || deltaOutputsCollected.count == 1 {
+                    print("📦 FIX #789: Collecting delta output \(deltaOutputsCollected.count) at height \(height)")
+                }
             }
 
             // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
@@ -3399,9 +3529,15 @@ final class FilterScanner {
 
                 if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
                     try database.updateNoteWitness(noteId: note.id, witness: result.witness)
-                    // Extract anchor from witness and save it - enables INSTANT mode!
-                    if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                    // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
+                    // Same pattern as FIX #757: HeaderStore is primary, witness root is fallback
+                    let noteHeight = note.height ?? 0
+                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
+                        try database.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
+                    } else if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                        // Fallback to witness root only if header not available
                         try database.updateNoteAnchor(noteId: note.id, anchor: anchor)
+                        print("   ⚠️ FIX #793: Note \(note.id) using witness root (no header at \(noteHeight))")
                     }
                 }
 
@@ -3442,13 +3578,17 @@ final class FilterScanner {
             }
 
             // Collect all CMUs that need witnesses
+            // FIX #793: Also track note height for HeaderStore anchor lookup
             var targetCMUs: [Data] = []
             var noteIdMap: [Int: Int64] = [:]
+            var noteHeightMap: [Int: UInt64] = [:]  // FIX #793
 
             for note in notesNeedingWitness {
                 guard let cmu = note.cmu, cmu.count == 32 else { continue }
                 targetCMUs.append(cmu)
-                noteIdMap[targetCMUs.count - 1] = note.id
+                let idx = targetCMUs.count - 1
+                noteIdMap[idx] = note.id
+                noteHeightMap[idx] = note.height ?? 0  // FIX #793
             }
 
             guard !targetCMUs.isEmpty else {
@@ -3502,14 +3642,20 @@ final class FilterScanner {
             // Update database with computed witnesses AND anchors
             // FIX #197: treeLoadWithWitnesses stores tree in GLOBAL memory, so witnesses
             // match the global tree's anchor. Extract anchor from witness for INSTANT mode.
+            // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
             var successCount = 0
             for (index, result) in results.enumerated() {
                 guard let noteId = noteIdMap[index] else { continue }
                 if let (_, witness) = result {
                     try database.updateNoteWitness(noteId: noteId, witness: witness)
-                    // Extract anchor from witness and save it - enables INSTANT mode!
-                    if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                    // FIX #793: HeaderStore is primary source for anchor, witness root is fallback
+                    let noteHeight = noteHeightMap[index] ?? 0
+                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
+                        try database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
+                    } else if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                        // Fallback to witness root only if header not available
                         try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                        print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                     }
                     successCount += 1
                 }
@@ -3542,8 +3688,13 @@ final class FilterScanner {
                         guard let noteId = noteIdMap[index] else { continue }
                         if let (_, witness) = result {
                             try database.updateNoteWitness(noteId: noteId, witness: witness)
-                            if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                            // FIX #793: HeaderStore is primary source for anchor, witness root is fallback
+                            let noteHeight = noteHeightMap[index] ?? 0
+                            if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
+                                try database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
+                            } else if let anchor = ZipherXFFI.witnessGetRoot(witness) {
                                 try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
+                                print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                             }
                             retrySuccessCount += 1
                         }
