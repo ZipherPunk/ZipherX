@@ -3227,6 +3227,23 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
     };
     *pos_guard = position;
 
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is deserialized
+    // Without this, stale CMUs from previous session remain in memory
+    // When FIX #524 repair runs, it reads these stale CMUs and appends them AGAIN
+    // causing wrong CMU count (e.g., 420 instead of ~89 expected) and tree root mismatch
+    // This is the same fix pattern as FIX #764 in treeInit()
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree deserialize", old_count);
+        }
+    }
+
     true
 }
 
@@ -3310,6 +3327,20 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         None => return false,
     };
     *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded from CMUs
+    // Same fix as in tree_deserialize - prevents stale delta CMUs from corrupting tree root
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load from CMUs", old_count);
+        }
+    }
 
     debug_log!("✅ Tree loaded with {} commitments", count);
 
@@ -3406,6 +3437,20 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
         None => return false,
     };
     *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded with progress
+    // Same fix as in tree_deserialize and tree_load_from_cmus
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with progress", old_count);
+        }
+    }
 
     debug_log!("✅ Tree loaded with {} commitments", count);
 
@@ -3648,6 +3693,20 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
 
     let mut pos_guard = TREE_POSITION.lock().unwrap();
     *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded with witnesses
+    // Same fix as in tree_deserialize and other tree load functions
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with witnesses", old_count);
+        }
+    }
 
     let tree_time = start_time.elapsed();
     debug_log!("⏱️ FIX #197: Tree loaded in {:.1}s, found {}/{} targets",

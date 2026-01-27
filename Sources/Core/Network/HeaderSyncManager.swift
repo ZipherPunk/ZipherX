@@ -1440,18 +1440,26 @@ final class HeaderSyncManager {
                 prevHashFromHeaderStore = true
                 // FIX #707: Removed per-batch HeaderStore log (too spammy)
             } else {
-                // Fallback: Use nearest checkpoint
-                let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
-                for checkpointHeight in checkpoints {
-                    if checkpointHeight <= prevHeight {
-                        if let checkpointHex = ZclassicCheckpoints.mainnet[checkpointHeight],
-                           let hashData = Data(hexString: checkpointHex) {
-                            prevHash = Data(hashData.reversed())
-                            prevHashFromHeaderStore = false
-                            print("📋 FIX #670: Using checkpoint at \(checkpointHeight) for height \(prevHeight)")
-                            break
-                        }
-                    }
+                // FIX #772: ONLY use checkpoint if it's EXACTLY at prevHeight
+                // Using a checkpoint from an earlier height (e.g., 476969 for prevHeight 523360)
+                // will ALWAYS cause chain mismatch because the checkpoint hash is for a
+                // different block than the incoming header's hashPrevBlock.
+                //
+                // Previous logic (WRONG): Used nearest checkpoint at checkpointHeight <= prevHeight
+                // This caused massive chain mismatch spam for all headers between checkpoints.
+                //
+                // New logic (FIX #772): Only use checkpoint if checkpointHeight == prevHeight
+                // If no exact match, leave prevHash = nil so chain verification is skipped
+                // for the first header (just like index == 0 case).
+                if let checkpointHex = ZclassicCheckpoints.mainnet[prevHeight],
+                   let hashData = Data(hexString: checkpointHex) {
+                    prevHash = Data(hashData.reversed())
+                    prevHashFromHeaderStore = false
+                    print("📋 FIX #772: Using exact checkpoint at height \(prevHeight)")
+                } else {
+                    // No header in store and no checkpoint at prevHeight
+                    // Skip chain verification for first header (prevHash stays nil)
+                    print("ℹ️ FIX #772: No header/checkpoint at \(prevHeight) - skipping first header verification")
                 }
             }
         }

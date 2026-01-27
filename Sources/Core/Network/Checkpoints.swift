@@ -8,23 +8,13 @@ enum ZclassicCheckpoints {
 
     /// Known valid blocks on Zclassic mainnet
     /// Format: [height: blockHash]
+    /// FIX #774: Removed FAKE placeholder checkpoints (10000-500000) that were causing
+    /// chain mismatch errors. Only real verified checkpoints are kept.
     static let mainnet: [UInt64: String] = [
+        // Genesis block - verified
         0: "0007104ccda289427919efc39dc9e4d499804b7bebc22df55f8b834301260602",
+        // Early checkpoint - verified
         5000: "000000215f7c64f31ff4d4f153c6f85ef665dd87af7f6de42b9be7869a5b44b8",
-        10000: "00000002ccb7ae7a66b7c8ae7144f209fa44d4b7b0000f00000000000000000a",
-        20000: "0000000008f5af6f9fbd6b5c0e0e3d5c8e6b2a2d1e9f8c7b6a5d4c3b2a1e0f0d",
-        30000: "00000000068e2e9b3b6d5f4a3c2b1e0d9c8b7a6f5e4d3c2b1a0e9f8d7c6b5a4",
-        50000: "00000000045a5e6f7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7089a1b2c3",
-        75000: "000000000321abcdef0123456789abcdef0123456789abcdef0123456789abcd",
-        100000: "00000000023456789abcdef0123456789abcdef0123456789abcdef01234567",
-        150000: "000000000198765432fedcba9876543210fedcba9876543210fedcba987654",
-        200000: "0000000001abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        250000: "00000000012345678901234567890123456789012345678901234567890123",
-        300000: "000000000fedcba9876543210fedcba9876543210fedcba9876543210fedcba",
-        350000: "0000000009876543210fedcba9876543210fedcba9876543210fedcba98765",
-        400000: "00000000076543210fedcba9876543210fedcba9876543210fedcba9876543",
-        450000: "00000000054321fedcba9876543210fedcba9876543210fedcba987654321",
-        500000: "0000000003210fedcba9876543210fedcba9876543210fedcba98765432100",
 
         // Sapling activation height for Zclassic
         // This is where shielded (z-addr) transactions become available

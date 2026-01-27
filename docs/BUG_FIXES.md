@@ -8,6 +8,59 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #772: Chain Mismatch Spam from Wrong Checkpoint Fallback Logic
+**Problem**: Repeated "Chain mismatch at height X - will trust peer" warnings every ~320 blocks during header sync. The app logs massive chain mismatch spam but continues syncing.
+
+**Log Evidence** (before fix):
+```
+[05:35:44.640] ⚠️ Chain mismatch at height 523361 - will trust peer
+[05:35:44.722] ⚠️ Chain mismatch at height 523681 - will trust peer
+[05:35:44.814] ⚠️ Chain mismatch at height 524001 - will trust peer
+...repeating every 320 blocks...
+```
+
+**Root Cause Analysis**:
+1. When syncing headers, the code verifies chain continuity by checking `header.hashPrevBlock == prevHash`
+2. For the first header in a batch, it needs to know the previous block's hash
+3. If HeaderStore doesn't have the previous block, it falls back to checkpoints
+4. **BUG**: The fallback used `getNearestCheckpoint(before: prevHeight)` which returns a checkpoint at an **earlier** height
+5. For example, when syncing height 523361:
+   - `prevHeight = 523360`
+   - Nearest checkpoint might be at height 500000 (or 476969 after FIX #774)
+   - The checkpoint hash is for block **500000**, not block **523360**
+   - Incoming header's `hashPrevBlock` points to block **523360**
+   - These are different blocks → **GUARANTEED MISMATCH**
+
+**Why every 320 blocks?**:
+- P2P protocol sends headers in batches of up to 160
+- With 2-3 peers, batches of ~320 blocks are common
+- Each new batch resets `prevHash` from checkpoint → immediate mismatch
+
+**Solution** (FIX #772): Only use checkpoint if it's EXACTLY at `prevHeight`:
+```swift
+// OLD (WRONG): Used nearest checkpoint at checkpointHeight <= prevHeight
+let checkpoints = ZclassicCheckpoints.mainnet.keys.sorted(by: >)
+for checkpointHeight in checkpoints {
+    if checkpointHeight <= prevHeight { ... }  // WRONG!
+}
+
+// NEW (FIX #772): Only use checkpoint if exactly at prevHeight
+if let checkpointHex = ZclassicCheckpoints.mainnet[prevHeight] {
+    prevHash = Data(hashData.reversed())
+} else {
+    // No exact match - skip chain verification for first header
+    // (just like index == 0 case)
+    prevHash = nil
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift` - Fixed checkpoint fallback logic in `verifyHeaderChain()`
+
+**Result**: No more chain mismatch spam. When there's no header or checkpoint at `prevHeight`, the first header's chain verification is skipped (safe because within-batch verification still works).
+
+---
+
 ### FIX #770: FAST START Progress Stuck at ~83% During Witness Sync
 **Problem**: App stuck at 83% overall progress while header sync shows 99%. Progress doesn't complete even though startup tasks are running.
 
@@ -38,6 +91,62 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 **Files Modified**:
 - `Sources/App/ContentView.swift` - `currentSyncProgress` and `currentSyncTasks` computed properties
+
+---
+
+### FIX #771: Delta CMUs Not Cleared on Tree Deserialize/Load (Tree Root Mismatch)
+**Problem**: Tree root mismatch persists even after FIX #524 repair attempts. Boost tree root matches header at 2988797 ✅, but after appending delta CMUs, tree root doesn't match header at 2990287 ❌.
+
+**Log Evidence**:
+```
+✅ FIX #744: Boost tree root MATCHES header at 2988797!
+🔧 FIX #524: Appending delta CMUs from height 2988798 to 2990287...
+🔧 FIX #739 v4: Exporting 420 delta CMUs from memory  <-- WRONG! Should be ~89
+🔧 FIX #524: Appended 420 delta CMUs
+⚠️ FIX #524: Tree root still doesn't match blockchain
+```
+
+**Root Cause Analysis**:
+1. **FIX #764** correctly clears `DELTA_CMUS` in `treeInit()` ✅
+2. **BUT** `treeDeserialize()`, `tree_load_from_cmus()`, and other tree load functions do NOT clear `DELTA_CMUS` ❌
+3. When FIX #524 repair runs:
+   - `treeDeserialize()` loads the boost tree (1,045,687 CMUs) from serialized data
+   - But `DELTA_CMUS` still has **stale CMUs from previous append operations**
+   - FIX #524 reads these stale CMUs and appends them AGAIN to the fresh tree
+   - This causes **wrong CMU count** (420 instead of ~89 expected)
+   - Tree root mismatches because wrong/duplicate CMUs were appended
+
+**Why 420 instead of 89?**:
+- First FIX #524 attempt: 210 stale CMUs in memory
+- Second FIX #524 attempt: 420 stale CMUs (doubled because they were appended again but not cleared)
+- Real delta CMUs from P2P: Only ~89 outputs for the 1,489 block range
+
+**Solution**: Clear `DELTA_CMUS` in ALL tree load/deserialize functions (same pattern as FIX #764 in `treeInit()`):
+1. `zipherx_tree_deserialize()` - Deserialize from persistence
+2. `zipherx_tree_load_from_cmus()` - Load from raw CMU data
+3. `zipherx_tree_load_from_cmus_with_progress()` - Load with progress callback
+4. `zipherx_tree_load_with_witnesses()` - Load and create witnesses in single pass
+
+```rust
+// FIX #771: CRITICAL - Clear delta CMUs when tree is loaded/deserialized
+// Without this, stale CMUs from previous session remain in memory
+{
+    let mut delta_guard = match DELTA_CMUS.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let old_count = delta_guard.len();
+    delta_guard.clear();
+    if old_count > 0 {
+        debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree deserialize", old_count);
+    }
+}
+```
+
+**Files Modified**:
+- `Libraries/zipherx-ffi/src/lib.rs` - Added delta CMU clearing to 4 tree load functions
+
+**Result**: Tree root now matches blockchain after FIX #524 repair because stale delta CMUs are cleared before appending real ones
 
 ---
 
