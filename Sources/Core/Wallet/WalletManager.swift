@@ -5111,6 +5111,19 @@ final class WalletManager: ObservableObject {
         print("✅ FIX #577 v12: All tasks completed, progress at 100%")
         print("✅ Database repair complete - full resync finished")
 
+        // FIX #816: CRITICAL - Set isTreeLoaded = true after Full Rescan completes
+        // Problem: FIX #729 sets isTreeLoaded = false at line 4882 but never sets it back
+        // Root Cause: checkAndCatchUp() has `guard isTreeLoaded else { return }` at line 1948
+        //   - Full Rescan sets isTreeLoaded = false during initialization
+        //   - FilterScanner loads tree but doesn't set isTreeLoaded flag
+        //   - checkAndCatchUp() silently returns without doing anything
+        //   - Wallet stays behind chain tip (138 blocks in the reported bug)
+        // Solution: Set isTreeLoaded = true before calling checkAndCatchUp()
+        await MainActor.run {
+            self.isTreeLoaded = true
+        }
+        print("✅ FIX #816: Set isTreeLoaded = true after Full Rescan (enables catch-up sync)")
+
         // FIX #766: Trigger immediate catch-up sync after Full Rescan completes
         // Problem: After Full Rescan finishes, wallet stays behind chain tip (e.g., 451 blocks)
         // Root Cause: backgroundSyncToHeight() only runs from fetchNetworkStats() on 15s timer

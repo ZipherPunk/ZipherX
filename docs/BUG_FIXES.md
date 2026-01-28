@@ -8,6 +8,77 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #814: CRITICAL - stopBlockListener() Hangs Indefinitely (PHASE 2 Stuck)
+**Problem**: PHASE 2 block scanning gets stuck because `stopAllBlockListeners()` hangs forever
+
+**Symptoms**:
+- Log shows: "🛑 FIX #462: Stopping block listeners before header sync..."
+- Never shows: "🛑 FIX #462: Block listeners stopped, starting header sync..."
+- PHASE 2 never completes, initial sync stuck
+- Peers showing "Invalid magic bytes" errors (TCP stream desync)
+
+**Root Cause**: FIX #509 v3's `await task.value` waits indefinitely if block listener task is stuck:
+```swift
+// This can hang FOREVER if task doesn't respond to cancel
+_ = await task.value
+```
+- If peer has corrupted TCP stream, listener may be stuck in receive
+- If peer is waiting on a lock, listener won't exit
+- `stopAllBlockListeners()` waits for ALL peers, one stuck peer blocks everything
+
+**Solution**: Add 2-second timeout using Task group race pattern:
+```swift
+// FIX #814: Race between task completion and 2s timeout
+let completed = await withTaskGroup(of: Bool.self) { group in
+    group.addTask { await waitTask.value }
+    group.addTask { await timeoutTask.value }  // 2 second timeout
+    if let first = await group.next() {
+        group.cancelAll()
+        return first
+    }
+    return false
+}
+if !completed {
+    print("⚠️ FIX #814: [\(host)] Block listener stop timed out after 2s - proceeding anyway")
+}
+```
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` (stopBlockListener function)
+
+---
+
+### FIX #816: CRITICAL - Catch-Up Sync Silently Skipped After Full Rescan (138 Blocks Behind)
+**Problem**: After Full Rescan completes, wallet shows "138 blocks behind chain" and catch-up sync never runs
+
+**Symptoms**:
+- Full Rescan completes successfully (lastScannedHeight = 2992179)
+- Health check immediately reports "Wallet is 138 blocks behind chain"
+- FIX #766 triggers catch-up sync but it silently does nothing
+- SEND feature blocked, wallet never catches up automatically
+
+**Root Cause Analysis**:
+1. Full Rescan initialization (line 4882) sets `isTreeLoaded = false`
+2. FIX #729 added this reset to ensure FFI tree is properly cleared
+3. FilterScanner loads tree during PHASE 1/2 but doesn't set `isTreeLoaded` flag
+4. Full Rescan completes and calls `checkAndCatchUp()` (FIX #766)
+5. `checkAndCatchUp()` has guard: `guard isTreeLoaded else { return }`
+6. Since `isTreeLoaded` is still `false`, function returns immediately
+7. Wallet stays behind chain tip indefinitely
+
+**Key Insight**: The tree IS loaded in FFI, but the Swift `isTreeLoaded` flag was never set back to `true` after Full Rescan.
+
+**Solution**: FIX #816 - Set `isTreeLoaded = true` before calling `checkAndCatchUp()`
+- Added `self.isTreeLoaded = true` in MainActor.run block after Full Rescan completes
+- Placed BEFORE the `checkAndCatchUp()` call so the guard passes
+- Added debug log to confirm flag is set
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift`:
+  - Line ~5113: Added `isTreeLoaded = true` before `checkAndCatchUp()` call
+
+---
+
 ### FIX #815: False "Sync Lag 3377" Alert After Full Rescan - Stale walletHeight
 **Problem**: After Full Rescan completes, health check immediately shows "Wallet is 3377 blocks behind chain" and blocks SEND
 

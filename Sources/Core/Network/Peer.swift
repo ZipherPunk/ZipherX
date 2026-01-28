@@ -1273,6 +1273,7 @@ public final class Peer {
     /// Stop listening for block announcements
     /// FIX #509 v3: Wait for task to finish and release messageLock before returning
     /// This prevents race condition where header sync tries to acquire messageLock while listener holds it
+    /// FIX #814: Add 2s timeout to prevent indefinite hang if task is stuck
     func stopBlockListener() async {
         listenerLock.lock()
         _isListening = false  // Set flag first (checked by listener loop)
@@ -1284,16 +1285,40 @@ public final class Peer {
         // CRITICAL: We must wait because the task might be holding messageLock
         task?.cancel()
 
-        // Wait for task to finish and release messageLock
-        // The task holds messageLock during receive operations, so we must wait
+        // FIX #814: Wait for task with 2 second timeout
+        // If the task is stuck (e.g., peer with corrupted TCP stream), don't block forever
+        // The listener loop checks _isListening flag, so it SHOULD exit quickly after cancel
+        // But if it's stuck in a receive or waiting for a lock, we need to move on
         if let task = task {
-            do {
-                // Await the task value (will return when task finishes or is cancelled)
-                _ = await task.value
-            } catch is CancellationError {
-                // Expected - task was cancelled
-            } catch {
-                // Other errors - ignore, task is being stopped anyway
+            let waitTask = Task {
+                do {
+                    _ = await task.value
+                    return true
+                } catch {
+                    return true  // Task completed (even with error)
+                }
+            }
+
+            // Race: either task completes or we timeout after 2 seconds
+            let timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                return false
+            }
+
+            let completed = await withTaskGroup(of: Bool.self) { group in
+                group.addTask { await waitTask.value }
+                group.addTask { await timeoutTask.value }
+
+                // Return first result (either task completed or timeout)
+                if let first = await group.next() {
+                    group.cancelAll()
+                    return first
+                }
+                return false
+            }
+
+            if !completed {
+                print("⚠️ FIX #814: [\(host)] Block listener stop timed out after 2s - proceeding anyway")
             }
         }
 
