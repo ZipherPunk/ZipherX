@@ -955,6 +955,41 @@ final class WalletManager: ObservableObject {
                         }
                     } else {
                         print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
+
+                        // FIX #814: CRITICAL - Validate tree root against boost manifest when NO delta CMUs
+                        // Without this check, a corrupted database tree is accepted without validation
+                        // Previous bug: Tree root mismatch loop (18+ occurrences) because:
+                        //   1. Tree loaded from database with wrong root
+                        //   2. No delta CMUs to trigger FIX #755 validation
+                        //   3. Tree accepted without root check → health check fails → Full Rescan → repeat
+                        if let manifest = await CommitmentTreeUpdater.shared.loadCachedManifest(),
+                           let treeRoot = ZipherXFFI.treeRoot() {
+                            // Manifest tree_root is in display format (big-endian, reversed from wire)
+                            // FFI treeRoot() returns wire format (little-endian)
+                            // Convert manifest root to wire format for comparison
+                            if let manifestRootDisplay = Data(hexString: manifest.tree_root) {
+                                let manifestRootWire = Data(manifestRootDisplay.reversed())
+                                let rootsMatch = treeRoot == manifestRootWire
+
+                                if rootsMatch {
+                                    print("✅ FIX #814: Tree root validated against boost manifest")
+                                    print("   Tree root (wire):     \(treeRoot.prefix(16).hexString)...")
+                                    print("   Manifest root (wire): \(manifestRootWire.prefix(16).hexString)...")
+                                } else {
+                                    print("❌ FIX #814: CRITICAL - Database tree root MISMATCH!")
+                                    print("   Tree root (wire):     \(treeRoot.hexString)")
+                                    print("   Manifest root (wire): \(manifestRootWire.hexString)")
+                                    print("   This explains the persistent tree root mismatch loop!")
+                                    print("🗑️ FIX #814: Clearing corrupted database tree - will rebuild from boost file")
+                                    try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                    needsBoostReload = true
+                                }
+                            } else {
+                                print("⚠️ FIX #814: Could not parse manifest tree_root - skipping validation")
+                            }
+                        } else {
+                            print("⚠️ FIX #814: No manifest or tree root available - skipping validation")
+                        }
                     }
 
                     // FIX #756: If tree corruption detected, fall through to boost download
@@ -1728,10 +1763,17 @@ final class WalletManager: ObservableObject {
         print("📜 FIX #413: Checking for bundled headers in boost file...")
 
         // FIX #701: Skip if boost headers already loaded (prevents repeated loading)
+        // FIX #810: Must check if headers loaded up to FULL boost file height, not just "any headers exist"
+        // Previous bug: existingBoostHeight=2938860 (partial) would skip reload, missing ~50K headers
         let existingBoostHeight = HeaderStore.shared.boostFileEndHeight
-        if existingBoostHeight > 0 {
+        let expectedBoostHeight = ZipherXConstants.effectiveTreeHeight  // 2988797
+        if existingBoostHeight >= expectedBoostHeight {
             print("✅ FIX #701: Boost headers already loaded up to \(existingBoostHeight) - skipping reload")
             return (true, existingBoostHeight)
+        } else if existingBoostHeight > 0 {
+            // FIX #810: Partial headers exist - need to reload from boost file
+            print("⚠️ FIX #810: Partial boost headers detected (\(existingBoostHeight) < \(expectedBoostHeight))")
+            print("⚠️ FIX #810: Will reload full boost headers to avoid slow P2P sync")
         }
 
         // FIX #675: Check if boost headers were marked as corrupted

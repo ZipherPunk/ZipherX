@@ -1098,9 +1098,17 @@ final class HeaderStore {
             }
         }
 
-        // Process in chunks of 10,000 to avoid out-of-memory errors
-        let chunkSize = 10000
+        // FIX #812: PERFORMANCE OPTIMIZATION - Target: < 20 seconds for 2.5M headers
+        // Previous: ~100+ seconds due to per-header allocations and per-chunk transactions
+        // Optimizations:
+        // 1. Single transaction for entire operation (not per-chunk)
+        // 2. Direct pointer arithmetic instead of Data subscript allocations
+        // 3. Pre-allocated buffer for reversed hashes (reused each iteration)
+        // 4. Reduced Thread.sleep frequency (every 100K instead of every 10K)
+        // 5. SQLITE_STATIC for pointer binds (data valid during sqlite3_step)
+
         var processedCount = 0
+        let startTime = CFAbsoluteTimeGetCurrent()
 
         let sql = """
             INSERT OR REPLACE INTO headers
@@ -1108,183 +1116,147 @@ final class HeaderStore {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
-        // FIX #457 v2: Parse variable-length headers (140 + varint + 400 bytes solution)
         var byteOffset = 0
         let dataCount = data.count
 
-        print("📜 FIX #457 DEBUG: About to enter data.withUnsafeBytes, headerCount=\(headerCount)")
+        print("📜 FIX #812: Starting optimized header load for \(headerCount) headers")
 
-        try data.withUnsafeBytes { ptr in
-            var headerIndex = 0
-            var debugEnteredLoop = false
-
-            while headerIndex < headerCount && byteOffset < dataCount {
-                if !debugEnteredLoop {
-                    debugEnteredLoop = true
-                    print("📜 FIX #457: ENTERED while loop! headerIndex=\(headerIndex), headerCount=\(headerCount), byteOffset=\(byteOffset), dataCount=\(dataCount)")
-                }
-
-                if headerIndex == 0 {
-                    print("📜 FIX #457: Processing first header at height \(startHeight)")
-                }
-
-                if headerIndex % 100000 == 0 {
-                    print("📜 FIX #457 DEBUG: Processing header \(headerIndex)/\(headerCount), byteOffset=\(byteOffset)")
-                }
-                // Begin transaction for this chunk
-                guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
-                    throw DatabaseError.insertFailed("Failed to begin transaction")
-                }
-
-                var stmt: OpaquePointer?
-                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-                }
-
-                let endIndex = min(headerIndex + chunkSize, headerCount)
-                let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
-                while headerIndex < endIndex && byteOffset < dataCount {
-                    let height = startHeight + UInt64(headerIndex)
-
-                    // Parse header fields (first 140 bytes) - use Data subscripts to avoid alignment issues
-                    guard byteOffset + 140 <= dataCount else {
-                        sqlite3_finalize(stmt)
-                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                        throw DatabaseError.insertFailed("Unexpected end of boost file data")
-                    }
-
-                    // Helper to read UInt32 from Data at offset
-                    func readUInt32(_ offset: Int) -> UInt32 {
-                        return UInt32(data[offset]) |
-                               UInt32(data[offset + 1]) << 8 |
-                               UInt32(data[offset + 2]) << 16 |
-                               UInt32(data[offset + 3]) << 24
-                    }
-
-                    let version = readUInt32(byteOffset)
-                    let prevHash = Data(data[byteOffset + 4..<byteOffset + 36])
-                    let merkleRoot = Data(data[byteOffset + 36..<byteOffset + 68])
-                    let saplingRoot = Data(data[byteOffset + 68..<byteOffset + 100])
-                    let time = readUInt32(byteOffset + 100)
-                    let bits = readUInt32(byteOffset + 104)
-                    let nonce = Data(data[byteOffset + 108..<byteOffset + 140])
-
-                    // FIX #457: Use pre-computed block hash if available, else compute (SLOW!)
-                    let blockHash: Data
-                    if let hashes = blockHashes, headerIndex < hashes.count / 32 {
-                        // Use pre-computed hash from boost file (instant!)
-                        let hashOffset = headerIndex * 32
-                        let hashData = hashes[hashOffset..<hashOffset + 32]
-                        // FIX #809: Convert from big-endian (RPC/display format) to little-endian (wire format)
-                        // The boost file stores hashes in RPC format (big-endian, human-readable hex)
-                        // But HeaderStore needs wire format (little-endian) for P2P chain verification
-                        // Without this reversal, chain mismatch occurs at boost file boundary (e.g., height 2988798)
-                        // because P2P header.hashPrevBlock is in wire format, but HeaderStore.blockHash was big-endian
-                        blockHash = Data(hashData.reversed())
-                    } else {
-                        // Fallback: compute block hash from header (SLOW - 1+ minute!)
-                        let headerData = Data(bytes: ptr.baseAddress! + byteOffset, count: 140)
-                        blockHash = computeBlockHash(headerData)
-                    }
-
-                    sqlite3_reset(stmt)
-                    sqlite3_bind_int64(stmt, 1, Int64(height))
-                    blockHash.withUnsafeBytes { hashPtr in
-                        sqlite3_bind_blob(stmt, 2, hashPtr.baseAddress, Int32(blockHash.count), SQLITE_TRANSIENT)
-                    }
-                    prevHash.withUnsafeBytes { hashPtr in
-                        sqlite3_bind_blob(stmt, 3, hashPtr.baseAddress, Int32(prevHash.count), SQLITE_TRANSIENT)
-                    }
-                    merkleRoot.withUnsafeBytes { hashPtr in
-                        sqlite3_bind_blob(stmt, 4, hashPtr.baseAddress, Int32(merkleRoot.count), SQLITE_TRANSIENT)
-                    }
-                    saplingRoot.withUnsafeBytes { hashPtr in
-                        sqlite3_bind_blob(stmt, 5, hashPtr.baseAddress, Int32(saplingRoot.count), SQLITE_TRANSIENT)
-                    }
-                    sqlite3_bind_int64(stmt, 6, Int64(time))
-                    sqlite3_bind_int64(stmt, 7, Int64(bits))
-                    nonce.withUnsafeBytes { hashPtr in
-                        sqlite3_bind_blob(stmt, 8, hashPtr.baseAddress, Int32(nonce.count), SQLITE_TRANSIENT)
-                    }
-                    sqlite3_bind_int64(stmt, 9, Int64(version))
-
-                    let stepResult = sqlite3_step(stmt)
-                    if stepResult != SQLITE_DONE {
-                        let error = String(cString: sqlite3_errmsg(db))
-                        print("❌ FIX #457: INSERT FAILED at header \(headerIndex) height \(height): \(error) (code \(stepResult))")
-                        sqlite3_finalize(stmt)
-                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                        throw DatabaseError.insertFailed(error)
-                    }
-
-                    if headerIndex == 0 {
-                        print("✅ FIX #457: First INSERT succeeded at height \(height)")
-                    }
-                    if headerIndex == 1 {
-                        print("✅ FIX #457: Second INSERT succeeded at height \(height)")
-                    }
-
-                    // FIX #457 v10: Parse solution size from boost file format
-                    // Boost file uses uint16 (2 bytes) NOT varint for solution length!
-                    byteOffset += 140  // Skip compact header
-
-                    // Read solution length as uint16 (2 bytes, little-endian)
-                    guard byteOffset + 2 <= dataCount else {
-                        print("❌ FIX #457: Missing solution length at header \(headerIndex)")
-                        sqlite3_finalize(stmt)
-                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                        throw DatabaseError.insertFailed("Missing solution length")
-                    }
-
-                    let solutionSize = Int(data[byteOffset]) | (Int(data[byteOffset + 1]) << 8)
-                    byteOffset += 2  // Skip 2-byte solution length
-
-                    if byteOffset + solutionSize > dataCount {
-                        print("❌ FIX #457: Solution size \(solutionSize) exceeds data bounds at header \(headerIndex)")
-                        sqlite3_finalize(stmt)
-                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                        throw DatabaseError.insertFailed("Solution size exceeds data bounds")
-                    }
-
-                    if headerIndex == 0 {
-                        print("📊 FIX #457: First header solutionSize=\(solutionSize) bytes")
-                    }
-
-                    // Skip Equihash solution
-                    byteOffset += solutionSize
-                    headerIndex += 1
-                }
-
-                sqlite3_finalize(stmt)
-
-                // Commit this chunk
-                guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                    throw DatabaseError.insertFailed("Failed to commit transaction")
-                }
-
-                processedCount = headerIndex
-
-                // Progress log every 100k entries
-                if processedCount % 100000 == 0 || processedCount == headerCount {
-                    print("📜 FIX #457: Inserted \(processedCount)/\(headerCount) headers...")
-                }
-
-                // FIX #468: Report progress after each chunk
-                // FIX #485: Add log to verify callback is being invoked
-                let progressValue = Double(processedCount) / Double(headerCount)
-                print("🔧 FIX #485: Calling onProgress callback with \(Int(progressValue * 100))%")
-                onProgress?(progressValue)
-
-                // FIX #494 v2: Yield longer to allow UI updates during tight loop
-                // 10ms gives enough time for DispatchQueue.main.async to execute
-                // Without this, main thread is blocked and UI never updates
-                Thread.sleep(forTimeInterval: 0.01)
-            }
+        // FIX #812: Single transaction for entire operation
+        guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.insertFailed("Failed to begin transaction")
         }
 
-        print("✅ FIX #457: Loaded \(headerCount) headers into HeaderStore")
+        // FIX #812: Prepare statement ONCE for all headers
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        // FIX #812: Pre-allocate buffer for reversed hash (reused for each header)
+        var reversedHashBuffer = [UInt8](repeating: 0, count: 32)
+
+        // FIX #812: Inner processing function to avoid nested optional closures
+        func processHeaders(dataPtr: UnsafeRawBufferPointer, hashesPtr: UnsafeRawBufferPointer?) throws {
+            let basePtr = dataPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            let hashesBasePtr = hashesPtr?.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            let hashesCount = hashesPtr?.count ?? 0
+
+            var headerIndex = 0
+            var currentOffset = byteOffset
+
+            while headerIndex < headerCount && currentOffset < dataCount {
+                guard currentOffset + 140 <= dataCount else {
+                    throw DatabaseError.insertFailed("Unexpected end of boost file data at header \(headerIndex)")
+                }
+
+                let height = startHeight + UInt64(headerIndex)
+                let headerPtr = basePtr + currentOffset
+
+                // FIX #812: Direct pointer reads - no Data allocations!
+                let version = UInt32(headerPtr[0]) | UInt32(headerPtr[1]) << 8 | UInt32(headerPtr[2]) << 16 | UInt32(headerPtr[3]) << 24
+                let time = UInt32(headerPtr[100]) | UInt32(headerPtr[101]) << 8 | UInt32(headerPtr[102]) << 16 | UInt32(headerPtr[103]) << 24
+                let bits = UInt32(headerPtr[104]) | UInt32(headerPtr[105]) << 8 | UInt32(headerPtr[106]) << 16 | UInt32(headerPtr[107]) << 24
+
+                // Pointers to 32-byte fields (no copy needed)
+                let prevHashPtr = headerPtr + 4
+                let merkleRootPtr = headerPtr + 36
+                let saplingRootPtr = headerPtr + 68
+                let noncePtr = headerPtr + 108
+
+                // FIX #812: Block hash with minimal allocation
+                if let hashesBase = hashesBasePtr, headerIndex < hashesCount / 32 {
+                    // FIX #809: Reverse bytes in-place to reusable buffer
+                    let srcPtr = hashesBase + (headerIndex * 32)
+                    for i in 0..<32 {
+                        reversedHashBuffer[31 - i] = srcPtr[i]
+                    }
+                } else {
+                    // Fallback: compute hash (SLOW but rare path)
+                    let headerData = Data(bytes: headerPtr, count: 140)
+                    let computedHash = computeBlockHash(headerData)
+                    computedHash.withUnsafeBytes { ptr in
+                        ptr.copyBytes(to: UnsafeMutableBufferPointer(start: &reversedHashBuffer, count: 32))
+                    }
+                }
+
+                // FIX #812: Bind and execute within same scope where buffer pointers are valid
+                sqlite3_reset(stmt)
+                sqlite3_bind_int64(stmt, 1, Int64(height))
+
+                // Must bind and step while reversedHashBuffer pointer is valid
+                let stepResult: Int32 = reversedHashBuffer.withUnsafeBufferPointer { hashBufPtr in
+                    sqlite3_bind_blob(stmt, 2, hashBufPtr.baseAddress, 32, nil)
+                    sqlite3_bind_blob(stmt, 3, prevHashPtr, 32, nil)
+                    sqlite3_bind_blob(stmt, 4, merkleRootPtr, 32, nil)
+                    sqlite3_bind_blob(stmt, 5, saplingRootPtr, 32, nil)
+                    sqlite3_bind_int64(stmt, 6, Int64(time))
+                    sqlite3_bind_int64(stmt, 7, Int64(bits))
+                    sqlite3_bind_blob(stmt, 8, noncePtr, 32, nil)
+                    sqlite3_bind_int64(stmt, 9, Int64(version))
+                    return sqlite3_step(stmt)
+                }
+                if stepResult != SQLITE_DONE {
+                    let error = String(cString: sqlite3_errmsg(db))
+                    throw DatabaseError.insertFailed("INSERT FAILED at header \(headerIndex): \(error)")
+                }
+
+                // Skip to next header: 140 bytes header + 2 bytes solution length + solution
+                currentOffset += 140
+                guard currentOffset + 2 <= dataCount else {
+                    throw DatabaseError.insertFailed("Missing solution length at header \(headerIndex)")
+                }
+                let solutionSize = Int(basePtr[currentOffset]) | (Int(basePtr[currentOffset + 1]) << 8)
+                currentOffset += 2 + solutionSize
+
+                headerIndex += 1
+
+                // FIX #812: Progress updates every 100K (not every 10K)
+                if headerIndex % 100000 == 0 {
+                    processedCount = headerIndex
+                    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                    let rate = Double(headerIndex) / elapsed
+                    print("📜 FIX #812: \(processedCount)/\(headerCount) headers (\(Int(rate))/sec)")
+                    onProgress?(Double(processedCount) / Double(headerCount))
+
+                    // Yield briefly for UI - only every 100K headers
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+            }
+
+            processedCount = headerIndex
+            byteOffset = currentOffset
+        }
+
+        do {
+            // FIX #812: Use withUnsafeBytes properly for both data sources
+            try data.withUnsafeBytes { dataPtr in
+                if let hashes = blockHashes {
+                    try hashes.withUnsafeBytes { hashesPtr in
+                        try processHeaders(dataPtr: dataPtr, hashesPtr: hashesPtr)
+                    }
+                } else {
+                    try processHeaders(dataPtr: dataPtr, hashesPtr: nil)
+                }
+            }
+
+            sqlite3_finalize(stmt)
+
+            // FIX #812: Single commit for all headers
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.insertFailed("Failed to commit transaction")
+            }
+
+            let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+            let rate = Double(headerCount) / totalTime
+            print("✅ FIX #812: Loaded \(headerCount) headers in \(String(format: "%.1f", totalTime))s (\(Int(rate)) headers/sec)")
+            onProgress?(1.0)
+
+        } catch {
+            sqlite3_finalize(stmt)
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
     }
 
     /// FIX #413: Compute block hash from header data (double SHA-256)

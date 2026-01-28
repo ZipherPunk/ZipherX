@@ -61,6 +61,33 @@ final class HeaderSyncManager {
             Self.syncLock.unlock()
         }
 
+        // FIX #811: CRITICAL - Stop block listeners BEFORE header sync!
+        // Block listeners consume `headers` response messages, causing sync to hang forever.
+        // This is the REAL fix for FIX #383 (was documented but never properly implemented)
+        // Block listeners are on ALL peers and call receiveMessage() in a loop.
+        // When we send `getheaders`, the block listener receives the response first!
+        print("⏸️ FIX #811: Stopping block listeners before header sync...")
+        await networkManager.stopAllBlockListeners()
+
+        // FIX #813: Wait for in-flight receives to complete after stopping block listeners
+        // Block listeners use 100ms timeout in receiveMessageNonBlockingTolerant()
+        // Without this delay, a block listener might consume our header response:
+        // 1. Block listener acquires lock, starts 100ms receive
+        // 2. We call stopAllBlockListeners() (sets _isListening = false)
+        // 3. Header response arrives - block listener consumes it within 100ms!
+        // 4. We start header sync, but response is already consumed
+        // 200ms delay ensures all in-flight receives complete before we start
+        print("⏳ FIX #813: Waiting 200ms for in-flight receives to complete...")
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        defer {
+            // FIX #811: Resume block listeners after sync completes (or fails)
+            Task {
+                print("▶️ FIX #811: Resuming block listeners after header sync...")
+                await networkManager.startBlockListenersOnMainScreen()
+            }
+        }
+
         print("🔄 Starting header sync from height \(startHeight)")
 
         // FIX #775: Reset chain mismatch counter at start of new sync session
