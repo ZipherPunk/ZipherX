@@ -6322,6 +6322,13 @@ public final class NetworkManager: ObservableObject {
         var blocks: [(UInt64, CompactBlock)] = []
         var failCount = 0
         for (height, hash) in blockHashes {
+            // FIX #808: Check for cancellation to respect per-peer timeout
+            // Without this, the loop keeps running even after FIX #713's 20s timeout fires
+            if Task.isCancelled {
+                print("⚠️ FIX #808: [\(peer.host)] Task cancelled, stopping fetch at block \(height)")
+                break
+            }
+
             do {
                 let block = try await withTimeout(seconds: 10) {
                     try await peer.getBlockByHash(hash: hash)

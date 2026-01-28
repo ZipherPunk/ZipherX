@@ -2849,7 +2849,8 @@ public final class Peer {
 
             // FIX #111: Wrap send+receive in withExclusiveAccess to prevent race conditions
             // Without this, mempool scan could consume block messages meant for this operation
-            let blocks = try await withExclusiveAccess {
+            // FIX #806: Use timeout to prevent indefinite hang when peer lock is held
+            let blocks = try await withExclusiveAccessTimeout(seconds: 15) {
                 try await self.sendMessage(command: "getdata", payload: getdataPayload)
 
                 // Receive block messages
@@ -3341,7 +3342,8 @@ public final class Peer {
         payload.append(hash)
 
         // CRITICAL FIX: Wrap send+receive in withExclusiveAccess to prevent race with block listener
-        return try await withExclusiveAccess {
+        // FIX #806: Use timeout to prevent indefinite hang when peer lock is held
+        return try await withExclusiveAccessTimeout(seconds: 15) {
             try await self.sendMessage(command: "getdata", payload: payload)
 
             // Wait for block response with timeout
@@ -3424,7 +3426,8 @@ public final class Peer {
         }
 
         // CRITICAL FIX: Wrap send+receive in withExclusiveAccess to prevent race with block listener
-        return try await withExclusiveAccess {
+        // FIX #806: Use timeout to prevent indefinite hang when peer lock is held
+        return try await withExclusiveAccessTimeout(seconds: 15) {
             try await self.sendMessage(command: "getdata", payload: payload)
 
             // Wait for all block responses

@@ -178,8 +178,12 @@ final class HeaderSyncManager {
 
     /// FIX #122: Fill header gaps - detects and fills missing headers in the store
     /// This is crucial for fixing timestamps when header sync had discontinuities
+    /// FIX #802: Only check gaps from Sapling activation onwards (pre-Sapling headers not needed)
     func fillHeaderGaps() async throws -> Int {
         print("🔍 Checking for header gaps...")
+
+        // FIX #802: Only care about gaps from Sapling activation onwards
+        let saplingActivation: UInt64 = 476_969
 
         guard let minHeight = try? headerStore.getMinHeight(),
               let maxHeight = try? headerStore.getLatestHeight() else {
@@ -187,20 +191,24 @@ final class HeaderSyncManager {
             return 0
         }
 
-        let expectedCount = Int(maxHeight - minHeight + 1)
-        let actualCount = try headerStore.getHeaderCount()
+        // FIX #802: Start scanning from Sapling activation, not minHeight
+        let scanStartHeight = max(minHeight, saplingActivation)
+
+        // FIX #802: Calculate expected count only for post-Sapling range
+        let expectedCount = Int(maxHeight - scanStartHeight + 1)
+        let actualCount = try headerStore.countHeadersInRange(from: scanStartHeight, to: maxHeight)
         let missingCount = expectedCount - actualCount
 
         if missingCount <= 0 {
-            print("✅ No header gaps detected (\(actualCount) headers, \(minHeight)-\(maxHeight))")
+            print("✅ No header gaps detected in Sapling range (\(actualCount) headers, \(scanStartHeight)-\(maxHeight))")
             return 0
         }
 
-        print("⚠️ Detected \(missingCount) missing headers in range \(minHeight)-\(maxHeight)")
+        print("⚠️ Detected \(missingCount) missing headers in Sapling range \(scanStartHeight)-\(maxHeight)")
 
-        // Find all gaps
+        // Find all gaps (only in post-Sapling range)
         var gaps: [(start: UInt64, end: UInt64)] = []
-        var currentHeight = minHeight
+        var currentHeight = scanStartHeight
 
         while currentHeight <= maxHeight {
             if let _ = try? headerStore.getHeader(at: currentHeight) {
@@ -233,23 +241,32 @@ final class HeaderSyncManager {
         var totalFilled = 0
 
         for (gapStart, gapEnd) in gaps {
-            print("🔧 Filling gap \(gapStart) - \(gapEnd)...")
+            // FIX #802: Skip gaps entirely below Sapling activation
+            if gapEnd < saplingActivation {
+                print("⏭️ FIX #802: Skipping pre-Sapling gap \(gapStart) - \(gapEnd) (not needed for shielded wallet)")
+                continue
+            }
+
+            // FIX #802: Adjust gap start if it spans pre-Sapling range
+            let effectiveGapStart = max(gapStart, saplingActivation)
+
+            print("🔧 Filling gap \(effectiveGapStart) - \(gapEnd)...")
 
             do {
-                // We need to sync from gapStart using the header at gapStart-1 as locator
+                // We need to sync from effectiveGapStart using the header at effectiveGapStart-1 as locator
                 // This is handled automatically by syncHeadersSimple which uses buildGetHeadersPayload
-                try await syncHeadersSimple(from: gapStart, to: gapEnd + 1)
+                try await syncHeadersSimple(from: effectiveGapStart, to: gapEnd + 1)
 
                 // Verify the gap was filled
-                let filledCount = (gapStart...gapEnd).filter { height in
+                let filledCount = (effectiveGapStart...gapEnd).filter { height in
                     (try? headerStore.getHeader(at: height)) != nil
                 }.count
 
                 totalFilled += filledCount
-                print("✅ Filled \(filledCount) headers for gap \(gapStart) - \(gapEnd)")
+                print("✅ Filled \(filledCount) headers for gap \(effectiveGapStart) - \(gapEnd)")
 
             } catch {
-                print("⚠️ Failed to fill gap \(gapStart) - \(gapEnd): \(error)")
+                print("⚠️ Failed to fill gap \(effectiveGapStart) - \(gapEnd): \(error)")
             }
         }
 

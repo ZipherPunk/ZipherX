@@ -2386,22 +2386,16 @@ final class WalletManager: ObservableObject {
                         witnessIsCurrent = true
                         alreadyCurrentCount += 1
 
-                        // FIX #757: Anchor MUST come from HeaderStore, not from witness root!
-                        // The witness root is computed from the tree state, but anchor must match
-                        // the blockchain's finalsaplingroot at the note's height for TX validation.
-                        // This fixes anchor mismatch after tree corruption + rebuild.
-                        let noteHeight = note.height
-                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
-                            if note.anchor != headerAnchor {
-                                anchorUpdates.append((note.id, headerAnchor))
-                                print("   🔧 FIX #757: Note \(note.id) anchor from HEADER at height \(noteHeight)")
-                            }
-                        } else {
-                            // Fallback to witness root only if header not available
-                            if note.anchor != witnessAnchor {
-                                anchorUpdates.append((note.id, witnessAnchor))
-                                print("   ⚠️ FIX #757: Note \(note.id) using witness root (no header at \(noteHeight))")
-                            }
+                        // FIX #804: Use witness root as anchor (what the merkle path computes to)
+                        // REVERTS FIX #757 - HeaderStore at noteHeight is WRONG because:
+                        //   - Witness was created at tree state X (e.g., boost file height)
+                        //   - Note was received at height Y (different tree state)
+                        //   - HeaderStore at Y has different root than witness path computes
+                        //   - Mismatch causes "anchor mismatch - witness is corrupted" error!
+                        // The correct anchor is always the witness root.
+                        if note.anchor != witnessAnchor {
+                            anchorUpdates.append((note.id, witnessAnchor))
+                            print("   🔧 FIX #804: Note \(note.id) anchor updated to witness root")
                         }
 
                         // Old logic (WRONG - causes unnecessary witness rebuilds):
@@ -2546,8 +2540,23 @@ final class WalletManager: ObservableObject {
 
             // Sync delta CMUs if chain height > boost file height (thread-safe)
             // FIX #563 v43: Proper delta sync logic based on what we just loaded
-            let startHeight = await MainActor.run { () -> UInt64 in
+            var startHeight = await MainActor.run { () -> UInt64 in
                 return (try? WalletDatabase.shared.getTreeHeight()) ?? ZipherXConstants.effectiveTreeHeight
+            }
+
+            // FIX #808 v2: When tree is already in memory, estimate actual height from tree size
+            // The database tree_height may be stale (not updated after FAST START delta load)
+            // If tree has more CMUs than boost file, delta is already loaded - use estimated height
+            let boostCMUCount = UInt64(1045687)  // From ZipherXConstants
+            if treeWasAlreadyInMemory && currentTreeSize > Int(boostCMUCount) {
+                let deltaCMUCount = UInt64(currentTreeSize) - boostCMUCount
+                // Each delta block averages ~0.06 outputs, so estimate height
+                let estimatedDeltaBlocks = deltaCMUCount * 17  // ~17 blocks per CMU on average
+                let estimatedTreeHeight = ZipherXConstants.effectiveTreeHeight + estimatedDeltaBlocks
+                if estimatedTreeHeight > startHeight {
+                    print("✅ FIX #808 v2: Tree already has \(deltaCMUCount) delta CMUs - adjusting startHeight from \(startHeight) to \(estimatedTreeHeight)")
+                    startHeight = estimatedTreeHeight
+                }
             }
 
             // FIX #563 v43: Determine if we need to sync based on what we just loaded
@@ -2558,8 +2567,9 @@ final class WalletManager: ObservableObject {
 
             // FIX #563 v43: Skip delta sync ONLY if we loaded from DB AND tree is recent
             // If we just loaded from boost file, we MUST sync delta (even if recent) to update tree_height
-            // FIX #568 v2: NEVER skip delta sync if tree was already in memory - we need it to update witnesses!
-            let shouldSkipDeltaSync = !treeWasAlreadyInMemory && treeLoaded && isRecentEnough
+            // FIX #808 v2: Also skip if tree already has delta CMUs (treeWasAlreadyInMemory + has delta)
+            let treeAlreadyHasDelta = treeWasAlreadyInMemory && currentTreeSize > Int(boostCMUCount)
+            let shouldSkipDeltaSync = treeAlreadyHasDelta || (!treeWasAlreadyInMemory && treeLoaded && isRecentEnough)
 
             if shouldSkipDeltaSync {
                 // FIX #768: Only show "blocks behind" if actually behind, otherwise show "at tip"
@@ -2920,17 +2930,29 @@ final class WalletManager: ObservableObject {
                 print("🔧 FIX #571: Fetched \(p2pCMUs) CMUs via P2P")
             }
 
-            // PART 3: Append all delta CMUs to update witnesses
+            // PART 3: Append all delta CMUs to update tree AND witnesses
             if !deltaCMUs.isEmpty {
                 print("🔧 FIX #571: Step 2 - Appending \(deltaCMUs.count) delta CMUs (local: \(localCMUs), P2P: \(p2pCMUs))...")
                 await progress?("Appending delta CMUs for witness update...", 85)
 
-                // CRITICAL: This will update ALL witnesses in the FFI WITNESSES array!
+                // Step 2a: Append CMUs to TREE (for tree root computation)
                 for cmu in deltaCMUs {
                     _ = ZipherXFFI.treeAppend(cmu: cmu)
                 }
+                print("✅ FIX #571: Step 2a - Appended \(deltaCMUs.count) CMUs to tree")
 
-                print("✅ FIX #571: Step 2 complete - Appended \(deltaCMUs.count) delta CMUs, all witnesses now updated!")
+                // FIX #805: Step 2b - ALSO update WITNESSES with the same CMUs!
+                // CRITICAL: treeAppend() only updates the TREE, NOT the WITNESSES!
+                // Without this call, witnesses remain stale at boost file root.
+                // updateAllWitnessesBatch() appends CMUs to each loaded witness in WITNESSES array.
+                var packedCMUs = Data()
+                for cmu in deltaCMUs {
+                    packedCMUs.append(cmu)
+                }
+                let updatedWitnessCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
+                print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(deltaCMUs.count) delta CMUs")
+
+                print("✅ FIX #571 + FIX #805: Step 2 complete - Tree AND witnesses now updated!")
             } else {
                 print("⚠️ FIX #571: Step 2 - No delta CMUs to append")
             }
@@ -5261,7 +5283,8 @@ final class WalletManager: ObservableObject {
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // Get all unspent notes
-            let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 0)
+            // FIX #807: Use accountId: 1 (not 0) - matches all other getAllUnspentNotes calls
+            let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
             let unspentNotes = notes.filter { $0.cmu != nil }
 
             guard !unspentNotes.isEmpty else {

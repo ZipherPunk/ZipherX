@@ -1024,6 +1024,33 @@ final class HeaderStore {
                     print("🚨 FIX #536: Expected ~\(check.sampledCount) unique, but found duplicates - FORCING RELOAD")
                     hasCorruption = true
                 }
+
+                // FIX #809: Check for hash byte order corruption
+                // If blockHash is in wrong byte order (big-endian instead of little-endian), force reload
+                // Test by comparing stored hash at a checkpoint height vs expected checkpoint hash
+                if !hasCorruption, let blockHashes = blockHashes {
+                    // Use Sapling activation checkpoint (476969) as reference - guaranteed to be in boost range
+                    let testHeight: UInt64 = 476969
+                    if testHeight >= startHeight && testHeight <= endHeight,
+                       let checkpointHex = ZclassicCheckpoints.mainnet[testHeight],
+                       let checkpointHash = Data(hexString: checkpointHex) {
+                        // Checkpoint is in big-endian (display format)
+                        // For HeaderStore (wire format), we need little-endian = reversed checkpoint
+                        let expectedWireHash = Data(checkpointHash.reversed())
+
+                        if let storedHeader = try? getHeader(at: testHeight) {
+                            if storedHeader.blockHash != expectedWireHash {
+                                // Check if it matches the unreversed checkpoint (wrong byte order)
+                                if storedHeader.blockHash == checkpointHash {
+                                    print("🚨 FIX #809: CRITICAL - HeaderStore has wrong byte order (big-endian instead of wire format)!")
+                                    print("🚨 FIX #809: At height \(testHeight): stored=\(storedHeader.blockHash.prefix(8).map { String(format: "%02x", $0) }.joined())..., expected=\(expectedWireHash.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                    print("🚨 FIX #809: This was caused by boost file loading without byte reversal - FORCING RELOAD")
+                                    hasCorruption = true
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // FIX #777: Require 100% of boost headers - any gap means we need to reload
@@ -1149,7 +1176,13 @@ final class HeaderStore {
                     if let hashes = blockHashes, headerIndex < hashes.count / 32 {
                         // Use pre-computed hash from boost file (instant!)
                         let hashOffset = headerIndex * 32
-                        blockHash = hashes[hashOffset..<hashOffset + 32]
+                        let hashData = hashes[hashOffset..<hashOffset + 32]
+                        // FIX #809: Convert from big-endian (RPC/display format) to little-endian (wire format)
+                        // The boost file stores hashes in RPC format (big-endian, human-readable hex)
+                        // But HeaderStore needs wire format (little-endian) for P2P chain verification
+                        // Without this reversal, chain mismatch occurs at boost file boundary (e.g., height 2988798)
+                        // because P2P header.hashPrevBlock is in wire format, but HeaderStore.blockHash was big-endian
+                        blockHash = Data(hashData.reversed())
                     } else {
                         // Fallback: compute block hash from header (SLOW - 1+ minute!)
                         let headerData = Data(bytes: ptr.baseAddress! + byteOffset, count: 140)

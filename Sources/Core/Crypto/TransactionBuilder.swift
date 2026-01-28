@@ -377,6 +377,10 @@ final class TransactionBuilder {
         let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
         print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
 
+        // FIX #803: Log anchor and witness info BEFORE FFI call for debugging
+        let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
+        print("🔍 FIX #803: Building TX with anchor: \(anchorHex)... (witness: \(witnessToUse.count) bytes)")
+
         guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
             encryptedSpendingKey: encryptedKey,
             encryptionKey: encryptionKey,
@@ -390,6 +394,13 @@ final class TransactionBuilder {
             noteDiversifier: note.diversifier,
             chainHeight: chainHeight  // Use CURRENT chain height for expiry calculation
         ) else {
+            // FIX #803: Log detailed error for anchor mismatch debugging
+            print("❌ FIX #803: ANCHOR MISMATCH - FFI transaction build failed!")
+            print("   Anchor used: \(anchorHex)...")
+            print("   Witness size: \(witnessToUse.count) bytes")
+            print("   Note height: \(note.height), Chain height: \(chainHeight)")
+            print("   💡 The witness merkle path doesn't compute to the anchor - witness is corrupted")
+            print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
             throw TransactionError.proofGenerationFailed
         }
 
@@ -934,6 +945,12 @@ final class TransactionBuilder {
             let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
             print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
 
+            // FIX #803: Log spend info BEFORE FFI call for debugging
+            print("🔍 FIX #803: Building multi-input TX with \(spends.count) spends")
+            for (i, spend) in spends.enumerated() {
+                print("   Spend \(i): witness=\(spend.witness.count) bytes, value=\(spend.value)")
+            }
+
             guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
                 encryptedSpendingKey: encryptedKey,
                 encryptionKey: encryptionKey,
@@ -943,6 +960,11 @@ final class TransactionBuilder {
                 spends: spends,
                 chainHeight: chainHeight
             ) else {
+                // FIX #803: Log detailed error for anchor mismatch debugging
+                print("❌ FIX #803: ANCHOR MISMATCH - FFI multi-input transaction build failed!")
+                print("   Spends: \(spends.count), Chain height: \(chainHeight)")
+                print("   💡 One or more witness merkle paths don't compute to their anchors - witnesses are corrupted")
+                print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
                 throw TransactionError.proofGenerationFailed
             }
 
@@ -1040,6 +1062,10 @@ final class TransactionBuilder {
                 let (encryptedKey, encryptionKey) = try SecureKeyStorage.shared.getEncryptedKeyAndPassword()
                 print("🔐 VUL-002: Using encrypted key FFI (key decrypted only in Rust)")
 
+                // FIX #803: Log anchor and witness info BEFORE FFI call for debugging
+                let anchorHex = anchorToUse.prefix(16).map { String(format: "%02x", $0) }.joined()
+                print("🔍 FIX #803: Building TX with anchor: \(anchorHex)... (witness: \(witnessToUse.count) bytes)")
+
                 guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
                     encryptedSpendingKey: encryptedKey,
                     encryptionKey: encryptionKey,
@@ -1053,6 +1079,13 @@ final class TransactionBuilder {
                     noteDiversifier: note.diversifier,
                     chainHeight: chainHeight
                 ) else {
+                    // FIX #803: Log detailed error for anchor mismatch debugging
+                    print("❌ FIX #803: ANCHOR MISMATCH - FFI transaction build failed!")
+                    print("   Anchor used: \(anchorHex)...")
+                    print("   Witness size: \(witnessToUse.count) bytes")
+                    print("   Note height: \(noteHeight), Chain height: \(chainHeight)")
+                    print("   💡 The witness merkle path doesn't compute to the anchor - witness is corrupted")
+                    print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
                     throw TransactionError.proofGenerationFailed
                 }
 

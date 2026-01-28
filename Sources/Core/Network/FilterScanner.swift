@@ -1839,15 +1839,9 @@ final class FilterScanner {
                                 if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
                                     if updatedWitness.count >= 100 {
                                         try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
-
-                                        // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
-                                        // Same pattern as FIX #757: HeaderStore is primary, witness root is fallback
-                                        if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
-                                            try? database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
-                                        } else if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
-                                            // Fallback to witness root only if header not available
+                                        // FIX #804: Use witness root as anchor (what the merkle path computes to)
+                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
                                             try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
-                                            print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                                         }
                                         rebuiltCount += 1
                                     }
@@ -3581,15 +3575,9 @@ final class FilterScanner {
 
                 if let result = ZipherXFFI.treeCreateWitnessForCMU(cmuData: bundledData, targetCMU: cmu) {
                     try database.updateNoteWitness(noteId: note.id, witness: result.witness)
-                    // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
-                    // Same pattern as FIX #757: HeaderStore is primary, witness root is fallback
-                    let noteHeight = note.height ?? 0
-                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
-                        try database.updateNoteAnchor(noteId: note.id, anchor: headerAnchor)
-                    } else if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
-                        // Fallback to witness root only if header not available
+                    // FIX #804: Use witness root as anchor (what the merkle path computes to)
+                    if let anchor = ZipherXFFI.witnessGetRoot(result.witness) {
                         try database.updateNoteAnchor(noteId: note.id, anchor: anchor)
-                        print("   ⚠️ FIX #793: Note \(note.id) using witness root (no header at \(noteHeight))")
                     }
                 }
 
@@ -3694,20 +3682,21 @@ final class FilterScanner {
             // Update database with computed witnesses AND anchors
             // FIX #197: treeLoadWithWitnesses stores tree in GLOBAL memory, so witnesses
             // match the global tree's anchor. Extract anchor from witness for INSTANT mode.
-            // FIX #793: Anchor MUST come from HeaderStore (blockchain truth), not witness root
+            // FIX #804: REVERTS FIX #793 - Use WITNESS ROOT as anchor, not HeaderStore at note height!
+            // The witness merkle path computes to the TREE ROOT at witness creation time (boost file).
+            // Storing HeaderStore root at note height causes anchor mismatch because:
+            //   - Note was received at height X (with tree root A)
+            //   - Witness was created at boost file height Y (with tree root B)
+            //   - FIX #793 stored root A, but witness path computes root B → MISMATCH!
+            // The correct anchor is the witness root (what the path actually computes to).
             var successCount = 0
             for (index, result) in results.enumerated() {
                 guard let noteId = noteIdMap[index] else { continue }
                 if let (_, witness) = result {
                     try database.updateNoteWitness(noteId: noteId, witness: witness)
-                    // FIX #793: HeaderStore is primary source for anchor, witness root is fallback
-                    let noteHeight = noteHeightMap[index] ?? 0
-                    if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
-                        try database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
-                    } else if let anchor = ZipherXFFI.witnessGetRoot(witness) {
-                        // Fallback to witness root only if header not available
+                    // FIX #804: Use witness root as anchor (what the merkle path computes to)
+                    if let anchor = ZipherXFFI.witnessGetRoot(witness) {
                         try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
-                        print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                     }
                     successCount += 1
                 }
@@ -3740,13 +3729,9 @@ final class FilterScanner {
                         guard let noteId = noteIdMap[index] else { continue }
                         if let (_, witness) = result {
                             try database.updateNoteWitness(noteId: noteId, witness: witness)
-                            // FIX #793: HeaderStore is primary source for anchor, witness root is fallback
-                            let noteHeight = noteHeightMap[index] ?? 0
-                            if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: noteHeight) {
-                                try database.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
-                            } else if let anchor = ZipherXFFI.witnessGetRoot(witness) {
+                            // FIX #804: Use witness root as anchor (what the merkle path computes to)
+                            if let anchor = ZipherXFFI.witnessGetRoot(witness) {
                                 try database.updateNoteAnchor(noteId: noteId, anchor: anchor)
-                                print("   ⚠️ FIX #793: Note \(noteId) using witness root (no header at \(noteHeight))")
                             }
                             retrySuccessCount += 1
                         }

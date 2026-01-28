@@ -8,6 +8,233 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #809: CRITICAL - Chain Mismatch at Boost File Boundary Due to Hash Byte Order
+**Problem**: 641 chain mismatches occur at height 2988798 (one after boost file end at 2988797)
+
+**Symptoms**:
+- Log shows: "FIX #775: Chain mismatch at height 2988798"
+- Log shows: "FIX #792: Chain mismatch at 2988798 within boost range - HeaderStore has stale headers"
+- P2P headers from 2988798 to 2991820 get deleted and re-synced repeatedly
+
+**Root Cause**: Boost file stores block hashes in **big-endian (RPC/display format)**, but HeaderStore needs **little-endian (wire format)** for P2P chain verification:
+1. Boost generator (Python): `'hash': bytes.fromhex(hashes[height])` - stores in RPC format (big-endian)
+2. HeaderStore.loadHeadersFromBoostData: Used hash directly without byte reversal
+3. P2P headers have `hashPrevBlock` in wire format (little-endian)
+4. Chain verification compares them → MISMATCH!
+
+**Solution** (2 parts):
+
+**Part 1 - Reverse bytes when loading boost hashes** (HeaderStore.swift):
+```swift
+// FIX #809: Convert from big-endian (RPC/display format) to little-endian (wire format)
+// The boost file stores hashes in RPC format (big-endian, human-readable hex)
+// But HeaderStore needs wire format (little-endian) for P2P chain verification
+blockHash = Data(hashData.reversed())
+```
+
+**Part 2 - Detect and force reload of headers with wrong byte order**:
+- Sample a checkpoint height (e.g., 476969)
+- Compare stored hash vs expected wire-format hash
+- If stored hash matches big-endian checkpoint → wrong byte order → force reload
+
+**Files Modified**:
+- `Sources/Core/Storage/HeaderStore.swift` (loadHeadersFromBoostData - byte reversal + validation)
+
+**Before**: Chain mismatch at boost boundary causes 641+ header resyncs
+**After**: Hashes stored in correct wire format, chain verification passes
+
+---
+
+### FIX #808: CRITICAL - App Stuck at 83% Due to P2P Delta Sync Hang
+**Problem**: App stuck at 83% startup progress for hours, never completes
+
+**Symptoms**:
+- FAST START loads delta bundle successfully (166 CMUs)
+- INSTANT START witness rebuild then tries to re-sync 2835 blocks via P2P
+- P2P fetch hangs indefinitely on batch 4
+- Log shows only "Mempool scan suppressed (initial sync)" repeating for hours
+
+**Root Causes**:
+1. **Stale `tree_height` in database**: `getTreeHeight()` returns 2988797 (boost file end) even though tree is already at 2991632
+2. **Redundant P2P fetch**: When tree is already in memory with delta CMUs, code still tries to fetch via P2P
+3. **No task cancellation check**: Sequential block fetch loop doesn't check `Task.isCancelled`, so 20-second timeout is ignored
+
+**Solution (2 parts)**:
+
+**Part 1 - Cancellation check in P2P fetch** (NetworkManager.swift):
+```swift
+// FIX #808: Check for cancellation to respect per-peer timeout
+if Task.isCancelled {
+    print("⚠️ FIX #808: [\(peer.host)] Task cancelled, stopping fetch")
+    break
+}
+```
+
+**Part 2 - Skip P2P sync when tree already has delta** (WalletManager.swift):
+```swift
+// FIX #808 v2: When tree is already in memory, skip redundant P2P sync
+let treeAlreadyHasDelta = treeWasAlreadyInMemory && currentTreeSize > Int(boostCMUCount)
+let shouldSkipDeltaSync = treeAlreadyHasDelta || (!treeWasAlreadyInMemory && treeLoaded && isRecentEnough)
+```
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift` (fetchBlockBatchP2P loop)
+- `Sources/Core/Wallet/WalletManager.swift` (preRebuildWitnessesForInstantPayment)
+
+---
+
+### FIX #807: CRITICAL - fixAnchorMismatches() Using Wrong Account ID (0 vs 1)
+**Problem**: `fixAnchorMismatches()` finds "No unspent notes to fix" even though health check detects 17 mismatches
+
+**Symptoms**:
+- Health check: `🔍 FIX #550: Checking anchors for 17 unspent notes...`
+- Health check: `❌ Note 2285 height 2929119: ANCHOR MISMATCH` (17 times)
+- Fix function: `⚠️ FIX #550: No unspent notes to fix`
+- Fix function: `⚠️ FIX #550: Fixed 0/17 anchors`
+
+**Root Cause**: Account ID mismatch between detection and fix:
+- `WalletHealthCheck.swift:1065` uses `accountId: 1` → finds 17 notes ✅
+- `WalletManager.swift:5270` uses `accountId: 0` → finds 0 notes ❌
+- All other `getAllUnspentNotes()` calls use `accountId: 1`
+
+**Solution**: Change `fixAnchorMismatches()` to use `accountId: 1`:
+```swift
+// FIX #807: Use accountId: 1 (not 0) - matches all other getAllUnspentNotes calls
+let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift` (line 5270)
+
+---
+
+### FIX #806: P2P Block Fetch Hangs on Batch 4 Due to Indefinite Lock Wait
+**Problem**: Delta CMU sync hangs on batch 4, preventing FIX #805 witness update from running
+
+**Symptoms**:
+- Batches 1-3 complete successfully (482, 465, 430 blocks)
+- Batch 4 starts but NEVER completes
+- Log shows `⚠️ FIX #419: Lock acquisition timed out` for peers
+- FIX #762 overall timeout doesn't trigger (inner call is blocked)
+
+**Root Cause**: `getFullBlocks`, `getBlockByHash`, and `getBlocksByHashes` used `withExclusiveAccess` which waits **indefinitely** for the peer lock:
+- After 3 batches, some peer locks are still held (previous operations didn't complete cleanly)
+- Batch 4 tries to use these locked peers
+- `withExclusiveAccess` waits forever for the lock
+- FIX #713's 20-second timeout fires, but inner call is still blocked on lock acquisition
+
+**Solution**: Change all block fetch methods to use `withExclusiveAccessTimeout(seconds: 15)`:
+- `getFullBlocks` (line 2852)
+- `getBlockByHash` (line 3345)
+- `getBlocksByHashes` (line 3429)
+
+Now if a peer's lock is held, the operation times out after 15 seconds instead of hanging forever.
+
+**Files Modified**:
+- `Sources/Core/Network/Peer.swift` (3 locations)
+
+---
+
+### FIX #805: CRITICAL - Witnesses Not Updated with Delta CMUs (Stale Witness Root)
+**Problem**: After FIX #804, all 17 notes have the SAME stale anchor but it doesn't match current tree root
+
+**Symptoms**:
+- `Witness anchor: C49664A429FD3BD8...` (same for all 16 notes - boost file root)
+- `Current root:   6A839678EAC31D26...` (current chain height root)
+- `❌ FIX #575 v2: ANCHOR MISMATCH - witness is corrupted!`
+
+**Root Cause**: `preRebuildWitnessesForInstantPayment()` appended delta CMUs to TREE via `treeAppend()` but NOT to WITNESSES:
+- The comment "This will update ALL witnesses in the FFI WITNESSES array!" was **WRONG**
+- `treeAppend()` only updates the TREE for tree root computation
+- Witnesses need separate update via `updateAllWitnessesBatch()`
+- Without this, witnesses remain at boost file root (2,988,797) not current height (2,991,660)
+
+**Flow Before Fix**:
+1. Step 1: Load witnesses from DB into FFI WITNESSES array ✅
+2. Step 2: Fetch delta CMUs (local bundle + P2P) ✅
+3. Step 3: `treeAppend()` for each CMU - only updates TREE ❌ (witnesses NOT updated)
+
+**Solution**: After appending CMUs to tree, ALSO call `updateAllWitnessesBatch()`:
+```swift
+// Step 2a: Append to TREE
+for cmu in deltaCMUs {
+    _ = ZipherXFFI.treeAppend(cmu: cmu)
+}
+// FIX #805: Step 2b - ALSO update WITNESSES
+let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
+```
+
+**Files Modified**:
+- `Sources/Core/Wallet/WalletManager.swift`: Lines ~2917-2940 in `preRebuildWitnessesForInstantPayment()`
+
+---
+
+### FIX #804: CRITICAL - Use Witness Root as Anchor, Not HeaderStore at Note Height
+**Problem**: Transaction build fails with "ANCHOR MISMATCH - witness is corrupted" even though witnesses are valid
+
+**Symptoms**:
+- `❌ FIX #575 v2: ANCHOR MISMATCH - witness is corrupted!`
+- `Witness root: 330bef5f7645d564...`
+- `Path root:    2be7dde43f4fa253...`
+- `Failed to generate zero-knowledge proof`
+- All 17 notes have DIFFERENT stale anchors (each from their original height)
+
+**Root Cause**: FIX #793 and FIX #757 stored anchors from `HeaderStore.getSaplingRoot(at: noteHeight)` which is the note's ORIGINAL height, but witnesses were created at the BOOST FILE height. This causes a mismatch:
+- Witness merkle path computes to: boost file tree root
+- Database anchor stored as: note's original height root (DIFFERENT!)
+- FFI validates: merkle_path.root(cmu) == anchor → MISMATCH!
+
+**Key Insight**: In Zcash/Zclassic Sapling, the anchor must be what the witness merkle path actually computes to (the tree root at witness creation time), NOT the blockchain root at note height.
+
+**Solution**: Use witness root as anchor in all locations:
+1. PHASE 1.5 witness creation (3 locations in FilterScanner.swift)
+2. FIX #524 witness rebuild (1 location in FilterScanner.swift)
+3. `preRebuildWitnessesForInstantPayment` (1 location in WalletManager.swift)
+
+**Files Modified**:
+- `Sources/Core/Network/FilterScanner.swift`:
+  - Lines 3694-3714: PHASE 1.5 witness batch update
+  - Lines 3738-3753: PHASE 1.5 retry path
+  - Lines 3582-3594: Individual witness creation
+  - Lines 1838-1855: FIX #524 delta sync rebuild
+- `Sources/Core/Wallet/WalletManager.swift`:
+  - Lines 2389-2405: preRebuildWitnessesForInstantPayment
+
+---
+
+### FIX #802: Skip Pre-Sapling Header Gaps (Not Needed for Shielded Wallet)
+**Problem**: App stuck in header sync loop trying to fill gaps in pre-Sapling range (before block 476,969)
+
+**Symptoms**:
+- `🔧 Filling gap 187561 - 452000...` (pre-Sapling range)
+- Chain mismatch detected at heights 8361, 15081, etc.
+- FIX #746 restarts sync from 2991661, but gap filling continues to next gap
+- Infinite loop of gap detection → sync → mismatch → restart
+
+**Root Cause**:
+- HeaderStore has gaps in pre-Sapling range (186,520 - 452,000)
+- Boost file only contains headers from Sapling activation (476,969) onwards
+- Gap filling tried to sync pre-Sapling headers via P2P
+- P2P headers conflicted with existing stale headers causing chain mismatch loop
+
+**Key Insight**: ZipherX is a **Sapling shielded wallet** - we don't need pre-Sapling headers:
+- All shielded outputs start at block 476,969
+- All shielded spends start at block 476,969
+- Commitment tree starts at block 476,969
+- `finalsaplingroot` only exists from block 476,969
+
+**Solution**: Skip gaps below Sapling activation height
+1. Gap detection only scans from `max(minHeight, 476969)` onwards
+2. Gap filling skips any gap entirely below 476,969
+3. Gaps spanning pre/post-Sapling boundary are adjusted to start at 476,969
+
+**Files Modified**:
+- `Sources/Core/Network/HeaderSyncManager.swift`:
+  - `fillHeaderGaps()`: Start scanning from Sapling activation
+  - Gap loop: Skip pre-Sapling gaps, adjust boundary-spanning gaps
+
+---
+
 ### FIX #800: CRITICAL - Stale Witness Detection Was Using Wrong Comparison (42x Loop Fix)
 **Problem**: All 17/17 witnesses falsely detected as "stale" even when they are valid for spending
 
