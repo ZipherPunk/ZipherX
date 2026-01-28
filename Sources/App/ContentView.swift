@@ -314,6 +314,13 @@ struct ContentView: View {
                                     walletManager.setConnecting(true, status: "Initializing commitment tree...")
                                 }
 
+                                // FIX #819: Validate CMU cache byte order BEFORE loading
+                                // Stale cache from before FIX #743 has reversed CMUs causing tree root mismatch
+                                let cacheValid = await CommitmentTreeUpdater.shared.validateAndClearStaleCMUCache()
+                                if !cacheValid {
+                                    print("🗑️ FIX #819: Stale CMU cache cleared - will regenerate from boost file")
+                                }
+
                                 do {
                                     // Extract and deserialize tree from cached boost file
                                     let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()

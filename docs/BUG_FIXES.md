@@ -8,6 +8,126 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #819: CRITICAL - Auto-Detect and Clear Stale CMU Cache (Tree Root Mismatch Fix)
+**Problem**: Persistent "Tree root mismatch" and "ANCHOR MISMATCH - witness is corrupted" errors even after code fixes
+
+**Symptoms**:
+- FFI tree root doesn't match manifest's `tree_root` field
+- Transaction fails with "ANCHOR MISMATCH - witness is corrupted"
+- Witness merkle path computes to different root than stored anchor
+- Issues persist across app restarts and Full Rescan attempts
+
+**Root Cause**: Stale CMU cache files created BEFORE FIX #743 have CMUs in WRONG byte order
+- FIX #743 removed double-reversal from CMU extraction (boost file already has wire format)
+- But cache files created before the fix still have REVERSED CMUs
+- Tree built from cache produces different root than manifest expects
+- Witnesses created with wrong tree state have invalid anchors
+
+**Evidence** (comparing cache vs boost file first CMU):
+```
+# Cache CMU (REVERSED - wrong):
+5a 8d 47 a7 4b 48 ef ce 58 41 a4 3d da cc dc 75...
+
+# Boost file CMU (correct wire format):
+43 39 1d f0 dc 09 83 da 7a d6 47 a8 cd 4c 3a 25...
+```
+These are exact byte-reverses of each other!
+
+**Solution**: Auto-detect and clear stale CMU cache at startup
+1. Before loading CMU cache, compare first CMU to boost file
+2. If cache CMU == REVERSED(boost CMU), cache is stale
+3. Delete stale cache files and regenerate from boost file
+4. Added `validateAndClearStaleCMUCache()` function called at FAST START
+
+**Cache Files Affected**:
+- `~/Library/Application Support/ZipherX/BoostCache/zipherx_boost_cmus.bin`
+- `~/Library/Application Support/ZipherX/BoostCache/legacy_cmus_v*.bin`
+
+**Files Modified**:
+- `Sources/Core/Services/CommitmentTreeUpdater.swift` (validateCMUByteOrder, validateAndClearStaleCMUCache)
+- `Sources/App/ContentView.swift` (call validation at FAST START)
+- `scripts/team_orchestrator.py` (added CMU byte order knowledge to CRYPTO_EXPERT)
+
+---
+
+### FIX #818: Orchestrator False Positive - "Stale Witness Detected" Loop (19x Occurrences)
+**Problem**: Orchestrator reports "LOOP DETECTED - Stale witness detected: stale witness" with 19+ occurrences, but there are no actual stale witness errors in the app
+
+**Symptoms**:
+- Orchestrator constantly flags "Stale witness detected" as an issue
+- Error count accumulates across sessions (19 times reported)
+- Auto-fix attempts trigger unnecessarily
+
+**Root Cause**: The orchestrator's regex pattern `r"stale.*witness"` was too broad:
+- Matched informational log: "🔍 FIX #574: Checking for stale witnesses..."
+- Matched success log: "✅ Stale Witness Check: All witnesses are current ✓"
+- Both are FALSE POSITIVES - not actual errors!
+
+**Evidence**: Current log only has 2 matches:
+```
+[09:44:30.445] 🔍 FIX #574: Checking for stale witnesses (current root: 5823fe877f2a71aa...)...
+[09:44:34.332] ✅ Stale Witness Check: All 17 witnesses are current ✓
+```
+These are HEALTHY messages, not errors!
+
+**Solution**: Updated regex to only match ACTUAL error indicators:
+```python
+# Old pattern (false positives):
+(r"stale.*witness", "Stale witness detected"),
+
+# New pattern (FIX #818 - only matches errors):
+(r"(?:🚨|❌|🛑).*stale.*witness|(?:\d+/\d+).*(?:STALE witnesses|still stale)", "Stale witness detected"),
+```
+
+**Pattern Explanation**:
+- `🚨.*stale.*witness` - Matches error emoji (detection error)
+- `❌.*stale.*witness` - Matches failure emoji (check failure)
+- `🛑.*stale.*witness` - Matches stop emoji (repair exhaustion)
+- `(?:\d+/\d+).*STALE witnesses` - Matches "X/Y STALE witnesses!" format
+- `(?:\d+/\d+).*still stale` - Matches "X/Y witnesses still stale" format
+
+**Files Modified**:
+- `scripts/team_orchestrator.py` (issue_patterns array, line 2046)
+
+---
+
+### FIX #817: PERFORMANCE - Stop Block Listeners in Parallel (Was Sequential)
+**Problem**: Sync takes 4+ minutes because `stopAllBlockListeners()` waits sequentially for each peer
+
+**Symptoms**:
+- Multiple "Block listener stop timed out after 2s" messages
+- Each stuck peer adds 2 seconds to sync time
+- 5 stuck peers = 10 seconds wasted per sync operation
+
+**Root Cause**: Sequential for loop in both NetworkManager and PeerManager:
+```swift
+for peer in peersSnapshot {
+    await peer.stopBlockListener()  // Waits 2s for each stuck peer!
+}
+```
+
+**Solution**: Use TaskGroup to stop all peers in PARALLEL:
+```swift
+// FIX #817: All peers stopped concurrently, max wait = 2s
+await withTaskGroup(of: Void.self) { group in
+    for peer in listeningPeers {
+        group.addTask {
+            await peer.stopBlockListener()
+        }
+    }
+}
+```
+
+**Performance Improvement**:
+- **Before**: 2s × N stuck peers (5 peers = 10s delay)
+- **After**: Max 2s total (all peers stopped in parallel)
+
+**Files Modified**:
+- `Sources/Core/Network/PeerManager.swift` (stopAllBlockListeners)
+- `Sources/Core/Network/NetworkManager.swift` (stopAllBlockListeners)
+
+---
+
 ### FIX #814: CRITICAL - stopBlockListener() Hangs Indefinitely (PHASE 2 Stuck)
 **Problem**: PHASE 2 block scanning gets stuck because `stopAllBlockListeners()` hangs forever
 

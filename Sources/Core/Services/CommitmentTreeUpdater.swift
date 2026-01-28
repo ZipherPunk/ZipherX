@@ -620,6 +620,7 @@ actor CommitmentTreeUpdater {
 
     /// Load cached CMU data if it matches the current boost manifest
     /// Returns nil if cache doesn't exist, is corrupted, or doesn't match manifest
+    /// FIX #819: Also validates CMU byte order to detect stale cache from before FIX #743
     private func loadCachedCMUData(manifest: BoostManifest) throws -> Data? {
         // Check if cache file exists
         guard FileManager.default.fileExists(atPath: cachedCMUDataPath.path) else {
@@ -657,8 +658,86 @@ actor CommitmentTreeUpdater {
             return nil
         }
 
+        // FIX #819: CRITICAL - Validate CMU byte order to detect stale cache
+        // If cache was created before FIX #743, CMUs are in WRONG byte order (reversed)
+        // This causes tree root mismatch and anchor errors
+        let cmuByteOrderValid = try validateCMUByteOrder(cachedData: cachedData, manifest: manifest)
+        if !cmuByteOrderValid {
+            print("🗑️ FIX #819: Deleting stale CMU cache (wrong byte order detected)")
+            try? FileManager.default.removeItem(at: cachedCMUDataPath)
+            // Also delete legacy cache files
+            clearAllLegacyCMUCaches()
+            return nil
+        }
+
         print("✅ FIX #564: Cached CMU data validated (\(cachedCount) CMUs, \(cachedData.count) bytes)")
         return cachedData
+    }
+
+    /// FIX #819: Validate that cached CMUs have correct byte order by comparing to boost file
+    /// Returns true if byte order is correct, false if reversed (stale cache)
+    private func validateCMUByteOrder(cachedData: Data, manifest: BoostManifest) throws -> Bool {
+        guard let outputSection = manifest.sections.first(where: { $0.type == SectionType.outputs.rawValue }) else {
+            return true // Can't validate, assume OK
+        }
+
+        let activePath = getActiveBoostPath(for: manifest)
+        guard FileManager.default.fileExists(atPath: activePath.path) else {
+            return true // Can't validate, assume OK
+        }
+
+        // Read first CMU from cache (after 8-byte header)
+        guard cachedData.count >= 40 else { return true } // 8 header + 32 CMU
+        let cacheCMU = cachedData.subdata(in: 8..<40)
+
+        // Read first CMU from boost file
+        // Output record format: height(4) + index(4) + CMU(32) + ...
+        let fileHandle = try FileHandle(forReadingFrom: activePath)
+        defer { try? fileHandle.close() }
+
+        try fileHandle.seek(toOffset: outputSection.offset)
+        guard let recordData = try fileHandle.read(upToCount: 40) else {
+            return true // Can't read, assume OK
+        }
+
+        // CMU starts at offset 8 in the record (after height + index)
+        let boostCMU = recordData.subdata(in: 8..<40)
+
+        // Compare: If cache CMU equals boost CMU, byte order is correct
+        // If cache CMU equals REVERSED boost CMU, cache is stale (wrong byte order)
+        if cacheCMU == boostCMU {
+            print("✅ FIX #819: CMU byte order validation PASSED")
+            return true
+        }
+
+        // Check if reversed
+        let reversedBoostCMU = Data(boostCMU.reversed())
+        if cacheCMU == reversedBoostCMU {
+            print("❌ FIX #819: CMU byte order REVERSED - cache is stale!")
+            print("   Cache CMU:  \(cacheCMU.prefix(16).map { String(format: "%02x", $0) }.joined())")
+            print("   Boost CMU:  \(boostCMU.prefix(16).map { String(format: "%02x", $0) }.joined())")
+            return false
+        }
+
+        // Neither match - could be corrupt or different file
+        print("⚠️ FIX #819: CMU mismatch (not matching and not reversed) - regenerating cache")
+        return false
+    }
+
+    /// FIX #819: Clear all legacy CMU cache files
+    private func clearAllLegacyCMUCaches() {
+        let cacheDir = boostCacheDirectory
+        do {
+            let files = try FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+            for file in files {
+                if file.lastPathComponent.hasPrefix("legacy_cmus_") && file.pathExtension == "bin" {
+                    try FileManager.default.removeItem(at: file)
+                    print("🗑️ FIX #819: Deleted stale cache: \(file.lastPathComponent)")
+                }
+            }
+        } catch {
+            print("⚠️ FIX #819: Could not clear legacy caches: \(error)")
+        }
     }
 
     /// Save extracted CMU data to cache
@@ -678,6 +757,47 @@ actor CommitmentTreeUpdater {
         if FileManager.default.fileExists(atPath: cachedCMUDataPath.path) {
             try? FileManager.default.removeItem(at: cachedCMUDataPath)
             print("🗑️ FIX #564: Cleared cached CMU data")
+        }
+    }
+
+    /// FIX #819: Validate and clear stale CMU caches at startup
+    /// Call this BEFORE loading CMUs to ensure correct byte order
+    /// Returns true if cache was valid, false if cache was deleted
+    func validateAndClearStaleCMUCache() async -> Bool {
+        guard let manifest = loadCachedManifest() else {
+            print("ℹ️ FIX #819: No manifest found, skipping cache validation")
+            return true
+        }
+
+        // Check if cache exists
+        guard FileManager.default.fileExists(atPath: cachedCMUDataPath.path) else {
+            print("ℹ️ FIX #819: No CMU cache file, nothing to validate")
+            return true
+        }
+
+        do {
+            let cachedData = try Data(contentsOf: cachedCMUDataPath)
+            guard cachedData.count >= 40 else {
+                print("⚠️ FIX #819: CMU cache too small, deleting")
+                try? FileManager.default.removeItem(at: cachedCMUDataPath)
+                return false
+            }
+
+            let isValid = try validateCMUByteOrder(cachedData: cachedData, manifest: manifest)
+            if !isValid {
+                print("🗑️ FIX #819: Stale CMU cache detected and removed at startup")
+                try? FileManager.default.removeItem(at: cachedCMUDataPath)
+                clearAllLegacyCMUCaches()
+                return false
+            }
+
+            print("✅ FIX #819: CMU cache validated at startup - byte order correct")
+            return true
+        } catch {
+            print("⚠️ FIX #819: Error validating CMU cache: \(error)")
+            // On error, delete cache to be safe
+            try? FileManager.default.removeItem(at: cachedCMUDataPath)
+            return false
         }
     }
 

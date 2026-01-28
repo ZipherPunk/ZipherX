@@ -626,19 +626,21 @@ public final class NetworkManager: ObservableObject {
         print("🛑 FIX #383: Stopping all block listeners...")
         debugLog(.network, "⏸️ FIX #140: Pausing \(peers.count) block listeners for header sync...")
 
-        // FIX #509: Stop local peers and wait for them to finish
-        var stoppedCount = 0
-        for peer in peers {
-            if peer.isListening {
-                await peer.stopBlockListener()
-                stoppedCount += 1
+        // FIX #817: Stop local peers in PARALLEL (not sequential)
+        // Previously took 2s × N stuck peers; now max 2s total
+        let listeningPeers = peers.filter { $0.isListening }
+        await withTaskGroup(of: Void.self) { group in
+            for peer in listeningPeers {
+                group.addTask {
+                    await peer.stopBlockListener()
+                }
             }
         }
 
         // Also delegate to PeerManager (in case it has additional peers)
         await PeerManager.shared.stopAllBlockListeners()
 
-        debugLog(.network, "⏸️ FIX #140: Stopped \(stoppedCount) block listeners")
+        debugLog(.network, "⏸️ FIX #140: Stopped \(listeningPeers.count) block listeners")
     }
 
     /// FIX #139/FIX #383: Resume all block listeners after header sync

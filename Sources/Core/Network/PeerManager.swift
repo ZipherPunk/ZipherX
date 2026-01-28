@@ -594,6 +594,7 @@ public final class PeerManager: ObservableObject {
 
     /// FIX #462: Stop all block listeners before header sync
     /// FIX #509: Now waits for listeners to actually finish (prevents headers consumption race)
+    /// FIX #817: Stop peers in PARALLEL to avoid sequential 2s timeouts per stuck peer
     /// This prevents them from consuming "headers" responses meant for header sync
     public func stopAllBlockListeners() async {
         print("🛑 PeerManager: Stopping all block listeners...")
@@ -603,17 +604,20 @@ public final class PeerManager: ObservableObject {
         let peersSnapshot = peers
         peersLock.unlock()
 
-        var stoppedCount = 0
+        let listeningPeers = peersSnapshot.filter { $0.isListening }
 
-        // FIX #509: Await each stop to ensure listener is actually finished
-        for peer in peersSnapshot {
-            if peer.isListening {
-                await peer.stopBlockListener()
-                stoppedCount += 1
+        // FIX #817: Stop all peers in PARALLEL using TaskGroup
+        // Previously: Sequential loop took 2s × N stuck peers (e.g., 5 peers = 10s delay!)
+        // Now: All peers stopped concurrently, max wait = 2s (FIX #814 timeout)
+        await withTaskGroup(of: Void.self) { group in
+            for peer in listeningPeers {
+                group.addTask {
+                    await peer.stopBlockListener()
+                }
             }
         }
 
-        print("🛑 PeerManager: Stopped \(stoppedCount) block listeners (all finished)")
+        print("🛑 PeerManager: Stopped \(listeningPeers.count) block listeners (all finished)")
     }
 
     /// Resume all block listeners (after header sync)
