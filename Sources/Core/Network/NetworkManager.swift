@@ -298,6 +298,17 @@ public final class NetworkManager: ObservableObject {
         }
         debugLog(.network, "✅ FIX #145: Background processes ENABLED (initial sync complete)")
 
+        // FIX #815: Update walletHeight from database BEFORE starting health monitoring
+        // Problem: After Full Rescan, walletHeight was stale (showing boost file height 2988797)
+        //          but lastScannedHeight in DB was already updated to 2992134
+        // Result: Health check saw "3377 blocks behind" and blocked SEND unnecessarily
+        // Fix: Read fresh walletHeight from database before health check runs
+        let freshWalletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        if freshWalletHeight > 0 && freshWalletHeight != walletHeight {
+            print("📊 FIX #815: Refreshing walletHeight from \(walletHeight) to \(freshWalletHeight) before health check")
+            self.walletHeight = freshWalletHeight
+        }
+
         // FIX #409: Start continuous health monitoring
         startHealthMonitoring()
     }
@@ -489,8 +500,10 @@ public final class NetworkManager: ObservableObject {
 
         // Check 3: Wallet sync stuck (wallet far behind chain for >5 minutes)
         // FIX #555: Skip check if walletHeight is 0 (wallet not loaded yet) or during initial sync
-        let walletBehind = chainHeight > walletHeight ? chainHeight - walletHeight : 0
-        if walletBehind > 100 && !suppressBackgroundSync && walletHeight > 0 {
+        // FIX #815: Use fresh database value to avoid stale walletHeight after Full Rescan
+        let currentWalletHeight = max(walletHeight, (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0)
+        let walletBehind = chainHeight > currentWalletHeight ? chainHeight - currentWalletHeight : 0
+        if walletBehind > 100 && !suppressBackgroundSync && currentWalletHeight > 0 {
             // FIX #410: Block SEND only - balance may be wrong, could overspend
             blockFeatures([.send], reason: "Wallet behind network - balance may be outdated")
             criticalHealthAlert = CriticalHealthAlert(
@@ -512,7 +525,7 @@ public final class NetworkManager: ObservableObject {
                 ],
                 timestamp: Date()
             )
-            print("⚠️ FIX #409: WARNING - Wallet is \(walletBehind) blocks behind chain")
+            print("⚠️ FIX #409: WARNING - Wallet is \(walletBehind) blocks behind chain (wallet=\(currentWalletHeight), chain=\(chainHeight))")
             return
         }
 

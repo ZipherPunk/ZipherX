@@ -8,6 +8,37 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (January 2026)
 
+### FIX #815: False "Sync Lag 3377" Alert After Full Rescan - Stale walletHeight
+**Problem**: After Full Rescan completes, health check immediately shows "Wallet is 3377 blocks behind chain" and blocks SEND
+
+**Symptoms**:
+- Full Rescan completes successfully (lastScannedHeight = 2992134)
+- Immediately after, health check reports "3377 blocks behind"
+- SEND feature is blocked unnecessarily
+- Calculation: chainHeight (2992174) - walletHeight (2988797) = 3377
+
+**Root Cause Analysis**:
+1. Full Rescan completes and saves `lastScannedHeight = 2992134` to database
+2. `enableBackgroundProcesses()` is called which starts health monitoring
+3. Health monitoring runs IMMEDIATE health check via `performHealthCheck()`
+4. `performHealthCheck()` uses `self.walletHeight` (a @Published property)
+5. But `walletHeight` was NEVER updated after Full Rescan - it still had the OLD value (2988797 = boost file height)
+6. Health check sees: 2992174 - 2988797 = 3377 blocks behind → BLOCKS SEND!
+7. The property is only updated by `fetchNetworkStats()` which runs on a 30-second timer
+
+**Key Insight**: The database has the correct value (2992134), but the @Published property is stale.
+
+**Solution**: FIX #815 - Update walletHeight from database BEFORE starting health monitoring
+1. In `enableBackgroundProcesses()`: Read fresh walletHeight from database and update the property
+2. In `performHealthCheck()`: Use `max(walletHeight, dbHeight)` as defense in depth
+
+**Files Modified**:
+- `Sources/Core/Network/NetworkManager.swift`:
+  - `enableBackgroundProcesses()`: Added database read and property update before `startHealthMonitoring()`
+  - `performHealthCheck()`: Changed to use `max(walletHeight, dbLastScannedHeight)` for wallet sync check
+
+---
+
 ### FIX #814: CRITICAL - Tree Root Mismatch Loop (18+ Occurrences) - Missing No-Delta Validation
 **Problem**: Persistent "Tree root MISMATCH at height 2988797" error occurring 18+ times despite Full Rescan
 
