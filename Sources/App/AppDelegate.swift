@@ -115,6 +115,13 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     // MARK: - Scene Lifecycle
 
     func applicationDidEnterBackground(_ application: UIApplication) {
+        // FIX #894: CRITICAL - Checkpoint WAL databases before going to background
+        // Without this, headers loaded during the session could be lost if app is terminated
+        // iOS can terminate background apps at any time without warning
+        HeaderStore.shared.checkpoint()
+        WalletDatabase.shared.checkpoint()
+        print("💾 FIX #894: WAL checkpoints complete before background")
+
         // Schedule background refresh when app goes to background
         scheduleBackgroundRefresh()
         print("📱 App entered background - scheduled sync")

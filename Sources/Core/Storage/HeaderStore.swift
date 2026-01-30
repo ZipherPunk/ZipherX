@@ -61,8 +61,35 @@ final class HeaderStore {
     /// Close database connection
     func close() {
         if db != nil {
+            // FIX #894: Checkpoint WAL before closing to ensure all data is persisted
+            checkpoint()
             sqlite3_close(db)
             db = nil
+        }
+    }
+
+    // MARK: - FIX #894: WAL Checkpoint for Data Persistence
+
+    /// FIX #894: Force WAL checkpoint to persist all data to main database file
+    /// CRITICAL: Without this, headers loaded during a session may be lost on app termination
+    /// WAL mode is fast for writes but requires explicit checkpoint to ensure durability
+    /// Call this after bulk inserts (like loading 2.5M headers from boost file)
+    func checkpoint() {
+        guard db != nil else { return }
+
+        // PRAGMA wal_checkpoint(TRUNCATE) checkpoints and truncates the WAL file
+        // This is the most thorough checkpoint mode - ensures all data is in main DB
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA wal_checkpoint(TRUNCATE);", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                let busy = sqlite3_column_int(stmt, 0)
+                let log = sqlite3_column_int(stmt, 1)
+                let checkpointed = sqlite3_column_int(stmt, 2)
+                if log > 0 || checkpointed > 0 {
+                    print("💾 FIX #894: WAL checkpoint complete - busy:\(busy), log:\(log), checkpointed:\(checkpointed)")
+                }
+            }
+            sqlite3_finalize(stmt)
         }
     }
 
@@ -1211,15 +1238,17 @@ final class HeaderStore {
 
                 headerIndex += 1
 
-                // FIX #812: Progress updates every 100K (not every 10K)
-                if headerIndex % 100000 == 0 {
+                // FIX #891: Reduce progress callbacks from 100K to 500K (was every 100K)
+                // Less UI thread blocking during heavy SQLite operations
+                // Each callback triggers DispatchQueue.main.async which causes thread contention
+                if headerIndex % 500000 == 0 {
                     processedCount = headerIndex
                     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                     let rate = Double(headerIndex) / elapsed
                     print("📜 FIX #812: \(processedCount)/\(headerCount) headers (\(Int(rate))/sec)")
                     onProgress?(Double(processedCount) / Double(headerCount))
 
-                    // Yield briefly for UI - only every 100K headers
+                    // FIX #891: Yield briefly for UI - only every 500K headers (was 100K)
                     Thread.sleep(forTimeInterval: 0.001)
                 }
             }
@@ -1246,6 +1275,11 @@ final class HeaderStore {
             guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
                 throw DatabaseError.insertFailed("Failed to commit transaction")
             }
+
+            // FIX #894: CRITICAL - Checkpoint WAL immediately after bulk header insert
+            // Without this, 2.5M headers loaded over ~3 minutes could be lost on app termination
+            // WAL checkpoint ensures all data is written to main database file
+            checkpoint()
 
             let totalTime = CFAbsoluteTimeGetCurrent() - startTime
             let rate = Double(headerCount) / totalTime

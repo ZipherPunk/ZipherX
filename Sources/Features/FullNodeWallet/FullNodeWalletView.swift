@@ -477,10 +477,22 @@ struct FullNodeWalletView: View {
     }
 
     // FIX #286 v17: Check if we have pending transactions
+    // FIX #861: Only consider truly pending operations (not completed/failed)
     private var hasPendingTransactions: Bool {
-        !pendingOperations.isEmpty ||
+        // Filter for operations that are still executing or queued (not success/failed)
+        let trulyPendingOps = pendingOperations.filter { op in
+            op.status == "executing" || op.status == "queued"
+        }
+        return !trulyPendingOps.isEmpty ||
         pendingUnconfirmedBalance.transparent != 0 ||
         pendingUnconfirmedBalance.private_ != 0
+    }
+
+    // FIX #861: Get only truly pending operations for display
+    private var trulyPendingOperations: [RPCClient.PendingOperation] {
+        pendingOperations.filter { op in
+            op.status == "executing" || op.status == "queued"
+        }
     }
 
     // FIX #286 v17: Pending transaction banner
@@ -497,12 +509,13 @@ struct FullNodeWalletView: View {
                         .fontWeight(.semibold)
                         .foregroundColor(statusBlue)
 
-                    if !pendingOperations.isEmpty {
-                        let op = pendingOperations.first!
+                    // FIX #861: Use trulyPendingOperations instead of all operations
+                    if !trulyPendingOperations.isEmpty {
+                        let op = trulyPendingOperations.first!
                         Text("Operation: \(op.status)")
                             .font(.system(size: 10))
                             .foregroundColor(theme.textSecondary)
-                    } else {
+                    } else if pendingUnconfirmedBalance.transparent != 0 || pendingUnconfirmedBalance.private_ != 0 {
                         Text("Waiting for confirmation...")
                             .font(.system(size: 10))
                             .foregroundColor(theme.textSecondary)

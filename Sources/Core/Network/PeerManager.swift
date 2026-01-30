@@ -148,25 +148,23 @@ public final class PeerManager: ObservableObject {
 
     /// FIX #235, FIX #423: Hardcoded Zclassic seed nodes - EXEMPT from cooldown
     /// These are VERIFIED good ZCL nodes that should ALWAYS be tried first
+    // FIX #931: PRODUCTION MODE - All hardcoded seeds enabled
     public let HARDCODED_SEEDS: Set<String> = [
-        // FIX #507: Local node - highest priority (always fastest when available)
-        "127.0.0.1",          // Local zclassicd node on port 8033
-        // Original seeds - ZCL and ZEC both use Equihash(200,9)!
-        "140.174.189.3",
-        "140.174.189.17",
-        "205.209.104.118",
-        "95.179.131.117",
-        "45.77.216.198",
-        // FIX #423: Additional verified ZCL nodes from successful connections
-        "212.23.222.231",   // Connected successfully with version 170011
-        "157.90.223.151"    // Block listener started successfully
+        "127.0.0.1",          // Local node first (highest priority if running)
+        "140.174.189.3",      // MagicBean node cluster
+        "140.174.189.17",     // MagicBean node cluster
+        "205.209.104.118",    // MagicBean node
+        "95.179.131.117",     // Additional Zclassic node
+        "45.77.216.198",      // Additional Zclassic node
+        "212.23.222.231",     // FIX #423: Verified ZCL node
+        "157.90.223.151"      // FIX #423: Verified ZCL node
     ]
 
     /// DNS seeds for peer discovery
-    public let DNS_SEEDS = [
+    // FIX #931: PRODUCTION MODE - DNS seeds enabled
+    public let DNS_SEEDS: [String] = [
         "dnsseed.zclassic.org",
-        "dnsseed.rotorproject.org",
-        "dnsseed.zclnet.net"
+        "dnsseed.rotorproject.org"
     ]
 
     // MARK: - Published State
@@ -232,6 +230,12 @@ public final class PeerManager: ObservableObject {
     /// nonisolated(unsafe): Accessed from nonisolated functions via lock
     private nonisolated(unsafe) var headerSyncInProgressFlag: Bool = false
     private let headerSyncStateLock = NSLock()
+
+    /// FIX #907: Flag to block block listeners during ANY operation
+    /// Set to true during: scan, import, repair, broadcast, header sync
+    /// Block listeners can ONLY run when app is idle on main screen
+    private nonisolated(unsafe) var blockListenersBlockedFlag: Bool = false
+    private let blockListenersBlockedLock = NSLock()
 
     // MARK: - Initialization
 
@@ -532,6 +536,108 @@ public final class PeerManager: ObservableObject {
         print("🧹 Cleared parked hardcoded seeds")
     }
 
+    /// FIX #863: Record a ping failure for a parked peer
+    /// Called when a peer connects successfully but then fails ping
+    /// Returns true if peer should be banned (too many ping failures)
+    @discardableResult
+    public func recordPingFailure(_ host: String, port: UInt16) -> Bool {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        if var existing = parkedPeers[host] {
+            existing.incrementPingFailure()
+            parkedPeers[host] = existing
+            print("⚠️ FIX #863: [\(host)] Ping failure #\(existing.pingFailureCount)")
+            return existing.shouldBanForPingFailures
+        } else {
+            // Create new parked peer with ping failure
+            var newParked = ParkedPeer(address: host, port: port)
+            newParked.incrementPingFailure()
+            parkedPeers[host] = newParked
+            print("⚠️ FIX #863: [\(host)] First ping failure (new parked peer)")
+            return false
+        }
+    }
+
+    /// FIX #863: Reset ping failures for a peer (called when ping succeeds)
+    public func resetPingFailures(_ host: String) {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        if var existing = parkedPeers[host] {
+            if existing.pingFailureCount > 0 {
+                existing.resetPingFailures()
+                parkedPeers[host] = existing
+                print("✅ FIX #863: [\(host)] Ping failures reset")
+            }
+        }
+    }
+
+    /// FIX #863: Check if a peer should be banned for ping failures
+    public func shouldBanForPingFailures(_ host: String) -> Bool {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        return parkedPeers[host]?.shouldBanForPingFailures ?? false
+    }
+
+    /// FIX #908: Record a handshake failure for a peer
+    /// After 5 failures → park for 1 hour
+    /// After 1 hour, if 5 more failures → park for 24 hours
+    /// Returns the park duration in seconds
+    @discardableResult
+    public func recordHandshakeFailure(_ host: String, port: UInt16) -> TimeInterval {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        if var existing = parkedPeers[host] {
+            // Check if previous handshake park has expired
+            if existing.handshakeParkTime > 0 && existing.isHandshakeParkExpired {
+                // Park expired, advance to next phase
+                existing.advanceHandshakePhase()
+                parkedPeers[host] = existing
+                print("🔄 FIX #908: [\(host)] Handshake park expired, advancing to phase \(existing.handshakePhase)")
+            }
+
+            let parkDuration = existing.incrementHandshakeFailure()
+            parkedPeers[host] = existing
+
+            let durationStr = parkDuration >= 3600 ? "\(Int(parkDuration / 3600))h" : "\(Int(parkDuration / 60))m"
+            print("⚠️ FIX #908: [\(host)] Handshake failure #\(existing.handshakeFailureCount) (phase \(existing.handshakePhase)), park for \(durationStr)")
+            return parkDuration
+        } else {
+            // Create new parked peer with handshake failure
+            var newParked = ParkedPeer(address: host, port: port)
+            let parkDuration = newParked.incrementHandshakeFailure()
+            parkedPeers[host] = newParked
+            print("⚠️ FIX #908: [\(host)] First handshake failure (new parked peer), park for \(Int(parkDuration))s")
+            return parkDuration
+        }
+    }
+
+    /// FIX #908: Reset handshake failures for a peer (called when handshake succeeds)
+    public func resetHandshakeFailures(_ host: String) {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        if var existing = parkedPeers[host] {
+            if existing.handshakeFailureCount > 0 || existing.handshakePhase > 0 {
+                existing.resetHandshakeFailures()
+                parkedPeers[host] = existing
+                print("✅ FIX #908: [\(host)] Handshake failures reset")
+            }
+        }
+    }
+
+    /// FIX #908: Check if peer has extended handshake failure park
+    public func hasHandshakeFailurePark(_ host: String) -> Bool {
+        addressLock.lock()
+        defer { addressLock.unlock() }
+
+        guard let parked = parkedPeers[host] else { return false }
+        return parked.handshakeParkTime > 0 && !parked.isHandshakeParkExpired
+    }
+
     // MARK: - Cooldown
 
     /// Check if an address is on cooldown
@@ -592,12 +698,24 @@ public final class PeerManager: ObservableObject {
 
     // MARK: - Block Listener Coordination
 
+    /// FIX #874: Check if any block listeners are running (for fast-path skip)
+    public func hasActiveBlockListeners() async -> Bool {
+        peersLock.lock()
+        let hasListeners = peers.contains { $0.isListening }
+        peersLock.unlock()
+        return hasListeners
+    }
+
     /// FIX #462: Stop all block listeners before header sync
     /// FIX #509: Now waits for listeners to actually finish (prevents headers consumption race)
     /// FIX #817: Stop peers in PARALLEL to avoid sequential 2s timeouts per stuck peer
+    /// FIX #822: Add 5s overall timeout - don't block startup if peers are slow
+    /// FIX #829: Fix timeout not triggering due to Swift task group serialization
+    ///          Uses continuation + DispatchQueue for reliable timeout
     /// This prevents them from consuming "headers" responses meant for header sync
-    public func stopAllBlockListeners() async {
-        print("🛑 PeerManager: Stopping all block listeners...")
+    /// - Parameter timeout: Optional timeout in seconds (default 5s, use 10s for broadcast)
+    public func stopAllBlockListeners(timeout: Double = 5.0) async {
+        print("🛑 PeerManager: Stopping all block listeners (timeout: \(timeout)s)...")
 
         // FIX #509: Get peers snapshot with lock, then stop each listener
         peersLock.lock()
@@ -606,18 +724,145 @@ public final class PeerManager: ObservableObject {
 
         let listeningPeers = peersSnapshot.filter { $0.isListening }
 
-        // FIX #817: Stop all peers in PARALLEL using TaskGroup
-        // Previously: Sequential loop took 2s × N stuck peers (e.g., 5 peers = 10s delay!)
-        // Now: All peers stopped concurrently, max wait = 2s (FIX #814 timeout)
-        await withTaskGroup(of: Void.self) { group in
-            for peer in listeningPeers {
-                group.addTask {
-                    await peer.stopBlockListener()
+        if listeningPeers.isEmpty {
+            print("🛑 PeerManager: No listening peers to stop")
+            return
+        }
+
+        print("🛑 PeerManager: Stopping \(listeningPeers.count) listening peers...")
+
+        // FIX #822: FIRST signal all listeners to stop immediately (non-blocking)
+        // This sets _isListening = false so they'll exit their loop ASAP
+        for peer in listeningPeers {
+            peer.signalStopListener()
+        }
+
+        // FIX #829: Use withCheckedContinuation + DispatchQueue for reliable timeout
+        // Swift's cooperative threading can prevent Task.sleep from firing on time
+        // GCD's DispatchQueue runs on a separate thread pool, guaranteeing the timeout
+        let startTime = Date()
+        let timeoutSeconds: Double = timeout  // FIX #833: Use parameter instead of hardcoded 5s
+
+        let timedOut = await withCheckedContinuation { continuation in
+            var continuationResumed = false
+            let lock = NSLock()
+
+            // Start the actual stop operation
+            Task {
+                await withTaskGroup(of: Void.self) { group in
+                    for peer in listeningPeers {
+                        group.addTask {
+                            await peer.stopBlockListener()
+                        }
+                    }
+                }
+
+                // Completed - resume continuation if not already timed out
+                lock.lock()
+                if !continuationResumed {
+                    continuationResumed = true
+                    lock.unlock()
+                    continuation.resume(returning: false)  // Not timed out
+                } else {
+                    lock.unlock()
+                }
+            }
+
+            // Set up timeout on GCD queue (separate thread pool from Swift concurrency)
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
+                lock.lock()
+                if !continuationResumed {
+                    continuationResumed = true
+                    lock.unlock()
+                    continuation.resume(returning: true)  // Timed out
+                } else {
+                    lock.unlock()
                 }
             }
         }
 
-        print("🛑 PeerManager: Stopped \(listeningPeers.count) block listeners (all finished)")
+        let elapsed = Date().timeIntervalSince(startTime)
+        if timedOut {
+            print("⚠️ FIX #829: Block listener stop timed out after \(String(format: "%.1f", elapsed))s - proceeding anyway (\(listeningPeers.count) listeners)")
+            // FIX #906: Force release all message locks to unblock header sync
+            // The listeners may still be holding locks even though we're proceeding
+            print("🔓 FIX #906: Force releasing all message locks after timeout")
+            for peer in listeningPeers {
+                await peer.forceReleaseMessageLock()
+            }
+        } else {
+            print("🛑 PeerManager: Stopped \(listeningPeers.count) block listeners in \(String(format: "%.1f", elapsed))s")
+        }
+
+        // FIX #913: Mark all peers as active after stopping block listeners
+        // When block listeners are stopped, lastActivity doesn't update → peers become "stale"
+        // This causes ensureConnected() to try reconnecting which fails with "Peer handshake failed"
+        // Solution: Mark all connected peers as active so they don't appear stale
+        peersLock.lock()
+        let connectedPeers = peers.filter { $0.isConnectionReady }
+        peersLock.unlock()
+        for peer in connectedPeers {
+            peer.markActive()
+        }
+        print("✅ FIX #913: Marked \(connectedPeers.count) peers as active after stopping block listeners")
+    }
+
+    /// FIX #834: Ensure ALL block listeners are stopped before critical operations (broadcast)
+    /// Returns true only when ALL listeners verified stopped, false if any still running after max retries
+    /// This is stricter than stopAllBlockListeners() which proceeds on timeout
+    public func ensureAllBlockListenersStopped(maxRetries: Int = 3, retryDelay: Double = 1.0) async -> Bool {
+        print("🔒 FIX #834: Ensuring ALL block listeners are stopped...")
+
+        for attempt in 1...maxRetries {
+            // First, stop all listeners
+            await stopAllBlockListeners(timeout: 5.0)
+
+            // Now VERIFY all are actually stopped
+            peersLock.lock()
+            let stillListening = peers.filter { $0.isListening }
+            peersLock.unlock()
+
+            if stillListening.isEmpty {
+                print("✅ FIX #834: All block listeners verified stopped (attempt \(attempt))")
+                return true
+            }
+
+            print("⚠️ FIX #834: \(stillListening.count) listeners still running after attempt \(attempt)/\(maxRetries)")
+            for peer in stillListening {
+                print("   ⚠️ Still listening: \(peer.host):\(peer.port)")
+                // Force signal stop again
+                peer.signalStopListener()
+            }
+
+            if attempt < maxRetries {
+                print("🔄 FIX #834: Waiting \(retryDelay)s before retry...")
+                try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+            }
+        }
+
+        // Final check
+        peersLock.lock()
+        let finalCheck = peers.filter { $0.isListening }
+        peersLock.unlock()
+
+        if finalCheck.isEmpty {
+            print("✅ FIX #834: All block listeners stopped after retries")
+            return true
+        } else {
+            print("🚨 FIX #834: FAILED - \(finalCheck.count) listeners still running after \(maxRetries) attempts!")
+            for peer in finalCheck {
+                print("   🚨 Still listening: \(peer.host):\(peer.port)")
+            }
+            return false
+        }
+    }
+
+    /// Get count of currently listening peers (for verification)
+    public func getListeningPeerCount() -> Int {
+        peersLock.lock()
+        let count = peers.filter { $0.isListening }.count
+        peersLock.unlock()
+        return count
     }
 
     /// Resume all block listeners (after header sync)
@@ -630,7 +875,14 @@ public final class PeerManager: ObservableObject {
 
     /// FIX #509: Start block listeners ONLY when app is fully ready on main balance screen
     /// This should be called explicitly by the UI when the main screen is displayed
+    /// FIX #907: Check if operations are blocking listeners before starting
     public func startBlockListenersOnMainScreen() async {
+        // FIX #907: Don't start if operations are in progress
+        if areBlockListenersBlocked() {
+            print("🛑 FIX #907: PeerManager startBlockListenersOnMainScreen BLOCKED - operations in progress")
+            return
+        }
+
         print("▶️ FIX #509: PeerManager - Starting block listeners on main balance screen...")
         peersLock.lock()
         let peersSnapshot = peers
@@ -659,6 +911,35 @@ public final class PeerManager: ObservableObject {
         headerSyncStateLock.lock()
         defer { headerSyncStateLock.unlock() }
         return headerSyncInProgressFlag
+    }
+
+    // MARK: - FIX #907: Block Listeners Blocked State Management
+
+    /// FIX #907: Set block listeners blocked state
+    /// Called at START of any operation (scan, import, repair, broadcast)
+    /// Block listeners can ONLY run when blocked = false
+    nonisolated public func setBlockListenersBlocked(_ blocked: Bool) {
+        blockListenersBlockedLock.lock()
+        defer { blockListenersBlockedLock.unlock() }
+        blockListenersBlockedFlag = blocked
+        print("🛑 FIX #907: Block listeners \(blocked ? "BLOCKED" : "UNBLOCKED")")
+    }
+
+    /// FIX #907: Check if block listeners are blocked
+    /// Returns true if ANY operation is in progress that requires peers
+    nonisolated public func areBlockListenersBlocked() -> Bool {
+        blockListenersBlockedLock.lock()
+        defer { blockListenersBlockedLock.unlock() }
+        return blockListenersBlockedFlag
+    }
+
+    /// FIX #907: Comprehensive check - should block listeners be allowed to start?
+    /// Returns false if any operation is in progress
+    nonisolated public func canStartBlockListeners() -> Bool {
+        // Check both flags
+        let headerSyncBlocked = isHeaderSyncInProgress()
+        let operationsBlocked = areBlockListenersBlocked()
+        return !headerSyncBlocked && !operationsBlocked
     }
 
     // MARK: - Sybil Detection
@@ -924,6 +1205,7 @@ public final class PeerManager: ObservableObject {
     }
 
     /// Check if a peer should be skipped (banned OR parked and not ready for retry)
+    /// FIX #908: Also considers handshake failure park time
     public func shouldSkipPeer(_ host: String) -> Bool {
         // Banned peers are always skipped
         if isBanned(host) {
@@ -935,6 +1217,15 @@ public final class PeerManager: ObservableObject {
         if let parked = parkedPeers[host] {
             let ready = parked.isReadyForRetry
             addressLock.unlock()
+            if !ready {
+                // FIX #908: Log extended handshake park if applicable
+                if parked.handshakeParkTime > 0 {
+                    let remaining = parked.handshakeParkTimeRemaining
+                    let hrs = Int(remaining / 3600)
+                    let mins = Int((remaining.truncatingRemainder(dividingBy: 3600)) / 60)
+                    print("🅿️ FIX #908: Skipping \(host) - handshake park (\(hrs)h \(mins)m remaining)")
+                }
+            }
             return !ready
         }
         addressLock.unlock()
@@ -1116,37 +1407,93 @@ public final class PeerManager: ObservableObject {
 
         // FIX #563 v8: Use 5-second timeout instead of 2 seconds
         // 2s is too aggressive - only 1/6 peers responded, causing DUPLICATE false positive
+        // FIX #823: Added 10s OVERALL timeout - Swift TaskGroup can serialize tasks
+        // causing 16 peers × 5s = 80s hang (same issue as FIX #822)
         var respondingPeers: [Peer] = []
+        var didTimeout = false
 
-        await withTaskGroup(of: (Peer, Bool).self) { group in
-            for peer in candidates {
-                group.addTask {
-                    // 5-second ping test to accommodate Tor/remote latency
-                    let success = await peer.sendPing(timeoutSeconds: 5)
-                    return (peer, success)
+        // FIX #824: Always include localhost - skip ping verification for local node
+        // Local node is most reliable for broadcast but ping can fail due to lock contention
+        // when block listener is running. User reports localhost works 100%.
+        let localhostPeers = candidates.filter { $0.host == "127.0.0.1" }
+        let remotePeers = candidates.filter { $0.host != "127.0.0.1" }
+
+        if !localhostPeers.isEmpty {
+            respondingPeers.append(contentsOf: localhostPeers)
+            print("✅ FIX #824: Localhost included in broadcast (ping skipped - most reliable)")
+        }
+
+        // FIX #823 v3: Simple timeout pattern - don't wait for slow pings
+        // v2 had a bug: withThrowingTaskGroup still waited for tasks that were cancelled
+        // v3: Use a simple deadline and collect results that arrive in time
+        let deadline = Date().addingTimeInterval(10) // 10 second overall timeout
+        var pendingCount = remotePeers.count
+
+        print("🔍 FIX #823 v3: Starting ping verification for \(remotePeers.count) remote peers (10s deadline)")
+
+        // Start all pings in parallel
+        // FIX #869: sendPing now returns PingResult
+        let pingTask = Task {
+            await withTaskGroup(of: (Peer, PingResult).self) { group in
+                for peer in remotePeers {
+                    group.addTask {
+                        let result = await peer.sendPing(timeoutSeconds: 5)
+                        return (peer, result)
+                    }
                 }
-            }
 
-            for await (peer, success) in group {
-                if success {
-                    respondingPeers.append(peer)
-                    print("✅ FIX #563 v8: Peer \(peer.host) responds to ping")
-                } else {
-                    print("❌ FIX #563 v8: Peer \(peer.host) failed ping (zombie)")
+                for await (peer, pingResult) in group {
+                    // Check if we've exceeded deadline
+                    if Date() > deadline {
+                        print("⏰ FIX #823 v3: Deadline reached, stopping ping collection")
+                        break  // Stop waiting for more results
+                    }
+
+                    pendingCount -= 1
+                    // FIX #869: .success or .busy means peer is alive
+                    let isAlive = (pingResult == .success || pingResult == .busy)
+                    if isAlive {
+                        respondingPeers.append(peer)
+                        print("✅ FIX #563 v8: Peer \(peer.host) responds to ping (\(pendingCount) pending)")
+                    } else {
+                        print("❌ FIX #563 v8: Peer \(peer.host) failed ping (\(pingResult)) (\(pendingCount) pending)")
+                    }
                 }
             }
         }
 
-        // FIX #563 v8: If < 50% respond, use candidates anyway
-        // Don't let aggressive ping filtering reduce broadcast to too few peers
+        // Wait for either: all pings complete OR timeout
+        // Use simple polling instead of complex TaskGroup race
+        var pingsCompleted = false
+        while Date() < deadline {
+            if pingTask.isCancelled || pendingCount == 0 {
+                pingsCompleted = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000) // Check every 100ms
+        }
+
+        // Cancel any remaining work
+        pingTask.cancel()
+
+        print("📊 FIX #823 v3: Ping verification ended - completed=\(pingsCompleted), responses=\(respondingPeers.count)")
+
+        // FIX #823 v3: Use whatever peers responded before deadline
+        // If we got some responses, use them. If none, fall back to all candidates.
         let responseRate = Double(respondingPeers.count) / Double(candidates.count)
-        if respondingPeers.isEmpty || responseRate < 0.5 {
-            print("⚠️ FIX #563 v8: Only \(respondingPeers.count)/\(candidates.count) peers responded (\(Int(responseRate * 100))%)")
-            print("⚠️ FIX #563 v8: Using all \(candidates.count) candidates - ping timeout too aggressive")
+
+        if respondingPeers.isEmpty {
+            print("⚠️ FIX #823 v3: No peers responded in time, using all \(candidates.count) candidates")
             return candidates
         }
 
-        print("⚡ FIX #563 v8: \(respondingPeers.count)/\(candidates.count) peers verified responsive")
+        if responseRate < 0.5 {
+            print("⚠️ FIX #563 v8: Only \(respondingPeers.count)/\(candidates.count) peers responded (\(Int(responseRate * 100))%)")
+            print("⚠️ FIX #563 v8: Using all \(candidates.count) candidates - ping filtering too aggressive")
+            return candidates
+        }
+
+        print("⚡ FIX #823 v3: \(respondingPeers.count)/\(candidates.count) peers verified responsive")
         return respondingPeers
     }
 

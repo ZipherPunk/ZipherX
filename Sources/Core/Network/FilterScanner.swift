@@ -7,12 +7,7 @@ final class FilterScanner {
     private let networkManager: NetworkManager
     private let database: WalletDatabase
     private let rustBridge: RustBridge
-    private let insightAPI: InsightAPI
-
-    // P2P-Only Mode: When true, uses P2P network exclusively (no InsightAPI)
-    // When false (default), tries P2P first then falls back to InsightAPI
-    // Reads from UserDefaults - can be changed in Settings
-    var useP2POnly: Bool = UserDefaults.standard.bool(forKey: "useP2POnly")
+    // FIX #896: Removed InsightAPI - ZipherX is a cypherpunk P2P-only wallet, no centralized explorer dependency
 
     // Scanning parameters
     private let batchSize = 500 // Larger batches for faster sync
@@ -22,18 +17,46 @@ final class FilterScanner {
     // SECURITY: Thread-safe lock to prevent concurrent scans across all instances
     private static let globalScanLock = NSLock()
     private static var _isScanningFlag = false
+    // FIX #873: Track when scan started to detect stuck scans
+    private static var _scanStartTime: Date?
+    private static let SCAN_TIMEOUT_SECONDS: TimeInterval = 600 // 10 minutes max
 
     /// Check if any scan is currently in progress (thread-safe)
+    /// FIX #873: Also checks for stuck scans (>10 minutes) and auto-clears the flag
     static var isScanInProgress: Bool {
         globalScanLock.lock()
         defer { globalScanLock.unlock() }
+
+        // FIX #873: Auto-clear stuck scan flag after timeout
+        if _isScanningFlag, let startTime = _scanStartTime {
+            let elapsed = Date().timeIntervalSince(startTime)
+            if elapsed > SCAN_TIMEOUT_SECONDS {
+                print("🚨 FIX #873: Scan stuck for \(Int(elapsed))s - force-clearing isScanInProgress flag")
+                _isScanningFlag = false
+                _scanStartTime = nil
+                return false
+            }
+        }
+
         return _isScanningFlag
     }
 
     /// Thread-safe setter for scan flag
+    /// FIX #873: Also tracks scan start time for timeout detection
     private static func setScanInProgress(_ value: Bool) {
         globalScanLock.lock()
         _isScanningFlag = value
+        // FIX #873: Track start time when scan begins, clear when it ends
+        if value {
+            _scanStartTime = Date()
+            print("🔍 FIX #873: Scan started at \(Date())")
+        } else {
+            if let startTime = _scanStartTime {
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("✅ FIX #873: Scan completed in \(Int(elapsed))s")
+            }
+            _scanStartTime = nil
+        }
         globalScanLock.unlock()
     }
 
@@ -140,14 +163,13 @@ final class FilterScanner {
         onStatusUpdate?("phase2", "Building commitment tree (\(percent)%, \(blocksRemaining) blocks left)...")
     }
 
+    // FIX #896: Removed InsightAPI parameter - pure P2P implementation
     init(networkManager: NetworkManager = .shared,
          database: WalletDatabase = .shared,
-         rustBridge: RustBridge = .shared,
-         insightAPI: InsightAPI = .shared) {
+         rustBridge: RustBridge = .shared) {
         self.networkManager = networkManager
         self.database = database
         self.rustBridge = rustBridge
-        self.insightAPI = insightAPI
     }
 
     // MARK: - Scanning
@@ -166,9 +188,17 @@ final class FilterScanner {
 
         isScanning = true
         FilterScanner.setScanInProgress(true)
+
+        // FIX #907: Block all block listeners during the entire scan operation
+        // Block listeners can only run when app is idle on main screen
+        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
+        PeerManager.shared.setBlockListenersBlocked(true)
+
         defer {
             isScanning = false
             FilterScanner.setScanInProgress(false)
+            // FIX #907: Unblock block listeners when scan completes
+            PeerManager.shared.setBlockListenersBlocked(false)
         }
 
         // Get current chain height
@@ -210,11 +240,12 @@ final class FilterScanner {
         await WalletManager.shared.updateDownloadTask("download_timestamps", status: .completed, detail: timestampsSuccess ? "Height \(timestampsMaxHeight)" : "Using estimates")
 
         // Test P2P block fetching before starting scan
+        // FIX #896: Always use P2P (cypherpunk wallet - no centralized explorer)
         if FilterScanner.p2pBlockFetchingWorks == nil {
             let p2pWorks = await testP2PBlockFetching()
             FilterScanner.p2pBlockFetchingWorks = p2pWorks
-            if !p2pWorks && useP2POnly {
-                print("❌ P2P-only mode enabled but P2P block fetch failed!")
+            if !p2pWorks {
+                print("❌ P2P block fetch failed - no fallback available (cypherpunk mode)")
                 throw ScanError.networkError
             }
         }
@@ -326,10 +357,10 @@ final class FilterScanner {
             }
         }
 
-        // If startHeight > latestHeight, refresh height
+        // If startHeight > latestHeight, refresh height from P2P (FIX #896: no InsightAPI)
         if startHeight > latestHeight {
-            if let apiHeight = try? await insightAPI.getStatus().height, apiHeight >= startHeight {
-                currentChainHeight = apiHeight
+            if let p2pHeight = try? await networkManager.getChainHeight(), p2pHeight >= startHeight {
+                currentChainHeight = p2pHeight
             } else {
                 onProgress?(1.0, latestHeight, latestHeight)
                 return
@@ -699,33 +730,10 @@ final class FilterScanner {
                             throw ScanError.networkError
                         }
                     } catch {
-                        // Fallback to InsightAPI with parallel fetching
-                        if !useP2POnly {
-                            await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)]?).self) { group in
-                                for height in currentHeight...endHeight {
-                                    group.addTask {
-                                        do {
-                                            let txData = try await self.fetchBlockData(height: height)
-                                            return (height, txData.isEmpty ? nil : txData)
-                                        } catch {
-                                            return (height, nil)
-                                        }
-                                    }
-                                }
-                                for await (height, txData) in group {
-                                    if let data = txData {
-                                        blockDataMap[height] = data
-                                    } else {
-                                        // FIX #294: Track failed heights for retry
-                                        failedHeights.insert(height)
-                                    }
-                                }
-                            }
-                        } else {
-                            // P2P only mode - mark all as failed if P2P fails
-                            for height in currentHeight...endHeight {
-                                failedHeights.insert(height)
-                            }
+                        // FIX #896: P2P only mode - no InsightAPI fallback (cypherpunk wallet)
+                        // Mark all heights as failed for retry
+                        for height in currentHeight...endHeight {
+                            failedHeights.insert(height)
                         }
                     }
 
@@ -1033,6 +1041,42 @@ final class FilterScanner {
             await PeerManager.shared.setHeaderSyncInProgress(true)
 
             await PeerManager.shared.stopAllBlockListeners()
+
+            // FIX #903: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
+            // Same issue as FIX #900/902 - stopAllBlockListeners() has 5s timeout but "proceeds anyway"
+            // Block listeners can take 20+ seconds to actually stop
+            print("⏳ FIX #903: Verifying all block listeners are stopped...")
+            let verifyStartTime = Date()
+            let maxVerifyWait: Double = 30.0  // 30 seconds max wait
+            var lastListeningCount = 0
+
+            while true {
+                let elapsed = Date().timeIntervalSince(verifyStartTime)
+                if elapsed > maxVerifyWait {
+                    print("⚠️ FIX #903: Block listener verification timed out after \(Int(elapsed))s - proceeding anyway")
+                    break
+                }
+
+                let stillListening = await MainActor.run {
+                    networkManager.peers.filter { $0.isListening }.count
+                }
+                let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
+
+                if stillListening == 0 && !peerManagerListening {
+                    print("✅ FIX #903: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
+                    break
+                }
+
+                if stillListening != lastListeningCount {
+                    print("⏳ FIX #903: Still waiting for \(stillListening) block listeners to stop...")
+                    lastListeningCount = stillListening
+                }
+
+                try? await Task.sleep(nanoseconds: 500_000_000)  // Check every 500ms
+            }
+
+            print("⏳ FIX #903: Waiting 200ms for in-flight receives to complete...")
+            try? await Task.sleep(nanoseconds: 200_000_000)
             print("🛑 FIX #462: Block listeners stopped, starting header sync...")
 
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
@@ -1109,16 +1153,15 @@ final class FilterScanner {
                 // Continue with on-demand fallback - it may work
             }
 
-            // FIX #383: Resume block listeners after header sync completes
-            // Header sync is done, now block listeners can safely consume messages again
-            print("▶️ FIX #383: Resuming block listeners after header sync...")
-            await PeerManager.shared.resumeAllBlockListeners()
+            // FIX #907: DO NOT resume block listeners here!
+            // Block listeners must stay STOPPED during PHASE 2 block fetch
+            // Otherwise they will acquire locks on peers and block the P2P fetch
+            // Block listeners will be resumed at the END of the scan (see scan completion code)
 
-            // FIX #472: Clear header sync in progress flag AFTER resuming listeners
-            // This allows NEW peers to start listeners normally
+            // FIX #472: Clear header sync in progress flag (but keep listeners stopped)
             await PeerManager.shared.setHeaderSyncInProgress(false)
 
-            print("▶️ FIX #383: Block listeners resumed")
+            print("🛑 FIX #907: Block listeners staying STOPPED for PHASE 2 block fetch")
 
             // FIX #362: Explicit entry log to confirm PHASE 2 is running
             print("✅ FIX #362: Entering PHASE 2 sequential mode (currentHeight=\(currentHeight), targetHeight=\(targetHeight))")
@@ -1188,16 +1231,22 @@ final class FilterScanner {
 
             let totalBlocksToFetch = Int(rawBlockCount)
             let prefetchBatchSize = 500  // 500 blocks per batch
-            let parallelBatches = 4      // Fetch 4 batches simultaneously (2000 blocks at once)
+            // FIX #933: Reduced from 4 to 2 parallel batches to prevent overwhelming peers
+            // 4 batches × 500 blocks = 2000 blocks overwhelmed peers causing "Not connected" errors
+            // 2 batches × 500 blocks = 1000 blocks is more manageable while still fast
+            let parallelBatches = 2
 
             print("🚀 FIX #190 v6: Pre-fetching \(totalBlocksToFetch) blocks (\(parallelBatches)x parallel, batch=\(prefetchBatchSize))...")
             onStatusUpdate?("prefetch", "📥 Fetching 0/\(totalBlocksToFetch) blocks...")
             let prefetchStartTime = Date()
 
-            // Fetch blocks using PARALLEL batches for 3-4x speedup
+            // FIX #897: Fetch blocks with retry logic - don't skip failed blocks!
+            // Previous bug: Failed batches advanced prefetchHeight, losing transactions
             var prefetchedBlocks: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]] = [:]
-            var fetchedCount = 0
             var prefetchHeight = currentHeight
+            let maxRetries = 3
+            var consecutiveEmptyFetches = 0
+            let maxConsecutiveEmpty = 5  // Give up after 5 rounds with 0 blocks fetched
 
             while prefetchHeight <= targetHeight && isScanning {
                 // Create up to `parallelBatches` concurrent fetch tasks
@@ -1215,14 +1264,15 @@ final class FilterScanner {
                 guard !batchTasks.isEmpty else { break }
 
                 // Report fetch progress (0-50% of PHASE 2)
-                let fetchProgress = Double(fetchedCount) / Double(totalBlocksToFetch)
+                let fetchProgress = Double(prefetchedBlocks.count) / Double(totalBlocksToFetch)
                 let fetchPercent = Int(fetchProgress * 100)
                 let batchCount = batchTasks.count
-                print("📥 FIX #190 v6: Fetching \(fetchedCount)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches...")
-                onStatusUpdate?("prefetch", "📥 Fetching \(fetchedCount)/\(totalBlocksToFetch) blocks...")
+                print("📥 FIX #897: Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches from height \(prefetchHeight)...")
+                onStatusUpdate?("prefetch", "📥 Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks...")
                 reportPhase2Progress(fetchProgress * 0.5, height: prefetchHeight, maxHeight: targetHeight)
 
                 // Fetch all batches IN PARALLEL using TaskGroup
+                var batchBlocksFetched = 0
                 let batchResults = await withTaskGroup(of: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
                     for task in batchTasks {
                         group.addTask {
@@ -1231,7 +1281,7 @@ final class FilterScanner {
                                     try await self.fetchBlocksData(heights: task.heights)
                                 }
                             } catch {
-                                print("⚠️ FIX #190 v6: Batch \(task.start)-\(task.end) failed: \(error)")
+                                print("⚠️ FIX #897: Batch \(task.start)-\(task.end) failed: \(error)")
                                 return nil
                             }
                         }
@@ -1250,12 +1300,85 @@ final class FilterScanner {
                 for batchData in batchResults {
                     for (height, txData) in batchData {
                         prefetchedBlocks[height] = txData
+                        batchBlocksFetched += 1
                     }
-                    fetchedCount += batchData.count
+                }
+
+                // FIX #897: Check for missing blocks in this batch range and retry
+                let batchEndHeight = batchTasks.last!.end
+                var missingHeights: [UInt64] = []
+                for h in prefetchHeight...batchEndHeight {
+                    if prefetchedBlocks[h] == nil {
+                        missingHeights.append(h)
+                    }
+                }
+
+                if !missingHeights.isEmpty {
+                    print("⚠️ FIX #897: \(missingHeights.count) blocks missing from batch, retrying...")
+
+                    // Retry missing blocks in smaller sequential batches
+                    for retryAttempt in 1...maxRetries {
+                        guard isScanning else { break }
+
+                        // Only retry blocks that are still missing
+                        let stillMissing = missingHeights.filter { prefetchedBlocks[$0] == nil }
+                        if stillMissing.isEmpty { break }
+
+                        print("🔄 FIX #897: Retry \(retryAttempt)/\(maxRetries) for \(stillMissing.count) blocks...")
+
+                        // Retry in smaller chunks (50 blocks at a time)
+                        let retryChunkSize = 50
+                        for chunkStart in stride(from: 0, to: stillMissing.count, by: retryChunkSize) {
+                            guard isScanning else { break }
+                            let chunkEnd = min(chunkStart + retryChunkSize, stillMissing.count)
+                            let chunkHeights = Array(stillMissing[chunkStart..<chunkEnd])
+
+                            do {
+                                let retryResults = try await withTimeout(seconds: 30) {
+                                    try await self.fetchBlocksData(heights: chunkHeights)
+                                }
+                                for (height, txData) in retryResults {
+                                    prefetchedBlocks[height] = txData
+                                    batchBlocksFetched += 1
+                                }
+                            } catch {
+                                print("⚠️ FIX #897: Retry chunk \(chunkHeights.first ?? 0)-\(chunkHeights.last ?? 0) failed: \(error)")
+                            }
+                        }
+
+                        // Brief pause between retries to let network recover
+                        if retryAttempt < maxRetries {
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+                        }
+                    }
+
+                    // Log final status for this batch
+                    let finalMissing = missingHeights.filter { prefetchedBlocks[$0] == nil }
+                    if !finalMissing.isEmpty {
+                        print("❌ FIX #897: \(finalMissing.count) blocks still missing after \(maxRetries) retries (heights: \(finalMissing.prefix(5).map { String($0) }.joined(separator: ", "))...)")
+                    } else {
+                        print("✅ FIX #897: All missing blocks recovered after retry")
+                    }
+                }
+
+                // FIX #897: Track consecutive empty fetches to detect persistent network issues
+                if batchBlocksFetched == 0 {
+                    consecutiveEmptyFetches += 1
+                    print("⚠️ FIX #897: Empty fetch round \(consecutiveEmptyFetches)/\(maxConsecutiveEmpty)")
+                    if consecutiveEmptyFetches >= maxConsecutiveEmpty {
+                        print("❌ FIX #897: \(maxConsecutiveEmpty) consecutive empty fetches - network may be down, aborting prefetch")
+                        break
+                    }
+                    // Wait before retrying to let network recover
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
+                } else {
+                    consecutiveEmptyFetches = 0  // Reset on successful fetch
                 }
 
                 // Move to next set of parallel batches
-                prefetchHeight = batchTasks.last!.end + 1
+                prefetchHeight = batchEndHeight + 1
+
+                print("✅ FIX #897: Batch complete - \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks cached")
             }
 
             let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
@@ -1272,8 +1395,47 @@ final class FilterScanner {
                     }
                 }
             }
-            print("✅ FIX #190 v6: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+            print("✅ FIX #897: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
             print("📊 FIX #789: Fetched \(totalOutputsFetched) shielded outputs across \(blocksWithOutputs) blocks")
+
+            // FIX #910: CRITICAL - Detect network failure and throw error to trigger retry
+            // If we fetched less than 50% of needed blocks and network failed (consecutive empty),
+            // throw error instead of continuing with incomplete data
+            let fetchedPercentage = Double(prefetchedBlocks.count) / Double(totalBlocksToFetch)
+
+            // FIX #932: CRITICAL - Lower threshold and remove consecutiveEmptyFetches dependency
+            // Problem: FIX #910 only triggered when BOTH <50% fetched AND consecutive empty rounds
+            // But partial fetches reset consecutiveEmptyFetches → never triggers even with 73% missing!
+            // Log showed: "Processing 46 blocks" but "1/173" needed → 127 missing → tree mismatch
+            // Solution: Trigger on EITHER condition to prevent incomplete tree building
+            // - <80% fetched: Too many missing blocks, CMUs will be incomplete
+            // - consecutiveEmptyFetches: Network completely down
+            let hasTooManyMissing = fetchedPercentage < 0.8
+            let hasNetworkDown = consecutiveEmptyFetches >= maxConsecutiveEmpty
+
+            if hasTooManyMissing || hasNetworkDown {
+                let reason = hasTooManyMissing ? "too many missing blocks (\(Int((1 - fetchedPercentage) * 100))%)" : "network down"
+                print("🚨 FIX #932: ABORT - Only fetched \(Int(fetchedPercentage * 100))% of blocks (\(reason))")
+                print("🚨 FIX #932: Throwing error to trigger automatic retry when network recovers")
+
+                // Save what we have so far
+                let partialHeight = prefetchedBlocks.keys.max() ?? currentHeight
+                try? database.updateLastScannedHeight(partialHeight, hash: Data(count: 32))
+                if let treeData = ZipherXFFI.treeSerialize() {
+                    try? database.saveTreeState(treeData)
+                }
+                print("📍 FIX #932: Saved partial progress at height \(partialHeight)")
+
+                // Mark scan as not in progress so it can be retried
+                isScanning = false
+                Self.setScanInProgress(false)
+
+                throw NetworkError.scanAbortedDueToNetworkFailure(
+                    fetched: prefetchedBlocks.count,
+                    needed: totalBlocksToFetch,
+                    lastHeight: partialHeight
+                )
+            }
 
             // PROCESSING PHASE: Build commitment tree from pre-fetched blocks
             print("🔧 FIX #190: Processing \(prefetchedBlocks.count) blocks for commitment tree...")
@@ -1547,6 +1709,12 @@ final class FilterScanner {
             try? database.updateVerifiedCheckpointHeight(lastScanned)
             print("📍 FIX #176: Checkpoint updated to \(lastScanned) after scan complete")
         }
+
+        // FIX #907: Resume block listeners now that all sync operations are complete
+        // Block listeners were stopped for header sync and PHASE 2 block fetch
+        print("▶️ FIX #907: Resuming block listeners after scan complete...")
+        await PeerManager.shared.resumeAllBlockListeners()
+        print("✅ FIX #907: Block listeners resumed")
 
         print("✅ Scan complete")
     }
@@ -2243,10 +2411,14 @@ final class FilterScanner {
 
                     // FIX #396: When our note is spent, check if this is our pending outgoing TX
                     // If so, confirm it to clear the "awaiting confirmation" UI state
-                    let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
-                    if await NetworkManager.shared.isPendingOutgoingTx(txidHex) {
-                        print("📤 FIX #396: Our pending TX \(txidHex.prefix(16))... confirmed in block \(height)")
-                        await NetworkManager.shared.confirmOutgoingTx(txid: txidHex)
+                    // FIX #859: CRITICAL - tx.txHash is in wire format (little-endian)
+                    // But pendingOutgoingTxidSet contains display format (big-endian) txids
+                    // computed via rawTx.doubleSHA256().reversed()
+                    // We must reverse tx.txHash to match the display format for comparison
+                    let txidDisplayFormat = tx.txHash.reversed().map { String(format: "%02x", $0) }.joined()
+                    if await NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
+                        print("📤 FIX #859: Our pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
                     }
                 }
             }
@@ -2309,6 +2481,10 @@ final class FilterScanner {
         // If we find our outputs later but didn't detect any spends, it's likely our transaction with a deleted note
         var detectedOurSpendInThisTx = false
 
+        // FIX #843: Track external spend details for this TX (spent from another wallet or after app restart)
+        var externalSpendTxids = Set<String>()
+        var externalSpendNoteValue: UInt64 = 0  // Value of the note that was spent
+
         // FIX #288: Check for spent notes (nullifier detection) FIRST
         // DEBUG: Log spend detection attempts
         if let spends = spends, !spends.isEmpty {
@@ -2336,10 +2512,39 @@ final class FilterScanner {
 
                     // FIX #396: Confirm pending outgoing TX when nullifier found in block
                     // This clears the "awaiting confirmation" UI state
-                    if NetworkManager.shared.isPendingOutgoingTx(txid) {
-                        print("📤 FIX #396: Pending TX \(txid.prefix(16))... confirmed in block \(height)")
+                    // FIX #859: txid parameter is in wire format (from P2P), but pending set uses display format
+                    // Convert wire→display by reversing the bytes in the hex string
+                    let txidDisplayFormat: String
+                    if let txidData = Data(hexString: txid) {
+                        txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                    } else {
+                        txidDisplayFormat = txid  // Fallback if parsing fails
+                    }
+                    if NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
+                        print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
                         Task {
-                            await NetworkManager.shared.confirmOutgoingTx(txid: txid)
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
+                        }
+                    } else {
+                        // FIX #843: External spend or app-restart case
+                        // We detected our nullifier but TX wasn't in pending list
+                        // This happens when:
+                        // 1. TX was sent from another wallet with same key
+                        // 2. App was restarted before TX was confirmed
+                        // Record as SENT if not already recorded
+                        if let txidData = txidData {
+                            let alreadyRecorded = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
+                            if !alreadyRecorded {
+                                // Get the spent note to determine the value (use wire format nullifier)
+                                if let spentNote = try? database.getNoteByNullifier(nullifier: nullifierWire) {
+                                    print("💸 FIX #843: External/restart spend detected")
+                                    print("   TX: \(txid.prefix(16))... at height \(height)")
+                                    print("   Note value: \(spentNote.value) zatoshis")
+                                    // Track this TX for reconciliation when we find the change output
+                                    externalSpendTxids.insert(txid)
+                                    externalSpendNoteValue = spentNote.value
+                                }
+                            }
                         }
                     }
                 } else {
@@ -2457,28 +2662,52 @@ final class FilterScanner {
             var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
 
             // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            // FIX #942: txid is in WIRE format but pendingOutgoingTxidSet stores DISPLAY format
+            // Must convert wire → display by reversing bytes before comparison
             if !isChangeOutput {
-                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                let txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat)
             }
 
-            // FIX #690: If we found our outputs but didn't detect any spends in this transaction,
-            // and the transaction HAS spends, it's likely our sent transaction with a deleted note.
-            // The spent note was deleted during full resync, but we can still detect our change outputs.
-            if !isChangeOutput && !detectedOurSpendInThisTx && (spends?.isEmpty == false) {
-                // This transaction has spends that we didn't detect (note deleted during resync)
-                // But we found our outputs (change), so this must be our sent transaction
-                print("💸 FIX #690: Recording as SENT - found our change output but spend was deleted")
+            // FIX #843: Handle external spend / app-restart case
+            // We detected our nullifier spent but TX wasn't in pending list
+            // Now we found our change output - record the SENT transaction
+            if !isChangeOutput && externalSpendTxids.contains(txid) && externalSpendNoteValue > 0 {
+                let fee: UInt64 = 10000  // Standard fee
+                let changeValue = value
+                let sentAmount = externalSpendNoteValue > (changeValue + fee) ?
+                    externalSpendNoteValue - changeValue - fee : 0
+
+                print("💸 FIX #843: Recording external spend as SENT transaction")
+                print("   Input note: \(externalSpendNoteValue) zatoshis")
+                print("   Change output: \(changeValue) zatoshis")
+                print("   Sent amount: \(sentAmount) zatoshis")
+                print("   Fee: \(fee) zatoshis")
+
                 try database.recordSentTransactionAtomic(
-                    hashedNullifier: Data(),  // Empty - we don't have the nullifier
+                    hashedNullifier: Data(),  // We don't have it here, note already marked spent
                     txid: txidData,
                     spentHeight: height,
-                    amount: value,  // This is the CHANGE amount, not the sent amount
-                    fee: 10000,
-                    toAddress: "Change (FIX #690)",
-                    memo: nil
+                    amount: sentAmount,
+                    fee: fee,
+                    toAddress: "[External - FIX #843]",
+                    memo: "[External wallet or app-restart spend - FIX #843]"
                 )
                 isChangeOutput = true  // Mark as change so we don't record as received
+                externalSpendTxids.remove(txid)  // Handled, remove from tracking
             }
+
+            // FIX #690: DISABLED by FIX #864 - This logic was fatally flawed!
+            // The original logic: if we found our output + tx has spends + didn't detect OUR spends
+            //   → assume it's our sent transaction with deleted note
+            // BUG: When someone ELSE sends to us, their tx also has:
+            //   - Our output (what we received)
+            //   - Their spends (not ours)
+            //   - We don't detect OUR spends (because we didn't spend anything!)
+            // This caused received transactions to be incorrectly labeled as "sent"
+            // FIX #864: Removed this flawed logic entirely. External spends are handled by FIX #843.
+            // If we truly need to detect "our sent with deleted note", we should check pendingOutgoingTxids
+            // instead of making assumptions based on spends existing in the transaction.
 
             if !isChangeOutput {
                 // NOTE: Do NOT call trackPendingIncoming here - this is block scanning, not mempool.
@@ -2494,6 +2723,32 @@ final class FilterScanner {
             }
 
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
+        }
+
+        // FIX #843: Handle external spend with NO change output (entire amount sent)
+        // If we detected our nullifier spent but never found a change output, record as SENT
+        if !externalSpendTxids.isEmpty && externalSpendNoteValue > 0 {
+            for externalTxid in externalSpendTxids {
+                if let txidData = Data(hexString: externalTxid) {
+                    let fee: UInt64 = 10000
+                    let sentAmount = externalSpendNoteValue > fee ? externalSpendNoteValue - fee : 0
+
+                    print("💸 FIX #843: Recording external spend (no change) as SENT transaction")
+                    print("   TX: \(externalTxid.prefix(16))...")
+                    print("   Input note: \(externalSpendNoteValue) zatoshis")
+                    print("   Sent amount: \(sentAmount) zatoshis (no change output)")
+
+                    try database.recordSentTransactionAtomic(
+                        hashedNullifier: Data(),
+                        txid: txidData,
+                        spentHeight: height,
+                        amount: sentAmount,
+                        fee: fee,
+                        toAddress: "[External - FIX #843]",
+                        memo: "[External spend - no change - FIX #843]"
+                    )
+                }
+            }
         }
     }
 
@@ -2647,7 +2902,10 @@ final class FilterScanner {
             // Check if change output
             var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
             if !isChangeOutput {
-                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: info.txid)
+                // FIX #942: info.txid is in WIRE format (little-endian) but pendingOutgoingTxidSet stores DISPLAY format (big-endian)
+                // Must convert wire → display by reversing bytes before comparison
+                let txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat)
             }
 
             if !isChangeOutput {
@@ -2926,10 +3184,17 @@ final class FilterScanner {
                     debugLog(.wallet, "💸 Note spent @ height \(height)")
 
                     // FIX #396: Confirm pending outgoing TX when nullifier found in block
-                    if NetworkManager.shared.isPendingOutgoingSync(txid: txid) {
-                        print("📤 FIX #396: Pending TX \(txid.prefix(16))... confirmed in block \(height)")
+                    // FIX #859: txid parameter is in wire format, but pending set uses display format
+                    let txidDisplayFormat: String
+                    if let txidData = Data(hexString: txid) {
+                        txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                    } else {
+                        txidDisplayFormat = txid  // Fallback
+                    }
+                    if NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat) {
+                        print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
                         Task {
-                            await NetworkManager.shared.confirmOutgoingTx(txid: txid)
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
                         }
                     }
                 }
@@ -3033,8 +3298,11 @@ final class FilterScanner {
             var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
 
             // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            // FIX #942: txid is in WIRE format but pendingOutgoingTxidSet stores DISPLAY format
+            // Must convert wire → display by reversing bytes before comparison
             if !isChangeOutput {
-                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                let txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat)
             }
 
             if !isChangeOutput {
@@ -3169,8 +3437,11 @@ final class FilterScanner {
             var isChangeOutput = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
 
             // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+            // FIX #942: txid is in WIRE format but pendingOutgoingTxidSet stores DISPLAY format
+            // Must convert wire → display by reversing bytes before comparison
             if !isChangeOutput {
-                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txid)
+                let txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat)
             }
 
             if !isChangeOutput {
@@ -3243,9 +3514,11 @@ final class FilterScanner {
         var isChangeOutput = (try? database.transactionExists(txid: txid, type: .sent)) ?? false
 
         // Method 2: Check NetworkManager's pendingOutgoing tracking (catches race condition)
+        // FIX #942: txid is in WIRE format but pendingOutgoingTxidSet stores DISPLAY format
+        // Must convert wire → display by reversing bytes before comparison
         if !isChangeOutput {
-            let txidHex = txid.map { String(format: "%02x", $0) }.joined()
-            isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidHex)
+            let txidDisplayFormat = txid.reversed().map { String(format: "%02x", $0) }.joined()
+            isChangeOutput = NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat)
         }
 
         if !isChangeOutput {
@@ -3405,143 +3678,42 @@ final class FilterScanner {
         }
     }
 
-    /// Fetch block data for scanning - tries P2P first, falls back to InsightAPI
+    /// Fetch block data for scanning - P2P ONLY (FIX #896: removed InsightAPI)
     /// Returns: [(txid, [ShieldedOutput], [ShieldedSpend]?)]
     private func fetchBlockData(height: UInt64) async throws -> [(String, [ShieldedOutput], [ShieldedSpend]?)] {
-        // Try P2P if it's known to work or hasn't been tested yet
+        // FIX #896: P2P only - no InsightAPI fallback (cypherpunk wallet)
         let isConnectedForP2P = await MainActor.run { networkManager.isConnected }
-        if FilterScanner.p2pBlockFetchingWorks != false && isConnectedForP2P {
-            do {
-                let (_, txData) = try await networkManager.getBlockDataP2P(height: height)
-                FilterScanner.p2pBlockFetchingWorks = true
-                return txData
-            } catch {
-                if FilterScanner.p2pBlockFetchingWorks == nil {
-                    FilterScanner.p2pBlockFetchingWorks = false
-                }
-                if useP2POnly { throw error }
-            }
-        }
-
-        // Fallback to InsightAPI (unless P2P-only mode)
-        if useP2POnly {
+        guard isConnectedForP2P else {
             throw ScanError.networkError
         }
 
-        let blockHash = try await insightAPI.getBlockHash(height: height)
-        let block = try await insightAPI.getBlock(hash: blockHash)
-
-        // FIX #187: Cache timestamp from InsightAPI (was being discarded!)
-        BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: UInt32(block.time))
-
-        var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-        for txid in block.tx {
-            let tx = try await insightAPI.getTransaction(txid: txid)
-            let hasOutputs = tx.vShieldedOutput?.isEmpty == false
-            let hasSpends = tx.vShieldedSpend?.isEmpty == false
-            if hasOutputs || hasSpends {
-                txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
-            }
-        }
-
+        let (_, txData) = try await networkManager.getBlockDataP2P(height: height)
+        FilterScanner.p2pBlockFetchingWorks = true
         return txData
     }
 
-    /// Fetch multiple blocks' data for scanning - tries P2P batch first, falls back to InsightAPI
+    /// Fetch multiple blocks' data for scanning - P2P ONLY (FIX #896: removed InsightAPI)
     /// Returns: [(height, [(txid, [ShieldedOutput], [ShieldedSpend]?)])]
     private func fetchBlocksData(heights: [UInt64]) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        // Try P2P batch fetch if it's known to work or hasn't been tested
+        // FIX #896: P2P only - no InsightAPI fallback (cypherpunk wallet)
         let isConnected = await MainActor.run { networkManager.isConnected }
-        if FilterScanner.p2pBlockFetchingWorks != false && isConnected && !heights.isEmpty {
-            do {
-                let startHeight = heights.min()!
-                let count = heights.count
-                let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count)
-
-                var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-                var hasAnyShieldedData = false
-                for (h, _, timestamp, txData) in results {
-                    blockData.append((h, txData))
-                    // Cache real block timestamps for transaction history
-                    BlockTimestampManager.shared.cacheTimestamp(height: h, timestamp: timestamp)
-                    // Check if any transaction has actual shielded data
-                    for (_, outputs, spends) in txData {
-                        if !outputs.isEmpty || spends?.isEmpty == false {
-                            hasAnyShieldedData = true
-                        }
-                    }
-                }
-
-                // IMPORTANT: Only trust P2P if we actually got shielded data OR we know the blocks have none
-                // If we got blocks but zero shielded tx data, P2P parsing might be broken
-                // Fall back to InsightAPI to be safe
-                if !blockData.isEmpty && hasAnyShieldedData {
-                    FilterScanner.p2pBlockFetchingWorks = true
-                    return blockData
-                } else if !blockData.isEmpty {
-                    FilterScanner.p2pBlockFetchingWorks = false
-                }
-            } catch {
-                if FilterScanner.p2pBlockFetchingWorks == nil {
-                    FilterScanner.p2pBlockFetchingWorks = false
-                }
-                if useP2POnly {
-                    throw error
-                }
-            }
-        }
-
-        // Fallback to InsightAPI with parallel fetching
-        if useP2POnly {
+        guard isConnected && !heights.isEmpty else {
             throw ScanError.networkError
         }
 
-        var results: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-        let batchSize = 10 // Parallel fetch 10 blocks at a time
+        let startHeight = heights.min()!
+        let count = heights.count
+        let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count)
 
-        for batchStart in stride(from: 0, to: heights.count, by: batchSize) {
-            let batchEnd = min(batchStart + batchSize, heights.count)
-            let batch = Array(heights[batchStart..<batchEnd])
-
-            let batchResults = await withTaskGroup(of: (UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])?.self) { group in
-                for height in batch {
-                    group.addTask {
-                        do {
-                            let blockHash = try await self.insightAPI.getBlockHash(height: height)
-                            let block = try await self.insightAPI.getBlock(hash: blockHash)
-
-                            // FIX #187: Cache timestamp from InsightAPI (was being discarded!)
-                            BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: UInt32(block.time))
-
-                            var txData: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
-                            for txid in block.tx {
-                                let tx = try await self.insightAPI.getTransaction(txid: txid)
-                                let hasOutputs = tx.vShieldedOutput?.isEmpty == false
-                                let hasSpends = tx.vShieldedSpend?.isEmpty == false
-                                if hasOutputs || hasSpends {
-                                    txData.append((txid, tx.vShieldedOutput ?? [], tx.vShieldedSpend))
-                                }
-                            }
-                            return (height, txData)
-                        } catch {
-                            return nil
-                        }
-                    }
-                }
-
-                var collected: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
-                for await result in group {
-                    if let r = result {
-                        collected.append(r)
-                    }
-                }
-                return collected
-            }
-
-            results.append(contentsOf: batchResults)
+        var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+        for (h, _, timestamp, txData) in results {
+            blockData.append((h, txData))
+            // Cache real block timestamps for transaction history
+            BlockTimestampManager.shared.cacheTimestamp(height: h, timestamp: timestamp)
         }
 
-        return results.sorted { $0.0 < $1.0 }
+        FilterScanner.p2pBlockFetchingWorks = true
+        return blockData
     }
 
     // MARK: - Witness Pre-computation

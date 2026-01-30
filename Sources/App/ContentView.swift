@@ -57,6 +57,9 @@ struct ContentView: View {
     // FIX #231: Reduced verification warning (insufficient peers for consensus)
     @State private var showReducedVerificationAlert = false
 
+    // FIX #888: Download failed alert (ask user to retry import)
+    @State private var showDownloadFailedAlert = false
+
     // FIX #409: Critical health alert
     @State private var showCriticalHealthAlert = false
 
@@ -93,6 +96,16 @@ struct ContentView: View {
             if walletManager.isWalletCreated && !walletManager.isMnemonicBackupPending {
                 mainWalletView
                     .task {
+                        // FIX #881: Startup timing profiler for performance analysis
+                        let startupStart = CFAbsoluteTimeGetCurrent()
+                        var phaseTimings: [(String, Double)] = []
+
+                        func logPhase(_ name: String, since: CFAbsoluteTime) {
+                            let elapsed = CFAbsoluteTimeGetCurrent() - since
+                            phaseTimings.append((name, elapsed))
+                            print("⏱️ FIX #881: \(name) took \(String(format: "%.2f", elapsed * 1000))ms")
+                        }
+
                         print("DEBUGZIPHERX: 🚀 Task: Starting initial sync task...")
 
                         // Only run initial sync once
@@ -303,6 +316,9 @@ struct ContentView: View {
                             print("📍 FIX #408: HeaderStore=\(headerStoreHeight), CachedChain=\(cachedChainHeight), Behind=\(headersBehind)")
 
                             if isCheckpointValid && isHeaderStoreHealthy {
+                                // FIX #881: Profile INSTANT START phases
+                                let instantStartBegin = CFAbsoluteTimeGetCurrent()
+
                                 print("⚡ FIX #168: INSTANT START - checkpoint valid (gap=\(checkpointGap))")
                                 print("⚡ FIX #408: HeaderStore healthy (within \(headersBehind) blocks)")
 
@@ -316,12 +332,18 @@ struct ContentView: View {
 
                                 // FIX #819: Validate CMU cache byte order BEFORE loading
                                 // Stale cache from before FIX #743 has reversed CMUs causing tree root mismatch
+                                // FIX #881: This is now O(1) after first validation thanks to version caching
+                                let cacheValidStart = CFAbsoluteTimeGetCurrent()
                                 let cacheValid = await CommitmentTreeUpdater.shared.validateAndClearStaleCMUCache()
+                                logPhase("CMU cache validation", since: cacheValidStart)
                                 if !cacheValid {
                                     print("🗑️ FIX #819: Stale CMU cache cleared - will regenerate from boost file")
                                 }
 
                                 do {
+                                    // FIX #881: Time tree deserialization
+                                    let treeDeserializeStart = CFAbsoluteTimeGetCurrent()
+
                                     // Extract and deserialize tree from cached boost file
                                     let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
                                     if ZipherXFFI.treeDeserialize(data: serializedTree) {
@@ -407,22 +429,44 @@ struct ContentView: View {
                                         // Load delta CMUs on top if available
                                         if let manifest = DeltaCMUManager.shared.getManifest(),
                                            manifest.endHeight > ZipherXConstants.effectiveTreeHeight {
-                                            print("📦 FIX #530: Loading delta CMUs from height \(ZipherXConstants.effectiveTreeHeight + 1) to \(manifest.endHeight)...")
+                                            // FIX #840: ATOMIC delta append - eliminates TOCTOU race condition
+                                            // Previous FIX #831 re-checked tree size but wasn't atomic.
+                                            // FIX #840 holds all FFI locks throughout the check-and-append operation.
+                                            let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
+
+                                            print("📦 FIX #840: Loading delta CMUs from height \(ZipherXConstants.effectiveTreeHeight + 1) to \(manifest.endHeight)... [INSTANT START]")
                                             if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUsForHeightRange(
                                                 startHeight: ZipherXConstants.effectiveTreeHeight + 1,
                                                 endHeight: manifest.endHeight
                                             ) {
-                                                var appendedCount = 0
+                                                // Pack CMUs into contiguous Data for atomic append
+                                                var packedCMUs = Data()
                                                 for cmu in deltaCMUs {
-                                                    let position = ZipherXFFI.treeAppend(cmu: cmu)
-                                                    if position > 0 {
-                                                        appendedCount += 1
-                                                    }
+                                                    packedCMUs.append(cmu)
                                                 }
-                                                print("📦 FIX #530: Appended \(appendedCount) delta CMUs to tree")
 
-                                                let newTreeSize = ZipherXFFI.treeSize()
-                                                print("🌳 FIX #530: Tree size after delta: \(newTreeSize) commitments")
+                                                let appendResult = ZipherXFFI.treeAppendDeltaAtomic(
+                                                    cmus: packedCMUs,
+                                                    expectedBoostSize: effectiveCMUCount
+                                                )
+
+                                                switch appendResult {
+                                                case .appended:
+                                                    let newTreeSize = ZipherXFFI.treeSize()
+                                                    print("✅ FIX #840: ATOMIC append SUCCESS - \(deltaCMUs.count) delta CMUs [INSTANT START]")
+                                                    print("🌳 FIX #840: Tree size after delta: \(newTreeSize) commitments")
+
+                                                case .skipped:
+                                                    let currentTreeSize = ZipherXFFI.treeSize()
+                                                    print("🔄 FIX #840: ATOMIC append SKIPPED - delta already present (size=\(currentTreeSize)) [INSTANT START]")
+
+                                                case .mismatch:
+                                                    let currentTreeSize = ZipherXFFI.treeSize()
+                                                    print("⚠️ FIX #840: ATOMIC append MISMATCH - tree smaller than expected (size=\(currentTreeSize)) [INSTANT START]")
+
+                                                case .error:
+                                                    print("❌ FIX #840: ATOMIC append ERROR [INSTANT START]")
+                                                }
                                             }
                                         }
 
@@ -432,6 +476,8 @@ struct ContentView: View {
                                         await MainActor.run {
                                             walletManager.setTreeLoaded(true)
                                         }
+                                        // FIX #881: Log tree deserialization time
+                                        logPhase("Tree deserialization + delta load", since: treeDeserializeStart)
                                         print("✅ FIX #748: Set isTreeLoaded = true for FAST START")
                                     } else {
                                         print("⚠️ FIX #530: Failed to deserialize tree - will initialize fresh")
@@ -450,10 +496,16 @@ struct ContentView: View {
                                 }
 
                                 // Load cached balance immediately
+                                // FIX #881: Time balance loading
+                                let balanceLoadStart = CFAbsoluteTimeGetCurrent()
                                 walletManager.loadCachedBalance()
+                                logPhase("Cached balance load", since: balanceLoadStart)
 
                                 // Quick health check - only critical checks
+                                // FIX #881: Time health checks
+                                let healthCheckStart = CFAbsoluteTimeGetCurrent()
                                 let healthResults = await WalletHealthCheck.shared.runAllChecks()
+                                logPhase("Health checks", since: healthCheckStart)
                                 // FIX #723: Filter critical issues properly - check .critical flag OR keywords
                                 // Tree Root Validation returns critical=true but details say "Full Rescan" not "REPAIR"
                                 let criticalIssues = healthResults.filter {
@@ -506,7 +558,8 @@ struct ContentView: View {
                                         } else {
                                             walletManager.setConnecting(true, status: "Repairing wallet state...")
                                         }
-                                        walletManager.syncTasks.append(SyncTask(id: "instant_repair", title: hasTreeRootMismatch ? "Rebuilding Commitment Tree" : "Automatic Repair", status: .inProgress, progress: 0.0))
+                                        // FIX #887: User-friendly task titles
+                                        walletManager.syncTasks.append(SyncTask(id: "instant_repair", title: hasTreeRootMismatch ? "Repairing wallet" : "Auto-repair", status: .inProgress, progress: 0.0))
                                     }
 
                                     do {
@@ -561,7 +614,10 @@ struct ContentView: View {
                                 // If tree is corrupted, user can run "Settings → Repair Database" manually
                                 print("🔍 FIX #563 v31: Skipping tree corruption check (causes crashes during witness rebuild)")
 
+                                // FIX #881: Time witness rebuild
+                                let witnessRebuildStart = CFAbsoluteTimeGetCurrent()
                                 await walletManager.rebuildWitnessesForStartup()
+                                logPhase("Witness rebuild", since: witnessRebuildStart)
                                 print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
 
                                 // Show UI after health check completes
@@ -573,6 +629,13 @@ struct ContentView: View {
                                     walletManager.completeProgress()
                                 }
 
+                                // FIX #881: Log total INSTANT START time
+                                let instantStartTotal = CFAbsoluteTimeGetCurrent() - instantStartBegin
+                                print("⚡ FIX #881: INSTANT START total: \(String(format: "%.2f", instantStartTotal))s")
+                                print("⚡ FIX #881: Phase breakdown:")
+                                for (phase, elapsed) in phaseTimings {
+                                    print("   • \(phase): \(String(format: "%.2f", elapsed * 1000))ms")
+                                }
                                 print("⚡ FIX #168: INSTANT START COMPLETE (with health check + witness rebuild)!")
 
                                 // FIX #560: Mark all fast_* tasks as completed before returning
@@ -956,7 +1019,7 @@ struct ContentView: View {
                                 print("🔧 FIX #439: Tree Root mismatch detected - triggering Full Rescan to rebuild tree...")
                                 await MainActor.run {
                                     walletManager.setConnecting(true, status: "Tree mismatch - rebuilding...")
-                                    walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding commitment tree", status: .inProgress, progress: 0.0))
+                                    walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
                                 }
 
                                 // Trigger Full Rescan to rebuild the commitment tree
@@ -1029,7 +1092,7 @@ struct ContentView: View {
                                     // FIX #156: Add repair task to task list for UI visibility
                                     await MainActor.run {
                                         walletManager.setConnecting(true, status: "Rebuilding witnesses...")
-                                        walletManager.syncTasks.append(SyncTask(id: "fast_repair", title: "Rebuild Merkle witnesses", status: .inProgress, progress: 0.0))
+                                        walletManager.syncTasks.append(SyncTask(id: "fast_repair", title: "Verifying transactions", status: .inProgress, progress: 0.0))
                                     }
                                     try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
                                         print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
@@ -1099,7 +1162,7 @@ struct ContentView: View {
                                     print("🔧 FIX #162: Balance mismatch detected - rebuilding transaction history...")
                                     await MainActor.run {
                                         walletManager.setConnecting(true, status: "Repairing balance history...")
-                                        walletManager.syncTasks.append(SyncTask(id: "balance_repair_early", title: "Rebuild transaction history", status: .inProgress, progress: 0.0))
+                                        walletManager.syncTasks.append(SyncTask(id: "balance_repair_early", title: "Restoring history", status: .inProgress, progress: 0.0))
                                     }
 
                                     // Step 1: Clear corrupted history
@@ -1155,7 +1218,7 @@ struct ContentView: View {
                                         print("🔧 FIX #162: Balance mismatch detected AFTER verification - repairing now...")
                                         await MainActor.run {
                                             walletManager.setConnecting(true, status: "Repairing balance history...")
-                                            walletManager.syncTasks.append(SyncTask(id: "balance_repair", title: "Rebuild transaction history", status: .inProgress, progress: 0.0))
+                                            walletManager.syncTasks.append(SyncTask(id: "balance_repair", title: "Restoring history", status: .inProgress, progress: 0.0))
                                         }
 
                                         // Step 1: Clear corrupted history
@@ -1231,7 +1294,7 @@ struct ContentView: View {
                             print("🔄 FIX #770: Adding witness_sync task to FAST START progress")
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
-                                walletManager.syncTasks.append(SyncTask(id: "witness_sync", title: "Sync Merkle witnesses", status: .inProgress, progress: 0.0))
+                                walletManager.syncTasks.append(SyncTask(id: "witness_sync", title: "Syncing proofs", status: .inProgress, progress: 0.0))
                             }
 
                             // FIX #557 v8: Rebuild witnesses using WalletManager's account access
@@ -1326,6 +1389,13 @@ struct ContentView: View {
                         // FULL START MODE: First launch or wallet needs full sync
                         // ==========================================================
                         print("🚀 FULL START MODE: First launch or needs sync")
+
+                        // FIX #819: Validate CMU cache byte order BEFORE any tree operations
+                        // Stale cache from before FIX #743 has reversed CMUs causing tree root mismatch
+                        let fullStartCacheValid = await CommitmentTreeUpdater.shared.validateAndClearStaleCMUCache()
+                        if !fullStartCacheValid {
+                            print("🗑️ FIX #819: Stale CMU cache cleared in FULL START - will regenerate from boost file")
+                        }
 
                         // Show connecting status after tree is loaded
                         print("DEBUGZIPHERX: 📡 Task: Tree loaded, checking network...")
@@ -1587,7 +1657,7 @@ struct ContentView: View {
                             // Trigger automatic repair instead of showing alert
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Repairing wallet state...")
-                                walletManager.syncTasks.append(SyncTask(id: "full_start_repair", title: "Automatic Repair", status: .inProgress, progress: 0.0))
+                                walletManager.syncTasks.append(SyncTask(id: "full_start_repair", title: "Auto-repair", status: .inProgress, progress: 0.0))
                             }
 
                             do {
@@ -1617,7 +1687,7 @@ struct ContentView: View {
                             print("🔧 FIX #439: Tree Root mismatch detected (FULL START) - triggering Full Rescan...")
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Tree mismatch - rebuilding...")
-                                walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding commitment tree", status: .inProgress, progress: 0.0))
+                                walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
                             }
 
                             do {
@@ -1684,7 +1754,7 @@ struct ContentView: View {
                                 // FIX #156: Add repair task to task list for UI visibility
                                 await MainActor.run {
                                     walletManager.setConnecting(true, status: "Rebuilding witnesses...")
-                                    walletManager.syncTasks.append(SyncTask(id: "full_repair", title: "Rebuild Merkle witnesses", status: .inProgress, progress: 0.0))
+                                    walletManager.syncTasks.append(SyncTask(id: "full_repair", title: "Verifying transactions", status: .inProgress, progress: 0.0))
                                 }
                                 try? await walletManager.repairNotesAfterDownloadedTree { progress, current, total in
                                     print("🔧 FIX #120: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
@@ -2104,14 +2174,14 @@ struct ContentView: View {
             var tasks: [SyncTask] = []
 
             // Tree task (always completed in FAST START)
-            tasks.append(SyncTask(id: "tree", title: "Load Sapling note tree", status: .completed))
+            tasks.append(SyncTask(id: "tree", title: "Loading wallet data", status: .completed))
 
             // Connect task (depends on connection state)
             if !networkManager.isConnected {
                 let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
-                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: status))
+                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: status))
             } else {
-                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .completed))
+                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: .completed))
             }
 
             // CRITICAL FIX #560: Don't show 100% if we're still connecting or syncing!
@@ -2276,20 +2346,20 @@ struct ContentView: View {
             )
             tasks.append(treeTask)
         } else {
-            tasks.append(SyncTask(id: "tree", title: "Load Sapling note tree", status: .completed))
+            tasks.append(SyncTask(id: "tree", title: "Loading wallet data", status: .completed))
         }
 
         // 2. SECOND: Network connection task (after tree loaded)
         if walletManager.isTreeLoaded {
             if !networkManager.isConnected {
                 let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
-                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: status))
+                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: status))
             } else {
-                tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .completed))
+                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: .completed))
             }
         } else {
             // Tree not loaded yet - show connect as pending
-            tasks.append(SyncTask(id: "connect", title: "Join P2P network", status: .pending))
+            tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: .pending))
         }
 
         // 3. THIRD: Sync tasks from WalletManager
@@ -2340,7 +2410,7 @@ struct ContentView: View {
                 tasks.append(contentsOf: walletManager.syncTasks)
             } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
                 // Sync already complete or skipped - show completed scan task
-                tasks.append(SyncTask(id: "scan", title: "Decrypt shielded notes", status: .completed))
+                tasks.append(SyncTask(id: "scan", title: "Finding transactions", status: .completed))
             }
         }
 
@@ -2523,6 +2593,7 @@ struct ContentView: View {
             showExternalWalletSpendAlert: $showExternalWalletSpendAlert,
             showReducedVerificationAlert: $showReducedVerificationAlert,
             showCriticalHealthAlert: $showCriticalHealthAlert,
+            showDownloadFailedAlert: $showDownloadFailedAlert,
             selectedTab: $selectedTab,
             showCypherpunkSettings: $showCypherpunkSettings,
             availableDiskSpace: availableDiskSpace,
@@ -2861,6 +2932,7 @@ struct CypherpunkAlertsModifier: ViewModifier {
     @Binding var showExternalWalletSpendAlert: Bool
     @Binding var showReducedVerificationAlert: Bool
     @Binding var showCriticalHealthAlert: Bool
+    @Binding var showDownloadFailedAlert: Bool  // FIX #888
     @Binding var selectedTab: ContentView.Tab
     @Binding var showCypherpunkSettings: Bool
     let availableDiskSpace: String
@@ -2912,6 +2984,12 @@ struct CypherpunkAlertsModifier: ViewModifier {
                     activeAlert = .criticalHealth
                 }
             }
+            // FIX #888: Show download failed alert when boost download fails
+            .onChange(of: walletManager.boostDownloadFailed) { failed in
+                if failed, alertDismissedAt == nil || Date().timeIntervalSince(alertDismissedAt!) > 1.0 {
+                    activeAlert = .downloadFailed
+                }
+            }
             .sheet(item: Binding(
                 get: { activeAlert },
                 set: { newValue in
@@ -2927,6 +3005,11 @@ struct CypherpunkAlertsModifier: ViewModifier {
                     showExternalWalletSpendAlert = false
                     showReducedVerificationAlert = false
                     showCriticalHealthAlert = false
+                    showDownloadFailedAlert = false
+                    // FIX #888: Reset download failed flag when alert dismissed
+                    if walletManager.boostDownloadFailed {
+                        walletManager.boostDownloadFailed = false
+                    }
                 }
             )) { alert in
                 UnifiedAlertSheet(
@@ -2951,6 +3034,7 @@ enum UnifiedAlert: Identifiable {
     case externalSpend
     case reducedVerification
     case criticalHealth
+    case downloadFailed  // FIX #888
 
     var id: String {
         switch self {
@@ -2960,6 +3044,7 @@ enum UnifiedAlert: Identifiable {
         case .externalSpend: return "externalSpend"
         case .reducedVerification: return "reducedVerification"
         case .criticalHealth: return "criticalHealth"
+        case .downloadFailed: return "downloadFailed"
         }
     }
 }
@@ -2989,6 +3074,8 @@ struct UnifiedAlertSheet: View {
             reducedVerificationAlert
         case .criticalHealth:
             criticalHealthAlert
+        case .downloadFailed:
+            downloadFailedAlert
         }
     }
 
@@ -3058,6 +3145,22 @@ struct UnifiedAlertSheet: View {
                 Task { @MainActor in
                     await networkManager.handleHealthAlertAction(.dismiss)
                 }
+            })
+        )
+    }
+
+    // FIX #888: Download failed alert with retry option
+    private var downloadFailedAlert: some View {
+        AlertWrapper(
+            title: "Download Failed",
+            message: "Failed to download blockchain data.\n\n\(walletManager.boostDownloadError)\n\nWould you like to retry the import?",
+            primaryButton: ("Retry Import", {
+                Task {
+                    await walletManager.retryBoostDownload()
+                }
+            }),
+            secondaryButton: ("Cancel", {
+                // Just dismiss - user can try again from Settings later
             })
         )
     }

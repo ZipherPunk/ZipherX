@@ -156,9 +156,10 @@ public class FullNodeManager: ObservableObject {
     // MARK: - Initialization
 
     private init() {
-        // Load saved debug level from UserDefaults
+        // FIX #884: Load debug level from zclassic.conf (not UserDefaults)
+        // This ensures the UI reflects the actual daemon configuration
         self.daemonDebugLevel = .none
-        self.daemonDebugLevel = loadDebugLevel()
+        self.daemonDebugLevel = Self.getCurrentDebugLevelFromConf()
 
         // FIX #135: Only check node status and start polling in Full Node mode
         // In Light Mode, there's no daemon to poll - avoid "Connection refused" spam
@@ -767,27 +768,52 @@ public class FullNodeManager: ObservableObject {
     // MARK: - Debug Level Settings
 
     /// Debug level options for zclassicd daemon
+    /// FIX #884: Valid Zclassic debug categories from src/init.cpp
     public enum DaemonDebugLevel: String, CaseIterable {
-        case none = "none"           // No debug logging (minimal logs)
+        case none = "0"              // No debug logging (minimal logs)
         case network = "net"         // Network-related debug only
+        case mempool = "mempool"     // Mempool events
+        case rpc = "rpc"             // RPC call logging
+        case zrpc = "zrpc"           // Z-address RPC operations
+        case tor = "tor"             // Tor connection events
         case full = "1"              // Full debug (all categories)
 
         public var displayName: String {
             switch self {
             case .none: return "None"
             case .network: return "Network"
-            case .full: return "Full"
+            case .mempool: return "Mempool"
+            case .rpc: return "RPC"
+            case .zrpc: return "Z-RPC"
+            case .tor: return "Tor"
+            case .full: return "All (Verbose)"
             }
         }
 
         public var description: String {
             switch self {
             case .none:
-                return "Minimal logging - only errors and warnings"
+                return "Minimal logging - errors and warnings only"
             case .network:
-                return "Network events - peer connections, traffic"
+                return "Peer connections, message traffic"
+            case .mempool:
+                return "Transaction pool events"
+            case .rpc:
+                return "RPC method calls and responses"
+            case .zrpc:
+                return "Shielded transaction operations"
+            case .tor:
+                return "Tor proxy connections"
             case .full:
-                return "Full debug - all categories (very verbose)"
+                return "All debug categories (very verbose)"
+            }
+        }
+
+        /// Config file value (some differ from rawValue)
+        public var configValue: String {
+            switch self {
+            case .none: return ""  // No debug line = minimal logging
+            default: return self.rawValue
             }
         }
     }
@@ -810,6 +836,7 @@ public class FullNodeManager: ObservableObject {
     }
 
     /// Update zclassic.conf with new debug level
+    /// FIX #884: Generic handler for all debug categories
     /// Daemon restart required to apply changes
     public func updateDebugLevel(_ level: DaemonDebugLevel) {
         let configPath = Self.configPath
@@ -829,28 +856,17 @@ public class FullNodeManager: ObservableObject {
                 return trimmed.hasPrefix("debug=") || trimmed.hasPrefix("# debug=")
             }
 
-            // Add new debug setting based on level
-            switch level {
-            case .none:
-                // No debug line needed (defaults to minimal logging)
-                print("🔧 FullNodeManager: Debug level set to NONE")
-            case .network:
-                // Insert debug=net before first blank line or at a sensible location
+            // Add new debug setting if not "none"
+            let debugValue = level.configValue
+            if !debugValue.isEmpty {
+                // Insert debug=<value> at a sensible location
                 if let insertIndex = lines.firstIndex(where: { $0.contains("rpcthreads") }) {
-                    lines.insert("debug=net", at: insertIndex + 1)
+                    lines.insert("debug=\(debugValue)", at: insertIndex + 1)
                 } else {
-                    lines.append("debug=net")
+                    lines.append("debug=\(debugValue)")
                 }
-                print("🔧 FullNodeManager: Debug level set to NETWORK")
-            case .full:
-                // Insert debug=1 for full debug
-                if let insertIndex = lines.firstIndex(where: { $0.contains("rpcthreads") }) {
-                    lines.insert("debug=1", at: insertIndex + 1)
-                } else {
-                    lines.append("debug=1")
-                }
-                print("🔧 FullNodeManager: Debug level set to FULL")
             }
+            print("🔧 FullNodeManager: Debug level set to \(level.displayName) (debug=\(debugValue.isEmpty ? "disabled" : debugValue))")
 
             config = lines.joined(separator: "\n")
             try config.write(to: configPath, atomically: true, encoding: .utf8)
@@ -867,8 +883,13 @@ public class FullNodeManager: ObservableObject {
         }
     }
 
-    /// Get current debug level from zclassic.conf
+    /// Get current debug level from zclassic.conf (instance method)
     public func getCurrentDebugLevel() -> DaemonDebugLevel {
+        return Self.getCurrentDebugLevelFromConf()
+    }
+
+    /// FIX #884: Get current debug level from zclassic.conf (static, can be called during init)
+    private static func getCurrentDebugLevelFromConf() -> DaemonDebugLevel {
         let configPath = Self.configPath
 
         guard FileManager.default.fileExists(atPath: configPath.path),
@@ -881,10 +902,13 @@ public class FullNodeManager: ObservableObject {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("debug=") && !trimmed.hasPrefix("# ") {
                 let value = trimmed.replacingOccurrences(of: "debug=", with: "")
+                // Match against valid Zclassic debug categories
+                if let level = DaemonDebugLevel(rawValue: value) {
+                    return level
+                }
+                // Handle debug=1 (full debug)
                 if value == "1" {
                     return .full
-                } else if value == "net" {
-                    return .network
                 }
             }
         }

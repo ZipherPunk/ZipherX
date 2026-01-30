@@ -347,8 +347,34 @@ final class WalletDatabase {
     /// Close database connection
     func close() {
         if db != nil {
+            // FIX #894: Checkpoint WAL before closing to ensure all data is persisted
+            checkpoint()
             sqlite3_close(db)
             db = nil
+        }
+    }
+
+    // MARK: - FIX #894: WAL Checkpoint for Data Persistence
+
+    /// FIX #894: Force WAL checkpoint to persist all data to main database file
+    /// CRITICAL: Without this, wallet data may be lost on app termination
+    /// Call this on app background/termination to ensure durability
+    func checkpoint() {
+        guard db != nil else { return }
+
+        // PRAGMA wal_checkpoint(TRUNCATE) checkpoints and truncates the WAL file
+        // This is the most thorough checkpoint mode - ensures all data is in main DB
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA wal_checkpoint(TRUNCATE);", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                let busy = sqlite3_column_int(stmt, 0)
+                let log = sqlite3_column_int(stmt, 1)
+                let checkpointed = sqlite3_column_int(stmt, 2)
+                if log > 0 || checkpointed > 0 {
+                    print("💾 FIX #894: WalletDatabase WAL checkpoint - busy:\(busy), log:\(log), checkpointed:\(checkpointed)")
+                }
+            }
+            sqlite3_finalize(stmt)
         }
     }
 
@@ -1275,6 +1301,14 @@ final class WalletDatabase {
 
     /// Get all unspent notes (regardless of witness status) - for diagnostics
     func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
+        // FIX #940: Guard against nil database handle
+        // sqlite3_errmsg(nil) returns "out of memory" which is misleading
+        // This happens when health checks run before database is opened
+        guard db != nil else {
+            print("⚠️ getAllUnspentNotes: Database not open, returning empty array")
+            return []
+        }
+
         let sql = """
             SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
             FROM notes
@@ -1460,6 +1494,12 @@ final class WalletDatabase {
 
     /// Get unspent notes for account (with valid witnesses only)
     func getUnspentNotes(accountId: Int64) throws -> [WalletNote] {
+        // FIX #940: Guard against nil database handle
+        guard db != nil else {
+            print("⚠️ getUnspentNotes: Database not open, returning empty array")
+            return []
+        }
+
         let sql = """
             SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
             FROM notes
@@ -1956,7 +1996,14 @@ final class WalletDatabase {
             sqlite3_finalize(unspentStmt)
         }
 
-        let sql = "SELECT nf FROM notes WHERE is_spent = 0;"
+        // FIX #865: Return ALL nullifiers (spent AND unspent) for spend detection
+        // Previously only returned unspent notes, which caused:
+        // - Once a note was marked spent, its nullifier was removed from knownNullifiers
+        // - External spends (wallet.dat) couldn't be detected because nullifier wasn't tracked
+        // - Change outputs were incorrectly recorded as "received" instead of being filtered
+        // By tracking ALL nullifiers, we can always detect when our notes are spent,
+        // even if they were marked spent by a previous scan or manual database update.
+        let sql = "SELECT nf FROM notes;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -2060,6 +2107,11 @@ final class WalletDatabase {
     /// Get last scanned height
     /// FIX: Added validation to detect and auto-correct corrupted values
     func getLastScannedHeight() throws -> UInt64 {
+        // FIX #940: Guard against nil database handle
+        guard db != nil else {
+            return 0
+        }
+
         let sql = "SELECT last_scanned_height FROM sync_state WHERE id = 1;"
 
         var stmt: OpaquePointer?
@@ -2171,6 +2223,11 @@ final class WalletDatabase {
     /// Get the last verified checkpoint height where balance/history was confirmed correct.
     /// At startup, app MUST scan from this checkpoint to chain tip to catch ALL missed transactions.
     func getVerifiedCheckpointHeight() throws -> UInt64 {
+        // FIX #940: Guard against nil database handle
+        guard db != nil else {
+            return 0
+        }
+
         let sql = "SELECT verified_checkpoint_height FROM sync_state WHERE id = 1;"
 
         var stmt: OpaquePointer?
@@ -4711,6 +4768,11 @@ final class WalletDatabase {
     /// Used by background sync to know how far back to sync headers
     /// FIX #120: Sync headers from earliest missing timestamp, not just current height
     func getEarliestHeightNeedingTimestamp() throws -> UInt64? {
+        // FIX #940: Guard against nil database handle
+        guard db != nil else {
+            return nil
+        }
+
         let sql = "SELECT MIN(block_height) FROM transaction_history WHERE block_height > 0 AND (block_time IS NULL OR block_time = 0);"
 
         var stmt: OpaquePointer?
@@ -4959,6 +5021,65 @@ final class WalletDatabase {
         return items
     }
 
+    /// FIX #847: Get SENT transactions that are still pending (not confirmed)
+    /// Used at startup to restore hasOurPendingOutgoing flag and prevent double-spending
+    func getPendingSentTransactions() throws -> [TransactionHistoryItem] {
+        guard db != nil else {
+            print("⚠️ getPendingSentTransactions: Database not open")
+            return []
+        }
+
+        // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
+        let sql = """
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history
+            WHERE tx_type IN ('sent', 'α')
+            AND status IN ('pending', 'mempool', 'confirming')
+            ORDER BY created_at DESC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var items: [TransactionHistoryItem] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let txidLen = sqlite3_column_bytes(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let value = UInt64(sqlite3_column_int64(stmt, 4))
+            let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
+            let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = String(cString: sqlite3_column_text(stmt, 8))
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
+
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            let decodedType = decryptTxType(typeStr)
+
+            items.append(TransactionHistoryItem(
+                txid: txidData,
+                height: height,
+                blockTime: blockTime,
+                type: decodedType,
+                value: value,
+                fee: fee,
+                toAddress: toAddress,
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .pending,
+                confirmations: confirmations
+            ))
+        }
+
+        print("📜 FIX #847: Found \(items.count) pending SENT transactions")
+        return items
+    }
+
     /// FIX #353: Get the last confirmed transaction (for checkpoint reset after phantom TX removal)
     /// Returns the most recent transaction that is confirmed (status = 'confirmed')
     func getLastConfirmedTransaction() throws -> TransactionHistoryItem? {
@@ -5056,6 +5177,523 @@ final class WalletDatabase {
     // populateSentTransactionsFromSpentNotes() was removed because it added SENT transactions
     // with incorrect values (note value instead of actual sent amount).
     // populateHistoryFromNotes() now correctly calculates: actualSent = input - change - fee
+
+    // MARK: - FIX #851/852: Auto-Clean Mislabeled Change Outputs
+
+    /// FIX #852: Detect and clean mislabeled "received" transactions that are actually change outputs
+    /// Key insight: If we have a "received" history entry AND a note spent in the SAME txid,
+    /// that "received" is actually our change output (we provided inputs to that TX)
+    /// Also creates the missing "sent" entry if one doesn't exist
+    /// Called at startup - works even without knowing pending txids
+    /// FIX #853 v2: Handle both wire format and display format txids (inconsistent storage from old code)
+    /// Returns: Number of transactions cleaned up
+    func cleanMislabeledChangeOutputsAuto() throws -> Int {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Step 1: Get all "received" entries from transaction_history
+        let getReceivedSql = """
+            SELECT txid, value, block_height, block_time
+            FROM transaction_history
+            WHERE tx_type IN ('received', 'β');
+        """
+
+        var receivedStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, getReceivedSql, -1, &receivedStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(receivedStmt) }
+
+        struct ReceivedEntry {
+            let txid: Data
+            let amount: Int64
+            let blockHeight: Int64
+            let timestamp: Int64
+        }
+        var receivedEntries: [ReceivedEntry] = []
+
+        while sqlite3_step(receivedStmt) == SQLITE_ROW {
+            if let txidBlob = sqlite3_column_blob(receivedStmt, 0) {
+                let txidLen = sqlite3_column_bytes(receivedStmt, 0)
+                let txid = Data(bytes: txidBlob, count: Int(txidLen))
+                let amount = sqlite3_column_int64(receivedStmt, 1)
+                let blockHeight = sqlite3_column_int64(receivedStmt, 2)
+                let timestamp = sqlite3_column_int64(receivedStmt, 3)
+                receivedEntries.append(ReceivedEntry(txid: txid, amount: amount, blockHeight: blockHeight, timestamp: timestamp))
+            }
+        }
+
+        guard !receivedEntries.isEmpty else {
+            print("✅ FIX #852: No 'received' entries to check")
+            return 0
+        }
+
+        print("🔍 FIX #852: Checking \(receivedEntries.count) 'received' entries for mislabeled change outputs...")
+
+        // Step 2: For each received entry, check if we spent a note in that TX (check both formats)
+        struct MislabeledTx {
+            let txid: Data           // Original txid from history (for deletion)
+            let changeAmount: Int64  // The "received" amount is actually change
+            let blockHeight: Int64
+            let timestamp: Int64
+            let totalSpent: Int64    // Total value of notes spent in this TX
+            let spentTxid: Data      // The txid format used in notes.spent_in_tx
+        }
+        var mislabeledTxs: [MislabeledTx] = []
+
+        let checkSpentSql = "SELECT SUM(value) FROM notes WHERE spent_in_tx = ?;"
+
+        for entry in receivedEntries {
+            // Try original format
+            var totalSpent: Int64 = 0
+            var matchedTxid = entry.txid
+
+            var checkStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, checkSpentSql, -1, &checkStmt, nil) == SQLITE_OK {
+                entry.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(entry.txid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(checkStmt) == SQLITE_ROW && sqlite3_column_type(checkStmt, 0) != SQLITE_NULL {
+                    totalSpent = sqlite3_column_int64(checkStmt, 0)
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            // If no match, try reversed format (wire <-> display)
+            if totalSpent == 0 && entry.txid.count == 32 {
+                let reversedTxid = Data(entry.txid.reversed())
+
+                var checkStmt2: OpaquePointer?
+                if sqlite3_prepare_v2(db, checkSpentSql, -1, &checkStmt2, nil) == SQLITE_OK {
+                    reversedTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    }
+                    if sqlite3_step(checkStmt2) == SQLITE_ROW && sqlite3_column_type(checkStmt2, 0) != SQLITE_NULL {
+                        totalSpent = sqlite3_column_int64(checkStmt2, 0)
+                        matchedTxid = reversedTxid  // Use reversed format for sent entry
+                        print("🔄 FIX #853 v2: Found match with reversed txid format")
+                    }
+                    sqlite3_finalize(checkStmt2)
+                }
+            }
+
+            if totalSpent > 0 {
+                mislabeledTxs.append(MislabeledTx(
+                    txid: entry.txid,
+                    changeAmount: entry.amount,
+                    blockHeight: entry.blockHeight,
+                    timestamp: entry.timestamp,
+                    totalSpent: totalSpent,
+                    spentTxid: matchedTxid
+                ))
+            }
+        }
+
+        guard !mislabeledTxs.isEmpty else {
+            print("✅ FIX #852: No mislabeled change outputs found")
+            return 0
+        }
+
+        print("🔍 FIX #852: Found \(mislabeledTxs.count) mislabeled 'received' entries (actually change outputs)")
+
+        var cleanedCount = 0
+
+        for tx in mislabeledTxs {
+            // Delete the mislabeled "received" history entry
+            let deleteSql = """
+                DELETE FROM transaction_history
+                WHERE txid = ? AND tx_type IN ('received', 'β');
+            """
+
+            var deleteStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK {
+                tx.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(deleteStmt, 1, ptr.baseAddress, Int32(tx.txid.count), SQLITE_TRANSIENT)
+                }
+
+                if sqlite3_step(deleteStmt) == SQLITE_DONE {
+                    let deleted = Int(sqlite3_changes(db))
+                    if deleted > 0 {
+                        let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
+                        let changeZCL = Double(tx.changeAmount) / 100_000_000.0
+                        print("🧹 FIX #852: Deleted mislabeled 'received' entry: \(txidHex.prefix(16))... (\(changeZCL) ZCL was change)")
+                        cleanedCount += deleted
+                    }
+                }
+                sqlite3_finalize(deleteStmt)
+            }
+
+            // Check if a "sent" entry already exists for this txid (check both original and spent formats)
+            let checkSentSql = "SELECT COUNT(*) FROM transaction_history WHERE txid = ? AND tx_type = 'sent';"
+            var sentExists = false
+
+            // Check original txid format
+            var checkStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, checkSentSql, -1, &checkStmt, nil) == SQLITE_OK {
+                tx.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(tx.txid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(checkStmt) == SQLITE_ROW {
+                    sentExists = sqlite3_column_int(checkStmt, 0) > 0
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            // Also check with spentTxid format (may be reversed)
+            if !sentExists && tx.spentTxid != tx.txid {
+                var checkStmt2: OpaquePointer?
+                if sqlite3_prepare_v2(db, checkSentSql, -1, &checkStmt2, nil) == SQLITE_OK {
+                    tx.spentTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(tx.spentTxid.count), SQLITE_TRANSIENT)
+                    }
+                    if sqlite3_step(checkStmt2) == SQLITE_ROW {
+                        sentExists = sqlite3_column_int(checkStmt2, 0) > 0
+                    }
+                    sqlite3_finalize(checkStmt2)
+                }
+            }
+
+            // If no "sent" entry exists, create one using wire format txid (spentTxid)
+            // Sent amount = total spent - change - fee (assume 10000 zatoshis default fee)
+            if !sentExists {
+                let defaultFee: Int64 = 10000
+                let sentAmount = tx.totalSpent - tx.changeAmount - defaultFee
+
+                if sentAmount > 0 {
+                    let insertSql = """
+                        INSERT INTO transaction_history (txid, tx_type, value, fee, block_height, block_time, confirmations)
+                        VALUES (?, 'sent', ?, ?, ?, ?, 1);
+                    """
+
+                    var insertStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK {
+                        // FIX #853 v2: Use spentTxid (wire format) for consistency with block-scanned txids
+                        tx.spentTxid.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(tx.spentTxid.count), SQLITE_TRANSIENT)
+                        }
+                        sqlite3_bind_int64(insertStmt, 2, sentAmount)
+                        sqlite3_bind_int64(insertStmt, 3, defaultFee)
+                        sqlite3_bind_int64(insertStmt, 4, tx.blockHeight)
+                        sqlite3_bind_int64(insertStmt, 5, tx.timestamp)  // block_time uses timestamp value
+
+                        if sqlite3_step(insertStmt) == SQLITE_DONE {
+                            // Display in display format (reversed from wire)
+                            let displayTxid = Data(tx.spentTxid.reversed())
+                            let txidHex = displayTxid.map { String(format: "%02x", $0) }.joined()
+                            let sentZCL = Double(sentAmount) / 100_000_000.0
+                            print("📤 FIX #852: Created missing 'sent' entry: \(txidHex.prefix(16))... (\(sentZCL) ZCL)")
+                        }
+                        sqlite3_finalize(insertStmt)
+                    }
+                }
+            }
+        }
+
+        if cleanedCount > 0 {
+            print("✅ FIX #852: Cleaned \(cleanedCount) mislabeled change output(s) and created missing sent entries")
+        }
+
+        return cleanedCount
+    }
+
+    /// FIX #851: Delete mislabeled "received" transactions that are actually change outputs from our pending TXs
+    /// Called at startup after restoring persisted pending txids
+    /// Returns: Number of transactions cleaned up
+    func cleanMislabeledChangeOutputs(pendingTxids: [String]) throws -> Int {
+        guard !pendingTxids.isEmpty else { return 0 }
+
+        // SQLITE_TRANSIENT tells SQLite to copy the data immediately
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        var cleanedCount = 0
+
+        for txidHex in pendingTxids {
+            guard let txidData = Data(hexString: txidHex) else { continue }
+
+            // Delete any "received" history entries with this txid (they're actually change)
+            let deleteHistorySql = """
+                DELETE FROM transaction_history
+                WHERE txid = ? AND tx_type IN ('received', 'β');
+            """
+
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, deleteHistorySql, -1, &stmt, nil) == SQLITE_OK {
+                txidData.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT)
+                }
+
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    let deleted = Int(sqlite3_changes(db))
+                    if deleted > 0 {
+                        print("🧹 FIX #851: Deleted \(deleted) mislabeled 'received' history for pending TX: \(txidHex.prefix(16))...")
+                        cleanedCount += deleted
+                    }
+                }
+                sqlite3_finalize(stmt)
+            }
+
+            // Also check notes table - notes with this received_in_tx are change outputs
+            // We don't delete notes (they're real), but we could mark them appropriately
+            // For now, just log if found
+            let countNotesSql = "SELECT COUNT(*) FROM notes WHERE received_in_tx = ?;"
+            var countStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, countNotesSql, -1, &countStmt, nil) == SQLITE_OK {
+                txidData.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(countStmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT)
+                }
+
+                if sqlite3_step(countStmt) == SQLITE_ROW {
+                    let noteCount = sqlite3_column_int(countStmt, 0)
+                    if noteCount > 0 {
+                        print("📝 FIX #851: Found \(noteCount) note(s) with pending TX \(txidHex.prefix(16))... (likely change outputs)")
+                    }
+                }
+                sqlite3_finalize(countStmt)
+            }
+        }
+
+        return cleanedCount
+    }
+
+    // MARK: - FIX #853 v2: Migrate Display-Format TXIDs to Wire Format
+
+    /// FIX #853 v2: One-time migration to convert display-format txids to wire format
+    /// Detection: If a txid doesn't match any note's received_in_tx/spent_in_tx but reversed does, it's display format
+    /// Called at startup after database is open
+    /// Returns: Number of txids migrated
+    func migrateDisplayFormatTxidsToWireFormat() throws -> Int {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // Check if migration already ran (stored in sync_state or user defaults)
+        let migrationKey = "FIX853v2_TxidMigrationComplete"
+        if UserDefaults.standard.bool(forKey: migrationKey) {
+            print("✅ FIX #853 v2: TXID format migration already complete")
+            return 0
+        }
+
+        print("🔄 FIX #853 v2: Starting one-time TXID format migration...")
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Get all txids from transaction_history
+        let getTxidsSql = "SELECT DISTINCT txid FROM transaction_history WHERE txid IS NOT NULL;"
+        var getTxidsStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, getTxidsSql, -1, &getTxidsStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(getTxidsStmt) }
+
+        var txidsToCheck: [Data] = []
+        while sqlite3_step(getTxidsStmt) == SQLITE_ROW {
+            if let blob = sqlite3_column_blob(getTxidsStmt, 0) {
+                let len = sqlite3_column_bytes(getTxidsStmt, 0)
+                txidsToCheck.append(Data(bytes: blob, count: Int(len)))
+            }
+        }
+
+        print("🔄 FIX #853 v2: Checking \(txidsToCheck.count) transaction txids...")
+
+        var migratedCount = 0
+
+        // For each txid, check if it matches notes or if reversed matches
+        let checkNotesSql = """
+            SELECT COUNT(*) FROM notes
+            WHERE received_in_tx = ? OR spent_in_tx = ?;
+        """
+
+        for txid in txidsToCheck {
+            guard txid.count == 32 else { continue }
+
+            // Check if original format matches any note
+            var matchesOriginal = false
+            var checkStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt, nil) == SQLITE_OK {
+                txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+                    sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(checkStmt) == SQLITE_ROW {
+                    matchesOriginal = sqlite3_column_int(checkStmt, 0) > 0
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            if matchesOriginal {
+                // Already in correct format (wire format matches notes)
+                continue
+            }
+
+            // Check if reversed format matches any note
+            let reversedTxid = Data(txid.reversed())
+            var matchesReversed = false
+            var checkStmt2: OpaquePointer?
+            if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt2, nil) == SQLITE_OK {
+                reversedTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    sqlite3_bind_blob(checkStmt2, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(checkStmt2) == SQLITE_ROW {
+                    matchesReversed = sqlite3_column_int(checkStmt2, 0) > 0
+                }
+                sqlite3_finalize(checkStmt2)
+            }
+
+            if matchesReversed {
+                // This txid is in display format - convert to wire format
+                let updateSql = "UPDATE transaction_history SET txid = ? WHERE txid = ?;"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    reversedTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    }
+                    txid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+                    }
+
+                    if sqlite3_step(updateStmt) == SQLITE_DONE {
+                        let updated = sqlite3_changes(db)
+                        if updated > 0 {
+                            let displayHex = txid.map { String(format: "%02x", $0) }.joined()
+                            let wireHex = reversedTxid.map { String(format: "%02x", $0) }.joined()
+                            print("🔄 FIX #853 v2: Migrated txid \(displayHex.prefix(16))... → \(wireHex.prefix(16))...")
+                            migratedCount += Int(updated)
+                        }
+                    }
+                    sqlite3_finalize(updateStmt)
+                }
+            }
+            // If neither matches, leave as-is (could be orphan transaction)
+        }
+
+        // Mark migration as complete
+        UserDefaults.standard.set(true, forKey: migrationKey)
+
+        if migratedCount > 0 {
+            print("✅ FIX #853 v2: Migrated \(migratedCount) txid(s) from display format to wire format")
+        } else {
+            print("✅ FIX #853 v2: No txids needed migration (all already in wire format)")
+        }
+
+        return migratedCount
+    }
+
+    // MARK: - FIX #896: Migrate Delta Transaction TXIDs (InsightAPI Display Format Bug)
+
+    /// FIX #896: Migrate delta transaction txids from display format to wire format
+    /// InsightAPI returns txids in display format (big-endian), but we need wire format (little-endian)
+    /// This migration reverses txid bytes for all transactions above boost file height
+    /// Called at startup after database is open
+    /// Returns: Number of txids migrated
+    func migrateDeltaTxidsToWireFormat() throws -> Int {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let migrationKey = "FIX896_DeltaTxidMigrationComplete"
+        if UserDefaults.standard.bool(forKey: migrationKey) {
+            print("✅ FIX #896: Delta TXID migration already complete")
+            return 0
+        }
+
+        print("🔄 FIX #896: Starting delta TXID migration (InsightAPI display format fix)...")
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let boostFileEndHeight: UInt64 = 2988797  // ZipherXConstants.effectiveTreeHeight
+
+        // Get all txids from transaction_history at heights > boost file
+        let getTxidsSql = """
+            SELECT DISTINCT txid, height FROM transaction_history
+            WHERE height > ? AND txid IS NOT NULL;
+        """
+        var getTxidsStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, getTxidsSql, -1, &getTxidsStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(getTxidsStmt) }
+
+        sqlite3_bind_int64(getTxidsStmt, 1, Int64(boostFileEndHeight))
+
+        var deltaTxids: [(Data, UInt64)] = []
+        while sqlite3_step(getTxidsStmt) == SQLITE_ROW {
+            if let blob = sqlite3_column_blob(getTxidsStmt, 0) {
+                let len = sqlite3_column_bytes(getTxidsStmt, 0)
+                let height = UInt64(sqlite3_column_int64(getTxidsStmt, 1))
+                deltaTxids.append((Data(bytes: blob, count: Int(len)), height))
+            }
+        }
+
+        if deltaTxids.isEmpty {
+            print("✅ FIX #896: No delta transactions found (above height \(boostFileEndHeight))")
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            return 0
+        }
+
+        print("🔄 FIX #896: Found \(deltaTxids.count) delta transaction(s) to check...")
+
+        var migratedCount = 0
+
+        // For each delta txid, check if notes have a REVERSED version
+        // If so, the transaction_history has display format and needs conversion
+        let checkNotesSql = """
+            SELECT COUNT(*) FROM notes
+            WHERE received_in_tx = ? OR spent_in_tx = ?;
+        """
+
+        for (txid, height) in deltaTxids {
+            guard txid.count == 32 else { continue }
+
+            let reversedTxid = Data(txid.reversed())
+
+            // Check if REVERSED txid matches any note
+            var matchesReversed = false
+            var checkStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt, nil) == SQLITE_OK {
+                reversedTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(checkStmt) == SQLITE_ROW {
+                    matchesReversed = sqlite3_column_int(checkStmt, 0) > 0
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            if matchesReversed {
+                // Transaction has display format, notes have wire format
+                // Convert transaction to wire format
+                let updateSql = "UPDATE transaction_history SET txid = ? WHERE txid = ?;"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    reversedTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    }
+                    txid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
+                    }
+
+                    if sqlite3_step(updateStmt) == SQLITE_DONE {
+                        let updated = sqlite3_changes(db)
+                        if updated > 0 {
+                            let displayHex = txid.map { String(format: "%02x", $0) }.joined()
+                            let wireHex = reversedTxid.map { String(format: "%02x", $0) }.joined()
+                            print("🔄 FIX #896: Height \(height) - converted \(displayHex.prefix(16))... → \(wireHex.prefix(16))...")
+                            migratedCount += Int(updated)
+                        }
+                    }
+                    sqlite3_finalize(updateStmt)
+                }
+            }
+        }
+
+        UserDefaults.standard.set(true, forKey: migrationKey)
+
+        if migratedCount > 0 {
+            print("✅ FIX #896: Migrated \(migratedCount) delta transaction txid(s) to wire format")
+        } else {
+            print("✅ FIX #896: No delta txids needed migration (format already correct)")
+        }
+
+        return migratedCount
+    }
 
     // MARK: - FIX #229: Trusted Peers Management
 
@@ -5455,8 +6093,9 @@ struct TransactionHistoryItem {
 
     /// Transaction ID as hex string for display
     var txidString: String {
-        // FIX #465: txid is stored in little-endian format, reverse to big-endian for display
-        // This matches how block explorers and zclassic-cli display txids
+        // FIX #853 v2 + FIX #882: txid is stored in wire format (little-endian), reverse to display format (big-endian)
+        // This matches how block explorers display txids
+        // FIX #882 fixed FIX #880 which incorrectly stored in display format causing double-reversal
         txid.reversed().map { String(format: "%02x", $0) }.joined()
     }
 

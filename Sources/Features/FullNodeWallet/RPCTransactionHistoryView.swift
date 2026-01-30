@@ -581,6 +581,12 @@ struct RPCTransactionHistoryView: View {
                 transactions = txs.sorted { $0.timestamp > $1.timestamp }
                 isLoading = false
             }
+        } catch is CancellationError {
+            // FIX #854: Task cancellation is normal SwiftUI behavior (view dismissed/recreated)
+            // Don't log as error or show error message
+            await MainActor.run {
+                isLoading = false
+            }
         } catch {
             print("❌ FIX #286 v7: RPCTransactionHistoryView - error: \(error.localizedDescription)")
             await MainActor.run {

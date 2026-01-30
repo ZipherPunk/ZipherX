@@ -104,6 +104,15 @@ bool zipherx_build_transaction_multi(
 bool zipherx_tree_init(void);
 uint64_t zipherx_tree_append(const uint8_t *cmu);
 uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);  // Batch append (faster)
+
+/// FIX #840: ATOMIC delta CMU append - prevents race condition double-append
+/// Returns: 0=error, 1=appended, 2=skipped (already present), 3=mismatch (tree too small)
+uint32_t zipherx_tree_append_delta_atomic(
+    const uint8_t *cmus_data,
+    size_t cmu_count,
+    uint64_t expected_boost_size
+);
+
 uint64_t zipherx_tree_witness_current(void);
 bool zipherx_tree_root(uint8_t *root_out);
 bool zipherx_tree_get_witness(uint64_t witness_index, uint8_t *witness_out);
@@ -240,6 +249,20 @@ bool zipherx_witness_get_root(
 bool zipherx_witness_path_is_valid(
     const uint8_t *witness_data,
     size_t witness_len
+);
+
+// FIX #827: Verify witness anchor consistency
+// Checks if witness.root() == merkle_path.root(cmu)
+// A witness can pass witnessPathIsValid but still have corrupted path data
+// Parameters:
+// witness_data: serialized witness
+// witness_len: length of witness data
+// cmu_data: 32-byte CMU of the note
+// Returns: true if consistent, false if corrupted
+bool zipherx_witness_verify_anchor(
+    const uint8_t *witness_data,
+    size_t witness_len,
+    const uint8_t *cmu_data
 );
 
 // Compute nullifier for a note

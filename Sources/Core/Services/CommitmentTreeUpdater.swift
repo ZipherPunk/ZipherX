@@ -763,15 +763,31 @@ actor CommitmentTreeUpdater {
     /// FIX #819: Validate and clear stale CMU caches at startup
     /// Call this BEFORE loading CMUs to ensure correct byte order
     /// Returns true if cache was valid, false if cache was deleted
+    /// FIX #881: Skip validation if cache was already validated this session
     func validateAndClearStaleCMUCache() async -> Bool {
+        // FIX #881: PERFORMANCE - Skip redundant validation if already validated this session
+        // The cache version key persists across app restarts but we clear it when cache is deleted
+        let cacheValidatedKey = "CMUCacheValidatedVersion"
+        let currentCacheVersion = 6 // Bump this when cache format changes (matches FIX #743)
+        let lastValidatedVersion = UserDefaults.standard.integer(forKey: cacheValidatedKey)
+
+        if lastValidatedVersion == currentCacheVersion {
+            print("⚡ FIX #881: CMU cache already validated (version \(currentCacheVersion)) - skipping check")
+            return true
+        }
+
         guard let manifest = loadCachedManifest() else {
             print("ℹ️ FIX #819: No manifest found, skipping cache validation")
+            // FIX #881: Mark as validated since there's nothing to validate
+            UserDefaults.standard.set(currentCacheVersion, forKey: cacheValidatedKey)
             return true
         }
 
         // Check if cache exists
         guard FileManager.default.fileExists(atPath: cachedCMUDataPath.path) else {
             print("ℹ️ FIX #819: No CMU cache file, nothing to validate")
+            // FIX #881: Mark as validated since there's no cache
+            UserDefaults.standard.set(currentCacheVersion, forKey: cacheValidatedKey)
             return true
         }
 
@@ -780,6 +796,8 @@ actor CommitmentTreeUpdater {
             guard cachedData.count >= 40 else {
                 print("⚠️ FIX #819: CMU cache too small, deleting")
                 try? FileManager.default.removeItem(at: cachedCMUDataPath)
+                // FIX #881: Clear validation flag when cache is deleted
+                UserDefaults.standard.removeObject(forKey: cacheValidatedKey)
                 return false
             }
 
@@ -788,15 +806,21 @@ actor CommitmentTreeUpdater {
                 print("🗑️ FIX #819: Stale CMU cache detected and removed at startup")
                 try? FileManager.default.removeItem(at: cachedCMUDataPath)
                 clearAllLegacyCMUCaches()
+                // FIX #881: Clear validation flag when cache is deleted
+                UserDefaults.standard.removeObject(forKey: cacheValidatedKey)
                 return false
             }
 
             print("✅ FIX #819: CMU cache validated at startup - byte order correct")
+            // FIX #881: Mark as validated for future startups
+            UserDefaults.standard.set(currentCacheVersion, forKey: cacheValidatedKey)
             return true
         } catch {
             print("⚠️ FIX #819: Error validating CMU cache: \(error)")
             // On error, delete cache to be safe
             try? FileManager.default.removeItem(at: cachedCMUDataPath)
+            // FIX #881: Clear validation flag when cache is deleted
+            UserDefaults.standard.removeObject(forKey: cacheValidatedKey)
             return false
         }
     }

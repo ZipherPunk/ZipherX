@@ -635,15 +635,16 @@ Both binaries must be installed to /usr/local/bin:
                             .foregroundColor(theme.textSecondary)
                     }
 
+                    // FIX #857: SegmentedPickerStyle ignores foregroundColor on content
+                    // Use colorScheme(.dark) to force dark mode colors for segmented picker
                     Picker("Debug Level", selection: $fullNodeManager.daemonDebugLevel) {
                         ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
                             Text(level.displayName)
-                                .foregroundColor(theme.textPrimary)  // FIX #487 v3: Ensure text is visible
                                 .tag(level)
                         }
                     }
                     .pickerStyle(SegmentedPickerStyle())
-                    .foregroundColor(theme.textPrimary)  // FIX #487 v3: Ensure picker content is visible
+                    .colorScheme(.dark)  // FIX #857: Force dark mode for visible text on dark backgrounds
 
                     Text(fullNodeManager.daemonDebugLevel.description)
                         .font(.system(size: 10))

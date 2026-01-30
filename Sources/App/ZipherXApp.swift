@@ -1,6 +1,8 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+#else
+import AppKit
 #endif
 
 /// Global app startup time - captured at the very first moment of app launch
@@ -48,6 +50,22 @@ struct ZipherXApp: App {
         Task {
             await TorManager.shared.start()
         }
+
+        // FIX #894: Register for app termination notification to checkpoint WAL databases
+        // Without this, headers loaded during the session could be lost on app quit
+        #if os(macOS)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            // CRITICAL: Checkpoint WAL databases before app terminates
+            // This ensures all data (especially 2.5M headers) is written to main database file
+            HeaderStore.shared.checkpoint()
+            WalletDatabase.shared.checkpoint()
+            print("💾 FIX #894: WAL checkpoints complete before termination")
+        }
+        #endif
     }
 
     var body: some Scene {

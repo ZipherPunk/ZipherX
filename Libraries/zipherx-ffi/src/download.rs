@@ -24,6 +24,8 @@ fn get_client() -> &'static Client {
         // - Shorter keepalive (10s) to detect broken connections faster on network change
         // - pool_max_idle_per_host(0) = don't keep stale connections across network changes
         // - connect_timeout for faster initial connection
+        // FIX #886: Stall detection handled by STALL_TIMEOUT_SECS (5s) in streaming loop
+        // Note: read_timeout not available in reqwest 0.11
         Client::builder()
             .timeout(std::time::Duration::from_secs(3600)) // 1 hour total timeout
             .connect_timeout(std::time::Duration::from_secs(10)) // FIX #463: Faster connection timeout

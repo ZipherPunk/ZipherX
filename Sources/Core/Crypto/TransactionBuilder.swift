@@ -381,6 +381,24 @@ final class TransactionBuilder {
         let anchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
         print("🔍 FIX #803: Building TX with anchor: \(anchorHex)... (witness: \(witnessToUse.count) bytes)")
 
+        // FIX #838: CRITICAL - Verify witness consistency BEFORE building TX
+        // The Sapling library uses merkle_path.root(node) to compute the anchor, NOT witness.root()
+        // If these differ, the TX will be rejected by the network with "joinsplit requirements not met"
+        // This catches corrupted witnesses BEFORE wasting time on proof generation
+        if let cmu = noteCMU, !cmu.isEmpty {
+            if !ZipherXFFI.witnessVerifyAnchor(witnessToUse, cmu: cmu) {
+                let witnessRootHex = ZipherXFFI.witnessGetRoot(witnessToUse)?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+                print("❌ FIX #838: WITNESS CORRUPTED - stored root (\(witnessRootHex)...) != merkle_path.root(cmu)")
+                print("   The merkle path computes to a DIFFERENT anchor than witness.root()")
+                print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
+                throw TransactionError.witnessCorrupted
+            }
+            print("✅ FIX #838: Witness consistency verified (stored root == computed anchor)")
+        } else {
+            print("⚠️ FIX #838: Cannot verify witness consistency - CMU not available")
+        }
+
         guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
             encryptedSpendingKey: encryptedKey,
             encryptionKey: encryptionKey,
@@ -951,6 +969,21 @@ final class TransactionBuilder {
                 print("   Spend \(i): witness=\(spend.witness.count) bytes, value=\(spend.value)")
             }
 
+            // FIX #838: CRITICAL - Verify ALL witnesses are consistent BEFORE building multi-input TX
+            // Each witness must have merkle_path.root(cmu) == witness.root()
+            for (i, prepared) in preparedSpends.enumerated() {
+                if let cmu = prepared.note.cmu, !cmu.isEmpty {
+                    if !ZipherXFFI.witnessVerifyAnchor(prepared.witness, cmu: cmu) {
+                        let witnessRootHex = ZipherXFFI.witnessGetRoot(prepared.witness)?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+                        print("❌ FIX #838: WITNESS \(i) CORRUPTED - stored root (\(witnessRootHex)...) != merkle_path.root(cmu)")
+                        print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                        print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
+                        throw TransactionError.witnessCorrupted
+                    }
+                }
+            }
+            print("✅ FIX #838: All \(preparedSpends.count) witnesses verified consistent")
+
             guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
                 encryptedSpendingKey: encryptedKey,
                 encryptionKey: encryptionKey,
@@ -1065,6 +1098,23 @@ final class TransactionBuilder {
                 // FIX #803: Log anchor and witness info BEFORE FFI call for debugging
                 let anchorHex = anchorToUse.prefix(16).map { String(format: "%02x", $0) }.joined()
                 print("🔍 FIX #803: Building TX with anchor: \(anchorHex)... (witness: \(witnessToUse.count) bytes)")
+
+                // FIX #838: CRITICAL - Verify witness consistency BEFORE building TX
+                // The Sapling library uses merkle_path.root(node) to compute the anchor, NOT witness.root()
+                // If these differ, the TX will be rejected by the network with "joinsplit requirements not met"
+                if let cmu = note.cmu, !cmu.isEmpty {
+                    if !ZipherXFFI.witnessVerifyAnchor(witnessToUse, cmu: cmu) {
+                        let witnessRootHex = ZipherXFFI.witnessGetRoot(witnessToUse)?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+                        print("❌ FIX #838: WITNESS CORRUPTED - stored root (\(witnessRootHex)...) != merkle_path.root(cmu)")
+                        print("   The merkle path computes to a DIFFERENT anchor than witness.root()")
+                        print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                        print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
+                        throw TransactionError.witnessCorrupted
+                    }
+                    print("✅ FIX #838: Witness consistency verified (stored root == computed anchor)")
+                } else {
+                    print("⚠️ FIX #838: Cannot verify witness consistency - CMU not available")
+                }
 
                 guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
                     encryptedSpendingKey: encryptedKey,
@@ -2039,6 +2089,7 @@ enum TransactionError: LocalizedError {
     case memoTooLong(length: Int, max: Int)  // VUL-020
     case dustOutput(amount: UInt64, threshold: UInt64)  // VUL-024
     case witnessAnchorMismatch(noteHeight: UInt64, witnessRoot: String, headerAnchor: String)
+    case witnessCorrupted  // FIX #838: Witness merkle path computes to different root
 
     var errorDescription: String? {
         switch self {
@@ -2064,6 +2115,8 @@ enum TransactionError: LocalizedError {
             return "Output too small: \(String(format: "%.8f", amountZCL)) ZCL (minimum \(String(format: "%.8f", thresholdZCL)) ZCL to cover fees)"
         case .witnessAnchorMismatch(let noteHeight, _, _):
             return "Witness/anchor mismatch at height \(noteHeight). Database repair needed. Go to Settings → 'Repair Notes (fix balance)'"
+        case .witnessCorrupted:
+            return "Witness data corrupted. The merkle path computes to a different anchor. Go to Settings → 'Repair Database' to rebuild witnesses."
         }
     }
 }

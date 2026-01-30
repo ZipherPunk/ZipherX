@@ -411,22 +411,58 @@ struct FullNodeSettingsView: View {
     private var debugSection: some View {
         settingsCard(title: "Debug & Logs", icon: "ladybug") {
             VStack(alignment: .leading, spacing: 12) {
-                // Debug level picker
-                HStack {
-                    Text("Debug Level:")
-                        .font(theme.bodyFont)
+                // FIX #884: Improved debug level picker with clear visual design
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Daemon Debug Level")
+                        .font(theme.bodyFont.bold())
                         .foregroundColor(theme.textPrimary)
 
-                    Spacer()
+                    // Picker with clear dropdown indicator
+                    HStack {
+                        Picker("Select debug level", selection: $fullNodeManager.daemonDebugLevel) {
+                            ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
+                                Text(level.displayName).tag(level)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .tint(theme.accentColor)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(theme.surfaceColor.opacity(0.5))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 1)
+                                )
+                        )
 
-                    Picker("", selection: $fullNodeManager.daemonDebugLevel) {
-                        Text("None").tag(FullNodeManager.DaemonDebugLevel.none)
-                        Text("Network").tag(FullNodeManager.DaemonDebugLevel.network)
-                        Text("Full").tag(FullNodeManager.DaemonDebugLevel.full)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption)
+                            .foregroundColor(theme.textSecondary)
                     }
-                    .pickerStyle(.segmented)
-                    .frame(width: 200)
+
+                    // Description of selected level
+                    Text(fullNodeManager.daemonDebugLevel.description)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.top, 2)
+
+                    // Restart warning
+                    if fullNodeManager.daemonStatus.isRunning {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                            Text("Restart daemon to apply changes")
+                                .font(theme.captionFont)
+                        }
+                        .foregroundColor(.orange)
+                        .padding(.top, 4)
+                    }
                 }
+
+                Divider()
+                    .background(theme.textSecondary.opacity(0.3))
 
                 // Open debug.log
                 Button(action: openDebugLog) {

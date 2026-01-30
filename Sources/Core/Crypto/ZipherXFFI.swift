@@ -861,6 +861,40 @@ enum ZipherXFFI {
         }
     }
 
+    /// FIX #840: ATOMIC delta CMU append - prevents race condition double-append
+    ///
+    /// This function atomically checks the tree size and only appends delta CMUs if the tree
+    /// hasn't already been updated. Prevents TOCTOU race condition between WalletManager and ContentView.
+    ///
+    /// Returns:
+    ///   .appended - Delta successfully appended (tree was at expected boost size)
+    ///   .skipped - Delta already present (another thread already appended)
+    ///   .mismatch - Tree size < expected boost size (unexpected state)
+    ///   .error - Failed to append (invalid data or lock failure)
+    enum DeltaAppendResult: UInt32 {
+        case error = 0
+        case appended = 1
+        case skipped = 2
+        case mismatch = 3
+    }
+
+    static func treeAppendDeltaAtomic(cmus: Data, expectedBoostSize: UInt64) -> DeltaAppendResult {
+        guard cmus.count > 0 && cmus.count % 32 == 0 else {
+            print("❌ FIX #840 Swift: Invalid CMU data (count=\(cmus.count))")
+            return .error
+        }
+        let cmuCount = cmus.count / 32
+
+        let result = cmus.withUnsafeBytes { cmusPtr -> UInt32 in
+            guard let basePtr = cmusPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return zipherx_tree_append_delta_atomic(basePtr, cmuCount, expectedBoostSize)
+        }
+
+        return DeltaAppendResult(rawValue: result) ?? .error
+    }
+
     /// Load a witness into memory for tracking/updating
     /// Returns the witness index or UInt64.max on error
     static func treeLoadWitness(witnessData: UnsafePointer<UInt8>, witnessLen: Int) -> UInt64 {
@@ -1426,6 +1460,33 @@ enum ZipherXFFI {
         }
 
         return isValid
+    }
+
+    /// FIX #827: Verify witness anchor consistency
+    /// Checks if witness.root() == merkle_path.root(cmu)
+    /// A witness can pass witnessPathIsValid but still have corrupted path data
+    static func witnessVerifyAnchor(_ witness: Data, cmu: Data) -> Bool {
+        guard witness.count >= 100 else {
+            print("❌ witnessVerifyAnchor: witness too short (\(witness.count) bytes)")
+            return false
+        }
+
+        guard cmu.count == 32 else {
+            print("❌ witnessVerifyAnchor: CMU wrong size (\(cmu.count) bytes)")
+            return false
+        }
+
+        let isConsistent = witness.withUnsafeBytes { witnessPtr in
+            cmu.withUnsafeBytes { cmuPtr in
+                zipherx_witness_verify_anchor(
+                    witnessPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    witness.count,
+                    cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                )
+            }
+        }
+
+        return isConsistent
     }
 
     // MARK: - OVK Output Recovery (Transaction History)

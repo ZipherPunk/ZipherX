@@ -748,6 +748,20 @@ final class WalletHealthCheck {
             let searchStart = max(Int64(treeValidationHeight) - 50, 476969)  // Don't go below Sapling activation
             let searchEnd = min(Int64(treeValidationHeight) + 50, Int64(lastScannedHeight))
 
+            // FIX #893: Guard against invalid range (searchStart > searchEnd causes crash)
+            guard searchStart <= searchEnd else {
+                print("⚠️ FIX #893: Invalid search range \(searchStart)-\(searchEnd) (headers not synced to tree height)")
+                // Tree is ahead of HeaderStore - skip validation, non-critical
+                if deltaCMUs > 0 {
+                    return .passed("Tree Root Validation",
+                                  details: "Tree ahead of headers by \(treeValidationHeight - UInt64(searchEnd)) blocks - validation skipped")
+                } else {
+                    return .failed("Tree Root Validation",
+                                  details: "⚠️ Headers not synced to tree height \(treeValidationHeight)",
+                                  critical: false)
+                }
+            }
+
             print("⚠️ FIX #679: Header not found at exact height \(treeValidationHeight), searching range \(searchStart)-\(searchEnd)...")
 
             // FIX #682: Debug HeaderStore gaps - check what headers actually exist
@@ -1059,75 +1073,77 @@ final class WalletHealthCheck {
     /// If mismatches found, auto-rebuilds witnesses with correct HeaderStore anchors
     ///
     /// FIX #783: Skip auto-fix when tree repair is exhausted to prevent infinite loop
+    /// FIX #828: Changed to verify witness CONSISTENCY, not header comparison
+    ///
+    /// OLD (WRONG): Compare stored anchor vs HeaderStore at note height
+    ///   - Witnesses created at boost file height all have SAME root
+    ///   - Comparing to note height gives false positives
+    ///   - Sapling accepts ANY historical tree root as anchor
+    ///
+    /// NEW (FIX #828): Verify witness internal consistency
+    ///   - Check if witness.root() == merkle_path.root(cmu)
+    ///   - This is what the transaction builder actually uses
+    ///   - Uses FIX #827 witnessVerifyAnchor() function
     private func checkNoteAnchorsMatchHeaders() async -> HealthCheckResult {
         do {
             // FIX #760: Get all unspent notes with anchors (use accountId: 1)
             let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
-            let unspentNotes = notes.filter { $0.cmu != nil && $0.anchor != nil }
+            let unspentNotes = notes.filter { $0.cmu != nil && $0.witness.count >= 100 }
 
             guard !unspentNotes.isEmpty else {
-                return .passed("Anchor Validation", details: "No unspent notes with anchors to check")
+                return .passed("Anchor Validation", details: "No unspent notes with witnesses to check")
             }
 
-            print("🔍 FIX #550: Checking anchors for \(unspentNotes.count) unspent notes...")
+            print("🔍 FIX #828: Checking witness consistency for \(unspentNotes.count) unspent notes...")
 
-            var mismatchedNotes: [(noteId: Int64, height: UInt64, storedAnchor: Data)] = []
+            var corruptedNotes: [(noteId: Int64, height: UInt64)] = []
 
-            // Check each note's anchor against the header
+            // FIX #828: Check witness internal consistency using FIX #827's function
             for note in unspentNotes {
-                guard let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)),
-                      let storedAnchor = note.anchor else {
-                    continue
-                }
+                guard let cmu = note.cmu, !cmu.isEmpty else { continue }
 
-                if storedAnchor != headerAnchor {
-                    mismatchedNotes.append((noteId: note.id, height: note.height, storedAnchor: storedAnchor))
-                    print("   ❌ Note \(note.id) height \(note.height): ANCHOR MISMATCH")
-                    print("      Stored:  \(storedAnchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                    print("      Header:  \(headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                // FIX #827: Verify witness.root() == merkle_path.root(cmu)
+                if !ZipherXFFI.witnessVerifyAnchor(note.witness, cmu: cmu) {
+                    corruptedNotes.append((noteId: note.id, height: UInt64(note.height)))
+                    print("   ❌ Note \(note.id) height \(note.height): WITNESS CORRUPTED (path computes different root)")
                 }
             }
 
-            if mismatchedNotes.isEmpty {
-                print("✅ FIX #550: All \(unspentNotes.count) note anchors match blockchain headers!")
-                return .passed("Anchor Validation", details: "All \(unspentNotes.count) note anchors match blockchain headers ✓")
+            if corruptedNotes.isEmpty {
+                print("✅ FIX #828: All \(unspentNotes.count) witnesses are internally consistent!")
+                return .passed("Anchor Validation", details: "All \(unspentNotes.count) witnesses consistent ✓")
             }
 
             // FIX #783: Check if tree repair is exhausted BEFORE attempting auto-fix
-            // When TreeRepairExhausted is true, fixAnchorMismatches will call preRebuildWitnessesForInstantPayment
-            // which tries P2P delta sync → timeout → tree mismatch → repair → loop
             let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
             if repairExhausted {
                 print("🛑 FIX #783: Tree repair exhausted - SKIPPING auto-fix to prevent infinite loop")
-                print("🛑 FIX #783: \(mismatchedNotes.count) anchor mismatches detected but cannot auto-fix")
-                print("🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild tree and anchors")
+                print("🛑 FIX #783: \(corruptedNotes.count) corrupted witnesses detected but cannot auto-fix")
+                print("🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild witnesses")
 
-                // Return non-critical to allow app to continue
                 return .failed("Anchor Validation",
-                              details: "⚠️ \(mismatchedNotes.count) mismatched anchors. Auto-repair exhausted. Run 'Full Resync' in Settings.",
-                              critical: false)  // Non-critical to break the repair loop
+                              details: "⚠️ \(corruptedNotes.count) corrupted witnesses. Auto-repair exhausted. Run 'Full Resync' in Settings.",
+                              critical: false)
             }
 
-            // FIX #550: AUTO-FIX - Rebuild witnesses with correct HeaderStore anchors
-            print("🔧 FIX #550: Found \(mismatchedNotes.count) mismatched anchors - AUTO-FIXING...")
-            print("   This will rebuild witnesses with correct anchors from HeaderStore...")
+            // FIX #828: AUTO-FIX - Rebuild corrupted witnesses
+            print("🔧 FIX #828: Found \(corruptedNotes.count) corrupted witnesses - AUTO-FIXING...")
+            print("   This will rebuild witnesses with consistent anchors...")
 
-            // Trigger the witness rebuild from WalletManager
-            // This will rebuild ALL witnesses with HeaderStore anchors (FIX #546)
             let fixed = await WalletManager.shared.fixAnchorMismatches()
 
-            if fixed == mismatchedNotes.count {
-                print("✅ FIX #550: Successfully fixed all \(fixed) mismatched anchors!")
-                return .passed("Anchor Validation", details: "Fixed \(fixed) mismatched anchors ✓")
+            if fixed >= corruptedNotes.count {
+                print("✅ FIX #828: Successfully rebuilt \(fixed) witnesses!")
+                return .passed("Anchor Validation", details: "Rebuilt \(fixed) witnesses ✓")
             } else {
-                print("⚠️ FIX #550: Fixed \(fixed)/\(mismatchedNotes.count) anchors")
+                print("⚠️ FIX #828: Rebuilt \(fixed)/\(corruptedNotes.count) witnesses")
                 return .failed("Anchor Validation",
-                              details: "Fixed \(fixed)/\(mismatchedNotes.count) mismatched anchors. Click Force Rebuild Witnesses in Settings to retry.",
+                              details: "Rebuilt \(fixed)/\(corruptedNotes.count) witnesses. Run 'Full Resync' in Settings to retry.",
                               critical: false)
             }
 
         } catch {
-            print("❌ FIX #550: Error checking anchors: \(error)")
+            print("❌ FIX #828: Error checking witnesses: \(error)")
             return .failed("Anchor Validation", details: "Error: \(error.localizedDescription)", critical: false)
         }
     }

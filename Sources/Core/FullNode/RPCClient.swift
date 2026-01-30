@@ -348,6 +348,7 @@ public class RPCClient: ObservableObject {
     }
 
     /// Send transaction
+    /// FIX #855: Track sent z-transactions locally to persist across daemon restarts
     public func sendTransaction(from: String, to: String, amount: Double, memo: String? = nil) async throws -> String {
         var recipient: [String: Any] = [
             "address": to,
@@ -366,7 +367,52 @@ public class RPCClient: ObservableObject {
         }
 
         // Poll for operation result
-        return try await waitForOperation(opid)
+        let txid = try await waitForOperation(opid)
+
+        // FIX #855: Persist sent transaction locally
+        // z_getoperationstatus is lost when daemon restarts, so we track locally
+        persistSentZTransaction(txid: txid, from: from, to: to, amount: amount, memo: memo)
+
+        return txid
+    }
+
+    // MARK: - FIX #855: Local Sent Transaction Tracking
+
+    private static let sentZTransactionsKey = "ZipherX_WalletDat_SentZTransactions"
+
+    /// Persist a sent z-transaction locally (survives daemon restarts)
+    private func persistSentZTransaction(txid: String, from: String, to: String, amount: Double, memo: String?) {
+        var transactions = getSentZTransactions()
+
+        let tx: [String: Any] = [
+            "txid": txid,
+            "from": from,
+            "to": to,
+            "amount": amount,
+            "memo": memo ?? "",
+            "timestamp": Date().timeIntervalSince1970
+        ]
+
+        transactions.append(tx)
+
+        // Keep only last 1000 transactions
+        if transactions.count > 1000 {
+            transactions = Array(transactions.suffix(1000))
+        }
+
+        if let data = try? JSONSerialization.data(withJSONObject: transactions) {
+            UserDefaults.standard.set(data, forKey: Self.sentZTransactionsKey)
+            print("📤 FIX #855: Persisted sent z-transaction: \(txid.prefix(16))...")
+        }
+    }
+
+    /// Get all locally tracked sent z-transactions
+    func getSentZTransactions() -> [[String: Any]] {
+        guard let data = UserDefaults.standard.data(forKey: Self.sentZTransactionsKey),
+              let transactions = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return transactions
     }
 
     /// FIX #717: Send raw transaction via RPC
@@ -845,6 +891,7 @@ public class RPCClient: ObservableObject {
     ///   - to: Destination address
     ///   - amount: Amount in ZCL
     /// - Returns: Transaction ID
+    /// FIX #855: Track sent transactions locally to persist across daemon restarts
     public func sendToAddress(from: String, to: String, amount: Double) async throws -> String {
         // For t-to-t, use sendtoaddress or z_sendmany
         // z_sendmany works for both z and t source addresses
@@ -860,7 +907,12 @@ public class RPCClient: ObservableObject {
             throw RPCError.invalidResponse
         }
 
-        return try await waitForOperation(opid)
+        let txid = try await waitForOperation(opid)
+
+        // FIX #855: Persist sent transaction locally
+        persistSentZTransaction(txid: txid, from: from, to: to, amount: amount, memo: nil)
+
+        return txid
     }
 
     /// List recent transactions from wallet
@@ -1010,24 +1062,14 @@ public class RPCClient: ObservableObject {
         }
         print("📜 FIX #725: After t-address fetch: \(allTransactions.count) transactions")
 
-        // 2. Get z-address received transactions for all z-addresses
-        // z_listreceivedbyaddress returns RECEIVED z-transactions with full details
+        // FIX #866: Get z-address SENT transactions FIRST (before received)
+        // When sending to your OWN address, both SENT and RECEIVED entries exist for same txid
+        // By getting SENT first, we prioritize showing the user's ACTION (send) over the effect (receive)
+        // This fixes the bug where self-sends only showed as "received"
+
+        // 2. Get z-address SENT transactions from operation status (MOVED BEFORE received)
         let zAddresses = try await getZAddresses()
         print("📜 FIX #725: Found \(zAddresses.count) z-addresses in wallet")
-        var zReceivedCount = 0
-        for zAddr in zAddresses {
-            let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
-            for tx in zReceived {
-                if !seenTxids.contains(tx.txid) {
-                    allTransactions.append(tx)
-                    seenTxids.insert(tx.txid)
-                    zReceivedCount += 1
-                }
-            }
-        }
-        print("📜 FIX #725: Added \(zReceivedCount) z-address RECEIVED transactions")
-
-        // 3. Get z-address SENT transactions from operation status
         // FIX #725: Use z_getoperationstatus (non-destructive) to get recent sends
         // Note: This only captures operations from current daemon session
         let opResults = try await getZOperationResults()
@@ -1074,44 +1116,124 @@ public class RPCClient: ObservableObject {
         }
         print("📜 FIX #725: Added \(zSentCount) z-address SENT transactions from operations")
 
+        // FIX #855: Add locally tracked sent z-transactions (survives daemon restarts)
+        // z_getoperationstatus is reset when daemon restarts, so we also check local storage
+        let localSentTxs = getSentZTransactions()
+        var localSentCount = 0
+        for localTx in localSentTxs {
+            guard let txid = localTx["txid"] as? String,
+                  !seenTxids.contains(txid) else {
+                continue
+            }
+
+            let toAddress = localTx["to"] as? String ?? ""
+            let amount = localTx["amount"] as? Double ?? 0
+            let timestamp = localTx["timestamp"] as? Double ?? Date().timeIntervalSince1970
+
+            allTransactions.append(WalletTransaction(
+                txid: txid,
+                address: toAddress,
+                amount: UInt64(amount * 100_000_000),
+                fee: 10000, // Default fee
+                type: .sent,
+                timestamp: Date(timeIntervalSince1970: timestamp),
+                confirmations: 0, // Will be enriched below
+                height: nil
+            ))
+            seenTxids.insert(txid)
+            localSentCount += 1
+        }
+        if localSentCount > 0 {
+            print("📜 FIX #855: Added \(localSentCount) locally tracked z-address SENT transactions")
+        }
+
+        // 3. Get z-address RECEIVED transactions (AFTER sent - FIX #866)
+        // z_listreceivedbyaddress returns RECEIVED z-transactions with full details
+        // By processing after SENT, self-sends show as SENT (user's action) not RECEIVED
+        var zReceivedCount = 0
+        // FIX #862: Use composite key (txid+address) to avoid filtering out multiple outputs
+        // A single TX can have multiple z-outputs to different addresses in our wallet
+        var seenZOutputs = Set<String>()
+        for zAddr in zAddresses {
+            let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
+            for tx in zReceived {
+                // FIX #866: Skip if this txid was already added as SENT (self-send case)
+                // This ensures self-sends show as SENT, not RECEIVED
+                if seenTxids.contains(tx.txid) {
+                    continue
+                }
+                // FIX #862: Composite key to track unique outputs, not just unique txids
+                let outputKey = "\(tx.txid):\(tx.address)"
+                if !seenZOutputs.contains(outputKey) {
+                    allTransactions.append(tx)
+                    seenZOutputs.insert(outputKey)
+                    seenTxids.insert(tx.txid)
+                    zReceivedCount += 1
+                }
+            }
+        }
+        print("📜 FIX #866: Added \(zReceivedCount) z-address RECEIVED transactions (self-sends excluded)")
+
+        // FIX #885: Discover sent z-transactions using z_viewtransaction
+        // Zcash/Zclassic has no z_listsenttransactions RPC, so we examine each transaction
+        // for wallet spends to find sent transactions that weren't captured by operation status
+        print("📜 FIX #885: Discovering sent z-transactions via z_viewtransaction...")
+        let discoveredSentTxs = try await discoverSentZTransactions(knownTxids: Array(seenTxids))
+        var discoveredCount = 0
+        for sentTx in discoveredSentTxs {
+            // Only add if not already tracked as sent
+            let existingAsSent = allTransactions.contains { $0.txid == sentTx.txid && $0.type == .sent }
+            if !existingAsSent {
+                allTransactions.append(sentTx)
+                discoveredCount += 1
+            }
+        }
+        if discoveredCount > 0 {
+            print("📜 FIX #885: Discovered \(discoveredCount) additional sent z-transactions")
+        }
+
         // 4. For any transaction we found, try to enrich with full details
-        // This helps get accurate timestamps and heights for z-transactions
+        // FIX #855: Also refreshes confirmations from blockchain for pending transactions
         print("📜 FIX #725: Enriching \(allTransactions.count) transactions with full details...")
         var enrichedTransactions: [WalletTransaction] = []
         for tx in allTransactions {
-            // If transaction is missing height or has zero timestamp, try to get details
-            if tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 {
+            // FIX #855: Enrich ALL transactions, especially those with 0 confirmations
+            // This fixes "stuck pending" status by refreshing from blockchain
+            let needsEnrichment = tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 || tx.confirmations == 0
+            if needsEnrichment {
                 do {
                     let details = try await getTransaction(txid: tx.txid)
                     var enrichedTx = tx
 
-                    if let height = details["height"] as? Int, tx.height == nil {
-                        enrichedTx = WalletTransaction(
-                            txid: tx.txid,
-                            address: tx.address,
-                            amount: tx.amount,
-                            fee: tx.fee,
-                            type: tx.type,
-                            timestamp: tx.timestamp,
-                            confirmations: tx.confirmations,
-                            memo: tx.memo,
-                            height: UInt64(height)
-                        )
+                    // Update height if available
+                    var newHeight = tx.height
+                    if let height = details["height"] as? Int {
+                        newHeight = UInt64(height)
                     }
 
-                    if let blocktime = details["blocktime"] as? Int {
-                        enrichedTx = WalletTransaction(
-                            txid: enrichedTx.txid,
-                            address: enrichedTx.address,
-                            amount: enrichedTx.amount,
-                            fee: enrichedTx.fee,
-                            type: enrichedTx.type,
-                            timestamp: Date(timeIntervalSince1970: TimeInterval(blocktime)),
-                            confirmations: enrichedTx.confirmations,
-                            memo: enrichedTx.memo,
-                            height: enrichedTx.height
-                        )
+                    // Update confirmations from blockchain
+                    var newConfirmations = tx.confirmations
+                    if let confirmations = details["confirmations"] as? Int {
+                        newConfirmations = confirmations
                     }
+
+                    // Update timestamp if available
+                    var newTimestamp = tx.timestamp
+                    if let blocktime = details["blocktime"] as? Int {
+                        newTimestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                    }
+
+                    enrichedTx = WalletTransaction(
+                        txid: tx.txid,
+                        address: tx.address,
+                        amount: tx.amount,
+                        fee: tx.fee,
+                        type: tx.type,
+                        timestamp: newTimestamp,
+                        confirmations: newConfirmations,
+                        memo: tx.memo,
+                        height: newHeight
+                    )
 
                     enrichedTransactions.append(enrichedTx)
                 } catch {
@@ -1452,6 +1574,111 @@ public class RPCClient: ObservableObject {
         }
 
         return unspent
+    }
+
+    /// FIX #885: View full details of a shielded transaction (z_viewtransaction)
+    /// This reveals our spends and outputs in a transaction, allowing us to discover sent z-transactions
+    /// - Parameter txid: The transaction ID to view
+    /// - Returns: Dictionary with "spends" and "outputs" arrays showing wallet's involvement
+    public func zViewTransaction(_ txid: String) async throws -> [String: Any] {
+        let result = try await call(method: "z_viewtransaction", params: [txid])
+
+        guard let details = result as? [String: Any] else {
+            return [:]
+        }
+
+        return details
+    }
+
+    /// FIX #885: Discover sent z-transactions by examining wallet's spends in transactions
+    /// Zcash/Zclassic has no z_listsenttransactions RPC, so we use z_viewtransaction
+    /// to check each known transaction for our spends
+    public func discoverSentZTransactions(knownTxids: [String]) async throws -> [WalletTransaction] {
+        var sentTransactions: [WalletTransaction] = []
+
+        for txid in knownTxids {
+            do {
+                let details = try await zViewTransaction(txid)
+
+                // Check if we have spends in this transaction
+                guard let spends = details["spends"] as? [[String: Any]], !spends.isEmpty else {
+                    continue
+                }
+
+                // Calculate total spent from our wallet
+                var totalSpent: UInt64 = 0
+                for spend in spends {
+                    if let value = spend["value"] as? Double {
+                        totalSpent += UInt64(value * 100_000_000)
+                    } else if let valueZat = spend["valueZat"] as? Int {
+                        totalSpent += UInt64(valueZat)
+                    }
+                }
+
+                // Get outputs to calculate actual sent amount (total - change)
+                var changeAmount: UInt64 = 0
+                var recipientAddress = ""
+                if let outputs = details["outputs"] as? [[String: Any]] {
+                    for output in outputs {
+                        let isChange = output["isChange"] as? Bool ?? (output["is_mine_change"] as? Bool ?? false)
+                        let outValue: UInt64
+                        if let v = output["value"] as? Double {
+                            outValue = UInt64(v * 100_000_000)
+                        } else if let vZat = output["valueZat"] as? Int {
+                            outValue = UInt64(vZat)
+                        } else {
+                            continue
+                        }
+
+                        if isChange {
+                            changeAmount += outValue
+                        } else if recipientAddress.isEmpty {
+                            recipientAddress = output["address"] as? String ?? ""
+                        }
+                    }
+                }
+
+                // If we have spends but no recipient (all change), skip - this might be internal movement
+                let actualSent = totalSpent > changeAmount ? totalSpent - changeAmount : 0
+                if actualSent == 0 {
+                    continue
+                }
+
+                // Get transaction details for timestamp
+                var timestamp = Date()
+                var confirmations = 0
+                var height: UInt64? = nil
+                if let txDetails = try? await getTransaction(txid: txid) {
+                    if let blocktime = txDetails["blocktime"] as? Int {
+                        timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                    }
+                    if let conf = txDetails["confirmations"] as? Int {
+                        confirmations = conf
+                    }
+                    if let h = txDetails["height"] as? Int {
+                        height = UInt64(h)
+                    }
+                }
+
+                sentTransactions.append(WalletTransaction(
+                    txid: txid,
+                    address: recipientAddress,
+                    amount: actualSent,
+                    fee: 10000, // Default fee estimate
+                    type: .sent,
+                    timestamp: timestamp,
+                    confirmations: confirmations,
+                    height: height
+                ))
+
+                print("📤 FIX #885: Discovered sent z-transaction: \(txid.prefix(16))... amount=\(actualSent)")
+            } catch {
+                // Transaction might not be viewable (not in our wallet)
+                continue
+            }
+        }
+
+        return sentTransactions
     }
 
     /// Decode memo from hex string

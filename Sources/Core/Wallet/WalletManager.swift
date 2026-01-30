@@ -664,6 +664,10 @@ final class WalletManager: ObservableObject {
     @Published private(set) var boostFileSize: Int64 = 0
     @Published var showBoostDownloadSheet: Bool = false  // Show progress sheet during download
 
+    // FIX #888: Track download failures and allow retry
+    @Published var boostDownloadFailed: Bool = false
+    @Published var boostDownloadError: String = ""
+
     // Tree height/count now come from GitHub via ZipherXConstants.effectiveTreeHeight/effectiveTreeCMUCount
 
     // Lock to prevent concurrent tree loading
@@ -687,6 +691,62 @@ final class WalletManager: ObservableObject {
     /// Called from ContentView after FAST START loads tree from boost file
     func setTreeLoaded(_ loaded: Bool) {
         self.isTreeLoaded = loaded
+    }
+
+    /// FIX #888: Retry boost file download after failure
+    /// Called from ContentView when user taps "Retry Import" in download failed alert
+    func retryBoostDownload() async {
+        await MainActor.run {
+            // Reset failed state
+            self.boostDownloadFailed = false
+            self.boostDownloadError = ""
+            // Reset progress UI
+            self.treeLoadStatus = "Retrying download..."
+            self.treeLoadProgress = 0.0
+        }
+        // Retry the download
+        await preloadCommitmentTree()
+    }
+
+    // MARK: - FIX #852/853: Clean Mislabeled Change Outputs and Migrate TXIDs at Startup
+
+    /// FIX #852/853: Clean mislabeled change outputs and migrate txid formats at startup
+    /// Must be called AFTER database is open
+    private func cleanMislabeledChangeOutputsAtStartup() {
+        // FIX #853 v2: First, run one-time migration to convert display-format txids to wire format
+        // This ensures all txids are in consistent format before other checks run
+        do {
+            let migrated = try WalletDatabase.shared.migrateDisplayFormatTxidsToWireFormat()
+            if migrated > 0 {
+                print("🔄 FIX #853 v2: Migrated \(migrated) txid(s) to wire format")
+            }
+        } catch {
+            print("⚠️ FIX #853 v2: Failed to migrate txid formats: \(error)")
+        }
+
+        // FIX #852: Auto-detect mislabeled change outputs even without pending txids
+        // Detection: if we have a "received" entry AND spent a note in the same TX, it's our change
+        do {
+            let autoCleaned = try WalletDatabase.shared.cleanMislabeledChangeOutputsAuto()
+            if autoCleaned > 0 {
+                print("🧹 FIX #852: Auto-detected and cleaned \(autoCleaned) mislabeled change output(s)")
+            }
+        } catch {
+            print("⚠️ FIX #852: Failed to auto-clean mislabeled change outputs: \(error)")
+        }
+
+        // FIX #851: Also clean based on persisted pending txids (for TXs sent after FIX #849)
+        let pendingTxids = UserDefaults.standard.stringArray(forKey: "ZipherX_PendingOutgoingTxids") ?? []
+        if !pendingTxids.isEmpty {
+            do {
+                let cleaned = try WalletDatabase.shared.cleanMislabeledChangeOutputs(pendingTxids: pendingTxids)
+                if cleaned > 0 {
+                    print("🧹 FIX #851: Auto-cleaned \(cleaned) mislabeled change output(s) from pending txids")
+                }
+            } catch {
+                print("⚠️ FIX #851: Failed to clean mislabeled change outputs: \(error)")
+            }
+        }
     }
 
     private func preloadCommitmentTree() async {
@@ -723,6 +783,10 @@ final class WalletManager: ObservableObject {
             let spendingKey = try secureStorage.retrieveSpendingKey()
             let dbKey = Data(SHA256.hash(data: spendingKey))
             try WalletDatabase.shared.open(encryptionKey: dbKey)
+
+            // FIX #852: Clean mislabeled change outputs after database is open
+            // This must run here because NetworkManager.init runs before DB open
+            cleanMislabeledChangeOutputsAtStartup()
         } catch {
             print("⚠️ Failed to open database for tree preload: \(error)")
             return
@@ -909,49 +973,79 @@ final class WalletManager: ObservableObject {
                     }
 
                     if let deltaCMUs = deltaManager.loadDeltaCMUs(), !deltaCMUs.isEmpty {
-                        print("📦 FIX #558 v2: Loading \(deltaCMUs.count) delta CMUs into tree...")
-                        var appendedCount = 0
+                        // FIX #840: ATOMIC delta append - eliminates TOCTOU race condition
+                        // Previous FIX #831 re-checked tree size but wasn't atomic - race still possible
+                        // between check and append. FIX #840 holds all locks throughout the operation.
+                        //
+                        // Pack CMUs into contiguous Data for atomic append
+                        var packedCMUs = Data()
                         for cmu in deltaCMUs {
-                            let position = ZipherXFFI.treeAppend(cmu: cmu)
-                            if position != UInt64.max {
-                                appendedCount += 1
-                            }
+                            packedCMUs.append(cmu)
                         }
-                        let newTreeSize = ZipherXFFI.treeSize()
-                        print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
-                        print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                        // FIX #755: Validate tree root after delta load against header's finalsaplingroot
-                        // This catches corrupted/incomplete delta bundles that produce wrong tree state
-                        if let deltaManifest = deltaManager.getManifest(),
-                           let treeRoot = ZipherXFFI.treeRoot(),
-                           let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
-                            let headerRoot = header.hashFinalSaplingRoot
-                            let headerRootReversed = Data(headerRoot.reversed())
-                            let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+                        let appendResult = ZipherXFFI.treeAppendDeltaAtomic(
+                            cmus: packedCMUs,
+                            expectedBoostSize: effectiveCMUCount
+                        )
 
-                            if rootsMatch {
-                                print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
-                                // Save updated tree state (FIX #565)
+                        switch appendResult {
+                        case .appended:
+                            let newTreeSize = ZipherXFFI.treeSize()
+                            print("✅ FIX #840: ATOMIC append SUCCESS - \(deltaCMUs.count) delta CMUs appended")
+                            print("✅ FIX #840: Tree now has \(newTreeSize) CMUs (boost=\(effectiveCMUCount) + delta=\(deltaCMUs.count))")
+
+                            // FIX #755: Validate tree root after delta load against header's finalsaplingroot
+                            if let deltaManifest = deltaManager.getManifest(),
+                               let treeRoot = ZipherXFFI.treeRoot(),
+                               let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                                let headerRoot = header.hashFinalSaplingRoot
+                                let headerRootReversed = Data(headerRoot.reversed())
+                                let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                                if rootsMatch {
+                                    print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
+                                    // Save updated tree state (FIX #565)
+                                    if let treeData = ZipherXFFI.treeSerialize() {
+                                        try? WalletDatabase.shared.saveTreeState(treeData)
+                                    }
+                                } else {
+                                    print("❌ FIX #755: Tree root MISMATCH after delta load!")
+                                    print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                                    print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                                    print("🗑️ FIX #755/756 v2: Clearing corrupted tree, witnesses, AND delta bundle...")
+                                    try? WalletDatabase.shared.clearTreeStateForRebuild()
+                                    deltaManager.clearDeltaBundle()
+                                    needsBoostReload = true
+                                }
+                            } else {
+                                // No header available for validation - save tree anyway
                                 if let treeData = ZipherXFFI.treeSerialize() {
                                     try? WalletDatabase.shared.saveTreeState(treeData)
                                 }
+                            }
+
+                        case .skipped:
+                            // Another thread (ContentView INSTANT START) already appended delta
+                            let currentTreeSize = ZipherXFFI.treeSize()
+                            let expectedSizeNow = effectiveCMUCount + UInt64(deltaCMUs.count)
+                            print("🔄 FIX #840: ATOMIC append SKIPPED - delta already present (current=\(currentTreeSize))")
+                            if currentTreeSize == expectedSizeNow {
+                                print("✅ FIX #840: Tree size validated (\(currentTreeSize) = \(effectiveCMUCount) boost + \(deltaCMUs.count) delta)")
                             } else {
-                                print("❌ FIX #755: Tree root MISMATCH after delta load!")
-                                print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
-                                print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                                print("🗑️ FIX #755/756 v2: Clearing corrupted tree, witnesses, AND delta bundle...")
-                                // FIX #756 v2: Use clearTreeStateForRebuild to also clear witnesses
-                                // Witnesses were computed with wrong tree state and are now invalid
-                                try? WalletDatabase.shared.clearTreeStateForRebuild()
-                                deltaManager.clearDeltaBundle()
-                                needsBoostReload = true  // FIX #756: Flag to fall through to boost download
+                                print("⚠️ FIX #840: Tree size mismatch (current=\(currentTreeSize), expected=\(expectedSizeNow))")
                             }
-                        } else {
-                            // No header available for validation - save tree anyway
-                            if let treeData = ZipherXFFI.treeSerialize() {
-                                try? WalletDatabase.shared.saveTreeState(treeData)
-                            }
+
+                        case .mismatch:
+                            // Tree is smaller than expected boost size - unexpected state
+                            let currentTreeSize = ZipherXFFI.treeSize()
+                            print("⚠️ FIX #840: ATOMIC append MISMATCH - tree smaller than boost (current=\(currentTreeSize), expected=\(effectiveCMUCount))")
+                            print("🔄 FIX #840: Tree may need reload from boost file")
+                            needsBoostReload = true
+
+                        case .error:
+                            print("❌ FIX #840: ATOMIC append ERROR - failed to append delta CMUs")
+                            print("🔄 FIX #840: Falling back to boost file reload")
+                            needsBoostReload = true
                         }
                     } else {
                         print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
@@ -1130,6 +1224,9 @@ final class WalletManager: ObservableObject {
             print("❌ GitHub boost file download failed: \(error.localizedDescription)")
             await MainActor.run {
                 self.treeLoadStatus = "Failed to download boost data"
+                // FIX #888: Set download failed flag to show retry prompt
+                self.boostDownloadFailed = true
+                self.boostDownloadError = error.localizedDescription
             }
             return
         }
@@ -1170,49 +1267,67 @@ final class WalletManager: ObservableObject {
             }
 
             // FIX #558 v2: Load delta CMUs to complete the tree (boost file path)
-            // The delta CMUs are saved from previous scans but NOT loaded into the tree
-            // This causes PHASE 2 to refetch blocks on every startup!
+            // FIX #840: Now uses ATOMIC delta append to prevent race condition
             let deltaManager = DeltaCMUManager.shared
             if let deltaCMUs = deltaManager.loadDeltaCMUs(), !deltaCMUs.isEmpty {
-                print("📦 FIX #558 v2: Loading \(deltaCMUs.count) delta CMUs into tree...")
-                var appendedCount = 0
+                let effectiveCMUCount = ZipherXConstants.effectiveTreeCMUCount
+
+                // Pack CMUs into contiguous Data for atomic append
+                var packedCMUs = Data()
                 for cmu in deltaCMUs {
-                    let position = ZipherXFFI.treeAppend(cmu: cmu)
-                    if position != UInt64.max {
-                        appendedCount += 1
-                    }
+                    packedCMUs.append(cmu)
                 }
-                let newTreeSize = ZipherXFFI.treeSize()
-                print("✅ FIX #558 v2: Appended \(appendedCount)/\(deltaCMUs.count) delta CMUs to tree")
-                print("✅ FIX #558 v2: Tree now has \(newTreeSize) CMUs (was \(treeSize), added \(newTreeSize - treeSize))")
 
-                // FIX #755: Validate tree root after delta load (boost path)
-                if let deltaManifest = deltaManager.getManifest(),
-                   let treeRoot = ZipherXFFI.treeRoot(),
-                   let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
-                    let headerRoot = header.hashFinalSaplingRoot
-                    let headerRootReversed = Data(headerRoot.reversed())
-                    let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+                let appendResult = ZipherXFFI.treeAppendDeltaAtomic(
+                    cmus: packedCMUs,
+                    expectedBoostSize: effectiveCMUCount
+                )
 
-                    if rootsMatch {
-                        print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
+                switch appendResult {
+                case .appended:
+                    let newTreeSize = ZipherXFFI.treeSize()
+                    print("✅ FIX #840: ATOMIC append SUCCESS - \(deltaCMUs.count) delta CMUs [boost path]")
+                    print("✅ FIX #840: Tree now has \(newTreeSize) CMUs")
+
+                    // FIX #755: Validate tree root after delta load (boost path)
+                    if let deltaManifest = deltaManager.getManifest(),
+                       let treeRoot = ZipherXFFI.treeRoot(),
+                       let header = try? HeaderStore.shared.getHeader(at: deltaManifest.endHeight) {
+                        let headerRoot = header.hashFinalSaplingRoot
+                        let headerRootReversed = Data(headerRoot.reversed())
+                        let rootsMatch = treeRoot == headerRoot || treeRoot == headerRootReversed
+
+                        if rootsMatch {
+                            print("✅ FIX #755: Tree root validated after delta load at height \(deltaManifest.endHeight)")
+                            if let treeData = ZipherXFFI.treeSerialize() {
+                                try? WalletDatabase.shared.saveTreeState(treeData)
+                            }
+                        } else {
+                            print("❌ FIX #755: Tree root MISMATCH after delta load! (boost path)")
+                            print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
+                            print("   Header root: \(headerRoot.prefix(16).hexString)...")
+                            print("🗑️ FIX #755: Clearing corrupted delta bundle - will trigger PHASE 2 rescan")
+                            deltaManager.clearDeltaBundle()
+                            await MainActor.run {
+                                self.pendingDeltaRescan = true
+                            }
+                        }
+                    } else {
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? WalletDatabase.shared.saveTreeState(treeData)
                         }
-                    } else {
-                        print("❌ FIX #755: Tree root MISMATCH after delta load! (boost path)")
-                        print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
-                        print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                        print("🗑️ FIX #755: Clearing corrupted delta bundle - will trigger PHASE 2 rescan")
-                        deltaManager.clearDeltaBundle()
-                        await MainActor.run {
-                            self.pendingDeltaRescan = true
-                        }
                     }
-                } else {
-                    if let treeData = ZipherXFFI.treeSerialize() {
-                        try? WalletDatabase.shared.saveTreeState(treeData)
-                    }
+
+                case .skipped:
+                    let currentTreeSize = ZipherXFFI.treeSize()
+                    print("🔄 FIX #840: ATOMIC append SKIPPED - delta already present (size=\(currentTreeSize)) [boost path]")
+
+                case .mismatch:
+                    let currentTreeSize = ZipherXFFI.treeSize()
+                    print("⚠️ FIX #840: ATOMIC append MISMATCH - tree smaller than expected (size=\(currentTreeSize)) [boost path]")
+
+                case .error:
+                    print("❌ FIX #840: ATOMIC append ERROR [boost path]")
                 }
             } else {
                 print("📦 FIX #558 v2: No delta CMUs to load (first run or delta empty)")
@@ -1811,13 +1926,23 @@ final class WalletManager: ObservableObject {
         // FIX #683: Check if HeaderStore actually has the boost file headers (contiguous range)
         // Old bug: Only checked maxHeight >= boostEndHeight, which was TRUE for P2P headers
         // This caused boost file headers (476969-2984746) to never be loaded!
+        // FIX #899: CRITICAL - Require 100% of boost headers, not 95%!
+        // Old bug: 95% threshold allowed ~125K gaps in 2.5M headers
+        // Each gap triggered inefficient P2P sync from old checkpoint (28K headers per 320-block gap!)
+        // Full Resync took forever because gap filling was syncing from checkpoint 2938700 repeatedly
         let countInRange = (try? HeaderStore.shared.countHeadersInRange(from: sectionInfo.startHeight, to: sectionInfo.endHeight)) ?? 0
         let expectedCount = Int(sectionInfo.endHeight - sectionInfo.startHeight + 1)
-        let hasBoostHeaders = countInRange >= expectedCount * 95 / 100  // Allow 5% gaps
+        let hasBoostHeaders = countInRange == expectedCount  // FIX #899: Require exactly 100%
 
         if hasBoostHeaders {
             print("✅ FIX #413: Boost file headers already loaded (\(countInRange)/\(expectedCount) in range)")
             return (true, sectionInfo.endHeight)
+        }
+
+        // FIX #899: If partial headers exist, delete them to ensure clean boost load
+        if countInRange > 0 && countInRange < expectedCount {
+            print("⚠️ FIX #899: Partial headers detected (\(countInRange)/\(expectedCount)) - deleting for clean reload")
+            try? HeaderStore.shared.deleteHeadersInRange(from: sectionInfo.startHeight, to: sectionInfo.endHeight)
         }
 
         print("📜 FIX #683: Boost headers NOT loaded - only \(countInRange)/\(expectedCount) in range, will load now")
@@ -1853,10 +1978,24 @@ final class WalletManager: ObservableObject {
                 self.headerSyncTargetHeight = sectionInfo.endHeight
             }
 
+            // FIX #889: Notify NetworkManager that header loading is starting
+            // This suppresses NWPathMonitor callbacks (FIX #890) and fetchNetworkStats (FIX #892)
+            // which were causing the 91-99% stall during Import PK (5+ minutes lost!)
+            await MainActor.run {
+                NetworkManager.shared.setLoadingHeaders(true)
+            }
+
             // FIX #488: Run blocking loadHeadersFromBoostData on background thread
             // This prevents blocking the main thread, allowing UI updates during the 100-second load
             // The callback uses DispatchQueue.main.async which queues blocks on main thread
             // If main thread is blocked, those blocks never execute until load completes
+            defer {
+                // FIX #889: Ensure flag is cleared even if an error occurs
+                Task { @MainActor in
+                    NetworkManager.shared.setLoadingHeaders(false)
+                }
+            }
+
             try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else {
@@ -1998,9 +2137,11 @@ final class WalletManager: ObservableObject {
     /// This is lightweight - just appends new CMUs and updates witnesses
     func backgroundSyncToHeight(_ targetHeight: UInt64) async {
         // Prevent concurrent syncs
+        // FIX #873: Add debug logging for concurrent sync detection
         backgroundSyncLock.lock()
         if isBackgroundSyncing {
             backgroundSyncLock.unlock()
+            print("⚠️ FIX #873: Background sync blocked - already syncing (isBackgroundSyncing=true)")
             return
         }
         isBackgroundSyncing = true
@@ -2013,7 +2154,9 @@ final class WalletManager: ObservableObject {
         }
 
         // Don't sync during initial sync or if tree not loaded
+        // FIX #873: Add debug logging to identify why background sync is blocked
         guard isTreeLoaded && !isSyncing else {
+            print("⚠️ FIX #873: Background sync blocked - isTreeLoaded=\(isTreeLoaded), isSyncing=\(isSyncing)")
             return
         }
 
@@ -2027,9 +2170,19 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #841: Don't run background sync if broadcast is in progress
+        // Background sync triggers header sync which holds peer locks, causing broadcast timeouts
+        // The broadcast needs peer locks to send TX to peers - if header sync holds them, broadcast fails
+        guard await !NetworkManager.shared.isBroadcasting else {
+            print("⚠️ FIX #841: Background sync blocked - broadcast in progress")
+            return
+        }
+
         // Also block if FilterScanner is running (double protection)
-        guard !FilterScanner.isScanInProgress else {
-            print("⚠️ FIX #368: Background sync blocked - FilterScanner in progress")
+        // FIX #873: Added debug logging to identify stuck FilterScanner flag
+        let scanInProgress = FilterScanner.isScanInProgress
+        guard !scanInProgress else {
+            print("⚠️ FIX #368/#873: Background sync blocked - FilterScanner.isScanInProgress=\(scanInProgress)")
             return
         }
 
@@ -2243,6 +2396,27 @@ final class WalletManager: ObservableObject {
 
         } catch {
             print("⚠️ Background sync failed: \(error.localizedDescription)")
+
+            // FIX #910: Handle network failure by scheduling automatic retry
+            // When scan aborts due to network failure, wait for network to recover and retry
+            if case NetworkError.scanAbortedDueToNetworkFailure(_, _, let lastHeight) = error {
+                print("🔄 FIX #910: Scheduling automatic retry after network failure (last height: \(lastHeight))")
+
+                // Schedule retry in 10 seconds if network recovers
+                Task {
+                    // Wait for potential network recovery
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)  // 10 seconds
+
+                    // Check if we have peers now
+                    let peerCount = await NetworkManager.shared.connectedPeers
+                    if peerCount >= 3 {
+                        print("🔄 FIX #910: Network recovered (\(peerCount) peers), retrying sync...")
+                        await self.backgroundSyncToHeight(targetHeight)
+                    } else {
+                        print("⚠️ FIX #910: Network still down (\(peerCount) peers), will retry on next trigger")
+                    }
+                }
+            }
         }
     }
 
@@ -2306,7 +2480,12 @@ final class WalletManager: ObservableObject {
         do {
             // FIX #597 v2: Get header root (TRUE blockchain state) for FAST PATH comparison
             // The FFI treeRoot() can be out of sync with blockchain - must use header root!
-            let fastPathChainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? 0
+            // FIX #881: PERFORMANCE - Use cached chain height first to avoid network call
+            var fastPathChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
+            if fastPathChainHeight == 0 {
+                // Only call network if no cached height available
+                fastPathChainHeight = (try? await NetworkManager.shared.getChainHeight()) ?? 0
+            }
 
             // FIX #799: Get boost file end height - P2P headers above this are UNRELIABLE
             let boostFileEndHeight = ZipherXConstants.effectiveTreeHeight
@@ -2315,17 +2494,23 @@ final class WalletManager: ObservableObject {
             var useFFIRootInstead = false
 
             // FIX #799: Check if we're above boost file end - P2P headers have corrupted sapling roots
-            if fastPathChainHeight > boostFileEndHeight && boostFileEndHeight > 0 {
+            // FIX #881: INSTANT PATH - If height is unknown or above boost end, use FFI tree root directly
+            // This avoids expensive HeaderStore lookups during fast startup
+            if fastPathChainHeight == 0 || (fastPathChainHeight > boostFileEndHeight && boostFileEndHeight > 0) {
                 // P2P headers above boost file end have DUPLICATED/WRONG sapling roots
                 // (same root appears for 50+ blocks due to P2P protocol limitation)
                 // Use FFI computed tree root instead - it's built from verified CMUs
-                print("⚠️ FIX #799: Height \(fastPathChainHeight) > boost file end \(boostFileEndHeight)")
-                print("   P2P headers have unreliable sapling roots - using FFI tree root for comparison")
+                if fastPathChainHeight > 0 {
+                    print("⚠️ FIX #799: Height \(fastPathChainHeight) > boost file end \(boostFileEndHeight)")
+                    print("   P2P headers have unreliable sapling roots - using FFI tree root for comparison")
+                } else {
+                    print("⚡ FIX #881: No chain height yet - using FFI tree root for FAST PATH")
+                }
                 useFFIRootInstead = true
                 headerTreeRoot = ZipherXFFI.treeRoot()
                 if let root = headerTreeRoot {
                     let rootHex = root.prefix(16).map { String(format: "%02x", $0) }.joined()
-                    print("📋 FIX #799: Using FFI tree root: \(rootHex)...")
+                    print("📋 FIX #799/881: Using FFI tree root: \(rootHex)...")
                 }
             } else if fastPathChainHeight > 0 {
                 let headerStore = HeaderStore.shared
@@ -2340,21 +2525,31 @@ final class WalletManager: ObservableObject {
             // FIX #597 v2: FAST PATH - Check if witnesses match HEADER root (blockchain truth)
             // FIX #799: For heights above boost file, use FFI tree root (more reliable than P2P headers)
             // If most witnesses match the comparison root, we can skip the rebuild entirely
-            let notesForWitnessCheck = try WalletDatabase.shared.getAllNotes(accountId: accountId)
+            // FIX #881: PERFORMANCE - Only check UNSPENT notes (spent notes don't need witnesses for sending)
+            // Use getAllUnspentNotes directly instead of filtering - WalletNote doesn't have isSpent property
+            let notesForWitnessCheck = try WalletDatabase.shared.getAllUnspentNotes(accountId: accountId)
 
             guard !notesForWitnessCheck.isEmpty else {
-                print("✅ Pre-witness: No notes to update")
+                print("✅ Pre-witness: No unspent notes to update")
                 return
             }
 
             // Only use FAST PATH if we have a valid root to compare against
             if let validComparisonRoot = headerTreeRoot {
                 var matchingWitnessCount = 0
+                // FIX #881: PERFORMANCE - Early exit once we know FAST PATH will pass
+                // If we need 80% match and already have enough matches, skip remaining
+                let threshold = Int(Double(notesForWitnessCheck.count) * 0.8)
+
                 for note in notesForWitnessCheck {
                     if !note.witness.isEmpty, let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
                         // FIX #799: Compare against FFI root if above boost file, header root otherwise
                         if witnessAnchor == validComparisonRoot {
                             matchingWitnessCount += 1
+                            // FIX #881: Early exit if we already have enough matches
+                            if matchingWitnessCount >= threshold {
+                                break
+                            }
                         }
                     }
                 }
@@ -2362,7 +2557,7 @@ final class WalletManager: ObservableObject {
                 let matchRatio = Double(matchingWitnessCount) / Double(notesForWitnessCheck.count)
                 let sourceLabel = useFFIRootInstead ? "FFI" : "HEADER"
                 if matchRatio >= 0.8 {
-                    print("✅ FIX #597 v2 + FIX #799: FAST PATH - \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses (\(Int(matchRatio * 100))%) match \(sourceLabel) root - skipping rebuild!")
+                    print("✅ FIX #597 v2 + FIX #799 + FIX #881: FAST PATH - \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses (\(Int(matchRatio * 100))%) match \(sourceLabel) root - skipping rebuild!")
                     return
                 } else {
                     print("🔧 FIX #597 v2 + FIX #799: \(matchingWitnessCount)/\(notesForWitnessCheck.count) witnesses match \(sourceLabel) root (\(Int(matchRatio * 100))%) - need rebuild")
@@ -2416,6 +2611,19 @@ final class WalletManager: ObservableObject {
                             notesNeedingRebuild.append((note: note, cmu: cmu))
                         }
                         continue
+                    }
+
+                    // FIX #827: Verify witness anchor consistency (path computes to same root)
+                    // A witness can pass witnessPathIsValid but still have corrupted path data
+                    // that computes to a different root than witness.root()
+                    if let cmu = note.cmu, !cmu.isEmpty {
+                        if !ZipherXFFI.witnessVerifyAnchor(note.witness, cmu: cmu) {
+                            print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has anchor mismatch - forcing rebuild")
+                            print("   FIX #827: witness.root() != merkle_path.root(cmu)")
+                            corruptedWitnesses.append((note.id, note.height ?? 0))
+                            notesNeedingRebuild.append((note: note, cmu: cmu))
+                            continue
+                        }
                     }
 
                     if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
@@ -2781,7 +2989,7 @@ final class WalletManager: ObservableObject {
             print("🔄 FIX #569: Updating all witnesses - load FIRST, then append delta CMUs...")
 
             // STEP 1: Load all notes from database (thread-safe)
-            let allNotes = await MainActor.run { () -> [WalletNote] in
+            let allNotesForDelta = await MainActor.run { () -> [WalletNote] in
                 do {
                     return try WalletDatabase.shared.getAllNotes(accountId: accountId)
                 } catch {
@@ -2793,8 +3001,8 @@ final class WalletManager: ObservableObject {
             var emptyWitnessNotes: [WalletNote] = []
             var witnessIndexUpdates: [(noteId: Int64, position: UInt64)] = []
 
-            print("🔧 FIX #569: Step 1 - Loading \(allNotes.count) witnesses into FFI WITNESSES array...")
-            for note in allNotes {
+            print("🔧 FIX #569: Step 1 - Loading \(allNotesForDelta.count) witnesses into FFI WITNESSES array...")
+            for note in allNotesForDelta {
                 if note.witness.isEmpty {
                     emptyWitnessNotes.append(note)
                     continue
@@ -2977,11 +3185,26 @@ final class WalletManager: ObservableObject {
                 print("🔧 FIX #571: Step 2 - Appending \(deltaCMUs.count) delta CMUs (local: \(localCMUs), P2P: \(p2pCMUs))...")
                 await progress?("Appending delta CMUs for witness update...", 85)
 
+                // FIX #846: Check if tree already has these CMUs (from FIX #840 INSTANT START)
+                // CRITICAL: FIX #840 atomically appends delta CMUs at startup
+                // If we append again here, tree will have DOUBLE the delta CMUs
+                // This causes estimatedTreeHeight to exceed chain height → invalid anchor!
+                let currentTreeSize = ZipherXFFI.treeSize()
+                let boostCMUCount = Int(ZipherXConstants.effectiveTreeCMUCount)
+                let expectedSizeWithDelta = boostCMUCount + deltaCMUs.count
+                let treeAlreadyHasDelta = currentTreeSize >= expectedSizeWithDelta
+
                 // Step 2a: Append CMUs to TREE (for tree root computation)
-                for cmu in deltaCMUs {
-                    _ = ZipherXFFI.treeAppend(cmu: cmu)
+                // FIX #846: SKIP if tree already has delta CMUs from FIX #840
+                if treeAlreadyHasDelta {
+                    print("✅ FIX #846: Step 2a SKIPPED - Tree already has delta CMUs (size=\(currentTreeSize), expected=\(expectedSizeWithDelta))")
+                    print("✅ FIX #846: This prevents double-append bug that caused anchor mismatch!")
+                } else {
+                    for cmu in deltaCMUs {
+                        _ = ZipherXFFI.treeAppend(cmu: cmu)
+                    }
+                    print("✅ FIX #571: Step 2a - Appended \(deltaCMUs.count) CMUs to tree (new size: \(ZipherXFFI.treeSize()))")
                 }
-                print("✅ FIX #571: Step 2a - Appended \(deltaCMUs.count) CMUs to tree")
 
                 // FIX #805: Step 2b - ALSO update WITNESSES with the same CMUs!
                 // CRITICAL: treeAppend() only updates the TREE, NOT the WITNESSES!
@@ -3533,28 +3756,31 @@ final class WalletManager: ObservableObject {
             // FIX #558: Add FAST START task IDs that ContentView updates
             // Previous bug: IDs didn't match, so updateSyncTask() calls failed silently
             self.syncTasks = [
-                SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .pending),
-                SyncTask(id: "keys", title: "Derive spending keys", status: .pending),
-                SyncTask(id: "database", title: "Unlock encrypted vault", status: .pending),
-                SyncTask(id: "download_outputs", title: "Download shielded outputs", status: .pending),
-                SyncTask(id: "download_timestamps", title: "Download block timestamps", status: .pending),
-                SyncTask(id: "headers", title: "Sync block timestamps", status: .pending),
-                SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
-                SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
-                SyncTask(id: "witnesses", title: "Build Merkle witnesses", status: .pending),
-                SyncTask(id: "balance", title: "Tally unspent notes", status: .pending),
+                // FIX #887: User-friendly task titles (simple, human-readable)
+                SyncTask(id: "params", title: "Preparing wallet", status: .pending),
+                SyncTask(id: "keys", title: "Loading your keys", status: .pending),
+                SyncTask(id: "database", title: "Opening wallet", status: .pending),
+                SyncTask(id: "download_outputs", title: "Downloading blockchain", status: .pending),
+                SyncTask(id: "download_timestamps", title: "Getting timestamps", status: .pending),
+                SyncTask(id: "headers", title: "Syncing headers", status: .pending),
+                SyncTask(id: "height", title: "Connecting to network", status: .pending),
+                SyncTask(id: "scan", title: "Finding your transactions", status: .pending),
+                SyncTask(id: "witnesses", title: "Verifying transactions", status: .pending),
+                SyncTask(id: "balance", title: "Calculating balance", status: .pending),
                 // FAST START tasks (ContentView.swift)
-                SyncTask(id: "fast_balance", title: "Load balance from database", status: .pending),
-                SyncTask(id: "fast_peers", title: "Connect to P2P network", status: .pending),
-                SyncTask(id: "fast_headers", title: "Sync block headers", status: .pending),
-                SyncTask(id: "fast_health", title: "Verify wallet health", status: .pending),
-                SyncTask(id: "fast_repair", title: "Auto-repair if needed", status: .pending),
+                // FIX #887: User-friendly task titles for FAST START
+                SyncTask(id: "fast_balance", title: "Loading balance", status: .pending),
+                SyncTask(id: "fast_peers", title: "Connecting to network", status: .pending),
+                SyncTask(id: "fast_headers", title: "Syncing headers", status: .pending),
+                SyncTask(id: "fast_health", title: "Checking wallet", status: .pending),
+                SyncTask(id: "fast_repair", title: "Auto-repair", status: .pending),
                 // Repair tasks
-                SyncTask(id: "balance_repair", title: "Repair database", status: .pending),
-                SyncTask(id: "balance_repair_early", title: "Early repair check", status: .pending),
-                SyncTask(id: "full_repair", title: "Full database rescan", status: .pending),
-                SyncTask(id: "tree_rebuild", title: "Rebuild commitment tree", status: .pending),
-                SyncTask(id: "witness_sync", title: "Sync witnesses", status: .pending)
+                // FIX #887: User-friendly repair task titles
+                SyncTask(id: "balance_repair", title: "Repairing wallet", status: .pending),
+                SyncTask(id: "balance_repair_early", title: "Quick health check", status: .pending),
+                SyncTask(id: "full_repair", title: "Full wallet scan", status: .pending),
+                SyncTask(id: "tree_rebuild", title: "Rebuilding data", status: .pending),
+                SyncTask(id: "witness_sync", title: "Syncing proofs", status: .pending)
             ]
         }
 
@@ -4433,6 +4659,11 @@ final class WalletManager: ObservableObject {
         await MainActor.run { isRepairingDatabase = true }
         print("🔧 FIX #368: isRepairingDatabase = true (blocking backgroundSync)")
 
+        // FIX #907: Block all block listeners during repair
+        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
+        PeerManager.shared.setBlockListenersBlocked(true)
+        print("🛑 FIX #907: Block listeners blocked during repair")
+
         // FIX #577 v7: Show same sync UI as Import PK during Full Rescan
         // Track start time for completion duration display
         let rescanStartTime = Date()
@@ -4459,45 +4690,54 @@ final class WalletManager: ObservableObject {
                 self.overallProgress = 0.0  // Reset to 0 - was showing previous 100%
                 self.syncStatus = "Preparing Full Rescan..."
                 self.syncTasks = [
-                    SyncTask(id: "params", title: "Load zk-SNARK circuits", status: .completed, detail: "Cached"),
-                    SyncTask(id: "keys", title: "Derive spending keys", status: .completed, detail: "Keys loaded"),
-                    SyncTask(id: "database", title: "Unlock encrypted vault", status: .completed, detail: "Database created"),
-                    SyncTask(id: "download_outputs", title: "Download shielded outputs", status: .inProgress, detail: "Downloading boost file...", progress: 0.0),
-                    SyncTask(id: "download_timestamps", title: "Download block timestamps", status: .pending),
-                    SyncTask(id: "headers", title: "Sync block timestamps", status: .pending),
-                    SyncTask(id: "height", title: "Query chain tip from peers", status: .pending),
-                    SyncTask(id: "scan", title: "Decrypt shielded notes", status: .pending),
-                    SyncTask(id: "witnesses", title: "Build Merkle witnesses", status: .pending),
-                    SyncTask(id: "balance", title: "Tally unspent notes", status: .pending)
+                    // FIX #887: User-friendly task titles for Full Rescan
+                    SyncTask(id: "params", title: "Preparing wallet", status: .completed, detail: "Ready"),
+                    SyncTask(id: "keys", title: "Loading your keys", status: .completed, detail: "Loaded"),
+                    SyncTask(id: "database", title: "Opening wallet", status: .completed, detail: "Open"),
+                    SyncTask(id: "download_outputs", title: "Downloading blockchain", status: .inProgress, detail: "Starting...", progress: 0.0),
+                    SyncTask(id: "download_timestamps", title: "Getting timestamps", status: .pending),
+                    SyncTask(id: "headers", title: "Syncing headers", status: .pending),
+                    SyncTask(id: "height", title: "Connecting to network", status: .pending),
+                    SyncTask(id: "scan", title: "Finding your transactions", status: .pending),
+                    SyncTask(id: "witnesses", title: "Verifying transactions", status: .pending),
+                    SyncTask(id: "balance", title: "Calculating balance", status: .pending)
                 ]
             }
             print("🎬 FIX #577 v7: isFullRescan = true (showing CypherpunkSyncView)")
             print("📦 FIX #577 v14: Import PK tasks initialized IMMEDIATELY (ready for UI before any code runs)")
         }
         defer {
-            // FIX #451: Use synchronous reset instead of Task to ensure flag is always cleared
-            // Task can fail to execute if function throws, leaving flag stuck
-            Task { @MainActor in
+            // FIX #907: Unblock block listeners when repair completes
+            PeerManager.shared.setBlockListenersBlocked(false)
+            print("✅ FIX #907: Block listeners unblocked after repair")
+
+            // FIX #844: Clear flag IMMEDIATELY using sync dispatch (if not on main thread)
+            // Previous bug: Task { @MainActor in } was async, causing 2+ minute delay
+            // This delay allowed FilterScanner to see stale isRepairing=true and start unwanted scan
+            if Thread.isMainThread {
+                // Already on main thread - execute directly
                 self.isRepairingDatabase = false
-                print("🔧 FIX #368: isRepairingDatabase = false (backgroundSync unblocked)")
-                // FIX #577 v7: Set completion flags when done
-                // FIX #582: Keep isFullRescan = true until user clicks "Enter Wallet"
-                // This prevents ContentView from starting a new sync cycle
+                print("🔧 FIX #844: isRepairingDatabase = false (direct, already on main thread)")
                 if self.isFullRescan {
                     let duration = Date().timeIntervalSince(rescanStartTime)
                     self.isRescanComplete = true
                     self.rescanCompletionDuration = duration
-                    // NOTE: isFullRescan stays true until user clicks "Enter Wallet" in ContentView
                     print("🎬 FIX #577 v7 + FIX #582: Full Rescan complete in \(Int(duration))s, showing completion screen")
                     print("🔒 FIX #582: isFullRescan kept true until user clicks Enter Wallet")
                 }
-            }
-            // Also add a timeout-based reset as fallback
-            DispatchQueue.main.asyncAfter(deadline: .now() + 300) {  // 5 minutes max
-                Task { @MainActor in
-                    if self.isRepairingDatabase {
-                        print("⚠️ FIX #451: Auto-resetting stuck isRepairingDatabase flag after 5min timeout")
-                        self.isRepairingDatabase = false
+            } else {
+                // Not on main thread - use sync dispatch to ensure completion before defer returns
+                DispatchQueue.main.sync {
+                    self.isRepairingDatabase = false
+                    print("🔧 FIX #844: isRepairingDatabase = false (sync dispatch from background)")
+                    // FIX #577 v7: Set completion flags when done
+                    // FIX #582: Keep isFullRescan = true until user clicks "Enter Wallet"
+                    if self.isFullRescan {
+                        let duration = Date().timeIntervalSince(rescanStartTime)
+                        self.isRescanComplete = true
+                        self.rescanCompletionDuration = duration
+                        print("🎬 FIX #577 v7 + FIX #582: Full Rescan complete in \(Int(duration))s, showing completion screen")
+                        print("🔒 FIX #582: isFullRescan kept true until user clicks Enter Wallet")
                     }
                 }
             }
@@ -5379,21 +5619,24 @@ final class WalletManager: ObservableObject {
                 // Update witness
                 try? WalletDatabase.shared.updateNoteWitness(noteId: noteId, witness: witness)
 
-                // FIX #555: Use HeaderStore anchor (not witness root)
-                if let headerAnchor = try? HeaderStore.shared.getSaplingRoot(at: UInt64(note.height)) {
-                    try? WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: headerAnchor)
+                // FIX #828: Use WITNESS ROOT as anchor (REVERTS FIX #555)
+                // Per FIX #804: anchor must be what the witness merkle path computes to
+                // Using HeaderStore at note height is WRONG - witness was created at tree height
+                if let witnessRoot = ZipherXFFI.witnessGetRoot(witness) {
+                    try? WalletDatabase.shared.updateNoteAnchor(noteId: noteId, anchor: witnessRoot)
 
-                    // Verify
-                    if let verifyAnchor = try? WalletDatabase.shared.getAnchor(for: noteId),
-                       verifyAnchor == headerAnchor {
+                    // Verify consistency
+                    if let cmu = note.cmu, ZipherXFFI.witnessVerifyAnchor(witness, cmu: cmu) {
                         fixedCount += 1
-                        let anchorHex = headerAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        let anchorHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
                         print("   ✅ Note \(noteId) height \(note.height): witness rebuilt, anchor \(anchorHex)...")
+                    } else {
+                        print("   ⚠️ Note \(noteId): witness rebuilt but consistency check failed")
                     }
                 }
             }
 
-            print("✅ FIX #550: Rebuilt \(fixedCount)/\(unspentNotes.count) witnesses with correct anchors")
+            print("✅ FIX #828: Rebuilt \(fixedCount)/\(unspentNotes.count) witnesses with correct anchors")
             return fixedCount
 
         } catch {
@@ -6803,8 +7046,11 @@ final class WalletManager: ObservableObject {
         defaults.removeObject(forKey: "debugLoggingEnabled")
         defaults.removeObject(forKey: "useP2POnly")
         defaults.removeObject(forKey: "persisted_peer_addresses")
+        // FIX #896: Clear migration flags so they run again on fresh import
+        defaults.removeObject(forKey: "FIX853v2_TxidMigrationComplete")
+        defaults.removeObject(forKey: "FIX896_DeltaTxidMigrationComplete")
         defaults.synchronize()
-        print("🗑️ Cleared UserDefaults")
+        print("🗑️ Cleared UserDefaults (including migration flags)")
 
         // 6. Clear in-memory state
         DispatchQueue.main.async {
@@ -7389,6 +7635,49 @@ final class WalletManager: ObservableObject {
 
             let headerRoot = header.hashFinalSaplingRoot.hexString
             print("🔧 FIX #527: HeaderStore sapling_root at \(lastScanned): \(headerRoot.prefix(16))...")
+
+            // FIX #820: P2P getheaders protocol doesn't reliably include finalsaplingroot field
+            // FIX #796-#799 established that P2P headers have CORRUPTED sapling roots
+            // Only trust boost file headers (up to effectiveTreeHeight)
+            let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
+            if lastScanned > boostFileEndHeight {
+                print("🔍 FIX #820: Height \(lastScanned) > boost file end \(boostFileEndHeight)")
+                print("🔍 FIX #820: HeaderStore sapling roots unreliable for this range")
+
+                // FIX #936: CRITICAL - Fetch actual BLOCK via P2P to get reliable finalsaplingroot
+                // P2P getdata (blocks) includes finalsaplingroot, unlike getheaders
+                // This prevents false SUCCESS when tree is corrupted (anchor mismatch)
+                print("🔍 FIX #936: Fetching block \(lastScanned) via P2P for anchor validation...")
+
+                do {
+                    let block = try await NetworkManager.shared.getBlockForScanning(height: lastScanned)
+                    let blockSaplingRoot = block.finalSaplingRoot.hexString
+
+                    print("🔍 FIX #936: FFI tree root:   \(ourRootHex.prefix(16))...")
+                    print("🔍 FIX #936: Block sapling root: \(blockSaplingRoot.prefix(16))...")
+
+                    if ourRootHex == blockSaplingRoot {
+                        print("✅ FIX #936: Tree root matches P2P block - anchor is VALID")
+                        return CMUTreeValidationResult(isValid: true, ourRoot: ourRootHex, headerRoot: blockSaplingRoot, height: lastScanned)
+                    } else {
+                        // CRITICAL: Tree root MISMATCH with actual blockchain!
+                        // TX will be rejected with "joinsplit requirements not met"
+                        print("❌ FIX #936: TREE ROOT MISMATCH - TX WILL BE REJECTED!")
+                        print("   FFI root:    \(ourRootHex.prefix(16))...")
+                        print("   Block root:  \(blockSaplingRoot.prefix(16))...")
+                        print("   Height:      \(lastScanned)")
+                        print("❌ FIX #936: Blocking send - run 'Repair Database' to rebuild tree")
+                        return CMUTreeValidationResult(isValid: false, ourRoot: ourRootHex, headerRoot: blockSaplingRoot, height: lastScanned)
+                    }
+                } catch {
+                    // P2P block fetch failed - can't validate anchor
+                    // FIX #936: FAIL SAFE - block send when we can't verify
+                    print("⚠️ FIX #936: P2P block fetch failed: \(error)")
+                    print("⚠️ FIX #936: Cannot validate anchor - BLOCKING SEND for safety")
+                    print("⚠️ FIX #936: Reconnect to P2P network and try again")
+                    return CMUTreeValidationResult(isValid: false, ourRoot: ourRootHex, headerRoot: "fetch_failed", height: lastScanned)
+                }
+            }
 
             // FIX #719: CRITICAL - Block send if tree root mismatch detected
             // FIX #537 was WRONG - it allowed send even when roots didn't match

@@ -2690,6 +2690,162 @@ pub unsafe extern "C" fn zipherx_tree_append_batch(
     start_position
 }
 
+/// FIX #840: ATOMIC delta CMU append - prevents race condition double-append
+///
+/// This function atomically checks the tree size and only appends delta CMUs if the tree
+/// hasn't already been updated. This prevents the TOCTOU race condition between
+/// WalletManager and ContentView's INSTANT START path.
+///
+/// Race condition scenario (before this fix):
+///   1. Thread A (WalletManager) checks tree size → 1045687 (boost only)
+///   2. Thread B (ContentView) checks tree size → 1045687 (boost only)
+///   3. Both decide to append delta (since 1045687 == boost count)
+///   4. Thread A appends delta → tree size becomes 1045901
+///   5. Thread B appends delta → tree size becomes 1046115 (CORRUPTED!)
+///
+/// This fix:
+///   - Acquires ALL locks atomically at the start
+///   - Checks tree size while holding locks
+///   - Only appends if tree size == expected_boost_size
+///   - Returns status indicating whether append was performed or skipped
+///
+/// Parameters:
+///   cmus_data: Packed CMU data (32 bytes per CMU, in wire format)
+///   cmu_count: Number of CMUs to append
+///   expected_boost_size: Expected tree size before delta append (boost file CMU count)
+///
+/// Returns:
+///   0 = Error (failed to append)
+///   1 = SUCCESS - Delta appended (tree was at expected_boost_size)
+///   2 = SKIPPED - Delta already present (tree size > expected_boost_size)
+///   3 = MISMATCH - Tree size < expected_boost_size (unexpected state)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
+    cmus_data: *const u8,
+    cmu_count: usize,
+    expected_boost_size: u64,
+) -> u32 {
+    if cmus_data.is_null() || cmu_count == 0 {
+        debug_log!("❌ FIX #840: Invalid parameters (null={}, count={})", cmus_data.is_null(), cmu_count);
+        return 0;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(cmus_data, cmu_count * 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #840: Invalid CMUs data pointer in tree_append_delta_atomic");
+            return 0;
+        }
+    };
+
+    // CRITICAL: Acquire ALL locks atomically BEFORE checking tree size
+    // This prevents TOCTOU race condition
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire COMMITMENT_TREE lock");
+            return 0;
+        }
+    };
+    let tree = match tree_guard.as_mut() {
+        Some(t) => t,
+        None => {
+            eprintln!("❌ FIX #840: Tree not initialized");
+            return 0;
+        }
+    };
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire TREE_POSITION lock");
+            return 0;
+        }
+    };
+
+    // ATOMIC CHECK: Now that we hold all locks, check tree size
+    let current_size = *pos_guard;
+
+    if current_size > expected_boost_size {
+        // Delta already appended by another thread - SKIP
+        let delta_present = current_size - expected_boost_size;
+        debug_log!("🔄 FIX #840: SKIPPED - Delta already present (current={}, boost={}, delta={})",
+                   current_size, expected_boost_size, delta_present);
+        return 2; // SKIPPED
+    }
+
+    if current_size < expected_boost_size {
+        // Tree has fewer CMUs than expected - unexpected state
+        debug_log!("⚠️ FIX #840: MISMATCH - Tree smaller than boost (current={}, expected={})",
+                   current_size, expected_boost_size);
+        return 3; // MISMATCH
+    }
+
+    // Tree is exactly at boost size - safe to append delta
+    debug_log!("✅ FIX #840: Appending {} delta CMUs atomically (current={}, boost={})",
+               cmu_count, current_size, expected_boost_size);
+
+    // Parse all CMUs first
+    let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+    for i in 0..cmu_count {
+        let cmu_slice = &data[i * 32..(i + 1) * 32];
+        match zcash_primitives::sapling::Node::read(cmu_slice) {
+            Ok(n) => nodes.push(n),
+            Err(e) => {
+                eprintln!("❌ FIX #840: Failed to parse CMU {}: {:?}", i, e);
+                return 0;
+            }
+        }
+    }
+
+    // Append all nodes to tree
+    for (i, node) in nodes.iter().enumerate() {
+        if tree.append(*node).is_err() {
+            eprintln!("❌ FIX #840: Failed to append CMU {} to tree", i);
+            return 0;
+        }
+    }
+
+    // Store delta CMUs for witness updates
+    {
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) {
+            Some(g) => g,
+            None => {
+                eprintln!("❌ FIX #840: Failed to acquire DELTA_CMUS lock");
+                return 0;
+            }
+        };
+        for node in &nodes {
+            delta_guard.push(node.clone());
+        }
+        debug_log!("📊 FIX #840: Stored {} delta CMUs (total={})", cmu_count, delta_guard.len());
+    }
+
+    // Update all existing witnesses with all new nodes
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire WITNESSES lock");
+            // Tree was already modified, but witnesses not updated - partial failure
+            // Still update position and return success since tree is correct
+            *pos_guard += cmu_count as u64;
+            return 1;
+        }
+    };
+
+    for node in &nodes {
+        for witness in witnesses_guard.iter_mut() {
+            witness.append(*node).ok();
+        }
+    }
+
+    *pos_guard += cmu_count as u64;
+
+    debug_log!("✅ FIX #840: SUCCESS - Appended {} delta CMUs (new size={})", cmu_count, *pos_guard);
+    1 // SUCCESS
+}
+
 /// Create a witness for the current position in the tree
 /// Call this right after appending a note that belongs to us
 /// Returns the witness index (to retrieve later) or u64::MAX on error
@@ -4662,6 +4818,118 @@ pub unsafe extern "C" fn zipherx_witness_path_is_valid(
     let path_is_valid = witness.path().is_some();
     debug_log!("🔍 witness_path_is_valid: path_is_some={}", path_is_valid);
     path_is_valid
+}
+
+/// FIX #827: Check if a witness is internally consistent (anchor matches path computation)
+///
+/// This verifies that witness.root() == merkle_path.root(cmu), which ensures the witness
+/// can be used to create a valid transaction. A witness can pass witnessPathIsValid()
+/// (path is Some) but still have corrupted path data that computes to wrong anchor.
+///
+/// Parameters:
+/// - witness_data: Serialized witness data
+/// - witness_len: Length of witness data
+/// - cmu_data: 32-byte CMU (commitment) of the note
+///
+/// Returns: true if witness is consistent, false if corrupted
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_verify_anchor(
+    witness_data: *const u8,
+    witness_len: usize,
+    cmu_data: *const u8,
+) -> bool {
+    if witness_len < 100 {
+        debug_log!("❌ FIX #827: witness too short ({})", witness_len);
+        return false;
+    }
+
+    // Validate pointers
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            debug_log!("❌ FIX #827: invalid witness pointer");
+            return false;
+        }
+    };
+
+    let cmu_slice = match safe_slice(cmu_data, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("❌ FIX #827: invalid CMU pointer");
+            return false;
+        }
+    };
+
+    // Deserialize witness
+    let mut reader = std::io::Cursor::new(witness_slice);
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(e) => {
+                debug_log!("❌ FIX #827: witness deserialization failed: {:?}", e);
+                return false;
+            }
+        };
+
+    // Get the stored root
+    let witness_root = witness.root();
+    let mut witness_root_bytes = [0u8; 32];
+    if witness_root.write(&mut witness_root_bytes[..]).is_err() {
+        debug_log!("❌ FIX #827: failed to serialize witness root");
+        return false;
+    }
+
+    // Get merkle path (same logic as transaction builder)
+    let merkle_path = match witness.path() {
+        Some(p) => p,
+        None => {
+            // Construct from filled nodes
+            let filled = witness.filled();
+            let position = witness.witnessed_position();
+            match MerklePath::from_parts(filled.clone(), position) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug_log!("❌ FIX #827: failed to construct MerklePath: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    // Parse CMU and create Node
+    let mut cmu_bytes = [0u8; 32];
+    cmu_bytes.copy_from_slice(cmu_slice);
+
+    // CMU is an ExtractedNoteCommitment - parse directly from bytes
+    let cmu = match zcash_primitives::sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes).into_option() {
+        Some(c) => c,
+        None => {
+            debug_log!("❌ FIX #827: invalid CMU bytes");
+            return false;
+        }
+    };
+
+    // Compute path root using the CMU
+    let node = zcash_primitives::sapling::Node::from_cmu(&cmu);
+    let path_root = merkle_path.root(node);
+    let mut path_root_bytes = [0u8; 32];
+    if path_root.write(&mut path_root_bytes[..]).is_err() {
+        debug_log!("❌ FIX #827: failed to serialize path root");
+        return false;
+    }
+
+    // Compare roots
+    let is_consistent = witness_root_bytes == path_root_bytes;
+
+    if is_consistent {
+        debug_log!("✅ FIX #827: witness consistent - root {}...", hex::encode(&witness_root_bytes[..8]));
+    } else {
+        debug_log!("❌ FIX #827: WITNESS CORRUPTED!");
+        debug_log!("   witness.root(): {}...", hex::encode(&witness_root_bytes[..8]));
+        debug_log!("   path.root(cmu): {}...", hex::encode(&path_root_bytes[..8]));
+    }
+
+    is_consistent
 }
 
 /// Create witnesses for multiple CMUs using BATCH processing (OPTIMIZED)

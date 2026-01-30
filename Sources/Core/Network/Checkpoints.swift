@@ -109,18 +109,16 @@ enum ZclassicCheckpoints {
     /// FIX #229: Trusted peers are also stored in database table
     /// FIX #234: Added known working Zclassic nodes (MagicBean) as DNS seeds often return Zcash nodes
     /// FIX #507: Added localhost as highest priority seed
+    /// FIX #927: Production mode - all seeds enabled (same as Zclassic source)
     static let seedNodes: [String] = [
-        // FIX #507: Local node - highest priority (always fastest when available)
-        "127.0.0.1",         // Local zclassicd node on port 8033
-        // Known working Zclassic nodes (MagicBean:2.1.1-10, protocol version 170011/170012)
-        "140.174.189.3",    // MagicBean node cluster
-        "140.174.189.17",   // MagicBean node cluster
-        "205.209.104.118",  // MagicBean node
-        "95.179.131.117",   // Additional Zclassic node
-        "45.77.216.198",    // Additional Zclassic node
-        // FIX #423: Additional verified ZCL nodes
-        "212.23.222.231",   // Connected successfully with version 170011
-        "157.90.223.151"    // Block listener started successfully
+        "127.0.0.1",          // Local node first (highest priority if running)
+        "140.174.189.3",      // MagicBean node cluster
+        "140.174.189.17",     // MagicBean node cluster
+        "205.209.104.118",    // MagicBean node
+        "95.179.131.117",     // Additional Zclassic node
+        "45.77.216.198",      // Additional Zclassic node
+        "212.23.222.231",     // Connected successfully with version 170011
+        "157.90.223.151"      // Block listener started successfully
     ]
 
     /// Hardcoded .onion seed nodes (Tor hidden services)

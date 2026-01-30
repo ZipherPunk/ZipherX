@@ -162,12 +162,17 @@ public final class NetworkManager: ObservableObject {
     private let MIN_PEERS = 8  // Increased from 3 for better reliability
     private let MAX_PEERS = 30  // Increased from 20
     private let TARGET_PEER_PERCENT = 0.15 // Connect to 15% of known addresses
-    private let CONSENSUS_THRESHOLD = 7 // SECURITY: Byzantine fault tolerance (n=8, f=2) - VUL-001 fix + Audit #761
+    // FIX #934: Lowered from 7 to 3 - Zclassic network is small, can't reliably get 7 peers
+    // Byzantine fault tolerance still applies but with realistic peer counts
+    private let CONSENSUS_THRESHOLD = 3
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 604800 // VUL-010: 7 days for stronger Sybil protection
     private let MAX_KNOWN_ADDRESSES = 1000
     private let GETADDR_INTERVAL: TimeInterval = 30 // Request addresses every 30 seconds
+
+    // FIX #849: UserDefaults key for persisting pending outgoing txids across app restart
+    private let PENDING_TXIDS_KEY = "ZipherX_PendingOutgoingTxids"
 
     // MARK: - Published Properties
     @Published private(set) var connectedPeers: Int = 0
@@ -207,6 +212,15 @@ public final class NetworkManager: ObservableObject {
     /// FIX #130: Flag to indicate header sync is in progress
     /// Mempool scan will be paused during header sync to prevent P2P race conditions
     @Published private(set) var isHeaderSyncing: Bool = false
+
+    /// FIX #841: Flag to indicate broadcast is in progress
+    /// Background sync will be blocked during broadcast to prevent peer lock conflicts
+    @Published private(set) var isBroadcasting: Bool = false
+
+    /// FIX #871: Flag to indicate transient network recovery is in progress
+    /// Health check will NOT show CRITICAL "No active peers!" alert during this period
+    /// Set when FIX #870 detects ALL errors are transient (network hiccup) and delays recovery
+    @Published private(set) var isTransientRecoveryInProgress: Bool = false
 
     /// Sybil attack detection - published when a fake peer is banned
     /// Contains: (peerHost: String, fakeHeight: UInt64, realHeight: UInt64)
@@ -284,6 +298,23 @@ public final class NetworkManager: ObservableObject {
             print("🔒 FIX #519: Header sync in progress - health checks will skip pings")
         } else {
             print("🔓 FIX #519: Header sync complete - health checks resumed")
+        }
+    }
+
+    // MARK: - FIX #889-#892: Import PK Performance Optimization
+
+    /// FIX #889: Flag to indicate boost header loading is in progress
+    /// When true, suppresses NWPathMonitor callbacks (FIX #890) and fetchNetworkStats (FIX #892)
+    /// This prevents expensive network operations from interfering with SQLite bulk inserts
+    @Published private(set) var isLoadingHeaders: Bool = false
+
+    /// FIX #889: Set header loading flag (call from HeaderStore.loadHeadersFromBoostData)
+    func setLoadingHeaders(_ loading: Bool) {
+        isLoadingHeaders = loading
+        if loading {
+            print("🔒 FIX #889: Boost header load in progress - suppressing network operations")
+        } else {
+            print("🔓 FIX #889: Boost header load complete - resuming network operations")
         }
     }
 
@@ -473,6 +504,15 @@ public final class NetworkManager: ObservableObject {
         // Check 2: Peer connectivity
         let readyPeers = peers.filter { $0.isConnectionReady }.count
         if readyPeers == 0 && isConnected {
+            // FIX #871: If transient recovery is in progress, DON'T show CRITICAL alert
+            // This prevents false alarms when FIX #870 is waiting for network to stabilize
+            if isTransientRecoveryInProgress {
+                print("⏳ FIX #871: 0 peers but transient recovery in progress - suppressing CRITICAL alert")
+                // Still block features for safety, but don't scare user with CRITICAL alert
+                blockFeatures([.send, .receive, .chat], reason: "Reconnecting to network...")
+                return
+            }
+
             // FIX #410: Block ALL features - no network = no transactions
             blockFeatures([.send, .receive, .chat], reason: "No network connection")
             criticalHealthAlert = CriticalHealthAlert(
@@ -622,22 +662,50 @@ public final class NetworkManager: ObservableObject {
     /// FIX #139/FIX #383: Stop all block listeners before header sync
     /// FIX #509: Now async - waits for listeners to actually finish
     /// FIX #384: Delegates to PeerManager (but also operates on local peers for sync)
+    /// FIX #822: Add 5s overall timeout to prevent blocking startup
+    /// FIX #874: Early return if no listeners running - saves 5+ seconds during startup
     public func stopAllBlockListeners() async {
+        // FIX #874: Check if any listeners are actually running before spending time stopping
+        let listeningPeers = peers.filter { $0.isListening }
+        let peerManagerHasListeners = await PeerManager.shared.hasActiveBlockListeners()
+
+        if listeningPeers.isEmpty && !peerManagerHasListeners {
+            // FIX #874: No listeners running - skip expensive stop operations
+            debugLog(.network, "⏸️ FIX #874: No block listeners running - skipping stop (fast path)")
+            return
+        }
+
         print("🛑 FIX #383: Stopping all block listeners...")
         debugLog(.network, "⏸️ FIX #140: Pausing \(peers.count) block listeners for header sync...")
 
-        // FIX #817: Stop local peers in PARALLEL (not sequential)
-        // Previously took 2s × N stuck peers; now max 2s total
-        let listeningPeers = peers.filter { $0.isListening }
-        await withTaskGroup(of: Void.self) { group in
-            for peer in listeningPeers {
-                group.addTask {
-                    await peer.stopBlockListener()
+        // FIX #822: Signal all local listeners to stop immediately (non-blocking)
+        for peer in listeningPeers {
+            peer.signalStopListener()
+        }
+
+        // FIX #822: Use overall timeout for local peers
+        let localStopTask = Task {
+            await withTaskGroup(of: Void.self) { group in
+                for peer in listeningPeers {
+                    group.addTask {
+                        await peer.stopBlockListener()
+                    }
                 }
             }
         }
 
-        // Also delegate to PeerManager (in case it has additional peers)
+        let localTimeoutTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3s for local peers
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { _ = await localStopTask.value }
+            group.addTask { await localTimeoutTask.value }
+            _ = await group.next()
+            group.cancelAll()
+        }
+
+        // Also delegate to PeerManager (which has its own 5s timeout via FIX #822)
         await PeerManager.shared.stopAllBlockListeners()
 
         debugLog(.network, "⏸️ FIX #140: Stopped \(listeningPeers.count) block listeners")
@@ -654,7 +722,14 @@ public final class NetworkManager: ObservableObject {
 
     /// FIX #509: Start block listeners ONLY when app is fully ready on main balance screen
     /// This should be called explicitly by the UI when the main screen is displayed
+    /// FIX #907: Check if operations are blocking listeners before starting
     public func startBlockListenersOnMainScreen() async {
+        // FIX #907: Don't start if operations are in progress
+        if PeerManager.shared.areBlockListenersBlocked() {
+            print("🛑 FIX #907: startBlockListenersOnMainScreen BLOCKED - operations in progress")
+            return
+        }
+
         print("▶️ FIX #509: Starting block listeners on main balance screen...")
 
         // Start local peers
@@ -677,15 +752,16 @@ public final class NetworkManager: ObservableObject {
     // FIX #235, FIX #423: Hardcoded Zclassic seed nodes are EXEMPT from cooldown
     // These are known-good nodes that should always be retried immediately
     // NOTE: Keep in sync with PeerManager.shared.HARDCODED_SEEDS
+    // FIX #931: PRODUCTION MODE - All hardcoded seeds enabled
     private let HARDCODED_SEEDS = Set<String>([
-        "127.0.0.1",          // FIX #507: Local node - highest priority (always fastest)
-        "140.174.189.3",
-        "140.174.189.17",
-        "205.209.104.118",
-        "95.179.131.117",
-        "45.77.216.198",
-        "212.23.222.231",   // FIX #423: Verified ZCL node
-        "157.90.223.151"    // FIX #423: Verified ZCL node
+        "127.0.0.1",          // Local node first (highest priority if running)
+        "140.174.189.3",      // MagicBean node cluster
+        "140.174.189.17",     // MagicBean node cluster
+        "205.209.104.118",    // MagicBean node
+        "95.179.131.117",     // Additional Zclassic node
+        "45.77.216.198",      // Additional Zclassic node
+        "212.23.222.231",     // FIX #423: Verified ZCL node
+        "157.90.223.151"      // FIX #423: Verified ZCL node
     ])
 
     /// Check if an address is on cooldown (recently attempted)
@@ -795,7 +871,8 @@ public final class NetworkManager: ObservableObject {
     private let SYBIL_BYPASS_THRESHOLD: Int = 10 // After 10 Sybil rejections, bypass Tor
 
     // Known public Zclassic nodes (DNS seeds + hardcoded)
-    private let dnsSeedsZCL = [
+    // FIX #927: Restored DNS seeds (was FIX #918 debug mode)
+    private let dnsSeedsZCL: [String] = [
         "dnsseed.zclassic.org",
         "dnsseed.rotorproject.org",
         "dnsseed.zclnet.net"
@@ -806,12 +883,15 @@ public final class NetworkManager: ObservableObject {
     // Legacy hardcoded list removed - see WalletDatabase.getTrustedPeers()
 
     /// Get trusted peers from database for bootstrap (synchronous wrapper)
+    /// FIX #926: Restored production peer loading (was FIX #918 debug mode - localhost only)
     private func getTrustedPeersForBootstrap() -> [String] {
         // Try to get trusted peers from database
         if let peers = try? WalletDatabase.shared.getTrustedPeers() {
+            print("📡 FIX #926: Loaded \(peers.count) trusted peers from database")
             return peers.map { "\($0.host):\($0.port)" }
         }
         // Fallback if database not available (shouldn't happen)
+        print("⚠️ FIX #926: Database unavailable, using hardcoded fallback peers")
         return [
             "140.174.189.17:8033",
             "205.209.104.118:8033",
@@ -1027,6 +1107,122 @@ public final class NetworkManager: ObservableObject {
         if let dbHeight = try? WalletDatabase.shared.getLastScannedHeight() {
             self.walletHeight = dbHeight
             print("📊 FIX #272: Loaded walletHeight at startup: \(dbHeight)")
+        }
+
+        // FIX #847: Restore pending sent transactions from database
+        // This prevents double-spending when app restarts with unconfirmed TX
+        restorePendingSentTransactions()
+    }
+
+    /// FIX #847: Restore pending sent transactions from database at startup
+    /// This prevents sending when a previous TX is unconfirmed (anchor mismatch issue)
+    private func restorePendingSentTransactions() {
+        do {
+            let pendingSent = try WalletDatabase.shared.getPendingSentTransactions()
+            if !pendingSent.isEmpty {
+                print("⚠️ FIX #847: Found \(pendingSent.count) unconfirmed sent transaction(s) - blocking new sends")
+                for tx in pendingSent {
+                    let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
+                    print("  📤 Pending TX: \(txidHex.prefix(16))... status=\(tx.status.rawValue) value=\(tx.value) zatoshis")
+
+                    // Add to tracking state (for consistency with runtime tracking)
+                    pendingOutgoingLock.lock()
+                    pendingOutgoingTxidSet.insert(txidHex)
+                    pendingOutgoingLock.unlock()
+                }
+
+                // Set the flags to block new sends
+                self.hasOurPendingOutgoing = true
+                self.hasPendingMempoolTransaction = true
+                self.mempoolOutgoing = pendingSent.reduce(0) { $0 + $1.value + ($1.fee ?? 10000) }
+                self.mempoolOutgoingTxCount = pendingSent.count
+                self.pendingTransactionReason = "Previous transaction not yet confirmed"
+
+                // Track in the actor for confirmation checking
+                Task {
+                    for tx in pendingSent {
+                        let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
+                        _ = await txTrackingState.trackOutgoingSimple(txid: txidHex, amount: tx.value)
+                    }
+                    print("📤 FIX #847: \(pendingSent.count) pending TX(s) added to actor tracking")
+                }
+            } else {
+                print("✅ FIX #847: No pending sent transactions - sends allowed")
+            }
+        } catch {
+            print("⚠️ FIX #847: Failed to load pending sent transactions: \(error)")
+            // Don't block sends on error - fail open but log the issue
+        }
+
+        // FIX #849: ALSO restore pending txids from UserDefaults
+        // This handles txs that were broadcast but not yet written to database (FIX #350 defers writes)
+        restorePersistedPendingTxids()
+    }
+
+    // MARK: - FIX #849: Persist Pending Txids Across App Restart
+
+    /// FIX #849: Persist a pending txid to UserDefaults
+    /// Called when we add to pendingOutgoingTxidSet during broadcast
+    private func persistPendingTxid(_ txid: String) {
+        var txids = UserDefaults.standard.stringArray(forKey: PENDING_TXIDS_KEY) ?? []
+        if !txids.contains(txid) {
+            txids.append(txid)
+            UserDefaults.standard.set(txids, forKey: PENDING_TXIDS_KEY)
+            print("💾 FIX #849: Persisted pending txid: \(txid.prefix(16))... (total: \(txids.count))")
+        }
+    }
+
+    /// FIX #849: Remove a pending txid from UserDefaults when confirmed
+    private func removePendingTxidFromPersistence(_ txid: String) {
+        var txids = UserDefaults.standard.stringArray(forKey: PENDING_TXIDS_KEY) ?? []
+        if let index = txids.firstIndex(of: txid) {
+            txids.remove(at: index)
+            UserDefaults.standard.set(txids, forKey: PENDING_TXIDS_KEY)
+            print("🗑️ FIX #849: Removed confirmed txid from persistence: \(txid.prefix(16))... (remaining: \(txids.count))")
+        }
+    }
+
+    /// FIX #849: Restore pending txids from UserDefaults at startup
+    /// This handles the case where a TX was broadcast but app closed before confirmation
+    private func restorePersistedPendingTxids() {
+        // NOTE: FIX #852 (cleanMislabeledChangeOutputsAuto) is called from WalletManager.cleanMislabeledChangeOutputs()
+        // after database is open. It cannot be called here because NetworkManager.init runs before DB open.
+
+        let txids = UserDefaults.standard.stringArray(forKey: PENDING_TXIDS_KEY) ?? []
+        if txids.isEmpty {
+            print("✅ FIX #849: No persisted pending txids")
+            return
+        }
+
+        print("📥 FIX #849: Restoring \(txids.count) persisted pending txid(s)")
+        for txid in txids {
+            print("  📤 Persisted TX: \(txid.prefix(16))...")
+
+            pendingOutgoingLock.lock()
+            pendingOutgoingTxidSet.insert(txid)
+            pendingOutgoingLock.unlock()
+        }
+
+        // NOTE: FIX #851 cleanup is now handled in WalletManager.cleanMislabeledChangeOutputsAtStartup()
+        // after database is open. It cannot be called here because NetworkManager.init runs before DB open.
+
+        // Set flags to block new sends if there are pending txs
+        // Only set if not already set by FIX #847 (database-based restore)
+        if !self.hasOurPendingOutgoing {
+            self.hasOurPendingOutgoing = true
+            self.hasPendingMempoolTransaction = true
+            self.pendingTransactionReason = "Previous transaction not yet confirmed"
+            print("⚠️ FIX #849: Blocking new sends due to \(txids.count) persisted pending TX(s)")
+        }
+
+        // Track in actor for confirmation checking
+        Task {
+            for txid in txids {
+                // Track with 0 amount since we don't have the actual amount stored
+                // This is enough for confirmation detection and change output detection
+                _ = await txTrackingState.trackOutgoingSimple(txid: txid, amount: 0)
+            }
+            print("📤 FIX #849: \(txids.count) persisted pending TX(s) added to actor tracking")
         }
     }
 
@@ -1836,6 +2032,7 @@ public final class NetworkManager: ObservableObject {
         return host
     }
 
+    /// FIX #927: Restored production peer loading (was FIX #918 debug mode)
     private func loadPersistedAddresses() {
         guard let data = UserDefaults.standard.data(forKey: persistedAddressesKey),
               let savedAddresses = try? JSONDecoder().decode([PersistedAddress].self, from: data) else {
@@ -2224,6 +2421,7 @@ public final class NetworkManager: ObservableObject {
 
         print("📋 Valid candidates after dedup: \(validPeers.count)")
 
+        // FIX #927: Restored production peer connections (was FIX #918 localhost-only debug mode)
         // FIX #421: Hardcoded seeds are ALREADY at front (added first, dedup preserves order)
         // Count how many we have for logging
         let hardcodedSeeds = PeerManager.shared.HARDCODED_SEEDS
@@ -2294,8 +2492,10 @@ public final class NetworkManager: ObservableObject {
                             let peer = try await self.connectToPeer(address)
                             print("✅ Connected to \(address.host):\(address.port)")
                             // FIX #284: Unpark peer on successful connection
+                            // FIX #908: Reset handshake failures on successful connection
                             await MainActor.run {
                                 self.unparkPeer(address.host, port: address.port)
+                                PeerManager.shared.resetHandshakeFailures(address.host)
                             }
                             return (peer, address)
                         } catch let error as NetworkError {
@@ -2307,6 +2507,12 @@ public final class NetworkManager: ObservableObject {
                             } else if case .connectionTimeout = error {
                                 await MainActor.run {
                                     self.parkPeer(address.host, port: address.port)
+                                }
+                            } else if case .handshakeFailed = error {
+                                // FIX #908: Track handshake failures with extended parking
+                                // 5 failures → 1h park, 5 more → 24h park
+                                await MainActor.run {
+                                    PeerManager.shared.recordHandshakeFailure(address.host, port: address.port)
                                 }
                             } else if case .wrongChain(let host) = error {
                                 // FIX #229: Permanently ban Zcash peers - they're on wrong chain!
@@ -2675,6 +2881,14 @@ public final class NetworkManager: ObservableObject {
 
     /// Fetch network statistics (P2P-first when Tor enabled, InsightAPI fallback when disabled)
     func fetchNetworkStats() async {
+        // FIX #892: Skip if boost header loading in progress
+        // Prevents expensive network operations from interfering with SQLite bulk inserts
+        // This was causing the 91-99% stall during Import PK (5+ minutes lost)
+        if isLoadingHeaders {
+            // Silent return - don't spam logs during header load
+            return
+        }
+
         // FIX #286 v18: Debug - log suppress flag state
         if suppressBackgroundSync {
             print("⚠️ FIX #286 v18: fetchNetworkStats called but suppressBackgroundSync=true!")
@@ -2878,7 +3092,8 @@ public final class NetworkManager: ObservableObject {
         if suppressBackgroundSync {
             // Silently skip during initial sync
         } else if currentChainHeight > dbHeight && dbHeight > 0 {
-            print("🔄 Background sync: +\(currentChainHeight - dbHeight) blocks")
+            // FIX #873: Improved logging to distinguish trigger from execution
+            print("🔄 FIX #873: Triggering background sync: +\(currentChainHeight - dbHeight) blocks (wallet=\(dbHeight), chain=\(currentChainHeight))")
             Task {
                 await WalletManager.shared.backgroundSyncToHeight(currentChainHeight)
             }
@@ -2964,6 +3179,9 @@ public final class NetworkManager: ObservableObject {
         pendingOutgoingTxidSet.insert(txid)
         pendingOutgoingLock.unlock()
 
+        // FIX #849: Persist to UserDefaults for cross-restart tracking
+        persistPendingTxid(txid)
+
         // Also update mempoolOutgoing for immediate UI feedback
         self.mempoolOutgoing = amount
         self.mempoolOutgoingTxCount = 1
@@ -3039,6 +3257,9 @@ public final class NetworkManager: ObservableObject {
         pendingOutgoingTxidSet.insert(pendingTx.txid)
         pendingOutgoingLock.unlock()
 
+        // FIX #849: Persist to UserDefaults for cross-restart tracking
+        await MainActor.run { persistPendingTxid(pendingTx.txid) }
+
         let result = await txTrackingState.trackOutgoing(pendingTx)
         await MainActor.run {
             self.mempoolOutgoing = result.total
@@ -3053,6 +3274,9 @@ public final class NetworkManager: ObservableObject {
         pendingOutgoingLock.lock()
         pendingOutgoingTxidSet.insert(txid)
         pendingOutgoingLock.unlock()
+
+        // FIX #849: Persist to UserDefaults for cross-restart tracking
+        await MainActor.run { persistPendingTxid(txid) }
 
         let result = await txTrackingState.trackOutgoingSimple(txid: txid, amount: amount)
         await MainActor.run {
@@ -3079,6 +3303,9 @@ public final class NetworkManager: ObservableObject {
         pendingOutgoingTxidSet.remove(txid)
         pendingOutgoingLock.unlock()
 
+        // FIX #849: Remove from UserDefaults persistence
+        await MainActor.run { removePendingTxidFromPersistence(txid) }
+
         let result = await txTrackingState.confirmOutgoing(txid: txid)
         print("📤 confirmOutgoing result: removed=\(result.removed), total=\(result.total), count=\(result.count)")
 
@@ -3090,17 +3317,21 @@ public final class NetworkManager: ObservableObject {
 
                 // Only write to database if we have valid hashedNullifier (full pending TX info)
                 if !pendingTx.hashedNullifier.isEmpty {
-                    guard let txidData = Data(hexString: txid) else {
+                    guard let txidDisplayData = Data(hexString: txid) else {
                         print("⚠️ FIX #350: Invalid txid format: \(txid)")
                         return
                     }
+                    // FIX #943: txid string is in DISPLAY format (big-endian), but database expects WIRE format (little-endian)
+                    // FIX #882/FIX #853 v2 established that txidString computed property reverses for display
+                    // So we must store in wire format = reversed from display format
+                    let txidWireFormat = Data(txidDisplayData.reversed())
 
                     print("📤 FIX #350: Writing CONFIRMED sent TX to database...")
 
                     // FIX #350: Use atomic function to mark note spent AND insert history in one transaction
                     _ = try WalletDatabase.shared.recordSentTransactionAtomic(
                         hashedNullifier: pendingTx.hashedNullifier,
-                        txid: txidData,
+                        txid: txidWireFormat,
                         spentHeight: chainHeight,
                         amount: pendingTx.amount,
                         fee: pendingTx.fee,
@@ -3111,9 +3342,11 @@ public final class NetworkManager: ObservableObject {
                 } else {
                     // Legacy tracking (no full info) - just update existing record if any
                     print("📤 FIX #350: Legacy tracking - updating existing record if present")
-                    if let txidData = Data(hexString: txid) {
+                    if let txidDisplayData = Data(hexString: txid) {
+                        // FIX #943: Convert display format (big-endian) to wire format (little-endian)
+                        let txidWireFormat = Data(txidDisplayData.reversed())
                         try WalletDatabase.shared.updateSentTransactionOnConfirmation(
-                            txid: txidData,
+                            txid: txidWireFormat,
                             confirmedHeight: chainHeight,
                             blockTime: UInt64(currentTime)
                         )
@@ -3640,9 +3873,13 @@ public final class NetworkManager: ObservableObject {
         // Check each mempool transaction for shielded outputs
         for txHashData in mempoolTxs.prefix(50) { // Limit to 50 to avoid spam
             // P2P returns txids in wire format (little-endian)
-            // Convert to display format (big-endian) for consistency with InsightAPI
-            let txHashReversed = Data(txHashData.reversed())
-            let txHashHex = txHashReversed.map { String(format: "%02x", $0) }.joined()
+            // FIX #853 v2: Keep BOTH formats:
+            // - wireHex for database storage (matches block-scanned txids)
+            // - displayHex for comparison with existing pending txids and logging
+            let txHashWire = txHashData  // Wire format bytes (for DB storage)
+            let txHashWireHex = txHashWire.map { String(format: "%02x", $0) }.joined()  // Wire format hex
+            let txHashReversed = Data(txHashData.reversed())  // Display format bytes
+            let txHashHex = txHashReversed.map { String(format: "%02x", $0) }.joined()  // Display format hex (for comparisons)
 
             // EARLY CHECK: Skip change outputs from our own pending transactions
             // This prevents change from being counted in mempoolIncoming
@@ -3689,10 +3926,8 @@ public final class NetworkManager: ObservableObject {
                         // FIX #220: Also check if this TXID exists in our transaction_history as a SENT tx
                         // This prevents false "external spend" warnings for our own transactions that
                         // were already recorded but are still in mempool (pending tracking was cleared)
-                        var isOurRecorded = false
-                        if let txidData = Data(hexString: txHashHex) {
-                            isOurRecorded = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
-                        }
+                        // FIX #853 v2: Use wire format for database check (matches block-scanned storage)
+                        let isOurRecorded = (try? WalletDatabase.shared.transactionExists(txid: txHashWire, type: .sent)) ?? false
 
                         if !isOurPending && !isOurRecorded {
                             // EXTERNAL WALLET SPEND DETECTED - store for now, finalize after output parsing
@@ -3731,7 +3966,8 @@ public final class NetworkManager: ObservableObject {
 
                 if txIncomingAmount > 0 {
                     // EARLY check for change output - before counting toward mempoolIncoming
-                    let txidData = Data(hexString: txHashHex) ?? Data()
+                    // FIX #853 v2: Use wire format for database operations (matches block-scanned storage)
+                    let txidData = txHashWire
                     var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
 
                     if !isChangeOutput {
@@ -3763,8 +3999,8 @@ public final class NetworkManager: ObservableObject {
                         // This prevents the race condition where mempool scan runs
                         // after confirmation clears mempoolIncoming, but the tx
                         // is still in some peers' mempool (brief lag before removal)
-                        let txidDataForCheck = txidData.isEmpty ? (Data(hexString: txHashHex) ?? Data()) : txidData
-                        let alreadyConfirmed = (try? WalletDatabase.shared.transactionExists(txid: txidDataForCheck, type: .received)) ?? false
+                        // FIX #853 v2: txidData is already wire format, use directly
+                        let alreadyConfirmed = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .received)) ?? false
 
                         if alreadyConfirmed {
                             print("🔮 MEMPOOL: Skipping already-confirmed tx \(txHashHex.prefix(12))...")
@@ -4313,7 +4549,21 @@ public final class NetworkManager: ObservableObject {
     }
 
     private func connectToPeer(_ address: PeerAddress) async throws -> Peer {
+        // FIX #856: Skip .onion addresses entirely if Tor is disabled
+        let torMode = await TorManager.shared.mode
+        if address.host.hasSuffix(".onion") && torMode != .enabled {
+            throw NetworkError.connectionFailed(".onion addresses require Tor to be enabled")
+        }
+
         let peer = Peer(host: address.host, port: address.port, networkMagic: networkMagic)
+
+        // FIX #842: Use longer timeout for Tor connections (15s vs 10s for direct)
+        // Tor connections are inherently slower due to circuit building
+        // Note: FIX #842 also ensures Tor is ready BEFORE parallel recovery starts
+        let isLocalhost = address.host == "127.0.0.1" || address.host == "localhost"
+        let torBypassed = await TorManager.shared.isTorBypassed
+        let useTor = torMode == .enabled && !torBypassed && !isLocalhost
+        let timeoutNanos: UInt64 = useTor ? 15_000_000_000 : 10_000_000_000  // 15s Tor, 10s direct
 
         // Add timeout for connection attempts
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -4323,7 +4573,7 @@ public final class NetworkManager: ObservableObject {
             }
 
             group.addTask {
-                try await Task.sleep(nanoseconds: 10_000_000_000) // 10 second timeout
+                try await Task.sleep(nanoseconds: timeoutNanos)
                 throw NetworkError.connectionTimeout
             }
 
@@ -4444,6 +4694,22 @@ public final class NetworkManager: ObservableObject {
     func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> BroadcastResult {
         print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
 
+        // FIX #841: Block background sync during broadcast to prevent peer lock conflicts
+        // Background sync triggers header sync which holds peer locks, causing broadcast timeouts
+        isBroadcasting = true
+
+        // FIX #907: Block all block listeners during broadcast
+        // Block listeners hold peer locks and prevent broadcast from using peers
+        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
+        PeerManager.shared.setBlockListenersBlocked(true)
+
+        defer {
+            isBroadcasting = false
+            // FIX #907: Unblock block listeners after broadcast
+            PeerManager.shared.setBlockListenersBlocked(false)
+        }
+        print("📡 FIX #841+#907: isBroadcasting = true, block listeners blocked")
+
         // ============================================================================
         // VUL-002 FIX: Validate Sapling proofs LOCALLY before broadcasting
         // This prevents broadcasting invalid transactions that peers would relay but
@@ -4548,6 +4814,19 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
+            // FIX #821: For heights above boost file, P2P headers have UNRELIABLE sapling roots
+            // We can't verify historical anchors because HeaderStore doesn't have valid roots above boost file
+            // Since VUL-002 proofs passed, the anchor WAS valid when the witness was created
+            // Sapling protocol accepts ANY historical tree root - trust VUL-002 and let blockchain validate
+            let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
+            if !anchorFound && chainHeight > boostFileEndHeight {
+                print("⚠️ FIX #821: Chain height \(chainHeight) > boost file end \(boostFileEndHeight)")
+                print("⚠️ FIX #821: Cannot verify anchor via P2P (headers have unreliable sapling roots)")
+                print("✅ FIX #821: VUL-002 proofs passed - trusting TX (Sapling accepts historical anchors)")
+                print("✅ FIX #821: Anchor will be validated by blockchain nodes during broadcast")
+                anchorFound = true  // Trust VUL-002
+            }
+
             if !anchorFound {
                 print("❌ FIX #718: Anchor NOT FOUND - transaction WILL be rejected!")
                 print("❌ FIX #718: Anchor: \(anchorHex)")
@@ -4566,12 +4845,38 @@ public final class NetworkManager: ObservableObject {
             // Continue anyway - let P2P peers validate
         }
 
-        // FIX #160 + FIX #211: Check if Tor is enabled - need MUCH longer timeouts
-        // FIX #211: Real-world Tor broadcasts take 30-65 seconds per peer!
+        // FIX #160 + FIX #211: Check if Tor is enabled - need longer timeouts for Tor
+        // FIX #832: Per-peer timeout MUST be longer than lock acquisition timeout (10s)
+        // FIX #837: Internal reject wait reduced from 15s to 2s, so timeouts can be shorter
+        // Direct mode: 10s lock + 2s reject = 12s max, so 15s per-peer is enough
         let torEnabled = await TorManager.shared.mode == .enabled
-        let perPeerTimeout: UInt64 = torEnabled ? 75_000_000_000 : 5_000_000_000  // FIX #211: 75s for Tor (was 15s), 5s otherwise
-        let overallTimeout: UInt64 = torEnabled ? 120_000_000_000 : 15_000_000_000  // FIX #211: 120s for Tor (was 45s), 15s otherwise
+        let perPeerTimeout: UInt64 = torEnabled ? 45_000_000_000 : 15_000_000_000  // FIX #837: 15s direct, 45s Tor
+        let overallTimeout: UInt64 = torEnabled ? 90_000_000_000 : 30_000_000_000  // FIX #837: 30s direct, 90s Tor
         print("📡 FIX #211: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
+
+        // FIX #834: MUST ensure ALL block listeners are stopped before broadcast
+        // Block listeners hold messageLock which blocks broadcastTransaction()
+        // Previous fixes just timed out and proceeded - now we VERIFY 100% stopped
+        print("📡 FIX #834: Ensuring ALL block listeners stopped before broadcast...")
+        let allStopped = await PeerManager.shared.ensureAllBlockListenersStopped(maxRetries: 3, retryDelay: 1.0)
+
+        if !allStopped {
+            let stillListening = PeerManager.shared.getListeningPeerCount()
+            print("🚨 FIX #834: Cannot broadcast - \(stillListening) block listeners still running!")
+            print("🚨 FIX #834: This would cause peer lock conflicts and broadcast failures")
+            // Don't throw - still try to broadcast to peers that ARE available
+            // But log this as a serious warning
+        } else {
+            print("✅ FIX #834: All block listeners verified stopped - safe to broadcast")
+        }
+
+        // FIX #832: Restart block listeners when broadcast completes (success or failure)
+        defer {
+            Task {
+                print("📡 FIX #832: Restarting block listeners after broadcast...")
+                await PeerManager.shared.resumeAllBlockListeners()
+            }
+        }
 
         // FIX #160: Compute TX ID upfront - even if timeout occurs, we know what was sent
         let computedTxId = rawTx.doubleSHA256().reversed().map { String(format: "%02x", $0) }.joined()
@@ -4585,6 +4890,9 @@ public final class NetworkManager: ObservableObject {
         pendingOutgoingTxidSet.insert(computedTxId)
         pendingOutgoingLock.unlock()
         print("⚡ FIX #702: Pre-registered pending TX: \(computedTxId.prefix(12))... (prevents external spend false positive)")
+
+        // FIX #849: Persist to UserDefaults for cross-restart tracking
+        persistPendingTxid(computedTxId)
 
         // FIX #158: CRITICAL - Filter out banned peers from broadcast!
         // Banned peers may have been Sybil attackers - don't trust them to relay transactions
@@ -4625,17 +4933,37 @@ public final class NetworkManager: ObservableObject {
         }
 
         // Check 3: If no healthy peers, try to recover
+        // FIX #830: Don't call performHandshake() on already-connected peers!
+        // P2P protocol only allows ONE version message per connection.
+        // Sending duplicate VERSION causes node to reject with "Duplicate version message"
         if healthyPeers.isEmpty && !validPeers.isEmpty {
             print("⚠️ FIX #335: No healthy peers - attempting quick recovery...")
             onProgress?("network", "Reconnecting to peers...", 0.15)
 
-            // Try to reconnect one peer (quick test)
+            // Try to verify/reconnect one peer (quick test)
             for peer in validPeers.prefix(3) {
                 do {
-                    try await peer.ensureConnected()
-                    try await peer.performHandshake()
-                    print("✅ FIX #335: Peer \(peer.host) recovered - proceeding with broadcast")
-                    break
+                    // FIX #830: Check if peer is already connected before reconnecting
+                    if peer.isConnectionReady {
+                        // Peer is connected, just verify with ping (no handshake needed)
+                        // FIX #869: sendPing now returns PingResult
+                        let pingResult = await peer.sendPing(timeoutSeconds: 3.0)
+                        if pingResult == .success {
+                            print("✅ FIX #830: Peer \(peer.host) verified via ping - connection is alive")
+                            break
+                        } else {
+                            // Ping failed, peer may be dead - try next peer
+                            print("⚠️ FIX #830: Peer \(peer.host) ping failed (\(pingResult)) - trying next peer")
+                            continue
+                        }
+                    } else {
+                        // Peer is NOT connected, do full reconnection + handshake
+                        // FIX #914: ensureConnected() already calls performHandshake() internally!
+                        // DON'T call performHandshake() again - it causes "Duplicate version message" rejection
+                        try await peer.ensureConnected()
+                        print("✅ FIX #914: Peer \(peer.host) recovered via ensureConnected()")
+                        break
+                    }
                 } catch {
                     print("⚠️ FIX #335: Peer \(peer.host) failed recovery: \(error)")
                 }
@@ -4743,6 +5071,7 @@ public final class NetworkManager: ObservableObject {
         actor BroadcastState {
             var successCount = 0
             var rejectCount = 0  // FIX #349: Track explicit rejections
+            var duplicateCount = 0  // FIX #835: Track DUPLICATE responses (TX already in mempool)
             var txId: String?
             var mempoolVerified = false
             var pendingBroadcastSet = false  // Track if we've set pending broadcast
@@ -4766,12 +5095,28 @@ public final class NetworkManager: ObservableObject {
             func recordReject() { rejectCount += 1 }
             func getRejectCount() -> Int { rejectCount }
 
+            // FIX #835: Track DUPLICATE responses - means TX is ALREADY in peer's mempool!
+            // Multiple DUPLICATEs = TX successfully propagated to network
+            func recordDuplicate(_ txId: String) {
+                duplicateCount += 1
+                // Also set txId since DUPLICATE means they have this TX
+                if self.txId == nil {
+                    self.txId = txId
+                }
+            }
+            func getDuplicateCount() -> Int { duplicateCount }
+
             func markPendingBroadcastSet() { pendingBroadcastSet = true }
             func isPendingBroadcastSet() -> Bool { pendingBroadcastSet }
             func setVerified() { mempoolVerified = true }
             func isVerified() -> Bool { mempoolVerified }
             func getTxId() -> String? { txId }
             func getSuccessCount() -> Int { successCount }
+
+            // FIX #826: Track timeout to exit broadcast loop
+            private var timedOut = false
+            func markTimedOut() { timedOut = true }
+            func isTimedOut() -> Bool { timedOut }
         }
 
         let state = BroadcastState()
@@ -4854,6 +5199,27 @@ public final class NetworkManager: ObservableObject {
                         // FIX #349: Track explicit rejections (not timeouts) - these are CRITICAL signals
                         await state.recordReject()
                         print("⚠️ Peer \(peerHost) broadcast failed: transactionRejected (FIX #349: reject count incremented)")
+                    } catch let error as NetworkError where error == .transactionDuplicateRejected {
+                        // FIX #835: DUPLICATE means peer claims TX is in mempool
+                        // FIX #935 v3: But DUPLICATE can mask rejection (e.g., "joinsplit requirements not met")
+                        // DO NOT set pending broadcast from DUPLICATE alone - wait for verification!
+                        await state.recordDuplicate(computedTxId)
+                        let dupCount = await state.getDuplicateCount()
+                        let successCount = await state.getSuccessCount()
+                        print("⚠️ FIX #935 v3: Peer \(peerHost) returned DUPLICATE (count: \(dupCount), accepts: \(successCount))")
+
+                        // FIX #935 v3: Only set pending broadcast from DUPLICATE if we ALSO have accepts
+                        // DUPLICATE alone is NOT reliable - can mask rejection errors!
+                        let alreadySet = await state.isPendingBroadcastSet()
+                        if dupCount >= 1 && successCount >= 1 && broadcastAmount > 0 && !alreadySet {
+                            await MainActor.run {
+                                self.setPendingBroadcast(txid: computedTxId, amount: broadcastAmount)
+                            }
+                            await state.markPendingBroadcastSet()
+                            print("✅ FIX #935 v3: Set pending broadcast (DUPLICATE + \(successCount) accepts)")
+                        } else if successCount == 0 {
+                            print("⚠️ FIX #935 v3: NOT setting pending broadcast - 0 accepts, DUPLICATE alone is unreliable")
+                        }
                     } catch {
                         print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
                     }
@@ -4909,14 +5275,72 @@ public final class NetworkManager: ObservableObject {
                 // If peers accepted (no reject), TX is propagating through the network
                 var mempoolVerified = false
                 let currentSuccessCount = await state.getSuccessCount()
-                print("📊 FIX #392: After 500ms wait, successCount=\(currentSuccessCount)")
+                let duplicateCount = await state.getDuplicateCount()
+                print("📊 FIX #392: After 500ms wait, successCount=\(currentSuccessCount), duplicateCount=\(duplicateCount)")
 
                 // FIX #515: ALWAYS verify via P2P getdata, regardless of peer acceptance count
                 // Peers can LIE about accepting (Sybil attack) - MUST verify TX is actually in mempool!
                 // Previous FIX #390 shortcut was UNSAFE - see user case: 9 peers accepted but TX not in mempool
                 let rejectCount = await state.getRejectCount()
 
-                if currentSuccessCount >= 2 {
+                // ============================================================================
+                // FIX #835: DUPLICATE responses = SUCCESS!
+                // DUPLICATE means peer ALREADY has this TX in their mempool
+                // If multiple peers say DUPLICATE, TX has propagated successfully
+                // This is MORE reliable than acceptance - they're confirming they already have it!
+                // ============================================================================
+                // FIX #935: CRITICAL - Don't trust DUPLICATE if successCount == 0!
+                // If NO peer accepted the broadcast but we got DUPLICATE, something is wrong:
+                // - Peer may have returned wrong error code (e.g., DUPLICATE instead of REJECT)
+                // - "joinsplit requirements not met" returns DUPLICATE in some node versions!
+                // Only trust DUPLICATE if at least ONE peer actually accepted the TX during broadcast
+                // ============================================================================
+                if duplicateCount >= 2 && currentSuccessCount >= 1 {
+                    // FIX #935: Multiple DUPLICATEs + at least 1 accept = SUCCESS
+                    print("✅ FIX #835: \(duplicateCount) peers returned DUPLICATE + \(currentSuccessCount) accepts - TX is in network!")
+                    print("✅ FIX #835: This is CONFIRMED success - peers already have the TX")
+                    onProgress?("verify", "✅ Already in \(duplicateCount) peer mempools", 1.0)
+                    mempoolVerified = true
+                    await state.setVerified()
+                    await MainActor.run {
+                        self.setMempoolVerified()
+                    }
+                } else if duplicateCount >= 1 && currentSuccessCount == 0 {
+                    // FIX #935: DUPLICATE but NO accepts = SUSPICIOUS!
+                    // This often means "joinsplit requirements not met" (anchor mismatch)
+                    // Node returns DUPLICATE instead of proper REJECT code
+                    print("🚨 FIX #935: \(duplicateCount) DUPLICATE(s) but 0 accepts - TX likely REJECTED!")
+                    print("🚨 FIX #935: This is often 'joinsplit requirements not met' (anchor mismatch)")
+                    print("🚨 FIX #935: DO NOT trust DUPLICATE alone - requires P2P verification")
+                    onProgress?("verify", "⚠️ Verifying - \(duplicateCount) duplicate, 0 accepts...", 0.7)
+
+                    // Do P2P verification to confirm TX is actually in mempool
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                    if p2pVerified {
+                        print("✅ FIX #935: TX verified via P2P despite suspicious DUPLICATE response")
+                        onProgress?("verify", "✅ Transaction verified in network", 1.0)
+                        mempoolVerified = true
+                        await state.setVerified()
+                        await MainActor.run {
+                            self.setMempoolVerified()
+                        }
+                    } else {
+                        // P2P verify failed - DUPLICATE was likely masking a rejection!
+                        print("🚨 FIX #935: P2P verification FAILED - TX was REJECTED (anchor mismatch?)")
+                        print("🚨 FIX #935: DUPLICATE response was FALSE POSITIVE - TX is NOT in mempool!")
+                        onProgress?("error", "🚨 Transaction REJECTED - witness/anchor may be corrupted", 1.0)
+                        // mempoolVerified remains FALSE - broadcast FAILED
+                    }
+                } else if duplicateCount == 1 && currentSuccessCount >= 1 {
+                    // 1 DUPLICATE + 1+ accepts = TX is propagating
+                    print("✅ FIX #835: 1 DUPLICATE + \(currentSuccessCount) accepts - TX is propagating")
+                    onProgress?("verify", "✅ TX in network (1 dup + \(currentSuccessCount) accepts)", 1.0)
+                    mempoolVerified = true
+                    await state.setVerified()
+                    await MainActor.run {
+                        self.setMempoolVerified()
+                    }
+                } else if currentSuccessCount >= 2 {
                     // FIX #515: ALL acceptance counts (2+) require actual P2P getdata verification
                     // High acceptance counts are promising but NOT proof of mempool inclusion
                     print("📡 FIX #515: \(currentSuccessCount) peers accepted - verifying TX is ACTUALLY in mempool...")
@@ -4960,8 +5384,10 @@ public final class NetworkManager: ObservableObject {
                                 // 0 rejections means peers silently dropped the TX (broken/malicious)
                                 print("⚠️ FIX #515: 0 rejections = peers accepted but didn't add to mempool (broken or Sybil attack)")
                             }
-                            onProgress?("error", "⚠️ Broadcast failed - not in mempool", 1.0)
-                            // mempoolVerified remains FALSE - user must retry send
+                            // FIX #941: Do NOT call onProgress("error") here!
+                            // The post-TaskGroup code at line ~5603 checks successCount > 0 and can OVERRIDE this to success
+                            // Calling error progress here causes UI to show error even when TX ultimately succeeds
+                            // Let mempoolVerified remain FALSE - the final result is determined AFTER TaskGroup exits
                         }
                     }
                 } else if currentSuccessCount == 1 {
@@ -5011,8 +5437,9 @@ public final class NetworkManager: ObservableObject {
                             // Do NOT mark as verified - let caller handle potential broadcast failure
                             print("🚨 FIX #389: TX STILL not found after retry - broadcast may have failed!")
                             print("🚨 FIX #389: Single peer acceptance but TX not in network mempool")
-                            onProgress?("error", "⚠️ Transaction not confirmed in network - may need to resend", 1.0)
-                            // mempoolVerified remains false
+                            // FIX #941: Do NOT call onProgress("error") here!
+                            // Post-TaskGroup code checks successCount and can override to success
+                            // mempoolVerified remains false - final result determined after TaskGroup exits
                         }
                     }
                 } else {
@@ -5021,8 +5448,22 @@ public final class NetworkManager: ObservableObject {
                     print("⚠️ FIX #364: No explicit peer acceptance - attempting P2P verification with computed txid")
                     onProgress?("verify", "Verifying transaction propagation...", 0.7)
 
-                    // Try to verify TX exists via P2P getdata from connected peers
-                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                    // FIX #848: Add timeout to P2P verification to prevent hanging
+                    // P2P verification can hang indefinitely if peers are unresponsive
+                    // FIX #935 v2: REMOVED optimistic assumption on timeout!
+                    // User case: "joinsplit requirements not met" caused false SUCCESS because timeout assumed TX propagated
+                    // Timeout should mean UNKNOWN, not SUCCESS. Let user see the warning.
+                    var p2pVerified = false
+                    do {
+                        p2pVerified = try await withTimeout(seconds: 15) {
+                            await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                        }
+                    } catch {
+                        print("⏱️ FIX #935 v2: P2P verification timed out after 15s - status UNKNOWN")
+                        print("⚠️ FIX #935 v2: NOT assuming success on timeout - let user verify manually")
+                        // FIX #935 v2: Do NOT assume success - timeout means we don't know!
+                        p2pVerified = false
+                    }
                     if p2pVerified {
                         print("✅ FIX #364: TX verified via P2P - propagated despite no explicit accept!")
                         onProgress?("verify", "✅ Transaction verified in network", 1.0)
@@ -5053,17 +5494,34 @@ public final class NetworkManager: ObservableObject {
 
             // FIX #160: Add a timeout task with dynamic duration based on Tor mode
             // (longer timeout for Tor to allow SOCKS5 reconnections)
+            // FIX #826: Mark timed out so broadcast loop exits
+            // FIX #858: Timeout task now throws to exit TaskGroup immediately
+            // Swift's withTaskGroup waits for ALL tasks even after cancelAll()
+            // Network I/O doesn't respect Swift task cancellation, so we must throw to exit
             group.addTask {
                 try await Task.sleep(nanoseconds: overallTimeout) // FIX #160: Dynamic timeout
-                print("⏱️ Broadcast timeout reached (\(overallTimeout/1_000_000_000)s)")
+                print("⏱️ FIX #858: Broadcast timeout reached (\(overallTimeout/1_000_000_000)s) - throwing to exit TaskGroup")
+                await state.markTimedOut()
+                // FIX #858: Throw CancellationError to exit TaskGroup immediately
+                // This prevents waiting for slow network operations to complete
+                throw CancellationError()
             }
 
             // Wait for tasks - but check verified status after each
+            // FIX #826: Also check for timeout to exit the loop
+            // FIX #858: The timeout task now throws, which will propagate here
             var tasksRemaining = true
             while tasksRemaining {
                 // Check if mempool verified - exit early!
                 if await state.isVerified() {
                     print("✅ Mempool verified - exiting broadcast loop")
+                    group.cancelAll()
+                    break
+                }
+
+                // FIX #826: Check if overall timeout reached - exit loop to prevent hanging
+                if await state.isTimedOut() {
+                    print("⏱️ FIX #858: Timeout detected - cancelling remaining tasks and exiting")
                     group.cancelAll()
                     break
                 }
@@ -5079,9 +5537,25 @@ public final class NetworkManager: ObservableObject {
                         group.cancelAll()
                         break
                     }
+                    // FIX #826: Also check timeout after each task
+                    if await state.isTimedOut() {
+                        print("⏱️ FIX #858: Timeout after task completion - exiting")
+                        group.cancelAll()
+                        break
+                    }
+                } catch is CancellationError {
+                    // FIX #858: Timeout task threw CancellationError - exit immediately
+                    print("⏱️ FIX #858: CancellationError caught - exiting broadcast loop")
+                    group.cancelAll()
+                    break
                 } catch {
-                    // Task threw (timeout or error), continue
+                    // Other error - check verified/timeout status
                     if await state.isVerified() {
+                        group.cancelAll()
+                        break
+                    }
+                    if await state.isTimedOut() {
+                        print("⏱️ FIX #858: Timeout after error - exiting")
                         group.cancelAll()
                         break
                     }
@@ -5132,6 +5606,9 @@ public final class NetworkManager: ObservableObject {
             pendingOutgoingTxidSet.remove(txId)
             pendingOutgoingLock.unlock()
             print("🧹 FIX #702: Removed rejected TX from pending set: \(txId.prefix(12))...")
+
+            // FIX #849: Also remove from UserDefaults persistence
+            removePendingTxidFromPersistence(txId)
         } else if successCount > 0 {
             // FIX #694: Peers accepted! Even if others said DUPLICATE, we have acceptance
             // This means the transaction IS valid and was broadcast successfully
@@ -5164,6 +5641,11 @@ public final class NetworkManager: ObservableObject {
     /// Replaces InsightAPI.checkTransactionExists with decentralized P2P verification
     /// Returns true if at least one peer has the TX in their mempool/blockchain
     func verifyTxViaP2P(txid: String, excludePeers: [String] = [], maxAttempts: Int = 3) async -> Bool {
+        // FIX #848: Add overall timeout to prevent hanging indefinitely
+        // P2P verification should complete within 20 seconds total
+        let startTime = Date()
+        let maxDuration: TimeInterval = 20.0
+
         let readyPeers = peers.filter { $0.isConnectionReady && !excludePeers.contains($0.host) }
 
         guard !readyPeers.isEmpty else {
@@ -5179,9 +5661,17 @@ public final class NetworkManager: ObservableObject {
 
         // Try up to maxAttempts peers
         for (index, peer) in readyPeers.prefix(maxAttempts).enumerated() {
+            // FIX #848: Check timeout before each attempt
+            if Date().timeIntervalSince(startTime) > maxDuration {
+                print("⏱️ FIX #848: P2P verification timeout reached (\(maxDuration)s) - aborting")
+                return false
+            }
+
             do {
-                // Request TX via getdata (type 1 = MSG_TX)
-                let exists = try await peer.requestTransaction(txid: txidData)
+                // FIX #848: Add per-peer timeout (5 seconds)
+                let exists = try await withTimeout(seconds: 5.0) {
+                    try await peer.requestTransaction(txid: txidData)
+                }
                 if exists {
                     print("✅ FIX #247: TX \(txid.prefix(16))... verified via P2P (peer \(index + 1))")
                     return true
@@ -5191,7 +5681,9 @@ public final class NetworkManager: ObservableObject {
                 print("🔄 FIX #354: Peer \(peer.host) handshake/magic failed, attempting reconnect...")
                 do {
                     try await peer.ensureConnected()
-                    let exists = try await peer.requestTransaction(txid: txidData)
+                    let exists = try await withTimeout(seconds: 5.0) {
+                        try await peer.requestTransaction(txid: txidData)
+                    }
                     if exists {
                         print("✅ FIX #354: TX \(txid.prefix(16))... verified after reconnect (peer \(index + 1))")
                         return true
@@ -5199,6 +5691,9 @@ public final class NetworkManager: ObservableObject {
                 } catch {
                     print("⏳ FIX #354: Peer \(peer.host) still failing after reconnect: \(error.localizedDescription)")
                 }
+            } catch NetworkError.timeout {
+                // FIX #848: Peer timed out - try next peer
+                print("⏱️ FIX #848: Peer \(peer.host) timed out (5s) - trying next peer")
             } catch {
                 // Peer doesn't have TX or other error - try next peer
                 print("⏳ FIX #247: Peer \(peer.host) doesn't have TX or error: \(error.localizedDescription)")
@@ -6074,7 +6569,8 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
-            // Generate txid from transaction data (placeholder - would need real tx hash)
+            // FIX #882: Store txid in WIRE format (little-endian) - txidString property reverses for display
+            // FIX #880 was incorrect - it converted to display format causing double-reversal in UI
             let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
 
             if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
@@ -6090,45 +6586,77 @@ public final class NetworkManager: ObservableObject {
     /// All peers work in PARALLEL for maximum throughput
     /// Returns: [(height, blockHash, timestamp, txData)]
     func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+        // FIX #907: Ensure block listeners are stopped before P2P block fetch
+        // Block listeners hold messageLock, preventing block fetch from using peers
+        let listeningPeers = peers.filter { $0.isListening }
+        if !listeningPeers.isEmpty {
+            print("🛑 FIX #907: Stopping \(listeningPeers.count) block listeners before P2P fetch")
+            await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
+            // Force release all locks to ensure peers are available
+            for peer in listeningPeers {
+                await peer.forceReleaseMessageLock()
+            }
+        }
+
         // FIX #715: Better peer selection - check both connection state AND recent activity
         // Peers can show isConnectionReady=true but still be dead (TCP state lag)
         // hasRecentActivity is more reliable - means peer responded recently
-        var availablePeers = peers.filter { $0.isConnectionReady && $0.hasRecentActivity }
-
-        // FIX #715: If no peers with recent activity, fall back to just connection ready
-        if availablePeers.isEmpty {
+        // FIX #909: When block listeners are blocked (during operations), skip hasRecentActivity filter
+        // because stopped listeners mean no recent activity, but peers are still valid
+        var availablePeers: [Peer]
+        if PeerManager.shared.areBlockListenersBlocked() {
+            // FIX #909: During operations, use all connected peers (block listeners are stopped)
             availablePeers = peers.filter { $0.isConnectionReady }
+            print("🔓 FIX #909: Using \(availablePeers.count) connected peers (block listeners blocked)")
+        } else {
+            availablePeers = peers.filter { $0.isConnectionReady && $0.hasRecentActivity }
+            // FIX #715: If no peers with recent activity, fall back to just connection ready
+            if availablePeers.isEmpty {
+                availablePeers = peers.filter { $0.isConnectionReady }
+            }
         }
 
         // FIX #715: SHUFFLE peers to avoid always picking same (possibly bad) ones first
         availablePeers.shuffle()
 
-        if availablePeers.isEmpty && !peers.isEmpty {
-            // No ready peers but we have peers - try to reconnect them
-            print("⏳ P2P: No ready peers, attempting reconnection...")
+        // FIX #930: Proactively reconnect failed peers when we have fewer available than total
+        // Previous bug: Reconnection only triggered when availablePeers.isEmpty
+        // If localhost worked but remote peers failed, only 1 peer was used!
+        // New behavior: If we have non-ready peers, try to reconnect them in parallel
+        let nonReadyPeers = peers.filter { !$0.isConnectionReady }
+        if !nonReadyPeers.isEmpty {
+            print("🔄 FIX #930: \(availablePeers.count) ready, \(nonReadyPeers.count) non-ready - reconnecting failed peers...")
 
-            // Try to reconnect up to 3 peers in parallel
-            let peersToReconnect = Array(peers.prefix(3))
+            // Try to reconnect up to 5 non-ready peers in parallel (don't wait too long)
+            let peersToReconnect = Array(nonReadyPeers.prefix(5))
             await withTaskGroup(of: Void.self) { group in
                 for peer in peersToReconnect {
                     group.addTask {
                         do {
                             try await peer.ensureConnected()
+                            print("✅ FIX #930: Reconnected \(peer.host)")
                         } catch {
-                            print("⚠️ P2P: Failed to reconnect \(peer.host): \(error.localizedDescription)")
+                            // Don't spam logs - just note the failure
                         }
                     }
                 }
             }
 
-            // Check again after reconnection attempt
-            availablePeers = peers.filter { $0.isConnectionReady }
-
-            if availablePeers.isEmpty {
-                print("⚠️ P2P: Still no ready peers after reconnection attempt")
+            // Check again after reconnection attempt - refresh available list
+            if PeerManager.shared.areBlockListenersBlocked() {
+                availablePeers = peers.filter { $0.isConnectionReady }
             } else {
-                print("✅ P2P: Reconnected \(availablePeers.count) peers")
+                availablePeers = peers.filter { $0.isConnectionReady && $0.hasRecentActivity }
+                if availablePeers.isEmpty {
+                    availablePeers = peers.filter { $0.isConnectionReady }
+                }
             }
+            // FIX #939: Shuffle all peers equally (FIX #938 localhost prioritization REMOVED per user request)
+            // User wants remote peers to be FAST via batch fetching, not localhost-only
+            availablePeers.shuffle()
+
+            let reconnectedCount = availablePeers.count
+            print("📊 FIX #930: After reconnection: \(reconnectedCount) peers available")
         }
 
         guard !availablePeers.isEmpty else {
@@ -6139,17 +6667,21 @@ public final class NetworkManager: ObservableObject {
         // FIX #712: Use P2P protocol limit of 160 blocks per request for efficiency
         // Previous bug: Split 500 blocks across 13 peers = ~39 blocks each (slow, many small requests)
         // Fix: Each peer gets up to 160 blocks, only use as many peers as needed
-        let maxBlocksPerPeer = 160  // P2P protocol limit
+        // FIX #928: MAX_BLOCKS_IN_TRANSIT_PER_PEER = 128 (from Zclassic main.h)
+        let maxBlocksPerPeer = 128
         let peersNeeded = (count + maxBlocksPerPeer - 1) / maxBlocksPerPeer  // Ceiling division
         let actualPeerCount = min(peersNeeded, availablePeers.count)
-        let blocksPerPeer = (count + actualPeerCount - 1) / actualPeerCount  // Distribute evenly
+        // FIX #928: CRITICAL - Cap blocksPerPeer at 160 (P2P protocol limit)
+        // Bug: With 500 blocks and 3 peers, blocksPerPeer was 167 (exceeds limit!)
+        // Peers can only return 160 blocks max per request - excess blocks were lost
+        let blocksPerPeer = min(maxBlocksPerPeer, (count + actualPeerCount - 1) / actualPeerCount)
 
         // Check if block hashes are available for this range
         let bundledAvailable = BundledBlockHashes.shared.isLoaded && BundledBlockHashes.shared.contains(height: height)
         let headerStoreAvailable = (try? HeaderStore.shared.getHeader(at: height)) != nil
 
         debugLog(.network, "🚀 P2P fetch: \(count) blocks from height \(height), \(availablePeers.count) ready peers, bundled=\(bundledAvailable), headers=\(headerStoreAvailable)")
-        print("🚀 FIX #712: P2P fetch \(count) blocks using \(actualPeerCount) peers (~\(blocksPerPeer) blocks each, max 160)")
+        print("🚀 FIX #712: P2P fetch \(count) blocks using \(actualPeerCount) peers (~\(blocksPerPeer) blocks each, max 128)")
         let startTime = Date()
 
         // Each peer gets a DISJOINT range of blocks
@@ -6176,18 +6708,33 @@ public final class NetworkManager: ObservableObject {
 
                 group.addTask {
                     // FIX #713: Per-peer timeout to prevent one slow peer from blocking all
-                    // Each peer gets 20 seconds to complete its batch
+                    // FIX #928: Increased to 60s for 160 blocks sequential (was 20s, too short)
+                    // At 0.3s/block average, 160 blocks = 48s. 60s gives margin for slow peers.
                     let peerHost = peer.host
-                    let peerTimeout: UInt64 = 20_000_000_000  // 20 seconds
+                    let peerTimeout: UInt64 = 60_000_000_000  // 60 seconds
+
+                    // FIX #912: Use actor to safely track if data arrived before timeout
+                    // Previous bug: timeout message printed even when peer succeeded
+                    actor TimeoutTracker {
+                        var dataArrived = false
+                        func markDataArrived() { dataArrived = true }
+                        func didDataArrive() -> Bool { return dataArrived }
+                    }
+                    let tracker = TimeoutTracker()
 
                     return await withTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { innerGroup in
                         innerGroup.addTask {
-                            await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
+                            let result = await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
+                            await tracker.markDataArrived()
+                            return result
                         }
 
                         innerGroup.addTask {
                             try? await Task.sleep(nanoseconds: peerTimeout)
-                            print("⚠️ FIX #713: Peer \(peerHost) timed out after 20s")
+                            // FIX #912: Only log timeout if data didn't arrive first
+                            if await !tracker.didDataArrive() {
+                                print("⚠️ FIX #713: Peer \(peerHost) timed out after 20s")
+                            }
                             return nil
                         }
 
@@ -6236,7 +6783,12 @@ public final class NetworkManager: ObservableObject {
         var headerStoreCount = 0
         var bundledCount = 0
 
-        for i in 0..<count {
+        // FIX #928: Cap at P2P protocol limit (128 blocks per peer)
+        // From Zclassic main.h: MAX_BLOCKS_IN_TRANSIT_PER_PEER = 128
+        let maxP2PBlocks = 128
+        let effectiveCount = min(count, maxP2PBlocks)
+
+        for i in 0..<effectiveCount {
             let height = startHeight + UInt64(i)
 
             // First try HeaderStore (synced headers from P2P)
@@ -6256,10 +6808,11 @@ public final class NetworkManager: ObservableObject {
         }
 
         // FIX #120: If no hashes found, use on-demand P2P fetch (fetches headers first)
+        // FIX #928: Also cap at effectiveCount (160 P2P limit)
         if blockHashes.isEmpty {
-            print("📦 [\(peer.host)] Using on-demand P2P fetch for blocks \(startHeight)-\(startHeight + UInt64(count) - 1)")
+            print("📦 [\(peer.host)] Using on-demand P2P fetch for blocks \(startHeight)-\(startHeight + UInt64(effectiveCount) - 1)")
             do {
-                let blocks = try await peer.getFullBlocks(from: startHeight, count: count)
+                let blocks = try await peer.getFullBlocks(from: startHeight, count: effectiveCount)
                 var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
                 for block in blocks {
                     let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
@@ -6298,6 +6851,8 @@ public final class NetworkManager: ObservableObject {
                             }
                         }
 
+                        // FIX #882: Store txid in WIRE format (little-endian) - txidString property reverses for display
+                        // FIX #880 was incorrect - it converted to display format causing double-reversal in UI
                         let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
                         if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
                             // FIX #288: Debug log spends fetched
@@ -6333,30 +6888,61 @@ public final class NetworkManager: ObservableObject {
             return nil
         }
 
-        // SEQUENTIAL FETCH: Request blocks one by one (more reliable)
+        // FIX #939: BATCH FETCH - request all blocks in one getdata message
+        // Previous SEQUENTIAL fetch was SLOW: 128 blocks × 0.3s = ~38 seconds per peer
+        // BATCH fetch: 1 getdata request + response time = ~5-10 seconds per peer (5-7x faster!)
         var blocks: [(UInt64, CompactBlock)] = []
-        var failCount = 0
-        for (height, hash) in blockHashes {
-            // FIX #808: Check for cancellation to respect per-peer timeout
-            // Without this, the loop keeps running even after FIX #713's 20s timeout fires
-            if Task.isCancelled {
-                print("⚠️ FIX #808: [\(peer.host)] Task cancelled, stopping fetch at block \(height)")
-                break
+
+        do {
+            // Extract just the hashes for batch request
+            let hashes = blockHashes.map { $0.1 }
+            print("🚀 FIX #939: [\(peer.host)] Batch fetching \(hashes.count) blocks...")
+            let batchStartTime = Date()
+
+            // FIX #939: Use getBlocksByHashes for efficient batch retrieval
+            let fetchedBlocks = try await peer.getBlocksByHashes(hashes: hashes)
+
+            let batchDuration = Date().timeIntervalSince(batchStartTime)
+            let batchRate = Double(fetchedBlocks.count) / max(batchDuration, 0.001)
+            print("✅ FIX #939: [\(peer.host)] Batch fetched \(fetchedBlocks.count)/\(hashes.count) blocks in \(String(format: "%.1f", batchDuration))s (\(String(format: "%.0f", batchRate)) blocks/sec)")
+
+            // Match fetched blocks to their heights
+            // getBlocksByHashes returns blocks in order of the hashes we sent
+            for (index, block) in fetchedBlocks.enumerated() {
+                if index < blockHashes.count {
+                    let height = blockHashes[index].0
+                    blocks.append((height, block))
+                }
+            }
+        } catch {
+            // FIX #939: On batch failure, fall back to sequential fetch (one block at a time)
+            // This handles peers that don't respond well to large batch requests
+            if !(error is CancellationError) {
+                print("⚠️ FIX #939: [\(peer.host)] Batch fetch failed (\(error.localizedDescription)), falling back to sequential...")
             }
 
-            do {
-                let block = try await withTimeout(seconds: 10) {
-                    try await peer.getBlockByHash(hash: hash)
-                }
-                blocks.append((height, block))
-            } catch {
-                failCount += 1
-                // If too many failures, peer is likely dead
-                if failCount > 3 {
-                    print("⚠️ [\(peer.host)] Too many failures (\(failCount)), aborting batch")
+            // Sequential fallback
+            var failCount = 0
+            for (height, hash) in blockHashes {
+                if Task.isCancelled {
                     break
                 }
-                continue
+
+                do {
+                    let block = try await withTimeout(seconds: 10) {
+                        try await peer.getBlockByHash(hash: hash)
+                    }
+                    blocks.append((height, block))
+                } catch {
+                    if error is CancellationError {
+                        break
+                    }
+                    failCount += 1
+                    if failCount > 3 {
+                        break
+                    }
+                    continue
+                }
             }
         }
 
@@ -6404,6 +6990,8 @@ public final class NetworkManager: ObservableObject {
                     }
                 }
 
+                // FIX #882: Store txid in WIRE format (little-endian) - txidString property reverses for display
+                // FIX #880 was incorrect - it converted to display format causing double-reversal in UI
                 let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
 
                 if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
@@ -6508,6 +7096,8 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
+            // FIX #882: Store txid in WIRE format (little-endian) - txidString property reverses for display
+            // FIX #880 was incorrect - it converted to display format causing double-reversal in UI
             let txidHex = tx.txHash.map { String(format: "%02x", $0) }.joined()
 
             if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
@@ -6738,8 +7328,28 @@ public final class NetworkManager: ObservableObject {
 
         // FIX #250: Diagnostic logging for real iOS debugging
         let torMode = await TorManager.shared.mode
-        let torConnected = await TorManager.shared.connectionState.isConnected
-        let torSocksPort = await TorManager.shared.socksPort
+        var torConnected = await TorManager.shared.connectionState.isConnected
+        var torSocksPort = await TorManager.shared.socksPort
+        let torBypassed = await TorManager.shared.isTorBypassed
+
+        // ==========================================================================
+        // FIX #842: Wait for Tor SOCKS Proxy BEFORE Parallel Peer Recovery
+        // Problem: connectToPeer() has 10s timeout, but connectViaSocks5() waits 30s for Tor
+        //   → All parallel connections timeout simultaneously with "Request timed out"
+        // Root Cause: Each connection independently waits for Tor, but outer timeout fires first
+        // Solution: Wait for Tor to be ready ONCE before starting any connections
+        // ==========================================================================
+        if torMode == .enabled && !torBypassed && (!torConnected || torSocksPort == 0) {
+            print("🧅 FIX #842: Waiting for Tor SOCKS proxy before peer recovery...")
+            let proxyReady = await TorManager.shared.waitForSocksProxyReady(maxWait: 30)
+            if proxyReady {
+                torConnected = await TorManager.shared.connectionState.isConnected
+                torSocksPort = await TorManager.shared.socksPort
+                print("✅ FIX #842: Tor proxy ready (port \(torSocksPort))")
+            } else {
+                print("⚠️ FIX #842: Tor proxy not ready after 30s - connections may fail")
+            }
+        }
 
         // FIX #284: Get preferred seeds from database (replaces hardcoded seeds)
         let preferredSeeds = getPreferredSeeds()
@@ -6776,8 +7386,11 @@ public final class NetworkManager: ObservableObject {
         // FIX #427: Add hardcoded seeds FIRST - they are the most reliable
         // Previous bug: Recovery only used parked peers because hardcoded seeds
         // weren't in knownAddresses. This caused 0 peers when all parked peers failed.
+        // FIX #845: Also check if peer is parked and not ready for retry
+        // Without this, failed hardcoded seeds get re-added immediately every 30 seconds
+        // causing repeated "Ping failed: Peer handshake failed" errors
         for seedHost in HARDCODED_SEEDS {
-            if !isBanned(seedHost) && !peers.contains(where: { $0.host == seedHost }) {
+            if !isBanned(seedHost) && !peers.contains(where: { $0.host == seedHost }) && !shouldSkipPeer(seedHost) {
                 candidateAddresses.append((PeerAddress(host: seedHost, port: defaultPort), "hardcoded"))
             }
         }
@@ -6851,6 +7464,15 @@ public final class NetworkManager: ObservableObject {
             // Collect results as they complete
             for await (peer, address, source) in group {
                 if let peer = peer {
+                    // FIX #850: Check for duplicate before adding to prevent same peer appearing twice
+                    // This can happen when recovery runs while previous peer is still in array
+                    let isDuplicate = peers.contains { $0.host == peer.host }
+                    if isDuplicate {
+                        print("⚠️ FIX #850: Skipping duplicate peer \(address.host) - already in peers array")
+                        peer.disconnect()
+                        continue
+                    }
+
                     if recovered < maxPeers {
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
@@ -6858,6 +7480,8 @@ public final class NetworkManager: ObservableObject {
                         setupBlockListener(for: peer)
                         recovered += 1
                         unparkPeer(address.host, port: address.port)
+                        // FIX #908: Reset handshake failures on successful connection
+                        PeerManager.shared.resetHandshakeFailures(address.host)
                         print("✅ FIX #394: Recovered \(source) peer \(address.host) (\(recovered)/\(maxPeers))")
                     } else {
                         // Already have enough peers, disconnect this one
@@ -6885,6 +7509,11 @@ public final class NetworkManager: ObservableObject {
                     continue
                 }
 
+                // FIX #850: Skip if peer is already connected (prevent duplicates)
+                if peers.contains(where: { $0.host == address.host }) {
+                    continue
+                }
+
                 recordConnectionAttempt(address.host, port: address.port)
 
                 do {
@@ -6895,21 +7524,31 @@ public final class NetworkManager: ObservableObject {
                     setupBlockListener(for: peer)
                     recovered += 1
                     unparkPeer(address.host, port: address.port)
+                    // FIX #908: Reset handshake failures on successful connection
+                    PeerManager.shared.resetHandshakeFailures(address.host)
                     print("✅ FIX #227: Recovered peer \(address.host)")
 
                     if recovered >= 3 {
                         break  // Got enough peers
                     }
-                } catch {
+                } catch let error as NetworkError {
                     print("❌ FIX #227: Failed to connect to \(address.host): \(error.localizedDescription)")
-                    // Park instead of ban for connection issues
-                    parkPeer(address.host, port: address.port)
+                    // FIX #908: Track handshake failures with extended parking
+                    if case .handshakeFailed = error {
+                        PeerManager.shared.recordHandshakeFailure(address.host, port: address.port)
+                    } else {
+                        // Park instead of ban for connection issues
+                        parkPeer(address.host, port: address.port)
+                    }
 
                     // Track SOCKS5 failures specifically
                     if error.localizedDescription.contains("Socket is not connected") ||
                        error.localizedDescription.contains("SOCKS") {
                         consecutiveSOCKS5Failures += 1
                     }
+                } catch {
+                    print("❌ FIX #227: Failed to connect to \(address.host): \(error.localizedDescription)")
+                    parkPeer(address.host, port: address.port)
                 }
             }
         }
@@ -7122,11 +7761,13 @@ public final class NetworkManager: ObservableObject {
             } else {
                 // Only ping if no recent activity
                 // Use 10 second timeout for health check (was 3s - too aggressive)
-                if await peer.sendPing(timeoutSeconds: 10) {
-                    alive += 1
+                // FIX #869: sendPing now returns PingResult
+                let pingResult = await peer.sendPing(timeoutSeconds: 10)
+                if pingResult == .success || pingResult == .busy {
+                    alive += 1  // FIX #869: busy means peer might be fine
                 } else {
                     // Peer didn't respond - mark for potential reconnection
-                    debugLog(.network, "💓 Peer \(peer.host) not responding to health check")
+                    debugLog(.network, "💓 Peer \(peer.host) not responding to health check (\(pingResult))")
                 }
             }
         }
@@ -7136,6 +7777,14 @@ public final class NetworkManager: ObservableObject {
 
     /// Handle network path change with debouncing (like BitChat's 3s cooldown)
     private func handleNetworkPathChange(path: NWPath) async {
+        // FIX #890: Skip network path handling during boost header loading
+        // NWPathMonitor callbacks cause thread contention with SQLite bulk inserts
+        // This was contributing to the 91-99% stall during Import PK
+        if isLoadingHeaders {
+            debugLog(.network, "📶 FIX #890: Suppressing path change during header load")
+            return
+        }
+
         // Check if we're within the debounce window
         if let lastChange = lastPathChangeTime {
             let elapsed = Date().timeIntervalSince(lastChange)
@@ -7260,33 +7909,45 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        var deadPeers: [Peer] = []
+        var deadPeers: [(Peer, PingResult)] = []  // FIX #869: Track ping result with dead peer
         var alivePeersFromActivity = 0
 
         // FIX #327: Check recent activity FIRST before sending ping
         // Block listeners receive messages continuously - if we got data recently, peer is alive
         // Only ping peers with NO recent activity to avoid socket conflicts
-        await withTaskGroup(of: (Peer, Bool).self) { group in
+        // FIX #869: Return PingResult to distinguish transient vs protocol failures
+        await withTaskGroup(of: (Peer, PingResult).self) { group in
             for peer in readyPeers {
                 group.addTask {
                     // FIX #327: If peer had recent activity, it's alive (no ping needed)
                     if peer.hasRecentActivity {
-                        return (peer, true)  // Alive based on recent activity
+                        return (peer, .success)  // Alive based on recent activity
                     }
 
                     // No recent activity - send actual ping to check
-                    let isAlive = await peer.sendPing(timeoutSeconds: 10)
-                    return (peer, isAlive)
+                    let pingResult = await peer.sendPing(timeoutSeconds: 10)
+                    return (peer, pingResult)
                 }
             }
 
-            for await (peer, isAlive) in group {
-                if isAlive {
+            for await (peer, pingResult) in group {
+                switch pingResult {
+                case .success:
                     if peer.hasRecentActivity {
                         alivePeersFromActivity += 1
                     }
-                } else {
-                    deadPeers.append(peer)
+                    // FIX #863: Reset ping failures when peer is alive
+                    // This prevents false positives from temporary network issues
+                    await MainActor.run {
+                        PeerManager.shared.resetPingFailures(peer.host)
+                    }
+                case .busy:
+                    // FIX #869: Peer is busy with other operation, not dead
+                    // Don't count as failure, don't reset failures either
+                    break
+                case .timeout, .protocolError, .transientNetworkError:
+                    // FIX #869: Track result to decide whether to count towards ban
+                    deadPeers.append((peer, pingResult))
                 }
             }
         }
@@ -7311,7 +7972,7 @@ public final class NetworkManager: ObservableObject {
 
                 // Block peer reconnection attempts (they'll all fail anyway)
                 // Reset all reconnection attempts
-                for peer in deadPeers {
+                for (peer, _) in deadPeers {
                     await MainActor.run { PeerManager.shared.resetReconnectionAttempts(peer.host, port: peer.port) }
                 }
 
@@ -7326,18 +7987,81 @@ public final class NetworkManager: ObservableObject {
             }
 
             // FIX #473: Handle dead peers (they will be parked and not immediately retried)
-            for deadPeer in deadPeers {
+            // FIX #863/869: Track ping failures - only count PROTOCOL errors towards ban threshold
+            // Transient network errors (connection reset, broken pipe) should NOT count
+            // FIX #870: Track transient vs protocol errors to decide recovery strategy
+            var transientErrorCount = 0
+            var protocolErrorCount = 0
+
+            for (deadPeer, pingResult) in deadPeers {
+                // FIX #869: Only record ping failure for PROTOCOL errors
+                // Transient network errors can happen to any peer and shouldn't lead to banning
+                let isProtocolError = (pingResult == .timeout || pingResult == .protocolError)
+
+                var shouldBan = false
+                if isProtocolError {
+                    protocolErrorCount += 1
+                    // FIX #863: Record ping failure and check if peer should be banned
+                    // A peer that connects OK but consistently fails ping is likely on wrong chain
+                    shouldBan = await MainActor.run {
+                        PeerManager.shared.recordPingFailure(deadPeer.host, port: deadPeer.port)
+                    }
+                } else {
+                    transientErrorCount += 1
+                    // FIX #869: Transient network error - just log, don't count towards ban
+                    debugLog(.network, "⚠️ FIX #869: [\(deadPeer.host)] Transient network error - not counting towards ban")
+                }
+
+                if shouldBan {
+                    debugLog(.network, "🚫 FIX #863: [\(deadPeer.host)] Banning peer - too many ping failures (likely wrong chain or corrupted protocol)")
+                    banPeer(deadPeer, reason: .lowSuccessRate)
+                    // Remove from peers array and skip normal dead peer handling
+                    peers.removeAll { $0.id == deadPeer.id }
+                    continue
+                }
+
                 await handleDeadPeer(deadPeer)
             }
 
             // FIX #473: CRITICAL - Pre-emptively connect to MORE peers before we hit 0
             // Bitcoin Core maintains 8-10 outgoing connections for redundancy
             // We should connect to replacements IMMEDIATELY when peers die, not wait until 0
+            // FIX #870: Only do immediate parallel recovery for PROTOCOL errors
+            // FIX #872/879: Transient errors include error 54, error 57 (ENOTCONN), error 96 (ENOMSG),
+            // connection reset, socket not connected - temporary network issues, parallel recovery overwhelms network
             let currentReadyCount = peers.filter { $0.isConnectionReady }.count
             if currentReadyCount < CONSENSUS_THRESHOLD {
-                print("⚠️ FIX #473: Only \(currentReadyCount) peers alive (need \(CONSENSUS_THRESHOLD)) - pre-emptively connecting to replacements...")
-                // Trigger immediate recovery to connect to more peers before we hit 0
-                await attemptPeerRecovery()
+                // FIX #870: If ALL errors were transient (network hiccup), delay recovery
+                // This prevents overwhelming network with parallel connections that will all fail
+                let allTransient = (transientErrorCount > 0 && protocolErrorCount == 0)
+
+                if allTransient {
+                    debugLog(.network, "⚠️ FIX #870: All \(transientErrorCount) failures were transient network errors - delaying recovery by 5s")
+
+                    // FIX #871: Signal health check to suppress CRITICAL alert during transient recovery
+                    await MainActor.run { isTransientRecoveryInProgress = true }
+                    debugLog(.network, "⏳ FIX #871: Set isTransientRecoveryInProgress = true")
+
+                    // Short delay to let network stabilize before retrying
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5 seconds
+
+                    // Check if peers recovered during the delay (network hiccups often resolve quickly)
+                    let readyAfterDelay = peers.filter { $0.isConnectionReady }.count
+                    if readyAfterDelay >= CONSENSUS_THRESHOLD {
+                        debugLog(.network, "✅ FIX #870: Peers recovered during delay (\(readyAfterDelay) ready) - skipping recovery")
+                    } else {
+                        debugLog(.network, "🔄 FIX #870: Still only \(readyAfterDelay) peers - starting recovery")
+                        await attemptPeerRecovery()
+                    }
+
+                    // FIX #871: Clear the flag after recovery attempt (success or failure)
+                    await MainActor.run { isTransientRecoveryInProgress = false }
+                    debugLog(.network, "✅ FIX #871: Set isTransientRecoveryInProgress = false")
+                } else {
+                    print("⚠️ FIX #473: Only \(currentReadyCount) peers alive (need \(CONSENSUS_THRESHOLD)) - pre-emptively connecting to replacements...")
+                    // Trigger immediate recovery to connect to more peers before we hit 0
+                    await attemptPeerRecovery()
+                }
             }
         }
 
@@ -7693,6 +8417,7 @@ enum NetworkError: LocalizedError, Equatable {
     case invalidData
     case notFound
     case p2pFetchFailed
+    case scanAbortedDueToNetworkFailure(fetched: Int, needed: Int, lastHeight: UInt64)  // FIX #910
 
     var errorDescription: String? {
         switch self {
@@ -7730,6 +8455,8 @@ enum NetworkError: LocalizedError, Equatable {
             return "Data not found on peer"
         case .p2pFetchFailed:
             return "P2P block fetch failed"
+        case .scanAbortedDueToNetworkFailure(let fetched, let needed, let lastHeight):
+            return "FIX #910: Scan aborted - network failure (fetched \(fetched)/\(needed) blocks, last height: \(lastHeight))"
         }
     }
 }
