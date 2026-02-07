@@ -767,6 +767,16 @@ struct ContentView: View {
                                     walletManager.startPeriodicDeepVerification()
                                 }
 
+                                // FIX #1128: Run delta bundle compaction in background (non-blocking)
+                                // This removes duplicate CMUs that accumulate over time from re-scans
+                                // Running after startup so user can start using app immediately
+                                Task.detached(priority: .background) {
+                                    let result = DeltaCMUManager.shared.compactDeltaBundleIfNeeded()
+                                    if result.removed > 0 {
+                                        print("✅ FIX #1128: Background compaction removed \(result.removed) duplicate CMUs")
+                                    }
+                                }
+
                                 // FIX #560: DO NOT enable background processes yet!
                                 // Background processes will be enabled AFTER FAST START completes
                                 // Starting them now causes mempool scan, block notifications to interfere
@@ -1496,6 +1506,15 @@ struct ContentView: View {
                             // Runs every 30 minutes to catch missed transactions (including those from broadcast bugs)
                             walletManager.startPeriodicDeepVerification()
 
+                            // FIX #1128: Run delta bundle compaction in background (non-blocking)
+                            // This removes duplicate CMUs that accumulate over time from re-scans
+                            Task.detached(priority: .background) {
+                                let result = DeltaCMUManager.shared.compactDeltaBundleIfNeeded()
+                                if result.removed > 0 {
+                                    print("✅ FIX #1128: Background compaction removed \(result.removed) duplicate CMUs")
+                                }
+                            }
+
                             // FIX #500: Clear import progress flag if this was an import
                             if walletManager.isImportInProgress {
                                 walletManager.markImportComplete()
@@ -2147,6 +2166,14 @@ struct ContentView: View {
 
                             // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
                             walletManager.startPeriodicDeepVerification()
+
+                            // FIX #1128: Run delta bundle compaction in background (non-blocking)
+                            Task.detached(priority: .background) {
+                                let result = DeltaCMUManager.shared.compactDeltaBundleIfNeeded()
+                                if result.removed > 0 {
+                                    print("✅ FIX #1128: Background compaction removed \(result.removed) duplicate CMUs")
+                                }
+                            }
                         },
                         onStopSync: {
                             // User clicked STOP - cancel sync and go to main wallet

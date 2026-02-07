@@ -825,8 +825,20 @@ enum ZipherXFFI {
 
     // MARK: - Commitment Tree Functions
 
+    // FIX #1127: Cache tree size to reduce FFI calls
+    private static var cachedTreeSize: UInt64? = nil
+    private static let treeCacheLock = NSLock()
+
+    /// Invalidate tree size cache (call after any mutation)
+    private static func invalidateTreeSizeCache() {
+        treeCacheLock.lock()
+        cachedTreeSize = nil
+        treeCacheLock.unlock()
+    }
+
     /// Initialize a new empty Sapling commitment tree
     static func treeInit() -> Bool {
+        invalidateTreeSizeCache()  // FIX #1127
         return zipherx_tree_init()
     }
 
@@ -844,6 +856,7 @@ enum ZipherXFFI {
     static func treeAppend(cmu: Data) -> UInt64 {
         guard cmu.count == 32 else { return UInt64.max }
 
+        invalidateTreeSizeCache()  // FIX #1127
         return cmu.withUnsafeBytes { cmuPtr in
             zipherx_tree_append(cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self))
         }
@@ -852,6 +865,7 @@ enum ZipherXFFI {
     /// Add a note commitment from raw pointer (for bulk loading)
     /// Returns the position of the added commitment, or UInt64.max on error
     static func treeAppendRaw(cmu: UnsafePointer<UInt8>) -> UInt64 {
+        invalidateTreeSizeCache()  // FIX #1127
         return zipherx_tree_append(cmu)
     }
 
@@ -862,6 +876,7 @@ enum ZipherXFFI {
         guard cmus.count > 0 && cmus.count % 32 == 0 else { return UInt64.max }
         let cmuCount = cmus.count / 32
 
+        invalidateTreeSizeCache()  // FIX #1127
         return cmus.withUnsafeBytes { cmusPtr in
             zipherx_tree_append_batch(
                 cmusPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -901,7 +916,11 @@ enum ZipherXFFI {
             return zipherx_tree_append_delta_atomic(basePtr, cmuCount, expectedBoostSize)
         }
 
-        return DeltaAppendResult(rawValue: result) ?? .error
+        let appendResult = DeltaAppendResult(rawValue: result) ?? .error
+        if appendResult == .appended {
+            invalidateTreeSizeCache()  // FIX #1127: Invalidate on successful append
+        }
+        return appendResult
     }
 
     /// Load a witness into memory for tracking/updating
@@ -988,8 +1007,22 @@ enum ZipherXFFI {
     }
 
     /// Get current tree size (number of commitments)
+    /// FIX #1127: Uses cache to reduce FFI calls (invalidated on mutations)
     static func treeSize() -> UInt64 {
-        return zipherx_tree_size()
+        treeCacheLock.lock()
+        if let cached = cachedTreeSize {
+            treeCacheLock.unlock()
+            return cached
+        }
+        treeCacheLock.unlock()
+
+        let size = zipherx_tree_size()
+
+        treeCacheLock.lock()
+        cachedTreeSize = size
+        treeCacheLock.unlock()
+
+        return size
     }
 
     /// Serialize tree state for persistence
@@ -1019,6 +1052,7 @@ enum ZipherXFFI {
 
     /// Deserialize tree state from persistence
     static func treeDeserialize(data: Data) -> Bool {
+        invalidateTreeSizeCache()  // FIX #1127
         return data.withUnsafeBytes { ptr in
             zipherx_tree_deserialize(
                 ptr.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -1030,6 +1064,7 @@ enum ZipherXFFI {
     /// Load tree from raw CMUs file format
     /// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
     static func treeLoadFromCMUs(data: Data) -> Bool {
+        invalidateTreeSizeCache()  // FIX #1127
         return data.withUnsafeBytes { ptr in
             zipherx_tree_load_from_cmus(
                 ptr.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -1051,6 +1086,7 @@ enum ZipherXFFI {
     ///   - onProgress: Called with (currentCMU, totalCMUs) approximately every 10000 CMUs
     /// - Returns: true if tree was loaded successfully
     static func treeLoadFromCMUsWithProgress(data: Data, onProgress: @escaping TreeLoadProgressCallback) -> Bool {
+        invalidateTreeSizeCache()  // FIX #1127
         // Store callback globally so C callback can access it
         treeLoadProgressCallback = onProgress
 

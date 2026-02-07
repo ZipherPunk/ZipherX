@@ -6259,8 +6259,8 @@ final class WalletManager: ObservableObject {
             UserDefaults.standard.removeObject(forKey: "FIX1106_NullifierVerificationCheckpoint")
             UserDefaults.standard.removeObject(forKey: "FIX1089_FullVerificationComplete")
             UserDefaults.standard.removeObject(forKey: "FIX1089_NullifierVerificationCheckpoint")
-            // FIX #1104: Clear balance verification timestamp for fresh verification
-            UserDefaults.standard.removeObject(forKey: "FIX1104_BalanceVerifiedTimestamp")
+            // FIX #1126: Invalidate verified state before Full Rescan (will be re-verified after)
+            WalletHealthCheck.shared.invalidateVerifiedState()
         } else {
             // FIX #1016: Use quick fix if MOST notes (80%+) have valid witnesses
             // Old logic required 100% valid - if 1 note was bad, triggered 3+ minute full rescan!
@@ -6737,18 +6737,30 @@ final class WalletManager: ObservableObject {
                 self.balanceIntegrityIssue = false
                 self.balanceIntegrityMessage = nil
 
-                // FIX #1104: Persist balance verification success to prevent re-triggering Full Rescan
-                // This flag is checked in WalletHealthCheck.checkBalanceHistoryMatch() to avoid
-                // immediately triggering another 28+ minute Full Rescan on next startup
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "FIX1104_BalanceVerifiedTimestamp")
-                print("✅ FIX #1104: Set BalanceVerifiedTimestamp - next startup will trust this verification")
+                // FIX #1126: Save comprehensive verified state to skip redundant health checks on next startup
+                // Includes: tree size, witness count, balance, lastScannedHeight
+                let treeSize = ZipherXFFI.treeSize()
+                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                WalletHealthCheck.shared.saveVerifiedState(
+                    treeSize: treeSize,
+                    witnessCount: finalNoteCount,
+                    balance: UInt64(finalBalance),
+                    lastScannedHeight: lastScanned
+                )
             } else {
                 print("✅ FIX #1098: Balance verification passed (wallet may be empty)")
                 self.balanceIntegrityIssue = false
                 self.balanceIntegrityMessage = nil
 
-                // FIX #1104: Also set for empty wallet (valid state)
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "FIX1104_BalanceVerifiedTimestamp")
+                // FIX #1126: Save verified state for empty wallet too
+                let treeSize = ZipherXFFI.treeSize()
+                let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                WalletHealthCheck.shared.saveVerifiedState(
+                    treeSize: treeSize,
+                    witnessCount: 0,
+                    balance: 0,
+                    lastScannedHeight: lastScanned
+                )
             }
         }
     }
@@ -8529,8 +8541,8 @@ final class WalletManager: ObservableObject {
         // FIX #1089: Clear nullifier verification flags
         defaults.removeObject(forKey: "FIX1089_FullVerificationComplete")
         defaults.removeObject(forKey: "FIX1089_NullifierVerificationCheckpoint")
-        // FIX #1104: Clear balance verification timestamp
-        defaults.removeObject(forKey: "FIX1104_BalanceVerifiedTimestamp")
+        // FIX #1126: Invalidate verified state on wallet deletion
+        WalletHealthCheck.shared.invalidateVerifiedState()
         defaults.synchronize()
         print("🗑️ Cleared UserDefaults (including migration flags and verification checkpoints)")
 
@@ -9295,6 +9307,19 @@ final class WalletManager: ObservableObject {
 
     func validateTreeRootAtStartup() async -> Bool {
         print("🔐 FIX #1000: Validating tree root via P2P at STARTUP...")
+
+        // FIX #1129: Skip P2P validation if verified state is valid
+        // P2P validation is expensive (stops block listeners, fetches block, etc.)
+        // When we have a verified state from successful Full Rescan or health check,
+        // we can trust the local tree root without P2P confirmation
+        if WalletHealthCheck.shared.hasValidVerifiedState() {
+            print("⏩ FIX #1129: Using verified state - skipping P2P tree validation")
+            await MainActor.run {
+                treeRootValidAtStartup = true
+                treeRootMismatchDetected = false
+            }
+            return true
+        }
 
         // Get our current tree root from FFI
         guard let ourTreeRoot = ZipherXFFI.treeRoot(), !ourTreeRoot.isEmpty else {

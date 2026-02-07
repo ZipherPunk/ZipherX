@@ -25,10 +25,97 @@ final class WalletHealthCheck {
     static let shared = WalletHealthCheck()
     private init() {}
 
+    // MARK: - FIX #1126: Verified State System
+
+    /// Keys for verified state persistence
+    private enum VerifiedStateKeys {
+        static let timestamp = "FIX1126_VerifiedStateTimestamp"
+        static let treeSize = "FIX1126_VerifiedTreeSize"
+        static let witnessCount = "FIX1126_VerifiedWitnessCount"
+        static let notesBalance = "FIX1126_VerifiedBalance"
+        static let lastScannedHeight = "FIX1126_VerifiedLastScanned"
+    }
+
+    /// Check if we have a valid verified state (skip redundant health checks)
+    /// Returns true if state was verified within 24 hours AND current state matches
+    func hasValidVerifiedState() -> Bool {
+        let defaults = UserDefaults.standard
+        let timestamp = defaults.double(forKey: VerifiedStateKeys.timestamp)
+
+        // Must have been verified within 24 hours
+        let hoursSinceVerification = (Date().timeIntervalSince1970 - timestamp) / 3600
+        guard timestamp > 0 && hoursSinceVerification < 24 else {
+            return false
+        }
+
+        // Verify current state matches saved state
+        let savedTreeSize = UInt64(defaults.integer(forKey: VerifiedStateKeys.treeSize))
+        let savedWitnessCount = defaults.integer(forKey: VerifiedStateKeys.witnessCount)
+        let savedLastScanned = UInt64(defaults.integer(forKey: VerifiedStateKeys.lastScannedHeight))
+
+        // Get current values
+        let currentTreeSize = ZipherXFFI.treeSize()
+        let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+
+        // Tree size and lastScannedHeight should match (witnesses may vary slightly)
+        let treeSizeMatches = currentTreeSize == savedTreeSize || savedTreeSize == 0
+        let lastScannedMatches = currentLastScanned == savedLastScanned || savedLastScanned == 0
+
+        if treeSizeMatches && lastScannedMatches {
+            print("✅ FIX #1126: Valid verified state from \(String(format: "%.1f", hoursSinceVerification))h ago")
+            print("   Tree: \(currentTreeSize), LastScanned: \(currentLastScanned)")
+            return true
+        }
+
+        print("⚠️ FIX #1126: State changed since verification - running full health checks")
+        print("   Tree: \(currentTreeSize) vs saved \(savedTreeSize)")
+        print("   LastScanned: \(currentLastScanned) vs saved \(savedLastScanned)")
+        return false
+    }
+
+    /// Save current state as verified (call after successful Full Rescan or all health checks pass)
+    func saveVerifiedState(treeSize: UInt64, witnessCount: Int, balance: UInt64, lastScannedHeight: UInt64) {
+        let defaults = UserDefaults.standard
+        defaults.set(Date().timeIntervalSince1970, forKey: VerifiedStateKeys.timestamp)
+        defaults.set(Int(treeSize), forKey: VerifiedStateKeys.treeSize)
+        defaults.set(witnessCount, forKey: VerifiedStateKeys.witnessCount)
+        defaults.set(Int(balance), forKey: VerifiedStateKeys.notesBalance)
+        defaults.set(Int(lastScannedHeight), forKey: VerifiedStateKeys.lastScannedHeight)
+
+        // Also set FIX #1104 timestamp for backward compatibility
+        defaults.set(Date().timeIntervalSince1970, forKey: "FIX1104_BalanceVerifiedTimestamp")
+
+        print("✅ FIX #1126: Saved verified state - tree=\(treeSize), witnesses=\(witnessCount), balance=\(Double(balance)/100_000_000.0) ZCL")
+    }
+
+    /// Invalidate verified state (call when database is modified)
+    func invalidateVerifiedState() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: VerifiedStateKeys.timestamp)
+        defaults.removeObject(forKey: VerifiedStateKeys.treeSize)
+        defaults.removeObject(forKey: VerifiedStateKeys.witnessCount)
+        defaults.removeObject(forKey: VerifiedStateKeys.notesBalance)
+        defaults.removeObject(forKey: VerifiedStateKeys.lastScannedHeight)
+        print("🔄 FIX #1126: Invalidated verified state")
+    }
+
     /// Run all health checks and return results
     /// FIX #120: Ensures wallet is in consistent state before user interaction
     func runAllChecks() async -> [HealthCheckResult] {
         var results: [HealthCheckResult] = []
+
+        // FIX #1126: If we have a valid verified state, skip most health checks
+        // Only run critical checks that detect corruption, not validation checks
+        if hasValidVerifiedState() {
+            print("⏩ FIX #1126: Using verified state - skipping redundant health checks")
+
+            // Only run minimal checks
+            results.append(.passed("Verified State", details: "State verified within 24h"))
+            results.append(await checkLastScannedHeightCorruption())  // Always check for corruption
+            results.append(await checkP2PConnectivity())  // Always check network
+
+            return results
+        }
 
         // 0. FIX #166: CRITICAL - Check for corrupted last_scanned_height FIRST
         // This must be detected and fixed before any other checks run

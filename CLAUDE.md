@@ -104,23 +104,1350 @@ python3 scripts/team_orchestrator.py --verbose bugfix "balance incorrect"
 
 | Issue | Solution |
 |-------|----------|
+| Progress goes backward / tasks never run shown | FIX #1079 - Progress now monotonic (never decreases). Pending tasks that never run are hidden from UI. |
+| "Connection Lost" or "Health Issue" warning | FIX #1077 - Now auto-handled without user action. App auto-reconnects and auto-syncs. |
+| localhost (127.0.0.1) in ZipherX mode | FIX #1077 - localhost is now skipped in ZipherX P2P mode (no local node exists). |
+| Wallet regressed 10K+ blocks | FIX #1074 - scan timeout was based on START time, not PROGRESS time. FIX #1075 - wallet can NEVER regress below checkpoint (database protection). |
+| Startup takes 3+ minutes | FIX #1016 - quick fix now accepts 80%+ valid witnesses (was 100%) |
+| Send takes 60+ seconds | FIX #1013 fixed broken witness comparison - sends are now INSTANT |
+| Wrong balance after confirm | FIX #1015 - pending state now cleared AFTER balance refresh |
+| Change output as "received" | FIX #1084 fixed race condition. FIX #1085 DISABLED (was deleting valid notes!). FIX #1088 fixed flawed balance check that triggered unnecessary Full Rescans. |
+| "No connection" but peers connected | FIX #999 - Features now allowed when peers are recovering/reconnecting |
 | Slow startup (4+ min) | FIX #894 - WAL checkpoint issue, update app version |
 | Stuck at X% sync | Check z.log for "Invalid magic bytes" or timeouts |
 | Sync stalls 30+ min | FIX #910 - Network failure during PHASE 2, app auto-retries when network recovers |
-| Wrong balance | Settings → Repair Database |
+| Wrong balance | FIX #1091 v2+v3 - nullifiers computed with wrong tree position (FFI array index instead of witnessed_position). Now auto-triggers Full Rescan. FIX #876 auto-detects at startup. |
+| Full Scan stuck at 100% | FIX #1092 v2 - FIX #1084 was scanning 72K blocks for nullifier verification (redundant after any full scan). Now skipped during FULL START, Import PK, and Full Rescan. |
 | Wrong dates | Settings → Clear Block Headers |
 | Reversed txid in history | FIX #943 fixed storage format - run "Repair Database" to fix existing txns |
 | TX fails "joinsplit" | Zero sapling roots in P2P headers - use Full Resync (FIX #796 skips unreliable P2P validation) |
+| TX rejected + 9 DUPLICATEs | FIX #993/#994 - Incomplete delta CMUs. Now fetched at startup before balance view. |
+| TX rejected but shows "sent" | FIX #1073 - P2P verification failure wasn't recorded as rejection. Now FIX #935/515/389 paths increment rejectCount. |
 | TX shows "external spend" | Race condition fixed in FIX #702 - upgrade app |
 | TX fails | Check anchor/witness match, branch ID |
 | No peers | Wait 30s, check Tor mode status |
-| Tree root mismatch | Duplicate CMUs in delta bundle (FIX #784), corrupted DB tree without delta (FIX #814), or P2P timeout - use Full Resync after FIX #782 exhausts auto-repair |
+| Tree root mismatch | FIX #1068 loads from database after Full Rescan. FIX #1063 auto-clears corrupted tree when detected. Caused by: INSTANT START ignoring database tree (FIX #1068), FIX #568 v2 reusing oversized tree, duplicate CMUs (FIX #1007/#784), or corrupted DB tree (FIX #814). |
+| 100% P2P fetch failures | FIX #1062 - Block listeners consuming P2P responses during delta CMU fetch. Now stopped before fetch. |
 
 ## FIX Numbering
 
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
+- FIX #1129: PERFORMANCE - Skip P2P Validation When Verified State Valid
+  - Eliminates expensive P2P operations when local state verified within 24 hours
+  - Files: WalletManager.swift
+- FIX #1128: PERFORMANCE - Background Delta Bundle Compaction (Non-Blocking)
+  - Runs `compactDeltaBundleIfNeeded()` in background after startup completes
+  - Removes duplicate CMUs without blocking startup
+  - Files: ContentView.swift (3 locations)
+- FIX #1127: PERFORMANCE - Cache FFI Tree Size to Reduce FFI Calls
+  - Thread-safe caching with invalidation on tree mutations
+  - Repeat `treeSize()` calls are O(1) instead of FFI round-trip
+  - Files: ZipherXFFI.swift
+- FIX #1126: PERFORMANCE - Trust Verified State After Full Rescan
+  - Skip redundant health checks for 24 hours after successful Full Rescan
+  - Persists tree size, witness count, balance, lastScannedHeight
+  - Files: WalletHealthCheck.swift, WalletManager.swift
+- FIX #1125: CRITICAL - Balance Discrepancy After Full Resync (Change Detection by Height)
+  - Fixed FIX #465 that skipped SENT transactions when change txid didn't match
+  - Added height-based change detection for boost file notes
+  - Files: WalletDatabase.swift
+- FIX #1118 v3: Block SEND and Show Warning When Balance Discrepancy Detected (Cypherpunk Theme Fix)
+  - **Problem**: Balance view shown and SEND enabled even when discrepancy detected
+  - **User complaint**: "if there are discrepencies then balance must be replaced with the warning and send must be disable"
+  - **Root Cause v1**: FIX #1104 marked discrepancy as "non-critical" to prevent Full Rescan loops
+    - But non-critical meant UI didn't block SEND or show warning
+  - **Root Cause v2**: Two separate `MainActor.run` blocks caused SwiftUI race condition
+    - First block set `balanceIntegrityIssue = true`
+    - Second block set `isInitialSync = false` (triggering BalanceView render)
+    - SwiftUI might render BalanceView before observing the flag change
+  - **Root Cause v3**: `CypherpunkMainView` (iOS Cypherpunk theme) had no `balanceIntegrityIssue` check
+    - User was seeing `CypherpunkMainView` not `BalanceView` on iOS
+    - `BalanceView` had the check but `CypherpunkMainView.balanceSection` didn't
+    - Warning never displayed on iOS with Cypherpunk theme (default)
+  - **Solution v2**: Combine flag setting AND UI transition in SINGLE `MainActor.run` block
+    - Set `balanceIntegrityIssue = true` FIRST within the same block
+    - Then set `isInitialSync = false` to trigger UI transition
+    - Both happen atomically from SwiftUI's perspective
+    - Applied in INSTANT START, FAST START, and FULL START paths
+  - **Solution v3**: Added `balanceIntegrityIssue` check to `CypherpunkMainView.balanceSection`
+    - When flag is true: Shows red "BALANCE ISSUE" warning with message
+    - Hides balance amount, pending indicators, and USD value
+    - Instructs user: "Go to Settings → Repair Database"
+  - **Result**: Both BalanceView and CypherpunkMainView show warning when issue detected
+  - **Files Modified**: ContentView.swift (3 startup paths), System7Components.swift (CypherpunkMainView balanceSection)
+- FIX #1117: CRITICAL - Stop Running Scan Before Full Rescan lastScannedHeight Reset (Race Condition)
+  - **Problem**: PHASE 1 skipped - Full Rescan only found 8 notes instead of 36
+  - **Root Cause**: Race condition between background PHASE 2 scan and Full Rescan reset
+    - Full Rescan resets lastScannedHeight to 0
+    - Background PHASE 2 loop immediately sets it back to 2998092 (within 1ms!)
+    - FilterScanner sees lastScanned=2998092, sets isFullRescan=false, skips PHASE 1
+  - **Solution (Two layers of protection)**:
+    - Layer 1: Stop running scan and wait for it to fully stop BEFORE resetting lastScannedHeight
+    - Layer 2: Verify lastScannedHeight=0 right before calling startScan()
+  - **Files Modified**: WalletManager.swift (repairNotesAfterDownloadedTree)
+- FIX #1111: PERFORMANCE - Skip Witness Check When Tree Not Caught Up (45s → <5s Startup)
+  - **Problem**: INSTANT START took 45+ seconds instead of <5 seconds
+  - **Root Cause**: FIX #828 ran before tree caught up - delta at 3002599, lastScanned at 3002937
+    - 15 witnesses flagged as "corrupted" (FALSE POSITIVE - tree height mismatch!)
+    - 43-second unnecessary rebuild
+  - **Solution**: Skip FIX #828 when `deltaEndHeight < lastScannedHeight`
+  - **Files Modified**: WalletHealthCheck.swift
+- FIX #1110: CRITICAL - Note Wrongly Marked Spent by Flawed Value Pattern Matching (0.0025 ZCL Lost)
+  - **Problem**: Balance 0.90110001 ZCL (22 notes) vs local node 0.90360001 ZCL (23 notes)
+  - **Root Cause**: FIX #1084 v2's `fixMislabeledChangeByValuePattern()` used flawed heuristic
+    - Assumed value pattern matching = spend relationship (FALSE for separate incoming TXs!)
+    - Note 6178 (0.0025 ZCL) wrongly marked as spent
+  - **Solution**: Disabled FIX #1084 v2 + one-time repair to unmark note 6178
+  - **Files Modified**: WalletDatabase.swift, WalletManager.swift
+- FIX #1109: CRITICAL - WITNESSES Array Accumulating Across Rebuild Cycles (350 vs 23)
+  - **Problem**: User saw "total: 350 witnesses" in logs when only ~23 notes
+  - **Root Cause**: `treeCreateWitnessForCMU()` FFI pushes to WITNESSES array, but rebuild loops never cleared it first
+  - **Solution**: Call `witnessesClear()` before witness creation loops
+  - **Files Modified**: WalletManager.swift, FilterScanner.swift
+- FIX #1108: CRITICAL - Prevent Concurrent Witness Rebuilds (5GB+ Memory, 600% CPU)
+  - **Problem**: App consuming 5GB+ memory and 600%+ CPU
+  - **Root Cause**: `rebuildWitnessesForSpending()` lacked concurrency guard - multiple simultaneous rebuilds
+  - **Solution**: Added `witnessRebuildLock` + `isRebuildingWitnesses` guard
+  - **Files Modified**: WalletManager.swift
+- FIX #1107: CRITICAL - Balance Decreasing Due to Wrong Witness Size Check (838 vs 1028)
+  - **Problem**: Balance steadily decreased while app was running (0.90360001 → 0.89620001 ZCL)
+  - **Root Cause**: Witness size validation assumed full-depth tree (1028 bytes)
+    - Actual witness: 838 bytes (tree depth ~26, not 32)
+    - Encrypted: 838 + 28 = 866 bytes < 1028 minimum = excluded from balance!
+  - **Solution**: Changed minimum from 1028 to 100 bytes in all witness validation
+  - **Files Modified**: WalletDatabase.swift, TransactionBuilder.swift, FilterScanner.swift, WalletHealthCheck.swift, WalletManager.swift
+- FIX #1106: False "Received ZCL" Fireworks During Startup/Sync
+  - **Problem**: App showed "Received 0.0002 ZCL" fireworks popup during startup when no real incoming TX
+  - **Root Cause**: Balance fluctuates during sync as notes are discovered/verified - incorrectly triggers fireworks
+  - **Solution**: Added `isSyncing || FilterScanner.isScanInProgress` check before showing fireworks
+  - **Files Modified**: System7Components.swift
+- FIX #1105: PERFORMANCE - FIX #603 Periodic Witness Refresh Triggering Redundant 13K Block Scans
+  - **Problem**: After app startup, FIX #603's periodic witness refresh (every ~10 min) triggers 13K block scan
+  - **Root Cause**: FIX #603 used `effectiveTreeHeight` (boost file end = 2,988,797) to determine "downloaded range"
+    - Notes at heights 2,997,xxx seen as "beyond downloaded range" when wallet synced to 3,002,461
+    - Triggered full PHASE 2 rescan every 10 minutes while app was running
+  - **Solution**: Use `lastScannedHeight` from database instead of boost file end:
+    ```swift
+    let dbLastScanned = WalletDatabase.shared.getLastScannedHeight()
+    let downloadedTreeHeight = dbLastScanned > 0 ? UInt64(dbLastScanned) : ZipherXConstants.effectiveTreeHeight
+    ```
+  - **Files Modified**: WalletManager.swift (FIX #603 witness refresh function, line ~6795)
+- FIX #1104: CRITICAL - Prevent Repeated Full Rescan Loop (28+ Minute Startup Fix)
+  - **Problem**: App startup took 28+ minutes due to Full Rescan being triggered every time
+  - **Root Cause**: Balance Integrity check detected "missing balance" (0.90 vs 0.94 ZCL) and triggered Full Rescan repeatedly
+  - **Solution**: After Full Rescan's balance verification passes, set `FIX1104_BalanceVerifiedTimestamp`. On next startup, if within 24h, return non-critical failure (doesn't trigger FIX #1078)
+  - **Files Modified**: WalletManager.swift, WalletHealthCheck.swift
+- FIX #1103: CRITICAL - Skip Redundant FIX #1084 Scan When FIX #1089 Already Verified
+  - **Problem**: After Full Rescan completes, UI stays stuck for 10+ minutes waiting for redundant 73K block nullifier scan
+  - **Root Cause**: Two separate verification functions with different checkpoints - FIX #1089 sets `FIX1089_FullVerificationComplete=true` but FIX #1084 doesn't check this flag
+  - **Solution**: Added check at start of FIX #1084 (`verifyNullifierSpendStatus`) to skip if `FIX1089_FullVerificationComplete` is true
+  - **Files Modified**: WalletManager.swift
+- FIX #1102: CRITICAL - Balance Shows 0 After FIX #1078 Triggers Full Rescan (Race Condition)
+  - **Problem**: Balance shows 0 ZCL after FIX #1078 auto-triggers Full Rescan during INSTANT START
+  - **Root Cause**: Race condition - background sync left `isScanInProgress=true`, Full Rescan's `startScan()` checked this flag and returned immediately with "Scan already in progress, skipping" - but notes were already deleted!
+  - **Log Evidence**: `"⚠️ Scan already in progress, skipping"` followed by `"Full Rescan complete in 1s"` (impossible!)
+  - **Solution**: Added `FilterScanner.forceClearScanInProgressForRepair()` - called before Full Rescan's scan to ensure it actually runs
+  - **Files Modified**: FilterScanner.swift, WalletManager.swift
+- FIX #1101: PERFORMANCE - Skip Redundant 73K Block Scan After Full Rescan
+  - **Problem**: Full Rescan took 5:37, with 76s spent on redundant FIX #1089 verification
+  - **Solution**: Set `FIX1089_FullVerificationComplete=true` after PHASE 2 completes
+  - **Files Modified**: FilterScanner.swift
+- FIX #1079: Progress Display Fixes (Monotonic + Hide Unused Tasks)
+  - **Problem**: Progress going backward, tasks that never execute showing in list
+  - **Root Cause**: Progress calculated based on ALL tasks including pending ones → denominator fluctuated
+  - **Solution**:
+    1. Only show tasks with status != pending (filter out unused tasks)
+    2. `maxDisplayedProgress` state tracks max progress, returns `max(raw, max)` to never decrease
+    3. Progress formula: `effectiveComplete / activeTasks` (only tasks that started)
+  - **Files Modified**: ContentView.swift (currentSyncProgress, rawSyncProgress, currentSyncTasks)
+- FIX #1078: Auto-Trigger Full Rescan When Balance Corruption Detected
+  - **Problem**: Balance corruption detected (0.0175 vs 0.93 ZCL) but required manual Full Resync
+  - **Solution**: Auto-trigger `repairNotesAfterDownloadedTree(forceFullRescan: true)` when Balance Integrity fails
+  - Applied to INSTANT START, FAST START, and FULL START paths
+  - **Files Modified**: ContentView.swift (3 locations)
+- FIX #1077: Auto-Handle Health Issues + Remove localhost in ZipherX Mode
+  - **Problem 1**: "in zipherx mode NO 127.0.0.1 must be hardcoded !!!" - localhost always fails in P2P mode
+  - **Problem 2**: "Connection Lost" and "Health Issue" warnings requiring user action
+  - **Solution 1**: Skip localhost (127.0.0.1) in `discoverPeers()` when NOT Full Node mode
+  - **Solution 2**: Auto-trigger recovery instead of showing alerts:
+    - Connection Lost → auto `recoverPeers()` (no alert)
+    - Headers behind → auto `HeaderSyncManager.syncHeaders()` (no alert)
+    - Wallet behind → auto `backgroundSyncToHeight()` (no alert)
+  - **Files Modified**: NetworkManager.swift (discoverPeers, performHealthCheck)
+- FIX #1076: CRITICAL - Detect Missing Balance (Notes < History)
+  - **Problem**: Verification marked "VALID" when notes balance < history balance (missing ~0.92 ZCL!)
+  - **Root Cause**: Only checked `changeInBalance > 0`, not when notes < history
+  - **Solution**: Add check for `changeInBalance < 0` → mark INVALID when notes missing
+  - **Files Modified**: WalletDatabase.swift (verifyBalanceIntegrity)
+- FIX #1075 v2: CRITICAL - Wallet Must NEVER Regress (Smart Checkpoint Protection)
+  - **Problem v1**: Original was too strict - blocked ALL writes below checkpoint (even catch-up)
+  - **Problem**: Wallet could regress, losing synced state
+  - **Root Cause**: No check prevented `height < currentLastScannedHeight` (regression)
+  - **Solution v2**: Smart two-part check:
+    1. Block if `height < currentLastScannedHeight` (can't go backwards)
+    2. Block if was at checkpoint and trying to go below it
+    3. Allow catch-up (progress forward even if below checkpoint)
+  - **Files Modified**: WalletDatabase.swift (updateLastScannedHeight)
+- FIX #1074: CRITICAL - Scan Timeout Based on PROGRESS, Not Start Time (Wallet Regression Fix)
+  - **Problem**: Wallet regressed ~10,000 blocks even though scan was actively working
+  - **Root Cause**: FIX #873's timeout was based on scan START time (10 min), not PROGRESS time
+    - Scan was actively fetching blocks but got killed because >10 min passed since start
+    - Wallet went from ~3,002,224 back to 2,992,477 (lost ~10,000 blocks!)
+  - **Solution**: Track `_lastProgressTime` separately from `_scanStartTime`
+    - Increased timeout to 15 minutes with NO PROGRESS (was 10 min from start)
+    - Added `updateScanProgress()` calls at all checkpoint save locations (8 total)
+    - Now scan only killed if 15 minutes pass with NO progress at all
+  - **Files Modified**: FilterScanner.swift (8 locations)
+- FIX #1073: CRITICAL - P2P Verification Failure Not Recorded as Rejection (False Broadcast Success)
+  - **Problem**: TX rejected but app showed "broadcast success" and tracked TX for confirmation
+  - **Root Cause**: When FIX #935 detected P2P verification failed (DUPLICATE but TX not in mempool), it didn't call `state.recordReject()` → `rejectCount` stayed at 0 → FIX #990 assumed "peers might have accepted"
+  - **Underlying Issue**: Witness anchor mismatch (FIX #873 scan interruption corrupted tree state)
+  - **Solution**: Call `state.recordReject()` when P2P verification fails in FIX #935, FIX #515, and FIX #389 paths
+  - **Files Modified**: NetworkManager.swift (3 locations)
+- FIX #1097: Preferred Peer Selection for Header Sync AND Block Fetch (fPreferredDownload)
+  - **Problem**: Header sync and block fetch should use best/fastest peers first (whitelisted peers)
+  - **Solution**: `isPreferredForDownload` property (localhost + hardcoded seeds) + 1000 score bonus
+  - **Result**: Preferred peers ALWAYS tried first for both headers (gates everything) and blocks
+  - **Protocol limits**: Headers = 160 per request, Blocks = 128 per request
+  - **Files**: Peer.swift, NetworkManager.swift, HeaderSyncManager.swift
+- FIX #1095: PERFORMANCE - Utilize ALL Available Peers for Maximum P2P Throughput
+  - **Problem**: P2P fetch used only 2-4 peers even when 6 available (user: "why 160 blocks 6 peers?")
+  - **Root Cause**: `getBlocksDataP2P()` calculated "peers needed" and ignored extras
+    - OLD: 500 blocks ÷ 128 = 4 peers needed → 2 peers sat IDLE!
+  - **Solution**: Use ALL available peers, distribute blocks evenly
+    - Dynamic batch size: `peerCount × 128` (e.g., 6 peers × 128 = 768 blocks/round)
+  - **Performance**: 1.5x faster (6 peers × 84 blocks each vs 4 peers × 125 blocks)
+  - **Files**: NetworkManager.swift, WalletManager.swift, FilterScanner.swift
+- FIX #1094: PERFORMANCE - Remove Slow Sequential Fallback on Broken Peers
+  - **Problem**: Batch fetch failure → sequential fallback with 10s timeout per block
+  - **Solution**: Return empty immediately, let coordinator retry with different peers
+- FIX #1093: PERFORMANCE - Single-Pass Nullifier Verification (22x Faster)
+  - **Problem**: Scanned 72K blocks PER NOTE (22 notes × 72K = 1.58M block fetches!)
+  - **Solution**: Build nullifier lookup set, scan blocks ONCE → 72K blocks total
+- FIX #1092 v2: Skip FIX #1084 During Any Full Scan (Prevents 72K Block Stall)
+  - **Problem**: Any full scan (FULL START, Import PK, Full Rescan) stuck at 100% for 20+ minutes
+  - **Root Cause v1**: FIX #1092 only checked `isRepairingDatabase` - but FULL START has same issue!
+  - **Root Cause v2**: After PHASE 2, FilterScanner runs FIX #1084 which verifies nullifiers via P2P
+    - Scans from oldest note (~2,929,119) to chain tip (~3,001,400) = 72,293 blocks
+    - Blocks Full Rescan completion → `isTreeLoaded=false` → background sync blocked
+  - **Why redundant**: Any full scan JUST scanned all blocks - spends already detected!
+  - **Solution v2**: New `isFullScanInProgress` instance variable, set in all full scan paths
+  - **Files Modified**: FilterScanner.swift
+- FIX #1091 v3: CRITICAL - Auto Full Rescan When Nullifiers Fixed (Balance Correct at Startup!)
+  - **Problem**: After fixing nullifiers, app tried slow 72,000 block P2P scan (unreliable, times out)
+  - **Root Cause**: `verifyAllUnspentNotesOnChain()` scans from oldest note to chain tip via P2P
+    - 72,000+ blocks over P2P = hours of scanning, frequent timeouts
+    - User asked: "why at app restart in case of issue it did not perform same than full rescan?"
+  - **Solution**: When `fixedNullifiers > 0`, trigger Full Rescan instead of slow P2P verification
+    - Full Rescan uses boost file (fast) + targeted P2P (reliable)
+    - Balance accurate immediately after rescan
+  - **Migration**: Bumped to v3 (`FIX1091_V3_Applied`)
+  - **Files Modified**: ContentView.swift (2 locations), WalletManager.swift
+- FIX #1091 v2: Witness extraction now ALWAYS runs (not just when witnessIndex==0)
+- FIX #1091: Fixed wrong variable bug (`note.witnessIndex` → `position`)
+- FIX #1090 v2: CRITICAL - Nullifiers Computed with Wrong Tree Position (ROOT CAUSE of Balance Bug)
+  - **Problem**: `verifyAllUnspentNotesOnChain()` found "no external spends" despite 9 spent notes!
+  - **Root Cause**: Nullifiers computed with PLACEHOLDER positions, not real tree positions
+    - `processDecryptedNote()` used `height * 1000 + outputIndex` (COMPLETELY WRONG!)
+    - Real position is the index in the commitment tree (witnessIndex)
+    - Wrong nullifiers NEVER match blockchain nullifiers → spends not detected
+  - **Solution**: Recompute nullifiers at startup with correct positions:
+    1. For notes with `witnessIndex > 0`: Use witnessIndex as position
+    2. For notes with `witnessIndex == 0`: Extract position from witness data
+    3. Update database with correct (hashed) nullifier
+    4. Now verifyAllUnspentNotesOnChain() can detect spent notes!
+  - **v2**: Added persistent flag `FIX1090_NeedsFullVerification` + one-time migration
+    - Ensures full verification runs even if nullifiers were fixed in previous session
+    - `forceFullVerification` parameter added to `verifyAllUnspentNotesOnChain()`
+  - **Files Modified**: WalletManager.swift (new function, flags), FilterScanner.swift, ContentView.swift
+- FIX #1089: CRITICAL - Nullifier Verification Missed Historical Spends (10 ZCL Phantom Balance)
+  - **Problem**: App showed 10.74 ZCL but local node showed only 0.90 ZCL - ~10 ZCL phantom!
+  - **Root Cause**: FIX #1001 used checkpoint for verification, but checkpoint is set on TX confirm
+    - Checkpoint at 3,001,091, oldest note at 2,929,119
+    - FIX #1001 only scanned 3,001,092 → 3,001,093 (1 block!)
+    - Notes spent between 2,929,119 → 3,001,091 were NEVER detected
+  - **Solution**: Use `min(checkpoint, oldest_unspent_note_height)` as start
+    - Now scans from oldest note to ensure ALL historical spends detected
+    - After successful verification, updates checkpoint to chain height → next startup fast!
+  - **Files Modified**: WalletManager.swift (verifyAllUnspentNotesOnChain)
+- FIX #1088: CRITICAL - Balance Integrity Check Was Fundamentally Flawed
+  - **Problem**: Balance integrity check ALWAYS reported mismatch when change outputs exist
+  - **Root Cause**: Compared `notesBalance` (includes change) vs `historyBalance` (excludes change)
+    - Change outputs are NOT recorded in history as "received"
+    - So these values will NEVER match when change exists (which is normal!)
+  - **Example**: 32 unspent notes = 10.74 ZCL, but history shows 1.04 ZCL (49 genuine receives)
+    - The 9.7 ZCL difference is 59 change outputs - this is CORRECT!
+  - **Solution**: `verifyBalanceIntegrity()` now checks for ACTUAL corruption only:
+    - Negative values, impossible states, zero unspent notes when balance > 0
+    - Returns isValid=true when change exists (expected)
+  - **Files Modified**: WalletDatabase.swift, WalletHealthCheck.swift
+- FIX #1072: CRITICAL - Block Listener Lock Contention During TX Broadcast (Send Fails Fix)
+  - **Problem**: TX broadcast failed with "Lock acquisition timed out" for ALL peers - TX never sent
+  - **Root Cause 1**: Block listeners "stopped" but tasks running 13 more seconds in receive()
+    - `stopBlockListener()` force released lock but task still blocked in 15s receive timeout
+    - Task could re-acquire lock after we released it
+  - **Root Cause 2**: `sendShieldedWithProgress()` didn't set BLOCKED flag
+    - P2P fetch for witness rebuild's defer block restarted listeners
+    - Broadcast couldn't acquire locks because listeners just restarted
+  - **Solution Part 1**: Cancel connection when stopBlockListener times out (kills receive immediately)
+  - **Solution Part 2**: Set BLOCKED flag at start of send flow, clear in defer
+  - **Files Modified**: Peer.swift, WalletManager.swift
+- FIX #894: CRITICAL - GCD Timeout for Local Block Listener Stop (App Hang Fix)
+  - **Problem**: App stuck at "Reaching consensus" - header sync hangs indefinitely
+  - **Root Cause**: NetworkManager's `stopAllBlockListeners()` used `Task.sleep` for timeout
+    - Swift's cooperative threading can prevent `Task.sleep` from firing on time
+    - PeerManager was fixed with FIX #829 to use GCD, but NetworkManager wasn't updated
+    - When thread pool busy: 3s timeout never fires → local peer stop never completes → app hangs
+  - **Solution**: Apply same GCD timeout pattern from FIX #829 to NetworkManager
+    - `DispatchQueue.global().asyncAfter()` runs on separate thread pool
+    - Timeout guaranteed to fire even when Swift concurrency threads are busy
+  - **NWConnection Warnings**: Separate issue - Apple framework noise from rapid peer connections
+  - **Files Modified**: NetworkManager.swift (stopAllBlockListeners)
+- FIX #893: CRITICAL - Dispatcher-Based Block Fetching (Single Reader Architecture)
+  - **Problem**: TCP stream desync caused by multiple readers competing for socket
+  - **Root Cause**: Stopping block listeners, draining sockets, direct reads = race conditions
+  - **Solution**: Block listener stays running as ONLY TCP reader
+    - Added batch collector to dispatcher for multi-message operations
+    - `getBlocksByHashes()` registers with dispatcher, sends request, waits for collection
+    - Block listener receives responses, dispatcher routes to waiting collector
+    - No more stopping/starting listeners, no more socket draining
+  - **Benefits**: No TCP desync, no lost responses, reliable block fetching
+  - **Architecture**: See [docs/FIX_893_DISPATCHER_ARCHITECTURE.md](./docs/FIX_893_DISPATCHER_ARCHITECTURE.md)
+  - **Files Modified**: Peer.swift (dispatcher + getBlocksByHashes), NetworkManager.swift
+- FIX #892: CRITICAL - Disconnect After Stream Resync (Block Data Lost During Scan)
+  - **Problem**: FIX #891 resync successful but block fetches still return 0 blocks
+  - **Root Cause**: When scanning forward for magic bytes, we CONSUME the block responses
+    - `getdata` sent → peer sends blocks → but we're scanning through stale data
+    - The 300-500 scanned bytes contained our block responses!
+    - We sync to an OLD message, block responses never arrive → timeout
+  - **Solution**: After successful resync, disconnect and throw `streamDesync` error
+    - Caller's reconnect logic establishes fresh connection
+    - Fresh connection = no stale data = blocks arrive correctly
+  - **Files Modified**: Peer.swift (receiveMessage), NetworkManager.swift (new error)
+- FIX #891: TCP Stream Resynchronization via Magic Byte Scanning
+  - **Problem**: P2P stuck in infinite loop - every peer unusable after block listeners stopped
+  - **Root Cause**: FIX #919 closed connection on invalid magic, but reconnection didn't help
+  - **Research**: Bitcoin P2P protocol uses magic bytes to "seek to next message when stream state is unknown"
+  - **Solution**: Scan forward byte-by-byte to find next valid magic bytes (up to 512KB)
+  - **Note**: FIX #892 now disconnects after resync since scanned data is lost
+  - **Files Modified**: Peer.swift (receiveMessage)
+- FIX #890: CRITICAL - Sends Not Instant Due to Incorrect FIX #1018 Header Comparison
+  - **Problem**: Every send triggered slow witness rebuild (60+ seconds) instead of instant send
+  - **Root Cause**: FIX #1018 compared witness anchor to header root at NOTE HEIGHT
+    - `preRebuildWitnessesForInstantPayment()` builds witnesses at CHAIN TIP
+    - Witness anchor = chain tip root ≠ note height root → "anchor mismatch!" → rebuild
+  - **Solution**: Disabled FIX #1018's header comparison
+    - Sapling accepts ANY historical anchor - doesn't have to match note height
+    - Trust non-zero witness anchor for instant send
+  - **Files Modified**: TransactionBuilder.swift
+- FIX #889: CRITICAL - Auto-Fix Spent Notes at Startup (No Manual Repair Required)
+  - **Problem**: User had to manually "Repair Database" to fix balance issues
+  - **Scenarios**: TX confirmed but network lost, external wallet spent note, notes incorrectly marked unspent
+  - **Solution**: Automatic verification at INSTANT START and FAST START
+    - `cleanOrphanedPendingTransactions()` - cleans phantom TXs
+    - `verifyAllUnspentNotesOnChain()` - detects external spends
+  - **Files Modified**: ContentView.swift
+- FIX #888: CRITICAL - Phantom TX False Positive When Network Disconnected
+  - **Problem**: Confirmed TX deleted as "phantom" when network temporarily unavailable
+  - **Solution**: Return tristate from verification functions (true/false/nil)
+    - nil = unable to verify → KEEP TX (don't delete)
+  - **Files Modified**: NetworkManager.swift, WalletManager.swift, WalletHealthCheck.swift
+- FIX #877: Socket Draining After Every Block Listener Stop Operation
+  - **Problem**: "INVALID MAGIC BYTES" errors still occurring despite FIX #875 v2
+  - **Root Cause**: Many places stop block listeners but don't drain sockets AFTER the call returns
+    - FIX #875 v2 drains inside stopAllBlockListeners, but caller may continue immediately
+    - Short timeouts (3s) don't allow full draining
+  - **Solution**: Explicit socket drain after EVERY `stopAllBlockListeners()` call
+    - getBlocksDataP2P: Increased timeout to 5s + added drain
+    - preRebuildWitnessesForInstantPayment, repairUnrecordedSpends: Added drain
+    - validateCMUTreeBeforeSend, validateTreeRootAtStartup: Added drain
+    - TransactionBuilder (2 locations): Added drain
+  - **Files Modified**: NetworkManager.swift, WalletManager.swift, TransactionBuilder.swift
+- FIX #876: CRITICAL - Automatic Balance Fix at Startup (Notes Without Witnesses)
+  - **Problem**: Balance showing WRONG - notes without witnesses excluded from `getBalance()`
+  - **User complaint**: "if the balance is not accurate then the app should not show the balance !!!!"
+  - **Root Cause**: When delta CMU collection fails (P2P issues, FIX #756), notes in delta range have no witnesses
+    - `getBalance()` uses `WHERE witness IS NOT NULL` → notes without witnesses excluded
+    - 7 notes without witnesses → balance shows 0.0104 ZCL instead of full amount
+  - **Solution**: New health check + auto-repair at startup
+    - Health check `checkNotesWithoutWitnesses()` detects notes missing witnesses
+    - If detected in delta range: Clear stale delta → Reset lastScannedHeight → Full rescan
+    - Collects ALL delta CMUs → Witnesses computed → Correct balance displayed
+  - **Files Modified**: WalletDatabase.swift, WalletHealthCheck.swift, ContentView.swift
+- FIX #875 v2: CRITICAL - P2P Network Instability After Stopping Block Listeners (TCP Stream Desync)
+  - **Problem**: "INVALID MAGIC BYTES" errors immediately after stopping block listeners
+  - **Root Cause**: Block listener stopped mid-receive of large response (block data can be 1MB+)
+    - Remote peer continues sending → stale data in socket buffer
+    - Next P2P operation reads stale data → invalid magic bytes → connection reset
+  - **v1 problem**: 50ms timeout too short for large in-flight responses
+  - **v2 Solution**: Aggressive two-pass draining:
+    - Longer timeout (200ms), more iterations (20), larger buffer (256KB)
+    - Requires 3 consecutive empty rounds to confirm buffer is clear
+    - 500ms settling delay between drain passes to let final TCP packets arrive
+    - Second drain pass catches late arrivals
+  - **Files Modified**: Peer.swift, PeerManager.swift
+- FIX #874: CRITICAL - Deep Verification Adds CMUs to Tree But NOT to Delta Bundle
+  - **Problem**: Tree root mismatch at send time after Deep Verification runs
+  - **Root Cause**: Deep Verification (FIX #370) scans blocks and finds outputs that previous scans MISSED
+    - FIX #795 disables delta collection when manifest says it "covers" target height
+    - But Deep Verification still processes blocks and appends CMUs to TREE
+    - CMUs NOT added to DELTA bundle (collection disabled) → tree/delta out of sync
+    - Example: Tree had 1,046,438 CMUs, delta had only 741 (10 extra in tree)
+  - **Solution**: Track outputs found when delta is "disabled", update delta at end of scan
+    - New `deltaOutputsFoundInCoveredRange` array tracks these outputs
+    - At end of scan, if any found, update delta bundle to keep in sync
+  - **Files Modified**: FilterScanner.swift
+- FIX #873: CRITICAL - Block Ordering Bug + Missing Blocks Detection in Delta CMU Sync
+  - **Problem**: Transaction sends failing with "joinsplit requirements not met" after delta CMU sync
+  - **Root Cause 1**: `getBlocksByHashes()` returns blocks in RECEIVE order (not request order)
+    - Code assumed blocks arrive in request order, matched by INDEX → CMUs in wrong order
+    - Wrong CMU order → wrong tree root → invalid anchor
+  - **Root Cause 2**: `getBlocksDataP2P()` can return <100% of requested blocks (only fails at 10%)
+    - Missing blocks = incomplete delta CMUs → wrong tree root
+    - FIX #799 skips header verification above boost file → undetectable
+  - **Solution Part 1**: Match blocks by HASH instead of INDEX
+    - Created `hashToHeight` dictionary for correct height matching
+  - **Solution Part 2**: Track all fetched heights, retry missing blocks individually
+    - After batch, compare expected vs received heights
+    - Retry up to 50 missing blocks individually before proceeding
+  - **Files Modified**: NetworkManager.swift (hash-based matching), WalletManager.swift (missing block tracking/retry)
+- FIX #1068: CRITICAL - Load Tree from Database After Full Rescan (Not Boost File)
+  - **Problem**: After Full Rescan completes, next INSTANT START loads tree from boost file instead of database
+    - Full Rescan scans to chain tip and saves tree to database (correct)
+    - INSTANT START always loads from boost file (up to height 2,988,797) + delta CMUs
+    - If delta bundle doesn't cover chain tip → tree root mismatch → send blocked
+  - **Root Cause**: INSTANT START never checked if database has a more current tree
+    - Line 400-401 in ContentView.swift: `extractSerializedTree()` always used
+    - After Full Rescan, `lastScannedHeight` > `deltaEndHeight` but tree loaded from boost anyway
+  - **Solution**: Check database tree height vs boost + delta BEFORE loading
+    - If `dbLastScanned > deltaEndHeight`, load from database (Full Rescan result)
+    - Only use boost file + delta if database tree is not more current
+  - **Files Modified**: ContentView.swift (INSTANT START tree loading section)
+- FIX #1067: Convert Hex String CMUs to Data Format in P2P Fetch
+  - **Problem**: Compile error "Cannot convert value of type 'String' to expected argument type 'Data'"
+  - **Root Cause**: `getBlocksDataP2P()` returns `ShieldedOutput` where `cmu` is a hex String
+    - But `fetchCMUsFromBlocks()` needs `[Data]` for tree operations
+    - FIX #1065/1066 switched from direct peer access to `getBlocksDataP2P()` API
+    - API returns CMUs as hex strings, not Data bytes
+  - **Solution**: Convert hex string to Data before appending to CMU array
+    - `if let cmuData = Data(hex: output.cmu) { allCMUs.append(cmuData) }`
+    - Applied to both P2P fetch paths in TransactionBuilder
+  - **Files Modified**: TransactionBuilder.swift (2 locations in fetchCMUsFromBlocks)
+- FIX #1066: CODEBASE-WIDE - Fix All P2P Protocol Limit Violations (160 block limit)
+  - **Problem**: Multiple locations called `peer.getFullBlocks()` with counts > 160
+    - P2P protocol limits to 160 blocks per request (MAX_HEADERS_RESULTS)
+    - Affected: TransactionBuilder (2 paths), ContentView (1 path), NetworkManager (getBlocksOnDemandP2P)
+  - **Locations Fixed**:
+    1. **TransactionBuilder.swift PRIORITY 2**: Now uses `getBlocksDataP2P()` with proper pagination
+    2. **TransactionBuilder.swift partial coverage**: Now uses `getBlocksDataP2P()`
+    3. **ContentView.swift delta CMU fetch**: Now uses `getBlocksOnDemandP2P()`
+    4. **NetworkManager.getBlocksOnDemandP2P()**: Added INTERNAL pagination (128 blocks per batch)
+  - **Solution**: `getBlocksOnDemandP2P()` now paginates internally:
+    - Caps each P2P request to 128 blocks (MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+    - Loops until all requested blocks are fetched
+    - Returns partial results if some batches fail
+  - **Files Modified**: TransactionBuilder.swift, ContentView.swift, NetworkManager.swift
+- FIX #1065: CRITICAL - Use Paginated P2P Fetch for Delta CMUs (1.4% → 100% Fix)
+  - **Problem**: P2P delta CMU fetch only got 160/11,070 blocks (1.4%) - "Peer returned only 160/11070 blocks"
+  - **Root Cause**: `peer.getFullBlocks()` tried to get ALL blocks in single request
+    - P2P protocol limits to 160 blocks per request (MAX_HEADERS_RESULTS)
+    - Requesting 11,070 blocks → peer returns only 160 → 1.4% coverage
+    - Witnesses built with incomplete CMUs → wrong anchor → TX rejected
+  - **Solution**: Use `NetworkManager.getBlocksDataP2P()` which properly paginates
+    - Requests 500 blocks at a time, 128 per peer (MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+    - Multiple peers fetch in parallel for speed
+    - Already handles timeouts and retries
+  - **Files Modified**: TransactionBuilder.swift (fetchCMUsFromBlocks PRIORITY 2 section)
+- FIX #1064: CRITICAL - Remove InsightAPI Fallback + Wait for Peers Before P2P Fetch
+  - **Problem**: "InsightAPI failures: 11070/11070" in logs - InsightAPI should NEVER be used in ZipherX P2P mode
+  - **Root Cause 1**: InsightAPI fallback code still ran when P2P failed, even though API was disabled (FIX #120)
+    - P2P fails at startup (no peers connected yet)
+    - Code falls through to InsightAPI loop (11,070 iterations!)
+    - Each iteration fails because `fetchCMUsViaInsight()` is disabled
+    - Wastes time and creates confusing logs
+  - **Root Cause 2**: No wait for peers before P2P fetch
+    - Witness rebuild runs immediately at startup
+    - Peers take 10-30 seconds to connect
+    - P2P fetch fails instantly with 0 peers
+  - **Solution Part 1**: REMOVED InsightAPI fallback entirely
+    - ZipherX is P2P ONLY - no centralized APIs
+    - If P2P fails, return empty and let caller retry
+  - **Solution Part 2**: Wait for peers before P2P fetch (up to 30s)
+    - If no peers connected, wait in 1s increments
+    - Log progress every 10 seconds
+    - Only proceed with P2P fetch when peers are available
+  - **Files Modified**: TransactionBuilder.swift (fetchCMUsFromBlocks)
+- FIX #1063 v3: CRITICAL - Auto-Repair Corrupted Tree at STARTUP + Precise Size Validation
+  - **Problem**: Send blocked with "TREE ROOT MISMATCH" despite Full Resync - tree has 1,048,480 CMUs but should have ~1,046,288
+  - **Root Cause**: FIX #568 v2 reuses tree in memory without verifying size is correct
+    - Tree from previous corrupted run had ~2,192 extra duplicate CMUs
+    - Previous v2 used 10K buffer tolerance which was too loose
+    - Corrupted tree persisted even after Full Resync (tree exists in FFI memory)
+  - **Solution Part 1** (on send): When FIX #936 detects tree root mismatch, AUTO-REPAIR:
+    - Clear FFI tree with `treeInit()`
+    - Clear database tree state with `clearTreeStateForRebuild()`
+    - Clear delta bundle (may contain corrupted CMUs)
+    - Invalidate tree validation cache
+  - **Solution Part 2** (v3 - at STARTUP): FIX #568 v2 now does PRECISE size check:
+    - Calculate expected size: boost CMUs + delta bundle CMU count
+    - Compare FFI tree size against expected (100 CMU tolerance)
+    - If mismatch (e.g., 1,048,480 vs expected 1,046,288), clear FFI tree AND delta bundle
+    - Tree reloads from boost file on startup - no user action needed
+  - **Files Modified**: WalletManager.swift (FIX #936 mismatch handler, FIX #568 v2 precise size check)
+- FIX #1062: CRITICAL - Stop Block Listeners Before P2P Delta CMU Fetch (100% Failure Fix)
+  - **Problem**: Witness rebuild had 100% P2P fetch failure rate with "Invalid magic bytes" errors
+  - **Root Cause**: Block listeners running during P2P delta CMU fetch in `fetchCMUsFromBlocks()`
+    - Block listeners consume P2P responses in a loop
+    - P2P delta CMU fetch tries to read responses but gets wrong message types
+    - TCP stream becomes desynchronized → "Invalid magic bytes" errors
+    - 10,902/10,902 blocks failed to fetch → witnesses not rebuilt properly
+  - **Solution**: Stop block listeners BEFORE P2P delta CMU fetch, resume after
+    - Added to PRIORITY 2 P2P path (full fetch from scratch)
+    - Added to partial coverage path (delta bundle + P2P for remaining blocks)
+    - Uses `ensureAllBlockListenersStopped()` with 3 retries (same as FIX #1054/1056/1058)
+    - Resumes listeners after fetch completes (success or failure)
+  - **Files Modified**: TransactionBuilder.swift (fetchCMUsFromBlocks function - 2 P2P paths)
+- FIX #1061: Health Check Debug Logging + Early Return Investigation
+  - **Problem**: Features blocked even when wallet caught up to within 100 blocks
+  - **Investigation**: Added debug logging to track why health check not unblocking features
+    - Log when performHealthCheck() called and current blockedFeatures
+    - Log snooze period check
+    - Log headerStore vs chainHeight comparison
+    - Log walletHeight vs chainHeight comparison
+  - **Files Modified**: NetworkManager.swift (performHealthCheck debug logging)
+- FIX #1060: CRITICAL - Block Broadcast When Anchor Mismatch Detected
+  - **Problem**: TX broadcast showed "CLEARED" but blockchain rejected with "joinsplit requirements not met"
+  - **Root Cause**: FIX #718 detected anchor != FFI tree root but only logged WARNING
+    - FIX #821 then overrode by trusting VUL-002 (set `anchorFound = true`)
+    - TX was broadcast despite known anchor mismatch
+  - **Solution**: When above boost file AND anchor != FFI root, throw error immediately
+    - Don't let FIX #821 override when we've positively detected corruption
+    - Clear error message instructs user to run Repair Database
+  - **Files Modified**: NetworkManager.swift (broadcastTransaction FIX #718 section)
+- FIX #1059: CRITICAL - Auto-Rebuild Corrupt Witness Before TX Build
+  - **Problem**: TX rejected with "joinsplit requirements not met" but app showed "CLEARED"
+  - **Root Cause**: Witness created with corrupted tree has anchor that never existed on blockchain
+    - FIX #838 only checks internal consistency (both wrong values match each other)
+    - FIX #1059 was only in `buildShieldedTransaction` but app uses `buildShieldedTransactionWithProgress`!
+  - **Solution**: Added FIX #1059 to BOTH code paths in `buildShieldedTransactionWithProgress`:
+    - Single-input path (after line 1269): Verify anchor, rebuild witness if mismatch
+    - Multi-input path (after line 1082): Verify all witness anchors, throw if mismatch
+    - Extract position from old witness, get fresh witness from FFI tree
+  - **Files Modified**: TransactionBuilder.swift (2 code paths)
+- FIX #1058: Force-Disconnect Stuck Block Listeners
+  - **Problem**: Block listeners don't stop within timeout, causing persistent "Invalid magic bytes" errors
+  - **Root Cause**: Setting `isListening=false` doesn't stop listener blocked in network I/O
+    - `stopAllBlockListeners()` times out after 5s and "proceeds anyway"
+    - Stuck listeners continue consuming P2P responses meant for other operations
+  - **Solution**: Force-disconnect peers whose listeners don't stop after max retries
+    - Updated `ensureAllBlockListenersStopped()` to call `peer.disconnect()` on stuck listeners
+    - Updated FIX #1054/1056/1057 v2 to use this stricter function
+  - **Files Modified**: PeerManager.swift
+- FIX #1057 v2: P2P Race Condition in repairUnrecordedSpends (Block Listener Interference)
+  - **Problem**: P2P fetch at line 8859 can have responses consumed by block listeners
+  - **Root Cause**: Called after repairNotesAfterDownloadedTree() defer unblocks listeners
+  - **Solution v2**: Use `ensureAllBlockListenersStopped()` which force-disconnects stuck listeners
+  - **Files Modified**: WalletManager.swift
+- FIX #1056 v2: P2P Race Condition in preRebuildWitnessesForInstantPayment (Delta CMU Fetch)
+  - **Problem**: Delta CMU P2P fetch doesn't stop block listeners
+  - **Root Cause**: When called from backgroundSyncToHeight(), FilterScanner has unblocked listeners
+  - **Solution v2**: Use `ensureAllBlockListenersStopped()` which force-disconnects stuck listeners
+  - **Files Modified**: WalletManager.swift
+- FIX #1055: CRITICAL - Full Rescan Failure Leaves Wallet with Zero Balance
+  - **Problem**: Wallet shows 0 balance after startup - notes table empty but history exists
+  - **Root Cause**: FIX #1011 catch block only printed error, didn't prevent main UI showing
+    - Full Rescan deletes notes FIRST, then scans - if scan fails, notes gone forever
+    - Error caught but code continued → user sees empty wallet
+  - **Solution**: Return from error handler (like FIX #439), show "run Full Resync" message
+  - **Recovery**: User must run Settings → Repair Database → Full Resync
+  - **Files Modified**: ContentView.swift
+- FIX #1054 v2: P2P Block Fetch Fails with "Invalid magic bytes" (Block Listener Race)
+  - **Problem**: Delta CMU fetch fails with "Invalid magic bytes: got 01010000"
+  - **Root Cause**: FIX #994 calls `getFullBlocks()` WITHOUT stopping block listeners
+    - Block listeners consume P2P responses (same as FIX #383, #1037)
+    - Fetch reads from middle of message → invalid magic bytes
+  - **Solution v2**: Use `ensureAllBlockListenersStopped()` which force-disconnects stuck listeners
+  - **Files Modified**: ContentView.swift
+- FIX #1053: CRITICAL - Tree Root Mismatch from Double CMU Append (Repair Database at Startup)
+  - **Problem**: "Repair Database recommended" shown at startup due to tree root mismatch
+  - **Root Cause**: FIX #370 deep verification triggered PHASE 2 AFTER delta sync
+    - Delta sync updated tree to 2999127 ✅
+    - FIX #370 scan started from 2998984, triggering PHASE 2
+    - PHASE 2 tried to append CMUs again → tree corrupted
+  - **Solution**: Added `skipTreeModification` flag when delta sync already covers target
+  - **Files Modified**: FilterScanner.swift
+- FIX #1052: Send UI Stuck at "Activating Groth16 prover" + RPC Log Spam
+  - **Problem 1**: Send UI shows "Activating Groth16 prover" but stays stuck
+  - **Root Cause**: UI step marked in progress before actual prover callback
+    - WalletManager does witness update, tree validation BEFORE sending "prover" callback
+    - "verify" callbacks not displayed on the "prover" step
+  - **Solution 1**: Show "verify" callbacks (witness, tree) on "prover" step
+    - Renamed to "Preparing secure transaction"
+  - **Problem 2**: RPC logs spam console every 5 seconds in Full Node mode
+  - **Solution 2**: Suppress routine RPC polling logs
+  - **Files Modified**: SendView.swift, RPCClient.swift, FullNodeManager.swift
+- FIX #1051: CRITICAL - Recover from Corrupted lastScannedHeight (5+ Minute Startup Fix)
+  - **Problem**: App took 5+ minutes because FULL START used when FAST START should work
+  - **Root Cause**: `lastScannedHeight=0` but `checkpoint=2999001` (checkpoint exists!)
+    - FAST START requires `lastScannedHeight > 0`, no recovery mechanism existed
+  - **Solution**: If checkpoint exists but lastScannedHeight=0, restore from checkpoint
+    - Uses `effectiveLastScanned` throughout startup path
+    - Result: FAST START used → <10 second startup
+  - **Files Modified**: ContentView.swift
+- FIX #1050: Suppress Routine Log Noise (Cleaner Console)
+  - **Problem**: Console flooded with routine status messages every 10-30 seconds
+  - **Note**: `nw_connection_*_endpoint` warnings are from Apple's Network framework - can't suppress
+  - **Solution**: Suppress routine status logs, keep error/warning logs
+    - Block listener start, peer version, health checks, height updates, etc.
+  - **Files Modified**: Peer.swift, NetworkManager.swift, WalletManager.swift, FilterScanner.swift, ZipherXFFI.swift, WalletDatabase.swift
+- FIX #1049: Robust Confirmation Polling - Stop/Check/Restart Pattern
+  - **Problem**: TX confirmation not detected even after 4+ confirmations
+  - **Root Cause**: Passive confirmation detection insufficient
+    - `fetchNetworkStats()` runs every 15-30s (too slow)
+    - `lastScannedHeight` can regress, missing TX blocks
+    - Block listeners interfere with mempool checks
+  - **Solution**: Dedicated polling after broadcast with stop/check/restart pattern
+    - Polls every 10 seconds after broadcast
+    - Stops block listeners → checks mempool/blocks → restarts listeners
+    - Tracks broadcast height to ensure targeted scanning
+  - **Files Modified**: NetworkManager.swift
+- FIX #1048: Fast Broadcast - 500ms Silence = Success (Bitcoin/Zclassic Protocol)
+  - **Problem**: Broadcast takes 15+ seconds even though node accepts TX in <1 second
+  - **Root Cause**: Loop in `broadcastTransaction()` spawned multiple `receiveMessage()` tasks
+    - NWConnection socket reads do NOT respond to Swift task cancellation
+    - Each 200ms iteration created a new blocked task waiting for data
+  - **Key Insight**: Bitcoin/Zclassic protocol: SILENCE = SUCCESS, REJECT comes immediately (<100ms)
+  - **Solution**: Single `receiveMessageWithTimeout(seconds: 0.5)` call
+    - Timeout (silence) = TX ACCEPTED per protocol
+    - Reject message = TX failed
+  - **Files Modified**: Peer.swift (broadcastTransaction)
+- FIX #1047: Skip FIX #1018 Header Validation Above Boost File (60s→Instant Send)
+  - **Problem**: "Building Witness..." takes 60+ seconds even when witness is recent
+  - **Root Cause**: FIX #1018 compared witness anchor vs P2P header at note height
+    - P2P headers above boost file have UNRELIABLE sapling roots (FIX #796)
+    - False "anchor mismatch" triggered 47-second rebuild
+  - **Solution**: Skip header validation for notes above boost file (trust witness anchor)
+  - **Files Modified**: TransactionBuilder.swift
+- FIX #1046: No Error Dialog During Active Sync (Show "Syncing" Instead)
+  - **Problem**: Scary "Wallet Needs Update" dialog shown during normal catch-up sync
+  - **Root Cause**: FIX #409 health check showed dialog whenever wallet > 100 blocks behind
+    - Didn't check if sync was actively catching up
+    - UI already shows "Syncing" at bottom - dialog is redundant and alarming
+  - **Solution**: Check if sync in progress before showing error dialog
+    - If `WalletManager.isSyncing` or `FilterScanner.isScanInProgress`: block SEND silently, no dialog
+    - Only show dialog if wallet behind AND no sync running (truly stuck)
+  - **Files Modified**: NetworkManager.swift (performHealthCheck)
+- FIX #1045: Suppress Transient Error Log Spam in Parallel Recovery (FIX #394)
+  - **Problem**: Console flooded with "❌ FIX #394: Failed peer" for expected timeouts
+  - **Root Cause**: FIX #394 logged ALL connection failures with ❌ error emoji
+    - Transient errors (timeout, error 96 ENOMSG) are EXPECTED for unreachable peers
+    - FIX #1044 fixed maintenance loop, but parallel recovery still spammed logs
+  - **Solution**: Apply same transient error detection pattern as FIX #1044
+    - Only log with ❌ for actual protocol/peer errors
+    - Peer still parked on failure (correct behavior)
+  - **Files Modified**: NetworkManager.swift (FIX #394 catch block)
+- FIX #1044: Suppress Transient Error Log Spam in Maintenance Loop
+  - **Problem**: Console flooded with "❌ FIX #1025: Maintenance loop failed" for expected timeouts
+  - **Root Cause**: FIX #1025 logged ALL connection failures with ❌ error emoji
+    - Transient errors (timeout, connection reset) are EXPECTED for unreachable peers
+    - Not actual errors - just normal behavior when peers are offline
+  - **Solution**: Detect transient network errors and suppress logging
+    - Pattern follows FIX #869/872/879 transient error detection
+    - Only log with ❌ for actual protocol/peer errors
+  - **Files Modified**: NetworkManager.swift (FIX #1025 catch block)
+- FIX #1039: Suppress CancellationError Log Spam During Peer Connection
+  - **Problem**: Console flooded with "❌ Failed: ... CancellationError error 1" at startup
+  - **Root Cause**: FIX #1034's `group.cancelAll()` cancels remaining tasks when 3 peers connected
+    - Cancelled tasks throw `CancellationError` caught by generic catch block
+    - Expected behavior logged as error - confusing to users
+  - **Solution**: Add explicit `catch is CancellationError` to suppress logging
+    - Silent return for cancelled tasks
+    - Real failures (timeout, wrong chain) still logged
+  - **Files Modified**: NetworkManager.swift (connect function error handling)
+- FIX #1035: CRITICAL - Don't Block Sends When P2P Validation Unavailable
+  - **Problem**: Sends blocked with "Cannot validate anchor - BLOCKING SEND for safety"
+  - **Root Cause**: FIX #936 returned `isValid: false` when P2P block fetch failed
+    - P2P fetch fails early in startup (peers not fully connected yet)
+    - But witnesses were JUST updated with correct delta CMUs - anchor IS valid!
+  - **Solution**: Return `isValid: true` when P2P unavailable but witnesses recently updated
+    - P2P validation is belt-and-suspenders, not required
+    - Only block sends on CONFIRMED mismatch, not network unavailability
+  - **Files Modified**: WalletManager.swift, ContentView.swift
+- FIX #1034: PERFORMANCE - Immediate Peer Return Once Consensus Reached
+  - **Problem**: Startup waited 5+ seconds for peer timeouts even with 6 good peers connected
+  - **Root Cause**: FIX #547 required `elapsedAfterBatch > 3.0` AND `minPeersForEarlyReturn`
+    - Even with enough peers, code waited for slow peers to timeout
+    - User insight: "additional peers must not block startup"
+  - **Solution**: Return immediately once `minPeersForEarlyReturn` (3) peers connected
+    - Additional peers connect in background (FIX #429)
+    - No more 5s delay waiting for timeouts
+  - **Files Modified**: NetworkManager.swift (connect function, 2 locations)
+- FIX #1033: CRITICAL - Disable FIX #597 v2 FAST PATH (Wrong Tree Root Comparison)
+  - **Problem**: "18/23 witnesses match FFI root (78%) - need rebuild" triggered 46+ second rebuild EVERY startup
+  - **Root Cause**: FIX #597 v2 compared witness roots to CURRENT FFI tree root
+    - Sapling accepts ANY historical anchor - comparing to current root is meaningless
+    - Witnesses created at boost file height have DIFFERENT root than current tree (NORMAL!)
+  - **Solution**: Disabled FIX #597 v2 FAST PATH - use FIX #827 (internal consistency) instead
+  - **Files Modified**: WalletManager.swift (preRebuildWitnessesForInstantPayment)
+- FIX #1032: CRITICAL - Disable FIX #1021 Header Comparison (Wrong Anchor Check)
+  - **Problem**: All 23 witnesses flagged as "corrupted" at every startup
+  - **Root Cause**: FIX #1021 compared witness anchor to header root AT NOTE HEIGHT
+    - Batch-rebuilt witnesses use CURRENT tree root (valid for Sapling!)
+    - FIX #1013 already validates anchors exist in history
+  - **Solution**: Disabled FIX #1021 - FIX #827 and FIX #1013 are sufficient
+  - **Files Modified**: WalletManager.swift (preRebuildWitnessesForInstantPayment)
+- FIX #1031: CRITICAL - Change Output Incorrectly Shown as "Received" (FIX #843 Broken)
+  - **Problem**: Change from sent TX shown as "incoming" (TX 920d6ceb... showed 0.89 ZCL as received)
+  - **Root Cause**: `getNoteByNullifier()` called AFTER `markNoteSpent()` but SQL has `AND is_spent = 0`
+    - Note marked spent → query returns nil → FIX #843 never triggers → output recorded as "received"
+  - **Solution**: Get note value BEFORE marking spent, use stored value for FIX #843 check
+  - **Files Modified**: FilterScanner.swift (processShieldedOutputsSync)
+- FIX #1030: CRITICAL - Individual Note Failures Should NOT Trigger Full Rescan
+  - **Problem**: 1 note failing witness creation → Full Rescan (user: "not acceptable!")
+  - **Root Cause**: `rebuildWitnessesForNotes()` threw error on ANY single note failure
+  - **Solution**: Skip failed notes, save successful ones, only throw if ALL fail
+  - **UX**: 1/89 notes fail → 88 saved instantly, 1 rebuilt on-demand
+  - **Files Modified**: TransactionBuilder.swift, WalletManager.swift
+- FIX #1029: CRITICAL - Tree Height Not Persisted After Delta Sync
+  - **Problem**: Full delta re-synced at EVERY startup (30+ seconds wasted)
+  - **Root Cause**: `saveTreeState()` calls missing height parameter
+  - **Solution**: All 9 saveTreeState calls now include proper height
+  - **Files Modified**: WalletManager.swift
+- FIX #1028: CRITICAL - Bitcoin/Zclassic Broadcast Protocol (SILENCE = ACCEPTED)
+  - **Problem**: TX succeeded but app reported "verification failed"
+  - **Root Cause**: App expected response, but Bitcoin protocol uses SILENCE for acceptance
+  - **Solution**: No reject in 2s = SUCCESS (per Zclassic main.cpp protocol)
+  - **Files Modified**: Peer.swift
+- FIX #1027: Single Tree Build for All Witnesses (Performance 2x)
+  - **Problem**: Witness rebuild at startup took ~90 seconds (tree built TWICE)
+  - **Solution**: Build tree ONCE to chainHeight for ALL corrupted witnesses
+  - **Result**: ~90 seconds → ~45 seconds (2x improvement)
+  - **Files Modified**: WalletManager.swift
+- FIX #1026: Initial Block Download State Gate (Zclassic IsInitialBlockDownload)
+  - **Problem**: Network operations during initial sync cause failures
+  - **Solution**: Implemented IBD check with latch - gates operations until wallet synced
+  - **Files Modified**: NetworkManager.swift, WalletManager.swift
+- FIX #1025: Zclassic-style Connection Maintenance Loop
+  - **Problem**: Peer connections unreliable - too reactive, not proactive
+  - **Solution**: Continuous 500ms loop like Zclassic's ThreadOpenConnections
+  - **Files Modified**: NetworkManager.swift, PeerManager.swift
+- FIX #1023: Only Rebuild Boost-Range Witnesses at Startup (P2P Not Ready)
+  - **Problem**: FIX #1022 failed - P2P not connected at startup for delta-range notes
+  - **Solution**: Only rebuild boost-range notes at startup, delta-range fixed by FIX #569 later
+  - **Files Modified**: WalletManager.swift
+- FIX #1022: CRITICAL - Actually Rebuild Corrupted Witnesses at Startup (INSTANT SENDS!)
+  - **Problem**: FIX #1021 detected corrupted witnesses but didn't rebuild them!
+  - **Root Cause**: FIX #569 delta update only appends CMUs - doesn't fix corrupt merkle path
+  - **Solution**: Call `rebuildWitnessesForNotes()` BEFORE FIX #569 delta update
+  - **Result**: Witnesses properly rebuilt at STARTUP → INSTANT sends (no rebuild at send time!)
+  - **Files Modified**: WalletManager.swift (preRebuildWitnessesForInstantPayment)
+- FIX #1021: Validate Witness Anchors Against HeaderStore at STARTUP (Instant Sends)
+  - **Problem**: Corrupted witness detected at SEND time → slow rebuild
+  - **Solution**: Check witness anchor vs HeaderStore at note height during `preRebuildWitnessesForInstantPayment()`
+  - **Result**: Corrupted witnesses rebuilt at STARTUP → sends are INSTANT
+  - **Files Modified**: WalletManager.swift
+- FIX #1020: Defer Pending Broadcast Until P2P Verification Succeeds
+  - **Problem**: Notification flashed briefly for rejected TX
+  - **Root Cause**: FIX #1014 set pending BEFORE P2P verification
+  - **Solution**: Only set pending AFTER `verifyTxViaP2P()` returns true
+  - **Files Modified**: NetworkManager.swift
+- FIX #1019: CRITICAL - Clean Up Pending State When DUPLICATE + P2P Verify Fails
+  - **Problem**: Notification and pending balance showed for REJECTED TX
+  - **Zclassic Source**: DUPLICATE = anchor mismatch (not "already in mempool"!)
+    ```cpp
+    return state.Invalid(..., REJECT_DUPLICATE, "bad-txns-joinsplit-requirements-not-met");
+    ```
+  - **Solution**: Full cleanup in DUPLICATE + P2P verify failed path
+  - **Files Modified**: NetworkManager.swift
+- FIX #1018: CRITICAL - Validate Witness Anchor Against HeaderStore
+  - **Problem**: TX rejected even though FIX #1013 said INSTANT SEND
+  - **Root Cause**: Witness anchor from corrupted tree state not validated
+  - **Solution**: Compare anchor with HeaderStore sapling root at note height
+  - **Files Modified**: TransactionBuilder.swift
+- FIX #1017: Clear Pending UI State When P2P Verification Fails (Late Accepts)
+  - **Problem**: Send button stuck "Unavailable" after TX rejected
+  - **Solution**: Add `clearPendingBroadcast()` to FIX #985 path
+  - **Files Modified**: NetworkManager.swift
+- FIX #1016: CRITICAL - Quick Fix Should Accept 80%+ Valid Witnesses (Prevent 3+ Min Startup)
+  - **Problem**: 22/23 notes valid (95%) but triggered 3+ minute full rescan
+  - **Root Cause**: Required 100% valid witnesses - if 1 note bad, full rescan triggered
+  - **Solution**: Accept 80%+ valid witnesses, rebuild only the bad ones individually
+  - **Files Modified**: WalletManager.swift
+- FIX #1015: CRITICAL - Clear Pending State AFTER Balance Refresh (Wrong Balance Fix)
+  - **Problem**: Balance showed wrong (0.020) for several seconds after TX confirmed
+  - **Root Cause**: `clearPendingBroadcast()` in `confirmOutgoingTx()` ran BEFORE `refreshBalance()`
+  - **Solution**: Moved `clearPendingBroadcast()` to AFTER `refreshBalance()` in `checkPendingOutgoingConfirmations()`
+  - **Files Modified**: NetworkManager.swift
+- FIX #1014: Set Pending Broadcast Even When No Peer Explicitly Accepts
+  - **Problem**: `mempoolOutgoing=0` even though TX was tracked (pendingTxids=1)
+  - **Root Cause**: `setPendingBroadcast()` only called on peer acceptance, not on timeout/fallback
+  - **Solution**: Also call `setPendingBroadcast()` when using fallback txid (FIX #364 path)
+  - **Files Modified**: NetworkManager.swift
+- FIX #1013: CRITICAL - Remove Broken Witness Anchor Comparison (Instant Sends)
+  - **Problem**: Sending ZCL took 60+ seconds due to unnecessary witness rebuilds every time
+  - **Root Cause**: FIX #986 (TransactionBuilder) and FIX #988 (WalletHealthCheck) INCORRECTLY compared witness anchor to CURRENT tree root
+    - When new blocks arrived, current tree root changed → ALL witnesses flagged "stale"
+    - **This was WRONG!** Sapling accepts ANY VALID HISTORICAL ANCHOR
+    - A witness from block 2990000 is STILL VALID when tree is at 2992000
+  - **Solution**: Removed broken comparison logic
+    - TransactionBuilder: Trust stored witness if < maxAnchorAge blocks old (INSTANT path)
+    - WalletHealthCheck: Accept any non-zero anchor as valid (zero = corrupted)
+  - **Performance**: ~60 second rebuild → INSTANT send
+  - **Files Modified**: TransactionBuilder.swift, WalletHealthCheck.swift
+- FIX #1012: Zcash-Aligned Peer Management (Keepalive, Timeouts, Stale Detection)
+  - **Problem**: Peer management timing too aggressive, causing unnecessary traffic and instability
+  - **Root Cause**: Original 30s keepalive and 2s reconnect cooldown not aligned with Zcash protocol
+  - **Solution**: Aligned with Zcash P2P timing from net.h:
+    1. **Keepalive**: 30s → 60s (half of Zcash's 2min PING_INTERVAL)
+    2. **Reconnect cooldown**: 2s → 5s (prevents connection spam)
+    3. **Stale detection**: New proactive detection using TIMEOUT_INTERVAL (20min)
+    4. **Activity grace**: New 90s ACTIVITY_GRACE_PERIOD constant
+  - **Constants** (from Zcash net.h):
+    - PING_INTERVAL = 120s, TIMEOUT_INTERVAL = 1200s, ACTIVITY_GRACE_PERIOD = 90s
+  - **New Functions**: detectStalePeers(), getPeerHealthStats(), peerNeedsPing()
+  - **Files Modified**: Peer.swift, NetworkManager.swift, PeerManager.swift
+- FIX #1011 v2: Automatic Anchor Validation and Repair at Startup
+  - **Problem**: Tree corruption not auto-repaired, requiring manual "Repair Database"
+  - **Root Cause**: Health check might pass but anchor still invalid for transactions
+  - **Solution**: Multiple improvements for automatic repair:
+    1. **Version-based reset**: Reset repair counter when app version changes (new fixes may work)
+    2. **Increased max attempts**: 2 → 3 for more resilience
+    3. **Post-witness validation**: After witness rebuild, validate anchor via P2P
+    4. **Auto-repair trigger**: If anchor CONFIRMED invalid, trigger Full Rescan
+  - **v2 Fix**: Only trigger repair when mismatch is CONFIRMED
+    - P2P fetch failure (network issue) → Don't repair, validate on send
+    - Confirmed mismatch (roots differ) → Trigger automatic repair
+    - Prevents false positive repairs when peers temporarily disconnected
+  - **Result**: App automatically repairs REAL tree corruption, ignores network glitches
+  - **Files Modified**: ContentView.swift (startup validation), WalletManager.swift (public wrapper)
+- FIX #1010: PERFORMANCE - Skip Block Listener Verification When None Running
+  - **Problem**: Header sync startup took 500ms+ even when no block listeners were running
+  - **Root Cause**: FIX #904 changed `if hadListenersBefore` to `if true` (always verify)
+    - Even with 0 listeners, code ran full verification loop + 200ms delay
+    - This added ~500ms+ unnecessary overhead on EVERY header sync startup
+  - **Solution**: Restore conditional verification based on `hadListenersBefore`
+    - Only verify when listeners were actually running
+    - Fast path skips verification entirely when no listeners exist
+  - **Result**: Near-instant header sync start when no listeners running (typical for FAST START)
+  - **Files Modified**: HeaderSyncManager.swift (block listener verification logic)
+- FIX #1009: INSTANT Pre-Send Verification (Speed Optimization)
+  - **Problem**: Pre-send verification was too slow - users had to wait for P2P operations before sending
+  - **Root Cause**: Two slow P2P operations before every send:
+    1. `verifyNotesNotSpentOnChain()` - Scans up to 100 blocks via P2P
+    2. `validateCMUTreeBeforeSend()` - Fetches single block via P2P
+  - **Solution**: Multiple optimizations for INSTANT verification:
+    1. **Tree validation cache**: Cache result for 60 seconds
+    2. **INSTANT nullifier check**: Skip P2P scan if checkpoint within 5 blocks
+    3. **Cache invalidation**: Clear cache after sync/repair to ensure freshness
+  - **Result**: Second send attempt is INSTANT (uses cached validation)
+  - **Files Modified**: WalletManager.swift (caching, invalidation, skip logic)
+- FIX #1008: CRITICAL - Double Full Rescan Bug (PHASE 1 Runs Twice)
+  - **Problem**: App runs PHASE 1 Full Rescan twice at startup, wasting time and resources
+  - **Symptom**: Logs show `FIX #577 v8: Reset lastScannedHeight to 0 for fresh scan` TWICE
+  - **Root Cause**: FULL START path uses STALE health results after first repair
+    - `fullStartHealthResults` computed ONCE at line 1779 (before any repairs)
+    - FIX #686 repair runs at line 1803
+    - After repair completes, code continues to FIX #439 check at line 1820
+    - FIX #439 uses STALE `fullStartHealthResults` which still shows Tree Root mismatch
+    - Triggers SECOND repair at line 1833 with `forceFullRescan: true`
+  - **Solution**: Track `fix686RepairRan` flag to skip redundant FIX #439 repair
+    - If FIX #686 already ran a repair, skip FIX #439 (prevents double Full Rescan)
+  - **Files Modified**: ContentView.swift (FULL START repair logic)
+- FIX #1007: CRITICAL - Prevent Duplicate CMU Appending in PHASE 2 (Tree Corruption Fix)
+  - **Problem**: Database repair recommended error at startup - tree root mismatch
+  - **Root Cause**: Same CMUs appended TWICE to commitment tree
+    - Step 2a (FIX #571 in WalletManager) fetches blocks via P2P for witness update, appends 38 CMUs
+    - PHASE 2 scan (FilterScanner) then processes same blocks, appends SAME 38 CMUs again!
+    - Result: Tree has 1,046,321 CMUs instead of 1,046,283 (38 duplicates)
+  - **Evidence from logs**:
+    ```
+    [15:26:10.917] 🔧 FIX #571: Fetched 38 CMUs via P2P
+    [15:26:11.094] ✅ FIX #978: Step 2a - Appended 38 NEW CMUs to tree (new size: 1046283)
+    [15:26:13.567] 📦 FIX #789: Collecting delta output 1 at height 2997457  ← SAME HEIGHTS!
+    [15:26:15.192] 🌳 Saved commitment tree with 1046321 commitments  ← 38 EXTRA!
+    ```
+  - **Solution**: Track expected tree size at PHASE 2 start
+    - Record `treeSizeAtPhase2Start = ZipherXFFI.treeSize()` at PHASE 2 entry
+    - Track `cmusAppendedInPhase2` counter for each CMU we WOULD append
+    - Before `treeAppend()`: check if `currentTreeSize > expectedTreeSize`
+    - If tree already larger → Step 2a appended → SKIP (use existing position)
+    - If tree at expected size → append normally
+  - **Files Modified**: FilterScanner.swift (new tracking vars, PHASE 2 init, processShieldedOutputsSync check)
+- FIX #1006: Non-Destructive Timeout for Mempool Requests (Connection Stability Fix)
+  - **Problem**: Peers dying after every mempool request - "4 connected, 1 alive" cascading failures
+  - **Root Cause**: `receiveMessageWithTimeout()` force-cancels connection on EVERY timeout!
+    - Line 2280-2282: `self.connection = nil; conn?.forceCancel()`
+    - Mempool timeout (expected - empty mempool) killed the peer connection
+    - Health check saw dead peer, triggered recovery, reconnected, repeat forever
+  - **Solution**: Added `destroyConnectionOnTimeout` parameter (default: true)
+    - Mempool requests use `destroyConnectionOnTimeout: false`
+    - Empty mempool timeout no longer kills the connection
+    - Peers stay connected, no more cascading recovery loops
+  - **Files Modified**: Peer.swift (receiveMessageWithTimeout parameter, getMempoolTransactions call)
+- FIX #1005: Empty Mempool = No Response (Timeout is Success, Not Failure)
+  - **Problem**: Mempool requests "failing" on all peers including localhost
+  - **Root Cause**: Zclassic node sends NOTHING if mempool is empty!
+    - `main.cpp:6378-6407`: `if (vInv.size() > 0) pfrom->PushMessage("inv", vInv);`
+    - No `inv` response = empty mempool, NOT peer failure
+    - FIX #1004's timeout threw error, treating empty mempool as failure
+  - **Solution**: Treat timeout as "empty mempool" success
+    - Catch `NetworkError.timeout` inside the loop
+    - After 2 consecutive timeouts, return `[]` (empty array = success)
+    - Reduced max attempts from 10 to 5 (faster detection)
+  - **Block Listener Safety**: `messageLock` mechanism IS sufficient
+    - `withExclusiveAccess` holds lock from before send to after receive
+    - Block listener uses `tryAcquire()` which fails when lock held
+    - Response arrives AFTER we send `mempool` command (while holding lock)
+  - **Files Modified**: Peer.swift (getMempoolTransactions)
+- FIX #1004: Mempool Request Timeout (Indefinite Blocking Fix)
+  - **Problem**: All mempool requests timing out, even from localhost
+  - **Root Cause**: `getMempoolTransactions()` used `receiveMessage()` WITHOUT timeout
+    - Other similar functions use `receiveMessageWithTimeout()` (TX fetch=3s, block fetch=1s)
+    - Without timeout, `receiveMessage()` blocks FOREVER if peer doesn't respond
+  - **Zclassic Source Verified**: `main.cpp:6378-6407` - mempool command IS supported
+    - Node calls `mempool.queryHashes()` and responds with `inv` message containing tx hashes
+    - CRITICAL: If mempool empty, node sends NOTHING (no `inv` response)
+  - **Solution**: Changed to `receiveMessageWithTimeout(seconds: 3)` per attempt
+    - See FIX #1005 for empty mempool handling
+  - **Files Modified**: Peer.swift (getMempoolTransactions)
+- FIX #1003: False "Health Issue" Warning When Block Listeners Are Blocked
+  - **Problem**: "⚠️ Health Issue" warning shown even when peers are connected
+  - **Root Cause**: Health check's `countAlivePeers()` required `hasRecentActivity` or successful ping
+    - When block listeners are blocked (during sync operations), no activity is recorded
+    - All peers appear "dead" even though connections are perfectly fine
+    - FIX #909 already handled this for P2P fetch, but health check was missing it
+  - **Solution**: Apply FIX #909 pattern to `countAlivePeers()`
+    - When block listeners are blocked, count `isConnectionReady` peers as alive
+    - Skip `hasRecentActivity` and ping checks during operations
+  - **Files Modified**: NetworkManager.swift (countAlivePeers)
+- FIX #1002: P2P Magic Bytes Error Recovery (Corrupted Connection Detection)
+  - **Problem**: Mempool requests fail with "Invalid P2P magic bytes" even on good Zclassic peers
+  - **Root Cause**: Connection message stream gets out of sync
+    - Block listeners can consume responses meant for other operations
+    - After timeout, connection state becomes corrupted
+    - Subsequent requests read garbage instead of valid P2P messages
+  - **Solution**: Detect `invalidMagicBytes` error and force reconnection
+    - Disconnect peer when magic bytes error occurs
+    - Let next operation use fresh connection
+    - Prevents repeated failures on same corrupted connection
+  - **Files Modified**: NetworkManager.swift (scanMempoolForIncoming)
+- FIX #1001: PERFORMANCE - Checkpoint-Based Spend Verification (Not 5000 Blocks)
+  - **Problem**: FIX #303 spend verification scans 5000 blocks, blocking send for 60+ seconds
+  - **Root Cause**: FIX #303 scanned from oldest note height, limited to 5000 blocks by FIX #367
+    - Checkpoint exists at last TX confirmation height
+    - But FIX #303 ignored checkpoint and always scanned 5000 blocks
+  - **Solution**: Use checkpoint as start height (like FIX #595)
+    - Scan from checkpoint+1 to chain tip (typically just a few blocks)
+    - Checkpoint updated on every TX confirmation
+    - Only falls back to oldest note if no checkpoint exists
+  - **Result**: Spend verification now INSTANT after normal syncs
+  - **Files Modified**: WalletManager.swift (verifyAllUnspentNotesOnChain)
+- FIX #1000: CRITICAL - Validate Tree Root via P2P at Startup (Not Just Before Send)
+  - **Problem**: User sees balance, tries to send, THEN gets blocked with "Tree root mismatch"
+  - **Root Cause**: Startup health check used HeaderStore (unreliable), pre-send used P2P (reliable)
+    - FIX #796 skipped validation for heights above boost file (HeaderStore has corrupted roots)
+    - FIX #936 fetched actual P2P block and detected mismatch - but only before send
+    - Result: Bad UX - user thinks wallet is ready, then can't send
+  - **Solution**: Run P2P tree root validation at startup AFTER network connects
+    - New `validateTreeRootAtStartup()` function fetches actual block via P2P
+    - Called after INSTANT START and FAST START complete
+    - If mismatch detected: Shows repair alert IMMEDIATELY, before user tries to send
+    - Published properties `treeRootValidAtStartup` and `treeRootMismatchDetected` for UI
+  - **Files Modified**: WalletManager.swift (new function), ContentView.swift (startup calls)
+- FIX #999: Less Aggressive Network Blocking in FIX #410
+  - **Problem**: Send blocked with "No network connection" even when peers ARE connected/recovering
+  - **Root Cause**: FIX #410 checked `readyPeers == 0` but peers were mid-handshake or reconnecting
+    - Peers in array with `isConnectionReady = false` during handshake
+    - 7 seconds later peers were fully connected, but Send was already blocked
+  - **Solution**: Check if ANY peers exist (even if not ready) before blocking
+    - If `totalPeers > 0` or parked peers are ready for retry, allow features
+    - Peers are likely recovering - don't block during brief reconnection window
+  - **Files Modified**: NetworkManager.swift (performHealthCheck)
+- FIX #998: Consolidate SwiftUI Sheets to Prevent "Only Single Sheet Supported" Warnings
+  - **Problem**: Xcode console spam: "Currently, only presenting a single sheet is supported"
+  - **Root Cause**: ContentView had 5 separate `.sheet()` modifiers (settings, send, receive, chat, alerts)
+    - SwiftUI can only handle ONE `.sheet()` modifier at a time
+    - When multiple were active/inactive, warnings appeared
+  - **Solution**: Consolidated view sheets (settings, send, receive, chat) into single `.sheet(item:)`
+    - New `ActiveSheet` enum with cases: `.settings`, `.send`, `.receive`, `.chat`
+    - Single `@State private var activeViewSheet: ActiveSheet? = nil`
+    - Computed `Binding<Bool>` properties for backward compatibility
+    - Alert sheet kept separate (different concern)
+  - **Files Modified**: ContentView.swift
+- FIX #997: CRITICAL - Don't Replace Tree During Periodic Witness Refresh (Tree Corruption)
+  - **Problem**: Tree CMU count DROPPED during FIX #603 periodic witness refresh
+  - **Symptom**: Log showed CMUs going from 1046269 → 1046242 (27 CMUs LOST!)
+  - **Root Cause**: `rebuildWitnessesForSpending()` called `treeLoadFromCMUs()`
+    - `treeLoadFromCMUs()` REPLACES entire tree with boost file CMUs
+    - Also clears DELTA_CMUS array (FIX #771)
+    - Result: Tree loses all delta CMUs, root becomes invalid
+  - **Solution**: Check tree size before loading
+    - If `currentTreeSize > boostSize`: Preserve existing tree (has delta CMUs)
+    - If `currentTreeSize == 0`: Load from boost file
+    - Applied to 2 locations in `rebuildWitnessesForSpending()`
+  - **Files Modified**: WalletManager.swift (rebuildWitnessesForSpending)
+- FIX #996: CRITICAL - Clear WITNESSES Array Before Loading (Performance Fix)
+  - **Problem**: FIX #805 witness update gets progressively slower (5s→8s→10s→13s)
+  - **Symptom**: Log shows witness count growing (228→342→456→595) across sessions
+  - **Root Cause**: WITNESSES FFI array never cleared before loading
+    - Each call to `treeLoadWitness()` pushes to array without clearing
+    - `updateAllWitnessesBatch()` updates ALL witnesses in array (including stale ones)
+    - More witnesses × delta CMUs = O(n) slower each session
+  - **Solution**: New `zipherx_witnesses_clear()` FFI function
+    - Clears WITNESSES array without affecting COMMITMENT_TREE
+    - Called BEFORE loading witnesses in 3 locations:
+      1. WalletManager.swift: FIX #569 Step 1
+      2. WalletManager.swift: FIX #968
+      3. FilterScanner.swift: FIX #739 v3
+  - **Result**: Constant ~O(notes) time instead of growing O(accumulated witnesses)
+  - **Files Modified**: lib.rs, ZipherX-Bridging-Header.h, ZipherXFFI.swift, WalletManager.swift, FilterScanner.swift
+- FIX #995: TX Broadcast Performance - Reduced Timeouts + Timing Instrumentation
+  - **Problem**: TX broadcast taking 60+ seconds even when peers respond quickly (4-5s)
+  - **Analysis**: Per-peer timeout (15s) and overall timeout (30s) too conservative
+  - **Solution Part 1**: Aggressive timeouts - peer must respond in <5s!
+    - Lock timeout: 10s → **3s** (Peer.swift)
+    - Per-peer timeout: 15s → **5s** (direct mode)
+    - Overall timeout: 30s → **15s** (direct mode)
+    - Tor: 45s → 30s per-peer, 90s → 60s overall
+  - **Solution Part 2**: Added timing instrumentation
+    - Broadcast phase start/end timestamps with total elapsed time
+    - Per-peer timing on success/failure
+    - Groth16 proof generation timing in TransactionBuilder
+  - **Solution Part 3**: Localhost diagnostics to investigate 63s timeout
+    - Track ensureConnected() duration for localhost
+    - Track broadcastTransaction() duration for localhost
+    - Log when per-peer timeout fires for localhost
+  - **Files Modified**: NetworkManager.swift, TransactionBuilder.swift, Peer.swift
+- FIX #994: CRITICAL - Ensure Complete Delta CMU Coverage at STARTUP (Before Balance View)
+  - **Problem**: Tree state incomplete at startup → witness rebuild during TX gets wrong anchor
+  - **User Insight**: "missing ~8580 blocks worth of CMUs must be covered at app startup!"
+  - **Root Cause**: Delta bundle loaded at startup without checking if it covers to chain tip
+    - Delta manifest: endHeight=2997537, but chain at 2997538+
+    - Tree loaded with incomplete CMUs
+    - Later TX build tries to fetch remaining → gets partial data → wrong anchor
+  - **Solution**: At FAST/INSTANT START, BEFORE marking tree as loaded:
+    1. Compare delta manifest endHeight with current chainHeight
+    2. If incomplete, fetch missing CMUs via P2P (up to 30s timeout)
+    3. Append to FFI tree using atomic append
+    4. Update delta bundle for future use
+    5. THEN mark tree as loaded and show balance view
+  - **Files Modified**: ContentView.swift (INSTANT START path)
+- FIX #993: CRITICAL - P2P Fetch for Remaining Blocks Only (Root Cause of Anchor Mismatch)
+  - **Problem**: TX rejected with "joinsplit requirements not met" - anchor doesn't exist on blockchain
+  - **Symptom**: 9 DUPLICATE responses (TX previously rejected, txid cached by peers)
+  - **Root Cause**: When delta has partial coverage, P2P fetched WRONG range!
+    - Delta: 564 CMUs for heights 2988798-2997537 (partial coverage)
+    - Needed: 1 more block at height 2997538
+    - BUG: P2P fetched from 2988798 (startHeight), not from 2997538 (remaining)
+    - P2P only got 160 out of 8741 blocks → incomplete CMU data
+    - Tree built with incomplete CMUs → wrong root `74de1bf171c499ab...` (doesn't exist!)
+  - **Solution**:
+    1. Calculate correct remaining range: `p2pStartHeight = deltaManifest.endHeight + 1`
+    2. Fetch ONLY remaining blocks, not full range
+    3. Verify P2P returned ALL blocks before using (95% threshold)
+    4. If partial blocks received, try another peer
+  - **Files Modified**: TransactionBuilder.swift (fetchCMUsFromBlocks)
+- FIX #992: [REVERTED] Trust Multiple DUPLICATE Responses as Broadcast Success
+  - **Status**: REVERTED - FIX #935 was correct! DUPLICATE can mask "joinsplit requirements not met"
+  - **Problem**: TX getting 9 DUPLICATE responses but app shows "TX REJECTED"
+  - **Symptom**: Log shows `"🚨 FIX #935: 9 DUPLICATE(s) but 0 accepts - TX likely REJECTED!"`
+  - **Root Cause**: FIX #935 overly conservative - required P2P verification for ALL DUPLICATE counts
+    - DUPLICATE (0x12) = "TX already in mempool" per Zclassic source code (main.cpp)
+    - P2P getdata only works for MEMPOOL, not confirmed TXs
+    - If TX was confirmed since last broadcast, getdata returns NOT FOUND = false negative
+    - FIX #935 treated this as rejection, but TX was actually successful!
+  - **Solution**: Trust high DUPLICATE counts (3+) as success without P2P verification
+    - 3+ independent peers returning DUPLICATE = strong consensus TX is in network
+    - Only 1-2 DUPLICATEs = still suspicious, try P2P verify but don't mark as FAILED
+    - P2P getdata NOT FOUND no longer marks TX as rejected (could be confirmed)
+  - **Files Modified**: NetworkManager.swift (DUPLICATE handling logic)
+- FIX #988: Proactive Witness Rebuild at Startup (Match FIX #986 Validation)
+  - **Problem**: Witnesses built from old/corrupted tree state detected at TX time (FIX #986), not startup
+  - **User Request**: "why we do not run this fix at app startup?"
+  - **Root Cause**: FIX #800 made `checkStaleWitnesses()` too permissive
+    - Allowed witnesses with different roots: "Sapling accepts any historical anchor"
+    - But stale witness root may NOT be a valid historical root (from corrupted tree)
+    - FIX #986 in TransactionBuilder was stricter, forcing rebuild at TX time
+  - **Solution**: Make startup check as strict as FIX #986
+    - Witness root MUST match CURRENT FFI tree root
+    - If mismatch → witness is stale → trigger rebuild NOW, not at TX time
+    - Proactive fix prevents "joinsplit requirements not met" at TX time
+  - **Files Modified**: WalletHealthCheck.swift (checkStaleWitnesses)
+- FIX #987: Don't Assume Failure on Broadcast Timeout
+  - **Problem**: TX accepted by peers but app showed "broadcast failed" (removed pending txid)
+  - **Symptom**: Change output appeared as "incoming" instead of recognized as change
+  - **Root Cause**: FIX #979 assumed `successCount == 0` means failure
+    - But timeout != rejection! Peers may have accepted but response timed out
+    - TX was sent to network, pending txid removed, later change misidentified
+  - **Solution**: Track peer ATTEMPTS, not just successes/rejects
+    - If peers were attempted (>0) but none explicitly rejected (rejectCount == 0)
+    - Then TX may have been accepted - DON'T remove from pending set
+    - Let mempool scanner or block confirmation handle verification later
+  - **Files Modified**: NetworkManager.swift (BroadcastState actor, FIX #979)
+- FIX #986: CRITICAL - Stale Witness Detection in FIX #591 (Root Cause of TX Rejections)
+  - **Problem**: TX rejected with "joinsplit requirements not met" even after FIX #983-#985
+  - **Symptom**: Witness anchor `5dc3131845425052...` != current tree root `cc5ee8c99356eec0...`
+  - **Root Cause**: FIX #591 used stored witness WITHOUT verifying anchor validity
+    - Witnesses built from CORRUPTED tree state (before FIX #730, #743, etc.)
+    - Stored anchor `5dc3131845425052...` was never a valid blockchain root
+    - FIX #591 saw "only 1510 blocks old" and trusted the stored witness
+    - But the anchor never existed on blockchain → "joinsplit requirements not met"
+  - **Solution**: Verify stored witness anchor matches CURRENT tree root
+    - After extracting anchor from stored witness, compare vs `treeGetRoot()`
+    - If mismatch → witness is stale/corrupted → force rebuild
+    - Rebuilt witness uses CURRENT tree root which is verified correct
+  - **Files Modified**: TransactionBuilder.swift (FIX #591 fast path)
+- FIX #985: CRITICAL - Prevent FIX #694 From Overriding P2P Verification Failure
+  - **Problem**: TX showed "success" even when FIX #935 determined it was REJECTED
+  - **Symptom**: DUPLICATE at 500ms, FIX #935 detects failure, but 10s later ONE peer accepts → "success"
+  - **Root Cause**: FIX #935 sets `verified = false`, but code continues for 30s timeout
+    - Later peer accept sets `successCount = 1`
+    - FIX #694 checks `else if successCount > 0` and overrides to `verified = true`
+    - This IGNORES FIX #935's determination that TX was REJECTED!
+  - **Solution**: Track when P2P verification explicitly fails
+    - Added `p2pVerificationFailed` flag to BroadcastState actor
+    - FIX #935 sets flag when DUPLICATE + getdata returns NOT FOUND
+    - FIX #694 now checks `isP2PVerificationFailed()` first
+    - If P2P already failed, late accepts are IGNORED - TX stays rejected
+  - **Files Modified**: NetworkManager.swift (BroadcastState actor, FIX #935, FIX #694)
+- FIX #984: CRITICAL - Localhost Rejection Must Override DUPLICATE Success (False Positive Fix)
+  - **Problem**: App showed "success" with txid when local node rejected with "joinsplit requirements not met"
+  - **Symptom**: TX displayed as sent but will NEVER confirm (anchor invalid)
+  - **Root Cause**: FIX #835 treated DUPLICATE responses as success
+    - Old TX with invalid anchor stuck in peers' mempools
+    - New TX conflicts → peers return DUPLICATE
+    - FIX #835 saw DUPLICATE + accepts → false "success"
+    - But localhost rejection means TX is INVALID
+  - **Solution**: Track localhost rejection separately; if localhost rejects → HARD FAILURE
+    - Added `localhostRejected` and `localhostRejectReason` to BroadcastState
+    - Check before any success path: if localhost rejected, return failed immediately
+    - DUPLICATEs and accepts are IRRELEVANT if localhost validation failed
+  - **Files Modified**: NetworkManager.swift (BroadcastState actor, broadcast handling)
+- FIX #983: CRITICAL - extractAnchorFromTransaction Missing value_balance Field (8 Bytes Off)
+  - **Problem**: FIX #718 extracted WRONG anchor from SpendDescription, causing TX rejection
+  - **Symptom**: FIX #575 logged anchor `df90ec3e...` but extraction got `11385f6b...` (DIFFERENT!)
+  - **Root Cause**: Transaction parsing MISSING 8-byte `value_balance` field before sapling bundle
+    - v4 format: lock_time(4) + expiry(4) + **value_balance(8)** + sapling_spends...
+    - Code skipped straight from expiry to sapling spends (8 bytes off!)
+    - Extracted "anchor" was actually: cv[24:32] + anchor[0:24] (WRONG!)
+  - **Solution**: Added `try safeAdd(&offset, 8)` for value_balance before reading sapling spends
+  - **Files Modified**: NetworkManager.swift (extractAnchorFromTransaction)
+- FIX #982: Add CMU Verification + Debug Logging for Anchor Mismatch Investigation
+  - **Problem**: TX fails with "joinsplit requirements not met" even when FIX #838 passes
+  - **Root Cause**: FIX #838 uses stored CMU, but Rust computes CMU from note parts
+    - Swift's `witnessVerifyAnchor` uses `note.cmu` from database
+    - Rust's `buildTransactionEncrypted` calls `Note::from_parts()` then `note.cmu()`
+    - If byte orders differ → different anchor → network rejection
+  - **Solution**: Added debug logging + CMU verification FFI
+    - `zipherx_verify_note_cmu` FFI function added to bridging header
+    - `ZipherXFFI.verifyNoteCMU()` Swift wrapper added
+    - TransactionBuilder.swift logs diversifier, rcm, value, stored CMU (both formats)
+    - Rust already logs computed CMU in wire and display formats
+  - **Files Modified**: ZipherX-Bridging-Header.h, ZipherXFFI.swift, TransactionBuilder.swift
+- FIX #979: PERFORMANCE - Delta Bundle Compaction at Startup (Tree Mismatch Prevention)
+  - **Problem**: Delta bundle accumulates duplicate CMUs (527+ duplicates logged)
+  - **Root Cause**: Re-scans, overlapping syncs, and repair operations add same CMUs
+    - FIX #784 filters duplicates on load but they persist in file
+    - O(N) deduplication overhead on every CMU load
+  - **Solution**: Compact delta bundle at startup
+    - New `compactDeltaBundleIfNeeded()` in DeltaCMUManager
+    - One-time O(N) compaction vs O(N) on every load
+    - Sorts by (height, index) for correct tree order
+  - **Files Modified**: DeltaCMUManager.swift, ContentView.swift
+- FIX #977: Sent Transactions Not Showing After Full Resync
+  - **Problem**: After Full Resync, 44 sent TXs in database but UI shows 0
+  - **Root Cause**: `transactionHistoryVersion` incremented BEFORE sent TXs inserted
+    - Version incremented at 18:33:16 → UI reloaded (empty)
+    - Sent TXs inserted at 18:33:20 → UI never reloaded again
+  - **Solution**: Move version increment to END of Full Rescan
+    - Now triggers AFTER `populateHistoryFromNotes()` inserts all sent TXs
+  - **Files Modified**: WalletManager.swift (repairNotesAfterDownloadedTree)
+- FIX #976: CRITICAL - Tree Corruption Not Detected at Startup (Extra CMUs)
+  - **Problem**: Tree has 527 extra CMUs but health check passed, user couldn't send
+  - **Root Cause**: FIX #796 skips tree validation for heights above boost file
+    - This was designed for unreliable P2P header roots
+    - But it also skips validation when the TREE ITSELF is corrupted!
+  - **Solution**: Verify tree SIZE before trusting tree root
+    - Check actual size vs expected (boost + delta CMUs)
+    - If mismatch > 10 CMUs → return CRITICAL failure → auto Full Resync
+  - **Files Modified**: WalletHealthCheck.swift (checkTreeRootMatchesHeader)
+- FIX #975: CRITICAL - Phantom TX Cleanup Was Deleting REAL Confirmed Transactions
+  - **Problem**: FIX #970 v3 deleted ALL sent transactions including real confirmed ones!
+  - **Root Cause**: P2P `getdata` only works for MEMPOOL, not confirmed blockchain TXs
+    - Once TX is confirmed and removed from mempool, peers don't return it
+    - Real old confirmed TXs returned "not found" → incorrectly deleted as phantoms
+  - **Solution**: Only check truly unconfirmed transactions
+    - Reduce time window from 24 hours to 2 hours
+    - Only check TXs with `confirmations == 0`
+    - TXs with confirmations > 0 are real - NEVER delete them
+  - **Files Modified**: WalletManager.swift (cleanPendingTransactionsFromDatabase)
+- FIX #974: UI Not Refreshing After Phantom Transaction Cleanup
+  - **Problem**: Phantom TXs still displayed in UI after FIX #970 deletes them from database
+  - **Root Cause**: UI loads transaction history BEFORE cleanup completes
+    - App starts → BalanceView appears → `getTransactionHistory()` called
+    - FIX #970 cleanup runs → deletes phantom TXs
+    - UI has stale data from before cleanup
+  - **Solution**: Increment `transactionHistoryVersion` after cleanup
+    - BalanceView observes this property and reloads transaction history
+    - Fresh data from database (phantom TXs now removed)
+  - **Files Modified**: WalletManager.swift (cleanPendingTransactionsFromDatabase)
+- FIX #973: False "Connection Lost" Alert After Startup (Startup Grace Period)
+  - **Problem**: macOS shows "Connection Lost" warning immediately after INSTANT START completes
+  - **Root Cause**: Race condition between startup completion and peer reconnection
+    - INSTANT START completes → background processes enabled → health check runs
+    - Old peers are dead (block listeners ended), new connections not yet established
+    - Health check sees 0 ready peers → triggers "Connection Lost" CRITICAL alert
+    - About 15-20 seconds later, peers reconnect and alert clears
+  - **Solution**: Add 15-second grace period after `enableBackgroundProcesses()`
+    - Track `backgroundProcessesEnabledTime` timestamp
+    - If within 15 seconds of startup, suppress "Connection Lost" alert
+    - Still block features (safety), but show "Connecting..." instead of scary alert
+  - **Files Modified**: NetworkManager.swift (enableBackgroundProcesses, performHealthCheck)
+- FIX #970 v3: Auto-Cleanup Phantom/Rejected Transactions at Startup
+  - **Problem v1**: Rejected TX from before FIX #969 still shows in history
+  - **Problem v2**: UserDefaults was already cleaned but TX was still in database
+  - **Problem v3**: Phantom TX was marked as `status='confirmed'` - skipped by pending check!
+  - **Root Cause v3**: `getPendingSentTransactions()` only checks status IN ('pending', 'mempool', 'confirming')
+    - Phantom TX had `status='confirmed'` (incorrectly set before rejection detected)
+    - So it was never found and never deleted!
+  - **Solution v3**: Two-phase verification at startup:
+    1. Check pending TXs (status = pending/mempool/confirming) - verify on P2P
+    2. **NEW**: Check ALL recent sent TXs from last 24 hours (ANY status including 'confirmed')
+    3. For "confirmed" TXs, verify they actually exist on blockchain via P2P
+    4. If NOT on blockchain → it's a phantom TX → delete from database
+    5. `getRecentSentTransactions(hoursBack:)` - new DB function to get recent sent TXs
+  - **Files Modified**:
+    - WalletManager.swift (cleanPendingTransactionsFromDatabase, verifyTxExistsOnBlockchain)
+    - WalletDatabase.swift (getRecentSentTransactions - NEW)
+    - NetworkManager.swift (FIX #969 v2: also delete from DB on rejection)
+- FIX #969 v2: CRITICAL - Rejected TX Still Shows Wrong Balance and History Entry
+  - **Problem v1**: TX rejected by node ("joinsplit requirements not met") but app shows wrong balance and adds TX to history
+  - **Problem v2**: TX was already written to database before rejection → still shows after restart
+  - **Root Cause v1**: FIX #964 pre-tracks TX in actor BEFORE broadcast for confirmation detection
+    - When TX is rejected, only `pendingOutgoingTxidSet` and UserDefaults were cleared
+    - But `mempoolOutgoing` (from actor) and `pendingBroadcastAmount` were NOT cleared!
+    - Result: `effectiveDisplayBalance` subtracts rejected TX, UI shows "pending" for rejected TX
+  - **Root Cause v2**: TX written to transaction_history DB before rejection was detected
+  - **Solution v1**: On rejection, clear actor tracking and call `clearPendingBroadcast()`
+  - **Solution v2**: Also delete from transaction_history database on rejection
+    - Convert display txid to wire format, call `deletePhantomTransaction()`
+    - Refresh balance after deletion
+  - **Files Modified**: NetworkManager.swift (broadcastTransactionWithProgress rejection handler)
+- FIX #968: CRITICAL - Rebuilt Witnesses Missing Delta CMUs (TX Rejected with "joinsplit requirements not met")
+  - **Problem**: TX rejected - anchor was boost file root (7841 blocks behind), not current tree root
+  - **Root Cause**: FIX #557 v37 rebuilt witnesses but didn't update them with delta CMUs
+  - **Solution**: After rebuild, load witnesses to FFI, update with delta CMUs, extract corrected data
+  - **Files Modified**: WalletManager.swift
+- FIX #967: CRITICAL - lastScannedHeight Not Saved After PHASE 2 (Resync ~7800 Blocks Every Startup)
+  - **Problem**: App resyncs ~7800 delta blocks at EVERY startup instead of using persisted state
+  - **Root Cause**: FIX #167 blocks `updateLastScannedHeight()` because `cachedChainHeight` is stale
+    - PHASE 2 ends at 2996636, but trusted sources only know ~2988797 (boost file headers)
+    - Height 7839 blocks ahead → blocked by Sybil protection
+  - **Solution**: Update `cachedChainHeight` at START of scan (not just end)
+  - **Files Modified**: FilterScanner.swift (startScan function)
+- FIX #966: PERFORMANCE - False "Unexplained CMUs" Detection Causing Unnecessary Tree Rebuilds
+  - **Problem**: False positive "unexplained CMUs" when tree has delta baked in but file cleared
+  - **Root Cause**: Race condition between tree deserialization and delta bundle file state
+  - **Solution**: Use manifest CMU count as authoritative, add ±10 CMU tolerance band
+  - **Files Modified**: WalletManager.swift (preloadTree)
+- FIX #965: Auto-Detect Missing Sent Transactions at Startup
+  - **Problem**: TX broadcast but never recorded (VUL-002 error) - requires manual Full Resync
+  - **Solution**: At startup, check persisted txids vs transaction_history, auto-recover missing
+  - **Files Modified**: WalletManager.swift, WalletDatabase.swift, NetworkManager.swift
+- FIX #964: CRITICAL - Sent Transaction Not Recorded When VUL-002 Shows Error But TX Confirms
+  - **Problem**: Send shows error (VUL-002), TX confirms on blockchain, but never recorded to history
+  - **Root Cause**: TCP desync caused 0/8 broadcast "failure" → `PendingOutgoingTx` never created
+    - FIX #702/849 pre-register txid, but `trackPendingOutgoingFull()` only called on "success"
+    - `confirmOutgoingTx` couldn't find TX in actor → DB write skipped
+  - **Solution**: Pre-track in actor immediately after FIX #849 + new `recordSentTransactionMinimal()`
+  - **Files Modified**: NetworkManager.swift, WalletDatabase.swift
+- FIX #962: CRITICAL - Multi-Input Transaction Missing Anchor Verification
+  - **Problem**: Send fails with "joinsplit requirements not met" - peers return DUPLICATE
+  - **Root Cause**: Multi-input builder had NO anchor verification (single-input had FIX #575)
+  - **Solution**: Add per-spend anchor check: `merkle_path.root(node) == witness.root()`
+  - **Files Modified**: Libraries/zipherx-ffi/src/lib.rs
+- FIX #961: Remove Excessive Debug Logging Causing Log Spam Every 30ms
+  - **Problem**: TXHIST VIEW debug logs printing every ~30ms, filling logs with spam
+  - **Root Cause**: Debug `print()` in SwiftUI view body + `logoRotationTimer` (30ms) triggers re-render
+  - **Solution**: Removed FIX #959/960 debug logging (no longer needed, issue is fixed)
+  - **Files Modified**: System7Components.swift, BalanceView.swift
+- FIX #960: CRITICAL - PHASE 2 Trial Decryption Skipped on iOS (isNewWalletInitialSync Bug)
+  - **Problem**: Incoming TXs not detected on iOS Simulator - 7 TXs at heights 2992440-2995481 missing
+  - **Root Cause**: `isNewWalletInitialSync = true` set incorrectly when `treeExists || hasDownloadedTree`
+    - This flag causes trial decryption to be SKIPPED entirely
+    - But `treeExists = true` for existing wallets, not just new ones!
+  - **Solution**: Only set flag for truly new wallets: `isNewWalletInitialSync = !treeExists && hasDownloadedTree`
+  - **Files Modified**: FilterScanner.swift (line 377, plus debug logging at 3 skip points)
+- FIX #957: Faster Confirmation Detection After Broadcast
+  - **Problem**: User waits up to 48 seconds for "Settlement" notification after sending
+  - **Root Cause**: `checkPendingOutgoingConfirmations()` only runs every 30 seconds
+  - **Solution**: Add active confirmation polling at 10s, 30s, 60s after broadcast
+  - **Files Modified**: SendView.swift (FIX #957 task after broadcast)
+- FIX #956: Missing "Clearing" Celebration for Outgoing Transactions
+  - **Problem**: No "Cleared" feedback when TX enters mempool (0 confirmations)
+  - **Root Cause**: FIX #694 path didn't call `setMempoolVerified()` to trigger celebration
+  - **Solution**: Add `setMempoolVerified()` call in FIX #694 success block
+  - **Files Modified**: NetworkManager.swift (broadcastTransaction FIX #694 block)
+- FIX #955: Balance Display Reverts to Old Value After Sending
+  - **Problem**: Balance shows pre-send value instead of reduced balance during pending period
+  - **Root Cause**: `onPendingBalanceChanged` cleared pending tracking immediately when `pendingBalance==0`
+  - **Solution**: Only clear after 5-minute timeout (not immediately)
+  - **Files Modified**: BalanceView.swift (onPendingBalanceChanged)
+- FIX #954: Send Button Shows "No connection" Despite 4 Peers Connected
+  - **Problem**: Send disabled with "No network connection" even with 4 peers connected
+  - **Root Cause**: FIX #409 health check only runs every 60 seconds; features blocked when peers drop but not unblocked when peers reconnect
+  - **Solution**: Trigger immediate health check when peers reconnect if features are blocked
+  - **Files Modified**: NetworkManager.swift (reconnectWithBackoff, checkConnectionHealth)
+- FIX #952: CRITICAL - External Spend Detection Fails (Balance 4.5 ZCL vs Correct 0.9 ZCL)
+  - **Problem**: Change outputs from wallet.dat transactions recorded as "received" income
+  - **Root Cause**: Nullifier byte order mismatch between PHASE 1 (boost) and PHASE 2 (P2P)
+  - **Solution**: Try both byte orderings (wire and display format) when matching nullifiers
+  - **Result**: Balance now correct (0.90710001 ZCL instead of 4.507 ZCL)
+  - **Files Modified**: FilterScanner.swift (processShieldedOutputsSync)
+- FIX #951: PERFORMANCE - Parallel Header and CMU Loading (Saves ~25s on Fresh Import)
+  - **Problem**: Header loading (78s) and CMU extraction (25s) ran sequentially = 103s
+  - **Solution**: Run both in parallel using `async let` pattern
+  - **Result**: max(78s, 25s) = 78s total (saves ~25s on fresh import)
+  - **Files Modified**: WalletManager.swift (FIX #522 import path)
+- FIX #950: PERFORMANCE - Parallel Witness Updates in Rust (Rayon)
+  - **Problem**: Witness updates sequential O(N × witnesses) = 17M operations
+  - **Solution**: Collect remaining nodes first, then update all witnesses in parallel via Rayon
+  - **Result**: 30-60s → 5-10s (3-6x speedup depending on CPU cores)
+  - **Files Modified**: lib.rs (zipherx_tree_create_witnesses_batch)
+- FIX #949: CRITICAL - FIX #947 Disabled (Anchor Mismatch on SEND)
+  - **Problem**: After Import PK with FIX #947 enabled, SEND fails with "joinsplit requirements not met"
+  - **Root Cause**: Deferred witness computation creates witnesses with invalid anchors
+    - Database anchor, witness root, and TX anchor were THREE DIFFERENT values!
+  - **Solution**: Disabled FIX #947 - witnesses now computed during PHASE 1.5 (40-60s slower)
+  - **Files Modified**: WalletManager.swift (setDeferWitnessComputation → false)
+- FIX #948: CRITICAL - Header Loading 50x Slowdown (25 min → 40 sec)
+  - **Problem**: Boost file header loading took 25+ minutes instead of ~40 seconds
+  - **Root Cause**: Single SQLite transaction for 2.5M headers - WAL grew to 700MB+
+  - **Solution**: Commit every 100K headers to keep WAL manageable (~30MB/batch)
+  - **Performance**: 25 min → ~40 sec (maintains 60K+/sec throughout)
+  - **Files Modified**: HeaderStore.swift (loadHeadersFromBoostData)
+- FIX #947: DISABLED - Defer Witness Computation (Caused Anchor Mismatch)
+  - **Problem**: Import PK takes 5-7+ minutes, PHASE 1.5 alone takes 40-60 seconds
+  - **Attempted Solution**: Skip PHASE 1.5 during import, compute witnesses lazily on first SEND
+  - **Result**: SEND fails with anchor mismatch - disabled by FIX #949
+  - **Files Modified**: FilterScanner.swift, WalletManager.swift, TransactionBuilder.swift
+- FIX #946: Header Sync Loop Requesting Non-Existent Blocks
+  - **Problem**: App stuck in "No ready peers with valid heights" loop after PHASE 2
+  - **Root Cause**: FIX #747 allowed requesting headers up to 200 blocks beyond consensus
+  - **Solution**: Cap targetTip at consensusHeight - can't sync blocks that don't exist
+  - **Files Modified**: HeaderSyncManager.swift
+- FIX #945: CRITICAL - Post-Scan Spend Verification (Missed P2P Blocks Cause Wrong Balance)
+  - **Problem**: Balance too high (3.61 ZCL instead of 0.907 ZCL) after P2P scan
+  - **Root Cause**: Network issues during P2P fetch can miss blocks containing spends
+  - **Solution**: Run `verifyAllUnspentNotesOnChain()` after scan to catch missed spends
+  - **Files Modified**: FilterScanner.swift
+- FIX #944: CRITICAL - Header Deletion Function Did Nothing (Infinite Loop Fix)
+  - **Problem**: Import PK stuck at 98% in infinite chain mismatch loop
+  - **Root Cause**: `sqlite3_exec` does NOT bind `?` parameters - deletes NOTHING!
+  - **Solution**: Use `sqlite3_prepare_v2` + `sqlite3_bind_int64` + `sqlite3_step`
+  - **Files Modified**: HeaderStore.swift (deleteHeadersInRange)
 - FIX #943: Txid Displayed in Reverse in Transaction History
   - **Problem**: Txid shown incorrectly (byte-reversed) in transaction history details
   - **Root Cause**: `confirmOutgoingTx()` stored display format, but DB expects wire format
@@ -330,6 +1657,34 @@ Latest fixes:
     - `isScanInProgress` getter checks for timeout and auto-clears
     - Added comprehensive debug logging for all guard failures
   - **Files Modified**: FilterScanner.swift, WalletManager.swift, NetworkManager.swift
+- FIX #991: P2P Mempool Verification After Broadcast Timeout
+  - **Problem**: When peers timed out, TX was tracked but never verified in mempool
+  - **Root Cause**: FIX #987 skipped mempool verification when all peers timed out
+  - **Solution**: After timeout, wait 2s for propagation, then call `verifyTxViaP2P()`
+    - If verified in mempool → mark as `mempoolVerified = true`, show success
+    - If not verified → keep tracking, let block scanner confirm later
+  - **Protocol Insight**: Zclassic sends NO message on accept (silent acceptance per main.cpp:6136)
+    - Only rejections get explicit messages
+    - Verification requires asking peers if they have the TX (P2P getdata)
+  - **Files Modified**: NetworkManager.swift (FIX #987 timeout case)
+- FIX #990: Distinguish "Peers Timeout" from "No Peers Available" in Broadcast
+  - **Problem**: App showed "Transaction Issue" even when TX was successfully accepted by peers
+  - **Root Cause**: BroadcastResult didn't distinguish between "no peers available" vs "peers timed out"
+    - When all peers timed out (no accept, no reject), `peerCount=0`
+    - WalletManager saw `peerCount=0` and threw error
+    - But TX may have been accepted - Zclassic protocol sends NO response on accept (silent acceptance)
+  - **Solution**: Added `peersAttempted` field to BroadcastResult
+    - When `peersAttempted > 0` but `peerCount == 0` and `rejectCount == 0`: peers timed out
+    - Don't throw error, track TX for confirmation (acceptance is silent in Zclassic protocol)
+  - **Files Modified**: NetworkManager.swift (BroadcastResult, broadcast handling), WalletManager.swift (result handling)
+- FIX #989: PERFORMANCE - Parallel Witness Update for INSTANT Rebuild
+  - **Problem**: Witness rebuild took 14+ seconds for ~100 witnesses × ~600 delta CMUs
+  - **Root Cause**: `updateAllWitnessesBatch()` in FFI used sequential iteration
+    - O(witnesses × CMUs) = 96 × 558 = 53K witness.append() calls done sequentially
+  - **Solution**: Changed to Rayon's `par_iter_mut()` for parallel multi-core processing
+    - Each witness update is independent → perfect parallelization
+    - ~8x speedup on 8-core devices (14s → ~2s)
+  - **Files Modified**: lib.rs (zipherx_update_all_witnesses_batch)
 - FIX #872: Add ENOMSG (Error 96) and "Not Connected" to Transient Error Detection
   - **Problem**: Good peers marked as protocol errors for error 96 (ENOMSG) and "Not connected"
   - **Root Cause**: FIX #869's transient error detection was incomplete
