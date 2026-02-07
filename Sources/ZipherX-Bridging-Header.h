@@ -102,6 +102,7 @@ bool zipherx_build_transaction_multi(
 
 // Commitment tree functions
 bool zipherx_tree_init(void);
+uint64_t zipherx_witnesses_clear(void);  // FIX #996: Clear WITNESSES array before loading
 uint64_t zipherx_tree_append(const uint8_t *cmu);
 uint64_t zipherx_tree_append_batch(const uint8_t *cmus_data, size_t cmu_count);  // Batch append (faster)
 
@@ -752,6 +753,22 @@ size_t zipherx_tree_load_with_witnesses(
     uint64_t *positions_out,
     uint8_t *witnesses_out,
     TreeLoadProgressCallback progress_callback
+);
+
+// =============================================================================
+// FIX #982: CMU Consistency Verification (stored CMU vs computed CMU)
+// =============================================================================
+
+/// Verify that stored CMU matches computed CMU from note components
+/// This is CRITICAL because FIX #838 uses stored CMU but Rust rebuilds note from parts
+/// If they differ, anchor mismatch occurs → "joinsplit requirements not met"
+/// Returns: 0=mismatch, 1=match, 2=error
+uint32_t zipherx_verify_note_cmu(
+    const uint8_t *stored_cmu,     // 32 bytes - CMU from database
+    const uint8_t *diversifier,     // 11 bytes
+    const uint8_t *rcm,             // 32 bytes
+    uint64_t value,
+    const uint8_t *spending_key     // 169 bytes
 );
 
 // =============================================================================

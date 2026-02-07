@@ -1726,7 +1726,7 @@ Both binaries must be installed to /usr/local/bin:
                     // Show .onion address when running
                     if HiddenServiceManager.shared.state == .running,
                        let onionAddress = HiddenServiceManager.shared.onionAddress,
-                       let fullOnionAddress = HiddenServiceManager.shared.p2pOnionAddress {
+                       let _ = HiddenServiceManager.shared.p2pOnionAddress {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("YOUR .ONION ADDRESS")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -2206,24 +2206,6 @@ Both binaries must be installed to /usr/local/bin:
                     Rectangle()
                         .stroke(Color.red.opacity(0.8), lineWidth: 2)
                 )
-            }
-
-            // FIX #689: Force Detect Confirmed Transaction - DEBUG
-            Button(action: {
-                Task {
-                    await forceDetectTransaction()
-                }
-            }) {
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 12))
-                    Text("Detect TX")
-                        .font(theme.captionFont)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.blue.opacity(0.6))
             }
 
             Text("Nuclear option: Deletes all notes & history, re-downloads boost file, rescans entire blockchain. Use if balance is wrong after regular repair.")
@@ -3499,36 +3481,6 @@ Both binaries must be installed to /usr/local/bin:
         }
     }
 
-    // MARK: - FIX #689: Force Detect Confirmed Transaction
-
-    /// FIX #689: Force detect a confirmed transaction that wasn't recorded properly
-    /// DEBUG function to manually recover transactions that are confirmed on-chain but not in database
-    private func forceDetectTransaction() async {
-        print("🔍 FIX #689: Force detecting transaction 69849d0d...")
-
-        let txid = "69849d0d3ad6d861a07c2ad0388d13fd12370a18efea73c4103df8b1a6189a73"
-
-        do {
-            let detected = await walletManager.forceDetectConfirmedTransaction(txid)
-
-            await MainActor.run {
-                if detected {
-                    // Show success message
-                    recoveryMessage = "✅ Transaction detected and recorded in history!\n\nSent transaction has been properly recorded."
-                } else {
-                    recoveryMessage = "⚠️ Transaction not found as our spend.\n\nThis might be a receive-only transaction (change output)."
-                }
-                showRecoverySuccess = true
-            }
-
-        } catch {
-            await MainActor.run {
-                errorMessage = "Failed to detect transaction: \(error.localizedDescription)"
-                showError = true
-            }
-        }
-    }
-
     // MARK: - FIX #214/217: Scan for Unrecorded Transactions Only
 
     private func startScanForUnrecordedTx() {
@@ -3578,7 +3530,7 @@ Both binaries must be installed to /usr/local/bin:
         Task {
             do {
                 // Get current tree root
-                guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
+                guard let _ = ZipherXFFI.treeRoot() else {
                     await MainActor.run {
                         isRebuildingWitnesses = false
                         errorMessage = "No tree root available - tree may not be loaded"
@@ -3633,7 +3585,7 @@ Both binaries must be installed to /usr/local/bin:
                     // After fixing the FFI to use WIRE format, we MUST rebuild ALL witnesses
                     // Skipping based on root comparison doesn't work because both old witnesses AND old tree are DISPLAY format
                     // Trust that this is a FORCE rebuild and rebuild everything
-                    var witnessIsCurrent = false  // Always false for force rebuild
+                    let witnessIsCurrent = false  // Always false for force rebuild
 
                     // OLD CODE (DISABLED):
                     // if !note.witness.isEmpty {
@@ -3688,7 +3640,7 @@ Both binaries must be installed to /usr/local/bin:
                         for (index, (note, _)) in notesNeedingRebuild.enumerated() {
                             if index < results.count,
                                let result = results[index] {
-                                let (position, newWitness) = result
+                                let (_, newWitness) = result
                                 do {
                                     try WalletDatabase.shared.updateNoteWitness(noteId: note.id, witness: newWitness)
 

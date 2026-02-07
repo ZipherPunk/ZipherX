@@ -997,23 +997,27 @@ struct CypherpunkProgressStepRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 10) {
-                // Status indicator
+                // Status indicator - FIX #1123: Distinct colors for each state
                 Group {
                     switch step.status {
                     case .pending:
+                        // Gray circle - waiting to start
                         Circle()
-                            .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
+                            .stroke(Color.gray.opacity(0.5), lineWidth: 1)
                             .frame(width: 16, height: 16)
                     case .inProgress:
+                        // Yellow/Orange spinner - actively working
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: NeonColors.primary))
+                            .progressViewStyle(CircularProgressViewStyle(tint: Color.orange))
                             .scaleEffect(0.7)
                             .frame(width: 16, height: 16)
                     case .completed:
+                        // Green checkmark - done
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(NeonColors.progressFillStart)
+                            .foregroundColor(Color.green)
                             .frame(width: 16, height: 16)
                     case .failed:
+                        // Red X - error
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.red)
                             .frame(width: 16, height: 16)
@@ -1062,16 +1066,17 @@ struct CypherpunkProgressStepRow: View {
         }
     }
 
+    // FIX #1123: Distinct text colors for each step state
     private var stepTextColor: Color {
         switch step.status {
         case .pending:
-            return NeonColors.primaryVeryDim
+            return Color.gray  // Waiting - dim gray
         case .inProgress:
-            return NeonColors.primary
+            return Color.orange  // Active - bright orange
         case .completed:
-            return NeonColors.primaryDark
+            return Color.green.opacity(0.8)  // Done - green
         case .failed:
-            return .red
+            return .red  // Error - red
         }
     }
 }
@@ -1728,23 +1733,27 @@ struct CypherpunkSyncTaskRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
-                // Status indicator
+                // Status indicator - FIX #1123: Distinct colors for each state
                 Group {
                     switch task.status {
                     case .pending:
+                        // Gray circle - waiting to start
                         Circle()
-                            .stroke(NeonColors.primaryVeryDim, lineWidth: 1)
+                            .stroke(Color.gray.opacity(0.5), lineWidth: 1)
                             .frame(width: taskRowIconSize, height: taskRowIconSize)
                     case .inProgress:
+                        // Yellow/Orange spinner - actively working
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: NeonColors.primary))
+                            .progressViewStyle(CircularProgressViewStyle(tint: Color.orange))
                             .scaleEffect(0.6)
                             .frame(width: taskRowIconSize, height: taskRowIconSize)
                     case .completed:
+                        // Green checkmark - done
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(NeonColors.progressFillStart)
+                            .foregroundColor(Color.green)
                             .font(.system(size: taskRowIconSize))
                     case .failed:
+                        // Red X - error
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.red)
                             .font(.system(size: taskRowIconSize))
@@ -1792,16 +1801,17 @@ struct CypherpunkSyncTaskRow: View {
         }
     }
 
+    // FIX #1123: Distinct text colors for each task state
     private var taskTextColor: Color {
         switch task.status {
         case .pending:
-            return NeonColors.primaryVeryDim
+            return Color.gray  // Waiting - dim gray
         case .inProgress:
-            return NeonColors.primary
+            return Color.orange  // Active - bright orange
         case .completed:
-            return NeonColors.primaryDark
+            return Color.green.opacity(0.8)  // Done - green
         case .failed:
-            return .red
+            return .red  // Error - red
         }
     }
 }
@@ -1930,6 +1940,15 @@ struct CypherpunkMainView: View {
             // IMPORTANT: Suppress fireworks for change outputs from our own sends
             if newValue > previousBalance && previousBalance > 0 {
                 let increase = newValue - previousBalance
+
+                // FIX #1106: Suppress fireworks during sync/startup
+                // Balance fluctuates during initial sync as notes are discovered/verified
+                // This is NOT a real incoming transaction - just sync progress
+                if walletManager.isSyncing || FilterScanner.isScanInProgress {
+                    print("💰 FIX #1106: Balance increased by \(Double(increase) / 100_000_000.0) ZCL during sync - suppressing fireworks")
+                    previousBalance = newValue
+                    return
+                }
 
                 // Check if this is likely a change output from a recent send
                 var isLikelyChangeOutput = false
@@ -2072,73 +2091,100 @@ struct CypherpunkMainView: View {
                 .foregroundColor(matrixGreenDark)
                 .tracking(3)
 
-            // Main ZCL balance with glitch effect
-            ZStack {
-                Text(formatBalance(walletManager.shieldedBalance))
-                    .font(.system(size: 48, weight: .bold, design: .monospaced))
-                    .foregroundColor(matrixGreen)
-                    .shadow(color: matrixGreen.opacity(0.8), radius: 10)
-                    .offset(x: showGlitch ? glitchOffset : 0)
+            // FIX #1118: Show warning instead of balance if integrity issue detected
+            if walletManager.balanceIntegrityIssue {
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(.red)
+                        Text("BALANCE ISSUE")
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .foregroundColor(.red)
+                    }
+                    .shadow(color: .red.opacity(0.6), radius: 8)
 
-                if showGlitch {
+                    if let message = walletManager.balanceIntegrityMessage {
+                        Text(message)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.red.opacity(0.8))
+                            .multilineTextAlignment(.center)
+                    }
+
+                    Text("Go to Settings → Repair Database")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(matrixGreenDark)
+                }
+                .padding(.vertical, 8)
+            } else {
+                // Main ZCL balance with glitch effect
+                ZStack {
                     Text(formatBalance(walletManager.shieldedBalance))
                         .font(.system(size: 48, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color.cyan.opacity(0.5))
-                        .offset(x: -glitchOffset)
+                        .foregroundColor(matrixGreen)
+                        .shadow(color: matrixGreen.opacity(0.8), radius: 10)
+                        .offset(x: showGlitch ? glitchOffset : 0)
+
+                    if showGlitch {
+                        Text(formatBalance(walletManager.shieldedBalance))
+                            .font(.system(size: 48, weight: .bold, design: .monospaced))
+                            .foregroundColor(Color.cyan.opacity(0.5))
+                            .offset(x: -glitchOffset)
+                    }
                 }
+
+                // ZCL label
+                Text("ZCL")
+                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                    .foregroundColor(matrixGreenDark)
+
+                // RECEIVER SIDE: Show pending INCOMING amount right below balance
+                if networkManager.mempoolIncoming > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 12))
+                        Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        Text("INCOMING")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(matrixGreen)
+                    .shadow(color: matrixGreen.opacity(0.5), radius: 4)
+                }
+
+                // UNIFIED Pending indicator - shows OUTGOING in mempool OR notes with 0 confirmations
+                // Priority: mempoolOutgoing (tx not yet mined) > pendingBalance (mined but 0 conf)
+                if networkManager.mempoolOutgoing > 0 {
+                    // Transaction in mempool - not yet mined
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 12))
+                        Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        Text("awaiting confirmation")
+                            .font(.system(size: 9, design: .monospaced))
+                    }
+                    .foregroundColor(Color.orange)
+                    .shadow(color: Color.orange.opacity(0.5), radius: 4)
+                } else if walletManager.pendingBalance > 0 {
+                    // Transaction mined but 0 confirmations (change not yet spendable)
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle")
+                            .font(.system(size: 12))
+                        Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        Text("pending")
+                            .font(.system(size: 9, design: .monospaced))
+                    }
+                    .foregroundColor(Color.yellow)
+                    .shadow(color: Color.yellow.opacity(0.5), radius: 4)
+                }
+
+                // USD value (placeholder - would need price feed)
+                Text("≈ $\(formatUSDValue()) USD")
+                    .font(.system(size: 14, design: .monospaced))
+                    .foregroundColor(matrixGreenDarker)
             }
-
-            // ZCL label
-            Text("ZCL")
-                .font(.system(size: 16, weight: .bold, design: .monospaced))
-                .foregroundColor(matrixGreenDark)
-
-            // RECEIVER SIDE: Show pending INCOMING amount right below balance
-            if networkManager.mempoolIncoming > 0 {
-                HStack(spacing: 6) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 12))
-                    Text("+\(formatBalance(networkManager.mempoolIncoming)) ZCL")
-                        .font(.system(size: 14, weight: .medium, design: .monospaced))
-                    Text("INCOMING")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                }
-                .foregroundColor(matrixGreen)
-                .shadow(color: matrixGreen.opacity(0.5), radius: 4)
-            }
-
-            // UNIFIED Pending indicator - shows OUTGOING in mempool OR notes with 0 confirmations
-            // Priority: mempoolOutgoing (tx not yet mined) > pendingBalance (mined but 0 conf)
-            if networkManager.mempoolOutgoing > 0 {
-                // Transaction in mempool - not yet mined
-                HStack(spacing: 6) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 12))
-                    Text("-\(formatBalance(networkManager.mempoolOutgoing)) ZCL")
-                        .font(.system(size: 14, weight: .medium, design: .monospaced))
-                    Text("awaiting confirmation")
-                        .font(.system(size: 9, design: .monospaced))
-                }
-                .foregroundColor(Color.orange)
-                .shadow(color: Color.orange.opacity(0.5), radius: 4)
-            } else if walletManager.pendingBalance > 0 {
-                // Transaction mined but 0 confirmations (change not yet spendable)
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle")
-                        .font(.system(size: 12))
-                    Text("+\(formatBalance(walletManager.pendingBalance)) ZCL")
-                        .font(.system(size: 14, weight: .medium, design: .monospaced))
-                    Text("pending")
-                        .font(.system(size: 9, design: .monospaced))
-                }
-                .foregroundColor(Color.yellow)
-                .shadow(color: Color.yellow.opacity(0.5), radius: 4)
-            }
-
-            // USD value (placeholder - would need price feed)
-            Text("≈ $\(formatUSDValue()) USD")
-                .font(.system(size: 14, design: .monospaced))
-                .foregroundColor(matrixGreenDarker)
 
             // Privacy badge
             HStack(spacing: 6) {
@@ -2284,6 +2330,7 @@ struct CypherpunkMainView: View {
 
             // Transaction list
             if transactions.isEmpty && !isLoadingHistory {
+                // FIX #961: Removed debug logging (was causing spam from logoRotationTimer redraws)
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "doc.text")
@@ -2295,6 +2342,8 @@ struct CypherpunkMainView: View {
                     Spacer()
                 }
             } else {
+                // FIX #961: Removed excessive debug logging (was printing every 30ms due to logoRotationTimer)
+                // FIX #959/960 verified - transactions render correctly now
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(transactions, id: \.uniqueId) { tx in

@@ -151,7 +151,8 @@ public class FullNodeManager: ObservableObject {
     // MARK: - Auto-Refresh Timer
 
     private var statusRefreshTimer: Timer?
-    private static let STATUS_REFRESH_INTERVAL: TimeInterval = 5.0  // Refresh every 5 seconds
+    // FIX #1122: Reduced polling frequency from 5s to 10s (less log noise, still responsive)
+    private static let STATUS_REFRESH_INTERVAL: TimeInterval = 10.0
 
     // MARK: - Initialization
 
@@ -254,15 +255,15 @@ public class FullNodeManager: ObservableObject {
         // regardless of where the binary is installed (Zipher.app, /usr/local/bin, etc.)
         do {
             try RPCClient.shared.loadConfig()
-            print("✅ Full Node: config loaded successfully")
+            // FIX #1052: Suppress routine config load logs (called every 5s)
 
             // Try to connect to running daemon
             let connected = await RPCClient.shared.checkConnection()
-            print("🔄 Full Node: RPC connection result = \(connected)")
+            // FIX #1052: Suppress routine connection result logs (called every 5s)
 
             if connected {
                 isNodeInstalled = true  // Daemon is running, so it's "installed" somewhere
-                print("✅ Full Node: daemon is RUNNING (detected via RPC)")
+                // FIX #1052: Suppress routine "daemon is RUNNING" logs (called every 5s)
 
                 // Set initial status to syncing - checkSyncStatus will update to .running when fully synced
                 // This prevents showing "Running" while daemon is still in "Loading block index" phase
@@ -280,18 +281,18 @@ public class FullNodeManager: ObservableObject {
                 return
             }
         } catch {
-            print("⚠️ Full Node: config/RPC check failed - \(error.localizedDescription)")
+            // FIX #1052: Suppress routine config/RPC check failure logs (called every 5s)
         }
 
         // FALLBACK: Check if binary exists at standard path
         if !isNodeInstalled {
-            print("🔴 Full Node: daemon not installed at standard path")
+            // FIX #1052: Suppress routine "not installed" logs (called every 5s)
             daemonStatus = .notInstalled
             return
         }
 
         // Binary exists but daemon not running
-        print("🔴 Full Node: daemon installed but not running")
+        // FIX #1052: Suppress routine "not running" logs (called every 5s)
         daemonStatus = hasBlockchain ? .installed : .notInstalled
     }
 

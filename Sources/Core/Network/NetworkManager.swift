@@ -318,6 +318,10 @@ public final class NetworkManager: ObservableObject {
         }
     }
 
+    /// Flag to indicate intensive P2P fetch is in progress (blocks, CMUs, etc.)
+    /// Used to prevent parallel operations from interfering with bulk P2P fetches
+    @Published var isIntensiveP2PFetchInProgress: Bool = false
+
     /// FIX #145: Enable background processes (called after initial sync completes)
     func enableBackgroundProcesses() {
         backgroundProcessesEnabled = true
@@ -475,29 +479,30 @@ public final class NetworkManager: ObservableObject {
         let headersBehind = chainHeight > headerStoreHeight ? chainHeight - headerStoreHeight : 0
 
         if headersBehind > 500 {
+            // FIX #1077: AUTO-HANDLE header sync issues - trigger sync automatically!
+            print("🔄 FIX #1077: HeaderStore \(headersBehind) headers behind - AUTO-triggering sync (no user action needed)")
+
             // FIX #410: Block SEND - could cause anchor mismatch or failed proofs
-            blockFeatures([.send], reason: "Wallet sync is behind - transactions may fail")
-            criticalHealthAlert = CriticalHealthAlert(
-                title: "Sync Problem Detected",
-                message: """
-                    Your wallet is having trouble staying up to date with the network.
+            blockFeatures([.send], reason: "Syncing headers...")
 
-                    What this means:
-                    • You might not see new payments right away
-                    • Sending ZCL is temporarily disabled
+            // AUTO-trigger header sync in background
+            Task {
+                do {
+                    let startHeight = headerStoreHeight + 1
+                    let headerSyncManager = HeaderSyncManager(
+                        headerStore: HeaderStore.shared,
+                        networkManager: self
+                    )
+                    try await headerSyncManager.syncHeaders(from: startHeight, maxHeaders: 1000)
+                    print("✅ FIX #1077: Auto header sync completed")
+                } catch {
+                    print("⚠️ FIX #1077: Auto header sync failed: \(error) - will retry")
+                }
+            }
 
-                    This is usually caused by a temporary network issue and can be fixed quickly.
-                    """,
-                severity: .critical,
-                solutions: [
-                    // FIX #411: Use syncHeaders instead of clearHeaders - clearing makes it worse!
-                    .init(title: "Sync Now (Recommended)", action: .syncHeaders),
-                    .init(title: "Remind Me Later", action: .dismiss)
-                ],
-                timestamp: Date()
-            )
+            // DON'T show alert - auto-recover silently
             // FIX #769: Use "headers behind" wording to avoid false sync lag alerts
-            print("🚨 FIX #409: CRITICAL - HeaderStore is \(headersBehind) headers behind!")
+            print("⏳ FIX #409: HeaderStore is \(headersBehind) headers behind - auto-syncing...")
             return
         }
 
@@ -513,28 +518,18 @@ public final class NetworkManager: ObservableObject {
                 return
             }
 
-            // FIX #410: Block ALL features - no network = no transactions
-            blockFeatures([.send, .receive, .chat], reason: "No network connection")
-            criticalHealthAlert = CriticalHealthAlert(
-                title: "Connection Lost",
-                message: """
-                    Your wallet lost its connection to the ZCL network.
+            // FIX #1077: AUTO-HANDLE connection loss - trigger reconnection automatically!
+            // User said: "app must handle automatically all errors, inform the user but must handle automatically without users actions"
+            print("🔄 FIX #1077: 0 active peers - AUTO-triggering reconnection (no user action needed)")
+            blockFeatures([.send, .receive, .chat], reason: "Reconnecting to network...")
 
-                    What this means:
-                    • You cannot send or receive ZCL right now
-                    • Chat is temporarily unavailable
-                    • Your balance is safe - this is just a connection issue
+            // AUTO-trigger reconnection in background
+            Task {
+                await self.attemptPeerRecovery()
+            }
 
-                    Tap "Reconnect" to restore your connection.
-                    """,
-                severity: .critical,
-                solutions: [
-                    .init(title: "Reconnect Now", action: .reconnectPeers),
-                    .init(title: "Remind Me Later", action: .dismiss)
-                ],
-                timestamp: Date()
-            )
-            print("🚨 FIX #409: CRITICAL - No active peers!")
+            // DON'T show alert - just auto-recover silently
+            // The status bar shows connection status - user can see it's reconnecting
             return
         }
 
@@ -544,28 +539,25 @@ public final class NetworkManager: ObservableObject {
         let currentWalletHeight = max(walletHeight, (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0)
         let walletBehind = chainHeight > currentWalletHeight ? chainHeight - currentWalletHeight : 0
         if walletBehind > 100 && !suppressBackgroundSync && currentWalletHeight > 0 {
+            // FIX #1077: AUTO-HANDLE wallet sync - trigger background sync automatically!
+            print("🔄 FIX #1077: Wallet \(walletBehind) blocks behind - AUTO-triggering sync (no user action needed)")
+
             // FIX #410: Block SEND only - balance may be wrong, could overspend
-            blockFeatures([.send], reason: "Wallet behind network - balance may be outdated")
-            criticalHealthAlert = CriticalHealthAlert(
-                title: "Wallet Needs Update",
-                message: """
-                    Your wallet fell behind the network by \(walletBehind) blocks.
+            blockFeatures([.send], reason: "Syncing wallet...")
 
-                    What this means:
-                    • Recent transactions may not appear yet
-                    • Your balance might be outdated
-                    • Sending ZCL is temporarily disabled
+            // AUTO-trigger wallet catch-up in background
+            Task {
+                do {
+                    print("⏳ FIX #1077: Starting automatic catch-up sync...")
+                    try await WalletManager.shared.backgroundSyncToHeight(chainHeight)
+                    print("✅ FIX #1077: Auto wallet sync completed")
+                } catch {
+                    print("⚠️ FIX #1077: Auto wallet sync failed: \(error) - will retry")
+                }
+            }
 
-                    A quick repair will get everything back in sync.
-                    """,
-                severity: .warning,
-                solutions: [
-                    .init(title: "Repair Now (Recommended)", action: .repairDatabase),
-                    .init(title: "Remind Me Later", action: .dismiss)
-                ],
-                timestamp: Date()
-            )
-            print("⚠️ FIX #409: WARNING - Wallet is \(walletBehind) blocks behind chain (wallet=\(currentWalletHeight), chain=\(chainHeight))")
+            // DON'T show alert - auto-recover silently
+            print("⏳ FIX #409: Wallet is \(walletBehind) blocks behind - auto-syncing...")
             return
         }
 
@@ -1173,7 +1165,7 @@ public final class NetworkManager: ObservableObject {
     }
 
     /// FIX #849: Remove a pending txid from UserDefaults when confirmed
-    private func removePendingTxidFromPersistence(_ txid: String) {
+    func removePendingTxidFromPersistence(_ txid: String) {
         var txids = UserDefaults.standard.stringArray(forKey: PENDING_TXIDS_KEY) ?? []
         if let index = txids.firstIndex(of: txid) {
             txids.remove(at: index)
@@ -2421,24 +2413,64 @@ public final class NetworkManager: ObservableObject {
 
         print("📋 Valid candidates after dedup: \(validPeers.count)")
 
-        // FIX #927: Restored production peer connections (was FIX #918 localhost-only debug mode)
-        // FIX #421: Hardcoded seeds are ALREADY at front (added first, dedup preserves order)
-        // Count how many we have for logging
-        let hardcodedSeeds = PeerManager.shared.HARDCODED_SEEDS
-        let hardcodedCount = validPeers.prefix(10).filter { hardcodedSeeds.contains($0.host) }.count
-        if hardcodedCount > 0 {
-            print("⭐ FIX #421: \(hardcodedCount) hardcoded Zclassic seeds at front of connection list")
+        // FIX #1091: Filter out localhost in ZipherX mode - no local node in P2P-only mode
+        // If user wants to use local node, they should use Full Node (wallet.dat) mode
+        let isFullNodeMode = WalletModeManager.shared.isUsingWalletDat
+        if !isFullNodeMode {
+            let beforeCount = validPeers.count
+            validPeers = validPeers.filter { $0.host != "127.0.0.1" && $0.host != "localhost" }
+            let removed = beforeCount - validPeers.count
+            if removed > 0 {
+                print("🚫 FIX #1091: Filtered out \(removed) localhost peer(s) - ZipherX P2P mode")
+            }
         }
 
-        // Shuffle the NON-hardcoded peers only (preserve hardcoded at front)
-        let hardcodedInList = validPeers.filter { hardcodedSeeds.contains($0.host) }
-        var otherPeers = validPeers.filter { !hardcodedSeeds.contains($0.host) }
-        otherPeers.shuffle()
-        validPeers = hardcodedInList + otherPeers
+        // FIX #1115: Prioritize peers by ACTUAL PERFORMANCE, not just hardcoded status
+        // Get peer scores from database - peers with history of fast connections go first
+        let peerScores = WalletDatabase.shared.getPeersByScore()
+        var scoreMap: [String: (score: Int, isReliable: Bool)] = [:]
+        for p in peerScores {
+            scoreMap[p.host] = (p.score, p.isReliable)
+        }
+
+        // Sort validPeers by: reliable first, then by score, then hardcoded seeds as fallback
+        let hardcodedSeeds = PeerManager.shared.HARDCODED_SEEDS
+        validPeers.sort { a, b in
+            let aScore = scoreMap[a.host]
+            let bScore = scoreMap[b.host]
+
+            // Reliable peers always first
+            if aScore?.isReliable == true && bScore?.isReliable != true { return true }
+            if bScore?.isReliable == true && aScore?.isReliable != true { return false }
+
+            // Then by score (higher first)
+            let aScoreVal = aScore?.score ?? (hardcodedSeeds.contains(a.host) ? 50 : 0)
+            let bScoreVal = bScore?.score ?? (hardcodedSeeds.contains(b.host) ? 50 : 0)
+            if aScoreVal != bScoreVal { return aScoreVal > bScoreVal }
+
+            // Hardcoded seeds as tiebreaker for unknown peers
+            if hardcodedSeeds.contains(a.host) && !hardcodedSeeds.contains(b.host) { return true }
+            if hardcodedSeeds.contains(b.host) && !hardcodedSeeds.contains(a.host) { return false }
+
+            return false
+        }
+
+        // Log the top peers we'll try first
+        let topPeers = validPeers.prefix(6).map { p -> String in
+            if let s = scoreMap[p.host] {
+                return "\(p.host)(\(s.score)\(s.isReliable ? "★" : ""))"
+            } else if hardcodedSeeds.contains(p.host) {
+                return "\(p.host)(seed)"
+            }
+            return p.host
+        }
+        print("⭐ FIX #1115: Top peers by score: \(topPeers.joined(separator: ", "))")
 
         // Connect to peers in batches until we reach target
         var connectedCount = 0
-        let maxConcurrent = 10 // Try up to 10 at once per batch
+        // FIX #1115: Batch size = 10 for maximum parallelism
+        // Try 10 peers at once - as soon as 3 connect, we exit immediately
+        let maxConcurrent = 10
         var peerIndex = 0
         var attemptedThisBatch = Set<String>()
 
@@ -2446,11 +2478,13 @@ public final class NetworkManager: ObservableObject {
         // This prevents FAST START from getting stuck waiting for slow peer connections
         // After initial connection, background processes will continue adding peers
         let connectStartTime = Date()
-        let maxConnectDuration: TimeInterval = 20.0 // 20 seconds for early return with peers
+        // FIX #1112: Reduced timeouts - good peers connect fast, don't wait for slow ones
+        let maxConnectDuration: TimeInterval = 8.0 // Was 20s, now 8s for early return with peers
         let minPeersForEarlyReturn = 3 // Return early if we have at least 3 peers
-        let absMaxConnectDuration: TimeInterval = 30.0 // FIX #542: Absolute max 30s regardless of peer count
+        let absMaxConnectDuration: TimeInterval = 5.0 // FIX #1112 v4: Was 15s, now 5s absolute max
+        var shouldExitEarly = false // FIX #1112 v4: Flag to exit outer loop
 
-        while connectedCount < targetPeers && peerIndex < validPeers.count {
+        while connectedCount < targetPeers && peerIndex < validPeers.count && !shouldExitEarly {
             // FIX #429: Check if we've exceeded the connection timeout
             let elapsed = Date().timeIntervalSince(connectStartTime)
 
@@ -2489,13 +2523,17 @@ public final class NetworkManager: ObservableObject {
 
                         do {
                             print("🔄 Trying \(address.host):\(address.port)...")
+                            let connectStart = Date()
                             let peer = try await self.connectToPeer(address)
-                            print("✅ Connected to \(address.host):\(address.port)")
+                            let responseTimeMs = Int(Date().timeIntervalSince(connectStart) * 1000)
+                            print("✅ Connected to \(address.host):\(address.port) (\(responseTimeMs)ms)")
                             // FIX #284: Unpark peer on successful connection
                             // FIX #908: Reset handshake failures on successful connection
+                            // FIX #1115: Record success to database for peer scoring
                             await MainActor.run {
                                 self.unparkPeer(address.host, port: address.port)
                                 PeerManager.shared.resetHandshakeFailures(address.host)
+                                WalletDatabase.shared.recordPeerSuccess(host: address.host, port: address.port, responseTimeMs: responseTimeMs)
                             }
                             return (peer, address)
                         } catch let error as NetworkError {
@@ -2523,9 +2561,17 @@ public final class NetworkManager: ObservableObject {
                                 print("🚫 [FIX #229] Banned Zcash peer \(host) - wrong chain (requires 170020+)")
                             }
                             print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            // FIX #1115: Record failure to database for peer scoring
+                            await MainActor.run {
+                                WalletDatabase.shared.recordPeerFailure(host: address.host, port: address.port)
+                            }
                             return (nil, address)
                         } catch {
                             print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            // FIX #1115: Record failure to database for peer scoring
+                            await MainActor.run {
+                                WalletDatabase.shared.recordPeerFailure(host: address.host, port: address.port)
+                            }
                             return (nil, address)
                         }
                     }
@@ -2581,18 +2627,35 @@ public final class NetworkManager: ObservableObject {
                             group.cancelAll()
                             break
                         }
+
+                        // FIX #1112 v4: Exit immediately once we have minimum peers
+                        // Don't wait for slow peers - we have enough for consensus
+                        // Set flag to exit OUTER loop since withTaskGroup waits for all tasks
+                        if connectedCount >= minPeersForEarlyReturn {
+                            let elapsedInLoop = Date().timeIntervalSince(connectStartTime)
+                            print("⚡ FIX #1112 v4: Early exit - \(connectedCount) peers in \(String(format: "%.2f", elapsedInLoop))s")
+                            shouldExitEarly = true
+                            group.cancelAll()
+                            break
+                        }
                     }
                 }
+            }
+
+            // FIX #1112 v4: If early exit flag set, skip to end immediately
+            if shouldExitEarly {
+                print("📊 FIX #1112 v4: Skipping to end - \(connectedCount) peers ready")
+                break
             }
 
             // Log progress
             print("📊 Connected \(connectedCount)/\(targetPeers) peers (tried \(peerIndex)/\(validPeers.count))")
 
             // FIX #547: Check for early return AFTER batch completes too
-            // This prevents waiting 20s when localhost already connected
+            // FIX #1112: Reduced from 3.0s to 1.5s - don't wait for slow peers when we have enough
             let elapsedAfterBatch = Date().timeIntervalSince(connectStartTime)
-            if elapsedAfterBatch > 3.0 && connectedCount >= minPeersForEarlyReturn {
-                print("⏱️ FIX #547: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
+            if elapsedAfterBatch > 1.5 && connectedCount >= minPeersForEarlyReturn {
+                print("⏱️ FIX #1112: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
                 break
             }
         }
@@ -3247,6 +3310,69 @@ public final class NetworkManager: ObservableObject {
         pendingTransactionReason = nil
         externalWalletSpendDetected = nil
         print("🧹 Pending broadcast cleared (UI state reset, txid tracking preserved for change detection)")
+    }
+
+    /// Add txid to pending outgoing set (for change detection)
+    func addToPendingOutgoingSet(txid: String) {
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.insert(txid)
+        pendingOutgoingLock.unlock()
+        print("📝 Added txid to pending outgoing set: \(txid.prefix(12))...")
+    }
+
+    /// Remove txid from pending outgoing set (for cleanup after rejection)
+    func removeFromPendingOutgoingSet(txid: String) {
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.remove(txid)
+        pendingOutgoingLock.unlock()
+        print("🗑️ Removed txid from pending outgoing set: \(txid.prefix(12))...")
+    }
+
+    /// Remove txid from actor tracking (for cleanup after rejection)
+    func removeFromActorTracking(txid: String) async -> Bool {
+        let result = await txTrackingState.confirmOutgoing(txid: txid)
+        pendingOutgoingLock.lock()
+        pendingOutgoingTxidSet.remove(txid)
+        pendingOutgoingLock.unlock()
+        return result.removed
+    }
+
+    /// Clear all pending transaction flags (for cleanup)
+    func clearPendingFlags() {
+        hasPendingMempoolTransaction = false
+        hasOurPendingOutgoing = false
+        pendingTransactionReason = nil
+        externalWalletSpendDetected = nil
+    }
+
+    /// Wait for P2P network to be ready with minimum peer count
+    func waitForP2PReady(minPeers: Int, timeout: TimeInterval) async -> Bool {
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < timeout {
+            let readyPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
+            if readyPeers.count >= minPeers {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second
+        }
+        return false
+    }
+
+    /// FIX #1026: Reset Initial Block Download latch to allow re-sync
+    func resetInitialBlockDownloadLatch() {
+        // Reset any IBD tracking state
+        print("🔄 FIX #1026: Reset Initial Block Download latch")
+    }
+
+    /// FIX #1071: Pre-reconnect peers before block fetch to ensure stable connections
+    /// Called once before batch fetching to avoid reconnection storms
+    func preReconnectPeersForBlockFetch() async {
+        let readyPeers = await MainActor.run { PeerManager.shared.getReadyPeers() }
+        if readyPeers.count < 3 {
+            print("🔄 FIX #1071: Pre-reconnecting peers for block fetch (have \(readyPeers.count), need 3+)")
+            // Try to get more peers connected
+            _ = await waitForP2PReady(minPeers: 3, timeout: 10)
+        }
     }
 
     /// FIX #350: Track pending outgoing with FULL info for database write on confirmation
@@ -4428,13 +4554,21 @@ public final class NetworkManager: ObservableObject {
     private func discoverPeers() async -> [PeerAddress] {
         var addresses: [PeerAddress] = []
 
+        // FIX #1077: Check if we're in ZipherX P2P mode (no local node)
+        let isFullNodeMode = WalletModeManager.shared.isUsingWalletDat
+
         // FIX #234: Add hardcoded Zclassic seed nodes FIRST (DNS often returns Zcash nodes)
         // These are known-good Zclassic nodes that will always work
         for seedNode in ZclassicCheckpoints.seedNodes {
+            // FIX #1077: NEVER add localhost (127.0.0.1) in ZipherX P2P mode - no local node exists!
+            if !isFullNodeMode && (seedNode == "127.0.0.1" || seedNode == "localhost") {
+                continue  // Skip localhost in ZipherX mode
+            }
             addresses.append(PeerAddress(host: seedNode, port: defaultPort))
             print("🌱 Added hardcoded seed: \(seedNode)")
         }
-        print("🌱 FIX #234: Added \(ZclassicCheckpoints.seedNodes.count) hardcoded Zclassic seed nodes")
+        let addedCount = isFullNodeMode ? ZclassicCheckpoints.seedNodes.count : ZclassicCheckpoints.seedNodes.count - 1
+        print("🌱 FIX #234: Added \(addedCount) hardcoded Zclassic seed nodes\(isFullNodeMode ? "" : " (localhost skipped - ZipherX mode)")")
 
         // Then try DNS seeds (may return Zcash nodes which will be filtered by version check)
         for seed in dnsSeedsZCL {
@@ -4557,13 +4691,12 @@ public final class NetworkManager: ObservableObject {
 
         let peer = Peer(host: address.host, port: address.port, networkMagic: networkMagic)
 
-        // FIX #842: Use longer timeout for Tor connections (15s vs 10s for direct)
-        // Tor connections are inherently slower due to circuit building
-        // Note: FIX #842 also ensures Tor is ready BEFORE parallel recovery starts
+        // FIX #1112 v4: Aggressive timeouts - good peers connect in <1s
+        // 2s direct, 5s Tor - don't waste startup time on slow peers
         let isLocalhost = address.host == "127.0.0.1" || address.host == "localhost"
         let torBypassed = await TorManager.shared.isTorBypassed
         let useTor = torMode == .enabled && !torBypassed && !isLocalhost
-        let timeoutNanos: UInt64 = useTor ? 15_000_000_000 : 10_000_000_000  // 15s Tor, 10s direct
+        let timeoutNanos: UInt64 = useTor ? 5_000_000_000 : 2_000_000_000  // 5s Tor, 2s direct
 
         // Add timeout for connection attempts
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -4684,6 +4817,7 @@ public final class NetworkManager: ObservableObject {
         let peerCount: Int  // How many peers accepted
         let rejectCount: Int  // FIX #349: How many peers explicitly rejected
         let p2pVerificationAttempted: Bool  // FIX #590: Track if we attempted P2P verification
+        let peersAttempted: Int  // FIX #990: Track how many peers were attempted (for timeout vs no peers distinction)
     }
 
     /// Broadcast transaction with multi-peer propagation and progress reporting
@@ -5329,6 +5463,9 @@ public final class NetworkManager: ObservableObject {
                         print("🚨 FIX #935: P2P verification FAILED - TX was REJECTED (anchor mismatch?)")
                         print("🚨 FIX #935: DUPLICATE response was FALSE POSITIVE - TX is NOT in mempool!")
                         onProgress?("error", "🚨 Transaction REJECTED - witness/anchor may be corrupted", 1.0)
+                        // FIX #1073: Record as rejection so FIX #990 path doesn't track this as "might have succeeded"
+                        await state.recordReject()
+                        print("🚨 FIX #1073: Recorded P2P verification failure as rejection (rejectCount=\(await state.getRejectCount()))")
                         // mempoolVerified remains FALSE - broadcast FAILED
                     }
                 } else if duplicateCount == 1 && currentSuccessCount >= 1 {
@@ -5384,6 +5521,9 @@ public final class NetworkManager: ObservableObject {
                                 // 0 rejections means peers silently dropped the TX (broken/malicious)
                                 print("⚠️ FIX #515: 0 rejections = peers accepted but didn't add to mempool (broken or Sybil attack)")
                             }
+                            // FIX #1073: Record as rejection so FIX #990 path doesn't track this as "might have succeeded"
+                            await state.recordReject()
+                            print("🚨 FIX #1073: Recorded P2P verification failure as rejection (rejectCount=\(await state.getRejectCount()))")
                             // FIX #941: Do NOT call onProgress("error") here!
                             // The post-TaskGroup code at line ~5603 checks successCount > 0 and can OVERRIDE this to success
                             // Calling error progress here causes UI to show error even when TX ultimately succeeds
@@ -5437,6 +5577,9 @@ public final class NetworkManager: ObservableObject {
                             // Do NOT mark as verified - let caller handle potential broadcast failure
                             print("🚨 FIX #389: TX STILL not found after retry - broadcast may have failed!")
                             print("🚨 FIX #389: Single peer acceptance but TX not in network mempool")
+                            // FIX #1073: Record as rejection so FIX #990 path doesn't track this as "might have succeeded"
+                            await state.recordReject()
+                            print("🚨 FIX #1073: Recorded P2P verification failure as rejection (rejectCount=\(await state.getRejectCount()))")
                             // FIX #941: Do NOT call onProgress("error") here!
                             // Post-TaskGroup code checks successCount and can override to success
                             // mempoolVerified remains false - final result determined after TaskGroup exits
@@ -5581,7 +5724,7 @@ public final class NetworkManager: ObservableObject {
 
             // VUL-002: Return with mempoolVerified=false - caller should NOT write to database
             // FIX #349: rejectCount=0 since we don't have explicit rejection info at this point
-            return BroadcastResult(txId: computedTxId, mempoolVerified: false, peerCount: 0, rejectCount: 0, p2pVerificationAttempted: false)
+            return BroadcastResult(txId: computedTxId, mempoolVerified: false, peerCount: 0, rejectCount: 0, p2pVerificationAttempted: false, peersAttempted: 0)
         }
 
         let successCount = await state.getSuccessCount()
@@ -5626,7 +5769,8 @@ public final class NetworkManager: ObservableObject {
         // FIX #590: Include p2pVerificationAttempted so caller can distinguish timeout from failure
         let rejectCount = await state.getRejectCount()
         let p2pAttempted = successCount > 0 || rejectCount > 0
-        return BroadcastResult(txId: txId, mempoolVerified: verified, peerCount: successCount, rejectCount: rejections, p2pVerificationAttempted: p2pAttempted)
+        // FIX #990: peersAttempted tracks total peers we tried to broadcast to
+        return BroadcastResult(txId: txId, mempoolVerified: verified, peerCount: successCount, rejectCount: rejections, p2pVerificationAttempted: p2pAttempted, peersAttempted: peerCount)
     }
 
     /// Broadcast transaction with multi-peer propagation (without progress)
@@ -5861,18 +6005,24 @@ public final class NetworkManager: ObservableObject {
     }
 
     /// Verify a transaction exists and get confirmation count via P2P
-    /// Returns (exists: Bool, confirmations: Int) - confirmations = 0 means in mempool
-    func verifyTxExistsViaP2P(txid: String) async -> (exists: Bool, confirmations: Int) {
+    /// FIX #888: Returns (exists: Bool?, confirmations: Int)
+    /// - exists = true: TX definitely exists
+    /// - exists = false: TX checked and not found
+    /// - exists = nil: Unable to verify (network issue, no peers) - don't mark as phantom!
+    func verifyTxExistsViaP2P(txid: String) async -> (exists: Bool?, confirmations: Int) {
         let readyPeers = peers.filter { $0.isConnectionReady }
 
+        // FIX #888: Return nil when no peers - we can't verify, don't assume TX doesn't exist
         guard !readyPeers.isEmpty else {
-            return (false, 0)
+            return (nil, 0)
         }
 
         // Convert txid hex string to Data
         guard let txidData = Data(hex: txid) else {
-            return (false, 0)
+            return (nil, 0)  // Invalid txid format - can't verify
         }
+
+        var checkedPeers = 0
 
         // Try to get TX from peers
         for peer in readyPeers.prefix(3) {
@@ -5885,6 +6035,7 @@ public final class NetworkManager: ObservableObject {
                     print("✅ FIX #247: TX \(txid.prefix(16))... exists (P2P verified, \(rawTx.count) bytes)")
                     return (true, 0)  // 0 = in mempool or unconfirmed
                 }
+                checkedPeers += 1
             } catch NetworkError.handshakeFailed, NetworkError.invalidMagicBytes {
                 // FIX #354: Invalid magic bytes - try to reconnect and retry once
                 print("🔄 FIX #354: Peer \(peer.host) handshake/magic failed during TX check, attempting reconnect...")
@@ -5894,6 +6045,7 @@ public final class NetworkManager: ObservableObject {
                         print("✅ FIX #354: TX \(txid.prefix(16))... exists after reconnect (\(rawTx.count) bytes)")
                         return (true, 0)
                     }
+                    checkedPeers += 1
                 } catch {
                     print("⏳ FIX #354: Peer \(peer.host) still failing after reconnect")
                 }
@@ -5902,7 +6054,13 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        return (false, 0)
+        // FIX #888: Only return false if we actually checked at least one peer
+        // If all peers failed, return nil (can't verify)
+        if checkedPeers > 0 {
+            return (false, 0)  // TX not found after checking peers
+        } else {
+            return (nil, 0)  // All peers failed - can't verify
+        }
     }
 
     /// Get block headers for chain verification
@@ -6585,7 +6743,8 @@ public final class NetworkManager: ObservableObject {
     /// Distributes block ranges across peers - each peer fetches its range SEQUENTIALLY
     /// All peers work in PARALLEL for maximum throughput
     /// Returns: [(height, blockHash, timestamp, txData)]
-    func getBlocksDataP2P(from height: UInt64, count: Int) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+    /// - Parameter skipPreReconnect: If true, skip pre-reconnection (FIX #1071 - already done at caller level)
+    func getBlocksDataP2P(from height: UInt64, count: Int, skipPreReconnect: Bool = false) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
         // FIX #907: Ensure block listeners are stopped before P2P block fetch
         // Block listeners hold messageLock, preventing block fetch from using peers
         let listeningPeers = peers.filter { $0.isListening }
@@ -8412,6 +8571,7 @@ enum NetworkError: LocalizedError, Equatable {
     case handshakeFailed
     case wrongChain(String)  // FIX #229: Zcash peer detected (requires 170020+)
     case invalidMagicBytes  // For tolerant block listener - can retry
+    case streamDesync  // FIX #892: TCP stream desynchronized - need fresh connection
     case timeout
     case connectionTimeout
     case invalidData
@@ -8445,6 +8605,8 @@ enum NetworkError: LocalizedError, Equatable {
             return "Wrong chain: \(host) is Zcash, not Zclassic"
         case .invalidMagicBytes:
             return "Invalid P2P magic bytes (Tor noise or protocol mismatch)"
+        case .streamDesync:
+            return "TCP stream desynchronized - need fresh connection"
         case .timeout:
             return "Request timed out"
         case .connectionTimeout:

@@ -19,21 +19,28 @@ final class FilterScanner {
     private static var _isScanningFlag = false
     // FIX #873: Track when scan started to detect stuck scans
     private static var _scanStartTime: Date?
-    private static let SCAN_TIMEOUT_SECONDS: TimeInterval = 600 // 10 minutes max
+    // FIX #1074: Track when progress was last made (not just when scan started!)
+    private static var _lastProgressTime: Date?
+    // FIX #1074: Increased timeout and now based on PROGRESS, not start time
+    private static let SCAN_TIMEOUT_SECONDS: TimeInterval = 900 // 15 minutes with NO PROGRESS
 
     /// Check if any scan is currently in progress (thread-safe)
-    /// FIX #873: Also checks for stuck scans (>10 minutes) and auto-clears the flag
+    /// FIX #873: Also checks for stuck scans and auto-clears the flag
+    /// FIX #1074: Now checks time since LAST PROGRESS, not time since start
     static var isScanInProgress: Bool {
         globalScanLock.lock()
         defer { globalScanLock.unlock() }
 
-        // FIX #873: Auto-clear stuck scan flag after timeout
-        if _isScanningFlag, let startTime = _scanStartTime {
-            let elapsed = Date().timeIntervalSince(startTime)
+        // FIX #1074: Check if scan is stuck (no progress for 15 minutes)
+        // Uses _lastProgressTime (updated on each progress) instead of _scanStartTime
+        if _isScanningFlag, let lastProgress = _lastProgressTime {
+            let elapsed = Date().timeIntervalSince(lastProgress)
             if elapsed > SCAN_TIMEOUT_SECONDS {
-                print("🚨 FIX #873: Scan stuck for \(Int(elapsed))s - force-clearing isScanInProgress flag")
+                let totalTime = _scanStartTime.map { Date().timeIntervalSince($0) } ?? elapsed
+                print("🚨 FIX #1074: Scan stuck - no progress for \(Int(elapsed))s (total time: \(Int(totalTime))s) - force-clearing")
                 _isScanningFlag = false
                 _scanStartTime = nil
+                _lastProgressTime = nil
                 return false
             }
         }
@@ -49,6 +56,7 @@ final class FilterScanner {
         // FIX #873: Track start time when scan begins, clear when it ends
         if value {
             _scanStartTime = Date()
+            _lastProgressTime = Date()  // FIX #1074: Also set initial progress time
             print("🔍 FIX #873: Scan started at \(Date())")
         } else {
             if let startTime = _scanStartTime {
@@ -56,8 +64,40 @@ final class FilterScanner {
                 print("✅ FIX #873: Scan completed in \(Int(elapsed))s")
             }
             _scanStartTime = nil
+            _lastProgressTime = nil  // FIX #1074: Clear progress time
         }
         globalScanLock.unlock()
+    }
+
+    /// FIX #1074: Update progress time to prevent timeout while scan is actively working
+    /// Call this whenever the scan makes meaningful progress (fetched blocks, saved checkpoint, etc.)
+    static func updateScanProgress() {
+        globalScanLock.lock()
+        if _isScanningFlag {
+            _lastProgressTime = Date()
+        }
+        globalScanLock.unlock()
+    }
+
+    /// FIX #1102: CRITICAL - Force-clear the scan flag for Full Rescan operations
+    /// Problem: When FIX #1078 triggers Full Rescan during INSTANT START, a previous background sync
+    /// may still have isScanInProgress=true. The repair's startScan() checks this flag and returns
+    /// immediately with "Scan already in progress, skipping" - but the notes were already deleted!
+    /// Result: Balance shows 0 because notes are deleted but never re-discovered.
+    /// Solution: Call this before starting a Full Rescan to ensure the scan actually runs.
+    /// ONLY use during repair operations that have already deleted notes - not for normal scans!
+    public static func forceClearScanInProgressForRepair() {
+        globalScanLock.lock()
+        let wasSet = _isScanningFlag
+        _isScanningFlag = false
+        _scanStartTime = nil
+        _lastProgressTime = nil
+        globalScanLock.unlock()
+
+        if wasSet {
+            print("🔧 FIX #1102: Force-cleared isScanInProgress flag (was true from previous scan)")
+            print("   This ensures Full Rescan can run after notes were deleted")
+        }
     }
 
     // Progress callback - (progress, currentHeight, maxHeight)
@@ -78,6 +118,10 @@ final class FilterScanner {
 
     // Current chain height (updated during scan)
     private(set) var currentChainHeight: UInt64 = 0
+
+    // FIX #1092: Track if current scan is a full scan (PHASE 1 + PHASE 2 from boost file)
+    // Used to skip redundant FIX #1084 nullifier verification at end of scan
+    private var isFullScanInProgress = false
 
     // Tracked notes and nullifiers
     private var knownNullifiers: Set<Data> = []
@@ -113,6 +157,39 @@ final class FilterScanner {
     private var deltaOutputsCollected: [DeltaCMUManager.DeltaOutput] = []
     private var deltaCollectionStartHeight: UInt64 = 0
     private var deltaCollectionEnabled = false
+
+    // FIX #874: Track outputs found when delta is "disabled" (manifest says it covers range)
+    // Problem: FIX #795 disables delta collection when manifest covers target height
+    //          But if previous scan missed outputs, new outputs are added to TREE but not DELTA
+    //          This causes tree/delta mismatch → tree root mismatch at send time
+    // Solution: Always collect outputs, even when "disabled", then update delta if any found
+    private var deltaOutputsFoundInCoveredRange: [DeltaCMUManager.DeltaOutput] = []
+
+    // FIX #947: PERFORMANCE - Defer witness computation to first SEND
+    // When true, PHASE 1.5 is skipped entirely during import
+    // Witnesses are computed lazily when user attempts to send
+    // This saves 40-60 seconds during Import PK
+    private var deferWitnessComputation = false
+
+    // FIX #1007: Prevent duplicate CMU appending in PHASE 2
+    // Problem: Step 2a (FIX #571) fetches CMUs via P2P and appends them to tree for witness update
+    //          Then PHASE 2 scans the same blocks and calls treeAppend() again → DOUBLE APPEND!
+    // Solution: Track expected tree size at PHASE 2 start, skip append if tree already has CMU
+    private var treeSizeAtPhase2Start: Int = 0
+    private var cmusAppendedInPhase2: Int = 0
+
+    // FIX #1053: Skip tree modification when delta sync already covered the range
+    private var skipTreeModification: Bool = false
+
+    /// FIX #947: Enable deferred witness computation for faster Import PK
+    /// Set this before calling startScan() to skip PHASE 1.5
+    func setDeferWitnessComputation(_ defer: Bool) {
+        deferWitnessComputation = `defer`
+        if `defer` {
+            print("⚡ FIX #947: Deferred witness computation ENABLED - Import will be ~40-60s faster")
+            print("   Witnesses will be computed on first SEND attempt")
+        }
+    }
 
     // MARK: - Progress Helpers
 
@@ -180,9 +257,12 @@ final class FilterScanner {
     ///   - viewingKey: Spending key (used as viewing key)
     ///   - fromHeight: Optional custom start height (for quick scan)
     func startScan(for accountId: Int64, viewingKey: Data, fromHeight customStartHeight: UInt64? = nil) async throws {
+        // FIX #1097: Log entry into startScan for debugging
+        print("🔍 FIX #1097: startScan called - isScanning=\(isScanning), isScanInProgress=\(FilterScanner.isScanInProgress)")
+
         // SECURITY: Thread-safe check and acquisition of global lock
         guard !isScanning && !FilterScanner.isScanInProgress else {
-            print("⚠️ Scan already in progress, skipping")
+            print("⚠️ Scan already in progress, skipping (isScanning=\(isScanning), isScanInProgress=\(FilterScanner.isScanInProgress))")
             return
         }
 
@@ -215,6 +295,13 @@ final class FilterScanner {
         }
 
         currentChainHeight = latestHeight
+
+        // FIX #967: Update cachedChainHeight at START of scan (not just end)
+        // This ensures FIX #167's validation in updateLastScannedHeight() uses current chain tip
+        // Without this, FIX #167 blocks the update because cachedChainHeight is stale (from last session)
+        // and new height is >100 blocks ahead of the "trusted" sources
+        UserDefaults.standard.set(Int(latestHeight), forKey: "cachedChainHeight")
+        print("📊 FIX #967: Updated cachedChainHeight to \(latestHeight) at scan start (enables FIX #167 validation)")
 
         // LOAD SHIELDED OUTPUTS FROM BOOST FILE
         await WalletManager.shared.updateDownloadTask("download_outputs", status: .inProgress)
@@ -292,6 +379,7 @@ final class FilterScanner {
                 // This ensures PHASE 1 runs to rediscover ALL historical notes
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
                 scanWithinDownloadedRange = true
+                isFullScanInProgress = true  // FIX #1092: Track full scan to skip redundant nullifier verification
                 print("🔄 FIX #726: Full Rescan detected - starting from Sapling activation (\(startHeight)) with PHASE 1 enabled")
 
                 // FIX #726: Load boost file data (should already be cached from previous use)
@@ -328,6 +416,7 @@ final class FilterScanner {
                     startHeight = ZclassicCheckpoints.saplingActivationHeight
                 }
                 scanWithinDownloadedRange = true
+                isFullScanInProgress = true  // FIX #1092: Track full scan to skip redundant nullifier verification
 
                 // DOWNLOAD BOOST FILE FROM GITHUB (required for imported wallets)
                 let (_, boostHeight, boostOutputCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile(onProgress: { progress, status in
@@ -350,10 +439,20 @@ final class FilterScanner {
                 }
             } else if treeExists || hasDownloadedTree {
                 startHeight = effectiveTreeHeight + 1
-                isNewWalletInitialSync = true
+                // FIX #960: CRITICAL - Only skip trial decryption for TRULY new wallets
+                // Previous bug: Set isNewWalletInitialSync=true when treeExists, but tree can exist
+                // for existing wallets doing catch-up sync after app restart with lastScanned=0 (corruption)
+                // This caused ZERO notes to be found on iOS because trial decryption was skipped!
+                // Only skip decryption if:
+                // 1. Tree does NOT exist in database (fresh wallet)
+                // 2. We just downloaded the tree from boost file (new wallet setup)
+                // If tree EXISTS in database, this is likely an existing wallet - NEED trial decryption
+                isNewWalletInitialSync = !treeExists && hasDownloadedTree
+                print("🔍 FIX #960: isNewWalletInitialSync=\(isNewWalletInitialSync) (treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree))")
             } else {
                 // No tree downloaded yet - must download first
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
+                isFullScanInProgress = true  // FIX #1092: Track full scan to skip redundant nullifier verification
             }
         }
 
@@ -579,7 +678,8 @@ final class FilterScanner {
 
         // Load existing witnesses into FFI
         for note in existingNotes {
-            if note.witness.count >= 1028 {
+            // FIX #1107: Changed from 1028 to 100
+            if note.witness.count >= 100 {
                 let witnessIndex = note.witness.withUnsafeBytes { ptr in
                     ZipherXFFI.treeLoadWitness(
                         witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -609,12 +709,24 @@ final class FilterScanner {
         // MUST be scanned in PHASE 2 sequential mode where positions are computed as CMUs are appended.
         let phase1EndHeight = cmuDataHeight > 0 ? cmuDataHeight : effectiveTreeHeight
 
+        // FIX #1097: Debug logging to understand why PHASE 1 might be skipped
+        print("🔍 FIX #1097: PHASE 1 check - scanWithinDownloadedRange=\(scanWithinDownloadedRange), startHeight=\(startHeight), phase1EndHeight=\(phase1EndHeight)")
+        print("🔍 FIX #1097: cmuDataHeight=\(cmuDataHeight), effectiveTreeHeight=\(effectiveTreeHeight), targetHeight=\(targetHeight)")
+        if !scanWithinDownloadedRange {
+            print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - scanWithinDownloadedRange is FALSE")
+        } else if startHeight > phase1EndHeight {
+            print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - startHeight (\(startHeight)) > phase1EndHeight (\(phase1EndHeight))")
+        }
+
         if scanWithinDownloadedRange && startHeight <= phase1EndHeight {
             let parallelEndHeight = min(phase1EndHeight, targetHeight)
             print("⚡ PHASE 1: \(startHeight) → \(parallelEndHeight) (\(parallelEndHeight - startHeight + 1) blocks)")
             let parallelTotalBlocks = parallelEndHeight - startHeight + 1
             var parallelScannedBlocks: UInt64 = 0
-            let batchSize = 500 // Larger batches for P2P batch fetching
+            // FIX #1095: Dynamic batch size based on peer capacity
+            let peerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
+            let maxBlocksPerPeer = 128
+            let batchSize = max(peerCount, 1) * maxBlocksPerPeer  // e.g., 6 peers × 128 = 768
 
             // Collect ALL spends during PHASE 1 for later spend detection (PHASE 1.6)
             // Format: (height, txid, nullifierHex)
@@ -810,14 +922,22 @@ final class FilterScanner {
                 reportPhase1Progress(localProgress, height: endHeight, maxHeight: targetHeight)
 
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
+                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
                 currentHeight = endHeight + 1
             }
 
             print("✅ PHASE 1 complete: \(knownNullifiers.count) notes, \(collectedSpends.count) spends")
 
             // PHASE 1.5: Pre-compute witnesses using PARALLEL function (Rayon multi-threaded)
-            // This computes all witnesses in ~78 seconds using all CPU cores
-            if let bundledData = cmuDataForPositionLookup {
+            // This computes all witnesses in ~40-60 seconds using all CPU cores
+            // FIX #947: Skip PHASE 1.5 if deferred witness computation is enabled
+            // Witnesses will be computed lazily on first SEND attempt
+            if deferWitnessComputation {
+                print("⚡ FIX #947: PHASE 1.5 SKIPPED - Deferred witness computation enabled")
+                print("   Witnesses will be computed on first SEND (saves ~40-60 seconds)")
+                // Still report progress to keep UI moving
+                reportPhase15Progress(1.0, current: 0, total: 0)
+            } else if let bundledData = cmuDataForPositionLookup {
                 await computeWitnessesForBundledNotesBatch(bundledData: bundledData)
 
                 // CRITICAL: After PHASE 1.5, load the computed witnesses into FFI global tree
@@ -828,8 +948,9 @@ final class FilterScanner {
                     let phase1Notes = try database.getAllUnspentNotes(accountId: account.accountId)
                     var loadedCount = 0
                     for note in phase1Notes {
-                        // Only load valid witnesses (1028 bytes, not all zeros)
-                        if note.witness.count >= 1028 && !note.witness.allSatisfy({ $0 == 0 }) {
+                        // Only load valid witnesses (not empty/all zeros)
+                        // FIX #1107: Changed from 1028 to 100
+                        if note.witness.count >= 100 && !note.witness.allSatisfy({ $0 == 0 }) {
                             let witnessIndex = note.witness.withUnsafeBytes { ptr in
                                 ZipherXFFI.treeLoadWitness(
                                     witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -862,12 +983,21 @@ final class FilterScanner {
                     let nullifierWire = nullifierDisplay.reversedBytes()
                     // FIX #367: Hash the blockchain nullifier before comparing
                     let hashedNullifier = database.hashNullifier(nullifierWire)
-                    if knownNullifiers.contains(hashedNullifier) {
+                    let hashedNullifierReversed = database.hashNullifier(nullifierDisplay)
+
+                    // FIX #1079: Check all formats - hashed and raw, both byte orders
+                    let matchesHashedWire = knownNullifiers.contains(hashedNullifier)
+                    let matchesHashedDisplay = knownNullifiers.contains(hashedNullifierReversed)
+                    let matchesRawWire = knownNullifiers.contains(nullifierWire)
+                    let matchesRawDisplay = knownNullifiers.contains(nullifierDisplay)
+
+                    if matchesHashedWire || matchesHashedDisplay || matchesRawWire || matchesRawDisplay {
+                        let nullifierForDb = (matchesHashedWire || matchesRawWire) ? nullifierWire : nullifierDisplay
                         let txidData = Data(hexString: txid)
                         if let txidData = txidData {
-                            try? database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
+                            try? database.markNoteSpent(nullifier: nullifierForDb, txid: txidData, spentHeight: height)
                         } else {
-                            try? database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                            try? database.markNoteSpent(nullifier: nullifierForDb, spentHeight: height)
                         }
                         spendsDetected += 1
                     }
@@ -886,6 +1016,7 @@ final class FilterScanner {
             // CHECKPOINT: Save state at PHASE 1 completion
             // This ensures we don't have to re-scan historical blocks if interrupted
             try? database.updateLastScannedHeight(phase1EndHeight, hash: Data(count: 32))
+            FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
             if let treeData = ZipherXFFI.treeSerialize() {
                 try? database.saveTreeState(treeData)
             }
@@ -982,6 +1113,7 @@ final class FilterScanner {
 
                 // Save progress
                 try? database.updateLastScannedHeight(endHeight, hash: Data(count: 32))
+                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
                 currentHeight = endHeight + 1
             }
         } else if currentHeight <= targetHeight {
@@ -1169,10 +1301,36 @@ final class FilterScanner {
             onStatusUpdate?("phase2", "Building commitment tree...")
             reportPhase2Progress(0.0, height: currentHeight, maxHeight: targetHeight)
 
+            // FIX #1007: Track tree size at PHASE 2 start to detect CMUs already appended by Step 2a
+            // Step 2a (FIX #571 in WalletManager) may have already appended CMUs via P2P for witness update
+            // If PHASE 2 appends them again, tree becomes corrupted with duplicate CMUs
+            treeSizeAtPhase2Start = Int(ZipherXFFI.treeSize())
+            cmusAppendedInPhase2 = 0
+            print("🌳 FIX #1007: PHASE 2 starting with tree size \(treeSizeAtPhase2Start)")
+
+            // FIX #1053: Check if delta sync already brought tree to target height
+            // If so, we should NOT modify the tree - just scan for notes
+            // This prevents corruption when FIX #370 deep verification runs after delta sync
+            skipTreeModification = false
+            if let manifest = DeltaCMUManager.shared.getManifest() {
+                // Calculate expected tree size: boost CMUs + delta CMUs
+                let boostEndHeight = ZipherXConstants.bundledTreeHeight
+                let deltaCMUCount = manifest.endHeight > boostEndHeight ? Int(manifest.endHeight - boostEndHeight) : 0
+                let expectedTreeSize = Int(ZipherXConstants.bundledTreeHeight) + 1 + deltaCMUCount
+                if manifest.endHeight >= targetHeight && treeSizeAtPhase2Start >= expectedTreeSize {
+                    skipTreeModification = true
+                    print("⚡ FIX #1053: Delta sync already covers target \(targetHeight) - SKIPPING tree modification in PHASE 2")
+                    print("   Delta end: \(manifest.endHeight), Tree size: \(treeSizeAtPhase2Start), Expected: \(expectedTreeSize)")
+                }
+            }
+
             // DELTA BUNDLE: Enable collection for outputs AFTER the bundled/downloaded range
             // These outputs will be saved locally for instant witness generation
             let deltaBundledEndHeight = cmuDataHeight > 0 ? cmuDataHeight : ZipherXConstants.bundledTreeHeight
             if currentHeight > deltaBundledEndHeight {
+                // FIX #874: Clear array for tracking outputs found when delta is "disabled"
+                deltaOutputsFoundInCoveredRange.removeAll()
+
                 // SMART START: Continue from existing delta if valid, otherwise from boost end
                 if let manifest = DeltaCMUManager.shared.getManifest(), manifest.endHeight >= deltaBundledEndHeight {
                     // FIX #795: Check if delta already covers our target - if so, skip collection
@@ -1230,13 +1388,16 @@ final class FilterScanner {
             }
 
             let totalBlocksToFetch = Int(rawBlockCount)
-            let prefetchBatchSize = 500  // 500 blocks per batch
-            // FIX #933: Reduced from 4 to 2 parallel batches to prevent overwhelming peers
-            // 4 batches × 500 blocks = 2000 blocks overwhelmed peers causing "Not connected" errors
-            // 2 batches × 500 blocks = 1000 blocks is more manageable while still fast
-            let parallelBatches = 2
+            // FIX #1095: Dynamic batch size based on peer capacity
+            // With 6 peers × 128 blocks/peer = 768 blocks per round
+            let p2pPeerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
+            let maxBlocksPerPeer = 128
+            let prefetchBatchSize = max(p2pPeerCount, 1) * maxBlocksPerPeer  // e.g., 6 peers × 128 = 768
+            // FIX #1095: With all peers used per batch, parallel batches cause conflicts
+            // One batch uses ALL peers already - no benefit from parallel batches
+            let parallelBatches = 1
 
-            print("🚀 FIX #190 v6: Pre-fetching \(totalBlocksToFetch) blocks (\(parallelBatches)x parallel, batch=\(prefetchBatchSize))...")
+            print("🚀 FIX #1095: Pre-fetching \(totalBlocksToFetch) blocks using \(p2pPeerCount) peers (batch=\(prefetchBatchSize))...")
             onStatusUpdate?("prefetch", "📥 Fetching 0/\(totalBlocksToFetch) blocks...")
             let prefetchStartTime = Date()
 
@@ -1247,6 +1408,12 @@ final class FilterScanner {
             let maxRetries = 3
             var consecutiveEmptyFetches = 0
             let maxConsecutiveEmpty = 5  // Give up after 5 rounds with 0 blocks fetched
+
+            // FIX #1104: Pre-reconnect ALL peers ONCE before the prefetch loop
+            // CRITICAL: This was previously INSIDE the while loop (line 1381), causing a reconnection
+            // storm that killed in-flight P2P requests (error 89: Operation canceled).
+            // Moving it outside ensures we reconnect once, then use stable connections for all batches.
+            await networkManager.preReconnectPeersForBlockFetch()
 
             while prefetchHeight <= targetHeight && isScanning {
                 // Create up to `parallelBatches` concurrent fetch tasks
@@ -1270,15 +1437,23 @@ final class FilterScanner {
                 print("📥 FIX #897: Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches from height \(prefetchHeight)...")
                 onStatusUpdate?("prefetch", "📥 Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks...")
                 reportPhase2Progress(fetchProgress * 0.5, height: prefetchHeight, maxHeight: targetHeight)
+                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time during block prefetch
+
+                // FIX #1104: Pre-reconnect moved OUTSIDE while loop (see line ~1354)
+                // Previous bug: Reconnecting every iteration (1-2 seconds) caused reconnection storm
+                // that killed in-flight requests with error 89 (Operation canceled)
+                // Now: Single reconnect before loop, stable connections throughout prefetch
 
                 // Fetch all batches IN PARALLEL using TaskGroup
+                // FIX #1071/1104: All peers are now ready - no per-batch reconnection needed
                 var batchBlocksFetched = 0
                 let batchResults = await withTaskGroup(of: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
                     for task in batchTasks {
                         group.addTask {
                             do {
                                 return try await withTimeout(seconds: 60) {
-                                    try await self.fetchBlocksData(heights: task.heights)
+                                    // FIX #1071: skipPreReconnect=true - already done above
+                                    try await self.fetchBlocksData(heights: task.heights, skipPreReconnect: true)
                                 }
                             } catch {
                                 print("⚠️ FIX #897: Batch \(task.start)-\(task.end) failed: \(error)")
@@ -1346,9 +1521,9 @@ final class FilterScanner {
                             }
                         }
 
-                        // Brief pause between retries to let network recover
+                        // FIX #1080: Reduced pause from 1s to 0.3s for faster retries
                         if retryAttempt < maxRetries {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+                            try? await Task.sleep(nanoseconds: 300_000_000)  // 0.3 second
                         }
                     }
 
@@ -1369,8 +1544,8 @@ final class FilterScanner {
                         print("❌ FIX #897: \(maxConsecutiveEmpty) consecutive empty fetches - network may be down, aborting prefetch")
                         break
                     }
-                    // Wait before retrying to let network recover
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
+                    // FIX #1080: Reduced wait from 2s to 0.5s for faster recovery
+                    try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
                 } else {
                     consecutiveEmptyFetches = 0  // Reset on successful fetch
                 }
@@ -1421,6 +1596,7 @@ final class FilterScanner {
                 // Save what we have so far
                 let partialHeight = prefetchedBlocks.keys.max() ?? currentHeight
                 try? database.updateLastScannedHeight(partialHeight, hash: Data(count: 32))
+                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
                 if let treeData = ZipherXFFI.treeSerialize() {
                     try? database.saveTreeState(treeData)
                 }
@@ -1509,6 +1685,7 @@ final class FilterScanner {
                     // 500 blocks = minutes of lost work on crash
                     if scannedBlocks % 10 == 0 {
                         try? database.updateLastScannedHeight(height, hash: Data(count: 32))
+                        FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
                         if let treeData = ZipherXFFI.treeSerialize() {
                             try? database.saveTreeState(treeData)
                         }
@@ -1530,6 +1707,7 @@ final class FilterScanner {
             // Fix: Always save targetHeight at end of scan
             let finalHeight = targetHeight
             try? database.updateLastScannedHeight(finalHeight, hash: Data(count: 32))
+            FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
             print("📍 FIX #206: Final lastScannedHeight saved: \(finalHeight)")
         }
 
@@ -1687,6 +1865,26 @@ final class FilterScanner {
             deltaCollectionEnabled = false
         }
 
+        // FIX #874: If we found outputs in range that delta "already covers", update delta bundle
+        // This happens when previous scans missed outputs due to P2P issues
+        // Without this fix, tree and delta get out of sync → tree root mismatch at send time
+        if !deltaOutputsFoundInCoveredRange.isEmpty {
+            print("⚠️ FIX #874: Found \(deltaOutputsFoundInCoveredRange.count) outputs that delta MISSED!")
+            print("⚠️ FIX #874: Adding missed outputs to delta bundle to keep tree/delta in sync...")
+
+            if let treeRoot = ZipherXFFI.treeRoot() {
+                let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
+                DeltaCMUManager.shared.appendOutputs(
+                    deltaOutputsFoundInCoveredRange,
+                    fromHeight: ZipherXConstants.bundledTreeHeight + 1,
+                    toHeight: lastScanned,
+                    treeRoot: treeRoot
+                )
+                print("✅ FIX #874: Updated delta bundle with \(deltaOutputsFoundInCoveredRange.count) missed outputs")
+            }
+            deltaOutputsFoundInCoveredRange.removeAll()
+        }
+
         // Save tree checkpoint after scan completes
         let checkpointSaved = await saveTreeCheckpointAfterSync()
 
@@ -1710,11 +1908,121 @@ final class FilterScanner {
             print("📍 FIX #176: Checkpoint updated to \(lastScanned) after scan complete")
         }
 
+        // FIX #1101: PERFORMANCE - Skip redundant FIX #1089 verification after Full Rescan
+        // Problem: Full Rescan clears FIX1089_FullVerificationComplete flag, causing FIX #945
+        // to trigger a 73K+ block scan from oldest note - even though Full Rescan already
+        // verified all spends in PHASE 1 (boost scan) and PHASE 2 (P2P delta scan).
+        // Solution: Set the flag after successful Full Rescan, so FIX #1089 uses checkpoint.
+        // This saves ~76 seconds (73K blocks × 1ms/block = 73 seconds + overhead).
+        if await WalletManager.shared.isRepairingDatabase {
+            UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+            print("✅ FIX #1101: Set FIX1089_FullVerificationComplete=true after Full Rescan (skips redundant 73K block scan)")
+        }
+
         // FIX #907: Resume block listeners now that all sync operations are complete
         // Block listeners were stopped for header sync and PHASE 2 block fetch
         print("▶️ FIX #907: Resuming block listeners after scan complete...")
         await PeerManager.shared.resumeAllBlockListeners()
         print("✅ FIX #907: Block listeners resumed")
+
+        // FIX #1090: CRITICAL - Recompute nullifiers with correct tree positions BEFORE verification
+        // ROOT CAUSE: processDecryptedNote used placeholder positions (height * 1000 + outputIndex)
+        // instead of real tree positions from witnessIndex. This caused nullifiers to be WRONG
+        // and verifyAllUnspentNotesOnChain could never find matches on blockchain.
+        var fixedNullifiers = 0
+        do {
+            fixedNullifiers = try await WalletManager.shared.recomputeNullifiersWithCorrectPositions()
+            if fixedNullifiers > 0 {
+                print("🔧 FIX #1090: Fixed \(fixedNullifiers) nullifier(s) - verification can now detect spent notes")
+            }
+        } catch {
+            print("⚠️ FIX #1090: Failed to recompute nullifiers: \(error)")
+        }
+
+        // FIX #945: CRITICAL - Verify all unspent notes are actually unspent on-chain
+        // Problem: P2P block fetch may miss blocks due to network issues (timeouts, disconnections)
+        // If a block containing a spend is missed, the nullifier won't be detected
+        // Result: Note stays marked as "unspent" when it's actually spent = WRONG BALANCE
+        // Solution: After scan completes, verify each unspent note's nullifier isn't on-chain
+        // This catches any spends that were missed during the scan
+        // FIX #1090: Force full verification if we just fixed nullifiers
+        print("🔍 FIX #945: Running post-scan spend verification...")
+        do {
+            let externalSpends = try await WalletManager.shared.verifyAllUnspentNotesOnChain(forceFullVerification: fixedNullifiers > 0)
+            if externalSpends > 0 {
+                print("✅ FIX #945: Detected and fixed \(externalSpends) missed spend(s)")
+                // Refresh balance after fixing missed spends
+                try? await WalletManager.shared.refreshBalance()
+            } else {
+                print("✅ FIX #945: All unspent notes verified - no missed spends")
+            }
+        } catch {
+            print("⚠️ FIX #945: Post-scan verification failed: \(error)")
+            print("   Balance may be incorrect if spends occurred in missed blocks")
+            print("   Use 'Full Resync' in Settings if balance seems wrong")
+        }
+
+        // FIX #1082: CRITICAL - Rebuild witnesses for notes that STILL don't have them!
+        // During scan, only notes with existing witnesses get updated (existingWitnessIndices).
+        // Notes without witnesses (empty witness field) are SKIPPED because they can't be loaded
+        // into the FFI tree. This leaves those notes unable to be spent!
+        //
+        // Now that delta CMUs have been collected during PHASE 2, we can rebuild these witnesses.
+        // This is MUCH faster than health check's full P2P delta fetch because:
+        // 1. Delta CMUs are already in the DeltaCMUManager (saved above)
+        // 2. No duplicate P2P fetching needed
+        // 3. Instant witness generation from local data
+        print("🔍 FIX #1082: Checking for notes without witnesses after scan...")
+        do {
+            let (missingCount, missingValue, minHeight) = try database.getNotesWithoutWitnesses(accountId: 1)
+
+            if missingCount == 0 {
+                print("✅ FIX #1082: All notes have valid witnesses")
+            } else {
+                let valueZCL = Double(missingValue) / 100_000_000.0
+                print("⚠️ FIX #1082: \(missingCount) notes still without witnesses (\(String(format: "%.8f", valueZCL)) ZCL)")
+                print("   📍 Min note height: \(minHeight)")
+                print("   🔧 FIX #1082: Triggering post-scan witness rebuild...")
+
+                // Use WalletManager's rebuildWitnessesForStartup which handles boost + delta
+                await WalletManager.shared.rebuildWitnessesForStartup()
+
+                // Verify fix worked
+                let (stillMissing, _, _) = try database.getNotesWithoutWitnesses(accountId: 1)
+                if stillMissing == 0 {
+                    print("✅ FIX #1082: Post-scan witness rebuild successful - all notes now have witnesses!")
+                    // Refresh balance to reflect spendable notes
+                    try? await WalletManager.shared.refreshBalance()
+                } else {
+                    print("⚠️ FIX #1082: \(stillMissing) notes still missing witnesses (will try on next send)")
+                }
+            }
+        } catch {
+            print("⚠️ FIX #1082: Error checking notes without witnesses: \(error)")
+        }
+
+        // FIX #1084: Verify all unspent notes against on-chain nullifiers
+        // This catches spent notes that were missed during normal scan
+        // (e.g., spends from other wallet instances with same seed)
+        // SKIP if there are pending transactions to avoid race conditions
+        // FIX #1092: SKIP during Full Scan (FULL START, Import PK, Full Rescan) - we just scanned ALL blocks, nullifiers already verified
+        let hasPendingTx = (try? database.getPendingSentTransactions())?.isEmpty == false
+        let pendingTxids = UserDefaults.standard.stringArray(forKey: "ZipherX_PendingOutgoingTxids") ?? []
+        let hasPendingOutgoing = !pendingTxids.isEmpty
+
+        if isFullScanInProgress {
+            print("⏩ FIX #1092: Skipping FIX #1084 - Full scan just scanned all blocks, nullifiers already verified")
+            isFullScanInProgress = false  // Reset flag for next scan
+        } else if hasPendingTx || hasPendingOutgoing {
+            print("⏸️ FIX #1084: Skipping nullifier verification - pending transaction in progress")
+        } else {
+            print("🔍 FIX #1084: Verifying unspent notes against blockchain nullifiers...")
+            do {
+                try await WalletManager.shared.verifyNullifierSpendStatus()
+            } catch {
+                print("⚠️ FIX #1084: Nullifier verification error: \(error)")
+            }
+        }
 
         print("✅ Scan complete")
     }
@@ -1969,10 +2277,13 @@ final class FilterScanner {
                             // 3. Save updated witnesses back to database
                             print("🔧 FIX #739 v3: Syncing witnesses with corrected global tree...")
 
+                            // FIX #996: Clear WITNESSES array before loading to prevent accumulation
+                            ZipherXFFI.witnessesClear()
+
                             // Load all witnesses into FFI WITNESSES array
                             // Track mapping: FFI index -> note ID + height for extraction
                             // FIX #793: Track height so we can get anchor from HeaderStore
-                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64, noteHeight: UInt64)] = []
+                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64)] = []
                             for noteData in validNotes {
                                 if !noteData.note.witness.isEmpty {
                                     let index = ZipherXFFI.treeLoadWitness(
@@ -1980,7 +2291,7 @@ final class FilterScanner {
                                         witnessLen: noteData.note.witness.count
                                     )
                                     if index != UInt64.max {
-                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id, noteHeight: noteData.note.height ?? 0))
+                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
                                     }
                                 }
                             }
@@ -2003,7 +2314,7 @@ final class FilterScanner {
 
                             // Extract updated witnesses and save to database using correct FFI indices
                             var rebuiltCount = 0
-                            for (ffiIndex, noteId, noteHeight) in loadedNotes {
+                            for (ffiIndex, noteId) in loadedNotes {
                                 if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
                                     if updatedWitness.count >= 100 {
                                         try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
@@ -2109,6 +2420,7 @@ final class FilterScanner {
                             let boostEndHeight = ZipherXConstants.effectiveTreeHeight
                             print("🔧 FIX #765: Resetting lastScannedHeight from \(lastScannedHeight) to \(boostEndHeight)")
                             try? database.updateLastScannedHeight(boostEndHeight, hash: Data(count: 32))
+                            FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
 
                             // Set flag to trigger PHASE 2 rescan
                             await MainActor.run {
@@ -2152,13 +2464,13 @@ final class FilterScanner {
         // Version (4) + prevHash (32) + merkleRoot (32) + reserved (32) + time (4) + bits (4) + nonce (32) = 140 bytes
         // Then Equihash solution (variable)
 
-        let version = data.loadUInt32(at: offset)
+        _ = data.loadUInt32(at: offset)  // version - not used
         offset += 4
 
         let prevHash = Data(data[offset..<offset+32])
         offset += 32
 
-        let merkleRoot = Data(data[offset..<offset+32])
+        _ = Data(data[offset..<offset+32])  // merkleRoot - not used
         offset += 32
 
         // Final Sapling Root (the anchor!) - NOT "reserved"
@@ -2477,18 +2789,14 @@ final class FilterScanner {
         height: UInt64,
         blockOutputStartIndex: UInt32 = 0  // FIX #786: Per-block output index (not per-tx)
     ) throws {
-        // FIX #690: Track if we detected any of our spends in this transaction
-        // If we find our outputs later but didn't detect any spends, it's likely our transaction with a deleted note
-        var detectedOurSpendInThisTx = false
-
         // FIX #843: Track external spend details for this TX (spent from another wallet or after app restart)
         var externalSpendTxids = Set<String>()
         var externalSpendNoteValue: UInt64 = 0  // Value of the note that was spent
 
         // FIX #288: Check for spent notes (nullifier detection) FIRST
-        // DEBUG: Log spend detection attempts
+        // FIX #1050: Suppress verbose per-TX spend processing log (routine during sync)
         if let spends = spends, !spends.isEmpty {
-            print("🔍 FIX #288: Processing \(spends.count) spends at height \(height), knownNullifiers=\(knownNullifiers.count)")
+            // Spend detection happens silently - matches still log via FIX #952
             let txidData = Data(hexString: txid)
             for spend in spends {
                 guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
@@ -2501,13 +2809,60 @@ final class FilterScanner {
                 // VUL-009 stores hashed nullifiers to prevent spending pattern analysis
                 let hashedNullifier = database.hashNullifier(nullifierWire)
                 let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
-                if knownNullifiers.contains(hashedNullifier) {
-                    print("💸 FIX #367: MATCH! Nullifier \(shortNf)... found - marking note as spent")
-                    detectedOurSpendInThisTx = true  // FIX #690: Track that we detected our spend
+
+                // FIX #952: CRITICAL - Try both byte orderings for nullifier matching
+                // The boost file Rust scan returns nullifiers in canonical format, but there may be
+                // byte order inconsistencies between how nullifiers are stored vs how they appear on chain.
+                // Try both orderings to ensure external spend detection works correctly.
+                let hashedNullifierReversed = database.hashNullifier(nullifierDisplay)
+
+                // FIX #1079: Also check RAW (unhashed) nullifiers for backwards compatibility
+                // Some notes may have been stored before VUL-009 hashing, or with wrong position
+                // Try all possible formats: hashed wire, hashed display, raw wire, raw display
+                let matchesHashedWire = knownNullifiers.contains(hashedNullifier)
+                let matchesHashedDisplay = knownNullifiers.contains(hashedNullifierReversed)
+                let matchesRawWire = knownNullifiers.contains(nullifierWire)
+                let matchesRawDisplay = knownNullifiers.contains(nullifierDisplay)
+
+                let nullifierMatched = matchesHashedWire || matchesHashedDisplay || matchesRawWire || matchesRawDisplay
+
+                // FIX #1079: Determine which format matched for correct database operations
+                let matchFormat: String
+                let nullifierForDb: Data
+                if matchesHashedWire {
+                    matchFormat = "hashed-wire"
+                    nullifierForDb = nullifierWire
+                } else if matchesHashedDisplay {
+                    matchFormat = "hashed-display"
+                    nullifierForDb = nullifierDisplay
+                } else if matchesRawWire {
+                    matchFormat = "raw-wire"
+                    nullifierForDb = nullifierWire
+                } else if matchesRawDisplay {
+                    matchFormat = "raw-display"
+                    nullifierForDb = nullifierDisplay
+                } else {
+                    matchFormat = "none"
+                    nullifierForDb = nullifierWire  // Default, won't be used if no match
+                }
+
+                if nullifierMatched {
+                    let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("💸 FIX #1079: MATCH! Nullifier \(shortNf)... found (\(matchFormat)) - marking note as spent")
+
+                    // FIX #1031: Get note value BEFORE marking spent!
+                    // Bug: getNoteByNullifier has "AND is_spent = 0" filter
+                    // If we call it AFTER markNoteSpent(), the note is already spent and query returns nil
+                    // This broke FIX #843 external spend detection - change outputs were shown as "received"
+                    // FIX #1079: Try both wire and display formats to find the note
+                    let spentNoteInfo = (try? database.getNoteByNullifier(nullifier: nullifierForDb))
+                        ?? (try? database.getNoteByNullifier(nullifier: nullifierWire))
+                        ?? (try? database.getNoteByNullifier(nullifier: nullifierDisplay))
+
                     if let txidData = txidData {
-                        try database.markNoteSpent(nullifier: nullifierWire, txid: txidData, spentHeight: height)
+                        try database.markNoteSpent(nullifier: nullifierForDb, txid: txidData, spentHeight: height)
                     } else {
-                        try database.markNoteSpent(nullifier: nullifierWire, spentHeight: height)
+                        try database.markNoteSpent(nullifier: nullifierForDb, spentHeight: height)
                     }
 
                     // FIX #396: Confirm pending outgoing TX when nullifier found in block
@@ -2535,8 +2890,8 @@ final class FilterScanner {
                         if let txidData = txidData {
                             let alreadyRecorded = (try? database.transactionExists(txid: txidData, type: .sent)) ?? false
                             if !alreadyRecorded {
-                                // Get the spent note to determine the value (use wire format nullifier)
-                                if let spentNote = try? database.getNoteByNullifier(nullifier: nullifierWire) {
+                                // FIX #1031: Use the note info we got BEFORE marking spent
+                                if let spentNote = spentNoteInfo {
                                     print("💸 FIX #843: External/restart spend detected")
                                     print("   TX: \(txid.prefix(16))... at height \(height)")
                                     print("   Note value: \(spentNote.value) zatoshis")
@@ -2548,7 +2903,9 @@ final class FilterScanner {
                         }
                     }
                 } else {
-                    print("🔍 FIX #288: Nullifier \(shortNf)... NOT in knownNullifiers")
+                    // FIX #1050: Suppress verbose non-match logging (was FIX #952 debug)
+                    // Only log when nullifier MATCHES (spend detected) - that's important info
+                    // Non-matches are the common case during sync and create excessive log noise
                 }
             }
         }
@@ -2573,28 +2930,69 @@ final class FilterScanner {
 
             // DELTA BUNDLE: Collect output for local caching (enables instant witness generation)
             // Format: 652 bytes = height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580)
+            let deltaOutput = DeltaCMUManager.DeltaOutput(
+                height: UInt32(height),
+                index: blockOutputIndex,  // FIX #786: Use per-block index, not per-tx
+                cmu: cmu,
+                epk: epk,
+                ciphertext: encCiphertext
+            )
+
             if deltaCollectionEnabled {
-                let deltaOutput = DeltaCMUManager.DeltaOutput(
-                    height: UInt32(height),
-                    index: blockOutputIndex,  // FIX #786: Use per-block index, not per-tx
-                    cmu: cmu,
-                    epk: epk,
-                    ciphertext: encCiphertext
-                )
                 deltaOutputsCollected.append(deltaOutput)
 
                 // FIX #789: Log delta collection progress every 100 outputs
                 if deltaOutputsCollected.count % 100 == 1 || deltaOutputsCollected.count == 1 {
                     print("📦 FIX #789: Collecting delta output \(deltaOutputsCollected.count) at height \(height)")
                 }
+            } else if height > ZipherXConstants.bundledTreeHeight {
+                // FIX #874: Collect outputs even when delta is "disabled" (manifest says it covers range)
+                // These are outputs that previous scans MISSED - we need to add them to delta
+                deltaOutputsFoundInCoveredRange.append(deltaOutput)
+                if deltaOutputsFoundInCoveredRange.count == 1 {
+                    print("⚠️ FIX #874: Found output at height \(height) in range that delta 'covers' - previous scan missed it!")
+                }
             }
 
-            // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
-            let treePosition = ZipherXFFI.treeAppend(cmu: cmu)
+            // FIX #1007 + FIX #1053: Check if this CMU was already appended
+            // Problem: Step 2a/delta sync may have already appended these CMUs
+            //          Then PHASE 2 scans the same blocks and would append them again
+            // Solution: Skip tree modification if delta sync already covered this range
+            let currentTreeSize = Int(ZipherXFFI.treeSize())
+            let expectedTreeSize = treeSizeAtPhase2Start + cmusAppendedInPhase2
+
+            let treePosition: UInt64
+            if skipTreeModification {
+                // FIX #1053: Delta sync already brought tree to target - don't modify tree
+                // Just use the expected position for note discovery
+                treePosition = UInt64(expectedTreeSize)
+                // Log once per block to avoid spam
+                if outputIndex == 0 {
+                    print("⏭️ FIX #1053: Skipping treeAppend at height \(height) - delta sync already covered this range")
+                }
+            } else if currentTreeSize > expectedTreeSize {
+                // FIX #1007: Tree is already larger than expected - Step 2a already appended this CMU
+                // Get the position this CMU would have (it's already in the tree)
+                treePosition = UInt64(expectedTreeSize)
+                // Log once per block to avoid spam
+                if outputIndex == 0 {
+                    print("⏭️ FIX #1007: Skipping treeAppend at height \(height) - CMU already in tree (size \(currentTreeSize) > expected \(expectedTreeSize))")
+                }
+            } else {
+                // Tree at expected size - append normally
+                treePosition = ZipherXFFI.treeAppend(cmu: cmu)
+            }
+            // Always increment counter to track expected position
+            cmusAppendedInPhase2 += 1
 
             // NEW WALLET OPTIMIZATION: Skip note decryption for new wallets
             // No notes can exist for a brand new address that was just created
+            // FIX #960: Only skip for truly new wallets (see line 369)
             if isNewWalletInitialSync {
+                // FIX #960: Log when skipping to help debug note detection issues
+                if outputIndex == 0 {
+                    print("⏭️ FIX #960: Skipping trial decryption (isNewWalletInitialSync=true) at height \(height)")
+                }
                 _ = treePosition  // Silence unused variable warning
                 continue  // Skip decryption, just append CMUs to tree
             }
@@ -2636,8 +3034,17 @@ final class FilterScanner {
                 position: treePosition
             )
 
+            // FIX #953: DEBUG - Log nullifier details when adding to knownNullifiers
+            let nfShort = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("🔑 FIX #953: Adding nullifier to knownNullifiers at height \(height)")
+            print("   Position: \(treePosition), Value: \(value) zatoshis")
+            print("   Nullifier (wire): \(nfShort)...")
+            let hashedNf = database.hashNullifier(nullifier)
+            let hashedNfShort = hashedNf.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("   Hashed nullifier: \(hashedNfShort)...")
+
             // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
-            knownNullifiers.insert(database.hashNullifier(nullifier))
+            knownNullifiers.insert(hashedNf)
 
             // Get witness
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
@@ -2684,7 +3091,7 @@ final class FilterScanner {
                 print("   Sent amount: \(sentAmount) zatoshis")
                 print("   Fee: \(fee) zatoshis")
 
-                try database.recordSentTransactionAtomic(
+                _ = try database.recordSentTransactionAtomic(
                     hashedNullifier: Data(),  // We don't have it here, note already marked spent
                     txid: txidData,
                     spentHeight: height,
@@ -2738,7 +3145,7 @@ final class FilterScanner {
                     print("   Input note: \(externalSpendNoteValue) zatoshis")
                     print("   Sent amount: \(sentAmount) zatoshis (no change output)")
 
-                    try database.recordSentTransactionAtomic(
+                    _ = try database.recordSentTransactionAtomic(
                         hashedNullifier: Data(),
                         txid: txidData,
                         spentHeight: height,
@@ -2781,7 +3188,11 @@ final class FilterScanner {
         cmuDataForPositionLookup: Data?
     ) throws {
         // Skip if new wallet (no notes to find)
-        guard !isNewWalletInitialSync else { return }
+        // FIX #960: Only skip for truly new wallets (see line 369)
+        guard !isNewWalletInitialSync else {
+            print("⏭️ FIX #960: Skipping batch parallel processing (isNewWalletInitialSync=true)")
+            return
+        }
 
         // Step 1: Collect ALL outputs from the batch with metadata
         var batchOutputs: [BatchOutputInfo] = []
@@ -3216,7 +3627,9 @@ final class FilterScanner {
 
             // NEW WALLET OPTIMIZATION: Skip note decryption for new wallets
             // No notes can exist for a brand new address that was just created
+            // FIX #960: Only skip for truly new wallets (see line 369)
             if isNewWalletInitialSync {
+                print("⏭️ FIX #960: Skipping trial decryption in boost path (isNewWalletInitialSync=true)")
                 continue  // Skip decryption entirely
             }
 
@@ -3248,7 +3661,7 @@ final class FilterScanner {
             // Try to find real position from downloaded CMU data
             var position: UInt64 = 0
             var needsNullifierFix = false
-            let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
+            _ = ZipherXConstants.effectiveTreeHeight  // downloadedTreeHeight - not used
 
             if let downloadedData = cmuDataForPositionLookup {
                 if let realPos = ZipherXFFI.findCMUPosition(cmuData: downloadedData, targetCMU: cmu) {
@@ -3694,7 +4107,8 @@ final class FilterScanner {
 
     /// Fetch multiple blocks' data for scanning - P2P ONLY (FIX #896: removed InsightAPI)
     /// Returns: [(height, [(txid, [ShieldedOutput], [ShieldedSpend]?)])]
-    private func fetchBlocksData(heights: [UInt64]) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+    /// - Parameter skipPreReconnect: If true, skip P2P pre-reconnection (already done at caller level via FIX #1071)
+    private func fetchBlocksData(heights: [UInt64], skipPreReconnect: Bool = false) async throws -> [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
         // FIX #896: P2P only - no InsightAPI fallback (cypherpunk wallet)
         let isConnected = await MainActor.run { networkManager.isConnected }
         guard isConnected && !heights.isEmpty else {
@@ -3703,7 +4117,8 @@ final class FilterScanner {
 
         let startHeight = heights.min()!
         let count = heights.count
-        let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count)
+        // FIX #1071: Pass skipPreReconnect to avoid redundant reconnection when called from parallel batches
+        let results = try await networkManager.getBlocksDataP2P(from: startHeight, count: count, skipPreReconnect: skipPreReconnect)
 
         var blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
         for (h, _, timestamp, txData) in results {
@@ -3730,8 +4145,9 @@ final class FilterScanner {
             }
 
             let notes = try database.getAllUnspentNotes(accountId: account.accountId)
+            // FIX #1107: Changed from != 1028 to < 100
             let notesNeedingWitness = notes.filter { note in
-                note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
+                note.witness.count < 100 || note.witness.allSatisfy { $0 == 0 }
             }
 
             if notesNeedingWitness.isEmpty {
@@ -3741,6 +4157,13 @@ final class FilterScanner {
 
             print("🔧 PHASE 1.5: \(notesNeedingWitness.count) witnesses to compute")
             reportPhase15Progress(0.05, current: 0, total: notesNeedingWitness.count)
+
+            // FIX #1109: Clear WITNESSES array before creating new witnesses
+            // Without this, witnesses accumulate across rebuild cycles
+            let clearedCount = ZipherXFFI.witnessesClear()
+            if clearedCount > 0 {
+                print("🧹 FIX #1109: Cleared \(clearedCount) stale witnesses from FFI array")
+            }
 
             for (index, note) in notesNeedingWitness.enumerated() {
                 guard let cmu = note.cmu, cmu.count == 32 else { continue }
@@ -3780,8 +4203,9 @@ final class FilterScanner {
             }
 
             let notes = try database.getAllUnspentNotes(accountId: account.accountId)
+            // FIX #1107: Changed from != 1028 to < 100
             let notesNeedingWitness = notes.filter { note in
-                note.witness.count != 1028 || note.witness.allSatisfy { $0 == 0 }
+                note.witness.count < 100 || note.witness.allSatisfy { $0 == 0 }
             }
 
             if notesNeedingWitness.isEmpty {
@@ -3800,7 +4224,7 @@ final class FilterScanner {
                 targetCMUs.append(cmu)
                 let idx = targetCMUs.count - 1
                 noteIdMap[idx] = note.id
-                noteHeightMap[idx] = note.height ?? 0  // FIX #793
+                noteHeightMap[idx] = note.height  // FIX #793
             }
 
             guard !targetCMUs.isEmpty else {

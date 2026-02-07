@@ -298,34 +298,34 @@ final class HeaderStore {
         let chainwork = try computeChainWork(for: header)
 
         sqlite3_bind_int64(stmt, 1, Int64(header.height))
-        header.blockHash.withUnsafeBytes { ptr in
+        _ = header.blockHash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(header.blockHash.count), SQLITE_TRANSIENT)
         }
-        header.hashPrevBlock.withUnsafeBytes { ptr in
+        _ = header.hashPrevBlock.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(header.hashPrevBlock.count), SQLITE_TRANSIENT)
         }
-        header.hashMerkleRoot.withUnsafeBytes { ptr in
+        _ = header.hashMerkleRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(header.hashMerkleRoot.count), SQLITE_TRANSIENT)
         }
-        header.hashFinalSaplingRoot.withUnsafeBytes { ptr in
+        _ = header.hashFinalSaplingRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(header.hashFinalSaplingRoot.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 6, Int64(header.time))
         sqlite3_bind_int64(stmt, 7, Int64(header.bits))
-        header.nonce.withUnsafeBytes { ptr in
+        _ = header.nonce.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(header.nonce.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 9, Int64(header.version))
         // FIX #188: Store solution for Equihash verification
         if !header.solution.isEmpty {
-            header.solution.withUnsafeBytes { ptr in
+            _ = header.solution.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 10, ptr.baseAddress, Int32(header.solution.count), SQLITE_TRANSIENT)
             }
         } else {
             sqlite3_bind_null(stmt, 10)
         }
         // FIX #535: Store chainwork for fork detection
-        chainwork.withUnsafeBytes { ptr in
+        _ = chainwork.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(chainwork.count), SQLITE_TRANSIENT)
         }
 
@@ -375,27 +375,27 @@ final class HeaderStore {
 
                 // Bind values
                 sqlite3_bind_int64(stmt, 1, Int64(header.height))
-                header.blockHash.withUnsafeBytes { ptr in
+                _ = header.blockHash.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(header.blockHash.count), SQLITE_TRANSIENT)
                 }
-                header.hashPrevBlock.withUnsafeBytes { ptr in
+                _ = header.hashPrevBlock.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(header.hashPrevBlock.count), SQLITE_TRANSIENT)
                 }
-                header.hashMerkleRoot.withUnsafeBytes { ptr in
+                _ = header.hashMerkleRoot.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(header.hashMerkleRoot.count), SQLITE_TRANSIENT)
                 }
-                header.hashFinalSaplingRoot.withUnsafeBytes { ptr in
+                _ = header.hashFinalSaplingRoot.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(header.hashFinalSaplingRoot.count), SQLITE_TRANSIENT)
                 }
                 sqlite3_bind_int64(stmt, 6, Int64(header.time))
                 sqlite3_bind_int64(stmt, 7, Int64(header.bits))
-                header.nonce.withUnsafeBytes { ptr in
+                _ = header.nonce.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(header.nonce.count), SQLITE_TRANSIENT)
                 }
                 sqlite3_bind_int64(stmt, 9, Int64(header.version))
                 // FIX #188: Store solution for Equihash verification
                 if !header.solution.isEmpty {
-                    header.solution.withUnsafeBytes { ptr in
+                    _ = header.solution.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(stmt, 10, ptr.baseAddress, Int32(header.solution.count), SQLITE_TRANSIENT)
                     }
                 } else {
@@ -403,7 +403,7 @@ final class HeaderStore {
                 }
                 // FIX #535: Compute and store chainwork for fork detection
                 let chainwork = try computeChainWork(for: header)
-                chainwork.withUnsafeBytes { ptr in
+                _ = chainwork.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(chainwork.count), SQLITE_TRANSIENT)
                 }
 
@@ -472,7 +472,7 @@ final class HeaderStore {
         defer { sqlite3_finalize(stmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        hash.withUnsafeBytes { ptr in
+        _ = hash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hash.count), SQLITE_TRANSIENT)
         }
 
@@ -972,6 +972,10 @@ final class HeaderStore {
     }
 
     /// Delete all headers in a specific height range
+    /// FIX #944: CRITICAL - Fixed parameter binding bug! sqlite3_exec does NOT bind parameters.
+    /// The old code passed "?" placeholders literally, which SQLite treated as NULL.
+    /// Result: DELETE WHERE height >= NULL AND height <= NULL = deletes NOTHING!
+    /// This caused infinite chain mismatch loops during Import PK.
     func deleteHeadersInRange(from: UInt64, to: UInt64) throws {
         // FIX #794: Ensure database is open before deleting
         if db == nil {
@@ -980,9 +984,23 @@ final class HeaderStore {
         guard db != nil else { return }
 
         let sql = "DELETE FROM headers WHERE height >= ? AND height <= ?;"
-        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        // FIX #944: Properly bind the from and to height parameters
+        sqlite3_bind_int64(stmt, 1, Int64(from))
+        sqlite3_bind_int64(stmt, 2, Int64(to))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.deleteFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        let deletedCount = sqlite3_changes(db)
+        print("🗑️ FIX #944: Deleted \(deletedCount) headers in range \(from)-\(to)")
     }
 
     // MARK: - FIX #413: Bundled Headers from Boost File
@@ -1128,14 +1146,23 @@ final class HeaderStore {
         // FIX #812: PERFORMANCE OPTIMIZATION - Target: < 20 seconds for 2.5M headers
         // Previous: ~100+ seconds due to per-header allocations and per-chunk transactions
         // Optimizations:
-        // 1. Single transaction for entire operation (not per-chunk)
-        // 2. Direct pointer arithmetic instead of Data subscript allocations
-        // 3. Pre-allocated buffer for reversed hashes (reused each iteration)
-        // 4. Reduced Thread.sleep frequency (every 100K instead of every 10K)
-        // 5. SQLITE_STATIC for pointer binds (data valid during sqlite3_step)
+        // 1. Direct pointer arithmetic instead of Data subscript allocations
+        // 2. Pre-allocated buffer for reversed hashes (reused each iteration)
+        // 3. SQLITE_STATIC for pointer binds (data valid during sqlite3_step)
+        //
+        // FIX #948: CRITICAL - Commit every 100K headers to prevent SQLite slowdown
+        // Problem: Single transaction for 2.5M headers caused:
+        //   - WAL file grew to 700MB+ causing B-tree rebalancing overhead
+        //   - Insert rate dropped from 81K/sec to 1.7K/sec (50x slowdown!)
+        //   - Total time: 25+ minutes instead of ~30 seconds
+        // Solution: Commit in batches of 100K headers to:
+        //   - Keep WAL size manageable (~30MB per batch)
+        //   - Allow SQLite to checkpoint periodically
+        //   - Maintain consistent ~60K/sec insert rate throughout
 
         var processedCount = 0
         let startTime = CFAbsoluteTimeGetCurrent()
+        let batchSize = 100000  // FIX #948: Commit every 100K headers
 
         let sql = """
             INSERT OR REPLACE INTO headers
@@ -1146,9 +1173,9 @@ final class HeaderStore {
         var byteOffset = 0
         let dataCount = data.count
 
-        print("📜 FIX #812: Starting optimized header load for \(headerCount) headers")
+        print("📜 FIX #812/948: Starting optimized header load for \(headerCount) headers (batch size: \(batchSize))")
 
-        // FIX #812: Single transaction for entire operation
+        // FIX #948: Start first transaction
         guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
             throw DatabaseError.insertFailed("Failed to begin transaction")
         }
@@ -1162,6 +1189,7 @@ final class HeaderStore {
 
         // FIX #812: Pre-allocate buffer for reversed hash (reused for each header)
         var reversedHashBuffer = [UInt8](repeating: 0, count: 32)
+        var headersInCurrentBatch = 0  // FIX #948: Track headers in current batch
 
         // FIX #812: Inner processing function to avoid nested optional closures
         func processHeaders(dataPtr: UnsafeRawBufferPointer, hashesPtr: UnsafeRawBufferPointer?) throws {
@@ -1237,19 +1265,28 @@ final class HeaderStore {
                 currentOffset += 2 + solutionSize
 
                 headerIndex += 1
+                headersInCurrentBatch += 1
 
-                // FIX #891: Reduce progress callbacks from 100K to 500K (was every 100K)
-                // Less UI thread blocking during heavy SQLite operations
-                // Each callback triggers DispatchQueue.main.async which causes thread contention
-                if headerIndex % 500000 == 0 {
+                // FIX #948: Commit every batchSize headers to prevent WAL bloat and slowdown
+                if headersInCurrentBatch >= batchSize {
+                    // Commit current batch
+                    guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                        throw DatabaseError.insertFailed("Failed to commit batch at header \(headerIndex)")
+                    }
+
+                    // Start new transaction immediately
+                    guard sqlite3_exec(db, "BEGIN TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+                        throw DatabaseError.insertFailed("Failed to begin new batch at header \(headerIndex)")
+                    }
+
+                    headersInCurrentBatch = 0
+
+                    // Log progress with current rate
                     processedCount = headerIndex
                     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                     let rate = Double(headerIndex) / elapsed
-                    print("📜 FIX #812: \(processedCount)/\(headerCount) headers (\(Int(rate))/sec)")
+                    print("📜 FIX #948: \(processedCount)/\(headerCount) headers (\(Int(rate))/sec) - batch committed")
                     onProgress?(Double(processedCount) / Double(headerCount))
-
-                    // FIX #891: Yield briefly for UI - only every 500K headers (was 100K)
-                    Thread.sleep(forTimeInterval: 0.001)
                 }
             }
 
@@ -1271,19 +1308,19 @@ final class HeaderStore {
 
             sqlite3_finalize(stmt)
 
-            // FIX #812: Single commit for all headers
+            // FIX #948: Commit final batch (any remaining headers after last 100K batch)
             guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                throw DatabaseError.insertFailed("Failed to commit transaction")
+                throw DatabaseError.insertFailed("Failed to commit final batch")
             }
 
             // FIX #894: CRITICAL - Checkpoint WAL immediately after bulk header insert
-            // Without this, 2.5M headers loaded over ~3 minutes could be lost on app termination
+            // Without this, headers could be lost on app termination
             // WAL checkpoint ensures all data is written to main database file
             checkpoint()
 
             let totalTime = CFAbsoluteTimeGetCurrent() - startTime
             let rate = Double(headerCount) / totalTime
-            print("✅ FIX #812: Loaded \(headerCount) headers in \(String(format: "%.1f", totalTime))s (\(Int(rate)) headers/sec)")
+            print("✅ FIX #812/948: Loaded \(headerCount) headers in \(String(format: "%.1f", totalTime))s (\(Int(rate)) headers/sec)")
             onProgress?(1.0)
 
         } catch {
@@ -1298,7 +1335,7 @@ final class HeaderStore {
         var hash1 = [UInt8](repeating: 0, count: 32)
         var hash2 = [UInt8](repeating: 0, count: 32)
 
-        headerData.withUnsafeBytes { ptr in
+        _ = headerData.withUnsafeBytes { ptr in
             CC_SHA256(ptr.baseAddress, CC_LONG(headerData.count), &hash1)
         }
         CC_SHA256(&hash1, CC_LONG(32), &hash2)
@@ -1428,7 +1465,7 @@ final class HeaderStore {
         defer { sqlite3_finalize(stmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        zeroRoot.withUnsafeBytes { ptr in
+        _ = zeroRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
         }
         // FIX #797: Bind the sapling activation height
@@ -1473,7 +1510,7 @@ final class HeaderStore {
         defer { sqlite3_finalize(stmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        zeroRoot.withUnsafeBytes { ptr in
+        _ = zeroRoot.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(zeroRoot.count), SQLITE_TRANSIENT)
         }
         // FIX #797: Bind the sapling activation height
@@ -1515,7 +1552,7 @@ final class HeaderStore {
             for (height, saplingRoot) in roots {
                 sqlite3_reset(stmt)
 
-                saplingRoot.withUnsafeBytes { ptr in
+                _ = saplingRoot.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(saplingRoot.count), SQLITE_TRANSIENT)
                 }
                 sqlite3_bind_int64(stmt, 2, Int64(height))

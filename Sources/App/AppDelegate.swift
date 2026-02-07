@@ -19,8 +19,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // Register background task (iOS 13+)
         registerBackgroundTasks()
 
-        // Set minimum background fetch interval (legacy)
-        application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+        // NOTE: setMinimumBackgroundFetchInterval was deprecated in iOS 13.0.
+        // Modern background refresh is handled via BGTaskScheduler (iOS 13+) above.
+        // This legacy API is no longer used.
+        // application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
 
         print("📱 AppDelegate: Background fetch registered")
         return true

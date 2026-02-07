@@ -84,7 +84,15 @@ final class HeaderSyncManager {
         // Result: Parallel header sync starts, all peer lock acquisitions timeout → sync hangs
         // Solution: Wait until ALL listeners are verified stopped (up to 30s)
         // FIX #904: ALWAYS run verification to catch any listeners we might have missed
-        if true { // Always verify - removed hadListenersBefore check due to FIX #904
+        // FIX #1010: PERFORMANCE - Skip verification loop when NO listeners were running!
+        //   Problem: FIX #904's `if true` always runs the 30s verification loop
+        //   Even when hadListenersBefore=false (no listeners running), we still:
+        //   - Print "Verifying all block listeners are stopped..."
+        //   - Loop at least once checking stillListening == 0
+        //   - Wait 200ms for "in-flight receives" that don't exist
+        //   This adds ~500ms+ unnecessary delay on EVERY header sync startup!
+        //   Solution: Only verify/wait when listeners were actually running
+        if hadListenersBefore {  // FIX #1010: Only verify when there were actually listeners to stop
             print("⏳ FIX #900: Verifying all block listeners are stopped...")
             let verifyStartTime = Date()
             let maxVerifyWait: Double = 30.0  // 30 seconds max wait
@@ -121,6 +129,9 @@ final class HeaderSyncManager {
             // FIX #813: Additional 200ms for any in-flight receives
             print("⏳ FIX #813: Waiting 200ms for in-flight receives to complete...")
             try? await Task.sleep(nanoseconds: 200_000_000)
+        } else {
+            // FIX #1010: No listeners were running - skip verification entirely
+            print("⚡ FIX #1010: No block listeners were running - skipping verification (FAST PATH)")
         }
 
         defer {
@@ -167,16 +178,19 @@ final class HeaderSyncManager {
         //   for blocks we're about to scan. If caller says "I need 39 more headers",
         //   we should try to sync them even if peers claim chain is lower.
         // FIX #753: Only raise chainTip if we're actually behind consensus
+        // FIX #946: NEVER request headers beyond consensusHeight - they don't exist yet!
+        //   Previous bug: `targetTip <= consensusHeight + 200` allowed requesting blocks
+        //   200 ahead of chain tip, causing infinite loop waiting for non-existent blocks
         if let maxHeaders = maxHeaders, maxHeaders > 0 {
             let targetTip = startHeight + maxHeaders
-            // Only adjust if target is within reasonable range of consensus
-            // Don't request headers far beyond what peers report
-            if targetTip > chainTip && targetTip <= consensusHeight + 200 {
-                print("📊 FIX #180/747: Adjusting chainTip from \(chainTip) to \(targetTip) based on maxHeaders (\(maxHeaders))")
-                chainTip = targetTip
-            } else if targetTip < chainTip {
-                print("📊 FIX #180: Limiting chainTip from \(chainTip) to \(targetTip) based on maxHeaders (\(maxHeaders))")
-                chainTip = targetTip
+            // FIX #946: Cap targetTip at consensusHeight - can't sync blocks that don't exist
+            let cappedTarget = min(targetTip, consensusHeight)
+            if cappedTarget > chainTip {
+                print("📊 FIX #180/747/946: Adjusting chainTip from \(chainTip) to \(cappedTarget) (requested \(targetTip), capped at consensus \(consensusHeight))")
+                chainTip = cappedTarget
+            } else if cappedTarget < chainTip {
+                print("📊 FIX #180: Limiting chainTip from \(chainTip) to \(cappedTarget) based on maxHeaders (\(maxHeaders))")
+                chainTip = cappedTarget
             }
         }
 
@@ -460,7 +474,6 @@ final class HeaderSyncManager {
 
         // FIX: Timing diagnostics - track each step
         let syncStartTime = Date()
-        var stepTimings: [String: TimeInterval] = [:]
 
         // FIX #155: Report initial progress (0%) before starting
         let initialProgress = HeaderSyncProgress(
@@ -478,17 +491,8 @@ final class HeaderSyncManager {
         let maxSyncDuration: TimeInterval = 300.0  // 5 minutes to try all peers
         print("📊 FIX #502: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
 
-        // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
-        let localhostPeer = "127.0.0.1"
-        let trustedSeedPeers = [
-            "140.174.189.3",    // MagicBean node cluster
-            "140.174.189.17",   // MagicBean node cluster
-            "205.209.104.118",  // MagicBean node
-            "37.187.76.79",     // Known working Zclassic peer
-            "135.181.94.12",    // Known working Zclassic peer
-            "95.179.131.117",   // Zclassic seed node
-            "45.77.216.198"     // Zclassic seed node
-        ]
+        // FIX #1097: Use isPreferredForDownload from Peer (matches Zclassic fPreferredDownload)
+        // Preferred peers (hardcoded seeds) get +1000 bonus in performance score
 
         while currentHeight < chainTip {
             // FIX #274: Check total sync timeout
@@ -498,56 +502,26 @@ final class HeaderSyncManager {
                 throw SyncError.timeout("Header sync timed out after \(Int(elapsed))s - \(chainTip - currentHeight) blocks remaining")
             }
 
-            // FIX #502 v2: PRIORITIZE localhost (127.0.0.1) ABOVE ALL OTHER PEERS
-            // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it first!
-            // User's local node is most reliable - no network latency, always available
-            // Secondary: peers that have reported valid heights (peerStartHeight > 0)
-            // These are peers that completed handshake and sent us a valid chain height
+            // FIX #1097 v2: SIMPLIFIED - Just sort by performance score!
+            // isPreferredForDownload peers (hardcoded seeds) get +1000 bonus
+            // No more duplicate trustedSeedPeers list - uses PeerManager.HARDCODED_SEEDS
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
                     peer.isConnectionReady &&  // CRITICAL: Must have LIVE connection, not just handshake!
                     peer.isHandshakeComplete &&
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
                     !failedPeers.contains(peer.host) &&
-                    // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it first!
-                    (peer.host == localhostPeer || peer.hasRecentActivity)
+                    // FIX #1097: Preferred peers exempt from hasRecentActivity - ALWAYS try them!
+                    (peer.isPreferredForDownload || peer.hasRecentActivity)
                 }
 
-                // FIX #535: Performance-based sorting - BEST peers tried FIRST
-                // Priority: localhost > trusted seed > highest performance score > highest height
-                return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
-                    let peer1IsLocalhost = peer1.host == localhostPeer
-                    let peer2IsLocalhost = peer2.host == localhostPeer
-
-                    // Localhost ALWAYS comes first (user's local node is most reliable)
-                    if peer1IsLocalhost && !peer2IsLocalhost {
-                        return true  // peer1 (localhost) first
-                    } else if !peer1IsLocalhost && peer2IsLocalhost {
-                        return false  // peer2 (localhost) first
-                    }
-
-                    // Neither or both are localhost - use trusted seed logic
-                    let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
-                    let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
-
-                    if peer1IsTrusted && !peer2IsTrusted {
-                        return true  // peer1 first
-                    } else if !peer1IsTrusted && peer2IsTrusted {
-                        return false  // peer2 first
-                    } else {
-                        // Both trusted or both not trusted - USE PERFORMANCE SCORE!
-                        let score1 = peer1.getPerformanceScore()
-                        let score2 = peer2.getPerformanceScore()
-
-                        if abs(score1 - score2) > 5.0 {
-                            // Significant performance difference - use score
-                            return score1 > score2
-                        } else {
-                            // Similar performance - prefer higher peerStartHeight (more recent)
-                            return peer1.peerStartHeight > peer2.peerStartHeight
-                        }
-                    }
+                // FIX #1097: Simple sort by performance score - preferred peers naturally first
+                // Performance score includes +1000 for isPreferredForDownload peers
+                let sorted = allPeers.sorted { $0.getPerformanceScore() > $1.getPerformanceScore() }
+                if let best = sorted.first {
+                    print("📊 FIX #1097: Best peer for headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
                 }
+                return sorted
             }
 
             // FIX #707: Removed per-batch peer ranking log (too spammy)
@@ -696,48 +670,19 @@ final class HeaderSyncManager {
             Task { await networkManager.setHeaderSyncInProgress(false) }
         }
 
-        // FIX #502: PRIORITIZE localhost above all other peers - user's local node at 127.0.0.1:8033
-        let localhostPeer = "127.0.0.1"
-        let trustedSeedPeers = [
-            "140.174.189.3",    // MagicBean node cluster
-            "140.174.189.17",   // MagicBean node cluster
-            "205.209.104.118",  // MagicBean node
-            "37.187.76.79",     // Known working Zclassic peer
-            "135.181.94.12",    // Known working Zclassic peer
-            "95.179.131.117",   // Zclassic seed node
-            "45.77.216.198"     // Zclassic seed node
-        ]
+        // FIX #1097: Use isPreferredForDownload from Peer (matches Zclassic fPreferredDownload)
+        // Preferred peers (hardcoded seeds) get +1000 bonus in performance score
 
         // FIX #483: Use NetworkManager.peers directly instead of PeerManager
         let peers = await MainActor.run {
             // CRITICAL: Must have LIVE connection (isConnectionReady), not just handshake!
-            // Peers with completed handshake but dead connections cause "Not connected to network" errors
             let allPeers = networkManager.peers.filter { $0.isConnectionReady && $0.isHandshakeComplete }
-            // FIX #502: Sort: localhost FIRST, then trusted, then by peerStartHeight (most recent)
-            return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
-                let peer1IsLocalhost = peer1.host == localhostPeer
-                let peer2IsLocalhost = peer2.host == localhostPeer
-
-                // FIX #502: Localhost ALWAYS comes first
-                if peer1IsLocalhost && !peer2IsLocalhost {
-                    return true  // peer1 (localhost) first
-                } else if !peer1IsLocalhost && peer2IsLocalhost {
-                    return false  // peer2 (localhost) first
-                }
-
-                // Neither or both are localhost - use existing trusted seed logic
-                let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
-                let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
-
-                if peer1IsTrusted && !peer2IsTrusted {
-                    return true  // peer1 first
-                } else if !peer1IsTrusted && peer2IsTrusted {
-                    return false  // peer2 first
-                } else {
-                    // Both trusted or both not trusted - prefer higher peerStartHeight (more recent)
-                    return peer1.peerStartHeight > peer2.peerStartHeight
-                }
+            // FIX #1097: Simple sort by performance score - preferred peers naturally first
+            let sorted = allPeers.sorted { $0.getPerformanceScore() > $1.getPerformanceScore() }
+            if let best = sorted.first {
+                print("📊 FIX #1097: Best peer for parallel headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
             }
+            return sorted
         }
         guard !peers.isEmpty else {
             throw SyncError.insufficientPeers(got: 0, need: 1)
@@ -777,52 +722,19 @@ final class HeaderSyncManager {
             // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
             let headersStartHeight = actualLocatorHeight + 1
 
-            // Get fresh peer list for each batch, prioritizing trusted peers
-            // FIX #517: For localhost, skip hasRecentActivity check - always try it!
-            // FIX #502 v2: PRIORITIZE localhost, then peers with valid heights (peerStartHeight > 0)
+            // FIX #1097: Get fresh peer list for each batch, using performance score
+            // Preferred peers (hardcoded seeds) exempt from hasRecentActivity
             let currentPeers = await MainActor.run {
                 let allPeers = networkManager.peers.filter { peer in
                     peer.isConnectionReady &&  // CRITICAL: Must have LIVE connection, not just handshake!
                     peer.isHandshakeComplete &&
                     peer.peerStartHeight > 0 &&  // MUST have reported a valid height
                     !failedPeers.contains(peer.host) &&
-                    // FIX #517: Localhost exempt from hasRecentActivity - ALWAYS try it first!
-                    (peer.host == localhostPeer || peer.hasRecentActivity)
+                    // FIX #1097: Preferred peers exempt from hasRecentActivity - ALWAYS try them!
+                    (peer.isPreferredForDownload || peer.hasRecentActivity)
                 }
-                // FIX #535: Performance-based sorting - BEST peers tried FIRST
-                return allPeers.sorted { (peer1: Peer, peer2: Peer) -> Bool in
-                    let peer1IsLocalhost = peer1.host == localhostPeer
-                    let peer2IsLocalhost = peer2.host == localhostPeer
-
-                    // Localhost ALWAYS comes first (user's local node is most reliable)
-                    if peer1IsLocalhost && !peer2IsLocalhost {
-                        return true  // peer1 (localhost) first
-                    } else if !peer1IsLocalhost && peer2IsLocalhost {
-                        return false  // peer2 (localhost) first
-                    }
-
-                    // Neither or both are localhost - use trusted seed logic
-                    let peer1IsTrusted = trustedSeedPeers.contains(peer1.host)
-                    let peer2IsTrusted = trustedSeedPeers.contains(peer2.host)
-
-                    if peer1IsTrusted && !peer2IsTrusted {
-                        return true  // peer1 first
-                    } else if !peer1IsTrusted && peer2IsTrusted {
-                        return false  // peer2 first
-                    } else {
-                        // Both trusted or both not trusted - USE PERFORMANCE SCORE!
-                        let score1 = peer1.getPerformanceScore()
-                        let score2 = peer2.getPerformanceScore()
-
-                        if abs(score1 - score2) > 5.0 {
-                            // Significant performance difference - use score
-                            return score1 > score2
-                        } else {
-                            // Similar performance - prefer higher peerStartHeight (more recent)
-                            return peer1.peerStartHeight > peer2.peerStartHeight
-                        }
-                    }
-                }
+                // FIX #1097: Simple sort by performance score - preferred peers naturally first
+                return allPeers.sorted { $0.getPerformanceScore() > $1.getPerformanceScore() }
             }
 
             // FIX #707: Removed per-batch peer ranking log (too spammy)
@@ -1706,7 +1618,7 @@ final class HeaderSyncManager {
             }
         }
 
-        let totalHeaders = headers.count
+        let _ = headers.count  // totalHeaders - available for future logging
         for (index, header) in headers.enumerated() {
             // Verify previous hash links correctly
             // Skip verification for the very first header if we don't have its previous block
@@ -2020,10 +1932,10 @@ enum SyncError: LocalizedError, Equatable {
         case (.unexpectedMessage(let lhsE, let lhsG), .unexpectedMessage(let rhsE, let rhsG)):
             return lhsE == rhsE && lhsG == rhsG
         case (.invalidHeadersPayload(let lhsR), .invalidHeadersPayload(let rhsR)):
-            return lhsR == lhsR
+            return lhsR == rhsR
         case (.internalError(let lhsM), .internalError(let rhsM)):
             return lhsM == rhsM
-        case (.wrongFork(let lhsH, let lhsP, let lhsPW, let lhsOW), .wrongFork(let rhsH, let rhsP, let rhsPW, let rhsOW)):
+        case (.wrongFork(let lhsH, let lhsP, let lhsPW, _), .wrongFork(let rhsH, let rhsP, let rhsPW, _)):
             return lhsH == rhsH && lhsP == rhsP && lhsPW == rhsPW
         default:
             return false

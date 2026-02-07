@@ -358,7 +358,7 @@ actor TempImportDatabase {
     }
 
     private func bindBlob(_ stmt: OpaquePointer, _ index: Int32, _ data: Data) {
-        data.withUnsafeBytes { bytes in
+        _ = data.withUnsafeBytes { bytes in
             sqlite3_bind_blob(stmt, index, bytes.baseAddress, Int32(data.count), nil)
         }
     }

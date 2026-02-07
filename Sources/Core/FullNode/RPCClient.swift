@@ -133,7 +133,7 @@ public class RPCClient: ObservableObject {
         }
 
         config = RPCConfig(host: host, port: port, username: user, password: pass)
-        print("✅ RPC config loaded: \(host):\(port)")
+        // FIX #1119: Suppress routine log - called every 5s by FullNodeManager timer
     }
 
     /// Zclassic data directory path
@@ -154,9 +154,8 @@ public class RPCClient: ObservableObject {
     /// Check if daemon is running and responsive
     public func checkConnection() async -> Bool {
         do {
-            print("🔄 RPCClient: checking connection to daemon...")
+            // FIX #1052: Suppress routine connection check logs (called every 5s)
             let info = try await getInfo()
-            print("✅ RPCClient: daemon responded - height=\(info.height), peers=\(info.connections), version=\(info.version)")
             await MainActor.run {
                 self.isConnected = true
                 self.blockHeight = info.height
@@ -165,7 +164,8 @@ public class RPCClient: ObservableObject {
             }
             return true
         } catch {
-            print("❌ RPCClient: connection check failed - \(error.localizedDescription)")
+            // FIX #1052: Only log connection failures, not routine checks
+            // print("❌ RPCClient: connection check failed - \(error.localizedDescription)")
             await MainActor.run {
                 self.isConnected = false
             }

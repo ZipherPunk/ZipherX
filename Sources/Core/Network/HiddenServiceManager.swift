@@ -158,7 +158,7 @@ public final class HiddenServiceManager: ObservableObject {
         }
 
         // Check if Tor is connected first
-        guard await TorManager.shared.connectionState.isConnected else {
+        guard TorManager.shared.connectionState.isConnected else {
             print("🧅 Cannot start hidden service - Tor not connected")
             return false
         }
@@ -265,7 +265,7 @@ public final class HiddenServiceManager: ObservableObject {
 
         if newValue {
             // User enabled hidden service
-            if await TorManager.shared.connectionState.isConnected {
+            if TorManager.shared.connectionState.isConnected {
                 _ = await start()
             } else {
                 print("🧅 Hidden service enabled but Tor not connected - will start when Tor connects")

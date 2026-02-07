@@ -830,6 +830,15 @@ enum ZipherXFFI {
         return zipherx_tree_init()
     }
 
+    /// FIX #996: Clear WITNESSES array before loading new witnesses
+    /// CRITICAL: Must be called BEFORE treeLoadWitness() to prevent accumulation!
+    /// Without this, each session keeps adding witnesses (228→342→456→595) making FIX #805 slower.
+    /// Returns the number of witnesses that were cleared.
+    @discardableResult
+    static func witnessesClear() -> UInt64 {
+        return zipherx_witnesses_clear()
+    }
+
     /// Add a note commitment (cmu) to the tree
     /// Returns the position of the added commitment, or UInt64.max on error
     static func treeAppend(cmu: Data) -> UInt64 {
@@ -1004,7 +1013,7 @@ enum ZipherXFFI {
         }
 
         let result = Data(buffer.prefix(length))
-        print("✅ treeSerialize: \(length) bytes (\(length / 1_000_000)MB)")
+        // FIX #1050: Suppress verbose tree serialization log (routine during sync)
         return result
     }
 
@@ -1487,6 +1496,53 @@ enum ZipherXFFI {
         }
 
         return isConsistent
+    }
+
+    /// FIX #982: Verify stored CMU matches computed CMU from note parts
+    /// CRITICAL: FIX #838 uses stored CMU but Rust rebuilds note from (diversifier, value, rcm)
+    /// If they differ, anchor mismatch occurs → "joinsplit requirements not met"
+    /// - Parameters:
+    ///   - storedCMU: 32-byte CMU from database
+    ///   - diversifier: 11-byte diversifier
+    ///   - rcm: 32-byte random commitment
+    ///   - value: Note value in zatoshis
+    ///   - spendingKey: 169-byte spending key
+    /// - Returns: 0=mismatch, 1=match, 2=error
+    static func verifyNoteCMU(storedCMU: Data, diversifier: Data, rcm: Data, value: UInt64, spendingKey: Data) -> UInt32 {
+        guard storedCMU.count == 32 else {
+            print("❌ FIX #982: Stored CMU wrong size (\(storedCMU.count) bytes)")
+            return 2
+        }
+        guard diversifier.count == 11 else {
+            print("❌ FIX #982: Diversifier wrong size (\(diversifier.count) bytes)")
+            return 2
+        }
+        guard rcm.count == 32 else {
+            print("❌ FIX #982: RCM wrong size (\(rcm.count) bytes)")
+            return 2
+        }
+        guard spendingKey.count == 169 else {
+            print("❌ FIX #982: Spending key wrong size (\(spendingKey.count) bytes)")
+            return 2
+        }
+
+        let result = storedCMU.withUnsafeBytes { cmuPtr in
+            diversifier.withUnsafeBytes { divPtr in
+                rcm.withUnsafeBytes { rcmPtr in
+                    spendingKey.withUnsafeBytes { skPtr in
+                        zipherx_verify_note_cmu(
+                            cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            divPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            rcmPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            value,
+                            skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                        )
+                    }
+                }
+            }
+        }
+
+        return result
     }
 
     // MARK: - OVK Output Recovery (Transaction History)

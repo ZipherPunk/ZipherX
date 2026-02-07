@@ -924,6 +924,65 @@ final class WalletDatabase {
                 print("⚠️ Migration 12: Failed to add witness_index: \(String(cString: sqlite3_errmsg(db)))")
             }
         }
+
+        // Migration 13: FIX #741 - Add tree_height column to sync_state table
+        // Stores the height of the commitment tree, allowing us to persist delta sync progress
+        if !syncStateColumns.contains("tree_height") {
+            let alterSql = "ALTER TABLE sync_state ADD COLUMN tree_height INTEGER NOT NULL DEFAULT 0;";
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 13: Added tree_height column to sync_state table (FIX #741)")
+            } else {
+                print("⚠️ Migration 13: Failed to add tree_height: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+
+        // Migration 14: FIX #1085 - Add peer scoring columns to trusted_peers table
+        // score: 0-100, higher = better peer (starts at 50)
+        // is_reliable: 1 = peer has proven reliable (score >= 70, successes >= 5)
+        // is_bad: 1 = permanently bad peer (wrong chain, protocol errors) - never use
+        // response_time_ms: average response time in milliseconds
+        // last_success: timestamp of last successful connection
+        var trustedPeersColumns: Set<String> = []
+        var tpStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(trusted_peers);", -1, &tpStmt, nil) == SQLITE_OK {
+            while sqlite3_step(tpStmt) == SQLITE_ROW {
+                if let colName = sqlite3_column_text(tpStmt, 1) {
+                    trustedPeersColumns.insert(String(cString: colName))
+                }
+            }
+            sqlite3_finalize(tpStmt)
+        }
+
+        if !trustedPeersColumns.contains("score") {
+            let alterSql = "ALTER TABLE trusted_peers ADD COLUMN score INTEGER NOT NULL DEFAULT 50;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 14: Added score column to trusted_peers (FIX #1085)")
+            }
+        }
+        if !trustedPeersColumns.contains("is_reliable") {
+            let alterSql = "ALTER TABLE trusted_peers ADD COLUMN is_reliable INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 14: Added is_reliable column to trusted_peers (FIX #1085)")
+            }
+        }
+        if !trustedPeersColumns.contains("is_bad") {
+            let alterSql = "ALTER TABLE trusted_peers ADD COLUMN is_bad INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 14: Added is_bad column to trusted_peers (FIX #1085)")
+            }
+        }
+        if !trustedPeersColumns.contains("response_time_ms") {
+            let alterSql = "ALTER TABLE trusted_peers ADD COLUMN response_time_ms INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 14: Added response_time_ms column to trusted_peers (FIX #1085)")
+            }
+        }
+        if !trustedPeersColumns.contains("last_success") {
+            let alterSql = "ALTER TABLE trusted_peers ADD COLUMN last_success INTEGER NOT NULL DEFAULT 0;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 14: Added last_success column to trusted_peers (FIX #1085)")
+            }
+        }
     }
 
     // MARK: - Account Operations
@@ -948,10 +1007,10 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int(stmt, 1, Int32(accountIndex))
-        spendingKey.withUnsafeBytes { ptr in
+        _ = spendingKey.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(spendingKey.count), nil)
         }
-        viewingKey.withUnsafeBytes { ptr in
+        _ = viewingKey.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(viewingKey.count), nil)
         }
         sqlite3_bind_text(stmt, 4, address, -1, nil)
@@ -1054,15 +1113,15 @@ final class WalletDatabase {
         let encryptedMemo = memo != nil ? try encryptBlob(memo!) : nil
 
         sqlite3_bind_int64(stmt, 1, accountId)
-        encryptedDiversifier.withUnsafeBytes { ptr in
+        _ = encryptedDiversifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 3, Int64(value))
-        encryptedRcm.withUnsafeBytes { ptr in
+        _ = encryptedRcm.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
         }
         if let encMemo = encryptedMemo {
-            encMemo.withUnsafeBytes { ptr in
+            _ = encMemo.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(encMemo.count), SQLITE_TRANSIENT)
             }
         } else {
@@ -1070,17 +1129,17 @@ final class WalletDatabase {
         }
         // VUL-009: Hash nullifier before storage to prevent spending pattern analysis
         let hashedNullifier = hashNullifier(nullifier)
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
         }
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 8, Int64(height))
         if let witness = witness {
             // SECURITY: Encrypt witness (Merkle path) - VUL-002: throws on failure
             let encryptedWitness = try encryptBlob(witness)
-            encryptedWitness.withUnsafeBytes { ptr in
+            _ = encryptedWitness.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(encryptedWitness.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(stmt, 10, Int64(height))
@@ -1090,7 +1149,7 @@ final class WalletDatabase {
         }
         // Bind CMU (note commitment) - not encrypted (public on chain)
         if let cmu = cmu {
-            cmu.withUnsafeBytes { ptr in
+            _ = cmu.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
             }
         } else {
@@ -1114,7 +1173,7 @@ final class WalletDatabase {
             defer { sqlite3_finalize(selectStmt) }
 
             let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            hashedNullifier.withUnsafeBytes { ptr in
+            _ = hashedNullifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
             }
 
@@ -1179,15 +1238,15 @@ final class WalletDatabase {
                 let encryptedMemo = note.memo != nil ? try encryptBlob(note.memo!) : nil
 
                 sqlite3_bind_int64(stmt, 1, note.accountId)
-                encryptedDiversifier.withUnsafeBytes { ptr in
+                _ = encryptedDiversifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
                 }
                 sqlite3_bind_int64(stmt, 3, Int64(note.value))
-                encryptedRcm.withUnsafeBytes { ptr in
+                _ = encryptedRcm.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
                 }
                 if let encMemo = encryptedMemo {
-                    encMemo.withUnsafeBytes { ptr in
+                    _ = encMemo.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(encMemo.count), SQLITE_TRANSIENT)
                     }
                 } else {
@@ -1195,16 +1254,16 @@ final class WalletDatabase {
                 }
                 // VUL-009: Hash nullifier
                 let hashedNullifier = hashNullifier(note.nullifier)
-                hashedNullifier.withUnsafeBytes { ptr in
+                _ = hashedNullifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
                 }
-                note.txid.withUnsafeBytes { ptr in
+                _ = note.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
                 }
                 sqlite3_bind_int64(stmt, 8, Int64(note.height))
                 if let witness = note.witness {
                     let encryptedWitness = try encryptBlob(witness)
-                    encryptedWitness.withUnsafeBytes { ptr in
+                    _ = encryptedWitness.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(encryptedWitness.count), SQLITE_TRANSIENT)
                     }
                     sqlite3_bind_int64(stmt, 10, Int64(note.height))
@@ -1213,7 +1272,7 @@ final class WalletDatabase {
                     sqlite3_bind_null(stmt, 10)
                 }
                 if let cmu = note.cmu {
-                    cmu.withUnsafeBytes { ptr in
+                    _ = cmu.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
                     }
                 } else {
@@ -1604,7 +1663,15 @@ final class WalletDatabase {
 
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
+
+        // FIX #1079: Try hashed first, then fall back to raw for pre-VUL-009 notes
         try markNoteSpentByHashedNullifier(hashedNullifier: hashedNullifier, txid: txid, spentHeight: spentHeight)
+
+        // If no rows changed, try with raw nullifier (backwards compatibility)
+        if sqlite3_changes(db) == 0 {
+            print("⚠️ FIX #1079: No match with hashed nullifier, trying raw...")
+            try markNoteSpentByHashedNullifier(hashedNullifier: nullifier, txid: txid, spentHeight: spentHeight)
+        }
     }
 
     /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
@@ -1617,7 +1684,7 @@ final class WalletDatabase {
         let selectSql = "SELECT value FROM notes WHERE nf = ?;"
         var selectStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
-            hashedNullifier.withUnsafeBytes { ptr in
+            _ = hashedNullifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
             }
             if sqlite3_step(selectStmt) == SQLITE_ROW {
@@ -1635,11 +1702,11 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
@@ -1665,6 +1732,12 @@ final class WalletDatabase {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
         try markNoteSpentByHashedNullifier(hashedNullifier: hashedNullifier, spentHeight: spentHeight)
+
+        // FIX #1079: Try raw nullifier if hashed didn't match (backwards compatibility)
+        if sqlite3_changes(db) == 0 {
+            print("⚠️ FIX #1079: No match with hashed nullifier, trying raw...")
+            try markNoteSpentByHashedNullifier(hashedNullifier: nullifier, spentHeight: spentHeight)
+        }
     }
 
     /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
@@ -1683,10 +1756,10 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int64(stmt, 1, Int64(spentHeight))
-        syntheticTxid.withUnsafeBytes { ptr in
+        _ = syntheticTxid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(syntheticTxid.count), nil)
         }
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
@@ -1740,11 +1813,11 @@ final class WalletDatabase {
             }
             defer { sqlite3_finalize(updateStmt) }
 
-            txid.withUnsafeBytes { ptr in
+            _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
             }
             sqlite3_bind_int64(updateStmt, 2, Int64(spentHeight))
-            hashedNullifier.withUnsafeBytes { ptr in
+            _ = hashedNullifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(updateStmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
             }
 
@@ -1776,7 +1849,7 @@ final class WalletDatabase {
 
             let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-            txid.withUnsafeBytes { ptr in
+            _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(spentHeight))
@@ -1836,7 +1909,7 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, Int64(confirmedHeight))
         sqlite3_bind_int64(stmt, 2, Int64(blockTime))
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(txid.count), nil)
         }
 
@@ -1850,6 +1923,109 @@ final class WalletDatabase {
         }
     }
 
+    /// FIX #964: Record a minimal sent transaction when VUL-002 showed error but TX actually confirmed
+    /// This handles the case where broadcast appeared to fail (TCP desync) but TX reached the network
+    /// We don't have the full metadata (hashedNullifier, toAddress, memo) but we can still record
+    /// that a send happened, so it appears in transaction history
+    func recordSentTransactionMinimal(txid: Data, amount: UInt64, fee: UInt64, confirmedHeight: UInt64) throws {
+        // First check if a record already exists (avoid duplicates)
+        let checkSql = "SELECT id FROM transaction_history WHERE txid = ? LIMIT 1;"
+        var checkStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, checkSql, -1, &checkStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(checkStmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        if sqlite3_step(checkStmt) == SQLITE_ROW {
+            print("📤 FIX #964: TX already exists in history - skipping duplicate insert")
+            return
+        }
+
+        // VUL-015: Use obfuscated type code 'α' instead of 'sent' (same as recordSentTransaction)
+        let sql = """
+            INSERT INTO transaction_history (txid, block_height, tx_type, value, fee, status, confirmations)
+            VALUES (?, ?, 'α', ?, ?, 'confirmed', 1);
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+        sqlite3_bind_int64(stmt, 2, Int64(confirmedHeight))
+        sqlite3_bind_int64(stmt, 3, Int64(amount))
+        sqlite3_bind_int64(stmt, 4, Int64(fee))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("✅ FIX #964: Recorded minimal sent TX at height \(confirmedHeight) (amount: \(amount), fee: \(fee))")
+    }
+
+    /// FIX #965: Check if a transaction exists in transaction_history
+    /// Used to detect sent transactions that were broadcast but never recorded
+    func transactionExistsInHistory(txid: Data) throws -> Bool {
+        let sql = "SELECT 1 FROM transaction_history WHERE txid = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    /// FIX #970: Get transaction status from history (for phantom TX detection)
+    func getTransactionStatus(txid: Data) throws -> String? {
+        let sql = "SELECT status FROM transaction_history WHERE txid = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            if let statusPtr = sqlite3_column_text(stmt, 0) {
+                return String(cString: statusPtr)
+            }
+        }
+        return nil
+    }
+
+    /// FIX #980: Check if any note was spent by this txid (blockchain evidence of confirmation)
+    /// This proves the TX was actually mined - the nullifier was found on-chain
+    func noteSpentByTxidExists(txid: Data) throws -> Bool {
+        let sql = "SELECT 1 FROM notes WHERE spent_in_tx = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
     /// FIX #174: Get note info by nullifier (for external wallet spend detection)
     /// Returns (id: Int64, value: UInt64) if note exists and is unspent, nil otherwise
     /// NOTE: This function expects an UNHASHED nullifier from the blockchain
@@ -1859,13 +2035,56 @@ final class WalletDatabase {
 
         let sql = "SELECT id, value FROM notes WHERE nf = ? AND is_spent = 0;"
 
+        // FIX #1079: Try hashed nullifier first
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        _ = hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+        }
+
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let value = UInt64(sqlite3_column_int64(stmt, 1))
+            sqlite3_finalize(stmt)
+            return (id: id, value: value)
+        }
+        sqlite3_finalize(stmt)
+
+        // FIX #1079: Try raw nullifier (backwards compatibility for pre-VUL-009 notes)
+        var stmt2: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt2, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt2) }
+
+        _ = nullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt2, 1, ptr.baseAddress, Int32(nullifier.count), nil)
+        }
+
+        if sqlite3_step(stmt2) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt2, 0)
+            let value = UInt64(sqlite3_column_int64(stmt2, 1))
+            return (id: id, value: value)
+        }
+        return nil
+    }
+
+    /// FIX #885: Get note info by ALREADY-HASHED nullifier
+    /// Used by FIX #605 when SpendableNote.nullifier is already hashed (from database)
+    /// Returns (id: Int64, value: UInt64) if note exists and is unspent, nil otherwise
+    func getNoteByHashedNullifier(hashedNullifier: Data) throws -> (id: Int64, value: UInt64)? {
+        let sql = "SELECT id, value FROM notes WHERE nf = ? AND is_spent = 0;"
+
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
 
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
@@ -1890,7 +2109,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
@@ -2028,16 +2247,21 @@ final class WalletDatabase {
     // MARK: - Balance
 
     /// Get total SPENDABLE balance for account
-    /// FIX #292: Only count notes with valid witnesses (1028 bytes, not all zeros)
-    /// Notes without valid witnesses cannot be spent - don't show them as balance!
+    /// FIX #292: Only count notes with valid witnesses (not empty/null)
+    /// FIX #1107: Changed from 1028 to 100 byte minimum
+    /// Previous bug: Assumed full-depth tree (depth 32) = 1028 byte witnesses
+    /// But current tree depth ~26 produces 838 byte witnesses (866 encrypted)
+    /// 866 < 1028 → all new witnesses excluded from balance!
+    /// Witness = 4 (position) + D*32 (merkle path) + 28 (encryption overhead)
+    /// Minimum practical: 4 + 1*32 + 28 = 64 bytes, using 100 for safety margin
     func getBalance(accountId: Int64) throws -> UInt64 {
         let sql = """
             SELECT COALESCE(SUM(value), 0) FROM notes
             WHERE account_id = ?
             AND is_spent = 0
             AND witness IS NOT NULL
-            AND LENGTH(witness) >= 1028
-            AND witness != ZEROBLOB(1028);
+            AND LENGTH(witness) >= 100
+            AND witness != ZEROBLOB(LENGTH(witness));
         """
 
         var stmt: OpaquePointer?
@@ -2075,14 +2299,44 @@ final class WalletDatabase {
         return UInt64(sqlite3_column_int64(stmt, 0))
     }
 
+    /// FIX #876: Get count and total value of notes WITHOUT valid witnesses
+    /// These notes exist but cannot be spent until witnesses are rebuilt
+    /// FIX #1107: Changed 1028 to 100 (see getBalance for explanation)
+    func getNotesWithoutWitnesses(accountId: Int64) throws -> (count: Int, value: UInt64, minHeight: UInt64) {
+        let sql = """
+            SELECT COUNT(*), COALESCE(SUM(value), 0), COALESCE(MIN(received_height), 0) FROM notes
+            WHERE account_id = ?
+            AND is_spent = 0
+            AND (witness IS NULL OR LENGTH(witness) < 100 OR witness = ZEROBLOB(LENGTH(witness)));
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return (0, 0, 0)
+        }
+
+        let count = Int(sqlite3_column_int(stmt, 0))
+        let value = UInt64(sqlite3_column_int64(stmt, 1))
+        let minHeight = UInt64(sqlite3_column_int64(stmt, 2))
+        return (count, value, minHeight)
+    }
+
     /// FIX #292: Get count and value of notes needing witness rebuild
     /// Returns (count, totalValue) of notes that exist but cannot be spent yet
+    /// FIX #1107: Changed 1028 to 100 (see getBalance for explanation)
     func getNotesNeedingWitness(accountId: Int64) throws -> (count: Int, value: UInt64) {
         let sql = """
             SELECT COUNT(*), COALESCE(SUM(value), 0) FROM notes
             WHERE account_id = ?
             AND is_spent = 0
-            AND (witness IS NULL OR LENGTH(witness) < 1028 OR witness = ZEROBLOB(1028));
+            AND (witness IS NULL OR LENGTH(witness) < 100 OR witness = ZEROBLOB(LENGTH(witness)));
         """
 
         var stmt: OpaquePointer?
@@ -2100,6 +2354,189 @@ final class WalletDatabase {
         let count = Int(sqlite3_column_int(stmt, 0))
         let value = UInt64(sqlite3_column_int64(stmt, 1))
         return (count, value)
+    }
+
+    /// FIX #1082: Get max height of unspent notes
+    /// Used to determine if all notes are in boost range (instant rebuild) vs delta range (needs P2P)
+    func getMaxUnspentNoteHeight(accountId: Int64) throws -> UInt64 {
+        let sql = """
+            SELECT COALESCE(MAX(received_height), 0) FROM notes
+            WHERE account_id = ? AND is_spent = 0;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, accountId)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return UInt64(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// FIX #1083: Verify balance integrity
+    /// FIX #1088: CORRECTED - Balance = sum of unspent notes (includes change outputs)
+    /// The previous version incorrectly compared notes balance vs history balance, which will
+    /// ALWAYS mismatch when change outputs exist because change is NOT recorded in history.
+    ///
+    /// CORRECT FORMULA:
+    /// - Balance = Sum of ALL unspent notes (genuine received + unspent change)
+    /// - This is what notes table shows and is ALWAYS correct
+    ///
+    /// Returns: (isValid, notesBalance, historyBalance, details)
+    func verifyBalanceIntegrity(accountId: Int64) throws -> (isValid: Bool, notesBalance: UInt64, historyBalance: UInt64, details: String) {
+        guard db != nil else {
+            throw DatabaseError.notOpened
+        }
+
+        var details: [String] = []
+
+        // 1. Calculate balance from unspent notes - THIS IS THE AUTHORITATIVE BALANCE
+        let notesBalance = try getBalance(accountId: accountId)
+        let notesBalanceZCL = Double(notesBalance) / 100_000_000.0
+        details.append(String(format: "📊 Balance (unspent notes): %.8f ZCL", notesBalanceZCL))
+
+        // 2. Count total notes for diagnostics
+        let countSql = """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN is_spent = 0 THEN 1 ELSE 0 END) as unspent,
+                SUM(CASE WHEN is_spent = 1 THEN 1 ELSE 0 END) as spent
+            FROM notes WHERE account_id = ?;
+        """
+        var countStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(countStmt) }
+        sqlite3_bind_int64(countStmt, 1, accountId)
+
+        var totalNotes: Int = 0
+        var unspentCount: Int = 0
+        var spentCount: Int = 0
+        if sqlite3_step(countStmt) == SQLITE_ROW {
+            totalNotes = Int(sqlite3_column_int(countStmt, 0))
+            unspentCount = Int(sqlite3_column_int(countStmt, 1))
+            spentCount = Int(sqlite3_column_int(countStmt, 2))
+        }
+        details.append("📝 Notes: \(totalNotes) total (\(unspentCount) unspent, \(spentCount) spent)")
+
+        // 3. FIX #1088: Verify database consistency (NOT balance vs history)
+        // Check for impossible states:
+        // - Notes with negative values
+        // - Notes marked both spent AND with no spent_in_tx
+        var isValid = true
+        var issueFound = ""
+
+        // Check for notes with negative values
+        let negativeSql = "SELECT COUNT(*) FROM notes WHERE value < 0 AND account_id = ?;"
+        var negativeStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, negativeSql, -1, &negativeStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(negativeStmt, 1, accountId)
+            if sqlite3_step(negativeStmt) == SQLITE_ROW {
+                let negativeCount = Int(sqlite3_column_int(negativeStmt, 0))
+                if negativeCount > 0 {
+                    isValid = false
+                    issueFound = "Found \(negativeCount) notes with negative values"
+                    details.append("🚨 ERROR: \(issueFound)")
+                }
+            }
+            sqlite3_finalize(negativeStmt)
+        }
+
+        // Check for notes marked spent but no spent_in_tx
+        let orphanSpentSql = "SELECT COUNT(*) FROM notes WHERE is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '') AND account_id = ?;"
+        var orphanSpentStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, orphanSpentSql, -1, &orphanSpentStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(orphanSpentStmt, 1, accountId)
+            if sqlite3_step(orphanSpentStmt) == SQLITE_ROW {
+                let orphanCount = Int(sqlite3_column_int(orphanSpentStmt, 0))
+                if orphanCount > 0 {
+                    // This is a warning, not critical - spent notes without txid can happen
+                    details.append("⚠️ Warning: \(orphanCount) spent notes without spent_in_tx")
+                }
+            }
+            sqlite3_finalize(orphanSpentStmt)
+        }
+
+        // Check for zero unspent notes when balance should exist
+        if unspentCount == 0 && notesBalance > 0 {
+            isValid = false
+            issueFound = "Balance shows \(notesBalance) but no unspent notes found"
+            details.append("🚨 ERROR: \(issueFound)")
+        }
+
+        // FIX #1088: For historyBalance return, calculate what history WOULD show
+        // This is for logging/diagnostics only, NOT for comparison
+        let historyReceivedSql = """
+            SELECT COALESCE(SUM(value), 0) FROM transaction_history
+            WHERE tx_type IN ('received', 'β');
+        """
+        var historyReceivedStmt: OpaquePointer?
+        var historyReceived: UInt64 = 0
+        if sqlite3_prepare_v2(db, historyReceivedSql, -1, &historyReceivedStmt, nil) == SQLITE_OK {
+            if sqlite3_step(historyReceivedStmt) == SQLITE_ROW {
+                historyReceived = UInt64(sqlite3_column_int64(historyReceivedStmt, 0))
+            }
+            sqlite3_finalize(historyReceivedStmt)
+        }
+
+        let historySentSql = """
+            SELECT COALESCE(SUM(value), 0), COALESCE(SUM(COALESCE(fee, 0)), 0)
+            FROM transaction_history WHERE tx_type IN ('sent', 'α');
+        """
+        var historySentStmt: OpaquePointer?
+        var historySent: UInt64 = 0
+        var historyFees: UInt64 = 0
+        if sqlite3_prepare_v2(db, historySentSql, -1, &historySentStmt, nil) == SQLITE_OK {
+            if sqlite3_step(historySentStmt) == SQLITE_ROW {
+                historySent = UInt64(sqlite3_column_int64(historySentStmt, 0))
+                historyFees = UInt64(sqlite3_column_int64(historySentStmt, 1))
+            }
+            sqlite3_finalize(historySentStmt)
+        }
+
+        // History balance excludes change - this is expected to differ from notes balance
+        let historyBalance = historyReceived >= (historySent + historyFees)
+            ? historyReceived - historySent - historyFees
+            : 0
+
+        let historyBalanceZCL = Double(historyBalance) / 100_000_000.0
+        details.append(String(format: "📈 History view (excludes change): %.8f ZCL", historyBalanceZCL))
+
+        // The difference is expected - it's the unspent change outputs
+        let changeInBalance = Int64(notesBalance) - Int64(historyBalance)
+        if changeInBalance > 0 {
+            let changeZCL = Double(changeInBalance) / 100_000_000.0
+            details.append(String(format: "🔄 Unspent change outputs: %.8f ZCL (expected)", changeZCL))
+        }
+
+        // FIX #1076: CRITICAL - Detect when notes balance is LESS than history balance
+        // This means notes that SHOULD be unspent are missing or incorrectly marked as spent!
+        // Formula: history_received - history_sent - history_fees <= notes_balance (with some tolerance for pending)
+        if changeInBalance < 0 {
+            let missingZCL = Double(-changeInBalance) / 100_000_000.0
+            details.append(String(format: "🚨 MISSING BALANCE: %.8f ZCL!", missingZCL))
+            details.append("   Notes that should be unspent are missing or incorrectly marked as spent!")
+            // Mark as invalid if missing amount is significant (> 10000 zatoshis = 0.0001 ZCL)
+            if -changeInBalance > 10000 {
+                isValid = false
+                issueFound = String(format: "Missing %.8f ZCL - notes incorrectly spent or missing", missingZCL)
+            }
+        }
+
+        if isValid {
+            details.append("✅ Balance integrity: VALID")
+        } else {
+            details.append("🚨 Balance integrity: ISSUE DETECTED - \(issueFound)")
+        }
+
+        return (isValid, notesBalance, historyBalance, details.joined(separator: "\n"))
     }
 
     // MARK: - Sync State
@@ -2152,6 +2589,45 @@ final class WalletDatabase {
 
     /// Update last scanned height
     /// FIX #166/#167: Added validation to prevent writing corrupted values
+    /// FIX #1099: Force reset lastScannedHeight AND checkpoint to 0 during Full Rescan
+    /// This bypasses FIX #1075 regression protection because Full Rescan NEEDS to start from 0
+    /// ONLY call this from repairNotesAfterDownloadedTree(forceFullRescan: true)
+    func forceResetLastScannedHeightForFullRescan() throws {
+        print("🔧 FIX #1099: Force resetting lastScannedHeight AND checkpoint to 0 for Full Rescan")
+        print("   (Bypassing FIX #1075 regression protection - this is intentional)")
+
+        // SQLITE_TRANSIENT tells SQLite to copy the data immediately
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Reset lastScannedHeight to 0
+        let sql = "INSERT OR REPLACE INTO sync_state (id, last_scanned_height, last_scanned_hash) VALUES (1, 0, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let emptyHash = Data(count: 32)
+        _ = emptyHash.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(stmt, 1, bytes.baseAddress, Int32(emptyHash.count), SQLITE_TRANSIENT)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        // Also reset verified_checkpoint_height to 0 to allow fresh scan
+        let checkpointSql = "UPDATE sync_state SET verified_checkpoint_height = 0 WHERE id = 1;"
+        var checkpointStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, checkpointSql, -1, &checkpointStmt, nil) == SQLITE_OK {
+            sqlite3_step(checkpointStmt)
+            sqlite3_finalize(checkpointStmt)
+        }
+
+        print("✅ FIX #1099: lastScannedHeight and checkpoint forced to 0")
+    }
+
+    /// FIX #1075: NEVER allow regression below checkpoint
     /// Requires peer consensus validation before accepting any height update
     func updateLastScannedHeight(_ height: UInt64, hash: Data) throws {
         // FIX #166: Much stricter validation - block height should NEVER exceed ~3M on Zclassic
@@ -2159,8 +2635,8 @@ final class WalletDatabase {
         // Real max possible height by 2030: ~3.5M (at 150s/block)
         let maxReasonableHeight: UInt64 = 3_500_000
 
-        // DEBUG: Always log when this function is called with stack trace info
-        debugLog(.wallet, "📝 updateLastScannedHeight called with height=\(height)")
+        // FIX #1050: Suppress verbose per-block height update log (routine during sync)
+        // Only errors/warnings from this function are logged
 
         // FIX #167: CRITICAL - Validate against multiple trusted sources
         // 1. HeaderStore (P2P verified headers - Equihash validated)
@@ -2169,6 +2645,35 @@ final class WalletDatabase {
         let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
         let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
         let checkpointHeight = (try? getVerifiedCheckpointHeight()) ?? 0
+
+        // FIX #1075 v2: NEVER allow lastScannedHeight to REGRESS (go backwards)
+        // The checkpoint represents a verified good state.
+        // We allow progress FORWARD (even if below checkpoint - catching up)
+        // But BLOCK progress BACKWARD (regression from current height)
+        //
+        // User correctly said: "if there is a valid checkpoint then the wallet must never regressed below the checkpoint"
+        // This means: if we WERE at checkpoint, we can't go below it. But if we're CATCHING UP, allow progress.
+        let currentLastScanned = (try? getLastScannedHeight()) ?? 0
+
+        // REGRESSION CHECK: Block if new height is BELOW current height
+        if currentLastScanned > 0 && height < currentLastScanned {
+            // Only log once per 100 blocks to reduce spam during repeated attempts
+            if height % 100 == 0 || height == currentLastScanned - 1 {
+                print("🚨 [FIX #1075] BLOCKING regression: \(currentLastScanned) -> \(height)")
+                print("   Checkpoint: \(checkpointHeight)")
+            }
+            return  // BLOCK the regression
+        }
+
+        // CHECKPOINT FLOOR: If we're at or above checkpoint, block regression below it
+        // This is the "never regress below checkpoint" rule
+        if currentLastScanned >= checkpointHeight && checkpointHeight > 0 && height < checkpointHeight {
+            print("🚨 [FIX #1075] BLOCKING regression BELOW checkpoint!")
+            print("   Current: \(currentLastScanned), Attempted: \(height), Checkpoint: \(checkpointHeight)")
+            print("   Wallet was synced to checkpoint, cannot regress below it!")
+            Thread.callStackSymbols.prefix(10).forEach { print("   \($0)") }
+            return  // BLOCK the regression
+        }
 
         // The maximum trusted height is the highest from these validated sources
         let maxTrustedHeight = max(headerStoreHeight, cachedChainHeight, checkpointHeight)
@@ -2209,13 +2714,16 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int64(stmt, 1, Int64(height))
-        hash.withUnsafeBytes { ptr in
+        _ = hash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(hash.count), nil)
         }
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        // FIX #1031: Log successful height update for debugging slow startup issues
+        print("✅ [DATABASE] lastScannedHeight updated to \(height)")
     }
 
     // MARK: - FIX #165: Verified Checkpoint
@@ -2479,7 +2987,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        treeData.withUnsafeBytes { ptr in
+        _ = treeData.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(treeData.count), nil)
         }
 
@@ -2930,7 +3438,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(selectStmt) }
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
 
@@ -2947,7 +3455,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(deleteStmt) }
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(deleteStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
 
@@ -2987,7 +3495,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        nullifierToUse.withUnsafeBytes { ptr in
+        _ = nullifierToUse.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(nullifierToUse.count), nil)
         }
 
@@ -3172,10 +3680,10 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        realTxid.withUnsafeBytes { ptr in
+        _ = realTxid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(realTxid.count), nil)
         }
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
 
@@ -3233,10 +3741,10 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        realTxid.withUnsafeBytes { ptr in
+        _ = realTxid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(realTxid.count), nil)
         }
-        cmu.withUnsafeBytes { ptr in
+        _ = cmu.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(cmu.count), nil)
         }
 
@@ -3260,7 +3768,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
         }
 
@@ -3320,7 +3828,7 @@ final class WalletDatabase {
                 txid = uniqueData.prefix(32)
             }
 
-            txid.withUnsafeBytes { ptr in
+            _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertReceivedStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertReceivedStmt, 2, Int64(note.height))
@@ -3339,7 +3847,7 @@ final class WalletDatabase {
 
             sqlite3_bind_int64(insertReceivedStmt, 5, Int64(note.value))
 
-            note.diversifier.withUnsafeBytes { ptr in
+            _ = note.diversifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertReceivedStmt, 6, ptr.baseAddress, Int32(note.diversifier.count), SQLITE_TRANSIENT)
             }
 
@@ -3414,7 +3922,7 @@ final class WalletDatabase {
             // First try txid match (works for real txids)
             var changeStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
-                spentTx.txid.withUnsafeBytes { ptr in
+                _ = spentTx.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(changeStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
                 }
                 if sqlite3_step(changeStmt) == SQLITE_ROW {
@@ -3458,7 +3966,7 @@ final class WalletDatabase {
             // fee is still stored separately for display purposes
             let actualFee = defaultFee
 
-            spentTx.txid.withUnsafeBytes { ptr in
+            _ = spentTx.txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertSentStmt, 1, ptr.baseAddress, Int32(spentTx.txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertSentStmt, 2, Int64(spentTx.height))
@@ -3723,7 +4231,7 @@ final class WalletDatabase {
 
         // SECURITY: Encrypt witness before storage - VUL-002: throws on failure
         let encryptedWitness = try encryptBlob(witness)
-        encryptedWitness.withUnsafeBytes { ptr in
+        _ = encryptedWitness.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(encryptedWitness.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, noteId)
@@ -3743,7 +4251,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        anchor.withUnsafeBytes { ptr in
+        _ = anchor.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(anchor.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, noteId)
@@ -3839,7 +4347,7 @@ final class WalletDatabase {
     func updateNoteNullifier(noteId: Int64, nullifier: Data) throws {
         // Hash the nullifier before storage for privacy
         let hashedNullifier = hashNullifier(nullifier)
-        let sql = "UPDATE notes SET nullifier = ? WHERE id = ?;"
+        let sql = "UPDATE notes SET nf = ? WHERE id = ?;"  // Column is 'nf', not 'nullifier'
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -3847,7 +4355,7 @@ final class WalletDatabase {
         }
         defer { sqlite3_finalize(stmt) }
 
-        hashedNullifier.withUnsafeBytes { ptr in
+        _ = hashedNullifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
         }
         sqlite3_bind_int64(stmt, 2, noteId)
@@ -3949,7 +4457,7 @@ final class WalletDatabase {
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
@@ -3973,7 +4481,7 @@ final class WalletDatabase {
             sqlite3_bind_null(stmt, 7)
         }
         if let fromDiversifier = fromDiversifier {
-            fromDiversifier.withUnsafeBytes { ptr in
+            _ = fromDiversifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(fromDiversifier.count), SQLITE_TRANSIENT)
             }
         } else {
@@ -4048,16 +4556,22 @@ final class WalletDatabase {
 
         // Check total count (excluding change outputs for accurate count)
         // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
-        // FIX #450 v4: Filter β entries where there's an α entry at same block height (self-send change)
+        // FIX #1083: Filter β entries where txid matches α OR note was spent in same tx
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
             AND NOT (
                 t1.tx_type IN ('received', 'β')
-                AND EXISTS (
-                    SELECT 1 FROM transaction_history t2
-                    WHERE t2.block_height = t1.block_height
-                    AND t2.tx_type IN ('sent', 'α')
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM transaction_history t2
+                        WHERE t2.txid = t1.txid
+                        AND t2.tx_type IN ('sent', 'α')
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.spent_in_tx = t1.txid
+                    )
                 )
             );
         """
@@ -4070,24 +4584,30 @@ final class WalletDatabase {
             sqlite3_finalize(countStmt)
         }
 
-        // Exclude change outputs and deduplicate:
+        // FIX #1083: Exclude change outputs properly
         // 1. Explicitly exclude tx_type = 'change' or 'γ' (VUL-015 obfuscated)
-        // 2. Filter out β entries where there's an α entry at SAME block height (self-send change)
-        // 3. Keep β entries where there's NO α entry at same height (genuine received)
+        // 2. Filter out β entries where there's an α entry with SAME txid (change from our send)
+        // 3. Filter out β entries received in same tx where we spent a note (change output)
         // 4. Use subquery with DISTINCT to deduplicate BEFORE ordering
-        // FIX #450 v4: Distinguish self-send change from genuine received by checking
-        // if there's a sent (α) entry at the same block height
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
             AND NOT (
                 t1.tx_type IN ('received', 'β')
-                AND EXISTS (
-                    -- Filter β entries where there's an α entry at SAME block height (self-send change)
-                    SELECT 1 FROM transaction_history t2
-                    WHERE t2.block_height = t1.block_height
-                    AND t2.tx_type IN ('sent', 'α')
+                AND (
+                    -- FIX #1083: Filter β entries where there's an α entry with SAME txid
+                    EXISTS (
+                        SELECT 1 FROM transaction_history t2
+                        WHERE t2.txid = t1.txid
+                        AND t2.tx_type IN ('sent', 'α')
+                    )
+                    OR
+                    -- FIX #1083: Filter β entries received in tx where we spent a note (change)
+                    EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.spent_in_tx = t1.txid
+                    )
                 )
             )
             AND t1.rowid IN (
@@ -4197,7 +4717,7 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_text(stmt, 2, type.rawValue, -1, SQLITE_TRANSIENT)  // Old plaintext
@@ -4361,8 +4881,27 @@ final class WalletDatabase {
             // Placeholder txid "boost_spent_HEIGHT" will be resolved to real txid by FIX #371
             // Even before resolution, we should show SENT transactions (amount is correct)
 
-            // Find all change outputs: notes received in the same tx (note.txid == spentTxid)
-            let changeOutputs = allNotes.filter { $0.txid == spentTxid }
+            // FIX #1125: Find change outputs by TXID OR HEIGHT
+            // Problem: FIX #465 skipped real SENT txs when change txid didn't match spent_in_tx
+            // This caused historyBalance > notesBalance discrepancy after Full Rescan
+            // Root cause: Boost file notes may have different txids for change outputs
+            // Solution: Also look for change outputs by HEIGHT (same block = likely change)
+
+            // Method 1: Direct txid match (original logic)
+            var changeOutputs = allNotes.filter { $0.txid == spentTxid }
+
+            // Method 2: Height-based match for boost file notes (FIX #464 v3 parity)
+            // If a note was received at the same height where we spent, it's likely our change
+            if changeOutputs.isEmpty {
+                let heightBasedChange = allNotes.filter {
+                    !$0.isSpent && $0.receivedHeight == txInfo.spentHeight
+                }
+                if !heightBasedChange.isEmpty {
+                    changeOutputs = heightBasedChange
+                    print("📜 FIX #1125: Found \(heightBasedChange.count) change outputs by HEIGHT at \(txInfo.spentHeight)")
+                }
+            }
+
             let totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
 
             // totalBalanceImpact = sum(inputs) - sum(change) = amount to recipient + fee
@@ -4379,15 +4918,16 @@ final class WalletDatabase {
                 continue
             }
 
-            // FIX #465: Skip PROBABLE SELF-CHANGE transactions (ZipherX internal only)
-            // If toRecipient is >95% of input, it's likely a self-change transaction (not a real send)
-            // These happen when change outputs haven't been scanned into ZipherX notes table yet
-            let recipientRatio = Double(amountToRecipient) / Double(txInfo.inputValue)
-            if recipientRatio > 0.95 && totalChangeValue == 0 {
-                let txidDesc = String(bytes: spentTxid.prefix(8), encoding: .ascii) ?? spentTxid.prefix(8).hexString
-                print("📜 FIX #465: Skipping SENT txid=\(txidDesc)... - likely self-change (recipientRatio=\(String(format: "%.1f%%", recipientRatio * 100)))")
-                continue
-            }
+            // FIX #1125: Disable FIX #465's aggressive skip - it causes balance discrepancies!
+            // FIX #465 skipped SENT txs when recipientRatio > 95% AND totalChangeValue == 0
+            // But now with height-based change detection, totalChangeValue is usually found
+            // If still 0, it's better to record the SENT tx than skip it (prevents missing balance)
+            //
+            // OLD (broken):
+            // let recipientRatio = Double(amountToRecipient) / Double(txInfo.inputValue)
+            // if recipientRatio > 0.95 && totalChangeValue == 0 { continue }
+            //
+            // NEW: Always record SENT tx if amountToRecipient > 1000 (already checked above)
 
             print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
 
@@ -4398,7 +4938,7 @@ final class WalletDatabase {
                 continue
             }
 
-            spentTxid.withUnsafeBytes { ptr in
+            _ = spentTxid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(spentStmt, 2, Int64(txInfo.spentHeight))
@@ -4502,7 +5042,7 @@ final class WalletDatabase {
                 continue
             }
 
-            note.txid.withUnsafeBytes { ptr in
+            _ = note.txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(note.receivedHeight))
@@ -4521,7 +5061,7 @@ final class WalletDatabase {
             sqlite3_bind_null(insertStmt, 6) // fee (only for SENT)
             sqlite3_bind_null(insertStmt, 7) // to_address
             if let diversifier = note.diversifier {
-                diversifier.withUnsafeBytes { ptr in
+                _ = diversifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(insertStmt, 8, ptr.baseAddress, Int32(diversifier.count), SQLITE_TRANSIENT)
                 }
             } else {
@@ -4570,7 +5110,7 @@ final class WalletDatabase {
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
@@ -4637,7 +5177,7 @@ final class WalletDatabase {
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int64(stmt, 2, Int64(height))
@@ -4704,7 +5244,7 @@ final class WalletDatabase {
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-        txid.withUnsafeBytes { ptr in
+        _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
         // VUL-015: Use obfuscated type code instead of plaintext
@@ -4750,11 +5290,11 @@ final class WalletDatabase {
         sqlite3_bind_int(stmt, 2, Int32(confirmations))
         if let height = height {
             sqlite3_bind_int64(stmt, 3, Int64(height))
-            txid.withUnsafeBytes { ptr in
+            _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
         } else {
-            txid.withUnsafeBytes { ptr in
+            _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
         }
@@ -5080,6 +5620,70 @@ final class WalletDatabase {
         return items
     }
 
+    /// FIX #970 v3: Get recent sent transactions for phantom verification
+    /// Returns all sent transactions from the last 24 hours, regardless of status
+    /// This catches phantom TXs that were incorrectly marked as 'confirmed'
+    func getRecentSentTransactions(hoursBack: Int = 24) throws -> [TransactionHistoryItem] {
+        guard db != nil else {
+            print("⚠️ getRecentSentTransactions: Database not open")
+            return []
+        }
+
+        let cutoffTime = Int(Date().timeIntervalSince1970) - (hoursBack * 3600)
+
+        // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
+        let sql = """
+            SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
+            FROM transaction_history
+            WHERE tx_type IN ('sent', 'α')
+            AND created_at >= ?
+            ORDER BY created_at DESC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(cutoffTime))
+
+        var items: [TransactionHistoryItem] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let txidPtr = sqlite3_column_blob(stmt, 0) else { continue }
+            let txidLen = sqlite3_column_bytes(stmt, 0)
+            let height = UInt64(sqlite3_column_int64(stmt, 1))
+            let blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
+            let typeStr = String(cString: sqlite3_column_text(stmt, 3))
+            let value = UInt64(sqlite3_column_int64(stmt, 4))
+            let fee = sqlite3_column_type(stmt, 5) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 5)) : nil
+            let toAddress = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 6)) : nil
+            let memo = sqlite3_column_type(stmt, 7) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 7)) : nil
+            let statusStr = String(cString: sqlite3_column_text(stmt, 8))
+            let confirmations = Int(sqlite3_column_int(stmt, 9))
+
+            let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            let decodedType = decryptTxType(typeStr)
+
+            items.append(TransactionHistoryItem(
+                txid: txidData,
+                height: height,
+                blockTime: blockTime,
+                type: decodedType,
+                value: value,
+                fee: fee,
+                toAddress: toAddress,
+                memo: memo,
+                status: TransactionStatus(rawValue: statusStr) ?? .pending,
+                confirmations: confirmations
+            ))
+        }
+
+        print("📜 FIX #970 v3: Found \(items.count) sent transactions from last \(hoursBack) hours")
+        return items
+    }
+
     /// FIX #353: Get the last confirmed transaction (for checkpoint reset after phantom TX removal)
     /// Returns the most recent transaction that is confirmed (status = 'confirmed')
     func getLastConfirmedTransaction() throws -> TransactionHistoryItem? {
@@ -5251,7 +5855,7 @@ final class WalletDatabase {
 
             var checkStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, checkSpentSql, -1, &checkStmt, nil) == SQLITE_OK {
-                entry.txid.withUnsafeBytes { ptr in
+                _ = entry.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(entry.txid.count), SQLITE_TRANSIENT)
                 }
                 if sqlite3_step(checkStmt) == SQLITE_ROW && sqlite3_column_type(checkStmt, 0) != SQLITE_NULL {
@@ -5266,7 +5870,7 @@ final class WalletDatabase {
 
                 var checkStmt2: OpaquePointer?
                 if sqlite3_prepare_v2(db, checkSpentSql, -1, &checkStmt2, nil) == SQLITE_OK {
-                    reversedTxid.withUnsafeBytes { ptr in
+                    _ = reversedTxid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                     }
                     if sqlite3_step(checkStmt2) == SQLITE_ROW && sqlite3_column_type(checkStmt2, 0) != SQLITE_NULL {
@@ -5308,7 +5912,7 @@ final class WalletDatabase {
 
             var deleteStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK {
-                tx.txid.withUnsafeBytes { ptr in
+                _ = tx.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(deleteStmt, 1, ptr.baseAddress, Int32(tx.txid.count), SQLITE_TRANSIENT)
                 }
 
@@ -5331,7 +5935,7 @@ final class WalletDatabase {
             // Check original txid format
             var checkStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, checkSentSql, -1, &checkStmt, nil) == SQLITE_OK {
-                tx.txid.withUnsafeBytes { ptr in
+                _ = tx.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(tx.txid.count), SQLITE_TRANSIENT)
                 }
                 if sqlite3_step(checkStmt) == SQLITE_ROW {
@@ -5344,7 +5948,7 @@ final class WalletDatabase {
             if !sentExists && tx.spentTxid != tx.txid {
                 var checkStmt2: OpaquePointer?
                 if sqlite3_prepare_v2(db, checkSentSql, -1, &checkStmt2, nil) == SQLITE_OK {
-                    tx.spentTxid.withUnsafeBytes { ptr in
+                    _ = tx.spentTxid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(tx.spentTxid.count), SQLITE_TRANSIENT)
                     }
                     if sqlite3_step(checkStmt2) == SQLITE_ROW {
@@ -5369,7 +5973,7 @@ final class WalletDatabase {
                     var insertStmt: OpaquePointer?
                     if sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil) == SQLITE_OK {
                         // FIX #853 v2: Use spentTxid (wire format) for consistency with block-scanned txids
-                        tx.spentTxid.withUnsafeBytes { ptr in
+                        _ = tx.spentTxid.withUnsafeBytes { ptr in
                             sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(tx.spentTxid.count), SQLITE_TRANSIENT)
                         }
                         sqlite3_bind_int64(insertStmt, 2, sentAmount)
@@ -5419,7 +6023,7 @@ final class WalletDatabase {
 
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, deleteHistorySql, -1, &stmt, nil) == SQLITE_OK {
-                txidData.withUnsafeBytes { ptr in
+                _ = txidData.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT)
                 }
 
@@ -5439,7 +6043,7 @@ final class WalletDatabase {
             let countNotesSql = "SELECT COUNT(*) FROM notes WHERE received_in_tx = ?;"
             var countStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, countNotesSql, -1, &countStmt, nil) == SQLITE_OK {
-                txidData.withUnsafeBytes { ptr in
+                _ = txidData.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(countStmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT)
                 }
 
@@ -5454,6 +6058,333 @@ final class WalletDatabase {
         }
 
         return cleanedCount
+    }
+
+    // MARK: - FIX #1084 v2: Detect Mislabeled Change by Value Pattern
+
+    /// FIX #1084 v2: DISABLED - Detect and fix change outputs recorded as "received" by analyzing value patterns
+    ///
+    /// ⚠️ FIX #1110: DISABLED due to false positives!
+    /// This function incorrectly marked note 6178 (0.0025 ZCL) as spent because:
+    /// - Note 6178 received at height 2953099 (0.0025 ZCL) - INCOMING TX
+    /// - Note 6179 received at height 2953104 (0.0015 ZCL) - ALSO INCOMING TX
+    /// - Function assumed 6178 was spent to create 6179, but they're UNRELATED!
+    /// - Value pattern matching is too dangerous - two separate incoming TXs can have similar values
+    ///
+    /// Returns: 0 (disabled)
+    func fixMislabeledChangeByValuePattern() throws -> Int {
+        // FIX #1110: DISABLED - Value pattern matching causes false positives
+        // The logic assumes notes with similar values are related by spend/change,
+        // but users can receive multiple unrelated incoming transactions of similar sizes.
+        print("⏭️ FIX #1110: fixMislabeledChangeByValuePattern DISABLED (false positive risk)")
+        return 0
+
+        // Original code below - DO NOT ENABLE
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Step 1: Get all "received" entries with their heights and values
+        let getReceivedSql = """
+            SELECT th.id, th.txid, th.block_height, th.value, n.id as note_id
+            FROM transaction_history th
+            JOIN notes n ON n.received_height = th.block_height AND n.value = th.value
+            WHERE th.tx_type IN ('received', 'β')
+            ORDER BY th.block_height DESC;
+        """
+
+        var receivedStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, getReceivedSql, -1, &receivedStmt, nil) == SQLITE_OK else {
+            print("⚠️ FIX #1084 v2: Failed to prepare received query: \(String(cString: sqlite3_errmsg(db)))")
+            return 0
+        }
+        defer { sqlite3_finalize(receivedStmt) }
+
+        struct ReceivedTx {
+            let historyId: Int64
+            let txid: Data
+            let blockHeight: Int64
+            let value: Int64
+            let noteId: Int64
+        }
+        var receivedTxs: [ReceivedTx] = []
+
+        while sqlite3_step(receivedStmt) == SQLITE_ROW {
+            let historyId = sqlite3_column_int64(receivedStmt, 0)
+            if let txidBlob = sqlite3_column_blob(receivedStmt, 1) {
+                let txidLen = sqlite3_column_bytes(receivedStmt, 1)
+                let txid = Data(bytes: txidBlob, count: Int(txidLen))
+                let blockHeight = sqlite3_column_int64(receivedStmt, 2)
+                let value = sqlite3_column_int64(receivedStmt, 3)
+                let noteId = sqlite3_column_int64(receivedStmt, 4)
+                receivedTxs.append(ReceivedTx(historyId: historyId, txid: txid, blockHeight: blockHeight, value: value, noteId: noteId))
+            }
+        }
+
+        guard !receivedTxs.isEmpty else {
+            print("✅ FIX #1084 v2: No received transactions to check")
+            return 0
+        }
+
+        print("🔍 FIX #1084 v2: Checking \(receivedTxs.count) 'received' transactions for value pattern match...")
+
+        var fixedCount = 0
+
+        // Step 2: For each received TX, look for an unspent note that could have been the input
+        // Input note: value = received_value + sent_amount + fee
+        // Typical sent amounts: 100000-500000 zatoshis (0.001-0.005 ZCL)
+        // Typical fee: 10000 zatoshis (0.0001 ZCL)
+        // So look for unspent notes with value = received + 50000 to 600000
+
+        let findInputSql = """
+            SELECT id, value, received_height FROM notes
+            WHERE is_spent = 0
+              AND received_height < ?
+              AND value > ?
+              AND value < ?
+            ORDER BY received_height DESC
+            LIMIT 1;
+        """
+
+        for rx in receivedTxs {
+            // Check if a "sent" entry already exists for this height
+            let checkSentSql = "SELECT COUNT(*) FROM transaction_history WHERE block_height = ? AND tx_type IN ('sent', 'α');"
+            var checkStmt: OpaquePointer?
+            var sentExists = false
+            if sqlite3_prepare_v2(db, checkSentSql, -1, &checkStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(checkStmt, 1, rx.blockHeight)
+                if sqlite3_step(checkStmt) == SQLITE_ROW {
+                    sentExists = sqlite3_column_int(checkStmt, 0) > 0
+                }
+                sqlite3_finalize(checkStmt)
+            }
+
+            // If sent exists, this received entry is legitimate (not change)
+            if sentExists { continue }
+
+            // Look for an unspent note that could have been the input
+            let minInputValue = rx.value + 50000   // At least 50k more (fee + tiny send)
+            let maxInputValue = rx.value + 600000  // At most 600k more (fee + reasonable send)
+
+            var inputStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, findInputSql, -1, &inputStmt, nil) == SQLITE_OK else { continue }
+            defer { sqlite3_finalize(inputStmt) }
+
+            sqlite3_bind_int64(inputStmt, 1, rx.blockHeight)
+            sqlite3_bind_int64(inputStmt, 2, minInputValue)
+            sqlite3_bind_int64(inputStmt, 3, maxInputValue)
+
+            if sqlite3_step(inputStmt) == SQLITE_ROW {
+                let inputNoteId = sqlite3_column_int64(inputStmt, 0)
+                let inputValue = sqlite3_column_int64(inputStmt, 1)
+                let inputHeight = sqlite3_column_int64(inputStmt, 2)
+
+                // Found a potential input note! This "received" is likely change.
+                let sentAmount = inputValue - rx.value - 10000  // Assume 10000 fee
+                let inputZCL = Double(inputValue) / 100_000_000.0
+                let changeZCL = Double(rx.value) / 100_000_000.0
+                let sentZCL = Double(sentAmount) / 100_000_000.0
+
+                print("🔍 FIX #1084 v2: Detected mislabeled change at height \(rx.blockHeight):")
+                print("   Input note #\(inputNoteId) at height \(inputHeight): \(inputZCL) ZCL (marked unspent but likely spent)")
+                print("   Change note #\(rx.noteId) at height \(rx.blockHeight): \(changeZCL) ZCL (recorded as 'received')")
+                print("   Implied sent amount: \(sentZCL) ZCL + 0.0001 fee")
+
+                // Fix: Mark input note as spent, delete "received" entry, add "sent" entry
+                // Step 2a: Mark input note as spent
+                let markSpentSql = "UPDATE notes SET is_spent = 1, spent_height = ?, spent_in_tx = ? WHERE id = ?;"
+                var markStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, markSpentSql, -1, &markStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(markStmt, 1, rx.blockHeight)
+                    _ = rx.txid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(markStmt, 2, ptr.baseAddress, Int32(rx.txid.count), SQLITE_TRANSIENT)
+                    }
+                    sqlite3_bind_int64(markStmt, 3, inputNoteId)
+                    if sqlite3_step(markStmt) == SQLITE_DONE {
+                        print("   ✅ Marked note #\(inputNoteId) as spent at height \(rx.blockHeight)")
+                    }
+                    sqlite3_finalize(markStmt)
+                }
+
+                // Step 2b: Delete the "received" history entry
+                let deleteReceivedSql = "DELETE FROM transaction_history WHERE id = ?;"
+                var deleteStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteReceivedSql, -1, &deleteStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(deleteStmt, 1, rx.historyId)
+                    if sqlite3_step(deleteStmt) == SQLITE_DONE {
+                        print("   ✅ Deleted mislabeled 'received' history entry #\(rx.historyId)")
+                    }
+                    sqlite3_finalize(deleteStmt)
+                }
+
+                // Step 2c: Add "sent" history entry (using α type code)
+                let insertSentSql = """
+                    INSERT INTO transaction_history (txid, block_height, tx_type, value, fee, status, confirmations)
+                    VALUES (?, ?, 'α', ?, 10000, 'confirmed', 1);
+                """
+                var insertStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, insertSentSql, -1, &insertStmt, nil) == SQLITE_OK {
+                    _ = rx.txid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(rx.txid.count), SQLITE_TRANSIENT)
+                    }
+                    sqlite3_bind_int64(insertStmt, 2, rx.blockHeight)
+                    sqlite3_bind_int64(insertStmt, 3, sentAmount)
+                    if sqlite3_step(insertStmt) == SQLITE_DONE {
+                        print("   ✅ Added 'sent' history entry for \(sentZCL) ZCL at height \(rx.blockHeight)")
+                    }
+                    sqlite3_finalize(insertStmt)
+                }
+
+                fixedCount += 1
+            }
+        }
+
+        if fixedCount > 0 {
+            print("🧹 FIX #1084 v2: Fixed \(fixedCount) mislabeled change output(s) by value pattern")
+        } else {
+            print("✅ FIX #1084 v2: No mislabeled change outputs detected by value pattern")
+        }
+
+        return fixedCount
+    }
+
+    // MARK: - FIX #1110: Unmark Note as Spent by ID
+
+    /// FIX #1110: Unmark a note as spent by its ID
+    /// Used to fix notes wrongly marked by FIX #1084 v2's false positives
+    func unmarkNoteAsSpentById(noteId: Int64) throws {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = """
+            UPDATE notes
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            WHERE id = ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let changes = sqlite3_changes(db)
+        if changes > 0 {
+            print("✅ FIX #1110: Unmarked note #\(noteId) as unspent")
+        } else {
+            print("⚠️ FIX #1110: Note #\(noteId) not found")
+        }
+    }
+
+    // MARK: - FIX #1085: P2P Verification - Get Suspicious Heights
+
+    /// FIX #1085: Get heights where notes may be mislabeled for P2P verification
+    /// Returns heights where:
+    /// - "received" entry exists without corresponding "sent" entry
+    /// - Value pattern suggests it could be change from an unrecorded send
+    /// Called before P2P verification to know which blocks to fetch
+    func getSuspiciousHeightsForP2PVerification() throws -> [UInt64] {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // Get "received" entries that don't have a matching "sent" at the same height
+        let sql = """
+            SELECT DISTINCT th.block_height
+            FROM transaction_history th
+            LEFT JOIN (
+                SELECT block_height FROM transaction_history
+                WHERE tx_type IN ('sent', 'α')
+            ) sent ON th.block_height = sent.block_height
+            WHERE th.tx_type IN ('received', 'β')
+              AND sent.block_height IS NULL
+            ORDER BY th.block_height;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("⚠️ FIX #1085: Failed to prepare suspicious heights query")
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var heights: [UInt64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let height = UInt64(sqlite3_column_int64(stmt, 0))
+            heights.append(height)
+        }
+
+        return heights
+    }
+
+    /// FIX #1085: Get notes at a specific height for comparison with P2P data
+    /// Returns: [(noteId, value, isSpent, nullifierHash)]
+    func getNotesAtHeight(_ height: UInt64) throws -> [(id: Int64, value: Int64, isSpent: Bool, nullifierHash: Data?)] {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let sql = "SELECT id, value, is_spent, hashed_nullifier FROM notes WHERE received_height = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        var notes: [(id: Int64, value: Int64, isSpent: Bool, nullifierHash: Data?)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let value = sqlite3_column_int64(stmt, 1)
+            let isSpent = sqlite3_column_int(stmt, 2) != 0
+            var nullifierHash: Data? = nil
+            if let blob = sqlite3_column_blob(stmt, 3) {
+                let len = sqlite3_column_bytes(stmt, 3)
+                nullifierHash = Data(bytes: blob, count: Int(len))
+            }
+            notes.append((id: id, value: value, isSpent: isSpent, nullifierHash: nullifierHash))
+        }
+
+        return notes
+    }
+
+    /// FIX #1085: Delete notes and history at specific heights for P2P rescan
+    /// Called when P2P verification finds discrepancies
+    func deleteNotesAndHistoryAtHeights(_ heights: [UInt64]) throws -> Int {
+        guard let db = db else { throw DatabaseError.notOpened }
+        guard !heights.isEmpty else { return 0 }
+
+        var deletedCount = 0
+
+        for height in heights {
+            // Delete notes at this height
+            let deleteNotesSql = "DELETE FROM notes WHERE received_height = ?;"
+            var deleteNotesStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, deleteNotesSql, -1, &deleteNotesStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(deleteNotesStmt, 1, Int64(height))
+                if sqlite3_step(deleteNotesStmt) == SQLITE_DONE {
+                    deletedCount += Int(sqlite3_changes(db))
+                }
+                sqlite3_finalize(deleteNotesStmt)
+            }
+
+            // Delete history at this height
+            let deleteHistorySql = "DELETE FROM transaction_history WHERE block_height = ?;"
+            var deleteHistoryStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, deleteHistorySql, -1, &deleteHistoryStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(deleteHistoryStmt, 1, Int64(height))
+                sqlite3_step(deleteHistoryStmt)
+                sqlite3_finalize(deleteHistoryStmt)
+            }
+        }
+
+        if deletedCount > 0 {
+            print("🗑️ FIX #1085: Deleted \(deletedCount) note(s) at \(heights.count) height(s) for P2P rescan")
+        }
+
+        return deletedCount
     }
 
     // MARK: - FIX #853 v2: Migrate Display-Format TXIDs to Wire Format
@@ -5509,7 +6440,7 @@ final class WalletDatabase {
             var matchesOriginal = false
             var checkStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt, nil) == SQLITE_OK {
-                txid.withUnsafeBytes { ptr in
+                _ = txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
                     sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
                 }
@@ -5529,7 +6460,7 @@ final class WalletDatabase {
             var matchesReversed = false
             var checkStmt2: OpaquePointer?
             if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt2, nil) == SQLITE_OK {
-                reversedTxid.withUnsafeBytes { ptr in
+                _ = reversedTxid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(checkStmt2, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                     sqlite3_bind_blob(checkStmt2, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                 }
@@ -5544,10 +6475,10 @@ final class WalletDatabase {
                 let updateSql = "UPDATE transaction_history SET txid = ? WHERE txid = ?;"
                 var updateStmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                    reversedTxid.withUnsafeBytes { ptr in
+                    _ = reversedTxid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                     }
-                    txid.withUnsafeBytes { ptr in
+                    _ = txid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
                     }
 
@@ -5647,7 +6578,7 @@ final class WalletDatabase {
             var matchesReversed = false
             var checkStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, checkNotesSql, -1, &checkStmt, nil) == SQLITE_OK {
-                reversedTxid.withUnsafeBytes { ptr in
+                _ = reversedTxid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                     sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                 }
@@ -5663,10 +6594,10 @@ final class WalletDatabase {
                 let updateSql = "UPDATE transaction_history SET txid = ? WHERE txid = ?;"
                 var updateStmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                    reversedTxid.withUnsafeBytes { ptr in
+                    _ = reversedTxid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
                     }
-                    txid.withUnsafeBytes { ptr in
+                    _ = txid.withUnsafeBytes { ptr in
                         sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
                     }
 
@@ -6030,6 +6961,226 @@ final class WalletDatabase {
         }
 
         print("📡 FIX #229: Seeded \(initialPeers.count) trusted Zclassic peers")
+    }
+
+    // MARK: - FIX #1085: Peer Scoring System
+
+    /// Update peer score after successful connection
+    /// - Parameters:
+    ///   - host: Peer hostname/IP
+    ///   - port: Peer port
+    ///   - responseTimeMs: Response time in milliseconds (optional)
+    func recordPeerSuccess(host: String, port: UInt16 = 8033, responseTimeMs: Int? = nil) {
+        guard let db = db else { return }
+
+        let now = Int(Date().timeIntervalSince1970)
+        var sql: String
+
+        if let responseTime = responseTimeMs {
+            // Update with response time averaging
+            sql = """
+                INSERT INTO trusted_peers (host, port, successes, failures, score, last_success, response_time_ms, last_connected)
+                VALUES (?, ?, 1, 0, 55, ?, ?, ?)
+                ON CONFLICT(host, port) DO UPDATE SET
+                    successes = successes + 1,
+                    score = MIN(100, score + 5),
+                    last_success = excluded.last_success,
+                    last_connected = excluded.last_connected,
+                    response_time_ms = CASE
+                        WHEN response_time_ms = 0 THEN excluded.response_time_ms
+                        ELSE (response_time_ms + excluded.response_time_ms) / 2
+                    END,
+                    is_reliable = CASE
+                        WHEN score + 5 >= 70 AND successes + 1 >= 5 THEN 1
+                        ELSE is_reliable
+                    END
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_bind_int(stmt, 2, Int32(port))
+                sqlite3_bind_int64(stmt, 3, Int64(now))
+                sqlite3_bind_int(stmt, 4, Int32(responseTime))
+                sqlite3_bind_int64(stmt, 5, Int64(now))
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        } else {
+            sql = """
+                INSERT INTO trusted_peers (host, port, successes, failures, score, last_success, last_connected)
+                VALUES (?, ?, 1, 0, 55, ?, ?)
+                ON CONFLICT(host, port) DO UPDATE SET
+                    successes = successes + 1,
+                    score = MIN(100, score + 5),
+                    last_success = excluded.last_success,
+                    last_connected = excluded.last_connected,
+                    is_reliable = CASE
+                        WHEN score + 5 >= 70 AND successes + 1 >= 5 THEN 1
+                        ELSE is_reliable
+                    END
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_bind_int(stmt, 2, Int32(port))
+                sqlite3_bind_int64(stmt, 3, Int64(now))
+                sqlite3_bind_int64(stmt, 4, Int64(now))
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+    }
+
+    /// Update peer score after failed connection
+    func recordPeerFailure(host: String, port: UInt16 = 8033) {
+        guard let db = db else { return }
+
+        let sql = """
+            INSERT INTO trusted_peers (host, port, successes, failures, score)
+            VALUES (?, ?, 0, 1, 40)
+            ON CONFLICT(host, port) DO UPDATE SET
+                failures = failures + 1,
+                score = MAX(0, score - 10),
+                is_reliable = CASE WHEN score - 10 < 50 THEN 0 ELSE is_reliable END
+        """
+
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_int(stmt, 2, Int32(port))
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+        }
+    }
+
+    /// Mark peer as permanently bad (wrong chain, protocol errors)
+    func markPeerAsBad(host: String, port: UInt16 = 8033, reason: String) {
+        guard let db = db else { return }
+
+        let sql = """
+            INSERT INTO trusted_peers (host, port, is_bad, score, notes)
+            VALUES (?, ?, 1, 0, ?)
+            ON CONFLICT(host, port) DO UPDATE SET
+                is_bad = 1,
+                score = 0,
+                is_reliable = 0,
+                notes = excluded.notes
+        """
+
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_int(stmt, 2, Int32(port))
+            sqlite3_bind_text(stmt, 3, reason, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            print("🚫 FIX #1085: Marked \(host):\(port) as permanently bad: \(reason)")
+        }
+    }
+
+    /// Get all reliable peers (score >= 70, successes >= 5, not bad)
+    func getReliablePeers() -> [(host: String, port: UInt16, score: Int)] {
+        guard let db = db else { return [] }
+
+        let sql = """
+            SELECT host, port, score FROM trusted_peers
+            WHERE is_reliable = 1 AND is_bad = 0 AND score >= 70
+            ORDER BY score DESC, last_success DESC
+        """
+
+        var peers: [(String, UInt16, Int)] = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let host = String(cString: sqlite3_column_text(stmt, 0))
+                let port = UInt16(sqlite3_column_int(stmt, 1))
+                let score = Int(sqlite3_column_int(stmt, 2))
+                peers.append((host, port, score))
+            }
+            sqlite3_finalize(stmt)
+        }
+        return peers
+    }
+
+    /// Get all bad peers to exclude from connection attempts
+    func getBadPeers() -> Set<String> {
+        guard let db = db else { return [] }
+
+        let sql = "SELECT host FROM trusted_peers WHERE is_bad = 1"
+
+        var badPeers: Set<String> = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let host = String(cString: sqlite3_column_text(stmt, 0))
+                badPeers.insert(host)
+            }
+            sqlite3_finalize(stmt)
+        }
+        return badPeers
+    }
+
+    /// Get peers sorted by score for prioritized connection
+    func getPeersByScore() -> [(host: String, port: UInt16, score: Int, isReliable: Bool)] {
+        guard let db = db else { return [] }
+
+        let sql = """
+            SELECT host, port, score, is_reliable FROM trusted_peers
+            WHERE is_bad = 0
+            ORDER BY is_reliable DESC, score DESC, last_success DESC
+            LIMIT 50
+        """
+
+        var peers: [(String, UInt16, Int, Bool)] = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let host = String(cString: sqlite3_column_text(stmt, 0))
+                let port = UInt16(sqlite3_column_int(stmt, 1))
+                let score = Int(sqlite3_column_int(stmt, 2))
+                let isReliable = sqlite3_column_int(stmt, 3) != 0
+                peers.append((host, port, score, isReliable))
+            }
+            sqlite3_finalize(stmt)
+        }
+        return peers
+    }
+
+    /// Check if a peer is marked as bad
+    func isPeerBad(host: String) -> Bool {
+        guard let db = db else { return false }
+
+        let sql = "SELECT is_bad FROM trusted_peers WHERE host = ?"
+
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, host, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                let isBad = sqlite3_column_int(stmt, 0) != 0
+                sqlite3_finalize(stmt)
+                return isBad
+            }
+            sqlite3_finalize(stmt)
+        }
+        return false
+    }
+
+    /// Get count of reliable peers
+    func getReliablePeerCount() -> Int {
+        guard let db = db else { return 0 }
+
+        let sql = "SELECT COUNT(*) FROM trusted_peers WHERE is_reliable = 1 AND is_bad = 0"
+
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                let count = Int(sqlite3_column_int(stmt, 0))
+                sqlite3_finalize(stmt)
+                return count
+            }
+            sqlite3_finalize(stmt)
+        }
+        return 0
     }
 }
 

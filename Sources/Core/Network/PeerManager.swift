@@ -288,7 +288,18 @@ public final class PeerManager: ObservableObject {
 
         // FIX #469: ONLY return peers with completed handshake AND live connection!
         // Peers with isHandshakeComplete=true but isConnectionReady=false will fail when used
-        let readyPeers = peerSnapshot.filter { $0.isConnectionReady && $0.isHandshakeComplete }
+        var readyPeers = peerSnapshot.filter { $0.isConnectionReady && $0.isHandshakeComplete }
+
+        // FIX #1091: Filter out localhost in ZipherX mode - no local node in P2P-only mode
+        let isFullNodeMode = WalletModeManager.shared.isUsingWalletDat
+        if !isFullNodeMode {
+            let beforeCount = readyPeers.count
+            readyPeers = readyPeers.filter { $0.host != "127.0.0.1" && $0.host != "localhost" }
+            let removed = beforeCount - readyPeers.count
+            if removed > 0 {
+                print("🚫 FIX #1091: Filtered out \(removed) localhost peer(s) - ZipherX P2P mode")
+            }
+        }
 
         let notReady = peerSnapshot.filter { $0.isConnectionReady && !$0.isHandshakeComplete }
         if !notReady.isEmpty {
@@ -321,11 +332,15 @@ public final class PeerManager: ObservableObject {
     /// FIX #469: Only return peers with COMPLETED P2P handshake
     /// FIX #434: Only return valid Zclassic peers
     /// FIX #458: Added lock to protect peers array
-    /// FIX #592: ALWAYS include hardcoded seeds (especially 127.0.0.1) - they're verified good nodes!
+    /// FIX #592: ALWAYS include hardcoded seeds - they're verified good nodes!
+    /// FIX #1091: EXCEPT localhost in ZipherX mode - no local node in P2P-only mode
     public func getPeersForBroadcast() -> [Peer] {
         peersLock.lock()
         let peerSnapshot = peers
         peersLock.unlock()
+
+        // FIX #1091: Check if we're in ZipherX mode (no local node)
+        let isFullNodeMode = WalletModeManager.shared.isUsingWalletDat
 
         return peerSnapshot.filter { peer in
             // Must not be banned and must have completed handshake
@@ -333,8 +348,13 @@ public final class PeerManager: ObservableObject {
                 return false
             }
 
+            // FIX #1091: NEVER include localhost in ZipherX mode - no local node exists!
+            if !isFullNodeMode && (peer.host == "127.0.0.1" || peer.host == "localhost") {
+                return false
+            }
+
             // FIX #592: Hardcoded seeds are ALWAYS included (verified good nodes)
-            // Especially 127.0.0.1 - the local node which user says is working 100%
+            // (But only in Full Node mode for localhost - see above)
             if HARDCODED_SEEDS.contains(peer.host) {
                 return true  // Skip recent activity check for hardcoded seeds
             }

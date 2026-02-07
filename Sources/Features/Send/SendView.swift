@@ -209,7 +209,8 @@ struct SendView: View {
                     // FIX #242: Also disable during catch-up sync
                     // FIX #360: Also disable during database repair
                     // FIX #410: Also disable when health check blocks send
-                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send))
+                    // FIX #1098: Also disable when balance integrity issue detected
+                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send) || walletManager.balanceIntegrityIssue)
                 }
                 .padding()
             }
@@ -799,6 +800,9 @@ struct SendView: View {
     private var sendButtonTitle: String {
         if isSending {
             return "Sending..."
+        } else if walletManager.balanceIntegrityIssue {
+            // FIX #1098: Show balance issue state
+            return "Balance Issue"
         } else if networkManager.isFeatureBlocked(.send) {
             // FIX #410: Show blocked state
             return "Unavailable"
@@ -837,9 +841,9 @@ struct SendView: View {
     private func sendTransaction() {
         // FIX #210: Check if Tor mode is enabled but Tor isn't running
         Task {
-            let torMode = await TorManager.shared.mode
-            let torConnected = await TorManager.shared.connectionState.isConnected
-            let socksPort = await TorManager.shared.socksPort
+            let torMode = TorManager.shared.mode
+            let torConnected = TorManager.shared.connectionState.isConnected
+            let socksPort = TorManager.shared.socksPort
 
             if torMode == .enabled && (!torConnected || socksPort == 0) {
                 // Tor is enabled but not running - show alert
@@ -1116,6 +1120,23 @@ struct SendView: View {
                 Task {
                     try? await walletManager.refreshBalance()
                 }
+
+                // FIX #957: Start faster confirmation checking
+                // Don't wait for the 30-second fetchNetworkStats interval
+                // Check at 10s, 30s, and 60s for quicker Settlement feedback
+                Task {
+                    print("⏱️ FIX #957: Starting faster confirmation checks...")
+                    for delay in [10, 30, 60] {
+                        try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+                        print("⏱️ FIX #957: Confirmation check at \(delay)s...")
+                        await networkManager.checkPendingOutgoingConfirmations()
+                        // Stop if no more pending transactions
+                        if networkManager.mempoolOutgoing == 0 {
+                            print("⏱️ FIX #957: TX confirmed - stopping early checks")
+                            break
+                        }
+                    }
+                }
             } catch {
                 // If broadcast fails (e.g., stale anchor), fall back to normal send
                 await MainActor.run {
@@ -1157,7 +1178,7 @@ struct SendView: View {
         // Initialize progress steps with cypherpunk-friendly names
         sendProgress = [
             SendProgressStep(id: "validate", title: "Verifying privacy shield", status: .pending),
-            SendProgressStep(id: "prover", title: "Activating Groth16 prover", status: .pending),
+            SendProgressStep(id: "prover", title: "Preparing secure transaction", status: .pending),
             SendProgressStep(id: "notes", title: "Selecting shielded notes", status: .pending),
             SendProgressStep(id: "tree", title: "Loading commitment tree", status: .pending, detail: "1M+ secrets"),
             SendProgressStep(id: "witness", title: "Building merkle witness", status: .pending),
@@ -1313,8 +1334,9 @@ struct SendView: View {
             // Update broadcast step progress (but don't show success yet!)
             updateStepSync("broadcast", status: .inProgress, detail: detail?.replacingOccurrences(of: #"\s*\[txid:[^\]]+\]"#, with: "", options: .regularExpression), progress: progress)
         case "verify":
-            // FIX #118: Handle mempool verification phase
-            // NetworkManager sends "verify" phase during mempool checking
+            // FIX #1052: Handle BOTH pre-prover verification AND mempool verification
+            // Pre-prover: WalletManager sends "verify" during witness update, tree validation
+            // Mempool: NetworkManager sends "verify" during mempool checking
             if progress == 1.0 || detail?.contains("mempool") == true {
                 // Mempool verified - show success!
                 updateStepSync("broadcast", status: .completed, detail: detail ?? "In mempool - awaiting miners")
@@ -1323,6 +1345,15 @@ struct SendView: View {
                     showSuccess = true
                     isSending = false
                 }
+            } else if detail?.contains("witness") == true || detail?.contains("Witness") == true {
+                // FIX #1052: Pre-prover witness verification - show on "prover" step
+                updateStepSync("prover", status: .inProgress, detail: detail)
+            } else if detail?.contains("notes") == true || detail?.contains("Notes") == true {
+                // FIX #1052: Pre-prover notes verification - show on "prover" step
+                updateStepSync("prover", status: .inProgress, detail: detail)
+            } else if detail?.contains("tree") == true || detail?.contains("Tree") == true || detail?.contains("commitment") == true {
+                // FIX #1052: Pre-prover tree validation - show on "prover" step
+                updateStepSync("prover", status: .inProgress, detail: detail)
             } else {
                 // Still verifying
                 updateStepSync("broadcast", status: .inProgress, detail: detail, progress: progress)

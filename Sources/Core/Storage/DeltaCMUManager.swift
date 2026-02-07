@@ -621,7 +621,7 @@ class DeltaCMUManager {
     /// FIX #563 v3: Disabled - delta CMUs aren't being saved properly, causing false rejections
     /// The delta bundle will be re-fetched as needed during witness rebuild
     func validateTreeRootAgainstHeaders() async -> Bool {
-        guard let manifest = getManifest() else {
+        guard getManifest() != nil else {
             return true  // No delta = nothing to validate
         }
 
@@ -633,5 +633,122 @@ class DeltaCMUManager {
         // 3. TransactionBuilder rebuilds witnesses with fresh data from FFI tree
         print("📦 FIX #563 v3: Skipping delta tree root validation (delta from boost, validated by FFI sync)")
         return true
+    }
+
+    // MARK: - FIX #979: Delta Bundle Compaction
+
+    /// FIX #979: PERFORMANCE - Compact delta bundle at startup to remove accumulated duplicates
+    /// The delta bundle can accumulate duplicate CMUs over time due to:
+    /// 1. Re-scans of the same height range
+    /// 2. Background sync overlapping with catch-up sync
+    /// 3. Repair operations re-scanning already processed blocks
+    ///
+    /// This function reads the delta bundle, removes duplicates, and rewrites it.
+    /// Should be called once at app startup BEFORE loading CMUs into memory.
+    ///
+    /// Returns: (originalCount, compactedCount) - tuple showing before/after counts
+    func compactDeltaBundleIfNeeded() -> (original: Int, compacted: Int, removed: Int) {
+        return queue.sync {
+            guard FileManager.default.fileExists(atPath: deltaFileURL.path),
+                  let manifest = getManifest() else {
+                return (0, 0, 0)
+            }
+
+            do {
+                let existingData = try Data(contentsOf: deltaFileURL)
+                let originalCount = existingData.count / Self.OUTPUT_SIZE
+
+                // Quick check: if manifest.outputCount matches file, likely no duplicates
+                // Skip compaction if difference is small (< 5% overhead)
+                let duplicateThreshold = max(10, originalCount / 20) // 5% or at least 10
+                if Int(manifest.outputCount) >= originalCount - duplicateThreshold {
+                    print("📦 FIX #979: Delta bundle looks clean (file:\(originalCount), manifest:\(manifest.outputCount)) - skipping compaction")
+                    return (originalCount, originalCount, 0)
+                }
+
+                print("📦 FIX #979: Compacting delta bundle (file has \(originalCount) records, manifest says \(manifest.outputCount))...")
+
+                // Parse all outputs and deduplicate by (height, index) key
+                var seenKeys = Set<String>()
+                var uniqueOutputs: [DeltaOutput] = []
+                uniqueOutputs.reserveCapacity(originalCount)
+                var duplicateCount = 0
+
+                for i in 0..<originalCount {
+                    let offset = i * Self.OUTPUT_SIZE
+                    if let output = DeltaOutput.parse(from: existingData, at: offset) {
+                        let key = "\(output.height)_\(output.index)"
+                        if seenKeys.contains(key) {
+                            duplicateCount += 1
+                        } else {
+                            seenKeys.insert(key)
+                            uniqueOutputs.append(output)
+                        }
+                    }
+                }
+
+                // Only rewrite if we found significant duplicates
+                if duplicateCount < 10 {
+                    print("📦 FIX #979: Only \(duplicateCount) duplicates found - not worth rewriting")
+                    return (originalCount, originalCount, duplicateCount)
+                }
+
+                // Sort by (height, index) for correct tree order
+                uniqueOutputs.sort { ($0.height, $0.index) < ($1.height, $1.index) }
+
+                // Rewrite the file with unique, sorted outputs
+                var compactedData = Data(capacity: uniqueOutputs.count * Self.OUTPUT_SIZE)
+                for output in uniqueOutputs {
+                    compactedData.append(output.serialize())
+                }
+                try compactedData.write(to: deltaFileURL)
+
+                // Update manifest with correct count
+                let newManifest = DeltaManifest(
+                    startHeight: manifest.startHeight,
+                    endHeight: manifest.endHeight,
+                    outputCount: UInt64(uniqueOutputs.count),
+                    cmuCount: UInt64(uniqueOutputs.count),
+                    treeRoot: manifest.treeRoot,
+                    updatedAt: ISO8601DateFormatter().string(from: Date())
+                )
+                let manifestData = try JSONEncoder().encode(newManifest)
+                try manifestData.write(to: manifestFileURL)
+
+                // Update cache
+                cachedOutputCount = UInt64(uniqueOutputs.count)
+
+                print("✅ FIX #979: Compacted delta bundle from \(originalCount) to \(uniqueOutputs.count) records (removed \(duplicateCount) duplicates)")
+                return (originalCount, uniqueOutputs.count, duplicateCount)
+
+            } catch {
+                print("⚠️ FIX #979: Failed to compact delta bundle: \(error)")
+                return (0, 0, 0)
+            }
+        }
+    }
+
+    /// FIX #979: Check if delta bundle needs compaction
+    /// Returns true if there are likely duplicates (manifest count != file record count)
+    func needsCompaction() -> Bool {
+        guard FileManager.default.fileExists(atPath: deltaFileURL.path),
+              let manifest = getManifest() else {
+            return false
+        }
+
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: deltaFileURL.path)
+            let fileSize = attributes[.size] as? Int ?? 0
+            let fileRecordCount = fileSize / Self.OUTPUT_SIZE
+
+            // If file has more records than manifest claims, we have duplicates
+            let hasDuplicates = fileRecordCount > Int(manifest.outputCount) + 10
+            if hasDuplicates {
+                print("📦 FIX #979: Delta bundle needs compaction (file:\(fileRecordCount) > manifest:\(manifest.outputCount))")
+            }
+            return hasDuplicates
+        } catch {
+            return false
+        }
     }
 }

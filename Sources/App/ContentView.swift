@@ -25,15 +25,21 @@ struct ContentView: View {
     @State private var showCompletionScreen: Bool = false
     private let estimatedSyncDuration: TimeInterval = 60  // ~60 seconds estimated for new wallet
 
+    // FIX #1079: Track max progress to ensure progress NEVER goes backward
+    @State private var maxDisplayedProgress: Double = 0.0
+
     // DEBUG: Set to true to pause at sync completion with a confirmation button
     private let DEBUG_PAUSE_AT_COMPLETION = true
     @State private var debugWaitingForConfirmation = false
     @State private var debugCompletionMessage = ""
 
     /// Get the effective start time for sync timing display
-    /// Uses walletCreationTime if available (when user clicked create/import), otherwise falls back to appStartupTime
+    /// FIX #1120: Uses rescanStartTime for Full Rescan, walletCreationTime for initial sync
     private var effectiveStartTime: Date {
-        walletManager.walletCreationTime ?? appStartupTime
+        if walletManager.isFullRescan, let rescanStart = walletManager.rescanStartTime {
+            return rescanStart
+        }
+        return walletManager.walletCreationTime ?? appStartupTime
     }
 
     // Cypherpunk mode sheet states
@@ -100,7 +106,7 @@ struct ContentView: View {
                         let startupStart = CFAbsoluteTimeGetCurrent()
                         var phaseTimings: [(String, Double)] = []
 
-                        func logPhase(_ name: String, since: CFAbsoluteTime) {
+                        func logPhase(_ name: String, since: CFAbsoluteTime) -> Void {
                             let elapsed = CFAbsoluteTimeGetCurrent() - since
                             phaseTimings.append((name, elapsed))
                             print("⏱️ FIX #881: \(name) took \(String(format: "%.2f", elapsed * 1000))ms")
@@ -167,13 +173,25 @@ struct ContentView: View {
                         // If wallet is already synced, show cached balance immediately
                         // and do background sync later (achieves <5s startup)
                         // ==========================================================
-                        let lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+                        var lastScannedHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
                         let cachedChainHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
-                        let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
 
                         // FIX #168: Use verified_checkpoint_height for INSTANT startup
                         // If checkpoint == lastScannedHeight, wallet is fully verified - NO health checks needed!
                         let checkpointHeight = (try? WalletDatabase.shared.getVerifiedCheckpointHeight()) ?? 0
+
+                        // FIX #1051: Recover from corrupted lastScannedHeight
+                        // If checkpoint exists but lastScannedHeight=0, restore from checkpoint
+                        // This prevents unnecessary FULL START when wallet was previously synced
+                        if lastScannedHeight == 0 && checkpointHeight > 0 {
+                            print("🔧 FIX #1051: lastScannedHeight=0 but checkpoint=\(checkpointHeight) - recovering...")
+                            // Use empty hash - will be updated on next scan
+                            try? WalletDatabase.shared.updateLastScannedHeight(checkpointHeight, hash: Data())
+                            lastScannedHeight = checkpointHeight
+                            print("✅ FIX #1051: Restored lastScannedHeight to \(checkpointHeight)")
+                        }
+
+                        let blocksBehind = cachedChainHeight > lastScannedHeight ? cachedChainHeight - lastScannedHeight : 0
                         let checkpointGap = lastScannedHeight > checkpointHeight ? lastScannedHeight - checkpointHeight : 0
                         let isCheckpointValid = checkpointHeight > 0 && checkpointGap <= 10  // Within 10 blocks = valid
 
@@ -551,31 +569,49 @@ struct ContentView: View {
                                         $0.checkName == "Tree Root Validation"
                                     }
 
+                                    // FIX #1078: Check for Balance Integrity failure - needs FULL rescan
+                                    let hasBalanceCorruption = criticalIssues.contains {
+                                        $0.checkName == "Balance Integrity"
+                                    }
+                                    if hasBalanceCorruption {
+                                        print("🔧 FIX #1078: Balance corruption detected (INSTANT START) - AUTO-triggering FULL RESCAN...")
+                                    }
+
+                                    // FIX #1078: Balance corruption also needs full rescan (same as tree mismatch)
+                                    let needsFullRescan = hasTreeRootMismatch || hasBalanceCorruption
+
                                     // Trigger automatic repair instead of showing alert
                                     await MainActor.run {
-                                        if hasTreeRootMismatch {
+                                        if hasBalanceCorruption {
+                                            walletManager.setConnecting(true, status: "Balance issue - rebuilding from scratch...")
+                                        } else if hasTreeRootMismatch {
                                             walletManager.setConnecting(true, status: "Tree mismatch - rebuilding from scratch...")
                                         } else {
                                             walletManager.setConnecting(true, status: "Repairing wallet state...")
                                         }
                                         // FIX #887: User-friendly task titles
-                                        walletManager.syncTasks.append(SyncTask(id: "instant_repair", title: hasTreeRootMismatch ? "Repairing wallet" : "Auto-repair", status: .inProgress, progress: 0.0))
+                                        walletManager.syncTasks.append(SyncTask(id: "instant_repair", title: needsFullRescan ? "Repairing wallet" : "Auto-repair", status: .inProgress, progress: 0.0))
                                     }
 
                                     do {
-                                        // FIX #723: For tree root mismatch, force FULL rescan to rebuild tree from boost file
-                                        if hasTreeRootMismatch {
-                                            print("🔧 FIX #723: Tree root mismatch detected - triggering FULL RESCAN")
+                                        // FIX #723/#1078: For tree root mismatch OR balance corruption, force FULL rescan
+                                        if needsFullRescan {
+                                            if hasBalanceCorruption {
+                                                print("🔧 FIX #1078: Balance corruption detected - triggering FULL RESCAN")
+                                            }
+                                            if hasTreeRootMismatch {
+                                                print("🔧 FIX #723: Tree root mismatch detected - triggering FULL RESCAN")
+                                            }
                                             // FIX #778: Increment repair attempt counter
                                             UserDefaults.standard.set(repairAttempts + 1, forKey: repairAttemptsKey)
-                                            print("🔧 FIX #778: Tree root repair attempt \(repairAttempts + 1)/\(maxRepairAttempts)")
+                                            print("🔧 FIX #778: Repair attempt \(repairAttempts + 1)/\(maxRepairAttempts)")
                                         }
                                         try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                                            print("🔧 FIX #686/723: Instant repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                            print("🔧 FIX #686/723/1078: Instant repair progress \(Int(progress * 100))% (\(current)/\(total))")
                                             Task { @MainActor in
                                                 walletManager.updateSyncTask(id: "instant_repair", status: .inProgress, detail: "\(current)/\(total)", progress: progress)
                                             }
-                                        }, forceFullRescan: hasTreeRootMismatch)
+                                        }, forceFullRescan: needsFullRescan)
                                         await MainActor.run {
                                             walletManager.updateSyncTask(id: "instant_repair", status: .completed)
                                         }
@@ -620,8 +656,80 @@ struct ContentView: View {
                                 logPhase("Witness rebuild", since: witnessRebuildStart)
                                 print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
 
-                                // Show UI after health check completes
+                                // FIX #1090: CRITICAL - Recompute nullifiers with correct positions + verify
+                                // This MUST run after witnesses are rebuilt (they contain the correct positions)
+                                // Without this, spent notes won't be detected and balance will be WRONG
+                                print("🔧 FIX #1090: Verifying nullifiers at INSTANT START...")
                                 await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Verifying balance accuracy...")
+                                }
+                                do {
+                                    // Step 1: Fix any nullifiers computed with wrong positions
+                                    let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
+                                    if fixedNullifiers > 0 {
+                                        print("🔧 FIX #1091 v2: Fixed \(fixedNullifiers) nullifier(s) - triggering Full Rescan for accurate balance")
+
+                                        // FIX #1091 v2: When nullifiers are fixed, trigger Full Rescan
+                                        // The slow P2P verification (72,000+ blocks) is unreliable
+                                        // Full Rescan uses boost file + targeted P2P = fast and reliable
+                                        await MainActor.run {
+                                            walletManager.setConnecting(true, status: "Repairing balance (nullifiers were corrupted)...")
+                                        }
+                                        try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
+                                            Task { @MainActor in
+                                                walletManager.setConnecting(true, status: "Repairing: \(Int(progress * 100))%")
+                                            }
+                                        }, forceFullRescan: true)
+                                        print("✅ FIX #1091 v2: Full Rescan complete - balance is now accurate!")
+                                        // Clear the flag since we've done a full rescan
+                                        UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
+                                        UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                                    } else {
+                                        // No nullifiers needed fixing - do quick verification
+                                        let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: false)
+                                        if externalSpends > 0 {
+                                            print("✅ FIX #1090: Detected and fixed \(externalSpends) external spend(s)")
+                                            try? await walletManager.refreshBalance()
+                                        } else {
+                                            print("✅ FIX #1090: All unspent notes verified - balance is accurate!")
+                                        }
+                                    }
+                                } catch {
+                                    print("⚠️ FIX #1091 v2: Repair failed: \(error)")
+                                    print("   Run 'Full Resync' in Settings if balance seems wrong")
+                                }
+
+                                // FIX #1118 v2: Detect balance issues BEFORE UI transition
+                                // This blocks SEND and shows warning even if discrepancy is marked non-critical
+                                // (Non-critical is used to prevent Full Rescan loops, but user should still see warning)
+
+                                // DEBUG: Print all health results to diagnose
+                                print("🔍 FIX #1118 DEBUG: Checking \(healthResults.count) health results for Balance Integrity issues:")
+                                for result in healthResults {
+                                    print("   - \(result.checkName): passed=\(result.passed), critical=\(result.critical)")
+                                }
+
+                                let hasAnyBalanceIssue = healthResults.contains {
+                                    $0.checkName == "Balance Integrity" && !$0.passed
+                                }
+                                print("🔍 FIX #1118 DEBUG: hasAnyBalanceIssue = \(hasAnyBalanceIssue)")
+
+                                if hasAnyBalanceIssue {
+                                    print("⚠️ FIX #1118: Balance discrepancy detected - blocking SEND and showing warning")
+                                }
+
+                                // FIX #1118 v2: CRITICAL - Set flag AND transition UI in SINGLE MainActor.run block
+                                // Two separate MainActor.run blocks caused race condition where SwiftUI rendered
+                                // BalanceView before observing the flag change. Now both happen atomically.
+                                await MainActor.run {
+                                    // Set balance integrity flag FIRST (before isInitialSync=false triggers BalanceView)
+                                    if hasAnyBalanceIssue {
+                                        walletManager.balanceIntegrityIssue = true
+                                        walletManager.balanceIntegrityMessage = "Balance discrepancy detected - run Full Resync in Settings"
+                                        print("🚨 FIX #1118 v2: balanceIntegrityIssue set to TRUE before UI transition")
+                                    }
+
+                                    // NOW transition UI - BalanceView will see the correct flag value
                                     walletManager.setRepairingHistory(false)
                                     walletManager.setConnecting(false, status: nil)
                                     isInitialSync = false
@@ -1014,11 +1122,22 @@ struct ContentView: View {
                                 $0.checkName == "Tree Root Validation" && !$0.passed && $0.critical
                             }
 
-                            if hasCritical && hasTreeRootMismatch {
-                                // FIX #439: Tree Root mismatch is critical but we CAN fix it with Full Rescan
-                                print("🔧 FIX #439: Tree Root mismatch detected - triggering Full Rescan to rebuild tree...")
+                            // FIX #1078: Check for Balance Integrity failure (critical but REPAIRABLE via Full Rescan)
+                            let hasBalanceCorruption = healthResults.contains {
+                                $0.checkName == "Balance Integrity" && !$0.passed && $0.critical
+                            }
+
+                            if hasCritical && (hasTreeRootMismatch || hasBalanceCorruption) {
+                                // FIX #1078: Balance corruption or Tree Root mismatch - auto-trigger Full Rescan
+                                if hasBalanceCorruption {
+                                    print("🔧 FIX #1078: Balance corruption detected - AUTO-triggering Full Rescan to rebuild notes...")
+                                }
+                                if hasTreeRootMismatch {
+                                    print("🔧 FIX #439: Tree Root mismatch detected - triggering Full Rescan to rebuild tree...")
+                                }
+                                let statusMsg = hasBalanceCorruption ? "Balance issue - rebuilding..." : "Tree mismatch - rebuilding..."
                                 await MainActor.run {
-                                    walletManager.setConnecting(true, status: "Tree mismatch - rebuilding...")
+                                    walletManager.setConnecting(true, status: statusMsg)
                                     walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
                                 }
 
@@ -1306,6 +1425,62 @@ struct ContentView: View {
                             }
                             print("✅ FIX #557 v8: Witnesses synced - balance is now accurate!")
 
+                            // FIX #1090: CRITICAL - Recompute nullifiers with correct positions + verify
+                            // This MUST run after witnesses are rebuilt (they contain the correct positions)
+                            // Without this, spent notes won't be detected and balance will be WRONG
+                            print("🔧 FIX #1090: Verifying nullifiers at FAST START...")
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Verifying balance accuracy...")
+                            }
+                            do {
+                                // Step 1: Fix any nullifiers computed with wrong positions
+                                let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
+                                if fixedNullifiers > 0 {
+                                    print("🔧 FIX #1091 v2: Fixed \(fixedNullifiers) nullifier(s) - triggering Full Rescan for accurate balance")
+
+                                    // FIX #1091 v2: When nullifiers are fixed, trigger Full Rescan
+                                    // The slow P2P verification (72,000+ blocks) is unreliable
+                                    // Full Rescan uses boost file + targeted P2P = fast and reliable
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Repairing balance (nullifiers were corrupted)...")
+                                    }
+                                    try await walletManager.repairNotesAfterDownloadedTree(
+                                        onProgress: { progress, current, total in
+                                            Task { @MainActor in
+                                                walletManager.setConnecting(true, status: "Repairing: \(Int(progress * 100))%")
+                                            }
+                                        },
+                                        forceFullRescan: true
+                                    )
+                                    print("✅ FIX #1091 v2: Full Rescan complete - balance is now accurate!")
+                                    // Clear the flag since we've done a full rescan
+                                    UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
+                                    UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                                } else {
+                                    // No nullifiers needed fixing - do quick verification
+                                    let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: false)
+                                    if externalSpends > 0 {
+                                        print("✅ FIX #1090: Detected and fixed \(externalSpends) external spend(s)")
+                                        try? await walletManager.refreshBalance()
+                                    } else {
+                                        print("✅ FIX #1090: All unspent notes verified - balance is accurate!")
+                                    }
+                                }
+                            } catch {
+                                print("⚠️ FIX #1091 v2: Repair failed: \(error)")
+                                print("   Run 'Full Resync' in Settings if balance seems wrong")
+                            }
+
+                            // FIX #1118: Detect balance issues BEFORE UI transition
+                            // This blocks SEND and shows warning even if discrepancy is marked non-critical
+                            // (Non-critical is used to prevent Full Rescan loops, but user should still see warning)
+                            let hasAnyBalanceIssue = healthResults.contains {
+                                $0.checkName == "Balance Integrity" && !$0.passed
+                            }
+                            if hasAnyBalanceIssue {
+                                print("⚠️ FIX #1118: Balance discrepancy detected (FAST START) - blocking SEND and showing warning")
+                            }
+
                             // Mark initial sync as complete - NOW safe because all checks passed or were fixed
                             print("⚡ FAST START COMPLETE: UI ready!")
 
@@ -1351,10 +1526,21 @@ struct ContentView: View {
                                 print("🟢 DEBUG: User confirmed, proceeding to balance view")
                             }
 
+                            // FIX #1118 v2: CRITICAL - Set flag AND transition UI in SINGLE MainActor.run block
+                            // Two separate MainActor.run blocks caused race condition where SwiftUI rendered
+                            // BalanceView before observing the flag change. Now both happen atomically.
                             await MainActor.run {
+                                // Set balance integrity flag FIRST (before isInitialSync=false triggers BalanceView)
+                                if hasAnyBalanceIssue {
+                                    walletManager.balanceIntegrityIssue = true
+                                    walletManager.balanceIntegrityMessage = "Balance discrepancy detected - run Full Resync in Settings"
+                                    print("🚨 FIX #1118 v2: balanceIntegrityIssue set to TRUE before UI transition (FAST START)")
+                                }
+
                                 // FIX #162: Clear repair flag - FAST START complete, Views can now call populateHistoryFromNotes
                                 walletManager.setRepairingHistory(false)
 
+                                // NOW transition UI - BalanceView will see the correct flag value
                                 walletManager.setConnecting(false, status: nil)
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
@@ -1682,11 +1868,22 @@ struct ContentView: View {
                             $0.checkName == "Tree Root Validation" && !$0.passed && $0.critical
                         }
 
-                        if fullStartHasCritical && fullStartHasTreeRootMismatch {
-                            // FIX #439: Tree Root mismatch is critical but we CAN fix it with Full Rescan
-                            print("🔧 FIX #439: Tree Root mismatch detected (FULL START) - triggering Full Rescan...")
+                        // FIX #1078: Check for Balance Integrity failure (critical but REPAIRABLE via Full Rescan)
+                        let fullStartHasBalanceCorruption = fullStartHealthResults.contains {
+                            $0.checkName == "Balance Integrity" && !$0.passed && $0.critical
+                        }
+
+                        if fullStartHasCritical && (fullStartHasTreeRootMismatch || fullStartHasBalanceCorruption) {
+                            // FIX #1078: Balance corruption or Tree Root mismatch - auto-trigger Full Rescan
+                            if fullStartHasBalanceCorruption {
+                                print("🔧 FIX #1078: Balance corruption detected (FULL START) - AUTO-triggering Full Rescan...")
+                            }
+                            if fullStartHasTreeRootMismatch {
+                                print("🔧 FIX #439: Tree Root mismatch detected (FULL START) - triggering Full Rescan...")
+                            }
+                            let fullStartStatusMsg = fullStartHasBalanceCorruption ? "Balance issue - rebuilding..." : "Tree mismatch - rebuilding..."
                             await MainActor.run {
-                                walletManager.setConnecting(true, status: "Tree mismatch - rebuilding...")
+                                walletManager.setConnecting(true, status: fullStartStatusMsg)
                                 walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
                             }
 
@@ -1877,7 +2074,22 @@ struct ContentView: View {
                             print("✅ FULL START: All health checks passed! (100% complete)")
                         }
 
+                        // FIX #1118: Detect balance issues for FULL START
+                        // This blocks SEND and shows warning even if discrepancy is marked non-critical
+                        let fullStartHasAnyBalanceIssue = fullStartHealthResults.contains {
+                            $0.checkName == "Balance Integrity" && !$0.passed
+                        }
+                        if fullStartHasAnyBalanceIssue {
+                            print("⚠️ FIX #1118: Balance discrepancy detected (FULL START) - blocking SEND and showing warning")
+                        }
+
+                        // FIX #1118 v2: Set flag in same block as UI state changes
                         await MainActor.run {
+                            if fullStartHasAnyBalanceIssue {
+                                walletManager.balanceIntegrityIssue = true
+                                walletManager.balanceIntegrityMessage = "Balance discrepancy detected - run Full Resync in Settings"
+                                print("🚨 FIX #1118 v2: balanceIntegrityIssue set to TRUE (FULL START)")
+                            }
                             walletManager.setConnecting(false, status: nil)
                         }
 
@@ -1964,6 +2176,18 @@ struct ContentView: View {
                         }
                     )
                     .transition(.opacity)
+                    // FIX #1079: Track max progress to ensure it never decreases
+                    .onChange(of: rawSyncProgress) { newProgress in
+                        if newProgress > maxDisplayedProgress {
+                            maxDisplayedProgress = newProgress
+                        }
+                    }
+                    // FIX #1079: Reset max progress when Full Rescan starts
+                    .onChange(of: walletManager.isFullRescan) { isRescan in
+                        if isRescan {
+                            maxDisplayedProgress = 0.0
+                        }
+                    }
                 }
 
                 // DEBUG: Confirmation overlay to pause before showing balance view
@@ -2161,109 +2385,168 @@ struct ContentView: View {
     }
 
     /// Combined progress for all sync phases - MONOTONIC (never decreases!)
-    /// Uses WalletManager.overallProgress which only ever increases
+    /// FIX #1079: Progress NEVER goes backward - uses max tracking
     private var currentSyncProgress: Double {
         // FIX #560: Check if we're in FAST START mode (tree loaded, initial sync)
         // FIX #577 v13: Also treat Full Rescan like initial sync (same progress display as Import PK)
         // Don't check isSyncing because FAST START might sync headers!
         let isFastStartMode = walletManager.isTreeLoaded && (isInitialSync || walletManager.isFullRescan)
 
+        var rawProgress: Double = 0.0
+
         if isFastStartMode {
-            // FIX #560: Manually build task list for FAST START progress
-            // FIX #577 v13: For Full Rescan, show core Import PK tasks (not fast_* tasks)
-            var tasks: [SyncTask] = []
+            // FIX #1079: Only count tasks that are ACTUALLY RUNNING or COMPLETED
+            // Don't count pending tasks in the denominator (they may never run!)
+            var completedCount = 0
+            var inProgressCount = 0
 
             // Tree task (always completed in FAST START)
-            tasks.append(SyncTask(id: "tree", title: "Loading wallet data", status: .completed))
+            completedCount += 1
 
-            // Connect task (depends on connection state)
-            if !networkManager.isConnected {
-                let status: SyncTaskStatus = walletManager.isConnecting ? .inProgress : .pending
-                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: status))
-            } else {
-                tasks.append(SyncTask(id: "connect", title: "Connecting to network", status: .completed))
+            // Connect task
+            if networkManager.isConnected {
+                completedCount += 1
+            } else if walletManager.isConnecting {
+                inProgressCount += 1
             }
 
-            // CRITICAL FIX #560: Don't show 100% if we're still connecting or syncing!
-            // The isConnecting flag stays true until ALL FAST START work completes
-            if walletManager.isConnecting {
-                // Add a "finalizing" task to keep progress below 100%
-                tasks.append(SyncTask(id: "finalizing", title: "Finalizing startup...", status: .inProgress))
-            }
-
+            // FIX #1079: Count only NON-PENDING tasks from syncTasks
             // FIX #577 v13: For Full Rescan, show core sync tasks; for FAST START, show fast_* tasks
+            let relevantTaskIds: Set<String>
             if walletManager.isFullRescan {
-                // FIX #727: Full Rescan - use WHITELIST of known Import PK task IDs only
-                // Previous blacklist approach let unwanted health check/repair tasks through
-                // FIX #752: Added tree_rebuild to display list so progress is visible
-                let importPKTaskIds: Set<String> = [
+                relevantTaskIds = [
                     "params", "keys", "database", "download_outputs", "download_timestamps",
                     "headers", "height", "scan", "witnesses", "balance", "instant_repair",
                     "tree_rebuild", "full_start_repair", "full_repair"
                 ]
-                let coreTasks = walletManager.syncTasks.filter { task in
-                    importPKTaskIds.contains(task.id)
-                }
-                if !coreTasks.isEmpty {
-                    tasks.append(contentsOf: coreTasks)
-                }
             } else {
-                // FIX #770: FAST START - include fast_* tasks PLUS additional repair/sync tasks
-                // Previous bug: witness_sync, balance_repair, tree_rebuild etc. were not included
-                // causing progress to show ~83% when these tasks were running
-                let fastStartTaskIds: Set<String> = [
+                relevantTaskIds = [
+                    "fast_balance", "fast_peers", "fast_headers", "fast_health", "fast_repair",
                     "witness_sync", "balance_repair", "balance_repair_early",
-                    "tree_rebuild", "instant_repair", "fast_repair"
+                    "tree_rebuild", "instant_repair"
                 ]
-                let fastTasks = walletManager.syncTasks.filter { task in
-                    task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)
-                }
-                if !fastTasks.isEmpty {
-                    tasks.append(contentsOf: fastTasks)
-                }
             }
 
-            // Calculate progress
-            let totalTasks = max(tasks.count, 1)  // At least 1 to avoid division by zero
-            var completedCount = 0
-            var inProgressCount = 0
+            // FIX #1079: Only count tasks that have STARTED (not pending)
+            // FIX #1121: For Full Rescan, count ALL tasks (pending WILL run!)
+            var pendingCount = 0
+            for task in walletManager.syncTasks {
+                let isRelevant = relevantTaskIds.contains(task.id) ||
+                    (!walletManager.isFullRescan && task.id.hasPrefix("fast_"))
+                guard isRelevant else { continue }
 
-            for task in tasks {
                 switch task.status {
                 case .completed, .failed:
                     completedCount += 1
                 case .inProgress:
                     inProgressCount += 1
                 case .pending:
-                    break
+                    // FIX #1121: For Full Rescan, pending tasks WILL run, so count them
+                    if walletManager.isFullRescan {
+                        pendingCount += 1
+                    }
+                    // FIX #1079: For FAST START, DON'T count pending tasks - they may never run!
                 }
             }
 
-            let completedProgress = Double(completedCount) / Double(totalTasks)
-            let inProgressProgress = (Double(inProgressCount) / Double(totalTasks)) * 0.5
+            // FIX #1121: Calculate progress based on ALL tasks for Full Rescan
+            // FIX #1079: For FAST START, only count active tasks
+            let totalTasks: Int
+            if walletManager.isFullRescan {
+                // Full Rescan: ALL relevant tasks count (pending WILL run)
+                totalTasks = completedCount + inProgressCount + pendingCount
+            } else {
+                // FAST START: Only active tasks (pending may never run)
+                totalTasks = completedCount + inProgressCount
+            }
 
-            let progress = min(completedProgress + inProgressProgress, 1.0)
-            return progress
+            if totalTasks > 0 {
+                // In-progress tasks count as 50% complete, pending as 0%
+                let effectiveComplete = Double(completedCount) + (Double(inProgressCount) * 0.5)
+                // If still connecting, cap at 95%
+                let maxProgress = walletManager.isConnecting ? 0.95 : 1.0
+                rawProgress = min((effectiveComplete / Double(totalTasks)), maxProgress)
+            } else {
+                rawProgress = 0.1  // At least show some progress
+            }
+        } else {
+            // Use the monotonic progress from WalletManager for normal sync
+            // This never goes backward, providing smooth UX
+            let baseProgress = walletManager.overallProgress
+
+            // If we're in post-sync verification (isConnecting after tasks complete),
+            // cap progress at 98% so user knows it's not fully done yet
+            let statusAllTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
+                if case .completed = $0.status { return true }
+                if case .failed = $0.status { return true }
+                return false
+            }
+
+            if statusAllTasksCompleted && walletManager.isConnecting {
+                rawProgress = min(baseProgress, 0.98)
+            } else {
+                rawProgress = baseProgress
+            }
         }
 
-        // Use the monotonic progress from WalletManager for normal sync
-        // This never goes backward, providing smooth UX
-        let baseProgress = walletManager.overallProgress
+        // FIX #1079: MONOTONIC - Return the max of raw progress and stored max
+        // The actual max tracking happens in the view via onChange
+        return max(rawProgress, maxDisplayedProgress)
+    }
 
-        // If we're in post-sync verification (isConnecting after tasks complete),
-        // cap progress at 98% so user knows it's not fully done yet
-        let statusAllTasksCompleted = !walletManager.syncTasks.isEmpty && walletManager.syncTasks.allSatisfy {
-            if case .completed = $0.status { return true }
-            if case .failed = $0.status { return true }
-            return false
+    /// FIX #1079: Raw progress for tracking (used by onChange to update maxDisplayedProgress)
+    /// FIX #1121: For Full Rescan, count pending tasks in total
+    private var rawSyncProgress: Double {
+        let isFastStartMode = walletManager.isTreeLoaded && (isInitialSync || walletManager.isFullRescan)
+
+        if isFastStartMode {
+            var completedCount = 0
+            var inProgressCount = 0
+            var pendingCount = 0
+
+            completedCount += 1  // Tree always completed
+
+            if networkManager.isConnected {
+                completedCount += 1
+            } else if walletManager.isConnecting {
+                inProgressCount += 1
+            }
+
+            let relevantTaskIds: Set<String> = walletManager.isFullRescan ?
+                ["params", "keys", "database", "download_outputs", "download_timestamps",
+                 "headers", "height", "scan", "witnesses", "balance", "instant_repair",
+                 "tree_rebuild", "full_start_repair", "full_repair"] :
+                ["fast_balance", "fast_peers", "fast_headers", "fast_health", "fast_repair",
+                 "witness_sync", "balance_repair", "balance_repair_early", "tree_rebuild", "instant_repair"]
+
+            for task in walletManager.syncTasks {
+                let isRelevant = relevantTaskIds.contains(task.id) ||
+                    (!walletManager.isFullRescan && task.id.hasPrefix("fast_"))
+                guard isRelevant else { continue }
+
+                switch task.status {
+                case .completed, .failed: completedCount += 1
+                case .inProgress: inProgressCount += 1
+                case .pending:
+                    // FIX #1121: For Full Rescan, pending tasks WILL run
+                    if walletManager.isFullRescan { pendingCount += 1 }
+                }
+            }
+
+            // FIX #1121: Include pending tasks in total for Full Rescan
+            let totalTasks = walletManager.isFullRescan ?
+                (completedCount + inProgressCount + pendingCount) :
+                (completedCount + inProgressCount)
+
+            if totalTasks > 0 {
+                let effectiveComplete = Double(completedCount) + (Double(inProgressCount) * 0.5)
+                let maxProgress = walletManager.isConnecting ? 0.95 : 1.0
+                return min((effectiveComplete / Double(totalTasks)), maxProgress)
+            }
+            return 0.1
         }
 
-        if statusAllTasksCompleted && walletManager.isConnecting {
-            // During verification phase, show progress between 98-99%
-            return min(baseProgress, 0.98)
-        }
-
-        return baseProgress
+        return walletManager.overallProgress
     }
 
     /// Combined status for all sync phases
@@ -2363,6 +2646,8 @@ struct ContentView: View {
         }
 
         // 3. THIRD: Sync tasks from WalletManager
+        // FIX #1079: Only show tasks that have STARTED (not pending)
+        // Pending tasks that will never execute should not clutter the UI
         if isFastStartMode {
             // FIX #562: FAST START mode - only show fast_* tasks, not all 20+ tasks!
             // FIX #577 v13: Full Rescan shows only core Import PK tasks (same as FAST START)
@@ -2376,29 +2661,34 @@ struct ContentView: View {
             // For FAST START, show fast_* tasks only
             if walletManager.isFullRescan {
                 // FIX #727: Full Rescan - use WHITELIST of known Import PK task IDs only
-                // Previous blacklist approach let unwanted health check/repair tasks through
-                // FIX #752: Added tree_rebuild to display list so progress is visible
+                // FIX #1079: Only show tasks that have STARTED (inProgress, completed, or failed)
                 let importPKTaskIds: Set<String> = [
                     "params", "keys", "database", "download_outputs", "download_timestamps",
                     "headers", "height", "scan", "witnesses", "balance", "instant_repair",
                     "tree_rebuild", "full_start_repair", "full_repair"
                 ]
                 let coreTasks = walletManager.syncTasks.filter { task in
-                    importPKTaskIds.contains(task.id)
+                    guard importPKTaskIds.contains(task.id) else { return false }
+                    // FIX #1079: Only include non-pending tasks
+                    if case .pending = task.status { return false }
+                    return true
                 }
                 if !coreTasks.isEmpty {
                     tasks.append(contentsOf: coreTasks)
                 }
             } else {
                 // FIX #770: FAST START - include fast_* tasks PLUS additional repair/sync tasks
-                // Previous bug: witness_sync, balance_repair, tree_rebuild etc. were not displayed
-                // and not counted in progress, causing progress to show ~83% when these tasks were running
+                // FIX #1079: Only show tasks that have STARTED (not pending)
                 let fastStartTaskIds: Set<String> = [
                     "witness_sync", "balance_repair", "balance_repair_early",
                     "tree_rebuild", "instant_repair", "fast_repair"
                 ]
                 let fastTasks = walletManager.syncTasks.filter { task in
-                    task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)
+                    let isRelevant = task.id.hasPrefix("fast_") || fastStartTaskIds.contains(task.id)
+                    guard isRelevant else { return false }
+                    // FIX #1079: Only include non-pending tasks
+                    if case .pending = task.status { return false }
+                    return true
                 }
                 if !fastTasks.isEmpty {
                     tasks.append(contentsOf: fastTasks)
@@ -2406,8 +2696,13 @@ struct ContentView: View {
             }
         } else {
             // NORMAL START mode - show all sync tasks
+            // FIX #1079: Only show tasks that have STARTED (not pending)
             if !walletManager.syncTasks.isEmpty {
-                tasks.append(contentsOf: walletManager.syncTasks)
+                let activeTasks = walletManager.syncTasks.filter { task in
+                    if case .pending = task.status { return false }
+                    return true
+                }
+                tasks.append(contentsOf: activeTasks)
             } else if networkManager.isConnected && walletManager.isTreeLoaded && !walletManager.isSyncing {
                 // Sync already complete or skipped - show completed scan task
                 tasks.append(SyncTask(id: "scan", title: "Finding transactions", status: .completed))
@@ -2861,7 +3156,7 @@ struct ContentView: View {
                         .font(.system(size: 14))
                         .foregroundColor(.orange)
                         .rotationEffect(.degrees(walletManager.isCatchingUp ? 360 : 0))
-                        .animation(walletManager.isCatchingUp ? Animation.linear(duration: 1.0).repeatForever(autoreverses: false) : .default, value: walletManager.isCatchingUp)
+                        .animation(walletManager.isCatchingUp ? .linear(duration: 1.0).repeatForever(autoreverses: false) : .default, value: walletManager.isCatchingUp)
 
                     Text("Syncing...")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
@@ -2889,7 +3184,7 @@ struct ContentView: View {
                             .fill(Color.orange)
                             .frame(width: geometry.size.width * 0.3, height: 6)
                             .offset(x: walletManager.isCatchingUp ? geometry.size.width * 0.7 : 0)
-                            .animation(walletManager.isCatchingUp ? Animation.easeInOut(duration: 1.0).repeatForever(autoreverses: true) : .default, value: walletManager.isCatchingUp)
+                            .animation(walletManager.isCatchingUp ? .easeInOut(duration: 1.0).repeatForever(autoreverses: true) : .default, value: walletManager.isCatchingUp)
                     }
                     .cornerRadius(3)
                 }

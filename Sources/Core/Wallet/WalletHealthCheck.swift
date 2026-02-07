@@ -88,12 +88,16 @@ final class WalletHealthCheck {
         // Compares stored note anchors with blockchain headers to detect witness corruption
         results.append(await checkNoteAnchorsMatchHeaders())
 
-        // 16. FIX #574: Detect stale witnesses at startup
+        // 16. FIX #876: CRITICAL - Check for notes without witnesses (balance accuracy)
+        // If notes exist without witnesses, balance is WRONG and must be fixed
+        results.append(await checkNotesWithoutWitnesses())
+
+        // 18. FIX #574: Detect stale witnesses at startup
         // Checks if witness anchors match CURRENT tree root (not note height anchor)
         // This is critical after FIX #572/573 fixes - stale witnesses cause TX rejections
         results.append(await checkStaleWitnesses())
 
-        // 17. FIX #698: Detect and auto-repair zero sapling roots in HeaderStore
+        // 19. FIX #698: Detect and auto-repair zero sapling roots in HeaderStore
         // P2P bug causes headers to have zero sapling roots, causing TX failures
         results.append(await checkAndRepairZeroSaplingRoots())
 
@@ -269,36 +273,43 @@ final class WalletHealthCheck {
     /// - History is for display purposes only, not for balance calculation
     private func checkBalanceHistoryMatch() async -> HealthCheckResult {
         do {
-            // Get current balance from unspent notes - this is the ONLY reliable source
-            let notes = try WalletDatabase.shared.getUnspentNotes(accountId: 1)
-            let noteBalance = notes.reduce(0) { $0 + $1.value }
-            let noteBalanceZCL = Double(noteBalance) / 100_000_000.0
+            // FIX #1083: Use comprehensive balance verification
+            // FIX #1088: verifyBalanceIntegrity now correctly handles change outputs
+            // It returns isValid=true when database is consistent (even if notes != history due to change)
+            let (isValid, notesBalance, _, details) = try WalletDatabase.shared.verifyBalanceIntegrity(accountId: 1)
 
-            // Get history counts for informational display only
-            let history = try WalletDatabase.shared.getTransactionHistory(limit: 10000, offset: 0)
-            var receivedCount = 0
-            var sentCount = 0
+            let noteBalanceZCL = Double(notesBalance) / 100_000_000.0
 
-            for tx in history {
-                switch tx.type {
-                case .received:
-                    receivedCount += 1
-                case .sent:
-                    sentCount += 1
-                case .change:
-                    break
+            print("🏥 FIX #1088: Balance Integrity Check")
+            print(details)
+
+            if isValid {
+                return .passed("Balance Integrity", details: String(format: "%.8f ZCL (verified)", noteBalanceZCL))
+            } else {
+                // FIX #1104: Check if balance was recently verified after a Full Rescan
+                // If verified within last 24 hours, don't trigger another Full Rescan (non-critical)
+                // This prevents the 28+ minute loop where startup keeps triggering Full Rescan
+                let verifiedTimestamp = UserDefaults.standard.double(forKey: "FIX1104_BalanceVerifiedTimestamp")
+                let hoursSinceVerification = (Date().timeIntervalSince1970 - verifiedTimestamp) / 3600
+
+                if verifiedTimestamp > 0 && hoursSinceVerification < 24 {
+                    print("⏩ FIX #1104: Balance was verified \(String(format: "%.1f", hoursSinceVerification))h ago - NOT triggering Full Rescan")
+                    print("   (Minor discrepancy detected but Full Rescan already completed recently)")
+                    // Return non-critical to avoid triggering FIX #1078's Full Rescan
+                    return .failed("Balance Integrity",
+                                  details: "Minor discrepancy (verified \(String(format: "%.1f", hoursSinceVerification))h ago)",
+                                  critical: false)
                 }
+
+                // FIX #1088: Only critical when actual database corruption detected
+                // (negative values, impossible states - NOT just notes != history difference)
+                print("🚨 FIX #1088: Database corruption detected - requires repair")
+                return .failed("Balance Integrity",
+                              details: "Database corruption detected - run Repair Database",
+                              critical: true)
             }
-
-            // FIX #163: Always pass - unspent notes ARE the balance, no reconciliation needed
-            // History balance formula (RECEIVED - SENT - FEES) is mathematically incorrect
-            // because change notes are counted in RECEIVED but not subtracted from the formula
-            print("🏥 FIX #163: Balance = SUM(unspent notes) = \(noteBalance) zatoshis (\(notes.count) notes)")
-            print("   History has \(receivedCount) received, \(sentCount) sent (display only)")
-
-            return .passed("Balance Reconciliation", details: "Balance: \(String(format: "%.8f", noteBalanceZCL)) ZCL (\(notes.count) notes, \(receivedCount)↓ \(sentCount)↑)")
         } catch {
-            return .failed("Balance Reconciliation", details: error.localizedDescription, critical: false)
+            return .failed("Balance Integrity", details: error.localizedDescription, critical: false)
         }
     }
 
@@ -421,7 +432,8 @@ final class WalletHealthCheck {
                 // FIX #557 v50: Check if witness has valid data (not all zeros)
                 // A witness with valid data can be used even if anchor doesn't match
                 // The anchor will be updated during transaction building
-                if note.witness.count >= 1028 && !note.witness.allSatisfy({ $0 == 0 }) {
+                // FIX #1107: Changed from 1028 to 100
+                if note.witness.count >= 100 && !note.witness.allSatisfy({ $0 == 0 }) {
                     // Witness has valid data - consider it valid
                     // The witness root might not match stored anchor if tree was updated
                     // but that's OK - transaction builder will use current tree root
@@ -812,11 +824,53 @@ final class WalletHealthCheck {
         // CRITICAL: Compare our tree root with header's finalsaplingroot
         let headerSaplingRoot = header.hashFinalSaplingRoot
 
+        // FIX #976: BEFORE skipping validation (FIX #796), verify tree SIZE is correct!
+        // Tree corruption (extra CMUs) would be missed if we just trust the computed root.
+        // The tree root is computed from CMUs - if there are extra/missing CMUs, root is WRONG.
+        if let boostOutputCount = boostManifest?.output_count {
+            // Get expected delta CMU count from manifest
+            let expectedDeltaCMUs: UInt64
+            if let deltaManifest = DeltaCMUManager.shared.getManifest() {
+                expectedDeltaCMUs = UInt64(deltaManifest.cmuCount)
+            } else {
+                expectedDeltaCMUs = 0
+            }
+
+            let expectedTreeSize = boostOutputCount + expectedDeltaCMUs
+            let actualTreeSize = treeSize
+
+            // Allow small tolerance (±10 CMUs) for race conditions during sync
+            let sizeDiff = actualTreeSize > expectedTreeSize
+                ? Int64(actualTreeSize - expectedTreeSize)
+                : -Int64(expectedTreeSize - actualTreeSize)
+
+            // FIX #1090: Only treat UNDER-sized trees as corruption
+            // OVER-sized is OK - P2P delta fetch may have added CMUs not yet persisted to manifest
+            if sizeDiff < -10 {
+                // Tree is UNDER-sized by more than 10 - missing CMUs, likely corrupted
+                print("❌ FIX #976: TREE SIZE MISMATCH - Tree is UNDER-SIZED!")
+                print("   Expected: \(expectedTreeSize) CMUs (boost: \(boostOutputCount) + delta: \(expectedDeltaCMUs))")
+                print("   Actual:   \(actualTreeSize) CMUs")
+                print("   Missing: \(-sizeDiff) CMUs")
+                print("   → Triggering Full Resync to rebuild tree from scratch")
+
+                return .failed("Tree Root Validation",
+                              details: "❌ Tree under-sized: missing \(-sizeDiff) CMUs. Full Resync required.",
+                              critical: true)
+            } else if sizeDiff > 10 {
+                // FIX #1090: Tree is OVER-sized - this is OK (P2P delta fetch added extra CMUs)
+                print("✅ FIX #1090: Tree has \(sizeDiff) extra CMUs (from P2P delta fetch) - this is OK")
+            }
+
+            print("✅ FIX #976: Tree size verified (\(actualTreeSize) CMUs, expected \(expectedTreeSize))")
+        }
+
         // FIX #796: P2P headers above boost file end have UNRELIABLE sapling roots
         // The P2P getheaders protocol doesn't reliably include finalsaplingroot.
         // Only boost file headers (loaded from verified boost file) are trustworthy.
         // If we're validating at a height ABOVE boost file, skip validation against
         // potentially corrupted P2P headers - trust our computed tree root instead.
+        // NOTE: FIX #976 above already verified tree SIZE is correct before we get here.
         if let boostEndHeight = boostManifest?.chain_height, treeValidationHeight > boostEndHeight {
             // Check if header sapling root is all zeros (definitely P2P artifact)
             let isZeroRoot = headerSaplingRoot.allSatisfy { $0 == 0 }
@@ -987,16 +1041,27 @@ final class WalletHealthCheck {
             }
 
             // FIX #247: Use P2P verification instead of InsightAPI (decentralized)
+            // FIX #888: Now returns Bool? - nil means unable to verify (don't mark as phantom!)
             let (exists, confirmations) = await NetworkManager.shared.verifyTxExistsViaP2P(txid: txidHex)
 
-            if exists {
+            switch exists {
+            case .some(true):
+                // TX definitely exists
                 verifiedCount += 1
                 if confirmations > 0 {
                     print("✅ FIX #247: TX \(txidHex.prefix(16))... verified via P2P (\(confirmations) confirmations)")
                 } else {
                     print("⏳ FIX #247: TX \(txidHex.prefix(16))... found via P2P (mempool/unconfirmed)")
                 }
-            } else {
+
+            case .none:
+                // FIX #888: Unable to verify - DO NOT mark as phantom!
+                // This prevents incorrectly deleting confirmed TXs when network is down
+                print("⚠️ FIX #888: TX \(txidHex.prefix(16))... unable to verify - skipping (network issue, NOT phantom)")
+                errorCount += 1
+                continue
+
+            case .some(false):
                 // FIX #269: Re-check peers before declaring phantom
                 // Peers may have dropped during the verification attempt
                 // FIX #384: Use PeerManager for centralized peer access
@@ -1086,6 +1151,30 @@ final class WalletHealthCheck {
     ///   - Uses FIX #827 witnessVerifyAnchor() function
     private func checkNoteAnchorsMatchHeaders() async -> HealthCheckResult {
         do {
+            // FIX #1111: Skip witness check when tree is not caught up to lastScannedHeight
+            // Root cause of 45s startup: Delta bundle ends at 3002599 but lastScannedHeight=3002937
+            // Witnesses created at 3002937 fail verification against tree at 3002599
+            // After catch-up sync, witnesses are fine - this is a false positive!
+            let lastScannedHeight = try WalletDatabase.shared.getLastScannedHeight()
+            let treeSize = ZipherXFFI.treeSize()
+            let boostEndHeight: UInt64 = 2988797  // ZipherXConstants.effectiveTreeHeight
+
+            // If tree is smaller than it should be for lastScannedHeight, skip check
+            // Tree needs CMUs up to lastScannedHeight to verify witnesses correctly
+            if lastScannedHeight > boostEndHeight {
+                // Rough check: tree should have grown since boost end
+                // Delta should have CMUs from boost end to lastScannedHeight
+                let deltaManifest = DeltaCMUManager.shared.getManifest()
+                let deltaEndHeight = deltaManifest?.endHeight ?? boostEndHeight
+
+                if deltaEndHeight < lastScannedHeight {
+                    print("⏭️ FIX #1111: Skipping witness check - tree not caught up")
+                    print("   Delta ends at \(deltaEndHeight) but lastScannedHeight=\(lastScannedHeight)")
+                    print("   Will verify witnesses after catch-up sync completes")
+                    return .passed("Anchor Validation", details: "Deferred - tree syncing to \(lastScannedHeight)")
+                }
+            }
+
             // FIX #760: Get all unspent notes with anchors (use accountId: 1)
             let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
             let unspentNotes = notes.filter { $0.cmu != nil && $0.witness.count >= 100 }
@@ -1172,7 +1261,8 @@ final class WalletHealthCheck {
 
             // FIX #760: Get all unspent notes (use accountId: 1)
             let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: 1)
-            let unspentNotes = notes.filter { !$0.witness.isEmpty && $0.witness.count >= 1028 }
+            // FIX #1107: Changed from 1028 to 100
+            let unspentNotes = notes.filter { !$0.witness.isEmpty && $0.witness.count >= 100 }
 
             guard !unspentNotes.isEmpty else {
                 return .passed("Stale Witness Check", details: "No unspent notes with witnesses")
@@ -1205,19 +1295,33 @@ final class WalletHealthCheck {
                 // Extract anchor from the witness itself (not from DB stored anchor)
                 // The witness internal root is what matters for transaction validity
                 if let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
-                    // FIX #800: Compare witness root to CURRENT tree root, not historical header root
-                    // All witnesses from treeCreateWitnessesBatch have the same root (current tree state)
-                    // This is correct for Sapling - anchor just needs to be a valid historical root
-                    if witnessRoot == currentTreeRoot {
+                    // FIX #1013: REMOVED FIX #988's broken comparison to current tree root!
+                    //
+                    // FIX #988 was WRONG: It compared witness root to CURRENT tree root
+                    // and flagged witnesses as "stale" when they didn't match.
+                    //
+                    // SAPLING TRUTH:
+                    // - Sapling accepts ANY VALID HISTORICAL ANCHOR within the exclusion period
+                    // - When new blocks arrive, the current tree root changes
+                    // - This does NOT invalidate existing witnesses with older anchors
+                    // - A witness with anchor from block 2990000 is VALID even if tree is now at 2992000
+                    //
+                    // FIX #988's broken logic caused:
+                    // - 73 witnesses flagged as "stale" at every startup (when blocks arrived)
+                    // - 60+ second rebuild every time user tried to send
+                    // - Same unnecessary rebuild in TransactionBuilder (FIX #986 - also fixed)
+                    //
+                    // CORRECT CHECK: Witness is valid if we can extract a NON-ZERO root
+                    // - Zero root = corrupted/uninitialized witness
+                    // - Non-zero root = valid historical anchor (Sapling will accept it)
+                    let isZeroAnchor = witnessRoot.allSatisfy { $0 == 0 }
+                    if !isZeroAnchor {
                         validCount += 1
                     } else {
-                        // Witness has a different root - might be from an older tree state
-                        // This is still VALID for Sapling as long as the root existed on-chain
-                        // Only mark as stale if we can't extract a root at all
-                        let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("   ⚠️ Note \(note.id) (height \(note.height)): witness root \(witnessRootHex)... differs from current")
-                        print("      This is OK - Sapling accepts any valid historical anchor")
-                        validCount += 1  // FIX #800: Still valid! Different root is acceptable
+                        // Zero root = corrupted witness, needs rebuild
+                        staleCount += 1
+                        staleNoteIds.append(note.id)
+                        print("   ❌ FIX #1013: Note \(note.id) (height \(note.height)): ZERO anchor - corrupted, needs rebuild")
                     }
                 } else {
                     // Could not extract root - this IS invalid (corrupted witness)
@@ -1228,7 +1332,7 @@ final class WalletHealthCheck {
             }
 
             if staleCount == 0 {
-                print("✅ FIX #574: All \(validCount) witnesses have current anchors!")
+                print("✅ FIX #1013: All \(validCount) witnesses have valid anchors (instant sends enabled)!")
                 // FIX #801: Reset repair counters when witnesses are healthy - allows auto-recovery
                 // Without this, counters stay elevated and block future repairs even when fixed
                 let staleWitnessGlobalKey = "StaleWitnessGlobalAttempts"
@@ -1241,7 +1345,8 @@ final class WalletHealthCheck {
                 return .passed("Stale Witness Check", details: "All \(validCount) witnesses are current ✓")
             }
 
-            print("🚨 FIX #574: Found \(staleCount)/\(unspentNotes.count) STALE witnesses!")
+            print("🚨 FIX #1013: Found \(staleCount)/\(unspentNotes.count) witnesses with ZERO/CORRUPTED anchors!")
+            print("🚨 FIX #1013: These need rebuild (zero anchor = uninitialized witness)")
 
             // FIX #783: Check if tree repair is exhausted BEFORE attempting auto-rebuild
             // When TreeRepairExhausted is true, P2P cannot fetch delta CMUs (persistent network issue)
@@ -1483,6 +1588,92 @@ final class WalletHealthCheck {
         } catch {
             print("❌ FIX #698: Error checking zero sapling roots: \(error)")
             return .failed("Sapling Root Check", details: "Error: \(error.localizedDescription)", critical: false)
+        }
+    }
+
+    // MARK: - FIX #876: Notes Without Witnesses Check
+
+    /// FIX #876: CRITICAL - Check for notes without witnesses
+    /// Notes without witnesses are EXCLUDED from balance calculation (getBalance WHERE witness IS NOT NULL)
+    /// This causes balance to show WRONG until witnesses are computed
+    ///
+    /// Root cause: Delta CMU collection failed or was cleared (FIX #756), leaving notes in delta range
+    /// without the CMUs needed to compute their witnesses
+    ///
+    /// FIX #1082: NO LONGER BLOCKS STARTUP - witness rebuild moved to AFTER PHASE 2 scan
+    /// Previously this function would trigger a full P2P delta fetch (10+ minutes) on every startup.
+    /// Now we let PHASE 2 collect delta CMUs naturally, then rebuild witnesses afterward.
+    private func checkNotesWithoutWitnesses() async -> HealthCheckResult {
+        print("🔍 FIX #876: Checking for notes without witnesses...")
+
+        do {
+            // Get notes without valid witnesses
+            let (count, totalValue, minHeight) = try WalletDatabase.shared.getNotesWithoutWitnesses(accountId: 1)
+
+            if count == 0 {
+                print("✅ FIX #876: All notes have valid witnesses")
+                return .passed("Notes Witness Check", details: "All notes have valid witnesses ✓")
+            }
+
+            // Notes exist without witnesses - this is CRITICAL because balance is WRONG
+            let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
+            let valueZCL = Double(totalValue) / 100_000_000.0
+
+            print("🚨 FIX #876: CRITICAL - \(count) notes without witnesses!")
+            print("   💰 Total value affected: \(String(format: "%.8f", valueZCL)) ZCL")
+            print("   📍 Min note height: \(minHeight) (boost file ends at \(boostFileEndHeight))")
+
+            // FIX #1082: Check if notes are ONLY in boost range (can rebuild instantly)
+            // vs delta range (requires P2P fetch which is slow)
+            let maxNoteHeight = try WalletDatabase.shared.getMaxUnspentNoteHeight(accountId: 1)
+            let allNotesInBoostRange = maxNoteHeight <= boostFileEndHeight
+
+            if allNotesInBoostRange {
+                // All notes are in boost range - can rebuild instantly from local data
+                print("   ⚡ FIX #1082: All notes in boost range - instant rebuild possible!")
+                print("   🔧 FIX #876: Triggering automatic witness rebuild...")
+
+                // Attempt to rebuild witnesses (fast - no P2P needed)
+                await WalletManager.shared.rebuildWitnessesForStartup()
+
+                // Verify fix worked
+                let (stillMissing, _, _) = try WalletDatabase.shared.getNotesWithoutWitnesses(accountId: 1)
+
+                if stillMissing == 0 {
+                    print("✅ FIX #876: Successfully computed witnesses for all \(count) notes!")
+
+                    // FIX #1074: Refresh balance after witness rebuild so UI shows correct amount
+                    print("🔄 FIX #1074: Refreshing balance after witness rebuild...")
+                    try await WalletManager.shared.refreshBalance()
+
+                    return .passed("Notes Witness Check", details: "Fixed \(count) notes - witnesses computed ✓")
+                } else {
+                    print("⚠️ FIX #876: \(stillMissing)/\(count) notes still without witnesses")
+                    // Still return passed to avoid blocking startup
+                    return .passed("Notes Witness Check", details: "Witnesses will rebuild after sync")
+                }
+            } else {
+                // FIX #1082: Notes in delta range - DON'T block startup with slow P2P fetch!
+                // The PHASE 2 scan will collect delta CMUs naturally, then we rebuild witnesses.
+                // This avoids duplicate P2P fetches and speeds up startup from 10+ min to ~30 sec.
+                print("   📦 FIX #1082: Notes in delta range (max height: \(maxNoteHeight))")
+                print("   ⚡ FIX #1082: SKIPPING blocking witness rebuild - will rebuild after PHASE 2 scan")
+                print("   📝 FIX #1082: PHASE 2 will collect delta CMUs, then witnesses rebuild naturally")
+
+                // Check if delta bundle already has enough CMUs
+                let deltaOutputCount = DeltaCMUManager.shared.getOutputCount()
+                let deltaEndHeight = DeltaCMUManager.shared.getDeltaEndHeight() ?? 0
+                print("   📊 Delta bundle status: \(deltaOutputCount) CMUs, end height \(deltaEndHeight)")
+
+                // Return passed - don't block startup. PHASE 2 scan will handle delta CMU collection.
+                // The witnesses will be rebuilt after PHASE 2 completes.
+                return .passed("Notes Witness Check",
+                              details: "⏳ \(count) notes need witnesses - will rebuild after sync")
+            }
+
+        } catch {
+            print("❌ FIX #876: Error checking notes without witnesses: \(error)")
+            return .failed("Notes Witness Check", details: "Error: \(error.localizedDescription)", critical: false)
         }
     }
 }

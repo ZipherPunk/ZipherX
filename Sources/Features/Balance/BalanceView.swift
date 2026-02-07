@@ -304,13 +304,30 @@ struct BalanceView: View {
     }
 
     private func onPendingBalanceChanged(newPendingBalance: UInt64) {
-        // When pendingBalance drops to 0, it means our notes got confirmed (1+ confirmations)
-        // SAFETY: Clear pending states if stale (tx was mined but tracking wasn't cleared)
+        // FIX #955: Do NOT clear pending tracking when pendingBalance == 0
+        // pendingBalance == 0 is NORMAL right after sending (before TX is mined)
+        // The clearing should happen via:
+        // 1. confirmOutgoingTx() when TX is confirmed (NetworkManager)
+        // 2. onBalanceChanged() when change output is detected (BalanceView)
+        //
+        // OLD BUG: Cleared mempoolOutgoing/balanceBeforeLastSend when pendingBalance == 0
+        // This broke effectiveDisplayBalance which relies on these values to show reduced balance
+        //
+        // SAFETY NET: Only clear if pending tracking has been stuck for > 5 minutes
+        // This handles edge cases where confirmation wasn't detected
         if newPendingBalance == 0 && (networkManager.pendingBroadcastAmount > 0 || networkManager.mempoolOutgoing > 0) {
-            print("💰 pendingBalance=0 but pending tracking active - clearing stale pending state")
-            networkManager.clearPendingBroadcast()
-            networkManager.clearAllPendingOutgoing()
-            walletManager.clearBalanceBeforeLastSend()
+            if let lastSend = walletManager.lastSendTimestamp {
+                let timeSinceSend = Date().timeIntervalSince(lastSend)
+                if timeSinceSend > 300.0 {  // 5 minutes
+                    print("💰 FIX #955: pendingBalance=0 and >5min since send - clearing stale pending state")
+                    networkManager.clearPendingBroadcast()
+                    networkManager.clearAllPendingOutgoing()
+                    walletManager.clearBalanceBeforeLastSend()
+                } else {
+                    // Normal case: TX sent recently, waiting for confirmation - do NOT clear
+                    print("💰 FIX #955: pendingBalance=0 but sent \(Int(timeSinceSend))s ago - keeping pending state")
+                }
+            }
         }
     }
 
@@ -442,18 +459,52 @@ struct BalanceView: View {
                     .font(theme.captionFont)
                     .foregroundColor(theme.textSecondary)
 
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(formatBalance(effectiveDisplayBalance))
-                        .font(.system(size: 24, weight: .bold, design: theme.hasRetroStyling ? .monospaced : .default))
-                        .foregroundColor(theme.textPrimary)
+                // FIX #1098: Show "Balance issue" if integrity check failed
+                // Debug: Log the flag value when view renders
+                // Also check WalletManager.shared directly in case @EnvironmentObject has stale reference
+                let _ = {
+                    let envFlag = walletManager.balanceIntegrityIssue
+                    let sharedFlag = WalletManager.shared.balanceIntegrityIssue
+                    print("🔍 FIX #1098 BalanceView RENDER:")
+                    print("   @EnvironmentObject flag = \(envFlag)")
+                    print("   WalletManager.shared flag = \(sharedFlag)")
+                    if envFlag != sharedFlag {
+                        print("   ⚠️ MISMATCH! Environment object has stale reference!")
+                    }
+                }()
+                if walletManager.balanceIntegrityIssue {
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.red)
+                            Text("Balance Issue")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundColor(.red)
+                        }
+                        if let message = walletManager.balanceIntegrityMessage {
+                            Text(message)
+                                .font(.system(size: 12))
+                                .foregroundColor(.red.opacity(0.8))
+                                .multilineTextAlignment(.center)
+                        }
+                        Text("Go to Settings → Repair Database")
+                            .font(.system(size: 11))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(formatBalance(effectiveDisplayBalance))
+                            .font(.system(size: 24, weight: .bold, design: theme.hasRetroStyling ? .monospaced : .default))
+                            .foregroundColor(theme.textPrimary)
 
-                    // FIX #266: Add Zclassic version next to ZCL
-                    Text("ZCL")
-                        .font(theme.bodyFont)
-                        .foregroundColor(theme.textSecondary)
-                    Text("v2.1.2")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(theme.textSecondary.opacity(0.6))
+                        // FIX #266: Add Zclassic version next to ZCL
+                        Text("ZCL")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                        Text("v2.1.2")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(theme.textSecondary.opacity(0.6))
+                    }
                 }
 
                 // Debug: Always log the balance card state
@@ -636,9 +687,9 @@ struct BalanceView: View {
                     Spacer()
                 }
                 .padding(8)
-                .onAppear { print("📜 TXHIST VIEW: Showing loading state") }
+                // FIX #961: Removed debug logging
             } else if transactions.isEmpty {
-                let _ = print("📜 TXHIST VIEW: Empty state - transactions.count=\(transactions.count), isLoadingHistory=\(isLoadingHistory)")
+                // FIX #961: Removed debug logging
                 HStack {
                     Image(systemName: "doc.text")
                         .font(.system(size: 12))
@@ -657,16 +708,11 @@ struct BalanceView: View {
                 let visibleTransactions = transactions.filter { tx in
                     // Always filter out change type
                     if tx.type == .change { return false }
-
                     // Filter out ALL pending transactions - only show confirmed
-                    if tx.isPending {
-                        print("📜 Hiding pending tx from history: \(tx.txidString.prefix(12))... type=\(tx.type)")
-                        return false
-                    }
-
+                    if tx.isPending { return false }
                     return true
                 }
-                let _ = print("📜 TXHIST VIEW: Showing \(visibleTransactions.count) of \(transactions.count) transactions (hidden: change + all pending)")
+                // FIX #961: Removed per-render debug logging
                 // Show up to 5 recent transactions (excluding change)
                 VStack(spacing: 0) {
                     ForEach(visibleTransactions.prefix(5), id: \.uniqueId) { tx in
@@ -878,7 +924,9 @@ struct BalanceView: View {
                 }
 
                 // Now fetch the history
-                let items = try WalletDatabase.shared.getTransactionHistory(limit: 10)
+                // FIX #958: Increased from 10 to 20 to show more transaction types
+                // With 10 limit, if user sends 10+ times, only "sent" shows (no received visible)
+                let items = try WalletDatabase.shared.getTransactionHistory(limit: 20)
                 print("📜 TXHIST: getTransactionHistory returned \(items.count) items")
 
                 // Deduplicate by type+value+height (same transaction shouldn't appear twice)
