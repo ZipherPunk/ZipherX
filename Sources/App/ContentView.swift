@@ -640,21 +640,30 @@ struct ContentView: View {
                                 // FIX #557 v9: Rebuild all stale witnesses BEFORE showing UI!
                                 // This ensures when the balance is shown, all witnesses are current
                                 // Same as FAST START FIX #557 v8, but for INSTANT START path
-                                print("🔄 FIX #557 v9: Rebuilding stale witnesses before showing UI (INSTANT START)...")
-                                await MainActor.run {
-                                    walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
+                                //
+                                // FIX #1131: Skip if witnesses were ALREADY rebuilt during health checks (FIX #550/828)
+                                // This prevents duplicate 40+ second witness rebuilds
+                                if WalletHealthCheck.shared.witnessesRebuiltThisSession {
+                                    print("⏩ FIX #1131: Skipping FIX #557 v9 - witnesses already rebuilt by FIX #550/828 this session")
+                                } else if WalletHealthCheck.shared.hasValidVerifiedState() {
+                                    print("⏩ FIX #1131: Skipping FIX #557 v9 - verified state is valid (FIX #1126)")
+                                } else {
+                                    print("🔄 FIX #557 v9: Rebuilding stale witnesses before showing UI (INSTANT START)...")
+                                    await MainActor.run {
+                                        walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
+                                    }
+
+                                    // FIX #563 v31: DISABLED tree corruption check before witness rebuild
+                                    // The tree rebuild was losing PHASE 2 delta CMUs and causing crashes
+                                    // If tree is corrupted, user can run "Settings → Repair Database" manually
+                                    print("🔍 FIX #563 v31: Skipping tree corruption check (causes crashes during witness rebuild)")
+
+                                    // FIX #881: Time witness rebuild
+                                    let witnessRebuildStart = CFAbsoluteTimeGetCurrent()
+                                    await walletManager.rebuildWitnessesForStartup()
+                                    logPhase("Witness rebuild", since: witnessRebuildStart)
+                                    print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
                                 }
-
-                                // FIX #563 v31: DISABLED tree corruption check before witness rebuild
-                                // The tree rebuild was losing PHASE 2 delta CMUs and causing crashes
-                                // If tree is corrupted, user can run "Settings → Repair Database" manually
-                                print("🔍 FIX #563 v31: Skipping tree corruption check (causes crashes during witness rebuild)")
-
-                                // FIX #881: Time witness rebuild
-                                let witnessRebuildStart = CFAbsoluteTimeGetCurrent()
-                                await walletManager.rebuildWitnessesForStartup()
-                                logPhase("Witness rebuild", since: witnessRebuildStart)
-                                print("✅ FIX #557 v9: Witnesses synced - balance is now accurate!")
 
                                 // FIX #1090: CRITICAL - Recompute nullifiers with correct positions + verify
                                 // This MUST run after witnesses are rebuilt (they contain the correct positions)

@@ -7085,6 +7085,11 @@ final class WalletManager: ObservableObject {
             }
 
             print("✅ FIX #828: Rebuilt \(fixedCount)/\(unspentNotes.count) witnesses with correct anchors")
+
+            // FIX #1131: Mark that witnesses were rebuilt this session
+            // This prevents FIX #557 from doing a SECOND redundant rebuild
+            WalletHealthCheck.shared.witnessesRebuiltThisSession = true
+
             return fixedCount
 
         } catch {

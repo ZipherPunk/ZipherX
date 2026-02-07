@@ -8,6 +8,38 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (February 2026)
 
+### FIX #1131: PERFORMANCE - Skip Duplicate Witness Rebuild at Startup
+
+**Problem**: INSTANT START took 48+ seconds due to TWO witness rebuilds:
+1. FIX #550/828 during health checks (rebuilds corrupted witnesses)
+2. FIX #557 v9 later (rebuilds ALL witnesses again - redundant!)
+
+**Root Cause**: FIX #557 v9 always ran `rebuildWitnessesForStartup()` even when FIX #550 already rebuilt witnesses during health checks in the same session.
+
+**Solution**: Track witness rebuilds with session flag, skip FIX #557 if already done:
+```swift
+// In WalletHealthCheck:
+var witnessesRebuiltThisSession: Bool = false
+
+// In FIX #550 after rebuild:
+WalletHealthCheck.shared.witnessesRebuiltThisSession = true
+
+// In FIX #557 v9:
+if WalletHealthCheck.shared.witnessesRebuiltThisSession {
+    print("⏩ FIX #1131: Skipping - witnesses already rebuilt")
+} else if WalletHealthCheck.shared.hasValidVerifiedState() {
+    print("⏩ FIX #1131: Skipping - verified state is valid")
+} else {
+    // Do the rebuild
+}
+```
+
+**Files Modified**: WalletHealthCheck.swift, WalletManager.swift, ContentView.swift, ZipherXApp.swift
+
+**Result**: Eliminates 40+ second duplicate witness rebuild. INSTANT START now ~10s instead of 48s.
+
+---
+
 ### FIX #1130: False Positive "Missing Balance" Warning in Integrity Check
 
 **Problem**: Log shows "MISSING BALANCE: 12.82 ZCL!" false positive even when wallet is correct

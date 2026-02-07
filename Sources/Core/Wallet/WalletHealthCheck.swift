@@ -25,6 +25,17 @@ final class WalletHealthCheck {
     static let shared = WalletHealthCheck()
     private init() {}
 
+    // MARK: - FIX #1131: Track witness rebuilds to avoid duplicate work
+
+    /// Set to true when witnesses are rebuilt during health checks (FIX #550/828)
+    /// Used by FIX #557 to skip redundant witness rebuild
+    var witnessesRebuiltThisSession: Bool = false
+
+    /// Reset at app launch
+    func resetSessionFlags() {
+        witnessesRebuiltThisSession = false
+    }
+
     // MARK: - FIX #1126: Verified State System
 
     /// Keys for verified state persistence

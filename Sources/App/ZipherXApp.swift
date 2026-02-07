@@ -32,6 +32,9 @@ struct ZipherXApp: App {
         NotificationManager.shared.requestPermission()
         print("🚀 App init at \(Date()) - startup time was \(appStartupTime)")
 
+        // FIX #1131: Reset session flags at app launch
+        WalletHealthCheck.shared.resetSessionFlags()
+
         // FIX #776: Clear incorrectly set boost headers corruption flag
         // The boost file is correct - this flag was set in error
         if UserDefaults.standard.bool(forKey: "HeaderStore.boostHeadersCorrupted") {
