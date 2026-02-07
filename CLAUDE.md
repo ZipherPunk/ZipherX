@@ -134,6 +134,9 @@ python3 scripts/team_orchestrator.py --verbose bugfix "balance incorrect"
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
+- FIX #1130: False Positive "Missing Balance" Warning in Integrity Check
+  - History vs notes comparison now informational only (different accounting methods)
+  - Files: WalletDatabase.swift
 - FIX #1129: PERFORMANCE - Skip P2P Validation When Verified State Valid
   - Eliminates expensive P2P operations when local state verified within 24 hours
   - Files: WalletManager.swift
