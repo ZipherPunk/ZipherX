@@ -3595,6 +3595,18 @@ final class WalletManager: ObservableObject {
             // This prevents health checks from detecting "stale" witnesses and triggering slow rebuilds
             var treeHasNewCMUs = false
             if notesNeedingRebuild.isEmpty && instantReadyPercent >= 80 {
+                // FIX #1133: If witnesses were already rebuilt this session, SKIP delta sync entirely!
+                // Sapling accepts ANY historical anchor - witnesses from 5 minutes ago are still valid.
+                // This prevents the ~1 second delta sync from running on every send attempt.
+                if WalletHealthCheck.shared.witnessesRebuiltThisSession {
+                    print("⚡ FIX #1133: SKIPPING delta sync - witnesses already updated THIS SESSION")
+                    print("   Sapling accepts historical anchors - current witnesses are valid!")
+                    await MainActor.run {
+                        lastWitnessRebuildTime = Date()
+                    }
+                    return  // INSTANT EXIT - witnesses were updated recently in this session!
+                }
+
                 // Check if any unspent note's witness root differs from current tree root
                 // This indicates new blocks arrived since witnesses were last updated
                 if let currentTreeRoot = ZipherXFFI.treeRoot(), !currentTreeRoot.isEmpty {

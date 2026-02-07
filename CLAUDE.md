@@ -134,6 +134,12 @@ python3 scripts/team_orchestrator.py --verbose bugfix "balance incorrect"
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
+- FIX #1133: PERFORMANCE - Skip Delta Sync on Pre-Build When Session Flag Set (INSTANT SENDS!)
+  - **Problem**: Every send attempt triggered ~1 second delta sync even after startup updated witnesses
+  - **Root Cause**: FIX #1132 detected "tree has grown" but didn't check if witnesses were already updated THIS SESSION
+  - **Sapling Truth**: Witnesses from 5 minutes ago with anchor X are STILL VALID even if tree grew to anchor Y
+  - **Solution**: Check `witnessesRebuiltThisSession` BEFORE triggering delta sync - skip if already done
+  - **Result**: After initial startup update, all subsequent sends are INSTANT (no delta sync)
 - FIX #1132: CRITICAL - Fast Witness Update Instead of Full Rebuild (INSTANT SENDS!)
   - **Problem**: 40+ second full rebuild whenever 1-2 new blocks arrive after Full Rescan
   - **Root Cause**: FIX #1076 skipped delta sync when witnesses were "valid", but never updated them with new blocks

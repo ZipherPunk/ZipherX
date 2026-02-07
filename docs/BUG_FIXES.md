@@ -45,6 +45,34 @@ if notesNeedingRebuild.isEmpty && instantReadyPercent >= 80 {
 
 ---
 
+### FIX #1133: PERFORMANCE - Skip Delta Sync on Pre-Build When Session Flag Set (INSTANT SENDS!)
+
+**Problem**: Even after witnesses were updated at startup (FIX #1132), every send attempt triggered another ~1 second delta sync. The pre-build witness check detected "tree has grown" and ran FIX #569 delta sync again.
+
+**Root Cause**: FIX #1132 correctly detected tree growth but didn't check if witnesses had ALREADY been updated in this session:
+```swift
+if witnessRoot != currentTreeRoot {
+    treeHasNewCMUs = true  // Triggers delta sync EVERY time tree grows!
+}
+```
+
+**Sapling Truth**: If witnesses were updated 5 minutes ago at tree root X, and tree has grown to root Y with 10 more CMUs, the transaction using anchor X is STILL VALID. Sapling accepts ANY historical anchor.
+
+**Solution**: Check `witnessesRebuiltThisSession` BEFORE triggering delta sync:
+```swift
+// FIX #1133: Skip if already updated this session
+if WalletHealthCheck.shared.witnessesRebuiltThisSession {
+    print("⚡ FIX #1133: SKIPPING delta sync - witnesses already updated THIS SESSION")
+    return  // INSTANT EXIT - witnesses are recent and valid!
+}
+```
+
+**Files Modified**: WalletManager.swift (preRebuildWitnessesForInstantPayment, FIX #1132 section)
+
+**Result**: After initial startup witness update, all subsequent sends are INSTANT (no delta sync). The session flag ensures we only update witnesses once per app session.
+
+---
+
 ### FIX #1131: PERFORMANCE - Skip Duplicate Witness Rebuild at Startup
 
 **Problem**: INSTANT START took 48+ seconds due to TWO witness rebuilds:
