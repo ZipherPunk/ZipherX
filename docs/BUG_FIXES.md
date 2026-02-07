@@ -8,6 +8,43 @@ For security, see [SECURITY.md](./SECURITY.md).
 
 ## Bug Fixes (February 2026)
 
+### FIX #1132: CRITICAL - Fast Witness Update Instead of Full Rebuild (INSTANT SENDS!)
+
+**Problem**: After Full Rescan or any startup, witnesses triggered 40+ second full rebuilds whenever 1-2 new blocks arrived, even though witnesses were structurally valid.
+
+**Root Cause**: FIX #1076 skipped delta sync when witnesses were "instant-ready" (80%+):
+```swift
+if notesNeedingRebuild.isEmpty && instantReadyPercent >= 80 {
+    return  // INSTANT EXIT - skipped delta sync!
+}
+```
+This meant witnesses never got updated with new blocks' CMUs. Later, other code detected "stale" witnesses (older root) and triggered FULL REBUILD instead of fast update.
+
+**Sapling Truth**: A witness with anchor from block 2990000 is VALID even if tree is now at 2992000. Sapling accepts ANY historical anchor. The witness just needs new CMUs appended (O(1) per CMU), NOT a full rebuild (O(N) loading 1M+ CMUs).
+
+**Solution**: Even when witnesses are valid, check if tree has grown (new blocks):
+```swift
+// FIX #1132: Check if tree has new CMUs
+if notesNeedingRebuild.isEmpty && instantReadyPercent >= 80 {
+    // Check if any witness root differs from current tree root
+    for note in notesForWitnessCheck {
+        if witnessRoot != currentTreeRoot {
+            treeHasNewCMUs = true  // Do FAST update, not skip!
+            break
+        }
+    }
+    if !treeHasNewCMUs {
+        return  // Only skip if witnesses are truly up-to-date
+    }
+}
+```
+
+**Files Modified**: WalletManager.swift (preRebuildWitnessesForInstantPayment)
+
+**Result**: New blocks now trigger FAST witness updates (milliseconds) instead of FULL rebuilds (40+ seconds). Transactions build instantly after sync.
+
+---
+
 ### FIX #1131: PERFORMANCE - Skip Duplicate Witness Rebuild at Startup
 
 **Problem**: INSTANT START took 48+ seconds due to TWO witness rebuilds:

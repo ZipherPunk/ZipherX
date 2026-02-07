@@ -3590,16 +3590,43 @@ final class WalletManager: ObservableObject {
             let totalNotes = notesForWitnessCheck.count
             let instantReadyPercent = totalNotes > 0 ? (alreadyCurrentCount * 100 / totalNotes) : 0
 
+            // FIX #1132: Even if witnesses are valid, check if tree has grown (new blocks arrived)
+            // If tree has new CMUs, we need to do a FAST UPDATE (not full rebuild)
+            // This prevents health checks from detecting "stale" witnesses and triggering slow rebuilds
+            var treeHasNewCMUs = false
             if notesNeedingRebuild.isEmpty && instantReadyPercent >= 80 {
-                print("⚡ FIX #1076: SKIPPING delta sync - \(alreadyCurrentCount)/\(totalNotes) witnesses instant-ready (\(instantReadyPercent)%)")
-                print("   This saves ~15 seconds of witness update time!")
-                await MainActor.run {
-                    lastWitnessRebuildTime = Date()  // Mark as rebuilt to use cooldown
+                // Check if any unspent note's witness root differs from current tree root
+                // This indicates new blocks arrived since witnesses were last updated
+                if let currentTreeRoot = ZipherXFFI.treeRoot(), !currentTreeRoot.isEmpty {
+                    for note in notesForWitnessCheck {
+                        if !note.witness.isEmpty, let witnessRoot = ZipherXFFI.witnessGetRoot(note.witness) {
+                            if witnessRoot != currentTreeRoot {
+                                treeHasNewCMUs = true
+                                let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                let treeRootHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                print("🔄 FIX #1132: Witness root \(witnessRootHex)... differs from tree root \(treeRootHex)...")
+                                print("   Tree has grown - will do FAST witness update (not full rebuild)")
+                                break
+                            }
+                        }
+                    }
                 }
-                return  // INSTANT EXIT - witnesses are already valid!
+
+                if !treeHasNewCMUs {
+                    print("⚡ FIX #1076: SKIPPING delta sync - \(alreadyCurrentCount)/\(totalNotes) witnesses instant-ready (\(instantReadyPercent)%)")
+                    print("   This saves ~15 seconds of witness update time!")
+                    await MainActor.run {
+                        lastWitnessRebuildTime = Date()  // Mark as rebuilt to use cooldown
+                    }
+                    return  // INSTANT EXIT - witnesses are already valid AND up-to-date!
+                }
             }
 
-            print("🔄 FIX #1076: Delta sync needed - only \(alreadyCurrentCount)/\(totalNotes) instant-ready (\(instantReadyPercent)%)")
+            if treeHasNewCMUs {
+                print("🔄 FIX #1132: FAST witness update needed - tree has new CMUs since last witness update")
+            } else {
+                print("🔄 FIX #1076: Delta sync needed - only \(alreadyCurrentCount)/\(totalNotes) instant-ready (\(instantReadyPercent)%)")
+            }
 
             // FIX #557 v32: Load boost file + sync delta CMUs to current chain tip
             // This ensures the global tree is at the current height before rebuilding witnesses
@@ -4458,6 +4485,11 @@ final class WalletManager: ObservableObject {
                 print("✅ FIX #569 v2: Step 3 complete - Updated \(updatedCount) witnesses with current tree state")
                 print("✅ FIX #569 v2: Updated \(anchorFixedCount) anchors to CURRENT tree root (chain height \(chainHeight))")
                 print("✅ FIX #569 v2: Witness update complete - ALL notes now have correct witnesses and anchors!")
+
+                // FIX #1132: Mark that witnesses were updated this session
+                // This prevents FIX #557 from doing a redundant rebuild after fast delta update
+                WalletHealthCheck.shared.witnessesRebuiltThisSession = true
+                print("✅ FIX #1132: Marked witnesses as updated (preventing redundant rebuild)")
             } else {
                 print("⚠️ FIX #586: STEP 3 extraction skipped (no delta CMUs appended)")
             }

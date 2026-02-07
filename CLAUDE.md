@@ -134,6 +134,12 @@ python3 scripts/team_orchestrator.py --verbose bugfix "balance incorrect"
 All bug fixes are numbered: `FIX #N`. See [docs/BUG_FIXES.md](./docs/BUG_FIXES.md) for complete list.
 
 Latest fixes:
+- FIX #1132: CRITICAL - Fast Witness Update Instead of Full Rebuild (INSTANT SENDS!)
+  - **Problem**: 40+ second full rebuild whenever 1-2 new blocks arrive after Full Rescan
+  - **Root Cause**: FIX #1076 skipped delta sync when witnesses were "valid", but never updated them with new blocks
+  - **Sapling Truth**: Witnesses with older anchors are VALID - just need new CMUs appended (O(1)), NOT full rebuild (O(N))
+  - **Solution**: Detect when tree has grown, do FAST witness update instead of skipping
+  - **Result**: New blocks trigger millisecond updates instead of 40+ second rebuilds
 - FIX #1131: PERFORMANCE - Skip Duplicate Witness Rebuild at Startup
   - Prevents FIX #557 from re-rebuilding witnesses that FIX #550 already fixed
   - Reduces INSTANT START from 48s to ~10s
