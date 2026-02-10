@@ -96,6 +96,38 @@ actor PeerMessageDispatcher {
         }
     }
 
+    /// FIX #1201: Wait for any of multiple response types with timeout and cleanup
+    /// When one command fires, removes the stale handler for the other commands
+    /// to prevent double-resume crashes. Returns nil on timeout.
+    func waitForAnyResponseWithTimeout(commands: [String], timeoutSeconds: Double) async -> (String, Data)? {
+        let result: (String, Data)? = await withReliableTimeout(seconds: timeoutSeconds) {
+            do {
+                return try await self.waitForAnyResponse(commands: commands)
+            } catch {
+                return nil as (String, Data)?
+            }
+        } onTimeout: {
+            return nil as (String, Data)?
+        }
+
+        // FIX #1201: Clean up stale handlers for commands that didn't fire
+        // When "notfound" fires, the "tx" handler still has the same (now-resumed) continuation.
+        // When timeout fires, ALL handlers are stale. Remove them to prevent double-resume.
+        if let fired = result {
+            // One command fired — remove handlers for the OTHER commands
+            for command in commands where command != fired.0 {
+                cancelWaitingHandler(command: command)
+            }
+        } else {
+            // Timeout — remove ALL handlers
+            for command in commands {
+                cancelWaitingHandler(command: command)
+            }
+        }
+
+        return result
+    }
+
     /// FIX #887: Cancel waiting handler for a specific command (for cleanup after timeout)
     func cancelWaitingHandler(command: String) {
         // Remove the handler without resuming (caller has already moved on)
@@ -117,6 +149,23 @@ actor PeerMessageDispatcher {
     func signalBroadcastTimeout(txid: String) {
         if let handler = broadcastHandlers.removeValue(forKey: "broadcast_\(txid)") {
             handler.resume(returning: nil)  // nil = no reject = success
+        }
+    }
+
+    /// FIX #1184: Wait for broadcast reject with timeout (routed through dispatcher)
+    /// Returns (command, payload) if reject received, nil if timeout (silence = success)
+    /// Uses GCD-based timeout for reliability (same pattern as waitForResponseWithTimeout)
+    func waitForBroadcastResultWithTimeout(txid: String, timeoutSeconds: Double) async -> (String, Data)? {
+        return await withReliableTimeout(seconds: timeoutSeconds) {
+            do {
+                return try await self.waitForBroadcastResult(txid: txid)
+            } catch {
+                return nil  // Connection error = treat as no reject
+            }
+        } onTimeout: {
+            // Timeout fired — signal no-reject (success) and clean up handler
+            self.signalBroadcastTimeout(txid: txid)
+            return nil
         }
     }
 
@@ -533,10 +582,14 @@ public final class Peer {
     /// Peers below this version are rejected - they don't support required features
     private static let minPeerProtocolVersion: Int32 = 170002
 
-    /// FIX #434: Maximum valid Zclassic protocol version
-    /// Zclassic uses 170010-170012 (Sapling + BIP155)
+    /// FIX #434 + FIX #1159: Valid Zclassic protocol versions
+    /// Zclassic uses:
+    ///   - 170010-170012 (Sapling + BIP155, older releases)
+    ///   - 170100-170199 (v2.x.x releases, e.g., 170110 = v2.1.2)
     /// Zcash uses 170018+ (NU upgrades) - these are WRONG CHAIN and must be rejected
     private static let maxZclassicProtocolVersion: Int32 = 170012
+    private static let zclassicV2MinVersion: Int32 = 170100
+    private static let zclassicV2MaxVersion: Int32 = 170199
     private let services: UInt64 = 1 // NODE_NETWORK
     private let userAgent = "/ZipherX:1.0.0/"
 
@@ -753,6 +806,11 @@ public final class Peer {
     /// This eliminates TCP stream race conditions that cause "INVALID MAGIC BYTES" errors
     private let messageDispatcher = PeerMessageDispatcher()
 
+    /// FIX #1184: Public accessor to check if dispatcher is active
+    var isDispatcherActive: Bool {
+        get async { await messageDispatcher.isActive }
+    }
+
     /// FIX #879: When true, operations use dispatcher instead of direct reads
     /// Set to true when block listener is running
     var useMessageDispatcher: Bool = false
@@ -770,7 +828,7 @@ public final class Peer {
         command: String,
         payload: Data,
         expectedResponse: String,
-        timeoutSeconds: Double = 30
+        timeoutSeconds: Double = 10  // FIX #1217: Reduced from 30s — single P2P responses arrive in <1s
     ) async throws -> (String, Data) {
         // Check if dispatcher is active (block listener running)
         let dispatcherActive = await messageDispatcher.isActive
@@ -795,30 +853,36 @@ public final class Peer {
                 throw NetworkError.timeout
             }
         } else {
-            // FIX #887: Fallback to direct reads (block listener not running)
-            print("📨 FIX #887: [\(host)] Dispatcher not active, using direct reads for '\(command)'")
-            return try await withExclusiveAccess {
-                try await self.sendMessage(command: command, payload: payload)
+            // FIX #1184: Do NOT use direct reads — receiveMessageWithTimeout(destroyConnectionOnTimeout: false)
+            // leaves orphaned NWConnection readers that desync TCP streams when block listeners restart.
+            // Try to activate dispatcher first. If still inactive, throw timeout to let caller retry.
+            print("📨 FIX #1184: [\(host)] Dispatcher not active for '\(command)' — attempting to start block listener...")
 
-                // Read response with retries (skip other message types)
-                var attempts = 0
-                while attempts < 10 {
-                    let (respCmd, respPayload) = try await self.receiveMessageWithTimeout(
-                        seconds: timeoutSeconds,
-                        destroyConnectionOnTimeout: false
-                    )
-                    if respCmd == expectedResponse {
-                        return (respCmd, respPayload)
+            // Try to start block listener to activate dispatcher
+            startBlockListener()
+
+            // Wait briefly for dispatcher activation (up to 2s)
+            for _ in 1...4 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                let nowActive = await messageDispatcher.isActive
+                if nowActive {
+                    print("📨 FIX #1184: [\(host)] Dispatcher activated — routing '\(command)' through it")
+                    try await sendMessage(command: command, payload: payload)
+                    if let response = await messageDispatcher.waitForResponseWithTimeout(
+                        command: expectedResponse,
+                        timeoutSeconds: timeoutSeconds
+                    ) {
+                        return response
+                    } else {
+                        await messageDispatcher.cancelWaitingHandler(command: expectedResponse)
+                        throw NetworkError.timeout
                     }
-                    // Handle reject
-                    if respCmd == "reject" {
-                        throw NetworkError.transactionRejected
-                    }
-                    print("⏭️ FIX #887: [\(self.host)] Skipping '\(respCmd)', waiting for '\(expectedResponse)'")
-                    attempts += 1
                 }
-                throw NetworkError.timeout
             }
+
+            // Dispatcher still not active after 2s — throw timeout (caller can retry with another peer)
+            print("⚠️ FIX #1184: [\(host)] Dispatcher failed to activate for '\(command)' — timeout")
+            throw NetworkError.timeout
         }
     }
 
@@ -1741,18 +1805,41 @@ public final class Peer {
     }
 
     /// FIX #184: Thread-safe disconnect to prevent double-free crash
+    /// FIX #1178: Null connection to trigger block listener identity check exit
+    /// FIX #1179: Do NOT cancel blockListenerTask — cancellation makes try? Task.sleep return
+    /// instantly via CancellationError, causing listeners to die within 4ms of starting.
+    /// The connection identity check (currentConn === startConnection) is sufficient.
     func disconnect() {
-        // FIX #509: Stop block listener in background task (async function)
-        // The listener will be cancelled and cleaned up, but we don't wait for it
+        // FIX #1179: Removed blockListenerTask?.cancel() — see comment above
+        // FIX #509: Request graceful stop via state machine
         Task { await stopBlockListener() }
 
         connectionLock.lock()
         let conn = connection
-        connection = nil
+        connection = nil  // FIX #1178: Block listener identity check will see this and exit
         connectionLock.unlock()
         // FIX #1039: Use safe cancel pattern to avoid NWConnection warnings
         safeCancelConnection(conn)
         isConnectedViaTor = false
+    }
+
+    /// FIX #1205: Track consecutive batch fetch failures for peer selection
+    /// Peers that repeatedly return 0 blocks are skipped to avoid 30s timeouts
+    private var _consecutiveBatchFailures: Int = 0
+    private let _batchFailLock = NSLock()
+    var consecutiveBatchFailures: Int {
+        _batchFailLock.lock()
+        defer { _batchFailLock.unlock() }
+        return _consecutiveBatchFailures
+    }
+    func recordBatchResult(blocksReceived: Int) {
+        _batchFailLock.lock()
+        if blocksReceived == 0 {
+            _consecutiveBatchFailures += 1
+        } else {
+            _consecutiveBatchFailures = 0
+        }
+        _batchFailLock.unlock()
     }
 
     /// Check if connection is still ready (not cancelled/failed)
@@ -1774,11 +1861,16 @@ public final class Peer {
         return peerVersion > 0 && isValidZclassicPeer
     }
 
-    /// FIX #434: Check if peer is a valid Zclassic node (not Zcash or other chain)
-    /// Zclassic uses protocol versions 170010-170012
+    /// FIX #434 + FIX #1159: Check if peer is a valid Zclassic node (not Zcash or other chain)
+    /// Zclassic uses protocol versions:
+    ///   - 170010-170012 (Sapling + BIP155, older releases)
+    ///   - 170100-170199 (v2.x.x releases, e.g., 170110 = v2.1.2)
     /// Zcash uses 170018+ (NU5 upgrades) - these return wrong Equihash params!
     var isValidZclassicPeer: Bool {
-        return peerVersion >= Peer.minPeerProtocolVersion && peerVersion <= Peer.maxZclassicProtocolVersion
+        // FIX #1159: Include Zclassic v2.x.x versions (170100-170199)
+        let isOldZclassic = peerVersion >= Peer.minPeerProtocolVersion && peerVersion <= Peer.maxZclassicProtocolVersion
+        let isZclassicV2 = peerVersion >= Peer.zclassicV2MinVersion && peerVersion <= Peer.zclassicV2MaxVersion
+        return isOldZclassic || isZclassicV2
     }
 
     /// Check if connection is stale (idle for too long)
@@ -1879,6 +1971,8 @@ public final class Peer {
         // Reconnect with fresh handshake
         try await connect()
         try await performHandshake()
+        // FIX #1181: Removed drainBufferedMessages() — it left orphaned NWConnection readers
+        // that desync TCP streams. receiveMessage() now resyncs on invalid magic instead.
         lastActivity = Date()
         print("✅ FIX #915: [\(host)] Reconnected successfully")
     }
@@ -1945,6 +2039,7 @@ public final class Peer {
         do {
             try await connect()
             try await performHandshake()
+            // FIX #1181: Removed drainBufferedMessages() — orphaned readers desync TCP
             lastActivity = Date()
             print("✅ FIX #1070: [\(host)] Force reconnect successful")
         } catch is CancellationError {
@@ -1978,7 +2073,9 @@ public final class Peer {
         // - Repair
         // - Broadcast
         if !PeerManager.shared.canStartBlockListeners() {
-            print("🛑 FIX #907: [\(host)] Block listener NOT started - operations in progress")
+            let headerBlocked = PeerManager.shared.isHeaderSyncInProgress()
+            let opsBlocked = PeerManager.shared.areBlockListenersBlocked()
+            print("🛑 FIX #907: [\(host)] Block listener NOT started - headerSync=\(headerBlocked), opsBlocked=\(opsBlocked)")
             return
         }
 
@@ -1998,6 +2095,14 @@ public final class Peer {
         blockListenerTask = Task { [weak self] in
             guard let self = self else { return }
 
+            // FIX #1178: Capture the connection we're starting on
+            // If self.connection changes (reconnection), we MUST exit immediately
+            // to prevent reading from a stale or new TCP stream (causes invalid magic bytes)
+            guard let startConnection = self.connection else {
+                _ = self.transitionTo(.stopped, from: nil)
+                return
+            }
+
             // FIX #1069: Transition to running state - if this fails, stopBlockListener was called
             // during the .starting state, so we should exit immediately
             let transitionSucceeded = self.transitionTo(.running(taskID: taskID), from: [.starting])
@@ -2011,12 +2116,24 @@ public final class Peer {
             // Add initial delay to let connection stabilize after handshake
             // This prevents reading garbage bytes that may be buffered
             // Longer delay for .onion peers (Tor), shorter for regular peers
-            if self.isOnion {
-                print("📡 [\(self.host)] .onion peer - waiting 2s for Tor connection to stabilize...")
-                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-            } else {
-                // Short delay for regular peers to let any pending handshake data clear
-                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            // FIX #1179: Use do/catch instead of try? to properly handle CancellationError
+            // try? swallows CancellationError, making the sleep return instantly (0ms instead of 200ms)
+            // which caused block listeners to die within 4ms of starting
+            do {
+                if self.isOnion {
+                    print("📡 [\(self.host)] .onion peer - waiting 2s for Tor connection to stabilize...")
+                    try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                } else {
+                    // Short delay for regular peers to let any pending handshake data clear
+                    try await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                }
+            } catch is CancellationError {
+                // FIX #1179: Task was cancelled during stabilization — exit cleanly
+                print("📡 FIX #1179: [\(self.host)] Block listener cancelled during stabilization delay")
+                _ = self.transitionTo(.stopped, from: nil)
+                return
+            } catch {
+                // Other errors during sleep — continue anyway
             }
 
             // FIX #1050: Suppress verbose log - block listener start is routine
@@ -2032,7 +2149,10 @@ public final class Peer {
             let maxConsecutiveErrors = 5
 
             // FIX #1069: Check state machine instead of _isListening flag
-            while case .running = self.getCurrentState(), self.connection != nil {
+            // FIX #1178: Also check connection identity — if connection changed, exit immediately
+            while case .running = self.getCurrentState(),
+                  let currentConn = self.connection,
+                  currentConn === startConnection {
                 do {
                     // RACE CONDITION FIX: Acquire lock before receiving to prevent
                     // concurrent socket reads with other P2P operations.
@@ -2066,27 +2186,34 @@ public final class Peer {
                     await self.handleBackgroundMessage(command: command, payload: payload)
 
                 } catch NetworkError.timeout {
-                    // Timeout is normal - just continue listening
-                    // FIX #1069: Check state machine for stop signal
-                    if case .stopping = self.getCurrentState() {
-                        break
-                    }
-                    continue
+                    // FIX #1184b: With the 500ms task group removed, timeout now means the
+                    // 120s header receive timed out (peer sent nothing for 120s = dead peer).
+                    // The connection was killed by receive(count:)'s GCD timeout.
+                    // Exit the listener — health check will replace the peer.
+                    print("📡 FIX #1184b: [\(self.host)] Block listener timeout (120s no data) — peer is dead, exiting")
+                    break
                 } catch is CancellationError {
                     // FIX #120: Listener was stopped - exit cleanly without error message
+                    // FIX #1184b: Kill connection to prevent orphaned NWConnection.receive from
+                    // desynchronizing the stream. When receive(count:24) is cancelled mid-wait,
+                    // the NWConnection.receive callback stays registered. If the connection is
+                    // reused (e.g., by header sync), the orphan fires first and consumes 24 bytes
+                    // → "Invalid magic bytes". Killing the connection cancels all pending callbacks.
+                    self.connectionLock.lock()
+                    let conn = self.connection
+                    self.connection = nil
+                    self.connectionLock.unlock()
+                    if let conn = conn {
+                        self.safeCancelConnection(conn, force: true)
+                        print("🔌 FIX #1184b: [\(self.host)] Killed connection after cancellation (orphan prevention)")
+                    }
                     break
                 } catch NetworkError.invalidMagicBytes {
-                    // For .onion peers, invalid magic bytes might be Tor noise - retry with backoff
-                    consecutiveErrors += 1
-                    if consecutiveErrors < maxConsecutiveErrors {
-                        let backoffMs = min(500 * consecutiveErrors, 2000)
-                        print("📡 [\(self.host)] Invalid magic bytes (attempt \(consecutiveErrors)/\(maxConsecutiveErrors)), retrying in \(backoffMs)ms...")
-                        try? await Task.sleep(nanoseconds: UInt64(backoffMs) * 1_000_000)
-                        continue
-                    } else {
-                        print("📡 [\(self.host)] Too many invalid magic bytes, stopping listener")
-                        break
-                    }
+                    // FIX #1175: Invalid magic bytes = stream is corrupted, stop immediately
+                    // Retrying on a desynced stream just reads more garbage
+                    // The peer will be replaced by health check recovery
+                    print("🔌 FIX #1175: [\(self.host)] Invalid magic bytes in block listener - stopping (stream corrupted)")
+                    break
                 } catch {
                     // Connection closed or error - stop listening
                     if case .running = self.getCurrentState() {
@@ -2111,7 +2238,17 @@ public final class Peer {
     /// Used by PeerManager to quickly signal all listeners before waiting on them
     /// This allows listeners to start shutting down in parallel while we wait
     /// FIX #1069: Now uses state machine
+    /// FIX #1248: Deactivate dispatcher synchronously for immediate effect
     func signalStopListener() {
+        // FIX #1248: Deactivate dispatcher synchronously (non-async)
+        // This can't be async since signalStopListener is synchronous, but we need to
+        // deactivate the dispatcher ASAP. Use Task to do it without blocking the caller.
+        // The actual stopBlockListener() will also deactivate (idempotent).
+        Task {
+            await messageDispatcher.setActive(false)
+            print("🔓 FIX #1248: [\(host)] Dispatcher deactivated in signalStopListener")
+        }
+
         // FIX #1069: Transition to stopping state (non-blocking)
         // Only transition from running - if already stopped/stopping, no-op
         stateLock.lock()
@@ -2131,7 +2268,22 @@ public final class Peer {
     /// This prevents race condition where header sync tries to acquire messageLock while listener holds it
     /// FIX #814: Add 2s timeout to prevent indefinite hang if task is stuck
     /// FIX #1069: Now uses state machine + unified GCD timeout (withReliableTimeout)
+    /// FIX #1248: Deactivate dispatcher IMMEDIATELY to prevent lock timeout during header sync
     func stopBlockListener() async {
+        // FIX #1248: Deactivate dispatcher synchronously BEFORE waiting for task
+        // Previous bug: dispatcher stayed active while block listener task was stopping,
+        // causing withExclusiveAccessTimeout(5s) in header sync to timeout waiting for messageLock.
+        // The dispatcher was only deactivated INSIDE the task at line 2228, but if the task
+        // was stuck on receiveMessage (120s timeout), the dispatcher remained active for up to
+        // 120 seconds. This caused:
+        // - Header sync tries withExclusiveAccessTimeout(seconds: 5.0) at line 720/936
+        // - Block listener holds messageLock waiting for receive() to complete
+        // - 5 second timeout expires → "Lock acquisition timed out" → peer disconnected
+        // Deactivating immediately tells all operations to skip this peer for dispatcher-based
+        // operations, preventing lock contention during the stop sequence.
+        await messageDispatcher.setActive(false)
+        print("🔓 FIX #1248: [\(host)] Dispatcher deactivated IMMEDIATELY on stop (preventing lock timeout)")
+
         // FIX #1069: Transition to stopping state - handle ALL states properly
         stateLock.lock()
         let currentState = listenerState
@@ -2307,7 +2459,15 @@ public final class Peer {
     /// Called by PeerManager when stopAllBlockListeners times out
     /// This ensures header sync can use peers even if listeners are stuck
     /// FIX #1093: Cancel connection BEFORE releasing lock to prevent race condition
+    /// FIX #1248: Deactivate dispatcher to prevent further lock contention
     public func forceReleaseMessageLock() async {
+        // FIX #1248: Deactivate dispatcher FIRST
+        // If we're force-releasing the lock, the block listener is stuck/dead.
+        // Deactivate dispatcher so no other operations try to use this peer for
+        // dispatcher-based operations (which would try to acquire the lock again).
+        await messageDispatcher.setActive(false)
+        print("🔓 FIX #1248: [\(host)] Dispatcher deactivated during force release")
+
         // FIX #1093: Cancel connection FIRST to kill any stuck reader
         // Previous bug: releasing lock while reader still active → another op acquires lock
         // → two concurrent readers → "Invalid magic bytes"
@@ -2367,53 +2527,95 @@ public final class Peer {
             throw CancellationError()
         }
 
-        guard let connection = connection else {
+        guard connection != nil else {
             throw NetworkError.notConnected
         }
 
-        // FIX #529: Use short timeout to prevent holding messageLock too long
-        // The block listener acquires messageLock before calling this function
-        // If timeout is too long, header sync will timeout trying to acquire messageLock
-        // FIX #1036: REMOVED FIX #920's disconnect-on-timeout - IT WAS THE BUG!
-        // - FIX #920 set connection=nil on timeout, breaking the block listener loop condition
-        // - Block listeners ALL exited after exactly 100ms because loop checks `connection != nil`
-        // - P2P fetch then failed with "notConnected" because all peers were disconnected!
-        // - Timeout is EXPECTED behavior (no messages to receive), NOT stream corruption
-        // - If stream corruption occurs, we'll get invalidMagicBytes which is handled with retry
-        return try await withThrowingTaskGroup(of: (String, Data).self) { group in
-            group.addTask {
-                // FIX #120: Check cancellation before blocking on receive
-                try Task.checkCancellation()
-                return try await self.receiveMessageTolerant()
-            }
-
-            group.addTask {
-                // FIX #529: 100ms timeout to allow header sync to acquire messageLock quickly
-                // FIX #1036: Increased to 500ms - 100ms was too aggressive over Tor
-                // Block announcements don't come that often, 500ms is still responsive
-                try await Task.sleep(nanoseconds: 500_000_000) // 500ms
-                // FIX #1036: Just throw timeout - DO NOT disconnect!
-                // The block listener loop catches this and continues normally
-                throw NetworkError.timeout
-            }
-
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
+        // FIX #1184b: REMOVED the 500ms task group timeout — it was the root cause of
+        // permanent TCP stream desync on ALL peers.
+        //
+        // The old code raced receiveMessageTolerant() against a 500ms Task.sleep in a
+        // withThrowingTaskGroup. Every 500ms cycle:
+        //   1. Registered a new NWConnection.receive(count: 24) callback
+        //   2. When 500ms fired, group.cancelAll() cancelled the Swift task
+        //   3. FIX #1196 prevented the GCD timeout from killing the connection (good!)
+        //   4. BUT the NWConnection.receive callback stayed registered in NWConnection's queue
+        //   5. When data arrived, the orphaned callback consumed 24 bytes from the TCP buffer
+        //   6. Those bytes were discarded (completionFlag already marked complete)
+        //   7. All subsequent reads were offset by 24 bytes → permanent stream desync
+        //   8. "Invalid magic in tolerant receive" on ALL peers
+        //
+        // With FIX #1184 (dispatcher-only routing), the block listener is the SOLE reader.
+        // No other operation needs messageLock, so we can let receive(count:) block until
+        // data arrives. ONE NWConnection.receive callback at a time = zero orphaned callbacks.
+        //
+        // Timeout: 120s for the initial header read. Blocks come every ~75s, pings every ~60s.
+        // If 120s passes with zero data, the peer is dead — connection is killed, listener exits.
+        // For stopping: FIX #1196's withTaskCancellationHandler resumes the continuation
+        // immediately on blockListenerTask?.cancel().
+        return try await receiveMessageTolerant(headerTimeout: 120.0)
     }
 
     /// Tolerant receive that throws invalidMagicBytes instead of handshakeFailed
-    private func receiveMessageTolerant() async throws -> (String, Data) {
-        // Read header (24 bytes)
-        let header = try await receive(count: 24)
+    /// FIX #1139: Added checksum validation - missing validation caused TCP stream desync!
+    /// Without checksum validation, a corrupted message with wrong length field would
+    /// read the wrong number of bytes, misaligning all subsequent reads.
+    /// FIX #1181: On invalid magic, attempt resync (same as receiveMessage)
+    /// FIX #1184b: Added headerTimeout parameter. Block listener uses 120s (blocks ~75s, pings ~60s).
+    ///            Payload reads still use the default 15s since data should flow continuously.
+    private func receiveMessageTolerant(headerTimeout: TimeInterval = P2PTimeout.messageReceive) async throws -> (String, Data) {
+        // Read header (24 bytes) — use headerTimeout for the initial wait
+        var header = try await receive(count: 24, timeout: headerTimeout)
 
-        // Verify magic - use invalidMagicBytes for block listener to retry
-        guard Array(header.prefix(4)) == networkMagic else {
+        // FIX #1181: Verify magic — resync if invalid (unsolicited messages from peers)
+        if Array(header.prefix(4)) != networkMagic {
             let gotMagic = Array(header.prefix(4)).map { String(format: "%02x", $0) }.joined()
-            let expectedMagic = networkMagic.map { String(format: "%02x", $0) }.joined()
-            print("🧅 [\(host)] Invalid magic bytes: got \(gotMagic), expected \(expectedMagic)")
-            throw NetworkError.invalidMagicBytes
+            print("🔄 FIX #1181: [\(host)] Invalid magic in tolerant receive: \(gotMagic), attempting resync...")
+
+            let maxScanBytes = isOnion ? 4096 : 65536
+            var window = Array(header)
+            var bytesScanned = 0
+            var resyncSucceeded = false
+
+            while bytesScanned < maxScanBytes {
+                if window.count >= 4 && Array(window.prefix(4)) == networkMagic {
+                    let bytesNeeded = 24 - window.count
+                    if bytesNeeded > 0 {
+                        let remaining = try await receive(count: bytesNeeded)
+                        window.append(contentsOf: remaining)
+                    }
+                    if window.count >= 24 {
+                        header = Data(window.prefix(24))
+                        resyncCount += 1
+                        if resyncCount > 5 {
+                            print("🔌 FIX #1181: [\(host)] Too many resyncs in tolerant receive - disconnecting")
+                            connectionLock.lock()
+                            let conn = connection
+                            connection = nil
+                            connectionLock.unlock()
+                            safeCancelConnection(conn, force: true)
+                            throw NetworkError.invalidMagicBytes
+                        }
+                        print("✅ FIX #1181: [\(host)] Tolerant resync after \(bytesScanned) bytes (resync #\(resyncCount))")
+                        resyncSucceeded = true
+                        break
+                    }
+                }
+                let nextByte = try await receive(count: 1)
+                window.removeFirst()
+                window.append(contentsOf: nextByte)
+                bytesScanned += 1
+            }
+
+            if !resyncSucceeded {
+                print("🔌 FIX #1181: [\(host)] Tolerant resync failed after \(bytesScanned) bytes - disconnecting")
+                connectionLock.lock()
+                let conn = connection
+                connection = nil
+                connectionLock.unlock()
+                safeCancelConnection(conn, force: true)
+                throw NetworkError.invalidMagicBytes
+            }
         }
 
         // Parse command
@@ -2423,10 +2625,28 @@ public final class Peer {
         // Parse length (safe loading)
         let length = header.loadUInt32(at: 16)
 
+        // FIX #1139: Extract expected checksum from header (bytes 20-24)
+        let expectedChecksum = header.loadUInt32(at: 20)
+
         // Read payload
         var payload = Data()
         if length > 0 {
             payload = try await receive(count: Int(length))
+        }
+
+        // FIX #1139: Validate checksum - doubleSHA256(payload).prefix(4)
+        // This is CRITICAL: if we read wrong length due to corrupted header,
+        // the checksum will fail and we detect the desync immediately!
+        let payloadHash = payload.doubleSHA256()
+        let actualChecksum = payloadHash.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
+
+        if actualChecksum != expectedChecksum {
+            print("🚨 FIX #1139: [\(host)] Block listener checksum mismatch for '\(command)'!")
+            print("   Expected: \(String(format: "0x%08x", expectedChecksum))")
+            print("   Actual:   \(String(format: "0x%08x", actualChecksum))")
+            print("   Payload size: \(payload.count) bytes")
+            // Throw invalidMagicBytes to trigger block listener's retry logic
+            throw NetworkError.invalidMagicBytes
         }
 
         return (command, payload)
@@ -2765,6 +2985,14 @@ public final class Peer {
         lastActivity = Date() // Mark connection as active after successful handshake
     }
 
+    // FIX #1181: drainBufferedMessages() REMOVED — it used receiveMessageWithTimeout(destroyConnectionOnTimeout: false)
+    // which left orphaned NWConnection readers. When the drain's last iteration timed out, the orphaned Task's
+    // receive(count: 24) remained registered. A subsequent fetch operation's receive(count: 24) was registered AFTER
+    // the orphaned header read but BEFORE its payload read. NWConnection delivers in registration order, so:
+    //   1. Orphaned reader gets addr header (24 bytes)
+    //   2. Fetch operation gets addr PAYLOAD (0xFD...) instead of next message header → "Invalid magic bytes"
+    // Fix: receiveMessage() now resyncs on invalid magic for all peers (FIX #1181)
+
     private func parseVersionPayload(_ data: Data) {
         guard data.count >= 80 else {
             print("⚠️ [\(host)] Version payload too short: \(data.count) bytes (need 80+)")
@@ -2856,8 +3084,26 @@ public final class Peer {
     // MARK: - Peer Discovery
 
     /// Request addresses from this peer (supports both addr and addrv2 responses)
+    /// FIX #1147: Use dispatcher when block listener is active to prevent TCP stream desync
     func getAddresses() async throws -> [PeerAddress] {
-        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
+        // Check if dispatcher is active (block listener running)
+        let dispatcherActive = await messageDispatcher.isActive
+
+        if dispatcherActive {
+            // FIX #1147: Use dispatcher pattern - block listener will deliver response
+            try await sendMessage(command: "getaddr", payload: Data())
+
+            // Wait for addr or addrv2 response via dispatcher
+            // Try addr first, then addrv2
+            if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addr", timeoutSeconds: 10) {
+                return parseAddrPayload(response.1)
+            } else if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addrv2", timeoutSeconds: 5) {
+                return parseAddrV2Payload(response.1)
+            }
+            return []
+        }
+
+        // FIX #131: Fallback to direct reads when block listener not running
         return try await withExclusiveAccess {
             try await sendMessage(command: "getaddr", payload: Data())
 
@@ -3215,26 +3461,26 @@ public final class Peer {
         // Verify magic
         var actualHeader = header
         if Array(header.prefix(4)) != networkMagic {
-            // FIX #891: TCP STREAM RESYNCHRONIZATION
-            // Instead of closing connection, scan forward to find next valid magic bytes
-            // Based on Bitcoin P2P protocol: "magic bytes used to seek to next message when stream state is unknown"
-            // Source: https://developer.bitcoin.org/reference/p2p_networking.html
+            // FIX #1181: Invalid magic bytes — stream is desynced by unsolicited messages
+            // Root cause: peers send addr/inv/addrv2 after handshake. If the stream is mid-payload
+            // (e.g., orphaned reader consumed header but not payload), the next read gets payload data.
+            // The bytes typically start with 0xFD (CompactSize for addr count > 252).
+            //
+            // FIX #1175 disconnected clear-net peers immediately, but this caused ALL peers to drop
+            // after every reconnection. Now we resync ALL peers (not just .onion).
+            // Magic bytes [0x24, 0xE9, 0x27, 0x64] are specific enough (1 in 4B false positive rate)
+            // that scanning for them is safe.
             let receivedMagic = Array(header.prefix(4))
-            print("🔄 FIX #891: [\(host)] Invalid magic bytes - attempting stream resynchronization...")
-            print("   Expected: \(networkMagic)")
-            print("   Received: \(receivedMagic)")
+            // FIX #1181: Scan limit: 64KB for clear-net (skip addr payloads), 4KB for .onion
+            let maxScanBytes = isOnion ? 4096 : 65536
+            print("🔄 FIX #1181: [\(host)] Invalid magic bytes - got \(receivedMagic), scanning up to \(maxScanBytes/1024)KB for resync...")
 
-            // Build a sliding window to scan for magic bytes
-            var window = Array(header)  // Start with the 24 bytes we already read
+            var window = Array(header)
             var bytesScanned = 0
-            let maxScanBytes = 512 * 1024  // Max 512KB scan before giving up
             var resyncSucceeded = false
 
-            // Scan byte-by-byte looking for magic sequence
             while bytesScanned < maxScanBytes {
-                // Check if window starts with magic bytes
                 if window.count >= 4 && Array(window.prefix(4)) == networkMagic {
-                    // Found magic! Read remaining bytes to complete header
                     let bytesNeeded = 24 - window.count
                     if bytesNeeded > 0 {
                         let remaining = try await receive(count: bytesNeeded)
@@ -3243,15 +3489,10 @@ public final class Peer {
 
                     if window.count >= 24 {
                         actualHeader = Data(window.prefix(24))
-                        print("✅ FIX #891: [\(host)] Stream RESYNCHRONIZED after \(bytesScanned) bytes!")
-
-                        // FIX #892 v2: After resync, CONTINUE with the resynchronized header instead of disconnecting
-                        // The resync found a valid message boundary - we should process it
-                        // Only throw error if this is a repeated resync (indicating persistent corruption)
                         resyncCount += 1
-                        if resyncCount > 3 {
-                            // Too many resyncs in this session - connection is truly corrupted
-                            print("🔄 FIX #892 v2: [\(host)] Too many resyncs (\(resyncCount)) - disconnecting")
+                        // FIX #1181: Allow more resyncs (5) since unsolicited messages are common
+                        if resyncCount > 5 {
+                            print("🔌 FIX #1181: [\(host)] Too many resyncs (\(resyncCount)) - disconnecting")
                             connectionLock.lock()
                             let conn = connection
                             connection = nil
@@ -3259,26 +3500,20 @@ public final class Peer {
                             safeCancelConnection(conn, force: true)
                             throw NetworkError.streamDesync
                         }
-                        print("🔄 FIX #892 v2: [\(host)] Continuing with resynchronized stream (resync #\(resyncCount))")
-                        // Continue processing with actualHeader set
+                        print("✅ FIX #1181: [\(host)] Resynchronized after \(bytesScanned) bytes (resync #\(resyncCount))")
+                        resyncSucceeded = true
+                        break
                     }
                 }
 
-                // Read one more byte and shift window
                 let nextByte = try await receive(count: 1)
                 window.removeFirst()
                 window.append(contentsOf: nextByte)
                 bytesScanned += 1
-
-                // Log progress every 64KB
-                if bytesScanned % 65536 == 0 {
-                    print("🔍 FIX #891: [\(host)] Scanned \(bytesScanned / 1024)KB looking for magic bytes...")
-                }
             }
 
             if !resyncSucceeded {
-                // Failed to resync - close connection as last resort
-                print("❌ FIX #891: [\(host)] Failed to resync after \(bytesScanned) bytes - closing connection")
+                print("🔌 FIX #1181: [\(host)] Failed to resync after \(bytesScanned) bytes - disconnecting")
                 connectionLock.lock()
                 let conn = connection
                 connection = nil
@@ -3435,6 +3670,7 @@ public final class Peer {
     ///   - .busy: Lock acquisition failed (peer busy with other operation)
     ///   - .timeout/.protocolError: Protocol issues - should count towards ban threshold
     ///   - .transientNetworkError: TCP-level issues - should NOT count towards ban threshold
+    /// FIX #1148: Use dispatcher pattern when block listener is active to prevent TCP stream desync
     func sendPing(timeoutSeconds: TimeInterval = 10) async -> PingResult {
         guard isConnectionReady else {
             return .protocolError  // Not connected is a protocol issue
@@ -3444,17 +3680,45 @@ public final class Peer {
         var nonce = Data(count: 8)
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 8, $0.baseAddress!) }
 
+        // FIX #1148: Check if dispatcher is active (block listener running)
+        let dispatcherActive = await messageDispatcher.isActive
+
+        if dispatcherActive {
+            // FIX #1148: Use dispatcher pattern - block listener will deliver pong response
+            do {
+                try await sendMessage(command: "ping", payload: nonce)
+
+                // Wait for pong response via dispatcher with timeout
+                if let response = await messageDispatcher.waitForResponseWithTimeout(command: "pong", timeoutSeconds: timeoutSeconds) {
+                    if response.1 == nonce {
+                        lastActivity = Date()
+                        return .success
+                    } else {
+                        // Wrong nonce - stale pong
+                        return .protocolError
+                    }
+                } else {
+                    return .timeout
+                }
+            } catch {
+                let errorDesc = error.localizedDescription
+                if errorDesc.contains("error 54") || errorDesc.contains("error 96") ||
+                   errorDesc.contains("error 57") || errorDesc.contains("Connection reset") ||
+                   errorDesc.contains("broken pipe") || errorDesc.contains("Not connected") {
+                    return .transientNetworkError
+                }
+                return .protocolError
+            }
+        }
+
+        // Fallback: Direct reads when block listener not running
         do {
             // FIX #724: Wrap ping in withExclusiveAccessTimeout to prevent race condition
-            // Without this, ping can interleave with other P2P operations (like getMempoolTransactions)
-            // causing corrupted reads and "handshake failed" errors
-            // Use 5 second timeout - if another operation holds lock longer, skip this ping
             return try await withExclusiveAccessTimeout(seconds: 5) {
                 // Send ping with nonce
                 try await sendMessage(command: "ping", payload: nonce)
 
                 // Loop to receive messages until we get matching pong or timeout
-                // Peers may send unsolicited messages (inv, addr, etc.) before pong
                 let startTime = Date()
                 var attempts = 0
                 let maxAttempts = 50  // Prevent infinite loop
@@ -3535,43 +3799,60 @@ public final class Peer {
 
     /// Request a transaction via P2P getdata message
     /// Returns true if peer has the TX (responds with tx message), false if not found
+    /// FIX #1149: Use dispatcher pattern when block listener is active to prevent TCP stream desync
     func requestTransaction(txid: Data) async throws -> Bool {
         guard isConnectionReady else {
             throw NetworkError.notConnected
         }
 
+        // Build getdata message for MSG_TX (type 1)
+        var payload = Data()
+        payload.append(0x01)  // Count = 1
+        var txType: UInt32 = 1  // MSG_TX
+        payload.append(Data(bytes: &txType, count: 4))
+        payload.append(txid)  // 32-byte hash
+
+        // FIX #1149: Check if dispatcher is active (block listener running)
+        let dispatcherActive = await messageDispatcher.isActive
+
+        if dispatcherActive {
+            // FIX #1149: Use dispatcher pattern - block listener will deliver response
+            try await sendMessage(command: "getdata", payload: payload)
+
+            // FIX #1201: Wait for EITHER "tx" OR "notfound" simultaneously
+            // Previous code waited for "tx" 5s THEN "notfound" 1s sequentially.
+            // If peer responded "notfound" during the 5s "tx" wait, the response was
+            // dispatched with no handler registered → dropped. We always waited the
+            // full 5s before checking notfound. Combined with verifyTxViaP2P's 5s
+            // outer timeout, this caused CancellationError on EVERY peer → false
+            // Sybil attack warnings even though TX was genuinely in the mempool.
+            if let response = await messageDispatcher.waitForAnyResponseWithTimeout(
+                commands: ["tx", "notfound"],
+                timeoutSeconds: 6
+            ) {
+                if response.0 == "tx" && !response.1.isEmpty {
+                    lastActivity = Date()
+                    return true
+                }
+                // "notfound" or empty "tx" = peer doesn't have it
+                return false
+            }
+            // Timeout with no response
+            return false
+        }
+
+        // Fallback: Direct reads when block listener not running
         // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
-        // Without this, the block listener can consume our TX response
-        // FIX #570: Optimize timeouts for faster P2P verification
         return try await withExclusiveAccess {
-            // Build getdata message for MSG_TX (type 1)
-            // Format: count (varint) + [type (4 bytes LE) + hash (32 bytes)]
-            var payload = Data()
-
-            // Count = 1
-            payload.append(0x01)
-
-            // Type = MSG_TX (1)
-            var txType: UInt32 = 1
-            payload.append(Data(bytes: &txType, count: 4))
-
-            // Hash (32 bytes, already in wire format - little endian)
-            payload.append(txid)
-
             try await sendMessage(command: "getdata", payload: payload)
 
             // FIX #354: Loop to drain buffered messages until we get tx/notfound
-            // FIX #570: Reduced maxAttempts from 10 to 5 and timeout from 10s to 3s
-            // This gives maximum 15s per peer (5 × 3s) instead of 100s (10 × 10s)
-            // Much more responsive while still allowing time for network latency
             var attempts = 0
-            let maxAttempts = 5  // FIX #570: was 10
+            let maxAttempts = 5
 
             while attempts < maxAttempts {
                 attempts += 1
 
-                // FIX #570: Reduced timeout from 10s to 3s for faster failure detection
-                // If peer has TX, it responds quickly. If not, we fail fast and try next peer.
                 let (command, responseData) = try await receiveMessageWithTimeout(seconds: 3)
 
                 if command == "tx" && !responseData.isEmpty {
@@ -3596,22 +3877,49 @@ public final class Peer {
 
     /// Get raw transaction data via P2P getdata message
     /// Returns the raw transaction bytes, or nil if not found
+    /// FIX #1150: Use dispatcher when block listener is active to prevent TCP stream desync
     func getRawTransaction(txid: Data) async throws -> Data? {
         guard isConnectionReady else {
             throw NetworkError.notConnected
         }
 
+        // Build getdata message for MSG_TX (type 1)
+        var payload = Data()
+        payload.append(0x01)  // count = 1
+
+        var txType: UInt32 = 1  // MSG_TX
+        payload.append(Data(bytes: &txType, count: 4))
+        payload.append(txid)  // 32-byte hash
+
+        // FIX #1150: Use dispatcher when block listener is active
+        let dispatcherActive = await messageDispatcher.isActive
+        if dispatcherActive {
+            // Send via dispatcher - block listener will route response back
+            try await sendMessage(command: "getdata", payload: payload)
+
+            // FIX #1201: Wait for EITHER "tx" OR "notfound" simultaneously
+            // Same fix as requestTransaction — sequential waits caused "notfound" to be
+            // dropped during the "tx" wait, always hitting the full 10s timeout.
+            if let response = await messageDispatcher.waitForAnyResponseWithTimeout(
+                commands: ["tx", "notfound"],
+                timeoutSeconds: 10
+            ) {
+                if response.0 == "tx" && !response.1.isEmpty {
+                    lastActivity = Date()
+                    return response.1
+                }
+                // "notfound" = peer doesn't have it
+                return nil
+            }
+
+            // Timeout with no response
+            return nil
+        }
+
+        // Fallback to direct reads when block listener is NOT active
         // FIX #354: Wrap in withExclusiveAccess to prevent race with block listener
         // FIX #570: Optimize timeouts for faster P2P verification
         return try await withExclusiveAccess {
-            // Build getdata message for MSG_TX (type 1)
-            var payload = Data()
-            payload.append(0x01)  // count = 1
-
-            var txType: UInt32 = 1  // MSG_TX
-            payload.append(Data(bytes: &txType, count: 4))
-            payload.append(txid)  // 32-byte hash
-
             try await sendMessage(command: "getdata", payload: payload)
 
             // FIX #354: Loop to drain buffered messages until we get tx/notfound
@@ -3714,7 +4022,46 @@ public final class Peer {
         }
     }
 
-    private func receive(count: Int) async throws -> Data {
+    /// FIX #1196: Thread-safe completion flag for receive(count:) that can be shared
+    /// between the NWConnection callback, GCD timeout, and withTaskCancellationHandler.
+    /// Reference type so all three closures share the same instance.
+    /// Also stores the continuation so onCancel can resume it (preventing continuation leaks).
+    private final class ReceiveCompletionFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completed = false
+        private var storedContinuation: CheckedContinuation<Data, Error>?
+
+        func storeContinuation(_ continuation: CheckedContinuation<Data, Error>) {
+            lock.lock()
+            storedContinuation = continuation
+            lock.unlock()
+        }
+
+        /// Atomically try to mark as complete. Returns true if this call completed it,
+        /// false if it was already completed by another path.
+        func tryComplete() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !completed else { return false }
+            completed = true
+            return true
+        }
+
+        /// Cancel: mark complete and resume continuation with CancellationError
+        func cancel() {
+            lock.lock()
+            guard !completed else { lock.unlock(); return }
+            completed = true
+            let cont = storedContinuation
+            storedContinuation = nil
+            lock.unlock()
+            cont?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// FIX #1184b: Added `timeout` parameter so block listener can use a longer header timeout.
+    /// Default remains P2PTimeout.messageReceive (15s) for normal operations.
+    private func receive(count: Int, timeout: TimeInterval = P2PTimeout.messageReceive) async throws -> Data {
         guard let connection = connection else {
             throw NetworkError.notConnected
         }
@@ -3747,61 +4094,66 @@ public final class Peer {
         // FIX #1069: Use GCD-based timeout with completion flag
         // GCD runs on separate thread pool from Swift concurrency, guaranteeing timeout fires
         // BUT: GCD block cannot be cancelled by group.cancelAll() - need completion flag!
+        // FIX #1196: Use withTaskCancellationHandler to set completion flag when task is cancelled.
+        // Without this, group.cancelAll() in receiveMessageNonBlockingTolerant leaves the GCD
+        // timeout alive. 15s later, the stale GCD timeout fires, sees operationCompleted==false,
+        // sets connection=nil → block listener's while condition fails → dispatcher deactivates.
 
-        return try await withCheckedThrowingContinuation { [weak self] (outerContinuation: CheckedContinuation<Data, Error>) in
-            // FIX #1069: Completion flag prevents GCD timeout from firing after success
-            // Same pattern as withReliableTimeout in AsyncTimeout.swift
-            var operationCompleted = false
-            let completionLock = NSLock()
+        // FIX #1196: Use reference-type flag so withTaskCancellationHandler's onCancel
+        // can access the same flag instance as the continuation and GCD timeout
+        let completionFlag = ReceiveCompletionFlag()
 
-            // Start the actual receive operation
-            connection.receive(minimumIncompleteLength: count, maximumLength: count) { [weak self] data, _, isComplete, error in
-                completionLock.lock()
-                guard !operationCompleted else {
-                    completionLock.unlock()
-                    return // Timeout already fired
-                }
-                operationCompleted = true
-                completionLock.unlock()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { [weak self] (outerContinuation: CheckedContinuation<Data, Error>) in
+                // FIX #1196: Store continuation so onCancel can resume it (prevents leak)
+                completionFlag.storeContinuation(outerContinuation)
 
-                if let error = error {
-                    outerContinuation.resume(throwing: error)
-                } else if let data = data {
-                    // FIX #922: NWConnection can return partial data if connection closes
-                    if data.count == count {
-                        outerContinuation.resume(returning: data)
+                // Start the actual receive operation
+                connection.receive(minimumIncompleteLength: count, maximumLength: count) { [weak self] data, _, isComplete, error in
+                    guard completionFlag.tryComplete() else { return } // Timeout or cancellation already fired
+
+                    if let error = error {
+                        outerContinuation.resume(throwing: error)
+                    } else if let data = data {
+                        // FIX #922: NWConnection can return partial data if connection closes
+                        if data.count == count {
+                            outerContinuation.resume(returning: data)
+                        } else {
+                            let hostForLog = self?.host ?? "unknown"
+                            print("⚠️ FIX #922: [\(hostForLog)] Partial data: got \(data.count)/\(count) bytes, isComplete=\(isComplete)")
+                            outerContinuation.resume(throwing: NetworkError.timeout)
+                        }
                     } else {
-                        let hostForLog = self?.host ?? "unknown"
-                        print("⚠️ FIX #922: [\(hostForLog)] Partial data: got \(data.count)/\(count) bytes, isComplete=\(isComplete)")
                         outerContinuation.resume(throwing: NetworkError.timeout)
                     }
-                } else {
+                }
+
+                // FIX #1069: GCD-based timeout (separate thread pool - guaranteed to fire)
+                // FIX #920: Increased from 3s to P2PTimeout.messageReceive (15s) for block data
+                // FIX #1184b: Use configurable timeout (120s for block listener header, 15s for payload)
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                    guard completionFlag.tryComplete() else { return } // Already completed or cancelled
+
+                    // FIX #920: CRITICAL - Must disconnect on GENUINE timeout!
+                    // If we're here, the receive is stuck (no data for the full timeout) -
+                    // disconnect to prevent TCP stream desync from orphaned NWConnection.receive
+                    // FIX #1196: This only fires for genuine stuck receives, NOT for cancelled tasks
+                    if let self = self {
+                        self.connectionLock.lock()
+                        let conn = self.connection
+                        self.connection = nil
+                        self.connectionLock.unlock()
+                        self.safeCancelConnection(conn, force: true)
+                    }
                     outerContinuation.resume(throwing: NetworkError.timeout)
                 }
             }
-
-            // FIX #1069: GCD-based timeout (separate thread pool - guaranteed to fire)
-            // FIX #920: Increased from 3s to P2PTimeout.messageReceive (15s) for block data
-            DispatchQueue.global().asyncAfter(deadline: .now() + P2PTimeout.messageReceive) { [weak self] in
-                completionLock.lock()
-                guard !operationCompleted else {
-                    completionLock.unlock()
-                    return // Operation completed successfully, don't timeout
-                }
-                operationCompleted = true
-                completionLock.unlock()
-
-                // FIX #920: CRITICAL - Must disconnect on timeout!
-                // If we're here, the receive is stuck - disconnect to prevent TCP stream desync
-                if let self = self {
-                    self.connectionLock.lock()
-                    let conn = self.connection
-                    self.connection = nil
-                    self.connectionLock.unlock()
-                    self.safeCancelConnection(conn, force: true)
-                }
-                outerContinuation.resume(throwing: NetworkError.timeout)
-            }
+        } onCancel: {
+            // FIX #1196: Task was cancelled (e.g., by stopBlockListener).
+            // Mark flag complete so the stale GCD timeout does NOT kill the connection.
+            // Also resume the continuation with CancellationError to prevent leak.
+            // Without this, the GCD timeout fires later → connection=nil → dispatcher dies.
+            completionFlag.cancel()
         }
     }
 
@@ -3834,101 +4186,82 @@ public final class Peer {
         //   - If TX invalid → peer sends "reject" message IMMEDIATELY (<100ms)
         //   - If TX valid → peer stays SILENT (no response = accepted into mempool)
         // This is standard Bitcoin protocol behavior!
-        //
-        // FIX #131: Wrap in withExclusiveAccess to prevent P2P race conditions
-        // FIX #1028: Lock timeout 2s - we only need time to SEND the TX
-        return try await withExclusiveAccessTimeout(seconds: 2) {
-            // Compute TX ID first for logging
-            let txId = rawTx.doubleSHA256().reversed()
-            let txIdString = txId.map { String(format: "%02x", $0) }.joined()
 
-            // FIX #1028: Send the TX - this is the only critical operation!
+        // Compute TX ID first for logging
+        let txId = rawTx.doubleSHA256().reversed()
+        let txIdString = txId.map { String(format: "%02x", $0) }.joined()
+
+        // FIX #1184: Route through dispatcher when block listener is active
+        // This eliminates orphaned NWConnection readers from receiveMessageWithTimeout
+        let dispatcherActive = await messageDispatcher.isActive
+        if dispatcherActive {
+            return try await broadcastTransactionViaDispatcher(rawTx: rawTx, txIdString: txIdString)
+        }
+
+        // Fallback: Direct read when dispatcher is not active (startup, repair)
+        return try await broadcastTransactionDirect(rawTx: rawTx, txIdString: txIdString)
+    }
+
+    /// FIX #1184: Broadcast through dispatcher — zero orphaned readers
+    /// Block listener dispatches reject messages to our waiting handler
+    private func broadcastTransactionViaDispatcher(rawTx: Data, txIdString: String) async throws -> String {
+        print("📡 FIX #1184: Broadcasting via dispatcher, txid: \(txIdString.prefix(16))...")
+
+        // Send TX — no lock needed, just a socket write
+        do {
+            try await sendMessage(command: "tx", payload: rawTx)
+            print("📡 FIX #1184: TX sent to peer via dispatcher path")
+        } catch {
+            print("❌ FIX #1184: Send FAILED: \(error.localizedDescription)")
+            throw error
+        }
+
+        // Wait for reject via dispatcher (1s timeout — Sapling proof validation ~100-500ms)
+        // Silence (timeout) = TX accepted per Bitcoin protocol
+        let result = await messageDispatcher.waitForBroadcastResultWithTimeout(
+            txid: txIdString,
+            timeoutSeconds: 1.0
+        )
+
+        if let (_, response) = result {
+            // Got a reject — parse it
+            return try parseBroadcastReject(response: response, txIdString: txIdString, prefix: "FIX #1184")
+        }
+
+        // nil = timeout = silence = TX ACCEPTED
+        print("✅ FIX #1184: No reject via dispatcher = TX ACCEPTED (silence = success)")
+        return txIdString
+    }
+
+    /// Fallback: Direct broadcast when dispatcher is not active (startup, repair)
+    private func broadcastTransactionDirect(rawTx: Data, txIdString: String) async throws -> String {
+        print("📡 FIX #1184: Broadcasting via direct path (dispatcher inactive), txid: \(txIdString.prefix(16))...")
+
+        return try await withExclusiveAccessTimeout(seconds: 2) {
+            // FIX #1028: Send the TX
             do {
                 try await sendMessage(command: "tx", payload: rawTx)
-                print("📡 FIX #1028: TX sent to peer, txid: \(txIdString.prefix(16))...")
+                print("📡 FIX #1048: TX sent to peer (direct), txid: \(txIdString.prefix(16))...")
             } catch {
-                // Send actually failed - peer didn't receive the TX
-                print("❌ FIX #1028: Send FAILED: \(error.localizedDescription)")
+                print("❌ FIX #1048: Send FAILED: \(error.localizedDescription)")
                 throw error
             }
 
-            // FIX #1048: SIMPLIFIED - Wait ONCE for reject, don't loop
-            // Per Bitcoin/Zclassic protocol:
-            //   - Reject message comes IMMEDIATELY (<100ms) if TX invalid
-            //   - Sapling proof validation ~100-500ms max
-            //   - SILENCE = SUCCESS (no response means TX accepted)
-            // Previous code looped with receiveMessage() which blocks indefinitely!
-            // NWConnection socket reads don't respond to Swift task cancellation.
-            // Fix: Single 500ms wait, then return success (silence = accepted)
-
+            // FIX #1048: Wait for reject with timeout (single attempt)
             do {
-                // Try to receive a message with 500ms timeout
-                // If we get a reject, handle it. If timeout, TX was accepted (silence)
                 let (command, response) = try await receiveMessageWithTimeout(seconds: 0.5, destroyConnectionOnTimeout: false)
 
-                // Got a message - check if it's a reject
                 if command == "reject" {
-                    var offset = 0
-                    if response.count > 0 {
-                        let msgLen = Int(response[0])
-                        offset = 1 + msgLen
-                    }
-                    if offset < response.count {
-                        let rejectCode = response[offset]
-                        let codeMap: [UInt8: String] = [
-                            0x01: "MALFORMED", 0x10: "INVALID", 0x11: "OBSOLETE", 0x12: "DUPLICATE",
-                            0x40: "NONSTANDARD", 0x41: "DUST", 0x42: "INSUFFICIENTFEE", 0x43: "CHECKPOINT"
-                        ]
-                        let codeName = codeMap[rejectCode] ?? "UNKNOWN(\(rejectCode))"
-
-                        var reason = ""
-                        if offset + 1 < response.count {
-                            let reasonLen = Int(response[offset + 1])
-                            if offset + 2 + reasonLen <= response.count {
-                                reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
-                            }
-                        }
-
-                        print("❌ FIX #1048: TX REJECTED by peer: \(codeName) - \(reason)")
-                        if rejectCode == 0x12 {
-                            // DUPLICATE = TX already in mempool = actually SUCCESS!
-                            print("✅ FIX #1048: DUPLICATE means TX is in mempool = SUCCESS!")
-                            throw NetworkError.transactionDuplicateRejected
-                        }
-                        throw NetworkError.transactionRejected
-                    }
+                    return try parseBroadcastReject(response: response, txIdString: txIdString, prefix: "FIX #1048")
                 }
-                // FIX #882: Got non-reject message - BUT this is NOT acceptance!
-                // Per Bitcoin protocol, ONLY silence within timeout = acceptance
-                // Other messages (ping, inv, addr, getheaders) are UNRELATED P2P activity
-                // The peer might still reject the TX - we need to keep waiting for reject or timeout
-                print("⚠️ FIX #882: Got '\(command)' (not reject) - waiting for actual verdict...")
 
-                // Wait again for reject or timeout
+                // Got non-reject, wait once more
+                print("⚠️ FIX #882: Got '\(command)' (not reject) - waiting for actual verdict...")
                 do {
                     let (cmd2, response2) = try await receiveMessageWithTimeout(seconds: 0.5, destroyConnectionOnTimeout: false)
                     if cmd2 == "reject" {
-                        // Parse and handle reject
-                        var offset = 0
-                        if response2.count > 0 {
-                            let msgLen = Int(response2[0])
-                            offset = 1 + msgLen
-                        }
-                        if offset < response2.count {
-                            let rejectCode = response2[offset]
-                            let codeMap: [UInt8: String] = [
-                                0x01: "MALFORMED", 0x10: "INVALID", 0x11: "OBSOLETE", 0x12: "DUPLICATE",
-                                0x40: "NONSTANDARD", 0x41: "DUST", 0x42: "INSUFFICIENTFEE", 0x43: "CHECKPOINT"
-                            ]
-                            let codeName = codeMap[rejectCode] ?? "UNKNOWN(\(rejectCode))"
-                            print("❌ FIX #882: TX REJECTED after non-reject: \(codeName)")
-                            if rejectCode == 0x12 {
-                                throw NetworkError.transactionDuplicateRejected
-                            }
-                            throw NetworkError.transactionRejected
-                        }
+                        return try parseBroadcastReject(response: response2, txIdString: txIdString, prefix: "FIX #882")
                     }
-                    // Another non-reject message or timeout, consider it accepted
                     print("✅ FIX #882: No reject after second wait = TX ACCEPTED")
                     return txIdString
                 } catch NetworkError.timeout {
@@ -3936,13 +4269,46 @@ public final class Peer {
                     return txIdString
                 }
             } catch NetworkError.timeout {
-                // FIX #1048: Timeout = SILENCE = SUCCESS per Bitcoin protocol!
-                // This is the EXPECTED case - nodes don't respond when accepting TX
                 print("✅ FIX #1048: No reject in 500ms = TX ACCEPTED (silence = success)")
                 return txIdString
             }
-            // Other errors propagate up
         }
+    }
+
+    /// Parse a reject message from broadcast and throw appropriate error
+    /// Returns txIdString on DUPLICATE (which is actually success), throws otherwise
+    private func parseBroadcastReject(response: Data, txIdString: String, prefix: String) throws -> String {
+        var offset = 0
+        if response.count > 0 {
+            let msgLen = Int(response[0])
+            offset = 1 + msgLen
+        }
+        if offset < response.count {
+            let rejectCode = response[offset]
+            let codeMap: [UInt8: String] = [
+                0x01: "MALFORMED", 0x10: "INVALID", 0x11: "OBSOLETE", 0x12: "DUPLICATE",
+                0x40: "NONSTANDARD", 0x41: "DUST", 0x42: "INSUFFICIENTFEE", 0x43: "CHECKPOINT"
+            ]
+            let codeName = codeMap[rejectCode] ?? "UNKNOWN(\(rejectCode))"
+
+            var reason = ""
+            if offset + 1 < response.count {
+                let reasonLen = Int(response[offset + 1])
+                if offset + 2 + reasonLen <= response.count {
+                    reason = String(data: response[(offset + 2)..<(offset + 2 + reasonLen)], encoding: .utf8) ?? ""
+                }
+            }
+
+            print("❌ \(prefix): TX REJECTED by peer: \(codeName) - \(reason)")
+            if rejectCode == 0x12 {
+                // DUPLICATE = TX already in mempool = actually SUCCESS!
+                print("✅ \(prefix): DUPLICATE means TX is in mempool = SUCCESS!")
+                throw NetworkError.transactionDuplicateRejected
+            }
+            throw NetworkError.transactionRejected
+        }
+        // Couldn't parse reject code — treat as generic rejection
+        throw NetworkError.transactionRejected
     }
 
     func getBlockHeaders(from height: UInt64, count: Int) async throws -> [BlockHeader] {
@@ -4035,19 +4401,24 @@ public final class Peer {
         // Stop hash (zeros = get maximum headers)
         payload.append(Data(count: 32))
 
-        // REVERTED FIX #887: Go back to direct reads with exclusive access
-        // The dispatcher integration was incomplete and caused TCP stream desync
+        // FIX #1231: CRITICAL - Do NOT use receiveMessageWithTimeout(..., destroyConnectionOnTimeout: false)
+        // inside withExclusiveAccessTimeout. This violates FIX #1181's orphaned reader pattern:
+        // When the outer timeout fires, the inner receiveMessageWithTimeout has already registered
+        // an NWConnection.receive(count:) callback that persists in the GCD queue. This orphaned
+        // reader consumes the `headers` response when it eventually arrives, desyncing the TCP stream.
+        // Solution: Use destroyConnectionOnTimeout: true. The outer lock will be released by the defer,
+        // and the connection will be killed cleanly if timeout occurs (no orphaned readers).
         let response = try await withExclusiveAccessTimeout(seconds: 30) {
             try await self.sendMessage(command: "getheaders", payload: payload)
 
-            // Wait for headers response, skip unrelated messages
+            // FIX #1236: Use 0.5s timeout for draining unsolicited messages (was 30s)
             var attempts = 0
             while attempts < 10 {
-                let (cmd, resp) = try await self.receiveMessageWithTimeout(seconds: 30, destroyConnectionOnTimeout: false)
+                let (cmd, resp) = try await self.receiveMessageWithTimeout(seconds: 0.5, destroyConnectionOnTimeout: true)
                 if cmd == "headers" {
                     return resp
                 }
-                print("⏭️ [\(self.host)] Skipping '\(cmd)' while waiting for headers")
+                print("⏭️ FIX #1236: [\(self.host)] Skipping '\(cmd)' while waiting for headers (attempt \(attempts+1)/10)")
                 attempts += 1
             }
             throw NetworkError.timeout
@@ -4153,10 +4524,12 @@ public final class Peer {
         payload.append(contentsOf: withUnsafeBytes(of: height.littleEndian) { Array($0) })
         payload.append(contentsOf: withUnsafeBytes(of: UInt32(count).littleEndian) { Array($0) })
 
-        // REVERTED FIX #887: Go back to direct reads with exclusive access
+        // FIX #1231: CRITICAL - Do NOT use receiveMessageWithTimeout(..., destroyConnectionOnTimeout: false)
+        // inside withExclusiveAccessTimeout. Same orphaned reader pattern as getBlockHeaders above.
+        // Use destroyConnectionOnTimeout: true to prevent orphaned NWConnection readers.
         let response = try await withExclusiveAccessTimeout(seconds: 30) {
             try await self.sendMessage(command: "getcfilters", payload: payload)
-            let (_, resp) = try await self.receiveMessageWithTimeout(seconds: 30, destroyConnectionOnTimeout: false)
+            let (_, resp) = try await self.receiveMessageWithTimeout(seconds: 30, destroyConnectionOnTimeout: true)
             return resp
         }
 
@@ -4856,74 +5229,31 @@ public final class Peer {
 
             // Wait for blocks via dispatcher with timeout
             // Dispatcher collects "block" messages from block listener
+            // FIX #1217: Adaptive timeout based on block count.
+            // Healthy peers deliver 128 blocks in <3s. Previous fixed 30s let dead peers
+            // waste 30s before failing — peer 77.110.103.38 wasted 60s across two calls.
+            // Scale: ≤10 blocks → 5s, ≤50 → 10s, >50 → 15s.
+            let batchTimeout: Double = hashes.count <= 10 ? 5.0 : (hashes.count <= 50 ? 10.0 : 15.0)
             let blockData = await messageDispatcher.waitForBatch(
                 command: "block",
                 expectedCount: hashes.count,
-                timeoutSeconds: 60  // Allow time for large batches
+                timeoutSeconds: batchTimeout
             )
 
-            print("📦 FIX #893: [\(host)] Received \(blockData.count)/\(hashes.count) blocks via dispatcher")
+            print("📦 FIX #893: [\(host)] Received \(blockData.count)/\(hashes.count) blocks via dispatcher (timeout=\(String(format: "%.0f", batchTimeout))s)")
 
             // Parse blocks
             return blockData.compactMap { parseCompactBlock($0) }
 
         } else {
-            // Fallback: Direct reads when block listener not running
-            // (e.g., during initial connection before listener starts)
-            print("📦 FIX #893: [\(host)] Fetching \(hashes.count) blocks via direct reads (listener not active)")
-
-            // FIX #1071: Pre-reconnection now happens at NetworkManager level
-            // before parallel fetches start, so peers should already have fresh sockets
-            // Just verify connection is ready
-            if !isConnectionReady {
-                print("⚠️ FIX #1071: [\(host)] Connection not ready, attempting reconnect...")
-                try await ensureConnected()
-            }
-
-            // FIX #1069: Use P2PTimeout constants and reliable GCD timeout
-            return try await withExclusiveAccessTimeout(seconds: P2PTimeout.lockAcquire) {
-                try await self.sendMessage(command: "getdata", payload: payload)
-
-                var blocks: [CompactBlock] = []
-                var attempts = 0
-                let maxAttempts = hashes.count * 30 + 30
-                let perMessageTimeout = P2PTimeout.messageReceive  // 15s per message
-
-                while blocks.count < hashes.count && attempts < maxAttempts {
-                    attempts += 1
-
-                    do {
-                        // FIX #1069: Use GCD-based reliable timeout instead of Task.sleep
-                        // Task.sleep can be delayed by Swift's cooperative threading
-                        let result = try await withReliableTimeoutThrowing(seconds: perMessageTimeout) {
-                            try await self.receiveMessage()
-                        }
-
-                        let (command, response) = result
-
-                        if command == "block" {
-                            if let block = self.parseCompactBlock(response) {
-                                blocks.append(block)
-                            }
-                        } else if command == "notfound" {
-                            continue
-                        } else if command == "ping" {
-                            try? await self.sendMessage(command: "pong", payload: response)
-                        }
-                    } catch is CancellationError {
-                        continue
-                    } catch is P2PTimeoutError {
-                        // FIX #1069: Reliable timeout fired - check if we have partial results
-                        if !blocks.isEmpty { break }
-                        continue
-                    } catch PeerError.timeout {
-                        if !blocks.isEmpty { break }
-                        continue
-                    }
-                }
-
-                return blocks
-            }
+            // FIX #1184: Do NOT use direct reads — they hold the message lock and
+            // prevent block listeners from reading, creating a vicious cycle where
+            // dispatchers stay inactive → more direct reads → lock contention → 76 blocks/s.
+            // Dispatcher path is lock-free (~300 blocks/s). If dispatcher is not active,
+            // this peer can't be used for batch block fetches. Caller (getBlocksDataP2P)
+            // will use other dispatcher-active peers instead.
+            print("📦 FIX #1184: [\(host)] Dispatcher not active — skipping peer for block fetch (\(hashes.count) blocks)")
+            return []
         }
     }
 
@@ -4977,36 +5307,66 @@ public final class Peer {
 
     /// Request mempool inventory from peer
     /// Returns list of transaction hashes currently in peer's mempool
-    /// Uses exclusive access to prevent message stream conflicts
     /// FIX #1004: Use receiveMessageWithTimeout to prevent indefinite blocking
     /// FIX #1005: Empty mempool = no response (Zclassic source: vInv.size() > 0 check)
-    ///           Timeout should be treated as "empty mempool", not "peer failed"
+    /// FIX #1184: Route through dispatcher when active to eliminate orphaned readers
     func getMempoolTransactions() async throws -> [Data] {
+        // FIX #1184: Route through dispatcher when block listener is active
+        let dispatcherActive = await messageDispatcher.isActive
+        if dispatcherActive {
+            return try await getMempoolTransactionsViaDispatcher()
+        }
+
+        // FIX #1184b: Do NOT fall back to direct reads when dispatcher is inactive.
+        // Direct reads use receiveMessageWithTimeout(destroyConnectionOnTimeout: false)
+        // which leaves orphaned NWConnection readers. When block listeners restart later,
+        // the orphaned reader consumes the next header → block listener reads payload data
+        // → "invalid magic bytes [253, ...]" → stream desync → peer death.
+        // Mempool will be queried on the next cycle when dispatcher is active.
+        print("🔮 FIX #1184b: Skipping mempool query (dispatcher inactive, avoiding orphaned readers)")
+        return []
+    }
+
+    /// FIX #1184: Mempool query through dispatcher — zero orphaned readers
+    /// Block listener dispatches inv messages to our waiting handler
+    private func getMempoolTransactionsViaDispatcher() async throws -> [Data] {
+        print("🔮 FIX #1184: Requesting mempool via dispatcher...")
+
+        // Send mempool request — no lock needed, just a socket write
+        try await sendMessage(command: "mempool", payload: Data())
+
+        // Wait for inv response via dispatcher (3s timeout)
+        // If mempool empty, Zclassic sends NOTHING → timeout → empty array
+        let result = await messageDispatcher.waitForResponseWithTimeout(
+            command: "inv",
+            timeoutSeconds: 3.0
+        )
+
+        guard let (_, response) = result, response.count >= 1 else {
+            print("🔮 FIX #1184: Mempool empty (no inv via dispatcher)")
+            return []
+        }
+
+        // Parse inv payload: [count: varint][inv_vector...]
+        return parseMempoolInv(response: response)
+    }
+
+    /// Fallback: Direct mempool query when dispatcher is not active
+    /// FIX #1183: Reduced to SINGLE timeout to limit orphaned NWConnection readers
+    private func getMempoolTransactionsDirect() async throws -> [Data] {
         return try await withExclusiveAccess {
-            print("🔮 Requesting mempool inventory from peer...")
+            print("🔮 FIX #1184: Requesting mempool via direct path (dispatcher inactive)...")
 
             // Send mempool request (empty payload)
             try await sendMessage(command: "mempool", payload: Data())
 
-            // Wait for inv response with transaction inventory
-            // FIX #1004: Use timeout to prevent blocking forever if peer doesn't respond
-            // FIX #1005: Zclassic main.cpp:6378-6407 - if mempool empty, node sends NOTHING!
-            //           So timeout after sending "mempool" command = empty mempool (success)
-            var txHashes: [Data] = []
             var attempts = 0
-            var consecutiveTimeouts = 0
 
-            while attempts < 5 {  // FIX #1005: Reduced from 10 (faster failure detection)
+            while attempts < 3 {
                 attempts += 1
 
                 do {
-                    // FIX #1004: Use 3s timeout per attempt
-                    // FIX #1005: Catch timeout separately to distinguish from other errors
-                    // FIX #1006: Use non-destructive timeout - don't kill connection on empty mempool
                     let (command, response) = try await receiveMessageWithTimeout(seconds: 3, destroyConnectionOnTimeout: false)
-
-                    // Got a response - reset timeout counter
-                    consecutiveTimeouts = 0
 
                     // Handle ping automatically
                     if command == "ping" {
@@ -5015,60 +5375,51 @@ public final class Peer {
                     }
 
                     if command == "inv" && response.count >= 1 {
-                        // Parse inv payload: [count: varint][inv_vector...]
-                        // Each inv_vector: [type: 4 bytes][hash: 32 bytes]
-                        var offset = 0
-
-                        // Read count (varint)
-                        let (count, countSize) = readVarInt(from: response, at: offset)
-                        offset += countSize
-
-                        for _ in 0..<count {
-                            guard offset + 36 <= response.count else { break }
-
-                            // Type: 1 = MSG_TX, 2 = MSG_BLOCK
-                            let invType = response.loadUInt32(at: offset)
-                            offset += 4
-
-                            // Hash (32 bytes)
-                            let hash = response.subdata(in: offset..<offset+32)
-                            offset += 32
-
-                            // Only collect transactions (type 1)
-                            if invType == 1 {
-                                txHashes.append(hash)
-                            }
-                        }
-
-                        print("🔮 Mempool contains \(txHashes.count) transactions")
-                        return txHashes
+                        return parseMempoolInv(response: response)
                     }
 
                     // Ignore other messages, keep waiting
-                    if attempts % 2 == 0 {
-                        print("⏳ Still waiting for mempool inv... (attempt \(attempts))")
-                    }
-                } catch NetworkError.timeout {
-                    // FIX #1005: Timeout = likely empty mempool (Zclassic sends nothing if empty)
-                    consecutiveTimeouts += 1
-
-                    // If we get 2 consecutive timeouts, treat as empty mempool
-                    if consecutiveTimeouts >= 2 {
-                        print("🔮 FIX #1005: Mempool empty (no inv response after 2 timeouts)")
-                        return []  // Empty mempool is success, not failure!
-                    }
-
-                    // First timeout - try once more in case of network latency
                     continue
+                } catch NetworkError.timeout {
+                    // FIX #1183: Return IMMEDIATELY on first timeout
+                    print("🔮 FIX #1183: Mempool empty (no inv response after timeout)")
+                    return []
                 }
-                // Other errors propagate up
             }
 
-            // Reached max attempts without definitive response
-            // FIX #1005: Treat as empty mempool rather than error
             print("🔮 FIX #1005: Mempool likely empty (no inv after \(attempts) attempts)")
-            return txHashes
+            return []
         }
+    }
+
+    /// Parse inv payload for mempool transaction hashes (MSG_TX type 1 only)
+    private func parseMempoolInv(response: Data) -> [Data] {
+        var txHashes: [Data] = []
+        var offset = 0
+
+        // Read count (varint)
+        let (count, countSize) = readVarInt(from: response, at: offset)
+        offset += countSize
+
+        for _ in 0..<count {
+            guard offset + 36 <= response.count else { break }
+
+            // Type: 1 = MSG_TX, 2 = MSG_BLOCK
+            let invType = response.loadUInt32(at: offset)
+            offset += 4
+
+            // Hash (32 bytes)
+            let hash = response.subdata(in: offset..<offset+32)
+            offset += 32
+
+            // Only collect transactions (type 1)
+            if invType == 1 {
+                txHashes.append(hash)
+            }
+        }
+
+        print("🔮 Mempool contains \(txHashes.count) transactions")
+        return txHashes
     }
 
     /// Check if a specific transaction is in the mempool

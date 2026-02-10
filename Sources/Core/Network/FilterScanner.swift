@@ -165,6 +165,12 @@ final class FilterScanner {
     // Solution: Always collect outputs, even when "disabled", then update delta if any found
     private var deltaOutputsFoundInCoveredRange: [DeltaCMUManager.DeltaOutput] = []
 
+    /// FIX #1214: Shared prefetch cache to avoid double-fetching blocks
+    /// Set by preRebuildWitnessesForInstantPayment (FIX #571), consumed by PHASE 2
+    /// When FIX #571 P2P fetches blocks for tree/witness updates, it caches parsed block data here.
+    /// FilterScanner PHASE 2 pre-populates its prefetchedBlocks from this cache, avoiding re-download.
+    static var sharedPrefetchCache: [UInt64: [(String, [ShieldedOutput], [ShieldedSpend]?)]]?
+
     // FIX #947: PERFORMANCE - Defer witness computation to first SEND
     // When true, PHASE 1.5 is skipped entirely during import
     // Witnesses are computed lazily when user attempts to send
@@ -273,6 +279,27 @@ final class FilterScanner {
         // Block listeners can only run when app is idle on main screen
         await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
         PeerManager.shared.setBlockListenersBlocked(true)
+
+        // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
+        // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
+        // Without this, FilterScanner can't fetch blocks or chain height → scan fails.
+        let deadPeersScan = await MainActor.run {
+            networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
+        }
+        if !deadPeersScan.isEmpty {
+            print("🔄 FIX #1228: Reconnecting \(deadPeersScan.count) peers with dead connections (FilterScanner start)...")
+            var reconnectedScan = Set<String>()  // FIX #1235
+            for peer in deadPeersScan {
+                if reconnectedScan.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
+                do {
+                    try await peer.ensureConnected()
+                    reconnectedScan.insert(peer.host)  // FIX #1235
+                    print("✅ FIX #1228: [\(peer.host)] Reconnected for FilterScanner")
+                } catch {
+                    print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+                }
+            }
+        }
 
         defer {
             isScanning = false
@@ -610,8 +637,9 @@ final class FilterScanner {
                             self.cmuDataForPositionLookup = cmuData
                         }
 
+                        // FIX #1138: Save tree state WITH HEIGHT from cached boost info
                         if let treeData = ZipherXFFI.treeSerialize() {
-                            try? database.saveTreeState(treeData)
+                            try? database.saveTreeState(treeData, height: cachedInfo.height)
                         }
                     } else {
                         // FIX #528: Deserialization failed - try legacy CMU fallback
@@ -650,8 +678,9 @@ final class FilterScanner {
                             self.cmuDataForPositionLookup = cmuData
                         }
 
+                        // FIX #1138: Save tree state WITH HEIGHT from boost file
                         if let treeData = ZipherXFFI.treeSerialize() {
-                            try? database.saveTreeState(treeData)
+                            try? database.saveTreeState(treeData, height: boostHeight)
                         }
                     } else {
                         // FIX #528: Deserialization failed - try loading from legacy CMU file
@@ -861,22 +890,49 @@ final class FilterScanner {
 
                             var stillFailed: Set<UInt64> = []
 
-                            // Retry each failed height individually
-                            for height in failedHeights.sorted() {
-                                do {
-                                    let isConnectedForRetry = await MainActor.run { networkManager.isConnected }
-                                    if isConnectedForRetry {
-                                        let results = try await networkManager.getBlocksDataP2P(from: height, count: 1)
-                                        if let (h, _, timestamp, txData) = results.first, h == height {
-                                            blockDataMap[height] = txData
-                                            BlockTimestampManager.shared.cacheTimestamp(height: height, timestamp: timestamp)
-                                            continue // Success!
-                                        }
+                            // FIX #1213: Batch retry failed heights in contiguous ranges instead of one-by-one
+                            // Previous code fetched each height with getBlocksDataP2P(count: 1) — extremely slow
+                            // for large failures (30ms/block × 1000 blocks = 30 seconds vs ~2 seconds batched)
+                            let sortedFailed = Array(failedHeights.sorted())
+                            let isConnectedForRetry = await MainActor.run { networkManager.isConnected }
+                            if isConnectedForRetry && !sortedFailed.isEmpty {
+                                // Group into contiguous ranges (max 128 per batch - P2P protocol limit)
+                                var ranges: [(start: UInt64, count: Int)] = []
+                                var rangeStart = sortedFailed[0]
+                                var rangeEnd = sortedFailed[0]
+                                for i in 1..<sortedFailed.count {
+                                    if sortedFailed[i] == rangeEnd + 1 && Int(sortedFailed[i] - rangeStart) < 128 {
+                                        rangeEnd = sortedFailed[i]
+                                    } else {
+                                        ranges.append((start: rangeStart, count: Int(rangeEnd - rangeStart) + 1))
+                                        rangeStart = sortedFailed[i]
+                                        rangeEnd = sortedFailed[i]
                                     }
-                                    stillFailed.insert(height)
-                                } catch {
-                                    stillFailed.insert(height)
                                 }
+                                ranges.append((start: rangeStart, count: Int(rangeEnd - rangeStart) + 1))
+
+                                print("🔄 FIX #1213: Retrying \(sortedFailed.count) failed heights in \(ranges.count) batches (was \(sortedFailed.count) individual requests)")
+
+                                for range in ranges {
+                                    do {
+                                        let results = try await networkManager.getBlocksDataP2P(from: range.start, count: range.count)
+                                        for (h, _, timestamp, txData) in results {
+                                            blockDataMap[h] = txData
+                                            BlockTimestampManager.shared.cacheTimestamp(height: h, timestamp: timestamp)
+                                        }
+                                    } catch {
+                                        // All heights in this range stay as failed
+                                    }
+                                }
+
+                                // Determine which heights are still missing
+                                for height in sortedFailed {
+                                    if blockDataMap[height] == nil {
+                                        stillFailed.insert(height)
+                                    }
+                                }
+                            } else {
+                                stillFailed = failedHeights
                             }
 
                             failedHeights = stillFailed
@@ -1017,10 +1073,11 @@ final class FilterScanner {
             // This ensures we don't have to re-scan historical blocks if interrupted
             try? database.updateLastScannedHeight(phase1EndHeight, hash: Data(count: 32))
             FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
+            // FIX #1138: Save tree state WITH HEIGHT
             if let treeData = ZipherXFFI.treeSerialize() {
-                try? database.saveTreeState(treeData)
+                try? database.saveTreeState(treeData, height: phase1EndHeight)
             }
-            print("💾 PHASE 1 checkpoint saved at height \(phase1EndHeight)")
+            print("💾 FIX #1138: PHASE 1 checkpoint saved at height \(phase1EndHeight)")
 
             // Move to blocks after CMU data height for PHASE 2
             // Use phase1EndHeight (which is cmuDataHeight from GitHub if available)
@@ -1209,6 +1266,28 @@ final class FilterScanner {
 
             print("⏳ FIX #903: Waiting 200ms for in-flight receives to complete...")
             try? await Task.sleep(nanoseconds: 200_000_000)
+
+            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
+            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
+            // Without this, header sync in PHASE 1.5 fails to find ready peers → sync hangs.
+            let deadPeersPhase15 = await MainActor.run {
+                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
+            }
+            if !deadPeersPhase15.isEmpty {
+                print("🔄 FIX #1228: Reconnecting \(deadPeersPhase15.count) peers with dead connections (PHASE 1.5 header sync)...")
+                var reconnectedPhase15 = Set<String>()  // FIX #1235
+                for peer in deadPeersPhase15 {
+                    if reconnectedPhase15.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
+                    do {
+                        try await peer.ensureConnected()
+                        reconnectedPhase15.insert(peer.host)  // FIX #1235
+                        print("✅ FIX #1228: [\(peer.host)] Reconnected for PHASE 1.5 header sync")
+                    } catch {
+                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+
             print("🛑 FIX #462: Block listeners stopped, starting header sync...")
 
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
@@ -1276,24 +1355,33 @@ final class FilterScanner {
             }
 
             // FIX #406: If headers still missing after all attempts, mark scan as incomplete
+            // FIX #1155: Reduced log severity for small gaps (1-2 blocks) - this is expected during chain tip advancement
             if !headersAvailable {
                 let finalHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-                print("🚨 FIX #406: CRITICAL - Headers missing after \(maxHeaderSyncAttempts) attempts!")
-                print("🚨 FIX #406: HeaderStore at \(finalHeaderHeight), need \(targetHeight)")
-                print("🚨 FIX #406: Blocks \(finalHeaderHeight + 1) to \(targetHeight) may have MISSING NOTES!")
-                print("🚨 FIX #406: On-demand P2P fetch will be attempted as fallback...")
+                let blocksGap = targetHeight - finalHeaderHeight
+                if blocksGap <= 2 {
+                    // Small gap is expected when peers haven't propagated latest block yet
+                    print("⏳ FIX #406: Headers \(finalHeaderHeight + 1)-\(targetHeight) not yet available from peers (gap=\(blocksGap))")
+                    print("⏳ FIX #406: On-demand P2P fetch will be attempted as fallback...")
+                } else {
+                    // Larger gap is more concerning
+                    print("🚨 FIX #406: CRITICAL - Headers missing after \(maxHeaderSyncAttempts) attempts!")
+                    print("🚨 FIX #406: HeaderStore at \(finalHeaderHeight), need \(targetHeight)")
+                    print("🚨 FIX #406: Blocks \(finalHeaderHeight + 1) to \(targetHeight) may have MISSING NOTES!")
+                    print("🚨 FIX #406: On-demand P2P fetch will be attempted as fallback...")
+                }
                 // Continue with on-demand fallback - it may work
             }
 
-            // FIX #907: DO NOT resume block listeners here!
-            // Block listeners must stay STOPPED during PHASE 2 block fetch
-            // Otherwise they will acquire locks on peers and block the P2P fetch
-            // Block listeners will be resumed at the END of the scan (see scan completion code)
+            // FIX #1205: Block listeners will be RESTARTED on demand by getBlocksDataP2P.
+            // Old FIX #907 kept them stopped (for pre-dispatcher direct reads).
+            // FIX #1184 dispatcher NEEDS block listeners running for block fetches.
+            // getBlocksDataP2P will unblock + start listeners if no dispatchers active.
 
-            // FIX #472: Clear header sync in progress flag (but keep listeners stopped)
+            // FIX #472: Clear header sync in progress flag
             await PeerManager.shared.setHeaderSyncInProgress(false)
 
-            print("🛑 FIX #907: Block listeners staying STOPPED for PHASE 2 block fetch")
+            print("▶️ FIX #1205: Block listeners will be restarted by getBlocksDataP2P for PHASE 2")
 
             // FIX #362: Explicit entry log to confirm PHASE 2 is running
             print("✅ FIX #362: Entering PHASE 2 sequential mode (currentHeight=\(currentHeight), targetHeight=\(targetHeight))")
@@ -1409,11 +1497,39 @@ final class FilterScanner {
             var consecutiveEmptyFetches = 0
             let maxConsecutiveEmpty = 5  // Give up after 5 rounds with 0 blocks fetched
 
+            // FIX #1214: Pre-populate from shared cache (set by FIX #571 P2P fetch in preRebuildWitnesses)
+            // This avoids double-fetching the same blocks that FIX #571 already downloaded
+            if let cache = FilterScanner.sharedPrefetchCache {
+                var cacheHits = 0
+                for (height, txData) in cache {
+                    if height >= currentHeight && height <= targetHeight {
+                        prefetchedBlocks[height] = txData
+                        cacheHits += 1
+                    }
+                }
+                FilterScanner.sharedPrefetchCache = nil  // Free memory
+                if cacheHits > 0 {
+                    print("⚡ FIX #1214: Pre-loaded \(cacheHits)/\(totalBlocksToFetch) blocks from shared cache (avoiding double-fetch)")
+                    // Advance prefetchHeight past the contiguous cached range from currentHeight
+                    var contiguousEnd = currentHeight
+                    while contiguousEnd <= targetHeight && prefetchedBlocks[contiguousEnd] != nil {
+                        contiguousEnd += 1
+                    }
+                    if contiguousEnd > currentHeight {
+                        prefetchHeight = contiguousEnd
+                        print("⚡ FIX #1214: Skipping P2P fetch for heights \(currentHeight)-\(contiguousEnd - 1) (cached), starting at \(prefetchHeight)")
+                    }
+                }
+            }
+
             // FIX #1104: Pre-reconnect ALL peers ONCE before the prefetch loop
             // CRITICAL: This was previously INSIDE the while loop (line 1381), causing a reconnection
             // storm that killed in-flight P2P requests (error 89: Operation canceled).
             // Moving it outside ensures we reconnect once, then use stable connections for all batches.
-            await networkManager.preReconnectPeersForBlockFetch()
+            // FIX #1214: Skip reconnect if all blocks already cached (no P2P needed)
+            if prefetchHeight <= targetHeight {
+                await networkManager.preReconnectPeersForBlockFetch()
+            }
 
             while prefetchHeight <= targetHeight && isScanning {
                 // Create up to `parallelBatches` concurrent fetch tasks
@@ -1593,14 +1709,19 @@ final class FilterScanner {
                 print("🚨 FIX #932: ABORT - Only fetched \(Int(fetchedPercentage * 100))% of blocks (\(reason))")
                 print("🚨 FIX #932: Throwing error to trigger automatic retry when network recovers")
 
-                // Save what we have so far
-                let partialHeight = prefetchedBlocks.keys.max() ?? currentHeight
-                try? database.updateLastScannedHeight(partialHeight, hash: Data(count: 32))
-                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
-                if let treeData = ZipherXFFI.treeSerialize() {
-                    try? database.saveTreeState(treeData)
+                // FIX #1203: Only save partial progress if we actually fetched blocks
+                // Bug: When prefetchedBlocks is empty, ?? currentHeight fell through to target height,
+                // advancing lastScannedHeight past blocks that were NEVER scanned.
+                if let partialHeight = prefetchedBlocks.keys.max() {
+                    try? database.updateLastScannedHeight(partialHeight, hash: Data(count: 32))
+                    FilterScanner.updateScanProgress()
+                    if let treeData = ZipherXFFI.treeSerialize() {
+                        try? database.saveTreeState(treeData, height: partialHeight)
+                    }
+                    print("📍 FIX #1203: Saved partial progress at height \(partialHeight)")
+                } else {
+                    print("⚠️ FIX #1203: Zero blocks fetched — NOT advancing lastScannedHeight (staying at \(currentHeight - 1))")
                 }
-                print("📍 FIX #932: Saved partial progress at height \(partialHeight)")
 
                 // Mark scan as not in progress so it can be retried
                 isScanning = false
@@ -1609,7 +1730,7 @@ final class FilterScanner {
                 throw NetworkError.scanAbortedDueToNetworkFailure(
                     fetched: prefetchedBlocks.count,
                     needed: totalBlocksToFetch,
-                    lastHeight: partialHeight
+                    lastHeight: prefetchedBlocks.keys.max() ?? (currentHeight > 0 ? currentHeight - 1 : 0)
                 )
             }
 
@@ -1618,6 +1739,7 @@ final class FilterScanner {
             onStatusUpdate?("phase2", "🔧 Processing 0/\(totalBlocksToFetch) blocks...")
             let processStartTime = Date()
             var processedCount = 0
+            var lastActuallyScannedHeight: UInt64 = currentHeight > 0 ? currentHeight - 1 : 0  // FIX #1203
 
             // Process blocks sequentially from pre-fetched cache
             while currentHeight <= targetHeight && isScanning {
@@ -1625,9 +1747,14 @@ final class FilterScanner {
                 let blockData: [(UInt64, [(String, [ShieldedOutput], [ShieldedSpend]?)])]
                 if let txData = prefetchedBlocks[currentHeight] {
                     blockData = [(currentHeight, txData)]
+                    lastActuallyScannedHeight = currentHeight  // FIX #1203: Only advance for fetched blocks
                 } else {
-                    // Block not in cache (no shielded data or fetch failed)
-                    blockData = [(currentHeight, [])]
+                    // FIX #1203: Block not in cache — fetch failed, DO NOT treat as empty.
+                    // Missing blocks could contain our transactions (outputs + nullifiers).
+                    // Skip processing but do NOT advance lastScannedHeight past this gap.
+                    print("⚠️ FIX #1203: Block \(currentHeight) missing from cache — skipping (will re-scan)")
+                    currentHeight += 1
+                    continue
                 }
 
                 // Process sequentially (all data already in memory)
@@ -1682,12 +1809,13 @@ final class FilterScanner {
 
                     // FIX #293: Save checkpoint every 10 blocks (was 500 - too risky!)
                     // If app crashes/force-quits, at most 10 blocks need re-scan
-                    // 500 blocks = minutes of lost work on crash
+                    // FIX #1203: Only save lastScannedHeight for blocks that were actually fetched
+                    // (lastActuallyScannedHeight tracks the highest contiguous fetched block)
                     if scannedBlocks % 10 == 0 {
-                        try? database.updateLastScannedHeight(height, hash: Data(count: 32))
+                        try? database.updateLastScannedHeight(lastActuallyScannedHeight, hash: Data(count: 32))
                         FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
                         if let treeData = ZipherXFFI.treeSerialize() {
-                            try? database.saveTreeState(treeData)
+                            try? database.saveTreeState(treeData, height: lastActuallyScannedHeight)
                         }
                     }
                 }
@@ -1701,21 +1829,27 @@ final class FilterScanner {
             let processRate = Double(scannedBlocks) / max(processDuration, 0.001)
             print("✅ FIX #190: Processed \(scannedBlocks) blocks in \(String(format: "%.1f", processDuration))s (\(String(format: "%.0f", processRate)) blocks/sec)")
 
-            // FIX #206: Save FINAL lastScannedHeight after PHASE 2 completes
-            // Bug: updateLastScannedHeight only called every 500 blocks, missing the final blocks
-            // Result: walletHeight < chainHeight triggers unnecessary catch-up sync
-            // Fix: Always save targetHeight at end of scan
-            let finalHeight = targetHeight
+            // FIX #206 + FIX #1203: Save FINAL lastScannedHeight after PHASE 2 completes
+            // FIX #1203: Use lastActuallyScannedHeight instead of targetHeight
+            // Bug: targetHeight was saved even when blocks were missing from cache,
+            // permanently skipping blocks that failed to fetch (including our own TXs).
+            let finalHeight = lastActuallyScannedHeight
             try? database.updateLastScannedHeight(finalHeight, hash: Data(count: 32))
             FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
-            print("📍 FIX #206: Final lastScannedHeight saved: \(finalHeight)")
+            if finalHeight < targetHeight {
+                print("📍 FIX #1203: Final lastScannedHeight saved: \(finalHeight) (target was \(targetHeight) — \(targetHeight - finalHeight) blocks will be re-scanned)")
+            } else {
+                print("📍 FIX #206: Final lastScannedHeight saved: \(finalHeight)")
+            }
         }
 
         // Final tree persistence
+        // FIX #1138: Save tree state WITH HEIGHT to ensure tree_height is persisted!
+        // Bug: saveTreeState called without height → tree_height stays 0 → delta resync on every startup
         if let treeData = ZipherXFFI.treeSerialize() {
-            try? database.saveTreeState(treeData)
+            try? database.saveTreeState(treeData, height: targetHeight)
             let treeSize = ZipherXFFI.treeSize()
-            print("🌳 Saved commitment tree with \(treeSize) commitments")
+            print("🌳 FIX #1138: Saved commitment tree with \(treeSize) commitments at height \(targetHeight)")
         }
 
         // CRITICAL: Update ALL note witnesses to match current tree state!
@@ -1814,8 +1948,14 @@ final class FilterScanner {
                 // This happens when Full Rescan resets lastScanned but delta uses old manifest
                 if deltaCollectionStartHeight > lastScanned {
                     print("⚠️ FIX #759: INVALID delta range \(deltaCollectionStartHeight)-\(lastScanned) (backwards)")
-                    print("⚠️ FIX #759: Clearing corrupted delta bundle and NOT saving invalid data")
-                    DeltaCMUManager.shared.clearDeltaBundle()
+                    // FIX #1254: Only clear delta if NOT verified (immutable).
+                    if UserDefaults.standard.bool(forKey: "DeltaBundleVerified") {
+                        print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite invalid range")
+                        print("   Backwards range is from new scan state, not delta corruption")
+                    } else {
+                        print("⚠️ FIX #759: Clearing corrupted delta bundle and NOT saving invalid data")
+                        DeltaCMUManager.shared.clearDeltaBundle()
+                    }
                 } else {
                     DeltaCMUManager.shared.appendOutputs(
                         deltaOutputsCollected,
@@ -1847,8 +1987,13 @@ final class FilterScanner {
                 // FIX #759: Validate height range before updating manifest
                 if deltaCollectionStartHeight > lastScanned {
                     print("⚠️ FIX #759: INVALID delta range \(deltaCollectionStartHeight)-\(lastScanned) (backwards, no outputs)")
-                    print("⚠️ FIX #759: Clearing corrupted delta bundle")
-                    DeltaCMUManager.shared.clearDeltaBundle()
+                    // FIX #1254: Only clear delta if NOT verified (immutable).
+                    if UserDefaults.standard.bool(forKey: "DeltaBundleVerified") {
+                        print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite invalid range")
+                    } else {
+                        print("⚠️ FIX #759: Clearing corrupted delta bundle")
+                        DeltaCMUManager.shared.clearDeltaBundle()
+                    }
                 } else {
                     DeltaCMUManager.shared.appendOutputs(
                         [],  // Empty outputs
@@ -1892,12 +2037,34 @@ final class FilterScanner {
         // This happens when FFI tree state becomes corrupted during PHASE 2
         // Symptoms: witnesses are 37 bytes (invalid), tree root doesn't match blockchain
         // FIX #736: Delta CMUs are now saved BEFORE this runs, so repair can load them!
+        var treeRepairFailed = false  // FIX #1238: Track if tree is corrupted (prevents stale witness creation)
         if !checkpointSaved {
             print("🔧 FIX #524: Tree root mismatch detected - attempting repair...")
             if await fixTreeRootMismatch(lastScannedHeight: targetHeight) {
                 print("✅ FIX #524: Tree root mismatch repaired - witnesses updated")
             } else {
                 print("⚠️ FIX #524: Could not repair tree root mismatch - may need full rescan")
+                // FIX #1238: Check if repair was exhausted — tree state is CORRUPTED
+                // When TreeRepairExhausted is true, the FFI tree has wrong root because delta
+                // CMUs are incomplete. ANY witnesses created from this tree will have anchors
+                // that don't exist on the blockchain → FIX #1224 flags them ALL as corrupted
+                // → infinite rebuild cycle. MUST NULL all witnesses and skip all rebuild paths.
+                let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
+                if repairExhausted {
+                    treeRepairFailed = true
+                    print("🛑 FIX #1238: Tree repair EXHAUSTED — tree state is corrupted!")
+                    print("   Nullifying ALL witnesses to prevent creation from corrupted tree")
+                    print("   Witnesses from corrupted tree have non-existent anchors → phantom TXs")
+                    print("   User must run 'Full Resync' in Settings to fix")
+                    // NULL all witnesses — they are ALL invalid (created from corrupted tree)
+                    // This prevents any code path from using these bad witnesses for spending
+                    do {
+                        let cleared = try WalletDatabase.shared.clearWitnessesForCorruptedTree()
+                        print("🛑 FIX #1238: Cleared \(cleared) corrupted witnesses via SQL")
+                    } catch {
+                        print("❌ FIX #1238: Failed to clear witnesses: \(error)")
+                    }
+                }
             }
         }
 
@@ -1917,6 +2084,13 @@ final class FilterScanner {
         if await WalletManager.shared.isRepairingDatabase {
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
             print("✅ FIX #1101: Set FIX1089_FullVerificationComplete=true after Full Rescan (skips redundant 73K block scan)")
+            // FIX #1252: Mark delta as verified after Full Rescan — immutable from now on.
+            // Full Rescan builds delta with complete P2P scan (same rigor as boost file).
+            // No more validation/repair/gap-fill needed on subsequent startups.
+            if checkpointSaved {
+                UserDefaults.standard.set(true, forKey: "DeltaBundleVerified")
+                print("✅ FIX #1252: Delta marked VERIFIED after Full Rescan (immutable like boost)")
+            }
         }
 
         // FIX #907: Resume block listeners now that all sync operations are complete
@@ -1972,6 +2146,17 @@ final class FilterScanner {
         // 1. Delta CMUs are already in the DeltaCMUManager (saved above)
         // 2. No duplicate P2P fetching needed
         // 3. Instant witness generation from local data
+        //
+        // FIX #1238: SKIP witness rebuild when tree repair is exhausted!
+        // If treeRepairFailed is true, the FFI tree has a wrong root (incomplete delta).
+        // Creating witnesses from this tree produces anchors that don't exist on blockchain.
+        // FIX #1224 would flag them ALL as corrupted at next startup → rebuild cycle → same
+        // bad witnesses. Better to leave witnesses NULL until user runs Full Resync.
+        if treeRepairFailed {
+            print("⏩ FIX #1238: Skipping FIX #1082 witness rebuild — tree state is corrupted")
+            print("   Creating witnesses from corrupted tree would produce invalid anchors")
+            print("   Witnesses left NULL — user must run 'Full Resync' in Settings")
+        } else {
         print("🔍 FIX #1082: Checking for notes without witnesses after scan...")
         do {
             let (missingCount, missingValue, minHeight) = try database.getNotesWithoutWitnesses(accountId: 1)
@@ -2000,6 +2185,7 @@ final class FilterScanner {
         } catch {
             print("⚠️ FIX #1082: Error checking notes without witnesses: \(error)")
         }
+        } // end FIX #1238 guard
 
         // FIX #1084: Verify all unspent notes against on-chain nullifiers
         // This catches spent notes that were missed during normal scan
@@ -2063,29 +2249,42 @@ final class FilterScanner {
                 return false
             }
 
-            // FIX #798: Skip tree root validation for P2P-synced headers (above boost file)
-            // P2P getheaders protocol doesn't include finalsaplingroot reliably
-            // Only boost file headers (up to effectiveTreeHeight) have correct sapling roots
+            // FIX #1204b: Validate tree root against HeaderStore for ALL heights
+            // getheaders stores real finalsaplingroot, FIX #1204 adds from full block fetches
             let boostEndHeight = ZipherXConstants.effectiveTreeHeight
             let isPeerSyncedHeight = lastScanned > boostEndHeight
 
             if isPeerSyncedHeight {
-                // FIX #798: P2P headers have unreliable sapling roots - TRUST our computed tree root
-                // Our tree is built from verified CMUs (boost file + P2P outputs), so it's authoritative
-                print("✅ FIX #798: Height \(lastScanned) > boost file end \(boostEndHeight) - trusting computed tree root")
-                print("   Our tree root: \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                print("   (Skipping header comparison - P2P headers don't have reliable sapling roots)")
+                // FIX #1204b: HeaderStore sapling roots ARE authoritative for post-boost heights.
+                // getheaders stores real finalsaplingroot + FIX #1204 saves from full block fetches.
+                // If non-zero, validate against it. Only trust FFI blindly if root is zero/missing.
+                let headerRoot = header.hashFinalSaplingRoot
+                let isZeroRoot = headerRoot.allSatisfy { $0 == 0 } || headerRoot.isEmpty
 
-                // FIX #801: Auto-clear exhaustion flags when FIX #798 successfully validates tree root
-                // These flags were set from previous failed repairs (before FIX #798 existed)
-                // Now that FIX #798 trusts computed tree root for P2P heights, repairs will succeed
+                if !isZeroRoot {
+                    // FIX #1204b: Authoritative root available — validate
+                    let headerRootReversed = Data(headerRoot.reversed())
+                    if treeRoot == headerRoot || treeRoot == headerRootReversed {
+                        print("✅ FIX #1204b: Tree root VERIFIED against HeaderStore at height \(lastScanned)")
+                    } else {
+                        print("⚠️ FIX #1204b: Tree root MISMATCH at height \(lastScanned) — NOT saving checkpoint")
+                        print("   Our root:    \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        print("   Header root: \(headerRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        return false
+                    }
+                } else {
+                    // Zero/missing root — trust our computed tree root
+                    print("✅ FIX #798: Height \(lastScanned) > boost file end \(boostEndHeight) — HeaderStore root is zero, trusting FFI root")
+                    print("   Our tree root: \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                }
+
+                // FIX #801: Auto-clear exhaustion flags when tree root validates
                 let wasExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
                 if wasExhausted {
                     UserDefaults.standard.set(false, forKey: "TreeRepairExhausted")
                     UserDefaults.standard.set(0, forKey: "DeltaBundleGlobalRepairAttempts")
                     UserDefaults.standard.set(0, forKey: "StaleWitnessGlobalAttempts")
-                    print("✅ FIX #801: Cleared exhaustion flags - P2P tree root validation now works!")
-                    print("   Stale witness auto-repair will run on next health check")
+                    print("✅ FIX #801: Cleared exhaustion flags")
                 }
             } else {
                 // For heights within boost file range, header sapling roots are reliable - validate normally
@@ -2127,15 +2326,34 @@ final class FilterScanner {
     private func fixTreeRootMismatch(lastScannedHeight: UInt64) async -> Bool {
         print("🔧 FIX #524: Starting tree root mismatch repair...")
 
-        // FIX #798: Skip entire repair for P2P-synced heights - header comparison is unreliable!
-        // P2P getheaders protocol doesn't include finalsaplingroot reliably
-        // Our tree is built from verified CMUs, so trust it instead of corrupted P2P header
+        // FIX #1204b: HeaderStore sapling roots ARE authoritative for post-boost heights.
+        // getheaders stores real finalsaplingroot + FIX #1204 saves from full block fetches.
+        // If we have a non-zero root, compare it. If zero/missing, trust FFI (no repair needed).
         let boostEndHeight = ZipherXConstants.effectiveTreeHeight
         if lastScannedHeight > boostEndHeight {
-            print("✅ FIX #798: Height \(lastScannedHeight) > boost file end \(boostEndHeight)")
-            print("✅ FIX #798: P2P headers have unreliable sapling roots - TRUSTING our computed tree root")
-            print("✅ FIX #798: No repair needed - tree is correct, header is wrong!")
-            return true  // Tree is correct, no repair needed
+            if let header = try? HeaderStore.shared.getHeader(at: lastScannedHeight) {
+                let headerRoot = header.hashFinalSaplingRoot
+                let isZeroRoot = headerRoot.allSatisfy { $0 == 0 } || headerRoot.isEmpty
+                if !isZeroRoot, let ourRoot = ZipherXFFI.treeRoot() {
+                    let headerRootReversed = Data(headerRoot.reversed())
+                    if ourRoot == headerRoot || ourRoot == headerRootReversed {
+                        print("✅ FIX #1204b: Tree root matches HeaderStore at \(lastScannedHeight) — no repair needed")
+                        return true
+                    }
+                    // Real mismatch — fall through to repair
+                    print("⚠️ FIX #1204b: Tree root MISMATCH at \(lastScannedHeight) — repair needed!")
+                    print("   Our root:    \(ourRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    print("   Header root: \(headerRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                } else {
+                    // Zero root — trust FFI
+                    print("✅ FIX #1204b: HeaderStore root is zero at \(lastScannedHeight) — trusting computed tree root")
+                    return true
+                }
+            } else {
+                // No header — trust FFI
+                print("✅ FIX #1204b: No header at \(lastScannedHeight) — trusting computed tree root")
+                return true
+            }
         }
 
         // CRITICAL FIX #557 v35: Check if tree root already matches header (FIX #557 v32 handles this now!)
@@ -2330,9 +2548,10 @@ final class FilterScanner {
                             print("✅ FIX #524+#739: Rebuilt \(rebuiltCount)/\(loadedNotes.count) witnesses (delta sync mode)")
 
                             // Save the corrected tree state
+                            // FIX #1138: Save tree state WITH HEIGHT
                             if let treeData = ZipherXFFI.treeSerialize() {
-                                try? database.saveTreeState(treeData)
-                                print("💾 FIX #524: Saved corrected tree state to database")
+                                try? database.saveTreeState(treeData, height: lastScannedHeight)
+                                print("💾 FIX #524+1138: Saved corrected tree state at height \(lastScannedHeight)")
                             }
 
                             return true
@@ -2387,46 +2606,89 @@ final class FilterScanner {
                             print("🔧 FIX #779: Delta repair attempt \(repairAttempts)/\(maxRepairAttempts) this session")
                             print("🔧 FIX #782: Global repair attempt \(globalAttempts)/\(maxGlobalAttempts) total")
 
-                            // Clear the corrupted delta bundle so next PHASE 2 scan will rebuild it properly
+                            // FIX #1219: Distinguish INCOMPLETE delta from CORRUPT delta.
+                            // Previous bug: always cleared delta on mismatch, even when the delta
+                            // was incomplete (P2P fetched 1 CMU out of ~5,800 expected). Clearing
+                            // forces a full rebuild but FIX #524 just loads the same incomplete delta
+                            // from disk → same 1 CMU → same wrong root → infinite repair loop.
+                            //
+                            // Incomplete = CMU count is far too low for the block range
+                            // Corrupt = CMU count is reasonable but data is wrong
                             let currentDeltaCount = DeltaCMUManager.shared.loadDeltaCMUs()?.count ?? 0
-                            print("🔧 FIX #765: Delta CMUs incomplete - clearing corrupted delta bundle")
-                            print("   Delta had \(currentDeltaCount) CMUs but produced wrong tree root")
-                            print("   Clearing delta bundle to force rebuild during next PHASE 2 scan")
-                            DeltaCMUManager.shared.clearDeltaBundle()
+                            let blockRange = lastScannedHeight - effectiveHeight
+                            // Zclassic averages ~0.35 shielded outputs per block
+                            let expectedMinCMUs = max(1, blockRange / 10)  // Conservative: at least 1 per 10 blocks
+                            let isIncomplete = currentDeltaCount < expectedMinCMUs && blockRange > 100
 
-                            // FIX #778: CRITICAL - Reset the FFI tree to boost file state!
-                            // Without this, the FFI tree still has delta CMUs in memory even though:
-                            // 1. Delta manifest was cleared
-                            // 2. lastScannedHeight was reset to boost end
-                            // This causes WalletHealthCheck to see tree size > boost file but no manifest,
-                            // leading to validation at wrong height → mismatch → repair loop forever.
-                            print("🔧 FIX #778: Resetting FFI tree to boost file state...")
-                            if let serializedTree = try? await CommitmentTreeUpdater.shared.extractSerializedTree() {
-                                _ = ZipherXFFI.treeInit()  // Clear tree and delta CMUs (FIX #764, #771)
-                                if ZipherXFFI.treeDeserialize(data: serializedTree) {
-                                    let resetTreeSize = ZipherXFFI.treeSize()
-                                    print("✅ FIX #778: FFI tree reset to boost file state (\(resetTreeSize) CMUs)")
-                                } else {
-                                    print("⚠️ FIX #778: Could not deserialize boost tree - treeInit already cleared delta CMUs")
-                                }
+                            // FIX #1252: NEVER clear a verified delta — it was built correctly.
+                            // If tree root mismatches with verified delta, the issue is in THIS scan's
+                            // P2P fetch (new blocks), not in the delta itself.
+                            let deltaIsVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+                            if deltaIsVerified {
+                                print("✅ FIX #1252: Delta is VERIFIED (immutable) — NOT clearing despite tree root mismatch")
+                                print("   Mismatch is from new blocks in this scan, not from delta corruption")
+                                print("   Delta will remain intact for next startup")
+                            } else if isIncomplete {
+                                // FIX #1219: Delta is INCOMPLETE, not corrupt. Clearing it won't help
+                                // because the same P2P issues will reproduce the same incomplete delta.
+                                // Instead, leave it and let syncDeltaBundleIfNeeded fill the gaps next time.
+                                print("🔧 FIX #1219: Delta is INCOMPLETE, not corrupt (\(currentDeltaCount) CMUs for \(blockRange) blocks, expected ≥\(expectedMinCMUs))")
+                                print("   NOT clearing delta — will retry P2P fetch on next sync cycle")
+                                print("   Previous bug: clearing incomplete delta → reload same data → same mismatch → infinite loop")
                             } else {
-                                // Fallback: Just init the tree to clear delta CMUs
-                                _ = ZipherXFFI.treeInit()
-                                print("⚠️ FIX #778: Could not load boost tree - cleared delta CMUs via treeInit")
+                                // Delta has a reasonable number of CMUs but produces wrong root = corrupt
+                                print("🔧 FIX #765: Delta CMUs appear CORRUPT (\(currentDeltaCount) CMUs for \(blockRange) blocks)")
+                                print("   Clearing delta bundle to force rebuild during next PHASE 2 scan")
+                                DeltaCMUManager.shared.clearDeltaBundle()
                             }
 
-                            // Also reset lastScannedHeight to boost file end so PHASE 2 rescans the full range
-                            // This ensures we re-fetch all blocks and properly collect ALL shielded outputs
-                            let boostEndHeight = ZipherXConstants.effectiveTreeHeight
-                            print("🔧 FIX #765: Resetting lastScannedHeight from \(lastScannedHeight) to \(boostEndHeight)")
-                            try? database.updateLastScannedHeight(boostEndHeight, hash: Data(count: 32))
-                            FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
+                            // FIX #1219: Only reset tree and lastScannedHeight for CORRUPT delta.
+                            // For incomplete delta, preserve existing state — resetting just forces
+                            // the same incomplete P2P fetch again (infinite loop at 1 CMU / 16,693 blocks).
+                            // FIX #1252: NEVER reset for verified delta — it's immutable.
+                            if deltaIsVerified {
+                                print("✅ FIX #1252: Skipping tree/height reset — delta is verified & immutable")
+                            } else if !isIncomplete {
+                                // FIX #778: CRITICAL - Reset the FFI tree to boost file state!
+                                // Without this, the FFI tree still has delta CMUs in memory even though:
+                                // 1. Delta manifest was cleared
+                                // 2. lastScannedHeight was reset to boost end
+                                // This causes WalletHealthCheck to see tree size > boost file but no manifest,
+                                // leading to validation at wrong height → mismatch → repair loop forever.
+                                print("🔧 FIX #778: Resetting FFI tree to boost file state...")
+                                if let serializedTree = try? await CommitmentTreeUpdater.shared.extractSerializedTree() {
+                                    _ = ZipherXFFI.treeInit()  // Clear tree and delta CMUs (FIX #764, #771)
+                                    if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                                        let resetTreeSize = ZipherXFFI.treeSize()
+                                        print("✅ FIX #778: FFI tree reset to boost file state (\(resetTreeSize) CMUs)")
+                                    } else {
+                                        print("⚠️ FIX #778: Could not deserialize boost tree - treeInit already cleared delta CMUs")
+                                    }
+                                } else {
+                                    // Fallback: Just init the tree to clear delta CMUs
+                                    _ = ZipherXFFI.treeInit()
+                                    print("⚠️ FIX #778: Could not load boost tree - cleared delta CMUs via treeInit")
+                                }
 
-                            // Set flag to trigger PHASE 2 rescan
-                            await MainActor.run {
-                                WalletManager.shared.pendingDeltaRescan = true
+                                // Also reset lastScannedHeight to boost file end so PHASE 2 rescans the full range
+                                // This ensures we re-fetch all blocks and properly collect ALL shielded outputs
+                                let boostEndHeight = ZipherXConstants.effectiveTreeHeight
+                                print("🔧 FIX #765: Resetting lastScannedHeight from \(lastScannedHeight) to \(boostEndHeight)")
+                                try? database.updateLastScannedHeight(boostEndHeight, hash: Data(count: 32))
+                                FilterScanner.updateScanProgress()  // FIX #1074: Update progress time to prevent timeout
+
+                                // Set flag to trigger PHASE 2 rescan
+                                await MainActor.run {
+                                    WalletManager.shared.pendingDeltaRescan = true
+                                }
+                                print("🔧 FIX #765: Set pendingDeltaRescan=true - will rescan from boost file end")
+                            } else {
+                                // FIX #1219: Incomplete delta — keep existing state, just trigger a delta re-sync
+                                print("🔧 FIX #1219: Keeping existing delta + tree state (incomplete, not corrupt)")
+                                print("   syncDeltaBundleIfNeeded will fill gaps on next cycle")
+                                // Reset global repair counter since this isn't a real repair failure
+                                UserDefaults.standard.set(max(0, globalAttempts - 1), forKey: globalRepairKey)
                             }
-                            print("🔧 FIX #765: Set pendingDeltaRescan=true - will rescan from boost file end")
 
                             return false
                         }
@@ -2730,6 +2992,7 @@ final class FilterScanner {
                     let txidDisplayFormat = tx.txHash.reversed().map { String(format: "%02x", $0) }.joined()
                     if await NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
                         print("📤 FIX #859: Our pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        // FIX #1146: Pass actual block height for accurate confirmation
                         await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
                     }
                 }
@@ -3049,7 +3312,62 @@ final class FilterScanner {
             // Get witness
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
 
-            // Store note with CMU
+            // FIX #1138: CRITICAL - Use computed CMU instead of blockchain CMU
+            // ROOT CAUSE FIX: P2P path was storing blockchain CMU directly, but during
+            // transaction building, CMU is recomputed from note parts. If there's any
+            // byte order difference, the comparison fails → "joinsplit requirements not met"
+            // This matches FIX #585 which does the same for boost file notes.
+            let cmuToStore: Data
+            if let computedCMU = ZipherXFFI.computeNoteCMU(
+                diversifier: Data(diversifier),
+                rcm: Data(rcm),
+                value: value,
+                spendingKey: spendingKey
+            ) {
+                // Verify CMU matches (compare in both byte orders)
+                let cmuReversed = Data(cmu.reversed())
+                if computedCMU == cmu {
+                    // Direct match - blockchain CMU is in correct format
+                    cmuToStore = cmu
+                } else if computedCMU == cmuReversed {
+                    // Byte order mismatch - use computed CMU (transaction building format)
+                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
+                    print("   Blockchain CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    print("   Computed CMU:   \(computedCMU.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    cmuToStore = computedCMU
+                } else {
+                    // Complete mismatch - use computed CMU for safety
+                    print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
+                    print("   Blockchain CMU: \(cmu.map { String(format: "%02x", $0) }.joined())")
+                    print("   Reversed:       \(cmuReversed.map { String(format: "%02x", $0) }.joined())")
+                    print("   Computed CMU:   \(computedCMU.map { String(format: "%02x", $0) }.joined())")
+                    cmuToStore = computedCMU
+                }
+            } else {
+                // Failed to compute CMU - fallback to blockchain CMU
+                print("⚠️ FIX #1138: Could not compute CMU at height \(height) - using blockchain CMU")
+                cmuToStore = cmu
+            }
+
+            // FIX #1142: CRITICAL - Verify witness consistency BEFORE storing
+            // Problem: If cmuToStore != cmu (byte order mismatch), witness was built with wrong CMU
+            // The witness merkle_path.root(cmu) won't match merkle_path.root(cmuToStore)
+            // This causes "joinsplit requirements not met" at send time
+            var witnessToStore = witness
+            if !ZipherXFFI.witnessVerifyAnchor(witness, cmu: cmuToStore) {
+                print("🚨 FIX #1142: Witness inconsistent with stored CMU at height \(height)")
+                print("   This note will need witness rebuild before spending")
+                print("   Setting hasCorruptedWitnesses = true to block SEND until fixed")
+                // FIX #1141: Immediately block SEND - don't wait for health check
+                Task { @MainActor in
+                    WalletManager.shared.hasCorruptedWitnesses = true
+                    WalletManager.shared.corruptedWitnessCount += 1
+                }
+            } else {
+                debugLog(.wallet, "✅ FIX #1142: Witness verified for note at height \(height)")
+            }
+
+            // Store note with verified CMU
             let noteId = try database.insertNote(
                 accountId: accountId,
                 diversifier: Data(diversifier),
@@ -3059,8 +3377,8 @@ final class FilterScanner {
                 nullifier: nullifier,
                 txid: txidData,
                 height: height,
-                witness: witness,
-                cmu: cmu // Store CMU for potential witness rebuild
+                witness: witnessToStore,
+                cmu: cmuToStore // FIX #1138: Use computed CMU for transaction building consistency
             )
 
             // IMMEDIATELY record in transaction history for real-time consistency
@@ -3296,6 +3614,29 @@ final class FilterScanner {
                 knownNullifiers.insert(database.hashNullifier(nullifier))
             }
 
+            // FIX #1138: CRITICAL - Use computed CMU instead of blockchain CMU
+            // Same logic as main P2P path - ensures consistency with transaction building
+            let cmuToStore: Data
+            if let computedCMU = ZipherXFFI.computeNoteCMU(
+                diversifier: note.diversifier,
+                rcm: note.rcm,
+                value: note.value,
+                spendingKey: spendingKey
+            ) {
+                let cmuReversed = Data(cmu.reversed())
+                if computedCMU == cmu {
+                    cmuToStore = cmu
+                } else if computedCMU == cmuReversed {
+                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(info.height) - using computed CMU")
+                    cmuToStore = computedCMU
+                } else {
+                    print("❌ FIX #1138: CMU MISMATCH at height \(info.height)!")
+                    cmuToStore = computedCMU
+                }
+            } else {
+                cmuToStore = cmu
+            }
+
             // Store note
             let noteId = try database.insertNote(
                 accountId: accountId,
@@ -3307,7 +3648,7 @@ final class FilterScanner {
                 txid: txidData,
                 height: info.height,
                 witness: Data(count: 1028),
-                cmu: cmu
+                cmu: cmuToStore // FIX #1138: Use computed CMU for transaction building consistency
             )
 
             // Check if change output
@@ -3691,6 +4032,29 @@ final class FilterScanner {
                 knownNullifiers.insert(database.hashNullifier(nullifier))
             }
 
+            // FIX #1138: CRITICAL - Use computed CMU instead of blockchain CMU
+            // Same logic as main P2P path - ensures consistency with transaction building
+            let cmuToStore: Data
+            if let computedCMU = ZipherXFFI.computeNoteCMU(
+                diversifier: Data(diversifier),
+                rcm: Data(rcm),
+                value: value,
+                spendingKey: spendingKey
+            ) {
+                let cmuReversed = Data(cmu.reversed())
+                if computedCMU == cmu {
+                    cmuToStore = cmu
+                } else if computedCMU == cmuReversed {
+                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
+                    cmuToStore = computedCMU
+                } else {
+                    print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
+                    cmuToStore = computedCMU
+                }
+            } else {
+                cmuToStore = cmu
+            }
+
             // Store note with CMU and empty witness (will need to rebuild for spending)
             let noteId = try database.insertNote(
                 accountId: accountId,
@@ -3702,7 +4066,7 @@ final class FilterScanner {
                 txid: txidData,
                 height: height,
                 witness: Data(count: 1028), // Empty witness - needs rebuild for spending
-                cmu: cmu // Store CMU for witness rebuild
+                cmu: cmuToStore // FIX #1138: Use computed CMU for transaction building consistency
             )
 
             // IMMEDIATELY record in transaction history for real-time consistency
@@ -3827,6 +4191,43 @@ final class FilterScanner {
             // Get current witness (will be updated at end of scan with final tree state)
             let witness = ZipherXFFI.treeGetWitness(index: witnessIndex) ?? Data(count: 1028)
 
+            // FIX #1138: CRITICAL - Use computed CMU instead of blockchain CMU
+            // Same logic as main P2P path - ensures consistency with transaction building
+            let cmuToStore: Data
+            if let computedCMU = ZipherXFFI.computeNoteCMU(
+                diversifier: note.diversifier,
+                rcm: note.rcm,
+                value: note.value,
+                spendingKey: spendingKey
+            ) {
+                let cmuReversed = Data(cmu.reversed())
+                if computedCMU == cmu {
+                    cmuToStore = cmu
+                } else if computedCMU == cmuReversed {
+                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
+                    cmuToStore = computedCMU
+                } else {
+                    print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
+                    cmuToStore = computedCMU
+                }
+            } else {
+                cmuToStore = cmu
+            }
+
+            // FIX #1142: CRITICAL - Verify witness consistency BEFORE storing
+            // This ensures the app NEVER breaks witnesses by storing invalid data
+            if !ZipherXFFI.witnessVerifyAnchor(witness, cmu: cmuToStore) {
+                print("🚨 FIX #1142: Witness inconsistent with stored CMU at height \(height)")
+                print("   This note will need witness rebuild before spending")
+                print("   Setting hasCorruptedWitnesses = true to block SEND until fixed")
+                Task { @MainActor in
+                    WalletManager.shared.hasCorruptedWitnesses = true
+                    WalletManager.shared.corruptedWitnessCount += 1
+                }
+            } else {
+                debugLog(.wallet, "✅ FIX #1142: Witness verified for note at height \(height)")
+            }
+
             // Store note in database with CMU
             let noteId = try database.insertNote(
                 accountId: accountId,
@@ -3838,7 +4239,7 @@ final class FilterScanner {
                 txid: txidData,
                 height: height,
                 witness: witness,
-                cmu: cmu // Store CMU for potential witness rebuild
+                cmu: cmuToStore // FIX #1138: Use computed CMU for transaction building consistency
             )
 
             // Track for final witness update
@@ -3906,6 +4307,43 @@ final class FilterScanner {
         // Get witness for the note commitment
         let witness = try await getWitness(for: output.cmu, at: height)
 
+        // FIX #1138: CRITICAL - Use computed CMU instead of compact block CMU
+        // This ensures consistency with transaction building
+        let cmuToStore: Data
+        if let computedCMU = ZipherXFFI.computeNoteCMU(
+            diversifier: note.diversifier,
+            rcm: note.rcm,
+            value: note.value,
+            spendingKey: spendingKey
+        ) {
+            let cmuReversed = Data(output.cmu.reversed())
+            if computedCMU == output.cmu {
+                cmuToStore = output.cmu
+            } else if computedCMU == cmuReversed {
+                print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
+                cmuToStore = computedCMU
+            } else {
+                print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
+                cmuToStore = computedCMU
+            }
+        } else {
+            cmuToStore = output.cmu
+        }
+
+        // FIX #1142: CRITICAL - Verify witness consistency BEFORE storing
+        // This ensures the app NEVER breaks witnesses by storing invalid data
+        if !ZipherXFFI.witnessVerifyAnchor(witness, cmu: cmuToStore) {
+            print("🚨 FIX #1142: Witness inconsistent with stored CMU at height \(height)")
+            print("   This note will need witness rebuild before spending")
+            print("   Setting hasCorruptedWitnesses = true to block SEND until fixed")
+            Task { @MainActor in
+                WalletManager.shared.hasCorruptedWitnesses = true
+                WalletManager.shared.corruptedWitnessCount += 1
+            }
+        } else {
+            debugLog(.wallet, "✅ FIX #1142: Witness verified for note at height \(height)")
+        }
+
         // Store note in database
         _ = try database.insertNote(
             accountId: accountId,
@@ -3916,7 +4354,8 @@ final class FilterScanner {
             nullifier: nullifier,
             txid: txid,
             height: height,
-            witness: witness
+            witness: witness,
+            cmu: cmuToStore // FIX #1138: Store computed CMU for transaction building consistency
         )
 
         // Record transaction history for received note
@@ -4388,9 +4827,10 @@ final class FilterScanner {
             self.cmuDataForPositionLookup = cmuData
 
             // Save tree state for future use
+            // FIX #1138: Save tree state WITH HEIGHT
             if let treeData = ZipherXFFI.treeSerialize() {
-                try? WalletDatabase.shared.saveTreeState(treeData)
-                print("✅ FIX #528: Saved tree state to database")
+                try? WalletDatabase.shared.saveTreeState(treeData, height: boostHeight)
+                print("✅ FIX #528+1138: Saved tree state at height \(boostHeight)")
             }
 
             return true

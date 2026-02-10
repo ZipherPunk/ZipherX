@@ -924,9 +924,16 @@ enum ZipherXFFI {
     }
 
     /// Load a witness into memory for tracking/updating
-    /// Returns the witness index or UInt64.max on error
+    /// FIX #1177: Returns ARRAY INDEX (not tree position) or UInt64.max on error
     static func treeLoadWitness(witnessData: UnsafePointer<UInt8>, witnessLen: Int) -> UInt64 {
         return zipherx_tree_load_witness(witnessData, witnessLen)
+    }
+
+    /// FIX #1177: Get tree position from a loaded witness (for nullifier computation)
+    /// witnessIndex: Array index returned by treeLoadWitness()
+    /// Returns tree position or UInt64.max on error
+    static func witnessGetTreePosition(witnessIndex: UInt64) -> UInt64 {
+        return zipherx_witness_get_tree_position(witnessIndex)
     }
 
     /// FIX #739: Update ALL loaded witnesses with a single CMU (without modifying tree)
@@ -1579,6 +1586,53 @@ enum ZipherXFFI {
         }
 
         return result
+    }
+
+    /// FIX #1138: Compute CMU from note parts - ROOT CAUSE FIX for P2P CMU mismatch
+    /// Ensures P2P notes store computed CMU (matching FIX #585 for boost file notes)
+    /// - Parameters:
+    ///   - diversifier: 11-byte diversifier
+    ///   - rcm: 32-byte random commitment
+    ///   - value: Note value in zatoshis
+    ///   - spendingKey: 169-byte spending key
+    /// - Returns: 32-byte computed CMU, or nil on error
+    static func computeNoteCMU(diversifier: Data, rcm: Data, value: UInt64, spendingKey: Data) -> Data? {
+        guard diversifier.count == 11 else {
+            print("❌ FIX #1138: Diversifier wrong size (\(diversifier.count) bytes)")
+            return nil
+        }
+        guard rcm.count == 32 else {
+            print("❌ FIX #1138: RCM wrong size (\(rcm.count) bytes)")
+            return nil
+        }
+        guard spendingKey.count == 169 else {
+            print("❌ FIX #1138: Spending key wrong size (\(spendingKey.count) bytes)")
+            return nil
+        }
+
+        var cmuOut = Data(count: 32)
+        let success = cmuOut.withUnsafeMutableBytes { cmuPtr in
+            diversifier.withUnsafeBytes { divPtr in
+                rcm.withUnsafeBytes { rcmPtr in
+                    spendingKey.withUnsafeBytes { skPtr in
+                        zipherx_compute_note_cmu(
+                            divPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            rcmPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            value,
+                            skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            cmuPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                        )
+                    }
+                }
+            }
+        }
+
+        if success {
+            return cmuOut
+        } else {
+            print("❌ FIX #1138: Failed to compute CMU")
+            return nil
+        }
     }
 
     // MARK: - OVK Output Recovery (Transaction History)

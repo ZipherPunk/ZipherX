@@ -95,14 +95,80 @@ CLAUDE.md
 CLAUDE_FULL_BACKUP.md
 GPT.md
 
-# Private session/debug docs (never commit)
-SESSION_SUMMARY.md
+# Private session/debug/analysis docs (never commit)
+SESSION_SUMMARY*.md
 ANCHOR_MISMATCH_ANALYSIS.md
 TRANSACTION_DEBUGGING.md
 COMPACT_BLOCK_IMPLEMENTATION_PLAN.md
 HEADER_SYNC_IMPLEMENTATION_PLAN.md
 QUICK_FIX.md
 ZipherX-iOS-Wallet-Architecture.md
+*_ANALYSIS.md
+*_SUMMARY.md
+*_PROMPT.md
+*_FINDINGS.md
+ESCALATION_*.md
+LOG_ANALYSIS_*.md
+FIX_*.md
+MIGRATION_*.md
+BROADCAST_*.md
+CODEBASE_*.md
+ADDING_PARALLEL*.md
+BOOST_FILE_*.md
+TOR_ISSUES*.md
+TREE_ROOT_*.md
+COMPLETE_FIX*.md
+
+# Security audits (never commit to public repo)
+*AUDIT*.md
+*AUDIT*.html
+SECURITY_AUDIT*.md
+SECURITY_AUDIT*.html
+
+# Claude backup docs
+CLAUDE_BACKUP*.md
+
+# Test/debug scripts (development only, never commit)
+test_*.py
+test_*.sh
+test_*.swift
+test_*.rs
+test_*.cpp
+test_decrypt
+test_decrypt_new
+test_decrypt_rust/
+check_*.py
+check_*.sh
+check_*.swift
+analyze_*.py
+analyze_*.sh
+diagnose_*.py
+verify_*.py
+verify_*.sh
+verify_*.swift
+scan_zclassic_peers*.py
+get_block_headers.py
+encode_key.py
+decode_key.py
+decrypt_key.py
+decrypt_key.swift
+convert_to_bech32.py
+extract_witness_roots.swift
+validate_witnesses.swift
+monitor_*.sh
+watch_*.sh
+prepare_test.sh
+quick_test.sh
+run_all_tests.sh
+scripts/
+
+# Rust FFI test binaries (dev tools, not needed for build)
+Libraries/zipherx-ffi/src/bin/test_*
+Libraries/zipherx-ffi/src/bin/verify_*
+Libraries/zipherx-ffi/verify_*.rs
+Libraries/zipherx-ffi/tt
+Libraries/zipherx-ffi/.cargo/
+Libraries/zipherx-ffi/src/lib.rs.bak
 
 # Test Rust target directories
 test_decrypt_rust/target/
@@ -110,8 +176,19 @@ test_decrypt_rust/target/
 
 # Local backup and test files (development only)
 *.backup
+*.bak
 validate_anchor.py
 zipherx_wallet.db
+
+# Performance docs (internal)
+PERFORMANCE_*.md
+PERFORMANCE_*.html
+STARTUP_*.md
+
+# Database files (never commit - contain wallet data or are generated at runtime)
+*.db
+!Libraries/**/*.db
+Resources/Binaries/*.db
 
 # External Zclassic node (C++ fork of Zcash/Bitcoin - not ZipherX code)
 zclassic-fork/

@@ -13,7 +13,8 @@ struct ContentView: View {
     @State private var isFirstLaunch: Bool = false
     @State private var isInitialSync: Bool = true  // Track initial sync state
     @State private var hasCompletedInitialSync: Bool = false  // Prevent re-running
-    @State private var isShowingLockScreen: Bool = false  // Don't show during initial sync
+    // FIX #1253: Lock screen starts TRUE when biometric enabled — NEVER show wallet before auth
+    @State private var isShowingLockScreen: Bool = BiometricAuthManager.shared.isBiometricEnabled
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
@@ -648,6 +649,22 @@ struct ContentView: View {
                                 } else if WalletHealthCheck.shared.hasValidVerifiedState() {
                                     print("⏩ FIX #1131: Skipping FIX #557 v9 - verified state is valid (FIX #1126)")
                                 } else {
+                                    // FIX #1220: Wait for gap-fill to finish before witness rebuild.
+                                    // Gap-fill runs in detached Task from WalletManager.init() — concurrent with INSTANT START.
+                                    // Witness rebuild (FIX #571) makes P2P requests that compete with gap-fill for bandwidth.
+                                    // Wait up to 5 minutes for gap-fill to complete, then proceed.
+                                    if await walletManager.isGapFillingDelta {
+                                        print("⏳ FIX #1220: Waiting for gap-fill to complete before witness rebuild...")
+                                        await MainActor.run {
+                                            walletManager.setConnecting(true, status: "Repairing tree integrity...")
+                                        }
+                                        for _ in 1...600 {  // Up to 5 min (600 × 500ms)
+                                            if await !walletManager.isGapFillingDelta { break }
+                                            try? await Task.sleep(nanoseconds: 500_000_000)
+                                        }
+                                        print("✅ FIX #1220: Gap-fill finished — proceeding with witness rebuild")
+                                    }
+
                                     print("🔄 FIX #557 v9: Rebuilding stale witnesses before showing UI (INSTANT START)...")
                                     await MainActor.run {
                                         walletManager.setConnecting(true, status: "Updating witnesses for instant send...")
@@ -676,23 +693,26 @@ struct ContentView: View {
                                     // Step 1: Fix any nullifiers computed with wrong positions
                                     let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
                                     if fixedNullifiers > 0 {
-                                        print("🔧 FIX #1091 v2: Fixed \(fixedNullifiers) nullifier(s) - triggering Full Rescan for accurate balance")
-
-                                        // FIX #1091 v2: When nullifiers are fixed, trigger Full Rescan
-                                        // The slow P2P verification (72,000+ blocks) is unreliable
-                                        // Full Rescan uses boost file + targeted P2P = fast and reliable
-                                        await MainActor.run {
-                                            walletManager.setConnecting(true, status: "Repairing balance (nullifiers were corrupted)...")
+                                        // FIX #1192: Do NOT trigger Full Rescan when nullifiers are fixed!
+                                        // recomputeNullifiersWithCorrectPositions() already:
+                                        //   1. Extracts correct positions from witness data
+                                        //   2. Updates witnessIndex in the database
+                                        //   3. Recomputes and stores correct nullifiers
+                                        // A full rescan clears the delta bundle and does an incomplete P2P
+                                        // refetch, which can cause a loop: positions wrong → fix → rescan → repeat
+                                        // Just refresh balance to pick up any newly-detected spends.
+                                        print("🔧 FIX #1192: Fixed \(fixedNullifiers) nullifier(s) in-place - refreshing balance (no rescan needed)")
+                                        try? await walletManager.refreshBalance()
+                                        // FIX #1195: Force full verification after nullifier fix
+                                        // The previous checkpoint was set with WRONG nullifiers
+                                        let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: true)
+                                        if externalSpends > 0 {
+                                            print("✅ FIX #1192: Detected \(externalSpends) external spend(s) after nullifier fix")
+                                            try? await walletManager.refreshBalance()
                                         }
-                                        try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                                            Task { @MainActor in
-                                                walletManager.setConnecting(true, status: "Repairing: \(Int(progress * 100))%")
-                                            }
-                                        }, forceFullRescan: true)
-                                        print("✅ FIX #1091 v2: Full Rescan complete - balance is now accurate!")
-                                        // Clear the flag since we've done a full rescan
-                                        UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
-                                        UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                                        print("✅ FIX #1192: Nullifiers corrected + balance refreshed - no rescan loop!")
+                                        // FIX #1195b: Let verifyAllUnspentNotesOnChain manage its own flags
+                                        // Don't unconditionally mark complete — scan may have timed out
                                     } else {
                                         // No nullifiers needed fixing - do quick verification
                                         let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: false)
@@ -1455,26 +1475,26 @@ struct ContentView: View {
                                 // Step 1: Fix any nullifiers computed with wrong positions
                                 let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
                                 if fixedNullifiers > 0 {
-                                    print("🔧 FIX #1091 v2: Fixed \(fixedNullifiers) nullifier(s) - triggering Full Rescan for accurate balance")
-
-                                    // FIX #1091 v2: When nullifiers are fixed, trigger Full Rescan
-                                    // The slow P2P verification (72,000+ blocks) is unreliable
-                                    // Full Rescan uses boost file + targeted P2P = fast and reliable
-                                    await MainActor.run {
-                                        walletManager.setConnecting(true, status: "Repairing balance (nullifiers were corrupted)...")
+                                    // FIX #1192: Do NOT trigger Full Rescan when nullifiers are fixed!
+                                    // recomputeNullifiersWithCorrectPositions() already:
+                                    //   1. Extracts correct positions from witness data
+                                    //   2. Updates witnessIndex in the database
+                                    //   3. Recomputes and stores correct nullifiers
+                                    // A full rescan clears the delta bundle and does an incomplete P2P
+                                    // refetch, which can cause a loop: positions wrong → fix → rescan → repeat
+                                    // Just refresh balance to pick up any newly-detected spends.
+                                    print("🔧 FIX #1192: Fixed \(fixedNullifiers) nullifier(s) in-place - refreshing balance (no rescan needed)")
+                                    try? await walletManager.refreshBalance()
+                                    // FIX #1195: Force full verification after nullifier fix
+                                    // The previous checkpoint was set with WRONG nullifiers
+                                    let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: true)
+                                    if externalSpends > 0 {
+                                        print("✅ FIX #1192: Detected \(externalSpends) external spend(s) after nullifier fix")
+                                        try? await walletManager.refreshBalance()
                                     }
-                                    try await walletManager.repairNotesAfterDownloadedTree(
-                                        onProgress: { progress, current, total in
-                                            Task { @MainActor in
-                                                walletManager.setConnecting(true, status: "Repairing: \(Int(progress * 100))%")
-                                            }
-                                        },
-                                        forceFullRescan: true
-                                    )
-                                    print("✅ FIX #1091 v2: Full Rescan complete - balance is now accurate!")
-                                    // Clear the flag since we've done a full rescan
-                                    UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
-                                    UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                                    print("✅ FIX #1192: Nullifiers corrected + balance refreshed - no rescan loop!")
+                                    // FIX #1195b: Let verifyAllUnspentNotesOnChain manage its own flags
+                                    // Don't unconditionally mark complete — scan may have timed out
                                 } else {
                                     // No nullifiers needed fixing - do quick verification
                                     let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(forceFullVerification: false)
@@ -2162,8 +2182,10 @@ struct ContentView: View {
                             // Header sync should have completed during initial sync phase
                             networkManager.enableBackgroundProcesses()
 
-                            // After initial sync, show lock screen if biometric enabled
-                            if biometricManager.isBiometricEnabled {
+                            // FIX #1253: Ensure lock screen shown after initial sync if biometric enabled
+                            // (redundant safety — isShowingLockScreen already starts true via FIX #1253,
+                            //  and overlay also checks hasAuthenticatedThisSession)
+                            if biometricManager.isBiometricEnabled && !biometricManager.hasAuthenticatedThisSession {
                                 isShowingLockScreen = true
                             }
 
@@ -2198,6 +2220,12 @@ struct ContentView: View {
                             }
                             // FIX #145: Enable background processes even on early stop
                             networkManager.enableBackgroundProcesses()
+
+                            // FIX #1253: MUST show lock screen on stop sync too — prevents bypass
+                            if biometricManager.isBiometricEnabled && !biometricManager.hasAuthenticatedThisSession {
+                                isShowingLockScreen = true
+                            }
+
                             // Start inactivity timer
                             startInactivityTimer()
                         },
@@ -2290,8 +2318,12 @@ struct ContentView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                // Face ID lock screen overlay
-                if isShowingLockScreen && biometricManager.isBiometricEnabled && !isInitialSync {
+                // FIX #1253: SECURITY — Lock screen overlay blocks ALL wallet content
+                // Shows when: (A) isShowingLockScreen is true, OR (B) biometric enabled but never authenticated this session
+                // The second condition prevents ANY wallet content from being visible before first auth
+                // NEVER dismiss until LAContext returns .success via BiometricAuthManager
+                if biometricManager.isBiometricEnabled && !isInitialSync &&
+                   (isShowingLockScreen || !biometricManager.hasAuthenticatedThisSession) {
                     LockScreenView(onUnlock: {
                         withAnimation {
                             isShowingLockScreen = false

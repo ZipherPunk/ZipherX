@@ -721,8 +721,13 @@ bool zipherx_decode_spending_key(const char *addr_str, uint8_t *sk_out);
 bool zipherx_validate_address(const char *addr_str);
 
 /// Load witness from serialized data (1028 bytes)
-/// Returns witness index or u64::MAX on error
+/// Returns array index or u64::MAX on error
 uint64_t zipherx_tree_load_witness(const uint8_t *witness_data, size_t witness_len);
+
+/// FIX #1177: Get tree position from a loaded witness (for nullifier computation)
+/// witness_index: Array index returned by zipherx_tree_load_witness
+/// Returns tree position or u64::MAX on error
+uint64_t zipherx_witness_get_tree_position(uint64_t witness_index);
 
 /// FIX #739: Update ALL loaded witnesses with a CMU (WITHOUT modifying the tree)
 /// Returns number of witnesses updated
@@ -769,6 +774,17 @@ uint32_t zipherx_verify_note_cmu(
     const uint8_t *rcm,             // 32 bytes
     uint64_t value,
     const uint8_t *spending_key     // 169 bytes
+);
+
+/// FIX #1138: Compute CMU from note parts - ROOT CAUSE FIX for P2P CMU mismatch
+/// Returns computed CMU in cmu_out (32 bytes)
+/// Returns: true on success, false on error
+bool zipherx_compute_note_cmu(
+    const uint8_t *diversifier,     // 11 bytes
+    const uint8_t *rcm,             // 32 bytes
+    uint64_t value,
+    const uint8_t *spending_key,    // 169 bytes
+    uint8_t *cmu_out                // 32 bytes output
 );
 
 // =============================================================================

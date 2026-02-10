@@ -3381,20 +3381,26 @@ struct SettlementCelebrationView: View {
 // MARK: - Lock Screen View
 
 /// Face ID lock screen overlay
+/// FIX #1253: Lock screen that BLOCKS all wallet content until authentication succeeds
+/// SECURITY: This overlay is opaque — no wallet data visible behind it
+/// On failure/cancel: stays locked, shows retry with increasing delays
+/// NEVER dismisses unless LAContext evaluatePolicy returns .success
 struct LockScreenView: View {
     @EnvironmentObject var themeManager: ThemeManager
     let onUnlock: () -> Void
 
+    @StateObject private var biometricManager = BiometricAuthManager.shared
     @State private var isAuthenticating = false
     @State private var authError: String?
     @State private var showRetryButton = false
+    @State private var retryCountdown: Int = 0  // FIX #1253: Countdown timer for retry delay
+    @State private var retryTimer: Timer?
 
     private var theme: AppTheme { themeManager.currentTheme }
-    private var biometricManager: BiometricAuthManager { BiometricAuthManager.shared }
 
     var body: some View {
         ZStack {
-            // Blurred/dimmed background
+            // FIX #1253: OPAQUE background — no wallet content visible
             theme.backgroundColor
                 .ignoresSafeArea()
 
@@ -3430,29 +3436,49 @@ struct LockScreenView: View {
                         .padding(.horizontal, 32)
                 }
 
+                // FIX #1253: Show failure count after 2+ failures
+                if biometricManager.consecutiveFailures >= 2 {
+                    Text("Failed attempts: \(biometricManager.consecutiveFailures)")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+
                 Spacer()
 
-                // Unlock button
+                // Unlock button / retry with countdown
                 if showRetryButton {
-                    Button(action: attemptUnlock) {
-                        HStack {
-                            Image(systemName: biometricManager.biometricType.systemImageName)
-                            Text("Tap to Unlock")
+                    if retryCountdown > 0 {
+                        // FIX #1253: Show countdown during retry delay
+                        Text("Try again in \(retryCountdown)s")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                    } else {
+                        Button(action: attemptUnlock) {
+                            HStack {
+                                Image(systemName: biometricManager.biometricType.systemImageName)
+                                Text("Try Again")
+                            }
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textPrimary)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                            .background(theme.buttonBackground)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                            )
+                            .cornerRadius(theme.cornerRadius)
                         }
-                        .font(theme.bodyFont)
-                        .foregroundColor(theme.textPrimary)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 12)
-                        .background(theme.buttonBackground)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: theme.cornerRadius)
-                                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
-                        )
-                        .cornerRadius(theme.cornerRadius)
+                        .buttonStyle(PlainButtonStyle())
                     }
-                    .buttonStyle(PlainButtonStyle())
+                } else if isAuthenticating {
+                    Text("Authenticating...")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
                 } else {
-                    // Auto-authenticate on appear
+                    // Waiting to auto-authenticate
                     Text("Authenticating...")
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
@@ -3468,23 +3494,39 @@ struct LockScreenView: View {
                 attemptUnlock()
             }
         }
+        .onDisappear {
+            // Clean up timer
+            retryTimer?.invalidate()
+            retryTimer = nil
+        }
     }
 
     private func attemptUnlock() {
+        // FIX #1253: Enforce retry delay
+        guard biometricManager.canRetry else {
+            let remaining = Int(ceil(biometricManager.retryDelayRemaining))
+            startRetryCountdown(seconds: remaining)
+            return
+        }
+
         isAuthenticating = true
         authError = nil
         showRetryButton = false
+        retryCountdown = 0
+        retryTimer?.invalidate()
 
         biometricManager.authenticateForAppUnlock { success, error in
             isAuthenticating = false
 
             if success {
+                // FIX #1253: ONLY dismiss lock screen on .success
                 onUnlock()
             } else {
+                // FIX #1253: Auth failed or cancelled — STAY LOCKED, show retry
                 if let laError = error as? LAError {
                     switch laError.code {
                     case .userCancel:
-                        authError = "Authentication cancelled"
+                        authError = "Authentication required to access wallet"
                     case .userFallback:
                         authError = "Use passcode instead"
                     case .biometryNotAvailable:
@@ -3500,6 +3542,29 @@ struct LockScreenView: View {
                     authError = "Authentication failed"
                 }
                 showRetryButton = true
+
+                // FIX #1253: Start countdown if there's a retry delay
+                let delay = Int(ceil(biometricManager.currentRetryDelay))
+                if delay > 0 {
+                    startRetryCountdown(seconds: delay)
+                }
+            }
+        }
+    }
+
+    /// FIX #1253: Countdown timer for retry delay
+    private func startRetryCountdown(seconds: Int) {
+        retryCountdown = seconds
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            DispatchQueue.main.async {
+                if retryCountdown > 1 {
+                    retryCountdown -= 1
+                } else {
+                    retryCountdown = 0
+                    timer.invalidate()
+                    retryTimer = nil
+                }
             }
         }
     }

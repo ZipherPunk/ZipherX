@@ -2960,9 +2960,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
         }
     };
 
-    // FIX #1091: Extract the ACTUAL tree position from the witness
-    // CRITICAL: witnessed_position() returns the real commitment tree index
-    // Previously returned array index which was wrong for nullifier computation
+    // FIX #1091: Extract the ACTUAL tree position from the witness for logging
     let tree_position = u64::from(witness.witnessed_position());
 
     // FIX #230: Use safe_lock for mutex
@@ -2973,8 +2971,35 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     let array_index = witnesses_guard.len();
     witnesses_guard.push(witness);
 
-    debug_log!("📝 FIX #1091: Loaded witness at array index {}, tree position {}", array_index, tree_position);
-    tree_position  // Return TREE POSITION, not array index!
+    // FIX #1177: Return ARRAY INDEX, not tree position!
+    // All callers (FilterScanner, TransactionBuilder, WalletManager) use this
+    // value to call zipherx_tree_get_witness() which indexes into WITNESSES Vec.
+    // Tree position is embedded in witness data and extracted during spend creation.
+    debug_log!("📝 FIX #1177: Loaded witness at array index {}, tree position {}", array_index, tree_position);
+    array_index as u64
+}
+
+/// FIX #1177: Get tree position (witnessed_position) from a loaded witness
+/// This is the actual commitment tree index needed for nullifier computation.
+/// witness_index: Array index returned by zipherx_tree_load_witness
+/// Returns tree position or u64::MAX on error
+#[no_mangle]
+pub extern "C" fn zipherx_witness_get_tree_position(witness_index: u64) -> u64 {
+    let witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    match witnesses_guard.get(witness_index as usize) {
+        Some(w) => {
+            let pos = u64::from(w.witnessed_position());
+            debug_log!("📝 FIX #1177: Witness array[{}] tree position = {}", witness_index, pos);
+            pos
+        }
+        None => {
+            debug_log!("❌ FIX #1177: Invalid witness index {} for position lookup (array size: {})", witness_index, witnesses_guard.len());
+            u64::MAX
+        }
+    }
 }
 
 /// Get the root of the tree
@@ -7757,6 +7782,77 @@ pub unsafe extern "C" fn zipherx_verify_note_cmu(
         debug_log!("   Computed: {}", hex::encode(&computed_cmu_bytes));
         return 0;
     }
+}
+
+/// FIX #1138: Compute CMU from note parts and return it
+/// This is the ROOT CAUSE FIX for CMU mismatch - ensures P2P notes store computed CMU
+/// just like FIX #585 does for boost file notes.
+///
+/// # Safety
+/// - All pointers must be valid and properly aligned
+/// - diversifier: 11 bytes, rcm: 32 bytes, spending_key: 169 bytes, cmu_out: 32 bytes
+///
+/// # Returns
+/// true if CMU was computed successfully, false on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_note_cmu(
+    diversifier: *const u8,
+    rcm: *const u8,
+    value: u64,
+    spending_key: *const u8,
+    cmu_out: *mut u8,
+) -> bool {
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid diversifier pointer"); return false; }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid rcm pointer"); return false; }
+    };
+    let sk_slice = match safe_slice(spending_key, 169) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid spending_key pointer"); return false; }
+    };
+    let out_slice = match safe_slice_mut(cmu_out, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid cmu_out pointer"); return false; }
+    };
+
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => { eprintln!("❌ FIX #1138: Invalid rcm"); return false; }
+    };
+
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => { eprintln!("❌ FIX #1138: Failed to read spending key: {:?}", e); return false; }
+    };
+
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => { eprintln!("❌ FIX #1138: Invalid diversifier for note address"); return false; }
+    };
+
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    let computed_cmu = note.cmu();
+    let computed_cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+    out_slice.copy_from_slice(&computed_cmu_bytes);
+
+    debug_log!("✅ FIX #1138: Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
+    true
 }
 
 /// Free a buffer allocated by Rust FFI

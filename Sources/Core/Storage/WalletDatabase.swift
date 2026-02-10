@@ -1835,10 +1835,12 @@ final class WalletDatabase {
             }
 
             // STEP 2: Insert transaction history (ALWAYS do this, even if note was missing)
+            // FIX #1134: Status must be 'confirmed' - this function is ONLY called when TX is confirmed!
+            // Previously 'pending' was WRONG - confirmOutgoingTx and FilterScanner only call this for confirmed TXs
             let insertSql = """
                 INSERT OR REPLACE INTO transaction_history
                 (txid, block_height, block_time, tx_type, value, fee, to_address, from_diversifier, memo, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 'pending');
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 'confirmed');
             """
 
             var insertStmt: OpaquePointer?
@@ -1853,9 +1855,15 @@ final class WalletDatabase {
                 sqlite3_bind_blob(insertStmt, 1, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(spentHeight))
-            // FIX #291: Use NULL for block_time - will be set when TX is confirmed
-            // Using current time was WRONG because TX isn't mined yet
-            sqlite3_bind_null(insertStmt, 3)
+            // FIX #1153: Get block_time immediately from HeaderStore instead of NULL
+            // Previously block_time was NULL and only populated later by fixBlockTimestamps()
+            // This caused "no date/hour" display issue for newly sent transactions
+            if let blockTime = try? HeaderStore.shared.getBlockTime(at: spentHeight), blockTime > 0 {
+                sqlite3_bind_int64(insertStmt, 3, Int64(blockTime))
+            } else {
+                // Fallback to NULL if header not available (rare edge case)
+                sqlite3_bind_null(insertStmt, 3)
+            }
 
             // VUL-015: Use obfuscated type code
             let encryptedType = encryptTxType(.sent)
@@ -2281,8 +2289,14 @@ final class WalletDatabase {
 
     /// FIX #292: Get total unspent balance INCLUDING notes without witnesses (for diagnostics)
     /// This shows what balance COULD be available after witness rebuild
+    /// FIX #1233: Also include orphan spent notes (is_spent=1 but spent_in_tx IS NULL or empty).
+    /// These are notes that were marked spent during a failed TX/rollback but never actually spent.
+    /// Without this, orphan notes are excluded from balance → missing balance.
     func getTotalUnspentBalance(accountId: Int64) throws -> UInt64 {
-        let sql = "SELECT COALESCE(SUM(value), 0) FROM notes WHERE account_id = ? AND is_spent = 0;"
+        let sql = """
+            SELECT COALESCE(SUM(value), 0) FROM notes WHERE account_id = ?
+            AND (is_spent = 0 OR (is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '')));
+        """
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -2397,7 +2411,9 @@ final class WalletDatabase {
         var details: [String] = []
 
         // 1. Calculate balance from unspent notes - THIS IS THE AUTHORITATIVE BALANCE
-        let notesBalance = try getBalance(accountId: accountId)
+        // FIX #1210: Use getTotalUnspentBalance (no witness requirement) for integrity check.
+        // getBalance() requires witnesses, returns 0 when witnesses are temporarily cleared.
+        var notesBalance = try getTotalUnspentBalance(accountId: accountId)
         let notesBalanceZCL = Double(notesBalance) / 100_000_000.0
         details.append(String(format: "📊 Balance (unspent notes): %.8f ZCL", notesBalanceZCL))
 
@@ -2449,16 +2465,39 @@ final class WalletDatabase {
             sqlite3_finalize(negativeStmt)
         }
 
-        // Check for notes marked spent but no spent_in_tx
-        let orphanSpentSql = "SELECT COUNT(*) FROM notes WHERE is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '') AND account_id = ?;"
+        // FIX #1233: Check for orphan spent notes (is_spent=1 but spent_in_tx IS NULL or empty)
+        // These are notes marked spent during a failed TX/rollback that were never actually spent.
+        // Previously this was just a warning — now auto-restore them like FIX #1169 does for phantoms.
+        let orphanSpentSql = "SELECT COUNT(*), COALESCE(SUM(value), 0) FROM notes WHERE is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '') AND account_id = ?;"
         var orphanSpentStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, orphanSpentSql, -1, &orphanSpentStmt, nil) == SQLITE_OK {
             sqlite3_bind_int64(orphanSpentStmt, 1, accountId)
             if sqlite3_step(orphanSpentStmt) == SQLITE_ROW {
                 let orphanCount = Int(sqlite3_column_int(orphanSpentStmt, 0))
+                let orphanTotal = UInt64(sqlite3_column_int64(orphanSpentStmt, 1))
                 if orphanCount > 0 {
-                    // This is a warning, not critical - spent notes without txid can happen
-                    details.append("⚠️ Warning: \(orphanCount) spent notes without spent_in_tx")
+                    let orphanZCL = Double(orphanTotal) / 100_000_000.0
+                    details.append(String(format: "🚨 FIX #1233: %d orphan spent note(s) (%.8f ZCL) — spent_in_tx missing", orphanCount, orphanZCL))
+                    details.append("🔧 FIX #1233: Auto-restoring orphan spent notes to unspent...")
+
+                    // Auto-fix: Restore orphan spent notes to unspent
+                    let restoreOrphanSql = """
+                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                        WHERE is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '') AND account_id = ?;
+                    """
+                    var restoreOrphanStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, restoreOrphanSql, -1, &restoreOrphanStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_int64(restoreOrphanStmt, 1, accountId)
+                        if sqlite3_step(restoreOrphanStmt) == SQLITE_DONE {
+                            let restored = Int(sqlite3_changes(db))
+                            // Recalculate balance after restoring notes
+                            notesBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
+                            let balanceZCL = Double(notesBalance) / 100_000_000.0
+                            details.append(String(format: "✅ FIX #1233: Restored %d orphan note(s) (+%.8f ZCL) — balance now %.8f ZCL",
+                                                  restored, orphanZCL, balanceZCL))
+                        }
+                        sqlite3_finalize(restoreOrphanStmt)
+                    }
                 }
             }
             sqlite3_finalize(orphanSpentStmt)
@@ -2469,6 +2508,152 @@ final class WalletDatabase {
             isValid = false
             issueFound = "Balance shows \(notesBalance) but no unspent notes found"
             details.append("🚨 ERROR: \(issueFound)")
+        }
+
+        // FIX #1169: CRITICAL - Detect notes spent by phantom TXs (TX doesn't exist in history or on chain)
+        // A note marked as spent but whose spending TX was deleted/never existed = stolen balance
+        let phantomSpentSql = """
+            SELECT n.id, n.value, hex(n.spent_in_tx) FROM notes n
+            WHERE n.is_spent = 1 AND n.spent_in_tx IS NOT NULL AND n.account_id = ?
+            AND NOT EXISTS (
+                SELECT 1 FROM transaction_history th WHERE th.txid = n.spent_in_tx
+            )
+            AND hex(n.spent_in_tx) NOT LIKE '626F6F7374%';
+        """
+        var phantomStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, phantomSpentSql, -1, &phantomStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(phantomStmt, 1, accountId)
+            var phantomCount = 0
+            var phantomTotal: UInt64 = 0
+            while sqlite3_step(phantomStmt) == SQLITE_ROW {
+                let noteId = sqlite3_column_int64(phantomStmt, 0)
+                let value = UInt64(sqlite3_column_int64(phantomStmt, 1))
+                phantomCount += 1
+                phantomTotal += value
+                let valueZCL = Double(value) / 100_000_000.0
+                details.append(String(format: "🚨 FIX #1169: Note #%d (%.8f ZCL) spent by TX not in history!", noteId, valueZCL))
+            }
+            sqlite3_finalize(phantomStmt)
+
+            if phantomCount > 0 {
+                isValid = false
+                let totalZCL = Double(phantomTotal) / 100_000_000.0
+                issueFound = String(format: "%d note(s) spent by phantom TXs (%.8f ZCL missing)", phantomCount, totalZCL)
+                details.append("🚨 FIX #1169: \(issueFound)")
+                details.append("🔧 FIX #1169: Auto-restoring notes spent by phantom TXs...")
+
+                // Auto-fix: Restore these notes to unspent
+                let restoreSql = """
+                    UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                    WHERE is_spent = 1 AND spent_in_tx IS NOT NULL AND account_id = ?
+                    AND id IN (
+                        SELECT n2.id FROM notes n2
+                        WHERE n2.is_spent = 1 AND n2.spent_in_tx IS NOT NULL AND n2.account_id = ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM transaction_history th WHERE th.txid = n2.spent_in_tx
+                        )
+                        AND hex(n2.spent_in_tx) NOT LIKE '626F6F7374%'
+                    );
+                """
+                var restoreStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, restoreSql, -1, &restoreStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(restoreStmt, 1, accountId)
+                    sqlite3_bind_int64(restoreStmt, 2, accountId)
+                    if sqlite3_step(restoreStmt) == SQLITE_DONE {
+                        let restored = Int(sqlite3_changes(db))
+                        // FIX #1245: Use getTotalUnspentBalance (no witness requirement) instead of getBalance
+                        // getBalance() requires witness IS NOT NULL — returns 0 when witnesses are cleared/missing
+                        // (FIX #1210 pattern). This caused restored amount to show as 0 or underflow.
+                        let newBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
+                        let restoredZCL = Double(newBalance - notesBalance) / 100_000_000.0
+                        notesBalance = newBalance
+                        details.append(String(format: "✅ FIX #1169: Restored %d note(s) (+%.8f ZCL) - balance corrected to %.8f ZCL",
+                                              restored, restoredZCL, Double(notesBalance) / 100_000_000.0))
+                        // After restoring, the balance IS now valid
+                        isValid = true
+                        issueFound = ""
+                    }
+                    sqlite3_finalize(restoreStmt)
+                }
+            }
+        }
+
+        // FIX #1245: Detect stale phantom TXs — sent TXs marked 'confirmed' but never mined (block_height=0).
+        // These are created by FIX #1221's root cause: empty mempool response falsely confirms TX.
+        // STEP 3 only catches these within 2 hours. After that, they live in history forever.
+        // A real confirmed TX has block_height > 0 (set by confirmOutgoingTx when mined).
+        // Stale threshold: 1 hour (enough for 24+ blocks at ~2.5 min/block).
+        let stalePhantomCutoff = Int(Date().timeIntervalSince1970) - 3600 // 1 hour ago
+        let stalePhantomSql = """
+            SELECT txid, value, fee FROM transaction_history
+            WHERE tx_type IN ('sent', 'α')
+            AND status = 'confirmed'
+            AND (block_height IS NULL OR block_height = 0)
+            AND created_at < ?
+            AND created_at > 0;
+        """
+        var stalePhantomStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, stalePhantomSql, -1, &stalePhantomStmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stalePhantomStmt, 1, Int64(stalePhantomCutoff))
+            var stalePhantomCount = 0
+            var stalePhantomTxids: [Data] = []
+            while sqlite3_step(stalePhantomStmt) == SQLITE_ROW {
+                guard let txidPtr = sqlite3_column_blob(stalePhantomStmt, 0) else { continue }
+                let txidLen = sqlite3_column_bytes(stalePhantomStmt, 0)
+                let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+                let value = UInt64(sqlite3_column_int64(stalePhantomStmt, 1))
+                stalePhantomCount += 1
+                stalePhantomTxids.append(txidData)
+                let txidHex = txidData.map { String(format: "%02x", $0) }.joined()
+                let valueZCL = Double(value) / 100_000_000.0
+                details.append(String(format: "🚨 FIX #1245: Stale phantom TX %@... (%.8f ZCL) — 'confirmed' but block_height=0 (never mined)",
+                                      String(txidHex.prefix(16)), valueZCL))
+            }
+            sqlite3_finalize(stalePhantomStmt)
+
+            if stalePhantomCount > 0 {
+                details.append("🔧 FIX #1245: Restoring \(stalePhantomCount) stale phantom TX(s) — notes + deleting from history...")
+
+                for txid in stalePhantomTxids {
+                    // Restore notes spent by this phantom TX
+                    let restoreNotesSql = """
+                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                        WHERE is_spent = 1 AND spent_in_tx = ? AND account_id = ?;
+                    """
+                    var restoreNotesStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, restoreNotesSql, -1, &restoreNotesStmt, nil) == SQLITE_OK {
+                        _ = txid.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(restoreNotesStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+                        }
+                        sqlite3_bind_int64(restoreNotesStmt, 2, accountId)
+                        if sqlite3_step(restoreNotesStmt) == SQLITE_DONE {
+                            let notesRestored = Int(sqlite3_changes(db))
+                            if notesRestored > 0 {
+                                details.append("✅ FIX #1245: Restored \(notesRestored) note(s) from stale phantom TX")
+                            }
+                        }
+                        sqlite3_finalize(restoreNotesStmt)
+                    }
+
+                    // Delete phantom TX from transaction_history
+                    let deleteTxSql = "DELETE FROM transaction_history WHERE txid = ?;"
+                    var deleteTxStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, deleteTxSql, -1, &deleteTxStmt, nil) == SQLITE_OK {
+                        _ = txid.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(deleteTxStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+                        }
+                        if sqlite3_step(deleteTxStmt) == SQLITE_DONE {
+                            details.append("🗑️ FIX #1245: Deleted stale phantom TX from history")
+                        }
+                        sqlite3_finalize(deleteTxStmt)
+                    }
+                }
+
+                // Recalculate balance after restoration
+                notesBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
+                let balanceZCL = Double(notesBalance) / 100_000_000.0
+                details.append(String(format: "✅ FIX #1245: Balance after stale phantom cleanup: %.8f ZCL", balanceZCL))
+            }
         }
 
         // FIX #1088: For historyBalance return, calculate what history WOULD show
@@ -2516,17 +2701,16 @@ final class WalletDatabase {
             details.append(String(format: "🔄 Unspent change outputs: %.8f ZCL (expected)", changeZCL))
         }
 
-        // FIX #1130: History vs notes comparison is INFORMATIONAL ONLY
-        // This comparison is fundamentally flawed because:
-        // - History balance = received - sent - fees (user-facing view, excludes change)
-        // - Notes balance = actual unspent outputs (includes change outputs)
-        // These CAN legitimately differ significantly and should NOT trigger isValid=false
-        // Real integrity checks (negative values, orphan spends) are above
+        // FIX #1130 + FIX #1169: History vs notes comparison
+        // When history > notes, it could be:
+        // 1. Normal accounting difference (change outputs)
+        // 2. A note incorrectly marked as spent by a phantom TX (caught by FIX #1169 above)
+        // FIX #1169 already auto-restores phantom-spent notes, so if we reach here
+        // and there's still a difference, it's either already fixed or a minor accounting gap
         if changeInBalance < 0 {
             let diffZCL = Double(-changeInBalance) / 100_000_000.0
-            details.append(String(format: "ℹ️ FIX #1130: History shows %.8f ZCL more than notes (informational)", diffZCL))
-            details.append("   This is expected - history and notes use different accounting methods")
-            // DO NOT set isValid=false - this is not a real integrity issue
+            details.append(String(format: "⚠️ FIX #1130: History shows %.8f ZCL more than notes", diffZCL))
+            details.append("   FIX #1169 phantom check ran above - remaining gap may be accounting difference")
         }
 
         if isValid {
@@ -3115,6 +3299,49 @@ final class WalletDatabase {
         print("🔄 Cleared tree state and witnesses for rebuild (preserved note records)")
     }
 
+    /// FIX #1210: Clear ONLY the serialized tree state blob, preserving witnesses AND lastScannedHeight.
+    /// Use this when the tree needs reloading (e.g., stale delta) but notes/witnesses are still valid.
+    /// Sapling accepts any historical anchor, so existing witnesses remain spendable.
+    func clearTreeStateOnly() throws {
+        let sql = "UPDATE sync_state SET tree_state = NULL WHERE id = 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        print("🔄 FIX #1210: Cleared tree state only (witnesses and lastScannedHeight preserved)")
+    }
+
+    /// FIX #1238: Clear witnesses and anchors for ALL unspent notes.
+    /// Used when tree repair is exhausted and all witnesses are from corrupted tree state.
+    /// Unlike clearTreeStateForRebuild, this preserves tree_state and lastScannedHeight.
+    /// Balance still shows via getTotalUnspentBalance() (FIX #1210, no witness requirement).
+    /// - Returns: Number of witnesses cleared
+    @discardableResult
+    func clearWitnessesForCorruptedTree() throws -> Int {
+        let sql = "UPDATE notes SET witness = NULL, anchor = NULL WHERE is_spent = 0 AND witness IS NOT NULL;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let affected = Int(sqlite3_changes(db))
+        print("🛑 FIX #1238: Cleared \(affected) corrupted witnesses (unspent notes only)")
+        return affected
+    }
+
     // MARK: - Tree Checkpoints
     // Checkpoints store verified tree state at block boundaries for reliable transaction building
 
@@ -3469,6 +3696,62 @@ final class WalletDatabase {
         }
 
         return deletedValue
+    }
+
+    /// FIX #1168: Restore all notes that were incorrectly marked as spent by a phantom/rejected TX
+    /// When a TX is rejected by the network, the notes it tried to spend must be restored to unspent
+    /// Returns: count of restored notes and their total value
+    func restoreNotesSpentByPhantomTx(txid: Data) throws -> (count: Int, totalValue: UInt64) {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        // First find what notes are affected
+        let selectSql = "SELECT id, value FROM notes WHERE spent_in_tx = ? AND is_spent = 1;"
+        var selectStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(selectStmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        var affectedNotes: [(id: Int64, value: UInt64)] = []
+        while sqlite3_step(selectStmt) == SQLITE_ROW {
+            let noteId = sqlite3_column_int64(selectStmt, 0)
+            let value = UInt64(sqlite3_column_int64(selectStmt, 1))
+            affectedNotes.append((id: noteId, value: value))
+        }
+
+        guard !affectedNotes.isEmpty else {
+            return (count: 0, totalValue: 0)
+        }
+
+        // Restore all affected notes to unspent
+        let updateSql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL WHERE spent_in_tx = ?;"
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+
+        _ = txid.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+        }
+
+        guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let updated = Int(sqlite3_changes(db))
+        let totalValue = affectedNotes.reduce(UInt64(0)) { $0 + $1.value }
+
+        for note in affectedNotes {
+            let valueZCL = Double(note.value) / 100_000_000.0
+            print("✅ FIX #1168: Restored note #\(note.id) (\(String(format: "%.8f", valueZCL)) ZCL) - TX was rejected by network")
+        }
+
+        return (count: updated, totalValue: totalValue)
     }
 
     /// VUL-002: Unmark a note as spent (restore it after phantom TX removal)
@@ -4531,11 +4814,15 @@ final class WalletDatabase {
         // Keep the one with the lowest id (first inserted)
         // VUL-015 fix: Normalize tx_type before grouping to handle both plaintext and obfuscated codes
         // 'sent' and 'α' are the same, 'received' and 'β' are the same, 'change' and 'γ' are the same
+        // FIX #1154: MUST include txid in GROUP BY to preserve distinct transactions!
+        // Previous bug: Two DIFFERENT transactions with same (type, value, height) were deleted as "duplicates"
+        // This caused user's previous TX to disappear from history when new TX had same amount
         let cleanupSql = """
             DELETE FROM transaction_history
             WHERE id NOT IN (
                 SELECT MIN(id) FROM transaction_history
                 GROUP BY
+                    txid,
                     CASE
                         WHEN tx_type IN ('sent', 'α') THEN 'sent'
                         WHEN tx_type IN ('received', 'β') THEN 'received'

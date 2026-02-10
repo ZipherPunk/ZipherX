@@ -420,10 +420,12 @@ actor ParallelImportCoordinator {
     private func saveTreeToDatabase(_ treeData: Data) async throws {
         print("💾 FIX #506: Saving tree to database...")
 
-        try WalletDatabase.shared.saveTreeState(treeData)
+        // FIX #1138: Save tree state WITH HEIGHT (boost file height)
+        let boostHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
+        try WalletDatabase.shared.saveTreeState(treeData, height: boostHeight)
         UserDefaults.standard.set(ZipherXFFI.treeSize(), forKey: "effectiveTreeCMUCount")
 
-        print("✅ FIX #506: Tree saved to database")
+        print("✅ FIX #506+1138: Tree saved at height \(boostHeight)")
     }
 
     // MARK: - Progress Posting

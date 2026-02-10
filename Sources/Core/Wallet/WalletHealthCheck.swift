@@ -68,18 +68,33 @@ final class WalletHealthCheck {
         let currentTreeSize = ZipherXFFI.treeSize()
         let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
 
-        // Tree size and lastScannedHeight should match (witnesses may vary slightly)
-        let treeSizeMatches = currentTreeSize == savedTreeSize || savedTreeSize == 0
+        // FIX #1182: Use tolerance for tree size comparison instead of exact match.
+        // Background delta sync (syncDeltaBundleIfNeeded) can add a few CMUs between
+        // verification and next check. Small growth (≤50 CMUs) is normal and should NOT
+        // trigger expensive 44-second health checks + witness rebuild.
+        // Tree can only GROW (append-only), so currentTreeSize >= savedTreeSize is expected.
+        let treeSizeTolerance: UInt64 = 50
+        let treeSizeMatches: Bool
+        if savedTreeSize == 0 {
+            treeSizeMatches = true
+        } else if currentTreeSize >= savedTreeSize && (currentTreeSize - savedTreeSize) <= treeSizeTolerance {
+            treeSizeMatches = true
+        } else if currentTreeSize == savedTreeSize {
+            treeSizeMatches = true
+        } else {
+            treeSizeMatches = false
+        }
         let lastScannedMatches = currentLastScanned == savedLastScanned || savedLastScanned == 0
 
         if treeSizeMatches && lastScannedMatches {
             print("✅ FIX #1126: Valid verified state from \(String(format: "%.1f", hoursSinceVerification))h ago")
-            print("   Tree: \(currentTreeSize), LastScanned: \(currentLastScanned)")
+            let treeDiff = currentTreeSize >= savedTreeSize ? currentTreeSize - savedTreeSize : 0
+            print("   Tree: \(currentTreeSize) (saved \(savedTreeSize), +\(treeDiff)), LastScanned: \(currentLastScanned)")
             return true
         }
 
         print("⚠️ FIX #1126: State changed since verification - running full health checks")
-        print("   Tree: \(currentTreeSize) vs saved \(savedTreeSize)")
+        print("   Tree: \(currentTreeSize) vs saved \(savedTreeSize) (diff: \(currentTreeSize > savedTreeSize ? Int64(currentTreeSize - savedTreeSize) : -Int64(savedTreeSize - currentTreeSize)))")
         print("   LastScanned: \(currentLastScanned) vs saved \(savedLastScanned)")
         return false
     }
@@ -984,11 +999,12 @@ final class WalletHealthCheck {
                               details: "⚠️ P2P header at \(treeValidationHeight) has zero sapling root - tree root trusted")
             }
 
-            // For non-zero roots above boost file, still skip validation but log for debugging
-            // The tree root is computed from CMUs which are verified, so trust the tree
-            print("⚠️ FIX #796: Skipping validation for P2P-range height - tree root computed from verified CMUs")
-            return .passed("Tree Root Validation",
-                          details: "✓ Tree root trusted (height \(treeValidationHeight) above boost file \(boostEndHeight))")
+            // FIX #1204: Non-zero roots above boost file are now AUTHORITATIVE.
+            // FIX #1204 saves finalsaplingroot from full block P2P fetches into HeaderStore.
+            // If we fetched the full block at this height (delta sync, block scanning),
+            // the root IS from the real block data — compare it normally.
+            print("✅ FIX #1204: Non-zero sapling root found above boost file — using for validation")
+            // Fall through to normal comparison below
         }
 
         // FIX #XXX: Try both byte orders - headers might be stored in different order
@@ -1281,6 +1297,16 @@ final class WalletHealthCheck {
                 return .passed("Anchor Validation", details: "No unspent notes with witnesses to check")
             }
 
+            // FIX #1136: Skip expensive witness check if rebuilt recently (persisted across restarts)
+            // This prevents 44+ second startup delay when witnesses were just rebuilt
+            let lastRebuildTime = UserDefaults.standard.double(forKey: "WitnessRebuildTimestamp")
+            let hoursSinceRebuild = (Date().timeIntervalSince1970 - lastRebuildTime) / 3600
+
+            if lastRebuildTime > 0 && hoursSinceRebuild < 24 {
+                print("⏩ FIX #1136: Skipping FIX #828 - witnesses rebuilt \(String(format: "%.1f", hoursSinceRebuild))h ago")
+                return .passed("Anchor Validation", details: "Recently rebuilt ✓")
+            }
+
             print("🔍 FIX #828: Checking witness consistency for \(unspentNotes.count) unspent notes...")
 
             var corruptedNotes: [(noteId: Int64, height: UInt64)] = []
@@ -1298,8 +1324,20 @@ final class WalletHealthCheck {
 
             if corruptedNotes.isEmpty {
                 print("✅ FIX #828: All \(unspentNotes.count) witnesses are internally consistent!")
+                // FIX #1141: Clear corrupted witness flag - all witnesses valid
+                await MainActor.run {
+                    WalletManager.shared.hasCorruptedWitnesses = false
+                    WalletManager.shared.corruptedWitnessCount = 0
+                }
                 return .passed("Anchor Validation", details: "All \(unspentNotes.count) witnesses consistent ✓")
             }
+
+            // FIX #1141: Set corrupted witness flag IMMEDIATELY to block SEND
+            await MainActor.run {
+                WalletManager.shared.hasCorruptedWitnesses = true
+                WalletManager.shared.corruptedWitnessCount = corruptedNotes.count
+            }
+            print("🚫 FIX #1141: SEND BLOCKED - \(corruptedNotes.count) corrupted witnesses detected")
 
             // FIX #783: Check if tree repair is exhausted BEFORE attempting auto-fix
             let repairExhausted = UserDefaults.standard.bool(forKey: "TreeRepairExhausted")
@@ -1308,9 +1346,10 @@ final class WalletHealthCheck {
                 print("🛑 FIX #783: \(corruptedNotes.count) corrupted witnesses detected but cannot auto-fix")
                 print("🛑 FIX #783: User MUST run 'Full Resync' in Settings to rebuild witnesses")
 
+                // FIX #1141: critical: true to block SEND until user runs Full Resync
                 return .failed("Anchor Validation",
                               details: "⚠️ \(corruptedNotes.count) corrupted witnesses. Auto-repair exhausted. Run 'Full Resync' in Settings.",
-                              critical: false)
+                              critical: true)
             }
 
             // FIX #828: AUTO-FIX - Rebuild corrupted witnesses
@@ -1321,12 +1360,21 @@ final class WalletHealthCheck {
 
             if fixed >= corruptedNotes.count {
                 print("✅ FIX #828: Successfully rebuilt \(fixed) witnesses!")
+                // FIX #1141: Clear corrupted witness flag - all fixed
+                await MainActor.run {
+                    WalletManager.shared.hasCorruptedWitnesses = false
+                    WalletManager.shared.corruptedWitnessCount = 0
+                }
                 return .passed("Anchor Validation", details: "Rebuilt \(fixed) witnesses ✓")
             } else {
                 print("⚠️ FIX #828: Rebuilt \(fixed)/\(corruptedNotes.count) witnesses")
+                // FIX #1141: Keep flag set - some witnesses still corrupted, critical: true to block SEND
+                await MainActor.run {
+                    WalletManager.shared.corruptedWitnessCount = corruptedNotes.count - fixed
+                }
                 return .failed("Anchor Validation",
                               details: "Rebuilt \(fixed)/\(corruptedNotes.count) witnesses. Run 'Full Resync' in Settings to retry.",
-                              critical: false)
+                              critical: true)
             }
 
         } catch {

@@ -42,6 +42,7 @@ class DeltaCMUManager {
 
     private let deltaFileName = "shielded_outputs_delta.bin"
     private let manifestFileName = "delta_manifest.json"
+    private let saplingRootsFileName = "delta_sapling_roots.bin"  // FIX #1253
 
     /// Output record size - MUST match GitHub boost file format exactly
     /// height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) = 652 bytes
@@ -57,6 +58,13 @@ class DeltaCMUManager {
     private var manifestFileURL: URL {
         // Use centralized app data directory (Application Support on macOS, Documents on iOS)
         return AppDirectories.appData.appendingPathComponent(manifestFileName)
+    }
+
+    // FIX #1253: Companion file for finalsaplingroots from P2P block fetches.
+    // Format: array of 40-byte entries (UInt64 height LE + 32-byte sapling_root).
+    // Append-only. Cleared only by clearDeltaBundle(). Immutable when DeltaBundleVerified.
+    private var saplingRootsFileURL: URL {
+        return AppDirectories.appData.appendingPathComponent(saplingRootsFileName)
     }
 
     // Thread safety
@@ -478,15 +486,136 @@ class DeltaCMUManager {
         }
     }
 
-    /// Clear the delta bundle (e.g., when wallet is deleted or GitHub bundle is updated)
-    func clearDeltaBundle() {
+    /// FIX #1190: Update only the tree root in the delta manifest
+    /// Called AFTER callers compute the tree root from FFI, to finalize the delta
+    /// This avoids the chicken-and-egg problem: delta outputs are saved during P2P fetch,
+    /// but tree root is only known after all CMUs are appended to the tree
+    func updateManifestTreeRoot(_ treeRoot: Data) {
         queue.sync {
+            guard var manifest = getManifest() else {
+                print("⚠️ FIX #1190: Cannot update tree root - no manifest exists")
+                return
+            }
+
+            manifest = DeltaManifest(
+                startHeight: manifest.startHeight,
+                endHeight: manifest.endHeight,
+                outputCount: manifest.outputCount,
+                cmuCount: manifest.cmuCount,
+                treeRoot: treeRoot.hexString,
+                updatedAt: ISO8601DateFormatter().string(from: Date())
+            )
+
+            do {
+                let manifestData = try JSONEncoder().encode(manifest)
+                try manifestData.write(to: manifestFileURL)
+                print("📦 FIX #1190: Updated delta manifest tree root to \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+            } catch {
+                print("⚠️ FIX #1190: Failed to update manifest tree root: \(error)")
+            }
+        }
+    }
+
+    /// Clear the delta bundle.
+    /// FIX #1254: By default, REFUSES to clear if delta is verified (immutable).
+    /// Only Full Rescan, wallet wipe, and boost file update should pass `force: true`.
+    /// All other callers (validation failures, tree mismatches, etc.) use default `force: false`
+    /// which protects verified delta from accidental destruction.
+    func clearDeltaBundle(force: Bool = false) {
+        queue.sync {
+            // FIX #1254: Guard verified delta from non-forced clears.
+            // 26+ callsites trigger clearDeltaBundle on validation failures,
+            // but verified delta was already validated against blockchain roots.
+            // Validation failure after verification = loading/sync issue, NOT delta corruption.
+            if !force && UserDefaults.standard.bool(forKey: "DeltaBundleVerified") {
+                print("🛡️ FIX #1254: clearDeltaBundle() BLOCKED — delta is VERIFIED (immutable)")
+                print("   Use force:true only for Full Rescan, wallet wipe, or boost update")
+                print("   Caller should handle the mismatch without destroying verified data")
+                return
+            }
             try? FileManager.default.removeItem(at: deltaFileURL)
             try? FileManager.default.removeItem(at: manifestFileURL)
+            try? FileManager.default.removeItem(at: saplingRootsFileURL)  // FIX #1253
             cachedOutputCount = 0
             cachedEndHeight = 0
-            print("📦 DeltaCMU: Cleared delta bundle")
+            // FIX #1252: Any delta clear invalidates the verified flag.
+            // Delta must be rebuilt and re-verified before becoming immutable again.
+            UserDefaults.standard.set(false, forKey: "DeltaBundleVerified")
+            // FIX #1253: Clear in-memory cache too
+            HeaderStore.shared.deltaSaplingRoots = []
+            if force {
+                print("📦 DeltaCMU: FORCE cleared delta bundle + sapling roots (authorized operation)")
+            } else {
+                print("📦 DeltaCMU: Cleared delta bundle + sapling roots (delta was not verified)")
+            }
         }
+    }
+
+    // MARK: - FIX #1253: Delta Sapling Roots
+
+    /// Append a finalsaplingroot from a P2P block fetch to the delta roots file.
+    /// Each entry is 40 bytes: UInt64 height (LE) + 32-byte sapling_root.
+    /// Append-only file, cleared only by clearDeltaBundle().
+    /// Also adds to HeaderStore in-memory cache for immediate containsSaplingRoot() lookups.
+    func appendSaplingRoot(height: UInt64, root: Data) {
+        guard root.count == 32 else { return }
+        queue.sync {
+            var entry = Data(capacity: 40)
+            var h = height
+            withUnsafeBytes(of: &h) { entry.append(contentsOf: $0) }  // 8 bytes LE
+            entry.append(root)  // 32 bytes
+
+            if FileManager.default.fileExists(atPath: saplingRootsFileURL.path) {
+                if let handle = try? FileHandle(forWritingTo: saplingRootsFileURL) {
+                    handle.seekToEndOfFile()
+                    handle.write(entry)
+                    handle.closeFile()
+                }
+            } else {
+                try? entry.write(to: saplingRootsFileURL)
+            }
+
+            // Also add to in-memory cache (both byte orders for FIX #1230)
+            HeaderStore.shared.deltaSaplingRoots.insert(root)
+            HeaderStore.shared.deltaSaplingRoots.insert(Data(root.reversed()))
+        }
+    }
+
+    /// Load all sapling roots from the delta roots file into a Set for O(1) lookups.
+    /// Called at startup to populate HeaderStore.deltaSaplingRoots.
+    /// Returns roots in BOTH byte orders (wire + canonical) for FIX #1230 compatibility.
+    func loadSaplingRoots() -> Set<Data> {
+        guard FileManager.default.fileExists(atPath: saplingRootsFileURL.path) else {
+            return []
+        }
+        guard let data = try? Data(contentsOf: saplingRootsFileURL) else {
+            return []
+        }
+
+        let entrySize = 40  // 8 (height) + 32 (root)
+        let count = data.count / entrySize
+        var roots = Set<Data>(minimumCapacity: count * 2)
+
+        for i in 0..<count {
+            let offset = i * entrySize + 8  // Skip height, read 32-byte root
+            guard offset + 32 <= data.count else { break }
+            let root = data[offset..<(offset + 32)]
+            let rootData = Data(root)
+            roots.insert(rootData)
+            roots.insert(Data(rootData.reversed()))  // FIX #1230: both byte orders
+        }
+
+        print("📦 FIX #1253: Loaded \(count) delta sapling roots (\(roots.count) entries with both byte orders)")
+        return roots
+    }
+
+    /// Check if the delta sapling roots file exists and has data
+    func hasSaplingRoots() -> Bool {
+        guard FileManager.default.fileExists(atPath: saplingRootsFileURL.path) else {
+            return false
+        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: saplingRootsFileURL.path)[.size] as? Int) ?? 0
+        return size >= 40  // At least one entry
     }
 
     /// Check if we need to fetch outputs from network
@@ -616,22 +745,64 @@ class DeltaCMUManager {
         }
     }
 
-    /// Validate delta bundle tree root against HeaderStore
-    /// This ensures the delta's anchor matches the blockchain's finalSaplingRoot at deltaEndHeight
-    /// FIX #563 v3: Disabled - delta CMUs aren't being saved properly, causing false rejections
-    /// The delta bundle will be re-fetched as needed during witness rebuild
+    /// FIX #1191: Validate delta tree root against P2P block's finalsaplingroot
+    /// Fetches a single block header from a P2P peer and compares the sapling root
+    /// NO local node, NO RPC, NO zclassic-cli — pure P2P validation
+    ///
+    /// Returns true if:
+    /// - No delta exists (nothing to validate)
+    /// - No peers available (graceful skip)
+    /// - Tree root matches blockchain (delta is correct)
+    /// Returns false if:
+    /// - Tree root does NOT match (delta is corrupt)
     func validateTreeRootAgainstHeaders() async -> Bool {
-        guard getManifest() != nil else {
+        guard let manifest = getManifest() else {
             return true  // No delta = nothing to validate
         }
 
-        // FIX #563 v3: Skip validation - delta root is from boost file, not current chain state
-        // The validation causes delta bundle to be cleared on every startup
-        // This is acceptable because:
-        // 1. Delta CMUs are re-fetched during witness rebuild if needed
-        // 2. The FFI tree is synced to chain tip during startup (FIX #557 v32)
-        // 3. TransactionBuilder rebuilds witnesses with fresh data from FFI tree
-        print("📦 FIX #563 v3: Skipping delta tree root validation (delta from boost, validated by FFI sync)")
+        // FIX #1191: Get finalsaplingroot from P2P peer for the delta end height
+        // The block's finalsaplingroot field is the authoritative tree root
+        let endHeight = manifest.endHeight
+
+        // Try to get the sapling root from HeaderStore first (fastest, no network)
+        if let header = try? HeaderStore.shared.getHeader(at: endHeight) {
+            let headerRoot = header.hashFinalSaplingRoot
+            let isZeroRoot = headerRoot.allSatisfy { $0 == 0 }
+
+            if !isZeroRoot {
+                // We have a non-zero header root — compare with delta
+                guard let deltaRootData = Data(hexString: manifest.treeRoot) else {
+                    print("⚠️ FIX #1191: Invalid hex in delta tree root")
+                    return true
+                }
+
+                // Header stores sapling root in wire format (same as delta)
+                if deltaRootData == headerRoot {
+                    print("✅ FIX #1191: Delta tree root MATCHES header at height \(endHeight)")
+                    return true
+                }
+
+                // Also check reversed (header might be display format)
+                let deltaReversed = Data(deltaRootData.reversed())
+                if deltaReversed == headerRoot {
+                    print("✅ FIX #1191: Delta tree root matches header (reversed) at height \(endHeight)")
+                    return true
+                }
+
+                // FIX #1204: HeaderStore roots above boost file ARE authoritative now.
+                // Delta sync fetched full blocks for endHeight → FIX #1204 stored the real
+                // finalsaplingroot from block data (not from unreliable getheaders).
+                // A mismatch here is a REAL mismatch — delta CMUs are corrupt.
+                print("❌ FIX #1191: Delta tree root MISMATCH at height \(endHeight)!")
+                print("   Delta root:  \(manifest.treeRoot.prefix(32))...")
+                print("   Header root: \(headerRoot.map { String(format: "%02x", $0) }.joined().prefix(32))...")
+                return false
+            }
+        }
+
+        // No header available or zero root — skip validation
+        // The delta will be validated indirectly through witness anchor checks
+        print("📦 FIX #1191: No reliable header at height \(endHeight) — skipping delta root validation")
         return true
     }
 

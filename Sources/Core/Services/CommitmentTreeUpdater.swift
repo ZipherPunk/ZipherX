@@ -471,7 +471,8 @@ actor CommitmentTreeUpdater {
 
         // FIX #755: Also invalidate delta bundle when boost file is updated
         // Delta CMUs are for heights after boost file - if boost file changes, delta is invalid
-        DeltaCMUManager.shared.clearDeltaBundle()
+        // FIX #1254: force:true — boost file update is authorized to clear verified delta
+        DeltaCMUManager.shared.clearDeltaBundle(force: true)
         print("🗑️ FIX #755: Cleared delta bundle (boost file updated)")
 
         // Update UserDefaults for effective tree height

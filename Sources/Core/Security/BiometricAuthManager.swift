@@ -40,9 +40,45 @@ final class BiometricAuthManager: ObservableObject {
     /// Whether the app is currently locked
     @Published private(set) var isLocked: Bool = true
 
+    /// FIX #1253: Whether app has been authenticated at least once this session
+    /// Prevents showing wallet content before first successful auth
+    @Published private(set) var hasAuthenticatedThisSession: Bool = false
+
+    /// FIX #1253: Consecutive failed authentication attempts (for increasing delay)
+    @Published private(set) var consecutiveFailures: Int = 0
+
+    /// FIX #1253: Timestamp of last failed attempt (for enforcing retry delay)
+    private var lastFailureTime: Date?
+
     /// Whether biometric auth is enabled in settings
     var isBiometricEnabled: Bool {
         UserDefaults.standard.bool(forKey: "useBiometricAuth")
+    }
+
+    /// FIX #1253: Retry delay based on consecutive failures (seconds)
+    /// 0 failures = 0s, 1 = 2s, 2 = 5s, 3 = 10s, 4 = 20s, 5+ = 30s
+    var currentRetryDelay: TimeInterval {
+        switch consecutiveFailures {
+        case 0: return 0
+        case 1: return 2
+        case 2: return 5
+        case 3: return 10
+        case 4: return 20
+        default: return 30
+        }
+    }
+
+    /// FIX #1253: Time remaining before retry is allowed
+    var retryDelayRemaining: TimeInterval {
+        guard let lastFailure = lastFailureTime else { return 0 }
+        let elapsed = Date().timeIntervalSince(lastFailure)
+        let remaining = currentRetryDelay - elapsed
+        return max(0, remaining)
+    }
+
+    /// FIX #1253: Whether retry is currently allowed (delay has passed)
+    var canRetry: Bool {
+        return retryDelayRemaining <= 0
     }
 
     private init() {
@@ -104,6 +140,8 @@ final class BiometricAuthManager: ObservableObject {
     func authenticate(reason: String, completion: @escaping (Bool, Error?) -> Void) {
         // Skip if biometric not enabled
         guard isBiometricEnabled else {
+            unlockApp()  // Ensure isLocked=false when biometric disabled
+            hasAuthenticatedThisSession = true  // FIX #1253
             completion(true, nil)
             return
         }
@@ -122,6 +160,13 @@ final class BiometricAuthManager: ObservableObject {
                         self?.lastAuthTime = Date()
                         self?.lastActivityTime = Date()
                         self?.isLocked = false
+                        self?.hasAuthenticatedThisSession = true  // FIX #1253
+                        self?.consecutiveFailures = 0  // FIX #1253: Reset on success
+                        self?.lastFailureTime = nil
+                    } else {
+                        // FIX #1253: Track failure for retry delay
+                        self?.consecutiveFailures += 1
+                        self?.lastFailureTime = Date()
                     }
                     completion(success, authError)
                 }
@@ -135,6 +180,13 @@ final class BiometricAuthManager: ObservableObject {
                         self?.lastAuthTime = Date()
                         self?.lastActivityTime = Date()
                         self?.isLocked = false
+                        self?.hasAuthenticatedThisSession = true  // FIX #1253
+                        self?.consecutiveFailures = 0  // FIX #1253: Reset on success
+                        self?.lastFailureTime = nil
+                    } else {
+                        // FIX #1253: Track failure for retry delay
+                        self?.consecutiveFailures += 1
+                        self?.lastFailureTime = Date()
                     }
                     completion(success, authError)
                 }
@@ -142,6 +194,7 @@ final class BiometricAuthManager: ObservableObject {
         }
         else {
             // No biometric/passcode available - allow access
+            hasAuthenticatedThisSession = true  // FIX #1253
             completion(true, nil)
         }
     }
@@ -167,6 +220,16 @@ final class BiometricAuthManager: ObservableObject {
     func authenticateForSend(amount: UInt64, completion: @escaping (Bool, Error?) -> Void) {
         let zcl = Double(amount) / 100_000_000.0
         let reason = String(format: "Authenticate to send %.8f ZCL", zcl)
+
+        #if DEBUG
+        // UAT mode: bypass send auth for test amounts (<= 0.0019 ZCL = 190000 zatoshis)
+        // Enable via: defaults write com.zipherpunk.zipherx.mac uatModeEnabled -bool true
+        if UserDefaults.standard.bool(forKey: "uatModeEnabled") && amount <= 190000 {
+            print("🧪 [UAT] Send auth bypassed for \(amount) zatoshis (\(String(format: "%.4f", zcl)) ZCL)")
+            completion(true, nil)
+            return
+        }
+        #endif
 
         // Check if biometric auth is enabled in settings
         let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
@@ -263,6 +326,16 @@ final class BiometricAuthManager: ObservableObject {
 
     /// Authenticate for app unlock
     func authenticateForAppUnlock(completion: @escaping (Bool, Error?) -> Void) {
+        #if DEBUG
+        // UAT mode: bypass app unlock for automated testing
+        // Enable via: defaults write com.zipherpunk.zipherx.mac uatModeEnabled -bool true
+        if UserDefaults.standard.bool(forKey: "uatModeEnabled") {
+            print("🧪 [UAT] App unlock bypassed (uatModeEnabled=true)")
+            unlockApp()
+            completion(true, nil)
+            return
+        }
+        #endif
         authenticate(reason: "Unlock ZipherX Wallet", completion: completion)
     }
 
@@ -277,6 +350,9 @@ final class BiometricAuthManager: ObservableObject {
     /// Unlock the app (call after successful authentication)
     func unlockApp() {
         isLocked = false
+        hasAuthenticatedThisSession = true  // FIX #1253
+        consecutiveFailures = 0  // FIX #1253: Reset failures on unlock
+        lastFailureTime = nil
         lastAuthTime = Date()
         lastActivityTime = Date()
     }

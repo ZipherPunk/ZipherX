@@ -3524,6 +3524,16 @@ Both binaries must be installed to /usr/local/bin:
 
     // FIX: Force rebuild all witnesses
     private func startForceRebuildWitnesses() {
+        // FIX #1240: Check if tree repair is exhausted BEFORE starting expensive rebuild.
+        // If TreeRepairExhausted is true, the FFI tree has wrong root (incomplete delta).
+        // Rebuilding witnesses from this tree produces anchors that don't exist on blockchain.
+        // Save user 1-5 minutes of futile work — direct them to Full Resync instead.
+        if UserDefaults.standard.bool(forKey: "TreeRepairExhausted") {
+            print("⏩ FIX #1240: Skipping force rebuild — tree repair exhausted")
+            errorMessage = "Tree state is corrupted (incomplete delta CMUs). Witnesses from this tree would have invalid anchors.\n\nPlease use 'Full Resync' instead to rebuild the tree from scratch."
+            return
+        }
+
         isRebuildingWitnesses = true
         print("🔧 Starting force rebuild of all witnesses...")
 

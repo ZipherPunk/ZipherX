@@ -15,6 +15,11 @@ final class HeaderStore {
     private let dbPath: String
     private let queue = DispatchQueue(label: "com.zipherx.headerstore", qos: .userInitiated)
 
+    // FIX #1253: In-memory cache of delta sapling roots (loaded from delta_sapling_roots.bin at startup).
+    // These are finalsaplingroots from post-boost blocks stored in the delta bundle.
+    // containsSaplingRoot() checks this Set (O(1)) before falling back to headers table SQL query.
+    var deltaSaplingRoots: Set<Data> = []
+
     private init() {
         dbPath = AppDirectories.database.appendingPathComponent("zipherx_headers.db").path
     }
@@ -126,6 +131,7 @@ final class HeaderStore {
             """
             CREATE INDEX IF NOT EXISTS idx_headers_hash ON headers(block_hash);
             CREATE INDEX IF NOT EXISTS idx_headers_time ON headers(time);
+            CREATE INDEX IF NOT EXISTS idx_headers_sapling_root ON headers(sapling_root);
             """
         ]
 
@@ -1576,6 +1582,53 @@ final class HeaderStore {
         }
     }
 
+    /// FIX #1156: Update or insert sapling root for a single height
+    /// Used when on-demand P2P block fetch provides sapling root but header sync failed
+    /// This ensures getSaplingRoot() works for notes discovered via on-demand fallback
+    func updateSaplingRoot(at height: UInt64, root: Data, timestamp: UInt32) throws {
+        // Ensure database is open
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return }
+
+        // First try UPDATE (if header exists but sapling root is null/zero)
+        let updateSql = "UPDATE headers SET sapling_root = ?, time = ? WHERE height = ? AND (sapling_root IS NULL OR length(sapling_root) = 0);"
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        _ = root.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(root.count), SQLITE_TRANSIENT)
+        }
+        sqlite3_bind_int64(updateStmt, 2, Int64(timestamp))
+        sqlite3_bind_int64(updateStmt, 3, Int64(height))
+
+        guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        // FIX #1163: If no rows updated, header doesn't exist - DO NOT insert minimal header!
+        // Previously inserted minimal headers with garbage block_hash = X'00' which broke
+        // getheaders locator (peers rejected our requests with unrecognized hash).
+        // Better to let header sync fill in proper headers later.
+        if sqlite3_changes(db) == 0 {
+            // Check if header already has a sapling root (skip if it does)
+            if let existingRoot = try? getSaplingRoot(at: height), !existingRoot.isEmpty {
+                return // Already has a valid sapling root
+            }
+
+            // FIX #1163: Don't insert minimal header - it corrupts HeaderStore for getheaders
+            // FIX #1253: Roots are now saved to delta_sapling_roots.bin via DeltaCMUManager
+            // during P2P block fetches. containsSaplingRoot() checks in-memory cache loaded
+            // from that file at startup. No separate table needed.
+        }
+    }
+
     /// FIX #120: Clear headers above a specific height
     /// Used to clear corrupted P2P-synced headers above the boost file range
     func clearHeadersAboveHeight(_ height: UInt64) throws {
@@ -1891,8 +1944,26 @@ final class HeaderStore {
     /// Check if a Sapling root (anchor) exists in the blockchain headers
     /// Returns true if the anchor is found in any block header
     /// FIX #536: Bind as BLOB instead of TEXT (sapling_root is BLOB column)
+    /// FIX #1230: Check BOTH original and reversed byte order. HeaderStore stores
+    /// finalsaplingroot in wire format (raw bytes from block header offset 68-100).
+    /// FFI treeRoot()/witnessGetRoot() return roots in zcash_primitives canonical
+    /// serialization which is REVERSED byte order. Without checking both, FIX #1224
+    /// anchor validation always fails for FFI-produced anchors → false "corrupted witness"
+    /// at startup and false anchorNotOnChain rejections in TransactionBuilder.
     func containsSaplingRoot(_ anchor: Data) async -> Bool {
-        let sql = "SELECT COUNT(*) FROM headers WHERE sapling_root = ?;"
+        // FIX #1230: Check both the original anchor bytes AND reversed byte order
+        // to handle wire format (HeaderStore) vs canonical format (FFI) mismatch
+        let reversed = Data(anchor.reversed())
+
+        // FIX #1253: Check in-memory delta sapling roots FIRST (O(1) Set lookup).
+        // These are loaded from delta_sapling_roots.bin at startup — covers post-boost
+        // heights where header sync may not have created full header rows yet.
+        if deltaSaplingRoots.contains(anchor) || deltaSaplingRoots.contains(reversed) {
+            return true
+        }
+
+        // Fall back to headers table SQL query (covers boost range + header-synced heights)
+        let sql = "SELECT COUNT(*) FROM headers WHERE sapling_root = ? OR sapling_root = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1903,12 +1974,22 @@ final class HeaderStore {
 
         // FIX #536: Bind as BLOB (not TEXT) - sapling_root is stored as BLOB
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        let bindResult = anchor.withUnsafeBytes { bytes in
+
+        // Bind original anchor bytes (parameter 1)
+        let bindResult1 = anchor.withUnsafeBytes { bytes in
             sqlite3_bind_blob(stmt, 1, bytes.baseAddress, Int32(anchor.count), SQLITE_TRANSIENT)
         }
+        guard bindResult1 == SQLITE_OK else {
+            print("⚠️ FIX #1230: Failed to bind anchor BLOB (original): \(String(cString: sqlite3_errmsg(db)))")
+            return false
+        }
 
-        guard bindResult == SQLITE_OK else {
-            print("⚠️ FIX #536: Failed to bind anchor BLOB: \(String(cString: sqlite3_errmsg(db)))")
+        // FIX #1230: Bind reversed anchor bytes (parameter 2)
+        let bindResult2 = reversed.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(stmt, 2, bytes.baseAddress, Int32(reversed.count), SQLITE_TRANSIENT)
+        }
+        guard bindResult2 == SQLITE_OK else {
+            print("⚠️ FIX #1230: Failed to bind anchor BLOB (reversed): \(String(cString: sqlite3_errmsg(db)))")
             return false
         }
 

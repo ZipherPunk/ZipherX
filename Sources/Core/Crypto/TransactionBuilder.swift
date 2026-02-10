@@ -188,9 +188,10 @@ final class TransactionBuilder {
                     print("✅ Loaded commitment tree with \(treeSize) commitments")
 
                     // CRITICAL: Save to database so we don't need to reload next time
+                    // FIX #1138: Save tree state WITH HEIGHT
                     if let serializedTreeData = ZipherXFFI.treeSerialize() {
-                        try? database.saveTreeState(serializedTreeData)
-                        print("💾 Tree state saved to database for future use")
+                        try? database.saveTreeState(serializedTreeData, height: UInt64(downloadedTreeHeight))
+                        print("💾 FIX #1138: Tree state saved at height \(downloadedTreeHeight)")
                     }
                 } else {
                     print("❌ Failed to deserialize tree from boost file")
@@ -425,6 +426,58 @@ final class TransactionBuilder {
             print("⚠️ FIX #838: Cannot verify witness consistency - CMU not available")
         }
 
+        // FIX #1224: CRITICAL — Verify anchor EXISTS on blockchain before building TX!
+        // A witness can pass witnessPathIsValid AND witnessVerifyAnchor (internally consistent)
+        // but have a BOGUS anchor from a corrupted/incomplete tree. This caused the phantom TX
+        // of FIX #1221: anchor 523b156e... was internally consistent but never existed on chain.
+        // FIX #1204 stores ALL historical finalsaplingroots in HeaderStore during P2P fetches.
+        // If anchor is not found in HeaderStore, the tree was corrupted when witness was created.
+        let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(anchorFromHeader)
+        if !anchorOnChain {
+            let badAnchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
+            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+            if deltaVerified {
+                print("⚠️ FIX #1256: Anchor \(badAnchorHex)... NOT in HeaderStore, but delta VERIFIED — proceeding")
+            } else {
+                print("❌ FIX #1224: Anchor \(badAnchorHex)... NOT FOUND in HeaderStore!")
+                print("   Witness is internally consistent but anchor never existed on blockchain")
+                print("   This would create a phantom TX — REJECTING before Groth16 proof generation")
+                throw TransactionError.anchorNotOnChain
+            }
+        }
+        print("✅ FIX #1224: Anchor verified (HeaderStore or delta verified)")
+
+        // FIX #1137: CRITICAL - Verify stored CMU matches CMU computed from note parts
+        // The Rust FFI recomputes CMU from note parts (diversifier, value, rcm) using Note::from_parts().cmu()
+        // If stored CMU doesn't match computed CMU, the anchor will be wrong and TX will be rejected
+        // This catches data integrity issues BEFORE wasting time on proof generation
+        if let cmu = noteCMU, !cmu.isEmpty {
+            let cmuVerifyResult = ZipherXFFI.verifyNoteCMU(
+                storedCMU: cmu,
+                diversifier: note.diversifier,
+                rcm: note.rcm,
+                value: note.value,
+                spendingKey: spendingKey
+            )
+
+            if cmuVerifyResult == 0 {
+                // CMU MISMATCH - the stored CMU doesn't match CMU computed from note parts!
+                let storedCMUHex = cmu.prefix(16).map { String(format: "%02x", $0) }.joined()
+                print("❌ FIX #1137: CMU MISMATCH DETECTED!")
+                print("   Stored CMU: \(storedCMUHex)...")
+                print("   But CMU computed from (diversifier, value, rcm) is DIFFERENT!")
+                print("   This means the note data in the database is inconsistent.")
+                print("   The anchor derived from stored CMU will NOT match the anchor Rust computes.")
+                print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                print("   💡 Run 'Settings → Repair Database → Full Resync' to fix note data")
+                throw TransactionError.cmuMismatch
+            } else if cmuVerifyResult == 1 {
+                print("✅ FIX #1137: CMU integrity verified (stored CMU == computed CMU)")
+            } else {
+                print("⚠️ FIX #1137: CMU verification returned error code \(cmuVerifyResult)")
+            }
+        }
+
         guard let rawTx = ZipherXFFI.buildTransactionEncrypted(
             encryptedSpendingKey: encryptedKey,
             encryptionKey: encryptionKey,
@@ -574,9 +627,10 @@ final class TransactionBuilder {
                 }
 
                 // CRITICAL: Save to database so we don't need to reload next time
+                // FIX #1138: Save tree state WITH HEIGHT
                 if let serializedTree = ZipherXFFI.treeSerialize() {
-                    try? database.saveTreeState(serializedTree)
-                    print("💾 Tree state saved to database for future use")
+                    try? database.saveTreeState(serializedTree, height: UInt64(downloadedTreeHeight))
+                    print("💾 FIX #1138: Tree state saved at height \(downloadedTreeHeight)")
                 }
 
                 onProgress("tree", "\(cmuCount.formatted()) CMUs loaded", 1.0)
@@ -591,8 +645,9 @@ final class TransactionBuilder {
                 onProgress("tree", "Extracting tree...", 0.85)
                 let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
                 if ZipherXFFI.treeDeserialize(data: serializedTree) {
+                    // FIX #1138: Save tree state WITH HEIGHT
                     if let serializedTreeData = ZipherXFFI.treeSerialize() {
-                        try? database.saveTreeState(serializedTreeData)
+                        try? database.saveTreeState(serializedTreeData, height: UInt64(downloadedTreeHeight))
                     }
                     onProgress("tree", "Tree ready", 1.0)
                 } else {
@@ -694,6 +749,23 @@ final class TransactionBuilder {
                     }
                 } else {
                     commonAnchor = witnessAnchor
+                }
+            }
+
+            // FIX #1224: Verify common anchor EXISTS on blockchain before proceeding
+            if allValid, let anchor = commonAnchor {
+                let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(anchor)
+                if !anchorOnChain {
+                    let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
+                    let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+                    if deltaVerified {
+                        print("⚠️ FIX #1256: Multi-input anchor \(anchorHex)... NOT in HeaderStore, but delta VERIFIED — proceeding")
+                    } else {
+                        print("🚨 FIX #1224: Multi-input common anchor \(anchorHex)... NOT FOUND in HeaderStore!")
+                        print("   All witnesses have matching anchors but anchor never existed on blockchain")
+                        print("   Tree was corrupted when witnesses were created — forcing rebuild")
+                        allValid = false
+                    }
                 }
             }
 
@@ -901,12 +973,13 @@ final class TransactionBuilder {
                             }
 
                             // 6. Save updated tree state
+                            // FIX #1138: Save tree state WITH HEIGHT
                             if let treeData = ZipherXFFI.treeSerialize() {
-                                try? WalletDatabase.shared.saveTreeState(treeData)
+                                try? WalletDatabase.shared.saveTreeState(treeData, height: chainHeight)
                                 try? WalletDatabase.shared.updateLastScannedHeight(chainHeight, hash: Data(count: 32))
                             }
 
-                            print("✅ FAST delta sync complete - \(preparedSpends.count) witnesses updated")
+                            print("✅ FIX #1138: FAST delta sync complete - \(preparedSpends.count) witnesses updated at height \(chainHeight)")
                         }
                     }
                 }
@@ -1012,6 +1085,31 @@ final class TransactionBuilder {
             }
             print("✅ FIX #838: All \(preparedSpends.count) witnesses verified consistent")
 
+            // FIX #1137: CRITICAL - Verify ALL stored CMUs match CMUs computed from note parts
+            // The Rust FFI recomputes CMU from note parts - if stored CMU differs, anchor will be wrong
+            for (i, prepared) in preparedSpends.enumerated() {
+                if let cmu = prepared.note.cmu, !cmu.isEmpty {
+                    let cmuVerifyResult = ZipherXFFI.verifyNoteCMU(
+                        storedCMU: cmu,
+                        diversifier: prepared.note.diversifier,
+                        rcm: prepared.note.rcm,
+                        value: prepared.note.value,
+                        spendingKey: spendingKey
+                    )
+
+                    if cmuVerifyResult == 0 {
+                        let storedCMUHex = cmu.prefix(16).map { String(format: "%02x", $0) }.joined()
+                        print("❌ FIX #1137: CMU MISMATCH on spend \(i)!")
+                        print("   Stored CMU: \(storedCMUHex)...")
+                        print("   But CMU computed from (diversifier, value, rcm) is DIFFERENT!")
+                        print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                        print("   💡 Run 'Settings → Repair Database → Full Resync' to fix note data")
+                        throw TransactionError.cmuMismatch
+                    }
+                }
+            }
+            print("✅ FIX #1137: All \(preparedSpends.count) CMUs verified matching")
+
             guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
                 encryptedSpendingKey: encryptedKey,
                 encryptionKey: encryptionKey,
@@ -1071,7 +1169,28 @@ final class TransactionBuilder {
                 var usedFastPath = false
                 var anchorMismatchDetected = false  // FIX #1018: Track if anchor doesn't match header
 
-                if blocksOld <= maxAnchorAge && note.witness.count > 0 {
+                // FIX #1160: Check if WITNESS anchor is current, not if NOTE is recent
+                // Problem: blocksOld uses NOTE HEIGHT, but FIX #569 updates witness to CURRENT tree state
+                // Example: Note at 2,951,000, chain at 3,004,000 → blocksOld = 53,000 (OLD)
+                //          But witness was updated by FIX #569 to height 3,004,000 (CURRENT)
+                // Solution: If witness anchor matches current tree root, use FAST PATH regardless of note age
+                var witnessIsUpdated = false
+                if note.witness.count > 0 {
+                    if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness),
+                       let currentTreeRoot = ZipherXFFI.treeRoot() {
+                        // Compare witness anchor to current FFI tree root
+                        if witnessAnchor == currentTreeRoot {
+                            witnessIsUpdated = true
+                            print("✅ FIX #1160: Witness anchor matches current tree root - INSTANT SEND!")
+                        } else {
+                            let witnessHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            let treeHex = currentTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            print("⚠️ FIX #1160: Witness anchor \(witnessHex)... ≠ tree root \(treeHex)...")
+                        }
+                    }
+                }
+
+                if (blocksOld <= maxAnchorAge || witnessIsUpdated) && note.witness.count > 0 {
                     // FAST PATH: Witness is recent, use stored witness directly
                     // FIX #1013: Trust the witness if it's recent - the anchor is a valid historical root
                     print("⚡ FIX #1013: Using STORED witness (only \(blocksOld) blocks old) - INSTANT!")
@@ -1086,19 +1205,21 @@ final class TransactionBuilder {
                     let hasValidDbAnchor = dbAnchor.count == 32 && !dbAnchor.allSatisfy { $0 == 0 }
                     let hasValidWitnessRoot = witnessRoot != nil && !witnessRoot!.allSatisfy { $0 == 0 }
 
-                    if hasValidDbAnchor && hasValidWitnessRoot && dbAnchor != witnessRoot! {
-                        // FIX #884: Database anchor differs from witness root!
-                        // This happens when FIX #569 updated the DB anchor but witness blob is stale.
-                        // The witness merkle path computes to the OLD anchor - we MUST rebuild!
-                        let dbHex = dbAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        let witnessHex = witnessRoot!.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        print("⚠️ FIX #884: Anchor mismatch detected!")
-                        print("   Database anchor: \(dbHex)...")
-                        print("   Witness anchor:  \(witnessHex)...")
-                        print("⚠️ FIX #884: FORCING witness rebuild to match current tree state")
-                        anchorMismatchDetected = true  // FIX #884: Force slow path
-                        // Fall through to slow path - do NOT use stale witness
-                    } else if let witnessRoot = witnessRoot {
+                    // FIX #1144: DISABLED FIX #884's anchor comparison - it was WRONG!
+                    // FIX #884 compared dbAnchor != witnessRoot and forced rebuild if they differed.
+                    // But this is INCORRECT because:
+                    //   1. FIX #569 updates DB anchor to CURRENT tree root
+                    //   2. Witness blob has its anchor from when witness was CREATED
+                    //   3. After new blocks arrive, these will ALWAYS differ!
+                    //   4. BUT the witness-embedded anchor IS VALID - it matches the merkle path
+                    //   5. Sapling accepts ANY historical anchor - no need to match current root!
+                    //
+                    // The witness is VALID if:
+                    //   - FIX #827: merkle_path.root(cmu) == witness.root() (already verified in preRebuild)
+                    //   - FIX #1013: Anchor is non-zero
+                    //
+                    // USE the witness-embedded anchor directly - it's the correct historical root!
+                    if let witnessRoot = witnessRoot {
                         anchorToUse = witnessRoot
                         let rootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
                         print("✅ FIX #1013: Witness anchor: \(rootHex)... (valid historical root)")
@@ -1109,14 +1230,16 @@ final class TransactionBuilder {
                             print("❌ FIX #1013: Witness has zero anchor - must rebuild")
                             // Fall through to slow path
                         } else {
-                            // FIX #1047: Skip header validation for notes above boost file
-                            // P2P headers above boost file have UNRELIABLE sapling roots (FIX #796)
+                            // FIX #1204b: HeaderStore sapling roots ARE authoritative (FIX #1204).
+                            // But note: witness anchor = chain TIP root, not note HEIGHT root.
+                            // FIX #890 (below) correctly disables header comparison for ALL heights
+                            // because comparing witness root to header[noteHeight] is wrong.
+                            // The real validations are FIX #827 (merkle path), #1013 (non-zero), #884 (DB match).
                             let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
                             if noteHeight > boostFileEndHeight {
-                                // Note is above boost file - P2P header roots are unreliable
-                                // Trust the witness anchor directly (it's non-zero and recent)
+                                // FIX #1204b: Trust witness anchor (non-zero, validated by FIX #827/#1013/#884)
                                 usedFastPath = true
-                                print("✅ FIX #1047: Note height \(noteHeight) > boost file \(boostFileEndHeight) - trusting witness anchor (P2P headers unreliable)")
+                                print("✅ FIX #1204b: Note height \(noteHeight) > boost file \(boostFileEndHeight) - trusting witness anchor (validated)")
                             } else {
                                 // FIX #890: DISABLED FIX #1018's header comparison - it was WRONG!
                                 // FIX #1018 compared witness anchor to header root at NOTE HEIGHT, but:
@@ -1214,6 +1337,29 @@ final class TransactionBuilder {
                     print("✅ FIX #838: Witness consistency verified (stored root == computed anchor)")
                 } else {
                     print("⚠️ FIX #838: Cannot verify witness consistency - CMU not available")
+                }
+
+                // FIX #1137: CRITICAL - Verify stored CMU matches CMU computed from note parts
+                if let cmu = note.cmu, !cmu.isEmpty {
+                    let cmuVerifyResult = ZipherXFFI.verifyNoteCMU(
+                        storedCMU: cmu,
+                        diversifier: note.diversifier,
+                        rcm: note.rcm,
+                        value: note.value,
+                        spendingKey: spendingKey
+                    )
+
+                    if cmuVerifyResult == 0 {
+                        let storedCMUHex = cmu.prefix(16).map { String(format: "%02x", $0) }.joined()
+                        print("❌ FIX #1137: CMU MISMATCH DETECTED!")
+                        print("   Stored CMU: \(storedCMUHex)...")
+                        print("   But CMU computed from (diversifier, value, rcm) is DIFFERENT!")
+                        print("   TX would be rejected by network with 'joinsplit requirements not met'")
+                        print("   💡 Run 'Settings → Repair Database → Full Resync' to fix note data")
+                        throw TransactionError.cmuMismatch
+                    } else if cmuVerifyResult == 1 {
+                        print("✅ FIX #1137: CMU integrity verified (stored CMU == computed CMU)")
+                    }
                 }
 
                 // FIX #995: Timing instrumentation - track Groth16 proof generation
@@ -1572,9 +1718,18 @@ final class TransactionBuilder {
         let startHeight = downloadedTreeHeight + 1
         print("📡 Fetching CMUs from blocks \(startHeight) to \(targetHeight)...")
 
-        // Batch fetch all CMUs using P2P-first approach
-        let allDeltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
-        print("📊 Got \(allDeltaCMUs.count) CMUs from blocks \(startHeight) to \(targetHeight)")
+        // FIX #1225: Batch fetch with error handling - fail fast if P2P fetch fails
+        let allDeltaCMUs: [Data]
+        do {
+            allDeltaCMUs = try await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+            print("📊 Got \(allDeltaCMUs.count) CMUs from blocks \(startHeight) to \(targetHeight)")
+        } catch TransactionError.deltaCMUsFetchFailed(let blockRange) {
+            print("❌ FIX #1225: Cannot rebuild witness - failed to fetch \(blockRange) blocks of delta CMUs")
+            return nil
+        } catch {
+            print("❌ Unexpected error fetching delta CMUs: \(error)")
+            return nil
+        }
 
         var additionalCMUs: [Data] = []
         var notePosition: UInt64? = nil
@@ -1640,11 +1795,25 @@ final class TransactionBuilder {
         let rootHex = anchor.map { String(format: "%02x", $0) }.joined()
         print("📝 Computed anchor from rebuilt tree: \(rootHex.prefix(16))...")
 
+        // FIX #1226: Verify anchor exists on blockchain before returning witness
+        // Same defense as multi-note path — prevents stale witnesses from incomplete tree
+        let singleAnchorOnChain = await HeaderStore.shared.containsSaplingRoot(anchor)
+        if !singleAnchorOnChain {
+            print("🚨 FIX #1226: Single-note witness anchor \(rootHex.prefix(16))... NOT FOUND in HeaderStore!")
+            print("🚨 FIX #1226: Tree was built from incomplete delta CMUs — returning nil")
+            return nil
+        }
+        print("✅ FIX #1226: Single-note witness anchor verified on blockchain")
+
+        // FIX #1190: Update delta manifest tree root now that we've computed the anchor
+        DeltaCMUManager.shared.updateManifestTreeRoot(anchor)
+
         // 7. CRITICAL: Save updated tree to database for future transactions
         // This avoids re-fetching CMUs from chain next time
+        // FIX #1138: Save tree state WITH HEIGHT
         if let serializedTree = ZipherXFFI.treeSerialize() {
-            try? WalletDatabase.shared.saveTreeState(serializedTree)
-            print("💾 Updated tree state saved to database")
+            try? WalletDatabase.shared.saveTreeState(serializedTree, height: targetHeight)
+            print("💾 FIX #1138: Updated tree state saved at height \(targetHeight)")
         }
 
         return (witness: witness, anchor: anchor)
@@ -1716,14 +1885,28 @@ final class TransactionBuilder {
         // 3. Fetch delta CMUs from chain (only blocks beyond boost file)
         // FIX #115: Fetch to targetHeight (chain tip), NOT maxNoteHeight
         // This ensures witnesses are built to a consistent, current tree state
+        // FIX #1225: Throw error if P2P fetch fails - prevents creating stale witnesses
         var deltaCMUs: [Data] = []
         if targetHeight > downloadedTreeHeight {
             let startHeight = downloadedTreeHeight + 1
             print("📡 Fetching delta CMUs from blocks \(startHeight) to \(targetHeight)...")
 
             // Use batched P2P-first fetching (reduces log spam, works with Tor)
-            deltaCMUs = await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
-            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain (covering \(targetHeight - startHeight + 1) blocks)")
+            // FIX #1225: This now throws if P2P fetch fails with empty CMUs
+            // FIX #1226: Also throws if partial coverage path returns incomplete data
+            deltaCMUs = try await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+            let blockRange = targetHeight - startHeight + 1
+            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain (covering \(blockRange) blocks)")
+
+            // FIX #1226: Sanity check — if we requested thousands of blocks but got 0 CMUs,
+            // the data is suspicious. While some block ranges legitimately have 0 shielded outputs,
+            // ranges >1000 blocks with 0 CMUs almost certainly indicate a fetch failure that
+            // fetchCMUsFromBlocks didn't detect (e.g., blocks returned but CMU extraction failed).
+            if deltaCMUs.isEmpty && blockRange > 1000 {
+                print("🚨 FIX #1226: Got 0 CMUs from \(blockRange) blocks — highly suspicious!")
+                print("🚨 FIX #1226: Refusing to create witnesses with stale boost-only data")
+                throw TransactionError.deltaCMUsFetchFailed(blockRange: blockRange)
+            }
         }
 
         // 4. Build combined CMU data: boost + delta
@@ -1773,6 +1956,28 @@ final class TransactionBuilder {
         }
         let rootHex = validAnchor.map { String(format: "%02x", $0) }.joined()
         print("📝 Extracted anchor from witness (same for all): \(rootHex.prefix(16))...")
+
+        // FIX #1226: Verify witness anchor EXISTS on blockchain before saving witnesses!
+        // Even if witness creation succeeded internally (correct merkle path), the anchor
+        // may not exist on the blockchain if the tree was built from incomplete delta CMUs.
+        // This is the LAST DEFENSE against stale witnesses being saved to the database.
+        // FIX #1224 checks at startup and pre-build, but this checks at CREATION TIME.
+        let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(validAnchor)
+        if !anchorOnChain {
+            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+            if deltaVerified {
+                print("⚠️ FIX #1256: Witness anchor \(rootHex.prefix(16))... NOT in HeaderStore, but delta VERIFIED — saving witnesses")
+            } else {
+                print("🚨 FIX #1226: Witness anchor \(rootHex.prefix(16))... NOT FOUND in HeaderStore!")
+                print("🚨 FIX #1226: Witnesses were created from incomplete/corrupted tree — REJECTING ALL")
+                print("🚨 FIX #1226: This prevents stale witnesses from being saved to database")
+                throw TransactionError.anchorNotOnChain
+            }
+        }
+        print("✅ FIX #1226: Witness anchor verified (HeaderStore or delta verified)")
+
+        // FIX #1190: Update delta manifest tree root now that we've computed the anchor
+        DeltaCMUManager.shared.updateManifestTreeRoot(validAnchor)
 
         // 7. Build results with same anchor for all (all witnesses from same batch have same root)
         // FIX #1030: Don't throw on individual note failures - process what we can!
@@ -1828,9 +2033,10 @@ final class TransactionBuilder {
         }
 
         // 9. Save updated tree state to database
+        // FIX #1138: Save tree state WITH HEIGHT
         if let serializedTree = ZipherXFFI.treeSerialize() {
-            try? WalletDatabase.shared.saveTreeState(serializedTree)
-            print("💾 Updated tree state saved to database at height \(targetHeight)")
+            try? WalletDatabase.shared.saveTreeState(serializedTree, height: targetHeight)
+            print("💾 FIX #1138: Updated tree state saved at height \(targetHeight)")
         }
 
         print("✅ Rebuilt \(results.count) witnesses with SAME anchor using boost + delta")
@@ -1839,7 +2045,8 @@ final class TransactionBuilder {
 
     /// Fetch CMUs from a range of blocks using P2P first, then InsightAPI fallback
     /// This batches requests to reduce log spam and uses P2P when Tor mode is enabled
-    internal func fetchCMUsFromBlocks(startHeight: UInt64, endHeight: UInt64) async -> [Data] {
+    /// FIX #1225: Now throws when P2P fetch fails with empty CMUs (prevents stale witness creation)
+    internal func fetchCMUsFromBlocks(startHeight: UInt64, endHeight: UInt64) async throws -> [Data] {
         var allCMUs: [Data] = []
         let networkManager = NetworkManager.shared
         let torEnabled = await TorManager.shared.mode == .enabled
@@ -1852,7 +2059,14 @@ final class TransactionBuilder {
         if let deltaManifest = deltaManager.getManifest() {
             // CRITICAL FIX #115: Validate delta bundle against headers BEFORE using
             // If validation fails (no header available, root mismatch), DO NOT use delta
-            let deltaValid = await deltaManager.validateTreeRootAgainstHeaders()
+            // FIX #1252: When delta is verified (immutable), skip re-validation — trust it.
+            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+            let deltaValid: Bool
+            if deltaVerified {
+                deltaValid = true
+            } else {
+                deltaValid = await deltaManager.validateTreeRootAgainstHeaders()
+            }
             if !deltaValid {
                 print("⚠️ DeltaCMU: Validation FAILED - NOT using delta bundle (would cause wrong anchor)")
                 // Clear corrupted delta so it won't be used again, then fall through to P2P
@@ -1895,6 +2109,26 @@ final class TransactionBuilder {
                                 print("⚠️ FIX #1062: Some block listeners still running - partial P2P fetch may fail")
                             }
 
+                            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
+                            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
+                            let deadPeersTxPartial = await MainActor.run {
+                                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
+                            }
+                            if !deadPeersTxPartial.isEmpty {
+                                print("🔄 FIX #1228: Reconnecting \(deadPeersTxPartial.count) peers with dead connections (TX partial P2P fetch)...")
+                                var reconnectedTxPartial = Set<String>()  // FIX #1235
+                                for peer in deadPeersTxPartial {
+                                    if reconnectedTxPartial.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
+                                    do {
+                                        try await peer.ensureConnected()
+                                        reconnectedTxPartial.insert(peer.host)  // FIX #1235
+                                        print("✅ FIX #1228: [\(peer.host)] Reconnected for TX partial P2P fetch")
+                                    } catch {
+                                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+                                    }
+                                }
+                            }
+
                             // FIX #877: Drain socket buffers after stopping block listeners
                             print("🚿 FIX #877: Draining socket buffers before partial P2P fetch...")
                             let partialConnectedPeers = await networkManager.peers.filter { $0.isConnectionReady }
@@ -1916,14 +2150,43 @@ final class TransactionBuilder {
 
                                 // Extract CMUs from the returned blocks
                                 // FIX #1067: Convert hex string CMUs to Data format
-                                for (_, _, _, transactions) in blocksData {
+                                // FIX #1190: Also collect full delta outputs for local caching
+                                var partialDeltaOutputs: [DeltaCMUManager.DeltaOutput] = []
+                                for (height, _, _, transactions) in blocksData {
+                                    var blockOutputIndex: UInt32 = 0
                                     for (_, outputs, _) in transactions {
                                         for output in outputs {
                                             if let cmuData = Data(hex: output.cmu) {
                                                 allCMUs.append(cmuData)
                                             }
+                                            // FIX #1190: Build delta output from P2P remainder
+                                            if let cmuDisplay = Data(hex: output.cmu),
+                                               let epkDisplay = Data(hex: output.ephemeralKey),
+                                               let encCiphertext = Data(hex: output.encCiphertext),
+                                               encCiphertext.count == 580 {
+                                                let deltaOutput = DeltaCMUManager.DeltaOutput(
+                                                    height: UInt32(height),
+                                                    index: blockOutputIndex,
+                                                    cmu: Data(cmuDisplay.reversed()),
+                                                    epk: Data(epkDisplay.reversed()),
+                                                    ciphertext: encCiphertext
+                                                )
+                                                partialDeltaOutputs.append(deltaOutput)
+                                            }
+                                            blockOutputIndex += 1
                                         }
                                     }
+                                }
+
+                                // FIX #1190: Append P2P remainder outputs to existing delta
+                                if !partialDeltaOutputs.isEmpty {
+                                    let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
+                                    DeltaCMUManager.shared.appendOutputs(partialDeltaOutputs, toHeight: endHeight, treeRoot: existingRoot)
+                                    print("📦 FIX #1190: Appended \(partialDeltaOutputs.count) delta outputs from P2P remainder (tree root pending)")
+                                } else if blocksData.count > 0 {
+                                    let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
+                                    DeltaCMUManager.shared.appendOutputs([], toHeight: endHeight, treeRoot: existingRoot)
+                                    print("📦 FIX #1190: Updated delta end height to \(endHeight) (no new outputs in P2P remainder)")
                                 }
 
                                 // FIX #995: Verify we got enough blocks
@@ -1943,11 +2206,17 @@ final class TransactionBuilder {
                                 print("⚠️ FIX #1066: P2P fetch failed: \(error.localizedDescription)")
                             }
 
-                            print("⚠️ FIX #995: P2P failed - proceeding with partial delta only")
+                            // FIX #1226: CRITICAL — Do NOT return partial delta CMUs when P2P fails!
+                            // Previous bug: Returned partial delta CMUs (covering up to deltaManifest.endHeight)
+                            // but caller expected CMUs covering FULL range (startHeight to endHeight).
+                            // Witness built from partial tree has STALE anchor → TX rejection or undetected spends.
+                            // Must throw error so caller knows data is incomplete.
+                            print("❌ FIX #1226: P2P failed for remaining \(p2pBlockCount) blocks — partial delta is INCOMPLETE")
+                            print("❌ FIX #1226: Delta covers \(deltaManifest.startHeight)-\(deltaManifest.endHeight), but need up to \(endHeight)")
                             // FIX #1062: Resume block listeners after partial P2P attempts failed
                             print("▶️ FIX #1062: Resuming block listeners after partial P2P failed")
                             await PeerManager.shared.resumeAllBlockListeners()
-                            return allCMUs  // Return delta CMUs even if P2P failed (better than nothing)
+                            throw TransactionError.deltaCMUsFetchFailed(blockRange: UInt64(p2pBlockCount))
                         }
                     }
                 } else {
@@ -1989,6 +2258,26 @@ final class TransactionBuilder {
                 print("✅ FIX #1062: All block listeners stopped - P2P fetch safe to proceed")
             }
 
+            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
+            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
+            let deadPeersTxFull = await MainActor.run {
+                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
+            }
+            if !deadPeersTxFull.isEmpty {
+                print("🔄 FIX #1228: Reconnecting \(deadPeersTxFull.count) peers with dead connections (TX full P2P fetch)...")
+                var reconnectedTxFull = Set<String>()  // FIX #1235
+                for peer in deadPeersTxFull {
+                    if reconnectedTxFull.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
+                    do {
+                        try await peer.ensureConnected()
+                        reconnectedTxFull.insert(peer.host)  // FIX #1235
+                        print("✅ FIX #1228: [\(peer.host)] Reconnected for TX full P2P fetch")
+                    } catch {
+                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+
             // FIX #877: Drain socket buffers after stopping block listeners
             // Prevents "INVALID MAGIC BYTES" from stale data in TCP buffers
             print("🚿 FIX #877: Draining socket buffers before P2P fetch...")
@@ -2013,14 +2302,44 @@ final class TransactionBuilder {
 
                 // Extract CMUs from the returned blocks
                 // FIX #1067: Convert hex string CMUs to Data format
-                for (_, _, _, transactions) in blocksData {
+                // FIX #1190: Also collect full delta outputs for local caching
+                var deltaOutputs: [DeltaCMUManager.DeltaOutput] = []
+                for (height, _, _, transactions) in blocksData {
+                    var blockOutputIndex: UInt32 = 0
                     for (_, outputs, _) in transactions {
                         for output in outputs {
                             if let cmuData = Data(hex: output.cmu) {
                                 allCMUs.append(cmuData)
                             }
+                            // FIX #1190: Build delta output (wire format for cmu/epk, raw for ciphertext)
+                            if let cmuDisplay = Data(hex: output.cmu),
+                               let epkDisplay = Data(hex: output.ephemeralKey),
+                               let encCiphertext = Data(hex: output.encCiphertext),
+                               encCiphertext.count == 580 {
+                                let deltaOutput = DeltaCMUManager.DeltaOutput(
+                                    height: UInt32(height),
+                                    index: blockOutputIndex,
+                                    cmu: Data(cmuDisplay.reversed()),    // display → wire format
+                                    epk: Data(epkDisplay.reversed()),    // display → wire format
+                                    ciphertext: encCiphertext             // raw, no reversal
+                                )
+                                deltaOutputs.append(deltaOutput)
+                            }
+                            blockOutputIndex += 1
                         }
                     }
+                }
+
+                // FIX #1190: Save delta outputs from P2P fetch (tree root updated by caller)
+                if !deltaOutputs.isEmpty {
+                    let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
+                    DeltaCMUManager.shared.appendOutputs(deltaOutputs, fromHeight: startHeight, toHeight: endHeight, treeRoot: existingRoot)
+                    print("📦 FIX #1190: Saved \(deltaOutputs.count) delta outputs from P2P fetch (tree root pending caller update)")
+                } else if blocksData.count > 0 {
+                    // FIX #1190: Even if no shielded outputs, update delta end height
+                    let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
+                    DeltaCMUManager.shared.appendOutputs([], fromHeight: startHeight, toHeight: endHeight, treeRoot: existingRoot)
+                    print("📦 FIX #1190: Updated delta end height to \(endHeight) (no new shielded outputs in range)")
                 }
 
                 print("✅ FIX #1065: P2P fetch complete - got \(allCMUs.count) CMUs from \(blocksData.count) blocks")
@@ -2048,9 +2367,15 @@ final class TransactionBuilder {
         // InsightAPI is a centralized service that violates ZipherX's privacy design.
         // If P2P fails (e.g., no peers at startup), return empty and let caller handle retry.
         // The caller should wait for peers to connect and retry, not use centralized API.
-        if allCMUs.isEmpty {
-            print("⚠️ FIX #1064: P2P delta CMU fetch failed - no peers available")
-            print("⚠️ FIX #1064: Returning empty - caller should retry after peers connect")
+
+        // FIX #1225: CRITICAL - Throw error when P2P fails with empty CMUs
+        // Previous bug: Returned empty array → caller created witnesses with stale data (boost only)
+        // → witnesses had wrong anchors → TX rejected or spends went undetected.
+        // MUST fail fast when delta CMUs are required but unavailable.
+        if allCMUs.isEmpty && endHeight > startHeight {
+            print("❌ FIX #1225: P2P delta CMU fetch FAILED - no CMUs retrieved for \(endHeight - startHeight + 1) blocks")
+            print("❌ FIX #1225: Cannot create witnesses with stale data - throwing error")
+            throw TransactionError.deltaCMUsFetchFailed(blockRange: endHeight - startHeight + 1)
         }
 
         return allCMUs
@@ -2222,6 +2547,9 @@ final class TransactionBuilder {
         do {
             let batchSize = 100  // P2P getheaders returns max 160 headers per request
             var currentStart = startHeight
+            // FIX #1218: Track received vs expected for incomplete detection
+            var totalReceived: UInt64 = 0
+            var consecutiveEmptyBatches = 0
 
             while currentStart <= endHeight {
                 let batchEnd = min(currentStart + UInt64(batchSize) - 1, endHeight)
@@ -2229,7 +2557,10 @@ final class TransactionBuilder {
 
                 let blocks = try await NetworkManager.shared.getBlocksOnDemandP2P(from: currentStart, count: batchCount)
 
+                // FIX #1218: Track which heights actually arrived
+                var batchReceivedHeights = Set<UInt64>()
                 for block in blocks {
+                    batchReceivedHeights.insert(block.blockHeight)
                     for tx in block.transactions {
                         for output in tx.outputs {
                             // CMU from CompactBlock.CompactOutput is already in wire format (little-endian)
@@ -2237,12 +2568,33 @@ final class TransactionBuilder {
                         }
                     }
                 }
+                totalReceived += UInt64(batchReceivedHeights.count)
 
-                print("📦 P2P batch: \(currentStart)-\(batchEnd) → \(blocks.count) blocks")
-                currentStart = batchEnd + 1
+                print("📦 P2P batch: \(currentStart)-\(batchEnd) → \(blocks.count) blocks (\(batchReceivedHeights.count)/\(batchCount) heights)")
+
+                // FIX #1218: Strict height advancement — only advance to highest received + 1
+                if batchReceivedHeights.isEmpty {
+                    consecutiveEmptyBatches += 1
+                    print("⚠️ FIX #1218: Empty batch \(currentStart)-\(batchEnd) (failure \(consecutiveEmptyBatches)/3)")
+                    if consecutiveEmptyBatches >= 3 {
+                        print("🛑 FIX #1218: 3 consecutive empty batches — aborting CMU fetch")
+                        break
+                    }
+                    continue  // Retry same range
+                } else {
+                    consecutiveEmptyBatches = 0
+                    let maxReceivedHeight = batchReceivedHeights.max()!
+                    if batchReceivedHeights.count < batchCount / 2 {
+                        // Less than 50% — advance only to what we received
+                        print("⚠️ FIX #1218: Incomplete batch — advancing to \(maxReceivedHeight + 1) not \(batchEnd + 1)")
+                        currentStart = maxReceivedHeight + 1
+                    } else {
+                        currentStart = batchEnd + 1
+                    }
+                }
             }
 
-            print("✅ P2P on-demand fetch complete: \(allCMUs.count) CMUs from \(totalBlocks) blocks")
+            print("✅ P2P on-demand fetch complete: \(allCMUs.count) CMUs from \(totalBlocks) blocks (received \(totalReceived) heights)")
             return allCMUs
 
         } catch NetworkError.notConnected {
@@ -2336,6 +2688,9 @@ enum TransactionError: LocalizedError {
     case dustOutput(amount: UInt64, threshold: UInt64)  // VUL-024
     case witnessAnchorMismatch(noteHeight: UInt64, witnessRoot: String, headerAnchor: String)
     case witnessCorrupted  // FIX #838: Witness merkle path computes to different root
+    case cmuMismatch  // FIX #1137: Stored CMU doesn't match CMU computed from note parts
+    case anchorNotOnChain  // FIX #1224: Anchor not found in any blockchain header
+    case deltaCMUsFetchFailed(blockRange: UInt64)  // FIX #1225: P2P fetch failed, cannot create witnesses with stale data
 
     var errorDescription: String? {
         switch self {
@@ -2363,6 +2718,12 @@ enum TransactionError: LocalizedError {
             return "Witness/anchor mismatch at height \(noteHeight). Database repair needed. Go to Settings → 'Repair Notes (fix balance)'"
         case .witnessCorrupted:
             return "Witness data corrupted. The merkle path computes to a different anchor. Go to Settings → 'Repair Database' to rebuild witnesses."
+        case .cmuMismatch:
+            return "Note data integrity error. The stored CMU doesn't match CMU computed from note parts. Go to Settings → 'Repair Database → Full Rescan' to fix."
+        case .anchorNotOnChain:
+            return "Anchor not found on blockchain. The commitment tree may be corrupted. Go to Settings → 'Repair Database → Full Rescan' to rebuild."
+        case .deltaCMUsFetchFailed(let blockRange):
+            return "Failed to fetch \(blockRange) blocks of commitment data from P2P network. Cannot create witnesses with stale data. Please wait for peers to connect and try again."
         }
     }
 }

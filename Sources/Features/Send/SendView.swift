@@ -202,6 +202,18 @@ struct SendView: View {
                         .padding(.vertical, 4)
                     }
 
+                    // FIX #1141: Show corrupted witness warning
+                    if walletManager.hasCorruptedWitnesses {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundColor(.red)
+                            Text("\(walletManager.corruptedWitnessCount) corrupted witness\(walletManager.corruptedWitnessCount == 1 ? "" : "es") - Run Full Resync in Settings")
+                                .font(theme.captionFont)
+                                .foregroundColor(.red)
+                        }
+                        .padding(.vertical, 4)
+                    }
+
                     // Send button
                     System7Button(title: sendButtonTitle) {
                         validateAndConfirm()
@@ -210,7 +222,9 @@ struct SendView: View {
                     // FIX #360: Also disable during database repair
                     // FIX #410: Also disable when health check blocks send
                     // FIX #1098: Also disable when balance integrity issue detected
-                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send) || walletManager.balanceIntegrityIssue)
+                    // FIX #1139: Disable during pre-build phase - only enable when TX is ready
+                    // FIX #1141: Also disable when witnesses are corrupted
+                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send) || walletManager.balanceIntegrityIssue || isPreparingTransaction || walletManager.hasCorruptedWitnesses || walletManager.isGapFillingDelta)
                 }
                 .padding()
             }
@@ -457,11 +471,12 @@ struct SendView: View {
             triggerPreparationIfNeeded()
         }
         .onChange(of: memo) { _ in
-            // Only re-prepare if we already have a prepared tx
-            if preparedTransaction != nil {
-                invalidatePreparedTransaction()
-                triggerPreparationIfNeeded()
-            }
+            // FIX #1258: Do NOT invalidate or re-prepare on memo change.
+            // Pre-build happens once when amount is entered. Memo is included
+            // at actual send time — if memo differs from prepared TX, the send
+            // path falls through to performSendTransaction() which builds with
+            // the final memo. This prevents a wasteful 2-4s Groth16 rebuild
+            // every time the user types in the memo field.
         }
         .onDisappear {
             // Cancel any ongoing preparation when view disappears
@@ -800,6 +815,9 @@ struct SendView: View {
     private var sendButtonTitle: String {
         if isSending {
             return "Sending..."
+        } else if walletManager.hasCorruptedWitnesses {
+            // FIX #1141: Show witness corruption state
+            return "Witness Error"
         } else if walletManager.balanceIntegrityIssue {
             // FIX #1098: Show balance issue state
             return "Balance Issue"
@@ -814,6 +832,9 @@ struct SendView: View {
             return "Syncing..."
         } else if hasPendingTransaction {
             return "Pending..."
+        } else if isPreparingTransaction {
+            // FIX #1139: Show preparing state
+            return "Preparing..."
         } else {
             return "Send ZCL"
         }
@@ -1230,6 +1251,46 @@ struct SendView: View {
                 await TorManager.shared.restoreAfterSingleTxBypass()
             } catch {
                 let errorStr = error.localizedDescription.lowercased()
+
+                // FIX #1137: CMU mismatch requires Full Resync (witness repair won't help)
+                // This is a data integrity issue - stored CMU doesn't match computed CMU
+                let isCMUMismatch = errorStr.contains("cmu") || errorStr.contains("note data integrity")
+
+                if isCMUMismatch {
+                    print("🚨 FIX #1137: CMU mismatch detected - triggering Full Resync...")
+                    await MainActor.run {
+                        if let currentIdx = sendProgress.firstIndex(where: { $0.status == .inProgress }) {
+                            sendProgress[currentIdx].status = .inProgress
+                            sendProgress[currentIdx].detail = "Auto-repairing note data..."
+                        }
+                    }
+
+                    // Trigger Full Resync - this rebuilds all note data from scratch
+                    do {
+                        print("🔧 FIX #1137: Starting automatic Full Resync...")
+                        try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, height, total in
+                            // Just log progress
+                            print("🔧 FIX #1137: Full Resync progress: \(Int(progress * 100))%")
+                        }, forceFullRescan: true)
+                        print("✅ FIX #1137: Full Resync complete - note data rebuilt!")
+
+                        // Retry the transaction after Full Resync
+                        await MainActor.run {
+                            isSending = false
+                            sendProgress = []
+                            hasAttemptedWitnessRepair = false
+                        }
+
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        await MainActor.run {
+                            performSendTransaction()
+                        }
+                        return
+                    } catch {
+                        print("❌ FIX #1137: Full Resync failed: \(error)")
+                        // Fall through to show error
+                    }
+                }
 
                 // FIX #750: Auto-repair anchor mismatch and retry
                 // If proof generation failed, it's likely corrupted witnesses

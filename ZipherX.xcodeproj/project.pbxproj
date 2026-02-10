@@ -56,6 +56,7 @@
 		39DBED283CC3B60CAF879629 /* BiometricAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD6AFDCA26B490632B50E6D /* BiometricAuthManager.swift */; };
 		3A30778ACDB48A112BCD4372 /* Binaries in Resources */ = {isa = PBXBuildFile; fileRef = C5A570D44D1F4FD4E8FC9B9B /* Binaries */; };
 		3AF8215663CEA8C7DE065E19 /* SecureKeyStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1384CBB77A8B373D13DA50F2 /* SecureKeyStorage.swift */; };
+		3CCFB24F1072CA7DAB248C99 /* AsyncTimeout.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEC990C6CC128A4EE43E4F47 /* AsyncTimeout.swift */; };
 		3D08C9F31B8F9C6F1837B406 /* RPCClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */; };
 		3D14CF0D99CE3A8E4ECA634C /* HeaderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20AAE966AD2E92B942B2AE59 /* HeaderStore.swift */; };
 		3EC81DFEA121068B44540EE6 /* Mac7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7173E7574C060D4285B73B46 /* Mac7Theme.swift */; };
@@ -83,6 +84,7 @@
 		5914C82375A7F26280EC072B /* SendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0A89DDCE7B836E49AF56B4 /* SendView.swift */; };
 		596F057F8F742BACC8C0B595 /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */; };
 		5B9788995FB9227C7F0D5864 /* WalletMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D769A0AE4089D10446BFBBCE /* WalletMode.swift */; };
+		5F8917A38D769E814F71D5D7 /* AsyncTimeout.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEC990C6CC128A4EE43E4F47 /* AsyncTimeout.swift */; };
 		60EA568D15B5804802223F01 /* CustomNodesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */; };
 		637AD9599E602F666DC55B86 /* CustomNodesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */; };
 		652A8B2EAD105A88B099985D /* AppDirectories.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9F90E89701CC0D1CFDA0770 /* AppDirectories.swift */; };
@@ -269,6 +271,7 @@
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
 		AD65941062D3050BEA2765F9 /* RustBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBridge.swift; sourceTree = "<group>"; };
+		AEC990C6CC128A4EE43E4F47 /* AsyncTimeout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncTimeout.swift; sourceTree = "<group>"; };
 		B20DAC18EA4D3211E1BFE4BC /* ParallelImportProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelImportProgressView.swift; sourceTree = "<group>"; };
 		B7F6B7B7115F3075801EC5C5 /* ExplorerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExplorerView.swift; sourceTree = "<group>"; };
 		B90A78B033ABA943576A2233 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
@@ -573,6 +576,7 @@
 		7A12B43495B930D9722D1AB2 /* Network */ = {
 			isa = PBXGroup;
 			children = (
+				AEC990C6CC128A4EE43E4F47 /* AsyncTimeout.swift */,
 				6626F058762A0D0666024868 /* BundledBlockHashes.swift */,
 				F745C75EE82A4C61B3D8050B /* BundledShieldedOutputs.swift */,
 				682F4CBFC6B66B8ECE69BBFA /* Checkpoints.swift */,
@@ -859,6 +863,7 @@
 			files = (
 				CEA228C1D6634E2A20C27D04 /* AppDelegate.swift in Sources */,
 				652A8B2EAD105A88B099985D /* AppDirectories.swift in Sources */,
+				3CCFB24F1072CA7DAB248C99 /* AsyncTimeout.swift in Sources */,
 				46D80759524E31A7309DEA25 /* BIP39Wordlist.swift in Sources */,
 				53AD3883AF96C239472094A2 /* BalanceView.swift in Sources */,
 				92A36FAFBBE9E6E5CE516875 /* BiometricAuthManager.swift in Sources */,
@@ -947,6 +952,7 @@
 			files = (
 				7641927DD93D363970BBAEE6 /* AppDelegate.swift in Sources */,
 				EE52E93FC8FCC4B875951563 /* AppDirectories.swift in Sources */,
+				5F8917A38D769E814F71D5D7 /* AsyncTimeout.swift in Sources */,
 				6A19AD197D8FA9F2CE7774BB /* BIP39Wordlist.swift in Sources */,
 				415EFC4A207B4AA59DB9891A /* BalanceView.swift in Sources */,
 				39DBED283CC3B60CAF879629 /* BiometricAuthManager.swift in Sources */,

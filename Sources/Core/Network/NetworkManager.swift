@@ -2944,6 +2944,13 @@ public final class NetworkManager: ObservableObject {
 
     /// Fetch network statistics (P2P-first when Tor enabled, InsightAPI fallback when disabled)
     func fetchNetworkStats() async {
+        // FIX #1220: Skip ALL background network activity during gap-fill.
+        // Gap-fill needs exclusive P2P bandwidth — concurrent fetches (FilterScanner,
+        // mempool scan, confirmation checks) steal connections and cause missing blocks.
+        if await WalletManager.shared.isGapFillingDelta {
+            return
+        }
+
         // FIX #892: Skip if boost header loading in progress
         // Prevents expensive network operations from interfering with SQLite bulk inserts
         // This was causing the 91-99% stall during Import PK (5+ minutes lost)
@@ -3648,6 +3655,12 @@ public final class NetworkManager: ObservableObject {
             // Strategy: Check if tx is NO LONGER in mempool (meaning it was mined)
             // We know the tx was broadcast successfully (it was in mempool earlier),
             // so if it's no longer in mempool, it must have been confirmed.
+            //
+            // FIX #1221: CRITICAL — empty mempool response is NOT "tx not in mempool"!
+            // When getMempoolTransactions() returns 0 hashes, the peer timed out or the
+            // dispatcher was inactive. Treating empty as "not in mempool" causes false
+            // SETTLEMENT (TX marked confirmed when never even broadcast properly).
+            // ALWAYS verify via P2P getdata before confirming.
 
             var isStillInMempool = false
             var mempoolCheckFailed = false
@@ -3656,17 +3669,37 @@ public final class NetworkManager: ObservableObject {
             if let peer = getConnectedPeer() {
                 do {
                     let mempoolTxs = try await peer.getMempoolTransactions()
-                    let txidData = Data(hexString: txid)
-                    isStillInMempool = txidData != nil && mempoolTxs.contains(txidData!)
 
-                    if isStillInMempool {
-                        print("📤 Tx \(txid.prefix(16))... still in mempool (not confirmed yet)")
+                    // FIX #1221: Empty mempool = peer failure, NOT "TX confirmed"
+                    // Real mempools almost always have transactions. Empty response means:
+                    // - Dispatcher inactive (block listeners stopped)
+                    // - Peer timed out
+                    // - TCP stream desynced
+                    // NEVER treat empty mempool as evidence of confirmation.
+                    if mempoolTxs.isEmpty {
+                        print("⚠️ FIX #1221: Mempool returned 0 TXs — treating as check FAILED (not confirmation evidence)")
+                        mempoolCheckFailed = true
                     } else {
-                        print("📤 Tx \(txid.prefix(16))... NOT in mempool - likely CONFIRMED!")
-                        // Additional verification: Check if we have the change note in database
-                        // If tx was broadcast and is no longer in mempool, it's confirmed
-                        await confirmOutgoingTx(txid: txid)
-                        confirmedCount += 1
+                        // FIX #1202: Mempool inv returns txids in wire format (little-endian),
+                        // but txid string is display format (big-endian). Must reverse bytes
+                        // for comparison, otherwise TX is never found in mempool → false "not in mempool"
+                        // → triggers FIX #1165 rejection path even when TX is valid.
+                        let txidData = Data(hexString: txid).map { Data($0.reversed()) }
+                        isStillInMempool = txidData != nil && mempoolTxs.contains(txidData!)
+
+                        if isStillInMempool {
+                            print("📤 Tx \(txid.prefix(16))... still in mempool (\(mempoolTxs.count) mempool TXs, not confirmed yet)")
+                        } else {
+                            // FIX #1259: TX not in a NON-EMPTY mempool — TX has left mempool.
+                            // This means: (a) mined into block, or (b) evicted/expired.
+                            // DO NOT confirm here — P2P getdata only finds mempool TXs, NOT mined TXs.
+                            // Confirmation MUST come from block scanner (FIX #859) finding our nullifier
+                            // in a block, which triggers confirmOutgoingTx.
+                            // Just log and wait for block scanner to do its job.
+                            print("📤 FIX #1259: Tx \(txid.prefix(16))... left mempool (\(mempoolTxs.count) mempool TXs) — waiting for block scanner confirmation (FIX #859)")
+                            // Fall through to mempoolCheckFailed path for DB check
+                            mempoolCheckFailed = true
+                        }
                     }
                 } catch {
                     print("📤 Tx \(txid.prefix(16))... mempool check failed: \(error.localizedDescription)")
@@ -3687,6 +3720,12 @@ public final class NetworkManager: ObservableObject {
                         print("📤 FIX #393: Tx \(txid.prefix(16))... found in database as SENT - CONFIRMED!")
                         await confirmOutgoingTx(txid: txid)
                         confirmedCount += 1
+                    } else {
+                        // FIX #1259: TX not in DB yet — waiting for block scanner (FIX #859)
+                        // to find our nullifier in a block and trigger confirmOutgoingTx.
+                        // P2P getdata only finds mempool TXs, NOT mined TXs — useless here.
+                        // DO NOT attempt premature confirmation.
+                        print("📤 FIX #1259: TX \(txid.prefix(16))... not in DB — waiting for block scanner (FIX #859)")
                     }
                 }
             }
@@ -4832,17 +4871,17 @@ public final class NetworkManager: ObservableObject {
         // Background sync triggers header sync which holds peer locks, causing broadcast timeouts
         isBroadcasting = true
 
-        // FIX #907: Block all block listeners during broadcast
-        // Block listeners hold peer locks and prevent broadcast from using peers
-        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-        PeerManager.shared.setBlockListenersBlocked(true)
+        // FIX #1184: DO NOT stop block listeners before broadcast!
+        // Stopping block listeners kills NWConnections → connections=nil → dispatcher inactive
+        // → broadcast uses unreliable direct path → false accepts from desynced TCP
+        // → false SETTLEMENT → phantom TX → balance corruption.
+        // isBroadcasting=true prevents header sync from starting (which would stop listeners).
+        // Block listeners stay running, dispatcher stays active, broadcast uses reliable dispatcher path.
 
         defer {
             isBroadcasting = false
-            // FIX #907: Unblock block listeners after broadcast
-            PeerManager.shared.setBlockListenersBlocked(false)
         }
-        print("📡 FIX #841+#907: isBroadcasting = true, block listeners blocked")
+        print("📡 FIX #841+#1184: isBroadcasting = true, block listeners KEPT RUNNING (dispatcher active)")
 
         // ============================================================================
         // VUL-002 FIX: Validate Sapling proofs LOCALLY before broadcasting
@@ -4948,26 +4987,48 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
-            // FIX #821: For heights above boost file, P2P headers have UNRELIABLE sapling roots
-            // We can't verify historical anchors because HeaderStore doesn't have valid roots above boost file
-            // Since VUL-002 proofs passed, the anchor WAS valid when the witness was created
-            // Sapling protocol accepts ANY historical tree root - trust VUL-002 and let blockchain validate
+            // FIX #821 + FIX #1204 + FIX #1221: Strict anchor validation.
+            // FIX #1204 stores authoritative finalsaplingroot from full block fetches (delta sync,
+            // block scanning). containsSaplingRoot() at line 4901 searches ALL stored roots.
+            // If STILL not found after FIX #1204, the anchor likely comes from a corrupted/incomplete
+            // commitment tree (e.g., gap-fill never completed, delta had missing CMUs).
+            //
+            // FIX #1221: DO NOT blindly trust anchors not in HeaderStore!
+            // Previous FIX #821 set anchorFound=true here, causing TX broadcast with invalid anchor
+            // → peers silently drop TX → mempool-disappearance triggers false SETTLEMENT → phantom TX
+            // → balance corruption. Now we REJECT unless anchor is in HeaderStore.
+            // Historical anchors from valid tree states WILL be in HeaderStore thanks to FIX #1204.
             let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
             if !anchorFound && chainHeight > boostFileEndHeight {
-                print("⚠️ FIX #821: Chain height \(chainHeight) > boost file end \(boostFileEndHeight)")
-                print("⚠️ FIX #821: Cannot verify anchor via P2P (headers have unreliable sapling roots)")
-                print("✅ FIX #821: VUL-002 proofs passed - trusting TX (Sapling accepts historical anchors)")
-                print("✅ FIX #821: Anchor will be validated by blockchain nodes during broadcast")
-                anchorFound = true  // Trust VUL-002
+                print("❌ FIX #1221: Anchor NOT in HeaderStore AND NOT matching FFI tree root!")
+                print("   Chain height \(chainHeight) > boost file end \(boostFileEndHeight)")
+                print("   FIX #1204 should have stored all historical roots — anchor is likely from corrupted tree")
+                print("   REJECTING TX to prevent phantom SETTLEMENT (FIX #1221)")
+                // DO NOT set anchorFound = true — let it fall through to error
             }
 
             if !anchorFound {
-                print("❌ FIX #718: Anchor NOT FOUND - transaction WILL be rejected!")
-                print("❌ FIX #718: Anchor: \(anchorHex)")
-                print("❌ FIX #718: Cause: Witness was built from wrong/corrupt tree state")
-                print("❌ FIX #718: Solution: Run Settings → Repair Database")
-                onProgress?("error", "❌ Anchor invalid - run Repair Database", 1.0)
-                throw NetworkError.invalidTransaction("Anchor not found on blockchain - witnesses built from corrupt tree. Run Repair Database to fix.")
+                // FIX #1256: When delta is VERIFIED (immutable), the tree is known-correct.
+                // containsSaplingRoot() lookup can fail (stale file, byte order edge cases,
+                // roots from newly-synced blocks not yet in delta_sapling_roots.bin).
+                // The Groth16 proof (VUL-002) already validates the anchor internally.
+                // Peers accepted our TX with anchor 6e615084... that containsSaplingRoot missed.
+                // Trust the verified tree + proof instead of the unreliable lookup.
+                let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+                if deltaVerified {
+                    print("⚠️ FIX #1256: Anchor NOT in HeaderStore, but delta is VERIFIED (immutable)")
+                    print("⚠️ FIX #1256: Anchor: \(anchorHex)")
+                    print("⚠️ FIX #1256: VUL-002 proof passed — trusting verified tree + Groth16 proof")
+                    print("⚠️ FIX #1256: Proceeding with broadcast (network will validate)")
+                    // Do NOT throw — let TX through, network consensus is the final validator
+                } else {
+                    print("❌ FIX #718: Anchor NOT FOUND - transaction WILL be rejected!")
+                    print("❌ FIX #718: Anchor: \(anchorHex)")
+                    print("❌ FIX #718: Delta NOT verified — tree may be corrupted")
+                    print("❌ FIX #718: Solution: Run Settings → Repair Database")
+                    onProgress?("error", "❌ Anchor invalid - run Repair Database", 1.0)
+                    throw NetworkError.invalidTransaction("Anchor not found on blockchain - witnesses built from corrupt tree. Run Repair Database to fix.")
+                }
             }
 
             print("✅ FIX #718: Anchor validation passed - TX should be accepted by network")
@@ -4988,29 +5049,13 @@ public final class NetworkManager: ObservableObject {
         let overallTimeout: UInt64 = torEnabled ? 90_000_000_000 : 30_000_000_000  // FIX #837: 30s direct, 90s Tor
         print("📡 FIX #211: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
 
-        // FIX #834: MUST ensure ALL block listeners are stopped before broadcast
-        // Block listeners hold messageLock which blocks broadcastTransaction()
-        // Previous fixes just timed out and proceeded - now we VERIFY 100% stopped
-        print("📡 FIX #834: Ensuring ALL block listeners stopped before broadcast...")
-        let allStopped = await PeerManager.shared.ensureAllBlockListenersStopped(maxRetries: 3, retryDelay: 1.0)
-
-        if !allStopped {
-            let stillListening = PeerManager.shared.getListeningPeerCount()
-            print("🚨 FIX #834: Cannot broadcast - \(stillListening) block listeners still running!")
-            print("🚨 FIX #834: This would cause peer lock conflicts and broadcast failures")
-            // Don't throw - still try to broadcast to peers that ARE available
-            // But log this as a serious warning
-        } else {
-            print("✅ FIX #834: All block listeners verified stopped - safe to broadcast")
-        }
-
-        // FIX #832: Restart block listeners when broadcast completes (success or failure)
-        defer {
-            Task {
-                print("📡 FIX #832: Restarting block listeners after broadcast...")
-                await PeerManager.shared.resumeAllBlockListeners()
-            }
-        }
+        // FIX #1184: Block listeners are KEPT RUNNING during broadcast.
+        // Previous FIX #834 stopped all block listeners here, killing NWConnections and
+        // making dispatcher inactive. This forced broadcast to use the unreliable direct path
+        // with orphan-prone receiveMessageWithTimeout — root cause of false SETTLEMENT.
+        // With FIX #1184, broadcast uses the dispatcher path (lock-free, no orphaned readers).
+        // isBroadcasting=true prevents header sync from stopping block listeners during broadcast.
+        print("📡 FIX #1184: Block listeners RUNNING — broadcast will use dispatcher path")
 
         // FIX #160: Compute TX ID upfront - even if timeout occurs, we know what was sent
         let computedTxId = rawTx.doubleSHA256().reversed().map { String(format: "%02x", $0) }.joined()
@@ -5797,11 +5842,14 @@ public final class NetworkManager: ObservableObject {
             return false
         }
 
-        // Convert txid hex string to Data (reversed for wire format)
-        guard let txidData = Data(hex: txid) else {
+        // FIX #1200: Convert txid hex string to Data and REVERSE for wire format.
+        // P2P protocol uses little-endian (wire format), display format is big-endian.
+        // Without reversal, peers respond "notfound" even when TX exists → false negatives.
+        guard let txidBytes = Data(hex: txid)?.reversed() else {
             print("⚠️ FIX #247: Invalid txid format: \(txid)")
             return false
         }
+        let txidData = Data(txidBytes)
 
         // Try up to maxAttempts peers
         for (index, peer) in readyPeers.prefix(maxAttempts).enumerated() {
@@ -5856,9 +5904,12 @@ public final class NetworkManager: ObservableObject {
         // Zcash v4 transaction format:
         // - Header (4 bytes): version (4) + version group ID
         // - Transparent inputs/outputs (variable, with compact size)
+        // - lock_time (4 bytes)
+        // - expiry_height (4 bytes)
+        // - valueBalance (8 bytes) ← FIX #1255: between expiry and sapling spends
         // - Sapling bundle:
         //   - compactSize: number of spends
-        //   - For each spend: SpendDescription
+        //   - For each spend: SpendDescription (384 bytes)
         //     - cv: ValueCommitment (32 bytes)
         //     - anchor: bls12_381::Scalar (32 bytes) ← THIS IS WHAT WE NEED
         //     - nullifier (32 bytes)
@@ -5867,7 +5918,6 @@ public final class NetworkManager: ObservableObject {
         //     - spendAuthSig (64 bytes)
         //   - compactSize: number of outputs
         //   - Outputs...
-        //   - valueBalance (8 bytes)
         //   - bindingSig (64 bytes)
 
         guard txData.count > 8 else {
@@ -5965,6 +6015,12 @@ public final class NetworkManager: ObservableObject {
             // Expiry height (4 bytes) for v4+
             try safeAdd(&offset, 4)
 
+            // FIX #1255: Skip valueBalance (8 bytes) — MUST be skipped before sapling spends
+            // valueBalance is an int64 between nExpiryHeight and nShieldedSpend in v4 format
+            // Bug: this was missing, causing anchor extraction to read 8 bytes too early
+            // (readCompactSize misread first byte of valueBalance as spend count)
+            try safeAdd(&offset, 8)
+
             // Now we're at the sapling bundle
             // Read number of sapling spends
             let numSpends = try readCompactSize(txData, &offset)
@@ -6017,10 +6073,14 @@ public final class NetworkManager: ObservableObject {
             return (nil, 0)
         }
 
-        // Convert txid hex string to Data
-        guard let txidData = Data(hex: txid) else {
+        // FIX #1202: Convert txid hex to Data and reverse for wire format.
+        // Same fix as FIX #1200: P2P protocol uses little-endian (wire format) txids,
+        // display format is big-endian. Without reversal, peers respond "notfound"
+        // even when TX is in their mempool → FIX #1165 falsely declares "REJECTED".
+        guard let txidBytes = Data(hex: txid)?.reversed() else {
             return (nil, 0)  // Invalid txid format - can't verify
         }
+        let txidData = Data(txidBytes)
 
         var checkedPeers = 0
 
@@ -6637,6 +6697,14 @@ public final class NetworkManager: ObservableObject {
                 }
 
                 if !blocks.isEmpty {
+                    // FIX #1204: Save finalsaplingroot to HeaderStore for all fetched blocks
+                    for block in blocks {
+                        if !block.finalSaplingRoot.isEmpty && !block.finalSaplingRoot.allSatisfy({ $0 == 0 }) {
+                            try? HeaderStore.shared.updateSaplingRoot(at: block.blockHeight, root: block.finalSaplingRoot, timestamp: block.time)
+                            // FIX #1253: Also save to delta sapling roots (survives missing header rows)
+                            DeltaCMUManager.shared.appendSaplingRoot(height: block.blockHeight, root: block.finalSaplingRoot)
+                        }
+                    }
                     print("✅ P2P on-demand: Got \(blocks.count) blocks from \(peer.host)")
                     return blocks
                 }
@@ -6745,17 +6813,8 @@ public final class NetworkManager: ObservableObject {
     /// Returns: [(height, blockHash, timestamp, txData)]
     /// - Parameter skipPreReconnect: If true, skip pre-reconnection (FIX #1071 - already done at caller level)
     func getBlocksDataP2P(from height: UInt64, count: Int, skipPreReconnect: Bool = false) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
-        // FIX #907: Ensure block listeners are stopped before P2P block fetch
-        // Block listeners hold messageLock, preventing block fetch from using peers
-        let listeningPeers = peers.filter { $0.isListening }
-        if !listeningPeers.isEmpty {
-            print("🛑 FIX #907: Stopping \(listeningPeers.count) block listeners before P2P fetch")
-            await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-            // Force release all locks to ensure peers are available
-            for peer in listeningPeers {
-                await peer.forceReleaseMessageLock()
-            }
-        }
+        // FIX #1205: Dispatcher activation moved AFTER reconnection (see below)
+        // Old FIX #907 stopped listeners here — removed. FIX #1184 dispatcher needs them running.
 
         // FIX #715: Better peer selection - check both connection state AND recent activity
         // Peers can show isConnectionReady=true but still be dead (TCP state lag)
@@ -6823,6 +6882,74 @@ public final class NetworkManager: ObservableObject {
             throw NetworkError.notConnected
         }
 
+        // FIX #1205: Activate dispatchers on demand AFTER reconnection
+        // Must run after FIX #930 reconnection so listeners start on current connections.
+        // FIX #1184 requires dispatcher for all block fetches (no direct reads).
+        var anyDispatcherActive = false
+        for peer in availablePeers {
+            if await peer.isDispatcherActive {
+                anyDispatcherActive = true
+                break
+            }
+        }
+        if !anyDispatcherActive {
+            print("🔄 FIX #1205: No dispatcher-active peers — starting block listeners for fetch...")
+            // Must unblock to allow startBlockListener() to proceed
+            if PeerManager.shared.areBlockListenersBlocked() {
+                PeerManager.shared.setBlockListenersBlocked(false)
+            }
+            // Also clear header sync flag (header sync is done by now)
+            await PeerManager.shared.setHeaderSyncInProgress(false)
+            // Start block listeners on available (reconnected) peers
+            for peer in availablePeers {
+                peer.startBlockListener()
+            }
+            // Wait for at least one dispatcher to activate (up to 5s)
+            for i in 0..<50 {
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                var activated = false
+                for peer in availablePeers {
+                    if await peer.isDispatcherActive {
+                        activated = true
+                        break
+                    }
+                }
+                if activated {
+                    print("✅ FIX #1205: Dispatcher activated after \(Double(i + 1) * 0.1)s")
+                    break
+                }
+            }
+        }
+
+        // FIX #1205: Skip peers with consecutive batch failures (dead peers waste 30s timeout)
+        // FIX #1208: Ensure at least 3 peers remain after filtering.
+        // FIX #1216: Reduced threshold from 2 to 1 — a single timeout (30s wasted) is enough
+        // to skip the peer. On macOS, peer 77.110.103.38 timed out in BOTH FIX #571 and FIX #1089,
+        // wasting 60s total. With threshold=1, the second call skips it immediately.
+        let minPeersToKeep = 3
+        let reliablePeers = availablePeers.filter { $0.consecutiveBatchFailures < 1 }
+        if reliablePeers.count >= minPeersToKeep {
+            // Enough reliable peers — skip the bad ones
+            if reliablePeers.count < availablePeers.count {
+                let skipped = availablePeers.count - reliablePeers.count
+                print("⚠️ FIX #1205: Skipping \(skipped) peers with consecutive batch failures (\(reliablePeers.count) remain)")
+                availablePeers = reliablePeers
+            }
+        } else if reliablePeers.count < availablePeers.count {
+            // FIX #1208: Not enough reliable peers. Reset failure counters for least-failed peers
+            // so they get another chance. This prevents the scan from running on just 1 peer.
+            let sortedByFailures = availablePeers.sorted { $0.consecutiveBatchFailures < $1.consecutiveBatchFailures }
+            let peersToKeep = Array(sortedByFailures.prefix(max(minPeersToKeep, reliablePeers.count)))
+            // Reset counters for peers we're giving another chance
+            for peer in peersToKeep where peer.consecutiveBatchFailures >= 2 {
+                let oldFailures = peer.consecutiveBatchFailures
+                peer.recordBatchResult(blocksReceived: 1)  // Resets counter to 0
+                print("🔄 FIX #1208: Giving [\(peer.host)] another chance (was \(oldFailures) failures)")
+            }
+            availablePeers = peersToKeep
+            print("🔄 FIX #1208: Kept \(peersToKeep.count) peers (min \(minPeersToKeep) needed for parallel fetching)")
+        }
+
         // FIX #712: Use P2P protocol limit of 160 blocks per request for efficiency
         // Previous bug: Split 500 blocks across 13 peers = ~39 blocks each (slow, many small requests)
         // Fix: Each peer gets up to 160 blocks, only use as many peers as needed
@@ -6867,10 +6994,12 @@ public final class NetworkManager: ObservableObject {
 
                 group.addTask {
                     // FIX #713: Per-peer timeout to prevent one slow peer from blocking all
-                    // FIX #928: Increased to 60s for 160 blocks sequential (was 20s, too short)
-                    // At 0.3s/block average, 160 blocks = 48s. 60s gives margin for slow peers.
+                    // FIX #1217: Adaptive per-peer timeout based on block count.
+                    // Batch dispatcher timeout is already adaptive (5-15s), but this outer
+                    // timeout must be slightly longer to allow batch timeout to fire first.
+                    // ≤10 blocks → 8s, ≤50 → 13s, >50 → 20s.
                     let peerHost = peer.host
-                    let peerTimeout: UInt64 = 60_000_000_000  // 60 seconds
+                    let peerTimeout: UInt64 = rangeCount <= 10 ? 8_000_000_000 : (rangeCount <= 50 ? 13_000_000_000 : 20_000_000_000)
 
                     // FIX #912: Use actor to safely track if data arrived before timeout
                     // Previous bug: timeout message printed even when peer succeeded
@@ -6920,9 +7049,14 @@ public final class NetworkManager: ObservableObject {
         let elapsed = Date().timeIntervalSince(startTime)
         let rate = Double(results.count) / max(elapsed, 0.001)
 
-        // If we got less than 10% of requested blocks, consider it a failure
-        if results.count < count / 10 {
-            print("⚠️ P2P fetch failed: only got \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s")
+        // FIX #1218: Raised threshold from 10% to 50%.
+        // Previous bug: 10% threshold meant 11/100 blocks = "success". Callers would
+        // advance their height cursor to batchEnd+1, permanently skipping the other 89 blocks.
+        // Over 16,693 blocks, this cascaded into only 1 CMU fetched instead of ~5,800.
+        // 50% is strict enough to catch massive P2P failures while still tolerating
+        // blocks with no shielded outputs (which are common on Zclassic).
+        if results.count < count / 2 {
+            print("⚠️ FIX #1218: P2P fetch incomplete: only got \(results.count)/\(count) blocks (\(String(format: "%.0f", Double(results.count) / Double(count) * 100))%) in \(String(format: "%.1f", elapsed))s")
             throw NetworkError.p2pFetchFailed
         }
 
@@ -6966,14 +7100,34 @@ public final class NetworkManager: ObservableObject {
             print("📦 [\(peer.host)] P2P batch: \(headerStoreCount) from HeaderStore, \(bundledCount) from BundledHashes")
         }
 
-        // FIX #120: If no hashes found, use on-demand P2P fetch (fetches headers first)
-        // FIX #928: Also cap at effectiveCount (160 P2P limit)
+        // FIX #1234: If no hashes found, SKIP this peer's batch instead of on-demand fetch.
+        // FIX #1184 explicitly warns: "ALL P2P block fetches MUST go through dispatcher".
+        // On-demand fetch uses withExclusiveAccess (direct reads) which conflicts with block
+        // listeners → lock acquisition timeouts (30s) → peer failures → gap-fill aborts.
+        // Better to skip and let header sync catch up, then retry with hashes available.
         if blockHashes.isEmpty {
+            print("⚠️ FIX #1234: [\(peer.host)] HeaderStore missing blocks \(startHeight)-\(startHeight + UInt64(effectiveCount) - 1) — skipping batch (header sync needed)")
+            peer.recordBatchResult(blocksReceived: 0)
+            return nil
+        }
+
+        // REMOVED FIX #120 on-demand fallback (moved below for reference):
+        // On-demand P2P fetch path is preserved but UNREACHABLE due to early return above.
+        // This code remains for documentation of why on-demand fetch was problematic:
+        if false && blockHashes.isEmpty {  // DEAD CODE - FIX #1234 returns nil above
             print("📦 [\(peer.host)] Using on-demand P2P fetch for blocks \(startHeight)-\(startHeight + UInt64(effectiveCount) - 1)")
             do {
                 let blocks = try await peer.getFullBlocks(from: startHeight, count: effectiveCount)
                 var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
                 for block in blocks {
+                    // FIX #1204: Save finalsaplingroot to HeaderStore for anchor validation
+                    // Full blocks from getdata have authoritative sapling roots
+                    if !block.finalSaplingRoot.isEmpty && !block.finalSaplingRoot.allSatisfy({ $0 == 0 }) {
+                        try? HeaderStore.shared.updateSaplingRoot(at: block.blockHeight, root: block.finalSaplingRoot, timestamp: block.time)
+                        // FIX #1253: Also save to delta sapling roots (survives missing header rows)
+                        DeltaCMUManager.shared.appendSaplingRoot(height: block.blockHeight, root: block.finalSaplingRoot)
+                    }
+
                     let finalBlockHash = block.blockHash.map { String(format: "%02x", $0) }.joined()
                     let blockTimestamp = block.time
                     var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
@@ -7039,7 +7193,7 @@ public final class NetworkManager: ObservableObject {
                 print("⚠️ [\(peer.host)] On-demand P2P fetch failed: \(error.localizedDescription)")
                 return nil
             }
-        }
+        }  // END DEAD CODE - FIX #1234
 
         // Check peer connection before attempting fetches
         guard peer.isConnectionReady else {
@@ -7105,13 +7259,22 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
+        // FIX #1205: Track batch fetch results for peer selection
+        peer.recordBatchResult(blocksReceived: blocks.count)
         if blocks.isEmpty && !blockHashes.isEmpty {
-            print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests")
+            print("⚠️ [\(peer.host)] Returned 0 blocks from \(blockHashes.count) requests (consecutive failures: \(peer.consecutiveBatchFailures))")
         }
 
         var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
         for (blockHeight, compactBlock) in blocks {
+            // FIX #1204: Save finalsaplingroot to HeaderStore for anchor validation
+            if !compactBlock.finalSaplingRoot.isEmpty && !compactBlock.finalSaplingRoot.allSatisfy({ $0 == 0 }) {
+                try? HeaderStore.shared.updateSaplingRoot(at: blockHeight, root: compactBlock.finalSaplingRoot, timestamp: compactBlock.time)
+                // FIX #1253: Also save to delta sapling roots (survives missing header rows)
+                DeltaCMUManager.shared.appendSaplingRoot(height: blockHeight, root: compactBlock.finalSaplingRoot)
+            }
+
             let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
             let blockTimestamp = compactBlock.time  // Block timestamp from P2P header
             var txDataList: [(String, [ShieldedOutput], [ShieldedSpend]?)] = []
