@@ -542,6 +542,23 @@ struct RPCSendView: View {
             return
         }
 
+        // FIX #1267: Require biometric/passcode auth before sending (was completely missing)
+        let zatoshis = UInt64(amountValue * 100_000_000)
+        let authSuccess = await withCheckedContinuation { continuation in
+            BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { success, error in
+                if !success {
+                    print("🔐 FIX #1267: Send auth failed in full node mode: \(error?.localizedDescription ?? "cancelled")")
+                }
+                continuation.resume(returning: success)
+            }
+        }
+        guard authSuccess else {
+            await MainActor.run {
+                errorMessage = "Authentication required to send transaction"
+            }
+            return
+        }
+
         await MainActor.run {
             isSending = true
             errorMessage = nil

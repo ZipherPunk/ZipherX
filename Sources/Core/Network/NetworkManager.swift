@@ -3091,8 +3091,24 @@ public final class NetworkManager: ObservableObject {
                 // FIX #403: Increase threshold to 50000 blocks (~3 months) to handle stale HeaderStore
                 let maxReasonableHeight = headerStoreHeight > 0 ? headerStoreHeight + 50000 : UInt64.max
                 if peerConsensusHeight <= maxReasonableHeight {
-                    currentChainHeight = peerConsensusHeight
-                    print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                    // FIX #1265: When peerMaxHeight is 1-2 blocks above consensus, prefer max height.
+                    // During block propagation, some peers have the new block (via inv) while others
+                    // haven't announced yet. Consensus picks the MOST common height, which is the OLD
+                    // height until >50% of peers announce. This delays block scanning by 30s-10min.
+                    // A 1-2 block difference is safe (normal propagation, not Sybil attack).
+                    if peerMaxHeight > peerConsensusHeight && peerMaxHeight <= peerConsensusHeight + 2 {
+                        let peersAtMax = peerHeights[peerMaxHeight, default: 0]
+                        if peersAtMax >= 1 {
+                            currentChainHeight = peerMaxHeight
+                            print("📡 FIX #1265: Using max peer height \(peerMaxHeight) (consensus: \(peerConsensusHeight), \(peersAtMax) peer(s) at max)")
+                        } else {
+                            currentChainHeight = peerConsensusHeight
+                            print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                        }
+                    } else {
+                        currentChainHeight = peerConsensusHeight
+                        print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                    }
                 } else {
                     print("🚨 FIX #381: Rejecting suspicious consensus \(peerConsensusHeight) (HeaderStore: \(headerStoreHeight))")
                     currentChainHeight = headerStoreHeight
@@ -3152,6 +3168,25 @@ public final class NetworkManager: ObservableObject {
         let dbHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
         await MainActor.run {
             self.walletHeight = dbHeight
+        }
+
+        // FIX #1263: Ensure block listeners are running during normal operation.
+        // Without block listeners, dispatchers are inactive → mempool queries fail,
+        // block inv messages are NOT received, peer heights stay stale, and both
+        // outgoing confirmations (FIX #859) and incoming TX detection are delayed 3+ min.
+        // Block listeners are the ONLY way to receive real-time block announcements.
+        if !suppressBackgroundSync && !PeerManager.shared.areBlockListenersBlocked() {
+            var anyActive = false
+            for peer in peers where peer.isConnectionReady {
+                if await peer.isDispatcherActive {
+                    anyActive = true
+                    break
+                }
+            }
+            if !anyActive && !peers.filter({ $0.isConnectionReady }).isEmpty {
+                print("📡 FIX #1263: No active dispatchers — starting block listeners for real-time block detection")
+                await startBlockListenersOnMainScreen()
+            }
         }
 
         // BACKGROUND SYNC: If chain is ahead of wallet, sync new blocks
@@ -3428,8 +3463,8 @@ public final class NetworkManager: ObservableObject {
     /// Called when a transaction is confirmed (found in a block)
     /// FIX #350: NOW writes to database - this is the ONLY place where sent TX is recorded!
     /// This is now async and awaitable to ensure proper completion ordering
-    func confirmOutgoingTx(txid: String) async {
-        print("📤 confirmOutgoingTx called for: \(txid.prefix(16))...")
+    func confirmOutgoingTx(txid: String, blockHeight: UInt64 = 0) async {
+        print("📤 confirmOutgoingTx called for: \(txid.prefix(16))... (blockHeight: \(blockHeight))")
 
         // Remove from sync-accessible set
         pendingOutgoingLock.lock()
@@ -3445,7 +3480,15 @@ public final class NetworkManager: ObservableObject {
         // FIX #350: Write to database NOW (on confirmation, not broadcast)
         if let pendingTx = result.pendingTx, result.removed {
             do {
-                let chainHeight = try await getChainHeight()
+                // FIX #1264: Use actual block height where TX was found, not current chain tip.
+                // FIX #859 passes the real block height from FilterScanner. getChainHeight() can
+                // return a LATER block if new blocks arrived between TX mining and detection.
+                let confirmedHeight: UInt64
+                if blockHeight > 0 {
+                    confirmedHeight = blockHeight
+                } else {
+                    confirmedHeight = try await getChainHeight()
+                }
                 let currentTime = UInt32(Date().timeIntervalSince1970)
 
                 // Only write to database if we have valid hashedNullifier (full pending TX info)
@@ -3465,13 +3508,13 @@ public final class NetworkManager: ObservableObject {
                     _ = try WalletDatabase.shared.recordSentTransactionAtomic(
                         hashedNullifier: pendingTx.hashedNullifier,
                         txid: txidWireFormat,
-                        spentHeight: chainHeight,
+                        spentHeight: confirmedHeight,
                         amount: pendingTx.amount,
                         fee: pendingTx.fee,
                         toAddress: pendingTx.toAddress,
                         memo: pendingTx.memo
                     )
-                    print("📤 FIX #350: CONFIRMED TX recorded atomically - note marked spent + history inserted at height \(chainHeight)")
+                    print("📤 FIX #350: CONFIRMED TX recorded atomically - note marked spent + history inserted at height \(confirmedHeight)")
                 } else {
                     // Legacy tracking (no full info) - just update existing record if any
                     print("📤 FIX #350: Legacy tracking - updating existing record if present")
@@ -3480,7 +3523,7 @@ public final class NetworkManager: ObservableObject {
                         let txidWireFormat = Data(txidDisplayData.reversed())
                         try WalletDatabase.shared.updateSentTransactionOnConfirmation(
                             txid: txidWireFormat,
-                            confirmedHeight: chainHeight,
+                            confirmedHeight: confirmedHeight,
                             blockTime: UInt64(currentTime)
                         )
                     }
@@ -3647,6 +3690,29 @@ public final class NetworkManager: ObservableObject {
 
         print("📤 Checking \(pendingTxids.count) pending outgoing transactions for confirmations...")
         print("📤 Pending txids: \(pendingTxids.map { $0.prefix(16) + "..." })")
+
+        // FIX #1263: Ensure block listeners are running when we have pending TXs.
+        // After broadcast, block listeners may be inactive (startup sequence, header sync,
+        // or scanner stopped them). Without dispatchers:
+        // - Mempool queries always return empty (FIX #1184b skips them)
+        // - Block inv messages are NOT received → no new-block scanning
+        // - FIX #859 (block scanner) never runs → TX confirmation delayed 3+ minutes
+        // Fix: Start block listeners on demand so dispatchers activate within ~500ms.
+        if !PeerManager.shared.areBlockListenersBlocked() {
+            var anyActive = false
+            for peer in peers where peer.isConnectionReady {
+                if await peer.isDispatcherActive {
+                    anyActive = true
+                    break
+                }
+            }
+            if !anyActive {
+                print("📤 FIX #1263: Dispatchers inactive with \(pendingTxids.count) pending TX(s) — starting block listeners for confirmation detection")
+                await startBlockListenersOnMainScreen()
+                // Give dispatchers time to activate
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
 
         var confirmedCount = 0
 

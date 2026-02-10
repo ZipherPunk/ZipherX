@@ -2992,8 +2992,8 @@ final class FilterScanner {
                     let txidDisplayFormat = tx.txHash.reversed().map { String(format: "%02x", $0) }.joined()
                     if await NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
                         print("📤 FIX #859: Our pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
-                        // FIX #1146: Pass actual block height for accurate confirmation
-                        await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
+                        // FIX #1264: Pass actual block height for accurate DB recording
+                        await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                     }
                 }
             }
@@ -3141,7 +3141,7 @@ final class FilterScanner {
                     if NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
                         print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
                         Task {
-                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                         }
                     } else {
                         // FIX #843: External spend or app-restart case
@@ -3946,7 +3946,7 @@ final class FilterScanner {
                     if NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat) {
                         print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
                         Task {
-                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat)
+                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                         }
                     }
                 }

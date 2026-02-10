@@ -1147,49 +1147,91 @@ public class RPCClient: ObservableObject {
             print("📜 FIX #855: Added \(localSentCount) locally tracked z-address SENT transactions")
         }
 
-        // 3. Get z-address RECEIVED transactions (AFTER sent - FIX #866)
-        // z_listreceivedbyaddress returns RECEIVED z-transactions with full details
-        // By processing after SENT, self-sends show as SENT (user's action) not RECEIVED
+        // 3. Get z-address RECEIVED transactions
+        // FIX #1269: Complete rewrite of z-received handling.
+        // - Use RAW z_listreceivedbyaddress to access the "change" field
+        // - SKIP change notes (these are our own money coming back, not real receives)
+        // - ALLOW same txid to appear as both SENT and RECEIVED when wallet holds both keys
+        //   (e.g., macOS sends to sim, both PKs in wallet.dat → show IN and OUT)
+        // - Only dedup identical outputs (same txid + same address)
         var zReceivedCount = 0
-        // FIX #862: Use composite key (txid+address) to avoid filtering out multiple outputs
-        // A single TX can have multiple z-outputs to different addresses in our wallet
         var seenZOutputs = Set<String>()
         for zAddr in zAddresses {
-            let zReceived = try await zListReceivedByAddress(zAddr, minconf: 0)
-            for tx in zReceived {
-                // FIX #866: Skip if this txid was already added as SENT (self-send case)
-                // This ensures self-sends show as SENT, not RECEIVED
-                if seenTxids.contains(tx.txid) {
-                    continue
-                }
-                // FIX #862: Composite key to track unique outputs, not just unique txids
-                let outputKey = "\(tx.txid):\(tx.address)"
-                if !seenZOutputs.contains(outputKey) {
-                    allTransactions.append(tx)
+            do {
+                let rawResult = try await call(method: "z_listreceivedbyaddress", params: [zAddr, 0])
+                guard let notes = rawResult as? [[String: Any]] else { continue }
+
+                for note in notes {
+                    guard let txid = note["txid"] as? String else { continue }
+                    let isChange = note["change"] as? Bool ?? false
+
+                    // FIX #1269: Skip change notes — they are NOT real receives.
+                    // Change outputs are handled by Stage 4 (sent TX detection via change notes).
+                    if isChange {
+                        continue
+                    }
+
+                    let amount = UInt64((note["amount"] as? Double ?? 0) * 100_000_000)
+                    let memoHex = note["memo"] as? String
+                    let memo = memoHex.flatMap { Self.decodeMemo($0) }
+
+                    // FIX #862: Composite key to avoid duplicate outputs
+                    let outputKey = "\(txid):\(zAddr)"
+                    guard !seenZOutputs.contains(outputKey) else { continue }
                     seenZOutputs.insert(outputKey)
-                    seenTxids.insert(tx.txid)
+
+                    // Get timing info
+                    var timestamp = Date()
+                    var confirmations = 0
+                    var height: UInt64? = nil
+                    if let txDetails = try? await getTransaction(txid: txid) {
+                        confirmations = txDetails["confirmations"] as? Int ?? 0
+                        if let time = txDetails["time"] as? Int {
+                            timestamp = Date(timeIntervalSince1970: TimeInterval(time))
+                        } else if let blocktime = txDetails["blocktime"] as? Int {
+                            timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                        }
+                        if let h = txDetails["height"] as? Int { height = UInt64(h) }
+                    }
+
+                    allTransactions.append(WalletTransaction(
+                        txid: txid,
+                        address: zAddr,
+                        amount: amount,
+                        fee: 0,
+                        type: .received,
+                        timestamp: timestamp,
+                        confirmations: confirmations,
+                        memo: memo,
+                        height: height
+                    ))
+                    seenTxids.insert(txid)
                     zReceivedCount += 1
                 }
+            } catch {
+                print("⚠️ FIX #1269: Failed z_listreceivedbyaddress for \(zAddr.prefix(16))...: \(error)")
             }
         }
-        print("📜 FIX #866: Added \(zReceivedCount) z-address RECEIVED transactions (self-sends excluded)")
+        print("📜 FIX #1269: Added \(zReceivedCount) z-address RECEIVED transactions (change notes excluded)")
 
-        // FIX #885: Discover sent z-transactions using z_viewtransaction
-        // Zcash/Zclassic has no z_listsenttransactions RPC, so we examine each transaction
-        // for wallet spends to find sent transactions that weren't captured by operation status
-        print("📜 FIX #885: Discovering sent z-transactions via z_viewtransaction...")
-        let discoveredSentTxs = try await discoverSentZTransactions(knownTxids: Array(seenTxids))
+        // FIX #1269: Discover sent z-transactions via change-note detection.
+        // Zclassic does NOT have z_viewtransaction (that's Zcash 4.x+).
+        // z_getoperationstatus is in-memory only — lost on daemon restart.
+        // Instead: notes marked "change: true" in z_listreceivedbyaddress reveal
+        // our SENDING transactions (change goes back to us on every send).
+        print("📜 FIX #1269: Discovering sent z-transactions via change-note detection...")
+        let discoveredSentTxs = try await discoverSentZTransactionsViaChangeNotes(
+            zAddresses: zAddresses,
+            existingSentTxids: Set(allTransactions.filter { $0.type == .sent }.map { $0.txid })
+        )
         var discoveredCount = 0
         for sentTx in discoveredSentTxs {
-            // Only add if not already tracked as sent
-            let existingAsSent = allTransactions.contains { $0.txid == sentTx.txid && $0.type == .sent }
-            if !existingAsSent {
-                allTransactions.append(sentTx)
-                discoveredCount += 1
-            }
+            allTransactions.append(sentTx)
+            seenTxids.insert(sentTx.txid)
+            discoveredCount += 1
         }
         if discoveredCount > 0 {
-            print("📜 FIX #885: Discovered \(discoveredCount) additional sent z-transactions")
+            print("📜 FIX #1269: Discovered \(discoveredCount) additional sent z-transactions via change notes")
         }
 
         // 4. For any transaction we found, try to enrich with full details
@@ -1576,106 +1618,154 @@ public class RPCClient: ObservableObject {
         return unspent
     }
 
-    /// FIX #885: View full details of a shielded transaction (z_viewtransaction)
-    /// This reveals our spends and outputs in a transaction, allowing us to discover sent z-transactions
-    /// - Parameter txid: The transaction ID to view
-    /// - Returns: Dictionary with "spends" and "outputs" arrays showing wallet's involvement
-    public func zViewTransaction(_ txid: String) async throws -> [String: Any] {
-        let result = try await call(method: "z_viewtransaction", params: [txid])
-
-        guard let details = result as? [String: Any] else {
-            return [:]
-        }
-
-        return details
-    }
-
-    /// FIX #885: Discover sent z-transactions by examining wallet's spends in transactions
-    /// Zcash/Zclassic has no z_listsenttransactions RPC, so we use z_viewtransaction
-    /// to check each known transaction for our spends
-    public func discoverSentZTransactions(knownTxids: [String]) async throws -> [WalletTransaction] {
+    /// FIX #1269: Discover sent z-transactions via change-note detection.
+    /// Zclassic does NOT have z_viewtransaction (that's Zcash 4.x+).
+    /// Instead, we use z_listreceivedbyaddress "change" field:
+    /// - Notes marked "change: true" = change output from OUR send
+    /// - The txid of the change note IS the sending transaction
+    /// - We can also detect spent notes by comparing received vs z_listunspent
+    ///
+    /// NOTE: gettransaction RPC in Zclassic does NOT return fee/amount for pure z-to-z
+    /// transactions (GetDebit/GetCredit only handle transparent inputs/outputs).
+    /// So we estimate amounts from the note data.
+    public func discoverSentZTransactionsViaChangeNotes(
+        zAddresses: [String],
+        existingSentTxids: Set<String>
+    ) async throws -> [WalletTransaction] {
         var sentTransactions: [WalletTransaction] = []
 
-        for txid in knownTxids {
+        // Step 1: Scan all z-addresses for change notes (reveal our sends)
+        // Also collect all received notes for spent-note detection
+        var changeNoteTxids: [String: UInt64] = [:]  // txid → change amount
+        var allReceivedNotes: [(txid: String, outindex: Int, amount: UInt64)] = []
+
+        for zAddr in zAddresses {
             do {
-                let details = try await zViewTransaction(txid)
+                let rawResult = try await call(method: "z_listreceivedbyaddress", params: [zAddr, 0])
+                guard let notes = rawResult as? [[String: Any]] else { continue }
 
-                // Check if we have spends in this transaction
-                guard let spends = details["spends"] as? [[String: Any]], !spends.isEmpty else {
-                    continue
-                }
+                for note in notes {
+                    guard let txid = note["txid"] as? String else { continue }
+                    let isChange = note["change"] as? Bool ?? false
+                    let amount = UInt64((note["amount"] as? Double ?? 0) * 100_000_000)
+                    let outindex = note["outindex"] as? Int ?? 0
 
-                // Calculate total spent from our wallet
-                var totalSpent: UInt64 = 0
-                for spend in spends {
-                    if let value = spend["value"] as? Double {
-                        totalSpent += UInt64(value * 100_000_000)
-                    } else if let valueZat = spend["valueZat"] as? Int {
-                        totalSpent += UInt64(valueZat)
+                    allReceivedNotes.append((txid: txid, outindex: outindex, amount: amount))
+
+                    if isChange {
+                        // Change note → this txid is one of our sending transactions
+                        changeNoteTxids[txid, default: 0] += amount
                     }
                 }
-
-                // Get outputs to calculate actual sent amount (total - change)
-                var changeAmount: UInt64 = 0
-                var recipientAddress = ""
-                if let outputs = details["outputs"] as? [[String: Any]] {
-                    for output in outputs {
-                        let isChange = output["isChange"] as? Bool ?? (output["is_mine_change"] as? Bool ?? false)
-                        let outValue: UInt64
-                        if let v = output["value"] as? Double {
-                            outValue = UInt64(v * 100_000_000)
-                        } else if let vZat = output["valueZat"] as? Int {
-                            outValue = UInt64(vZat)
-                        } else {
-                            continue
-                        }
-
-                        if isChange {
-                            changeAmount += outValue
-                        } else if recipientAddress.isEmpty {
-                            recipientAddress = output["address"] as? String ?? ""
-                        }
-                    }
-                }
-
-                // If we have spends but no recipient (all change), skip - this might be internal movement
-                let actualSent = totalSpent > changeAmount ? totalSpent - changeAmount : 0
-                if actualSent == 0 {
-                    continue
-                }
-
-                // Get transaction details for timestamp
-                var timestamp = Date()
-                var confirmations = 0
-                var height: UInt64? = nil
-                if let txDetails = try? await getTransaction(txid: txid) {
-                    if let blocktime = txDetails["blocktime"] as? Int {
-                        timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
-                    }
-                    if let conf = txDetails["confirmations"] as? Int {
-                        confirmations = conf
-                    }
-                    if let h = txDetails["height"] as? Int {
-                        height = UInt64(h)
-                    }
-                }
-
-                sentTransactions.append(WalletTransaction(
-                    txid: txid,
-                    address: recipientAddress,
-                    amount: actualSent,
-                    fee: 10000, // Default fee estimate
-                    type: .sent,
-                    timestamp: timestamp,
-                    confirmations: confirmations,
-                    height: height
-                ))
-
-                print("📤 FIX #885: Discovered sent z-transaction: \(txid.prefix(16))... amount=\(actualSent)")
             } catch {
-                // Transaction might not be viewable (not in our wallet)
+                print("⚠️ FIX #1269: Failed to get received notes for \(zAddr.prefix(16))...: \(error)")
                 continue
             }
+        }
+
+        // Step 2: Get all unspent notes to detect spent notes
+        var unspentKeys = Set<String>()
+        do {
+            let allUnspent = try await zListUnspent(minConf: 0, addresses: zAddresses)
+            for note in allUnspent {
+                if let txid = note["txid"] as? String, let outindex = note["outindex"] as? Int {
+                    unspentKeys.insert("\(txid):\(outindex)")
+                }
+            }
+        } catch {
+            print("⚠️ FIX #1269: Failed to get unspent notes: \(error)")
+        }
+
+        // Step 3: Compute total spent by finding received notes no longer in unspent
+        var totalSpentNoteValue: UInt64 = 0
+        for note in allReceivedNotes {
+            let key = "\(note.txid):\(note.outindex)"
+            if !unspentKeys.contains(key) {
+                totalSpentNoteValue += note.amount
+            }
+        }
+        if totalSpentNoteValue > 0 {
+            print("📊 FIX #1269: Total value of spent z-notes: \(totalSpentNoteValue) zatoshis")
+        }
+
+        // Step 4: Create "sent" entries for each change-note txid
+        for (txid, changeAmount) in changeNoteTxids {
+            // Skip if already tracked as sent
+            guard !existingSentTxids.contains(txid) else { continue }
+
+            // Get timing info from the transaction
+            var timestamp = Date()
+            var confirmations = 0
+            var height: UInt64? = nil
+
+            if let txDetails = try? await getTransaction(txid: txid) {
+                if let time = txDetails["time"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(time))
+                } else if let blocktime = txDetails["blocktime"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                }
+                confirmations = txDetails["confirmations"] as? Int ?? 0
+                if let h = txDetails["height"] as? Int {
+                    height = UInt64(h)
+                }
+            }
+
+            // Check if there's also a non-change received note with this txid (self-send)
+            let selfRecvAmount = allReceivedNotes
+                .filter { $0.txid == txid }
+                .reduce(0 as UInt64) { total, note in
+                    let key = "\(note.txid):\(note.outindex)"
+                    // Non-change notes are those whose amount != the change amount
+                    // (simplification: non-change notes that are still in received list)
+                    return total + note.amount
+                } - changeAmount  // Subtract change to get self-received amount
+
+            // Estimate sent amount:
+            // For self-sends: the non-change amount is what was "sent to self"
+            // For external sends: we only know the change; approximate sent = (some input) - change - fee
+            // Best effort: if selfRecvAmount > 0, use that; otherwise use change as reference
+            let sentAmount: UInt64
+            if selfRecvAmount > 0 {
+                sentAmount = selfRecvAmount  // Self-send amount
+            } else {
+                // External send — we know change came back but not exact outflow.
+                // Use a placeholder that indicates a send happened.
+                // The change amount gives context about the transaction size.
+                sentAmount = changeAmount  // Show change as approximate reference
+            }
+
+            sentTransactions.append(WalletTransaction(
+                txid: txid,
+                address: "Shielded",
+                amount: sentAmount,
+                fee: 10000, // Default Zclassic fee
+                type: .sent,
+                timestamp: timestamp,
+                confirmations: confirmations,
+                height: height
+            ))
+
+            print("📤 FIX #1269: Discovered sent z-TX: \(txid.prefix(16))... change=\(changeAmount), sent≈\(sentAmount)")
+        }
+
+        // Step 5: Detect exact-amount sends (no change note — note disappeared without change)
+        // These are rare but possible. We can detect them as "spent notes with no corresponding send"
+        var spentNotesWithoutSend: [(txid: String, amount: UInt64)] = []
+        for note in allReceivedNotes {
+            let key = "\(note.txid):\(note.outindex)"
+            if !unspentKeys.contains(key) {
+                // This note was spent. Check if we already know about a send involving it.
+                // If the note's txid ISN'T a change txid and ISN'T already tracked, it might be
+                // an input to an exact-amount send.
+                // Note: we can't determine WHICH tx spent this note without nullifier tracking.
+                // For now, just track the lost value.
+                if !changeNoteTxids.keys.contains(note.txid) && !existingSentTxids.contains(note.txid) {
+                    spentNotesWithoutSend.append((txid: note.txid, amount: note.amount))
+                }
+            }
+        }
+        if !spentNotesWithoutSend.isEmpty {
+            print("📊 FIX #1269: Found \(spentNotesWithoutSend.count) spent notes without matching send (possible exact-amount sends or inputs to known sends)")
         }
 
         return sentTransactions

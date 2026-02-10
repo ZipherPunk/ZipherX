@@ -1870,7 +1870,10 @@ final class WalletDatabase {
             sqlite3_bind_text(insertStmt, 4, encryptedType, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(insertStmt, 5, Int64(amount))
             sqlite3_bind_int64(insertStmt, 6, Int64(fee))
-            sqlite3_bind_text(insertStmt, 7, toAddress, -1, SQLITE_TRANSIENT)
+            // FIX #1268: Don't store recipient address for privacy (defense in depth).
+            // Shielded TXs hide the recipient on-chain — storing it locally undermines the privacy model.
+            // Old transactions that already have to_address will keep it, but new ones get NULL.
+            sqlite3_bind_null(insertStmt, 7) // to_address = NULL (privacy)
             if let memo = memo {
                 sqlite3_bind_text(insertStmt, 8, memo, -1, SQLITE_TRANSIENT)
             } else {

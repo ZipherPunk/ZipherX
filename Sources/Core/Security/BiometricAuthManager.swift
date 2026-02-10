@@ -221,10 +221,16 @@ final class BiometricAuthManager: ObservableObject {
         let zcl = Double(amount) / 100_000_000.0
         let reason = String(format: "Authenticate to send %.8f ZCL", zcl)
 
+        print("🔐 authenticateForSend: amount=\(amount) zatoshis (\(String(format: "%.8f", zcl)) ZCL)")
+
         #if DEBUG
         // UAT mode: bypass send auth for test amounts (<= 0.0019 ZCL = 190000 zatoshis)
         // Enable via: defaults write com.zipherpunk.zipherx.mac uatModeEnabled -bool true
-        if UserDefaults.standard.bool(forKey: "uatModeEnabled") && amount <= 190000 {
+        let uatEnabled = UserDefaults.standard.bool(forKey: "uatModeEnabled")
+        if uatEnabled {
+            print("🔐 WARNING: UAT mode is ENABLED (uatModeEnabled=true)")
+        }
+        if uatEnabled && amount <= 190000 {
             print("🧪 [UAT] Send auth bypassed for \(amount) zatoshis (\(String(format: "%.4f", zcl)) ZCL)")
             completion(true, nil)
             return
@@ -233,13 +239,16 @@ final class BiometricAuthManager: ObservableObject {
 
         // Check if biometric auth is enabled in settings
         let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        print("🔐 authenticateForSend: biometricEnabled=\(biometricEnabled)")
 
         if biometricEnabled {
             // Biometric enabled - require Face ID/Touch ID (fresh, no cache)
+            print("🔐 authenticateForSend: calling authenticateFresh (biometric path)")
             authenticateFresh(reason: reason, completion: completion)
         } else {
             // VUL-005 FIX: Even with biometric disabled, require device passcode
             // This ensures every transaction requires authentication
+            print("🔐 authenticateForSend: calling authenticateWithPasscode (passcode path)")
             authenticateWithPasscode(reason: reason, completion: completion)
         }
     }
@@ -250,6 +259,8 @@ final class BiometricAuthManager: ObservableObject {
         let context = LAContext()
         context.localizedFallbackTitle = "" // Hide biometric fallback option
         context.localizedCancelTitle = "Cancel"
+        // FIX #1267: Force fresh prompt — prevent auto-approval from recent system auth
+        context.touchIDAuthenticationAllowableReuseDuration = 0
 
         var error: NSError?
 
@@ -284,13 +295,19 @@ final class BiometricAuthManager: ObservableObject {
         let context = LAContext()
         context.localizedFallbackTitle = "Use Passcode"
         context.localizedCancelTitle = "Cancel"
+        // FIX #1267: Force fresh biometric prompt — prevent macOS from reusing
+        // recent Touch ID / Apple Watch auth. Without this, sends can auto-approve
+        // silently if user recently authenticated (e.g., app unlock).
+        context.touchIDAuthenticationAllowableReuseDuration = 0
 
         var error: NSError?
 
         // First try biometrics only - always fresh, no timeout check
         if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
+            print("🔐 authenticateFresh: using deviceOwnerAuthenticationWithBiometrics (Touch ID/Face ID)")
             context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { [weak self] success, authError in
                 DispatchQueue.main.async {
+                    print("🔐 authenticateFresh: biometric result — success=\(success), error=\(authError?.localizedDescription ?? "none")")
                     if success {
                         self?.lastAuthTime = Date()
                         self?.lastActivityTime = Date()
@@ -302,8 +319,10 @@ final class BiometricAuthManager: ObservableObject {
         }
         // Fall back to device passcode
         else if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+            print("🔐 authenticateFresh: biometric unavailable, falling back to deviceOwnerAuthentication (passcode)")
             context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, authError in
                 DispatchQueue.main.async {
+                    print("🔐 authenticateFresh: passcode result — success=\(success), error=\(authError?.localizedDescription ?? "none")")
                     if success {
                         self?.lastAuthTime = Date()
                         self?.lastActivityTime = Date()
@@ -315,6 +334,7 @@ final class BiometricAuthManager: ObservableObject {
         }
         else {
             // No biometric available - block the operation for security
+            print("🔐 authenticateFresh: NO authentication method available — blocking operation")
             completion(false, error)
         }
     }

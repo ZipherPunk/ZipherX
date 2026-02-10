@@ -443,18 +443,11 @@ struct TransactionDetailView: View {
                 detailRow("Fee", "\(String(format: "%.8f", fee)) ZCL")
             }
 
-            // Address (if available)
-            if let address = transaction.toAddress {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("To Address")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                    Text(address)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(theme.textPrimary)
-                        .textSelection(.enabled)
-                }
-                .padding(.top, 4)
+            // FIX #1268: Don't display recipient address for privacy (defense in depth).
+            // Shielded TXs hide the recipient on-chain — displaying it locally undermines the privacy model.
+            // Show "Shielded" instead, which is the whole point of z-addresses.
+            if transaction.type == .sent {
+                detailRow("To Address", "Shielded")
             }
         }
         .padding()

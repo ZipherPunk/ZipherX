@@ -2820,6 +2820,19 @@ public final class Peer {
         // Notify about new blocks
         if !blockHashes.isEmpty {
             print("📦 [\(host)] Received \(blockHashes.count) new block announcement(s)!")
+
+            // FIX #1265: Update peer height on block announcement.
+            // peerStartHeight is only set during VERSION handshake and never updated.
+            // When a peer announces a new block via inv, they MUST know about it,
+            // so their height is at least peerStartHeight + 1.
+            // Without this, getChainHeight() returns stale heights until peers reconnect,
+            // delaying TX confirmation detection by 2-10+ minutes.
+            let newHeight = peerStartHeight + Int32(blockHashes.count)
+            if newHeight > peerStartHeight {
+                print("📊 FIX #1265: [\(host)] Updating peer height \(peerStartHeight) → \(newHeight) (block announcement)")
+                peerStartHeight = newHeight
+            }
+
             for blockHash in blockHashes {
                 onBlockAnnounced?(blockHash)
             }

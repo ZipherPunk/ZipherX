@@ -2322,7 +2322,9 @@ struct ContentView: View {
                 // Shows when: (A) isShowingLockScreen is true, OR (B) biometric enabled but never authenticated this session
                 // The second condition prevents ANY wallet content from being visible before first auth
                 // NEVER dismiss until LAContext returns .success via BiometricAuthManager
-                if biometricManager.isBiometricEnabled && !isInitialSync &&
+                // FIX #1266: REMOVED !isInitialSync — lock screen MUST show during startup too.
+                // Without this, the startup/sync window is visible before user authenticates.
+                if biometricManager.isBiometricEnabled &&
                    (isShowingLockScreen || !biometricManager.hasAuthenticatedThisSession) {
                     LockScreenView(onUnlock: {
                         withAnimation {

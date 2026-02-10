@@ -38,7 +38,8 @@ struct RPCTransactionHistoryView: View {
         case .all:
             return transactions
         case .shielded:
-            return transactions.filter { $0.address.hasPrefix("zs") || $0.address.hasPrefix("zc") || $0.address.isEmpty }
+            // FIX #1269: Also match "Shielded" address label (used for discovered z-sends)
+            return transactions.filter { $0.address.hasPrefix("zs") || $0.address.hasPrefix("zc") || $0.address.isEmpty || $0.address == "Shielded" }
         case .transparent:
             return transactions.filter { $0.address.hasPrefix("t1") || $0.address.hasPrefix("t3") }
         }
