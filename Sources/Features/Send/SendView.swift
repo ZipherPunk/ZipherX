@@ -95,6 +95,12 @@ struct SendView: View {
     @State private var showTorUnavailableAlert = false
     @State private var pendingSendWithoutTor = false
 
+    // FIX #1270: Keyboard dismissal for iOS (decimalPad has no Done button)
+    enum SendField: Hashable {
+        case address, amount, memo
+    }
+    @FocusState private var focusedField: SendField?
+
     // FIX #565: Mempool verification pending warning (high peer acceptance but timeout)
     @State private var showMempoolVerificationPendingWarning = false
     @State private var mempoolVerificationPendingMessage = ""
@@ -228,6 +234,12 @@ struct SendView: View {
                 }
                 .padding()
             }
+            #if os(iOS)
+            // FIX #1270: Tap outside text fields to dismiss keyboard
+            .onTapGesture {
+                focusedField = nil
+            }
+            #endif
 
             // Progress overlay when sending
             if isSending {
@@ -483,6 +495,17 @@ struct SendView: View {
             preparationTask?.cancel()
             preparationTask = nil
         }
+        #if os(iOS)
+        // FIX #1270: "Done" toolbar button for keyboards without a return key (decimalPad)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    focusedField = nil
+                }
+            }
+        }
+        #endif
     }
 
     private var addressField: some View {
@@ -522,6 +545,7 @@ struct SendView: View {
             TextField("zs1...", text: $recipientAddress)
                 .font(theme.bodyFont)
                 .foregroundColor(theme.textPrimary)
+                .focused($focusedField, equals: .address)
                 #if os(iOS)
                 .autocapitalization(.none)
                 #endif
@@ -657,6 +681,7 @@ struct SendView: View {
                 TextField("0.00000000", text: $amount)
                     .font(theme.bodyFont)
                     .foregroundColor(theme.textPrimary)
+                    .focused($focusedField, equals: .amount)
                     #if os(iOS)
                     .keyboardType(.decimalPad)
                     #endif
@@ -700,6 +725,7 @@ struct SendView: View {
             TextField("Private message...", text: $memo)
                 .font(theme.bodyFont)
                 .foregroundColor(theme.textPrimary)
+                .focused($focusedField, equals: .memo)
                 .padding(8)
                 .background(theme.surfaceColor)
                 .overlay(
