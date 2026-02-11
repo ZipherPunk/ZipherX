@@ -2520,14 +2520,35 @@ final class FilterScanner {
                             // Get delta CMUs and append them to all loaded witnesses
                             let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
                             if !deltaCMUs.isEmpty {
-                                print("🔧 FIX #739 v3: Appending \(deltaCMUs.count) delta CMUs to all witnesses...")
-                                // Pack delta CMUs into contiguous data for batch update
-                                var packedCMUs = Data()
-                                for cmu in deltaCMUs {
-                                    packedCMUs.append(cmu)
+                                // FIX #1281: Apply same size-based guard as FIX #978.
+                                // Witnesses loaded from DB already have some delta CMUs in their
+                                // merkle paths. Only apply NEW CMUs to prevent double-apply corruption.
+                                let currentTreeSize = Int(ZipherXFFI.treeSize())
+                                let boostCMUCount = Int(ZipherXConstants.effectiveTreeCMUCount)
+                                let cmusAlreadyInWitnesses = max(0, currentTreeSize - boostCMUCount)
+
+                                let cmusForWitnesses: [Data]
+                                if cmusAlreadyInWitnesses >= deltaCMUs.count {
+                                    cmusForWitnesses = []
+                                    print("✅ FIX #1281: FIX #739 v3 SKIPPED witness update - all \(deltaCMUs.count) delta CMUs already applied")
+                                } else if cmusAlreadyInWitnesses > 0 {
+                                    cmusForWitnesses = Array(deltaCMUs.dropFirst(cmusAlreadyInWitnesses))
+                                    print("🔧 FIX #1281: FIX #739 v3 - Skipping first \(cmusAlreadyInWitnesses) CMUs, applying \(cmusForWitnesses.count) new CMUs to witnesses")
+                                } else {
+                                    cmusForWitnesses = deltaCMUs
+                                    print("🔧 FIX #739 v3: Appending \(deltaCMUs.count) delta CMUs to all witnesses...")
                                 }
-                                let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
-                                print("🔧 FIX #739 v3: Updated \(updatedCount) witnesses with delta CMUs")
+
+                                if !cmusForWitnesses.isEmpty {
+                                    var packedCMUs = Data()
+                                    for cmu in cmusForWitnesses {
+                                        packedCMUs.append(cmu)
+                                    }
+                                    let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: cmusForWitnesses.count)
+                                    print("🔧 FIX #739 v3: Updated \(updatedCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
+                                } else {
+                                    print("✅ FIX #739 v3: Witnesses already current (no update needed)")
+                                }
                             }
 
                             // Extract updated witnesses and save to database using correct FFI indices

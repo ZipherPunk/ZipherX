@@ -3390,11 +3390,13 @@ struct LockScreenView: View {
     let onUnlock: () -> Void
 
     @StateObject private var biometricManager = BiometricAuthManager.shared
+    @Environment(\.scenePhase) private var scenePhase  // FIX #1281
     @State private var isAuthenticating = false
     @State private var authError: String?
     @State private var showRetryButton = false
     @State private var retryCountdown: Int = 0  // FIX #1253: Countdown timer for retry delay
     @State private var retryTimer: Timer?
+    @State private var hasAttemptedAuth = false  // FIX #1281: Track if auth was attempted
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -3407,13 +3409,18 @@ struct LockScreenView: View {
             VStack(spacing: 24) {
                 Spacer()
 
-                // Lock icon
+                // Lock icon — FIX #1281: tappable to re-trigger auth
                 Image(systemName: biometricManager.biometricType.systemImageName)
                     .font(.system(size: 64))
                     .foregroundColor(theme.primaryColor)
                     .opacity(isAuthenticating ? 0.6 : 1.0)
                     .scaleEffect(isAuthenticating ? 1.1 : 1.0)
                     .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: isAuthenticating)
+                    .onTapGesture {
+                        if !isAuthenticating && !biometricManager.isAuthInProgress {
+                            attemptUnlock()
+                        }
+                    }
 
                 // Title
                 Text("ZipherX Locked")
@@ -3478,10 +3485,26 @@ struct LockScreenView: View {
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
                 } else {
-                    // Waiting to auto-authenticate
-                    Text("Authenticating...")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
+                    // FIX #1281: Show "Tap to Unlock" button when idle (not authenticating, no retry)
+                    // Previously showed "Authenticating..." even when nothing was happening,
+                    // leaving user stuck with no way to trigger auth prompt.
+                    Button(action: attemptUnlock) {
+                        HStack {
+                            Image(systemName: biometricManager.biometricType.systemImageName)
+                            Text("Tap to Unlock")
+                        }
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        .background(theme.buttonBackground)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                        )
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
 
                 Spacer()
@@ -3489,13 +3512,47 @@ struct LockScreenView: View {
             }
         }
         .onAppear {
-            // Auto-prompt for Face ID when lock screen appears
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                attemptUnlock()
+            if biometricManager.hasAuthenticatedThisSession {
+                onUnlock()
+                return
+            }
+
+            if biometricManager.isAuthInProgress {
+                return
+            }
+
+            // Auto-prompt after short delay (allows view to settle)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                if biometricManager.hasAuthenticatedThisSession {
+                    onUnlock()
+                    return
+                }
+                if !biometricManager.isAuthInProgress {
+                    hasAttemptedAuth = true
+                    attemptUnlock()
+                }
+            }
+        }
+        // FIX #1281: Re-trigger auth when app becomes active while lock screen is showing.
+        // .onAppear only fires ONCE when the view is first added. If auth completed/failed
+        // while the screen was off (device lock, screen saver), user returns to a dead
+        // lock screen with no auth prompt. This re-triggers auth on every foreground return.
+        .onChange(of: scenePhase) { newPhase in
+            if newPhase == .active && !biometricManager.hasAuthenticatedThisSession {
+                // Reset state so auth can be re-triggered
+                if !isAuthenticating && !biometricManager.isAuthInProgress {
+                    showRetryButton = false
+                    authError = nil
+                    // Small delay to let the scene fully activate
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        if !biometricManager.hasAuthenticatedThisSession && !biometricManager.isAuthInProgress {
+                            attemptUnlock()
+                        }
+                    }
+                }
             }
         }
         .onDisappear {
-            // Clean up timer
             retryTimer?.invalidate()
             retryTimer = nil
         }
@@ -3522,7 +3579,21 @@ struct LockScreenView: View {
                 // FIX #1253: ONLY dismiss lock screen on .success
                 onUnlock()
             } else {
-                // FIX #1253: Auth failed or cancelled — STAY LOCKED, show retry
+                // FIX #1273: On initial startup, cancel = quit app immediately
+                // User explicitly refused to authenticate — no access to wallet
+                if let laError = error as? LAError, laError.code == .userCancel {
+                    if !biometricManager.hasAuthenticatedThisSession {
+                        print("🔐 FIX #1273: User cancelled auth at startup — quitting app")
+                        #if os(macOS)
+                        NSApplication.shared.terminate(nil)
+                        #else
+                        exit(0)
+                        #endif
+                        return
+                    }
+                }
+
+                // FIX #1253: Auth failed — show retry
                 if let laError = error as? LAError {
                     switch laError.code {
                     case .userCancel:
@@ -3541,6 +3612,21 @@ struct LockScreenView: View {
                 } else {
                     authError = "Authentication failed"
                 }
+
+                // FIX #1273: After 3 consecutive failures at startup, quit the app
+                if biometricManager.consecutiveFailures >= 3 && !biometricManager.hasAuthenticatedThisSession {
+                    print("🔐 FIX #1273: 3 consecutive auth failures at startup — quitting app")
+                    authError = "Too many failed attempts. App will close."
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        #if os(macOS)
+                        NSApplication.shared.terminate(nil)
+                        #else
+                        exit(0)
+                        #endif
+                    }
+                    return
+                }
+
                 showRetryButton = true
 
                 // FIX #1253: Start countdown if there's a retry delay

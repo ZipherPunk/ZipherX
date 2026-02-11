@@ -218,8 +218,11 @@ public class RPCClient: ObservableObject {
     }
 
     /// Get balance for a specific z-address
-    public func getZBalance(address: String) async throws -> Double {
-        let result = try await call(method: "z_getbalance", params: [address])
+    // FIX #1272: Added minconf parameter. Default minconf=1 excludes locked notes during
+    // pending z_sendmany operations, making balance appear dramatically lower.
+    // Use minconf=0 to include unconfirmed/pending notes (matches z_gettotalbalance 0 behavior).
+    public func getZBalance(address: String, minconf: Int = 1) async throws -> Double {
+        let result = try await call(method: "z_getbalance", params: [address, minconf])
         if let balance = result as? Double {
             return balance
         }

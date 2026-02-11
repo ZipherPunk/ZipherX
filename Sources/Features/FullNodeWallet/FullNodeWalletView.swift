@@ -219,6 +219,18 @@ struct FullNodeWalletView: View {
         }
         .background(theme.backgroundColor)
         .task {
+            // FIX #1273: SECURITY — Wait for authentication before loading wallet data.
+            // FullNodeWalletView renders behind ContentView's lock screen overlay.
+            // Without this guard, RPC calls to daemon run before user authenticates.
+            if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                print("🔐 FIX #1273: [FullNode] Waiting for authentication...")
+                while !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    if Task.isCancelled { return }
+                }
+                print("🔐 FIX #1273: [FullNode] Authentication confirmed")
+            }
+
             // FIX #305: Check prerequisites FIRST before loading wallet data
             let prereqCheck = checkPrerequisites()
             await MainActor.run {
@@ -231,6 +243,11 @@ struct FullNodeWalletView: View {
                 await loadWalletData()
                 // FIX #286 v12: Check for external rescan on startup
                 await checkExternalRescanStatus()
+                // FIX #1273: Start polling AFTER auth + data load (onAppear skips when not authenticated)
+                await MainActor.run {
+                    startRescanStatusPolling()
+                    startPendingTxMonitoring()
+                }
             }
         }
         .onAppear {
@@ -238,6 +255,12 @@ struct FullNodeWalletView: View {
             let prereqCheck = checkPrerequisites()
             prerequisitesMissing = prereqCheck.missing
             prerequisitesMessage = prereqCheck.message
+
+            // FIX #1273: Don't start polling until authenticated — these make RPC calls
+            guard BiometricAuthManager.shared.hasAuthenticatedThisSession else {
+                // Polling will be started by .task after auth completes
+                return
+            }
 
             // FIX #286 v12: Start polling for external rescans
             if !prerequisitesMissing {
@@ -283,9 +306,17 @@ struct FullNodeWalletView: View {
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
 
-                    Text(formatBalance(totalBalance.total))
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
-                        .foregroundColor(theme.textPrimary)
+                    // FIX #1272: During pending z_sendmany, z_getbalance excludes locked notes
+                    // making balance appear dramatically lower. Show message instead of wrong number.
+                    if hasPendingTransactions {
+                        Text("Pending confirmation...")
+                            .font(.system(size: 22, weight: .semibold, design: .monospaced))
+                            .foregroundColor(statusBlue)
+                    } else {
+                        Text(formatBalance(totalBalance.total))
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                    }
                 }
 
                 Spacer()
@@ -610,9 +641,16 @@ struct FullNodeWalletView: View {
                 Text(title)
                     .font(theme.captionFont)
                     .foregroundColor(theme.textSecondary)
-                Text(formatBalance(amount))
-                    .font(theme.monoFont)
-                    .foregroundColor(theme.textPrimary)
+                // FIX #1272: Show pending indicator instead of wrong balance during sends
+                if hasPendingTransactions {
+                    Text("Pending...")
+                        .font(theme.monoFont)
+                        .foregroundColor(statusBlue)
+                } else {
+                    Text(formatBalance(amount))
+                        .font(theme.monoFont)
+                        .foregroundColor(theme.textPrimary)
+                }
             }
 
             Spacer()
@@ -732,38 +770,53 @@ struct FullNodeWalletView: View {
     }
 
     private func addressRow(_ address: WalletAddress) -> some View {
-        HStack {
-            // Address type icon
-            Image(systemName: address.isShielded ? "shield.fill" : "eye.fill")
-                .foregroundColor(theme.primaryColor)
-                .frame(width: 20)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(truncateAddress(address.address))
-                    .font(theme.monoFont)
-                    .foregroundColor(theme.textPrimary)
-                    .textSelection(.enabled)
-
-                Text(formatBalance(address.balance))
-                    .font(theme.captionFont)
-                    .foregroundColor(theme.textSecondary)
-            }
-
-            Spacer()
-
-            // Copy button
-            Button {
-                copyToClipboard(address.address)
-            } label: {
-                Image(systemName: "doc.on.doc")
-                    .font(.system(size: 14))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                // Address type icon
+                Image(systemName: address.isShielded ? "shield.fill" : "eye.fill")
                     .foregroundColor(theme.primaryColor)
-                    .padding(8)
+                    .frame(width: 20)
+
+                // FIX #1272: Show pending indicator instead of wrong per-address balance
+                if hasPendingTransactions && address.isShielded {
+                    Text("Pending confirmation...")
+                        .font(theme.captionFont)
+                        .foregroundColor(statusBlue)
+                } else {
+                    Text(formatBalance(address.balance))
+                        .font(theme.monoFont)
+                        .foregroundColor(theme.textPrimary)
+                }
+
+                Spacer()
+
+                // Copy button
+                Button {
+                    copyToClipboard(address.address)
+                } label: {
+                    HStack(spacing: 2) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 12))
+                        Text("Copy")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundColor(theme.primaryColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                     .background(theme.backgroundColor)
                     .cornerRadius(4)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("Copy address to clipboard")
             }
-            .buttonStyle(PlainButtonStyle())
-            .help("Copy address to clipboard")
+
+            // Full address on its own line with horizontal scroll
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(address.address)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .textSelection(.enabled)
+            }
         }
         .padding()
         .background(theme.surfaceColor)
@@ -2108,6 +2161,10 @@ struct FullNodeWalletView: View {
         guard !daemonBusyDetected else { return }
 
         do {
+            // FIX #1272: Capture pending state BEFORE updating — otherwise hadPendingBefore
+            // reads the NEW state and the transition is never detected.
+            let hadPendingBefore = hasPendingTransactions
+
             // 1. Check for pending z_sendmany operations
             let operations = try await RPCClient.shared.getPendingOperations()
 
@@ -2136,12 +2193,33 @@ struct FullNodeWalletView: View {
             }
 
             // 4. Check if pending balance changed to 0 (transaction confirmed)
-            let hadPendingBefore = hasPendingTransactions
-            let hasPendingNow = !operations.isEmpty || unconfirmed.transparent != 0 || unconfirmed.private_ != 0
+            // FIX #1272: Use the FRESH operations/unconfirmed data for hasPendingNow
+            let trulyPendingNow = operations.filter { $0.status == "executing" || $0.status == "queued" }
+            let hasPendingNow = !trulyPendingNow.isEmpty || unconfirmed.transparent != 0 || unconfirmed.private_ != 0
 
             if hadPendingBefore && !hasPendingNow {
-                print("📊 FIX #286 v17: All pending transactions confirmed - refreshing wallet data")
+                print("📊 FIX #1272: Pending→confirmed transition detected — refreshing all wallet data")
                 await loadWalletData()
+            }
+
+            // FIX #1272: Always refresh balance during monitoring when no pending ops.
+            // z_getbalance with minconf=1 returns wrong balance during pending z_sendmany
+            // (locked notes excluded). When TX confirms, balance restores — but ONLY if we
+            // re-fetch it. Refreshing every poll cycle (5s) is cheap (1 RPC call).
+            // Call loadWalletData() (not just totalBalance update) so per-address balances
+            // also get refreshed.
+            if !hasPendingNow {
+                let freshBalance = try? await RPCClient.shared.getDetailedBalance()
+                if let b = freshBalance {
+                    let transparent = UInt64((b.transparent * 100_000_000).rounded())
+                    let privateBalance = UInt64((b.private_ * 100_000_000).rounded())
+                    let total = UInt64((b.total * 100_000_000).rounded())
+                    let current = totalBalance
+                    if total != current.total || transparent != current.transparent || privateBalance != current.private {
+                        print("📊 FIX #1272: Balance changed \(formatBalance(current.total)) → \(formatBalance(total)) — refreshing all wallet data")
+                        await loadWalletData()
+                    }
+                }
             }
 
             // 5. Check for newly confirmed transactions by monitoring z_listreceivedbyaddress changes

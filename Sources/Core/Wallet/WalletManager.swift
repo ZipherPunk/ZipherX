@@ -123,6 +123,11 @@ final class WalletManager: ObservableObject {
     @Published var hasCorruptedWitnesses: Bool = false
     @Published var corruptedWitnessCount: Int = 0
 
+    // MARK: - FIX #1280: Auto Full Rescan when phantom witnesses detected
+    /// Set by FIX #1280 when witnesses have roots that don't match FFI tree.
+    /// Checked after backgroundSync to auto-trigger Full Rescan.
+    var phantomWitnessAutoRescanNeeded: Bool = false
+
     // MARK: - FIX #557 v15: Prevent concurrent witness rebuilds
     /// When true, preRebuildWitnessesForInstantPayment() returns immediately
     /// This prevents multiple rebuilds running simultaneously and producing inconsistent anchors
@@ -401,8 +406,17 @@ final class WalletManager: ObservableObject {
         loadWalletState()
 
         // Preload commitment tree in background if wallet exists
+        // FIX #1273: Wait for authentication before starting ANY background operations.
+        // Without this, tree preload, prover init, key reading, and delta validation
+        // all run before the user authenticates at the lock screen.
         if isWalletCreated {
             Task {
+                // FIX #1273: Gate all background operations behind authentication
+                while !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                    if Task.isCancelled { return }
+                }
+                print("🔐 FIX #1273: Authentication confirmed — starting WalletManager background tasks")
                 await preloadCommitmentTree()
                 // Pre-initialize prover for faster first transaction
                 await preloadProver()
@@ -3873,6 +3887,34 @@ final class WalletManager: ObservableObject {
                 await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
             }
 
+            // FIX #1280: Auto Full Rescan when phantom witnesses detected.
+            // preRebuildWitnessesForInstantPayment() sets this flag when witnesses have roots
+            // that don't match the verified FFI tree root (loaded from corrupted DB state).
+            // Automatically trigger Full Rescan to rebuild everything from scratch.
+            if await MainActor.run(body: { self.phantomWitnessAutoRescanNeeded }) {
+                await MainActor.run {
+                    self.phantomWitnessAutoRescanNeeded = false
+                    self.syncStatus = "Repairing corrupted witnesses..."
+                }
+                print("🔄 FIX #1280: AUTO FULL RESCAN — phantom witnesses detected")
+                print("🔄 FIX #1280: Witnesses had roots that don't match blockchain")
+                print("🔄 FIX #1280: Starting automatic Full Rescan to rebuild from correct tree...")
+
+                do {
+                    try await repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
+                        Task { @MainActor in
+                            self.syncStatus = "Repairing witnesses: \(Int(progress * 100))%"
+                            self.overallProgress = progress
+                        }
+                    }, forceFullRescan: true)
+                    print("✅ FIX #1280: Auto Full Rescan complete — witnesses rebuilt from correct tree")
+                } catch {
+                    print("❌ FIX #1280: Auto Full Rescan failed: \(error.localizedDescription)")
+                    print("   User should manually run Full Rescan from Settings")
+                }
+                return  // backgroundSync complete — Full Rescan handles everything
+            }
+
             // FIX #1210: Use getTotalUnspentBalance for display (no witness requirement).
             // getUnspentNotes() requires witness IS NOT NULL — shows partial balance when
             // only some witnesses are rebuilt. Display should always show full balance.
@@ -4039,6 +4081,29 @@ final class WalletManager: ObservableObject {
             // This ensures all unspent notes have witnesses matching current tree root
             // so the user can send instantly without waiting for witness rebuild
             await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
+
+            // FIX #1280: Auto Full Rescan when phantom witnesses detected at startup.
+            if await MainActor.run(body: { self.phantomWitnessAutoRescanNeeded }) {
+                await MainActor.run {
+                    self.phantomWitnessAutoRescanNeeded = false
+                    self.syncStatus = "Repairing corrupted witnesses..."
+                }
+                print("🔄 FIX #1280: AUTO FULL RESCAN (startup) — phantom witnesses detected")
+                print("🔄 FIX #1280: Starting automatic Full Rescan to rebuild from correct tree...")
+
+                do {
+                    try await repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
+                        Task { @MainActor in
+                            self.syncStatus = "Repairing witnesses: \(Int(progress * 100))%"
+                            self.overallProgress = progress
+                        }
+                    }, forceFullRescan: true)
+                    print("✅ FIX #1280: Auto Full Rescan complete (startup) — witnesses rebuilt")
+                } catch {
+                    print("❌ FIX #1280: Auto Full Rescan failed (startup): \(error.localizedDescription)")
+                }
+                // Continue to balance refresh below
+            }
 
             // FIX #300 + FIX #1210: Refresh balance AFTER witness rebuild.
             // Use getTotalUnspentBalance (no witness requirement) for display balance.
@@ -4352,21 +4417,20 @@ final class WalletManager: ObservableObject {
                         let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(witnessAnchor)
                         if !anchorOnChain {
                             let anchorHex = witnessAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
-                            // FIX #1256: When delta is VERIFIED, trust the tree.
-                            // containsSaplingRoot() misses valid anchors from recently-synced blocks.
-                            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
-                            if deltaVerified {
-                                print("⚠️ FIX #1256: [WITNESS \(index + 1)] Note ID=\(note.id) anchor \(anchorHex)... NOT in HeaderStore, but delta VERIFIED — keeping")
-                            } else {
-                                print("🚨 FIX #1224: [WITNESS \(index + 1)] Note ID=\(note.id) anchor \(anchorHex)... NOT FOUND in HeaderStore!")
-                                print("   Witness is internally consistent but anchor never existed on blockchain")
-                                print("   This witness was created from a corrupted/incomplete tree — forcing rebuild")
-                                corruptedWitnesses.append((note.id, note.height ?? 0))
-                                if let cmu = note.cmu, !cmu.isEmpty {
-                                    notesNeedingRebuild.append((note: note, cmu: cmu))
-                                }
-                                continue
+                            // FIX #1279: NEVER trust phantom anchors, even with DeltaBundleVerified=true.
+                            // FIX #1256 previously bypassed this check — caused phantom TX broadcast.
+                            // Proof: sim wallet tree root 3ed752cc matched blockchain at tip (3007184),
+                            // but ALL 44 witness anchors (b6e85eb1) were phantom — NOT on any block.
+                            // DeltaBundleVerified validates TIP root only, NOT intermediate witness anchors.
+                            // Witnesses loaded from DB at corrupted state are PERMANENTLY wrong.
+                            print("🚨 FIX #1279: [WITNESS \(index + 1)] Note ID=\(note.id) anchor \(anchorHex)... NOT FOUND in HeaderStore!")
+                            print("   Witness anchor is phantom — never existed on blockchain")
+                            print("   Witness was saved from corrupted tree state — must rebuild from current correct tree")
+                            corruptedWitnesses.append((note.id, note.height ?? 0))
+                            if let cmu = note.cmu, !cmu.isEmpty {
+                                notesNeedingRebuild.append((note: note, cmu: cmu))
                             }
+                            continue
                         }
 
                         witnessIsCurrent = true
@@ -5496,12 +5560,37 @@ final class WalletManager: ObservableObject {
                 // CRITICAL: treeAppend() only updates the TREE, NOT the WITNESSES!
                 // Without this call, witnesses remain stale at boost file root.
                 // updateAllWitnessesBatch() appends CMUs to each loaded witness in WITNESSES array.
-                var packedCMUs = Data()
-                for cmu in deltaCMUs {
-                    packedCMUs.append(cmu)
+                //
+                // FIX #1281: Apply SAME size-based guard as FIX #978 Step 2a.
+                // Witnesses loaded from DB already have `cmusAlreadyInTree` delta CMUs in their
+                // merkle paths. Applying ALL delta CMUs double-applies those → witness root at
+                // non-existent tree position → FIX #1280 flags ALL as corrupted → auto Full Rescan.
+                // Only apply NEW CMUs (same ones that were appended to tree in Step 2a).
+                let cmusForWitnesses: [Data]
+                if cmusAlreadyInTree >= deltaCMUs.count {
+                    // All CMUs already reflected in witnesses from DB, skip
+                    cmusForWitnesses = []
+                    print("✅ FIX #1281: Step 2b SKIPPED - Witnesses already have all \(deltaCMUs.count) delta CMUs")
+                } else if cmusAlreadyInTree > 0 {
+                    // Witnesses from DB have first N delta CMUs, only apply new ones
+                    cmusForWitnesses = Array(deltaCMUs.dropFirst(cmusAlreadyInTree))
+                    print("🔧 FIX #1281: Step 2b - Skipping first \(cmusAlreadyInTree) CMUs (already in witnesses), applying \(cmusForWitnesses.count) new CMUs")
+                } else {
+                    // Witnesses at boost boundary, apply all delta CMUs
+                    cmusForWitnesses = deltaCMUs
+                    print("🔧 FIX #805: Step 2b - Applying all \(deltaCMUs.count) delta CMUs to witnesses")
                 }
-                let updatedWitnessCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
-                print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(deltaCMUs.count) delta CMUs")
+
+                if !cmusForWitnesses.isEmpty {
+                    var packedCMUs = Data()
+                    for cmu in cmusForWitnesses {
+                        packedCMUs.append(cmu)
+                    }
+                    let updatedWitnessCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: cmusForWitnesses.count)
+                    print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
+                } else {
+                    print("✅ FIX #805: Step 2b - Witnesses already current (no update needed)")
+                }
 
                 print("✅ FIX #571 + FIX #805: Step 2 complete - Tree AND witnesses now updated!")
             } else {
@@ -5668,21 +5757,90 @@ final class WalletManager: ObservableObject {
                     }
                 }
 
+                // FIX #1279: Validate witnesses from FFI WITNESSES array BEFORE saving.
+                // The WITNESSES array is populated from DB-loaded witnesses. If those witnesses
+                // were saved from a corrupted tree, treeGetWitness() returns wrong merkle paths.
+                // The witness root MUST match the FFI tree root — if not, the witness is corrupt.
+                var phantomWitnessCount = 0
+                var phantomNoteIds: [Int64] = []  // FIX #1280: Track corrupted note IDs to NULL in DB
+
+                // FIX #1280: Get the VERIFIED FFI tree root for per-witness validation.
+                // The FFI tree root was already verified against HeaderStore above.
+                // Each extracted witness MUST produce the SAME root as the FFI tree.
+                // If a witness produces a different root, it was loaded from corrupted DB state
+                // and the delta CMU update couldn't fix it (wrong base → wrong extended path).
+                let ffiTreeRootForValidation = ZipherXFFI.treeRoot()
+                if let rootHex = ffiTreeRootForValidation?.prefix(8).map({ String(format: "%02x", $0) }).joined() {
+                    print("🔍 FIX #1280: FFI tree root for witness validation: \(rootHex)...")
+                }
+
                 for (note, position) in witnessIndices {
                     if let updatedWitness = ZipherXFFI.treeGetWitness(index: position) {
+                        // FIX #1280: Validate witness root matches FFI tree root BEFORE saving.
+                        // If witness was loaded from corrupted DB, treeGetWitness() returns the
+                        // corrupted witness with wrong merkle path. Its root will differ from
+                        // the verified FFI tree root. This is the per-witness check that
+                        // FIX #1279 Layer 2 missed (it only checked the tree root, not witness roots).
+                        if let ffiRoot = ffiTreeRootForValidation,
+                           let witnessRoot = ZipherXFFI.witnessGetRoot(updatedWitness) {
+                            if witnessRoot != ffiRoot && Data(witnessRoot.reversed()) != ffiRoot {
+                                // Witness produces different root than FFI tree — corrupted!
+                                phantomWitnessCount += 1
+                                phantomNoteIds.append(note.id)
+                                if phantomWitnessCount <= 3 {
+                                    let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                    print("🚨 FIX #1280: Note \(note.id) witness root \(witnessRootHex)... ≠ FFI tree root — SKIPPING")
+                                }
+                                continue  // Don't save this corrupted witness
+                            }
+                        }
                         witnessUpdates.append((note.id, updatedWitness))
                         updatedCount += 1
                     }
 
-                    // FIX #567 + FIX #569 v3: Use CURRENT anchor (matches updated witness), NOT witness root!
-                    // CRITICAL FIX #569 v3: Never extract anchor from witness itself!
-                    // The witness was just loaded from DB and has OLD anchor - extracting from it
-                    // would write the OLD anchor back, defeating the whole update process!
+                    // Only update anchor if witness was valid (not skipped above)
                     if let currentAnchor = currentTreeAnchor {
-                        positionAnchorUpdates.append((note.id, currentAnchor))
-                        anchorFixedCount += 1
-                    } else {
-                        print("❌ FIX #569 v3: No anchor available for note \(note.id) - skipping anchor update")
+                        // FIX #1280: Only add anchor update if witness was saved
+                        if witnessUpdates.last?.noteId == note.id {
+                            positionAnchorUpdates.append((note.id, currentAnchor))
+                            anchorFixedCount += 1
+                        }
+                    }
+                }
+
+                // FIX #1280: NULL corrupted witnesses in DB so they don't persist across restarts.
+                // Without this, the same corrupted witnesses would be loaded on next startup,
+                // FIX #1279 would detect them, FIX #1027 rebuild would fail, FIX #569 would
+                // re-load them → infinite cycle. NULLing breaks the cycle.
+                if !phantomNoteIds.isEmpty {
+                    print("🚨 FIX #1280: Skipped \(phantomWitnessCount) witnesses with phantom roots (≠ FFI tree root)")
+                    print("🚨 FIX #1280: NULLing \(phantomNoteIds.count) corrupted witnesses in DB to break infinite cycle")
+                    await MainActor.run {
+                        for noteId in phantomNoteIds {
+                            try? WalletDatabase.shared.clearWitnessForNote(noteId: noteId)
+                        }
+                    }
+                    print("🚨 FIX #1280: Saved \(updatedCount) valid witnesses, NULLed \(phantomWitnessCount) corrupted")
+                    print("🚨 FIX #1280: Run Full Rescan to rebuild corrupted witnesses from correct tree")
+                }
+
+                // FIX #1279: Also check the tree root itself against HeaderStore as backup
+                if let anchor = currentTreeAnchor {
+                    let anchorValid = await HeaderStore.shared.containsSaplingRoot(anchor)
+                    if !anchorValid {
+                        let anchorHex = anchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("🚨 FIX #1279: FFI tree anchor \(anchorHex)... NOT in HeaderStore!")
+                        print("🚨 FIX #1279: ALL \(witnessUpdates.count) witnesses are from corrupted tree")
+                        print("🚨 FIX #1279: REFUSING to save — witnesses need Full Rescan rebuild")
+                        phantomWitnessCount += witnessUpdates.count
+                        witnessUpdates.removeAll()
+                        positionAnchorUpdates.removeAll()
+
+                        // NULL all witnesses so they get rebuilt fresh
+                        await MainActor.run {
+                            try? WalletDatabase.shared.clearWitnessesForCorruptedTree()
+                            print("🚨 FIX #1279: Cleared ALL witnesses — phantom tree anchor")
+                        }
                     }
                 }
 
@@ -5698,9 +5856,31 @@ final class WalletManager: ObservableObject {
                     }
                 }
 
-                print("✅ FIX #569 v2: Step 3 complete - Updated \(updatedCount) witnesses with current tree state")
-                print("✅ FIX #569 v2: Updated \(anchorFixedCount) anchors to CURRENT tree root (chain height \(chainHeight))")
-                print("✅ FIX #569 v2: Witness update complete - ALL notes now have correct witnesses and anchors!")
+                if phantomWitnessCount > 0 && updatedCount == 0 {
+                    print("🚨 FIX #1280: ALL \(phantomWitnessCount) witnesses had phantom roots — none saved")
+                    // Only trigger auto-rescan if not already in a Full Rescan
+                    // (repairNotesAfterDownloadedTree calls preRebuildWitnessesForInstantPayment internally)
+                    let alreadyRescanning = await MainActor.run { self.isFullRescan || self.isRepairingDatabase }
+                    if !alreadyRescanning {
+                        print("🚨 FIX #1280: Auto Full Rescan will be triggered to rebuild witnesses")
+                        await MainActor.run { self.phantomWitnessAutoRescanNeeded = true }
+                    } else {
+                        print("⚠️ FIX #1280: Already in Full Rescan — skipping auto-trigger")
+                    }
+                } else if phantomWitnessCount > 0 {
+                    print("⚠️ FIX #1280: \(updatedCount) valid witnesses saved, \(phantomWitnessCount) phantom witnesses skipped")
+                    let alreadyRescanning = await MainActor.run { self.isFullRescan || self.isRepairingDatabase }
+                    if !alreadyRescanning {
+                        print("🚨 FIX #1280: Auto Full Rescan will be triggered to rebuild corrupted witnesses")
+                        await MainActor.run { self.phantomWitnessAutoRescanNeeded = true }
+                    } else {
+                        print("⚠️ FIX #1280: Already in Full Rescan — skipping auto-trigger")
+                    }
+                } else {
+                    print("✅ FIX #569 v2: Step 3 complete - Updated \(updatedCount) witnesses with current tree state")
+                    print("✅ FIX #569 v2: Updated \(anchorFixedCount) anchors to CURRENT tree root (chain height \(chainHeight))")
+                    print("✅ FIX #569 v2: Witness update complete - ALL notes now have correct witnesses and anchors!")
+                }
 
                 // FIX #1132: Mark that witnesses were updated this session
                 // This prevents FIX #557 from doing a redundant rebuild after fast delta update
@@ -10044,8 +10224,14 @@ final class WalletManager: ObservableObject {
         }
 
         // Load balance from database on startup (async)
+        // FIX #1273: Wait for authentication before opening database and reading keys.
+        // Without this, the DB opens and keys are read behind the lock screen.
         if isWalletCreated {
             Task {
+                while !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                    if Task.isCancelled { return }
+                }
                 await loadBalanceFromDatabase()
             }
         }

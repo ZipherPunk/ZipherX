@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalAuthentication
 #if os(iOS)
 import UIKit
 #else
@@ -25,6 +26,10 @@ struct ZipherXApp: App {
     #endif
 
     init() {
+        // FIX #1276: Auth is handled SOLELY by LockScreenView — single owner, zero races.
+        // Previously ZipherXApp.init() also triggered auth, causing double-prompt race conditions.
+        print("🔐 FIX #1276: Auth deferred to LockScreenView (single owner)")
+
         // Initialize NotificationManager early to set delegate
         // This ensures foreground notifications work
         _ = NotificationManager.shared
@@ -42,15 +47,19 @@ struct ZipherXApp: App {
             print("✅ FIX #776: Cleared incorrectly set boostHeadersCorrupted flag")
         }
 
-        // Fetch tree info from GitHub on first launch or to check for updates
-        // This runs async and updates ZipherXConstants with latest values
+        // FIX #1273: Defer network-dependent tasks until after authentication.
+        // These were running immediately at app launch, before the lock screen.
         Task {
-            await CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()
-        }
+            // Wait for auth before making any network requests or starting Tor
+            while !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                if Task.isCancelled { return }
+            }
 
-        // Auto-start Tor if mode is enabled (for maximum privacy)
-        // This ensures daemon routes through Tor from first connection
-        Task {
+            // Fetch tree info from GitHub (lightweight ~1KB manifest)
+            await CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()
+
+            // Auto-start Tor if mode is enabled (for maximum privacy)
             await TorManager.shared.start()
         }
 

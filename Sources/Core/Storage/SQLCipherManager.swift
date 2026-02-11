@@ -26,8 +26,7 @@ final class SQLCipherManager {
 
     // DEBUG: Set to true to disable SQLCipher encryption for debugging
     // FIX #226: Re-enabled SQLCipher - full database encryption active
-    // TEMPORARY: Disabled for debugging FIX #375
-    private static let DEBUG_DISABLE_SQLCIPHER = true
+    private static let DEBUG_DISABLE_SQLCIPHER = false
 
     /// Whether SQLCipher is available (compiled with encryption support)
     private(set) var isSQLCipherAvailable: Bool = false
@@ -80,8 +79,28 @@ final class SQLCipherManager {
             }
         }
 
-        // Check if biometric protection is available
-        hasBiometricProtection = checkBiometricSecretExists()
+        // FIX #1277: v3 uses app secret (device ID + HKDF), NOT biometric-protected keychain secret.
+        // The old v2 biometric secret was stored with .userPresence access control, which causes
+        // macOS to show a SECOND system auth prompt ("L'authentification de ZipherX est requise
+        // pour continuer") when checkBiometricSecretExists() queries the keychain at startup.
+        // Since v3 doesn't use it, delete it and skip the check entirely.
+        // hasBiometricProtection stays false — v3 provides auth via app-level biometric lock.
+        cleanupOldBiometricSecret()
+    }
+
+    /// FIX #1277: Remove old v2 biometric secret from keychain to prevent double auth prompt.
+    /// SecItemDelete does NOT trigger .userPresence auth — only reading data does.
+    private func cleanupOldBiometricSecret() {
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: biometricSecretKey
+        ]
+        let status = SecItemDelete(deleteQuery as CFDictionary)
+        if status == errSecSuccess {
+            print("🔐 FIX #1277: Cleaned up old v2 biometric secret from keychain")
+        }
+        // hasBiometricProtection stays false (default) — v3 doesn't need it
     }
 
     // MARK: - SQLCipher Detection

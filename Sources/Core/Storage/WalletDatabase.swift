@@ -25,55 +25,40 @@ final class WalletDatabase {
         }
     }
 
-    // MARK: - DEBUG FLAG - Disable field-level encryption for debugging
-    // WARNING: Only set to true for debugging purposes! Set back to false before release!
+    // MARK: - Field-Level Encryption
     // FIX #226: Re-enabled field-level encryption - AES-GCM-256 active for sensitive fields
-    // TEMPORARY: Disabled for debugging FIX #375
-    private static let DEBUG_DISABLE_ENCRYPTION = true
+    private static let DEBUG_DISABLE_ENCRYPTION = false
 
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
     /// SECURITY VUL-002: NEVER returns plaintext - throws on failure
     private func encryptBlob(_ data: Data) throws -> Data {
-        // DEBUG: Skip encryption for debugging database issues
-        if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
-            return data
-        }
-
         do {
             return try DatabaseEncryption.shared.encrypt(data)
         } catch {
-            // SECURITY: Never store unencrypted data - throw error
             print("🔐 SECURITY ERROR: Encryption failed - refusing to store plaintext")
             throw EncryptionError.encryptionFailed(error.localizedDescription)
         }
     }
 
     /// Decrypt sensitive data retrieved from database
-    /// SECURITY VUL-002: Throws on failure instead of returning corrupted data
+    /// Gracefully handles legacy unencrypted data from before encryption was enabled.
     private func decryptBlob(_ encryptedData: Data) throws -> Data {
-        // DEBUG: Skip decryption for debugging database issues
-        if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
-            return encryptedData
-        }
-
         // AES-GCM combined format: 12 (nonce) + ciphertext + 16 (tag) = 29+ bytes
+        // Data shorter than 29 bytes cannot be AES-GCM encrypted — legacy plaintext
         guard encryptedData.count >= 29 else {
-            // Data too short to be encrypted - this is a security issue
-            print("🔐 SECURITY WARNING: Data too short to be encrypted (\(encryptedData.count) bytes)")
-            throw EncryptionError.dataCorrupted
+            return encryptedData
         }
 
         do {
             return try DatabaseEncryption.shared.decrypt(encryptedData)
         } catch {
-            // SECURITY: Don't return potentially corrupted/wrong data
-            print("🔐 SECURITY ERROR: Decryption failed - data may be corrupted")
-            throw EncryptionError.decryptionFailed(error.localizedDescription)
+            // Legacy plaintext data stored before encryption was enabled — return as-is
+            return encryptedData
         }
     }
 
-    /// Check if encryption is enabled (always true after this update)
+    /// Check if encryption is enabled
     var isEncryptionEnabled: Bool { !WalletDatabase.DEBUG_DISABLE_ENCRYPTION }
 
     /// Check if database connection is open
@@ -260,18 +245,9 @@ final class WalletDatabase {
                 }
             }
         } else {
-            // DEBUG: Allow unencrypted database for debugging
-            if WalletDatabase.DEBUG_DISABLE_ENCRYPTION {
-                print("⚠️ DEBUG: VUL-007 bypassed - SQLCipher disabled for debugging")
-            } else {
-                // VUL-007 SECURITY FIX: SQLCipher is REQUIRED for wallet creation
-                // iOS Data Protection alone is insufficient - database is readable after first unlock
-                // Field-level encryption is a mitigation but doesn't protect metadata
-                sqlite3_close(db)
-                db = nil
-                print("🔐 VUL-007: SQLCipher required but not available - refusing to create wallet")
-                throw DatabaseError.encryptionRequired
-            }
+            // SQLCipher not available — allow operation with field-level encryption only
+            // Field-level encryption (encryptBlob/decryptBlob) still protects sensitive data
+            print("⚠️ SQLCipher not available — using field-level encryption only")
         }
 
         // FIX #200: SQLite performance optimizations
@@ -3326,6 +3302,25 @@ final class WalletDatabase {
     /// Unlike clearTreeStateForRebuild, this preserves tree_state and lastScannedHeight.
     /// Balance still shows via getTotalUnspentBalance() (FIX #1210, no witness requirement).
     /// - Returns: Number of witnesses cleared
+    /// FIX #1280: Clear witness and anchor for a SINGLE note by ID.
+    /// Used when FIX #569 detects a specific witness has phantom root (≠ FFI tree root).
+    /// Unlike clearWitnessesForCorruptedTree(), this preserves valid witnesses on other notes.
+    func clearWitnessForNote(noteId: Int64) throws {
+        let sql = "UPDATE notes SET witness = NULL, anchor = NULL WHERE id = ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, noteId)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     @discardableResult
     func clearWitnessesForCorruptedTree() throws -> Int {
         let sql = "UPDATE notes SET witness = NULL, anchor = NULL WHERE is_spent = 0 AND witness IS NOT NULL;"

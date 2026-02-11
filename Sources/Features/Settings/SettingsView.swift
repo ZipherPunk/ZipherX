@@ -684,7 +684,17 @@ Both binaries must be installed to /usr/local/bin:
                 HStack(spacing: 8) {
                     // ZipherX Wallet option
                     Button(action: {
-                        modeManager.setWalletSource(.zipherx)
+                        // FIX #1273: Require authentication when switching wallet modes
+                        // Different modes = different wallets with different private keys
+                        if modeManager.walletSource != .zipherx {
+                            BiometricAuthManager.shared.authenticateForSensitiveOperation(
+                                reason: "Authenticate to switch to ZipherX mode"
+                            ) { success, _ in
+                                if success {
+                                    modeManager.setWalletSource(.zipherx)
+                                }
+                            }
+                        }
                     }) {
                         HStack {
                             Image(systemName: "shield.fill")
@@ -705,7 +715,16 @@ Both binaries must be installed to /usr/local/bin:
 
                     // wallet.dat option
                     Button(action: {
-                        modeManager.setWalletSource(.walletDat)
+                        // FIX #1273: Require authentication when switching wallet modes
+                        if modeManager.walletSource != .walletDat {
+                            BiometricAuthManager.shared.authenticateForSensitiveOperation(
+                                reason: "Authenticate to switch to wallet.dat mode"
+                            ) { success, _ in
+                                if success {
+                                    modeManager.setWalletSource(.walletDat)
+                                }
+                            }
+                        }
                     }) {
                         HStack {
                             Image(systemName: "externaldrive.fill")

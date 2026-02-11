@@ -90,8 +90,15 @@ public class RPCWalletOperations: WalletOperationsProtocol, ObservableObject {
     // Double 0.00960000 * 100_000_000 can produce 959999.9999... due to IEEE 754
     // UInt64() truncates, so we must round first to get correct 960000
 
+    // Protocol conformance: getZBalance(address:) with default minconf=1
     public func getZBalance(address: String) async throws -> UInt64 {
-        let balance = try await rpcClient.getZBalance(address: address)
+        let balance = try await rpcClient.getZBalance(address: address, minconf: 1)
+        return UInt64((balance * 100_000_000).rounded())
+    }
+
+    // FIX #1272: Overload with explicit minconf parameter for pending balance queries.
+    public func getZBalance(address: String, minconf: Int) async throws -> UInt64 {
+        let balance = try await rpcClient.getZBalance(address: address, minconf: minconf)
         return UInt64((balance * 100_000_000).rounded())
     }
 

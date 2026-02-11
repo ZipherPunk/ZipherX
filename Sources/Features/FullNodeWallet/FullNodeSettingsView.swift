@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalAuthentication
 
 #if os(macOS)
 import AppKit
@@ -23,6 +24,17 @@ struct FullNodeSettingsView: View {
     @State private var lastBackupDate: Date?
     @State private var isCreatingBackup = false
     @State private var backupSuccess: String?
+
+    // FIX #1273: Auth settings state
+    @State private var useFaceID = false
+    @State private var usePINCode = false
+    @State private var biometricAvailable = false
+    @State private var selectedTimeout: TimeInterval = BiometricAuthManager.shared.authTimeout
+    @State private var showPINSetup = false
+    @State private var pinCode = ""
+    @State private var confirmPIN = ""
+    @State private var showPINText = false
+    @State private var authErrorMessage: String?
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -101,35 +113,45 @@ struct FullNodeSettingsView: View {
             // Content
             ScrollView {
                 VStack(spacing: 16) {
-                    // 1. Daemon Control
+                    // 1. Switch Mode (at top for easy access)
+                    switchModeSection
+
+                    // 2. Daemon Control
                     daemonControlSection
 
-                    // 2. Bootstrap Management
+                    // 3. Bootstrap Management
                     bootstrapSection
 
-                    // 3. Configuration
+                    // 4. Configuration
                     configurationSection
 
-                    // 4. Wallet Security
+                    // 5. Authentication & Lock
+                    authenticationSection
+
+                    // 6. Wallet Security
                     walletSecuritySection
 
-                    // 5. Debug & Logs
+                    // 7. Debug & Logs
                     debugSection
-
-                    // 6. Switch Mode
-                    switchModeSection
                 }
                 .padding()
             }
         }
         .frame(minWidth: 500, minHeight: 600)
         .background(theme.backgroundColor)
+        .onAppear {
+            checkBiometricAvailability()
+        }
         .sheet(isPresented: $showingBootstrapSheet) {
             BootstrapProgressView()
                 .environmentObject(themeManager)
         }
         .sheet(isPresented: $showingConfigEditor) {
             configEditorSheet
+        }
+        .sheet(isPresented: $showPINSetup) {
+            pinSetupSheet
+                .frame(minWidth: 400, idealWidth: 450, minHeight: 350, idealHeight: 400)
         }
     }
 
@@ -369,6 +391,150 @@ struct FullNodeSettingsView: View {
         }
     }
 
+    // MARK: - FIX #1273: Authentication & Lock Section
+
+    private var authenticationSection: some View {
+        settingsCard(title: "Authentication & Lock", icon: "lock.fill") {
+            VStack(alignment: .leading, spacing: 12) {
+                // Security warning when neither Face ID nor PIN is enabled
+                if !useFaceID && !usePINCode {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 16))
+                            .foregroundColor(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("SECURITY RECOMMENDED")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.orange)
+                            Text("Enable \(biometricAvailable ? getBiometricName() + " or " : "")PIN Code to protect your wallet.")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color.orange.opacity(0.1))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.orange, lineWidth: 1)
+                    )
+                }
+
+                // Face ID / Touch ID toggle
+                if biometricAvailable {
+                    HStack {
+                        Image(systemName: getBiometricIcon())
+                            .font(.system(size: 14))
+                            .foregroundColor(theme.textPrimary)
+                        Text(getBiometricName())
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textPrimary)
+                        Spacer()
+                        Toggle("", isOn: $useFaceID)
+                            .labelsHidden()
+                            .onChange(of: useFaceID) { newValue in
+                                if newValue {
+                                    authenticateWithBiometrics()
+                                } else {
+                                    UserDefaults.standard.set(false, forKey: "useBiometricAuth")
+                                }
+                            }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(theme.surfaceColor)
+                    .overlay(
+                        Rectangle()
+                            .stroke(theme.textPrimary, lineWidth: 1)
+                    )
+
+                    // Inactivity timeout picker (only show if Face ID enabled)
+                    if useFaceID {
+                        HStack {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.system(size: 14))
+                                .foregroundColor(theme.textPrimary)
+                            Text("Lock after")
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.textPrimary)
+                            Spacer()
+                            Menu {
+                                ForEach(BiometricAuthManager.timeoutOptions, id: \.seconds) { option in
+                                    Button(action: {
+                                        selectedTimeout = option.seconds
+                                        BiometricAuthManager.shared.setAuthTimeout(option.seconds)
+                                    }) {
+                                        if option.seconds == selectedTimeout {
+                                            Label(option.label, systemImage: "checkmark")
+                                        } else {
+                                            Text(option.label)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(BiometricAuthManager.shared.timeoutDisplayString)
+                                        .font(theme.bodyFont)
+                                        .foregroundColor(theme.primaryColor)
+                                    Image(systemName: "chevron.up.chevron.down")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(theme.primaryColor)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(theme.surfaceColor)
+                        .overlay(
+                            Rectangle()
+                                .stroke(theme.textPrimary, lineWidth: 1)
+                        )
+
+                        Text("\(getBiometricName()) required: at app launch, when sending ZCL, and after \(BiometricAuthManager.shared.timeoutDisplayString) of inactivity")
+                            .font(.system(size: 9))
+                            .foregroundColor(theme.textSecondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 4)
+                    }
+                }
+
+                // PIN Code toggle
+                HStack {
+                    Image(systemName: "number.square")
+                        .font(.system(size: 14))
+                        .foregroundColor(theme.textPrimary)
+                    Text("PIN Code")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+                    Spacer()
+                    Toggle("", isOn: $usePINCode)
+                        .labelsHidden()
+                        .onChange(of: usePINCode) { newValue in
+                            if newValue {
+                                showPINSetup = true
+                            } else {
+                                UserDefaults.standard.removeObject(forKey: "walletPIN")
+                            }
+                        }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+
+                if let error = authErrorMessage {
+                    Text(error)
+                        .font(theme.captionFont)
+                        .foregroundColor(.red)
+                        .padding(.horizontal, 12)
+                }
+            }
+        }
+    }
+
     // MARK: - Wallet Security Section
 
     private var walletSecuritySection: some View {
@@ -411,54 +577,72 @@ struct FullNodeSettingsView: View {
     private var debugSection: some View {
         settingsCard(title: "Debug & Logs", icon: "ladybug") {
             VStack(alignment: .leading, spacing: 12) {
-                // FIX #884: Improved debug level picker with clear visual design
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Daemon Debug Level")
-                        .font(theme.bodyFont.bold())
+                // Debug level selection
+                HStack(spacing: 12) {
+                    // Label on the left
+                    Text("Debug Level")
+                        .font(theme.bodyFont)
                         .foregroundColor(theme.textPrimary)
 
-                    // Picker with clear dropdown indicator
-                    HStack {
-                        Picker("Select debug level", selection: $fullNodeManager.daemonDebugLevel) {
-                            ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
-                                Text(level.displayName).tag(level)
+                    Spacer()
+
+                    // Current value + dropdown button
+                    Menu {
+                        ForEach(FullNodeManager.DaemonDebugLevel.allCases, id: \.self) { level in
+                            Button(action: {
+                                fullNodeManager.daemonDebugLevel = level
+                            }) {
+                                HStack {
+                                    Text(level.displayName)
+                                    if level == fullNodeManager.daemonDebugLevel {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
                             }
                         }
-                        .pickerStyle(.menu)
-                        .tint(theme.accentColor)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(theme.surfaceColor.opacity(0.5))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 1)
-                                )
-                        )
-
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.caption)
-                            .foregroundColor(theme.textSecondary)
-                    }
-
-                    // Description of selected level
-                    Text(fullNodeManager.daemonDebugLevel.description)
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                        .padding(.top, 2)
-
-                    // Restart warning
-                    if fullNodeManager.daemonStatus.isRunning {
-                        HStack(spacing: 4) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                            Text("Restart daemon to apply changes")
-                                .font(theme.captionFont)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(fullNodeManager.daemonDebugLevel.displayName)
+                                .font(theme.monoFont)
+                                .foregroundColor(theme.textPrimary)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.textSecondary)
                         }
-                        .foregroundColor(.orange)
-                        .padding(.top, 4)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(theme.backgroundColor)
+                        .overlay(
+                            Rectangle()
+                                .stroke(theme.borderColor, lineWidth: 1)
+                        )
                     }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.borderColor, lineWidth: 1)
+                )
+
+                // Description of selected level
+                Text(fullNodeManager.daemonDebugLevel.description)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary.opacity(0.7))
+                    .padding(.horizontal, 12)
+
+                // Restart warning
+                if fullNodeManager.daemonStatus.isRunning {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                        Text("Restart daemon to apply changes")
+                            .font(theme.captionFont)
+                    }
+                    .foregroundColor(.orange)
                 }
 
                 Divider()
@@ -712,6 +896,135 @@ struct FullNodeSettingsView: View {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: Int64(size))
+    }
+
+    // MARK: - FIX #1273: PIN Setup Sheet
+
+    private var pinSetupSheet: some View {
+        VStack(spacing: 20) {
+            Text("Set PIN Code")
+                .font(theme.titleFont)
+                .foregroundColor(theme.textPrimary)
+
+            VStack(spacing: 12) {
+                HStack {
+                    if showPINText {
+                        TextField("Enter 4-6 digit PIN", text: $pinCode)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                    } else {
+                        SecureField("Enter 4-6 digit PIN", text: $pinCode)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                    }
+                    Button(action: { showPINText.toggle() }) {
+                        Image(systemName: showPINText ? "eye.slash.fill" : "eye.fill")
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+                .frame(maxWidth: 250)
+
+                HStack {
+                    if showPINText {
+                        TextField("Confirm PIN", text: $confirmPIN)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                    } else {
+                        SecureField("Confirm PIN", text: $confirmPIN)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                    }
+                    Image(systemName: "eye.fill")
+                        .foregroundColor(.clear)
+                }
+                .frame(maxWidth: 250)
+            }
+
+            if !pinCode.isEmpty && !confirmPIN.isEmpty && pinCode != confirmPIN {
+                Text("PINs do not match")
+                    .font(theme.captionFont)
+                    .foregroundColor(.red)
+            }
+
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    pinCode = ""
+                    confirmPIN = ""
+                    showPINText = false
+                    usePINCode = false
+                    showPINSetup = false
+                }
+                .foregroundColor(.red)
+
+                Button("Save PIN") {
+                    savePIN()
+                }
+                .disabled(pinCode.count < 4 || pinCode != confirmPIN)
+            }
+        }
+        .padding(30)
+        .background(theme.backgroundColor)
+    }
+
+    // MARK: - FIX #1273: Auth Helper Functions
+
+    private func checkBiometricAvailability() {
+        let context = LAContext()
+        var error: NSError?
+        biometricAvailable = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
+        useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        usePINCode = UserDefaults.standard.string(forKey: "walletPIN") != nil
+    }
+
+    private func getBiometricName() -> String {
+        let context = LAContext()
+        _ = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+        switch context.biometryType {
+        case .faceID: return "Face ID"
+        case .touchID: return "Touch ID"
+        default: return "Biometric"
+        }
+    }
+
+    private func getBiometricIcon() -> String {
+        let context = LAContext()
+        _ = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+        switch context.biometryType {
+        case .faceID: return "faceid"
+        case .touchID: return "touchid"
+        default: return "lock"
+        }
+    }
+
+    private func authenticateWithBiometrics() {
+        let context = LAContext()
+        let reason = "Enable biometric authentication for ZipherX"
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
+            DispatchQueue.main.async {
+                if success {
+                    UserDefaults.standard.set(true, forKey: "useBiometricAuth")
+                    useFaceID = true
+                } else {
+                    useFaceID = false
+                    if let error = error {
+                        authErrorMessage = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    private func savePIN() {
+        guard pinCode.count >= 4 && pinCode.count <= 6 else {
+            authErrorMessage = "PIN must be 4-6 digits"
+            return
+        }
+        guard pinCode == confirmPIN else {
+            authErrorMessage = "PINs do not match"
+            return
+        }
+        let hashedPIN = PINSecurity.hashPIN(pinCode)
+        UserDefaults.standard.set(hashedPIN, forKey: "walletPIN")
+        pinCode = ""
+        confirmPIN = ""
+        showPINSetup = false
     }
 }
 

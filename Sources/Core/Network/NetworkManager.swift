@@ -1708,6 +1708,9 @@ public final class NetworkManager: ObservableObject {
 
     /// Request addresses from all connected peers
     private func discoverMoreAddresses() async {
+        // FIX #1273: Don't discover addresses before authentication
+        guard BiometricAuthManager.shared.hasAuthenticatedThisSession else { return }
+
         var discoveredCount = 0
         var onionDiscoveredCount = 0
         for peer in peers {
@@ -1759,6 +1762,9 @@ public final class NetworkManager: ObservableObject {
     /// Refresh chain height (P2P consensus primary when Tor enabled, InsightAPI fallback)
     /// Also triggers background sync if wallet is behind
     private func refreshChainHeight() async {
+        // FIX #1273: Don't refresh chain height before authentication
+        guard BiometricAuthManager.shared.hasAuthenticatedThisSession else { return }
+
         guard isConnected else { return }
 
         // FIX #145: Skip if background processes are disabled (initial sync in progress)
@@ -5074,27 +5080,23 @@ public final class NetworkManager: ObservableObject {
             }
 
             if !anchorFound {
-                // FIX #1256: When delta is VERIFIED (immutable), the tree is known-correct.
-                // containsSaplingRoot() lookup can fail (stale file, byte order edge cases,
-                // roots from newly-synced blocks not yet in delta_sapling_roots.bin).
-                // The Groth16 proof (VUL-002) already validates the anchor internally.
-                // Peers accepted our TX with anchor 6e615084... that containsSaplingRoot missed.
-                // Trust the verified tree + proof instead of the unreliable lookup.
+                // FIX #1279: NEVER bypass anchor validation, even with DeltaBundleVerified=true.
+                // FIX #1256 previously bypassed this check when delta was verified, trusting that
+                // "verified tree = valid anchor". WRONG — the sim wallet proved this false:
+                // FFI tree root at tip MATCHED blockchain (3ed752cc = real root at 3007184),
+                // but witness computation produced anchor b6e85eb1... which is NOT a valid
+                // finalsaplingroot at ANY block height. TX was broadcast, peers accepted to mempool,
+                // but miners never mined it (8+ blocks, all coinbase-only). Anchor is phantom.
+                // Root cause: witness FFI produces wrong merkle paths despite correct tree root.
+                // DeltaBundleVerified only validates tip root, NOT intermediate witness anchors.
+                // The ONLY safe check is containsSaplingRoot() — if anchor not found, REJECT.
                 let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
-                if deltaVerified {
-                    print("⚠️ FIX #1256: Anchor NOT in HeaderStore, but delta is VERIFIED (immutable)")
-                    print("⚠️ FIX #1256: Anchor: \(anchorHex)")
-                    print("⚠️ FIX #1256: VUL-002 proof passed — trusting verified tree + Groth16 proof")
-                    print("⚠️ FIX #1256: Proceeding with broadcast (network will validate)")
-                    // Do NOT throw — let TX through, network consensus is the final validator
-                } else {
-                    print("❌ FIX #718: Anchor NOT FOUND - transaction WILL be rejected!")
-                    print("❌ FIX #718: Anchor: \(anchorHex)")
-                    print("❌ FIX #718: Delta NOT verified — tree may be corrupted")
-                    print("❌ FIX #718: Solution: Run Settings → Repair Database")
-                    onProgress?("error", "❌ Anchor invalid - run Repair Database", 1.0)
-                    throw NetworkError.invalidTransaction("Anchor not found on blockchain - witnesses built from corrupt tree. Run Repair Database to fix.")
-                }
+                print("❌ FIX #1279: Anchor NOT FOUND in HeaderStore — REJECTING TX")
+                print("❌ FIX #1279: Anchor: \(anchorHex)")
+                print("❌ FIX #1279: DeltaBundleVerified=\(deltaVerified) (irrelevant — tip root ≠ witness anchor)")
+                print("❌ FIX #1279: Witness computation produces phantom anchors — run Full Rescan")
+                onProgress?("error", "❌ Anchor invalid - run Full Rescan", 1.0)
+                throw NetworkError.invalidTransaction("Anchor not found on blockchain - witness computation produced phantom anchor. Run Full Rescan to rebuild witnesses.")
             }
 
             print("✅ FIX #718: Anchor validation passed - TX should be accepted by network")
@@ -7506,6 +7508,11 @@ public final class NetworkManager: ObservableObject {
 
     private func rotatePeers() {
         Task {
+            // FIX #1273: Don't rotate/connect peers before authentication
+            guard BiometricAuthManager.shared.hasAuthenticatedThisSession else {
+                return
+            }
+
             // Check for peers that should be banned
             for peer in peers {
                 if peer.shouldBan() {
@@ -7674,6 +7681,11 @@ public final class NetworkManager: ObservableObject {
 
     /// Check if peers need recovery and trigger reconnection if needed
     private func checkPeerRecovery() {
+        // FIX #1273: Don't attempt peer recovery before authentication
+        if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+            return
+        }
+
         // FIX #227: Don't run during sync/repair/connection operations - they manage their own connections
         if WalletManager.shared.isSyncing || WalletManager.shared.isRepairingHistory || isConnecting {
             return  // Skip recovery check during active operations
@@ -7712,6 +7724,11 @@ public final class NetworkManager: ObservableObject {
 
     /// Attempt to recover peer connections
     public func attemptPeerRecovery() async {
+        // FIX #1273: Don't attempt peer recovery before authentication
+        guard BiometricAuthManager.shared.hasAuthenticatedThisSession else {
+            print("🔄 FIX #1273: Skipping peer recovery — not authenticated yet")
+            return
+        }
         print("🔄 FIX #227: Attempting peer recovery...")
 
         // FIX #250: Diagnostic logging for real iOS debugging
@@ -8074,11 +8091,12 @@ public final class NetworkManager: ObservableObject {
             var iteration = 0
             while !Task.isCancelled {
                 iteration += 1
-                print("🔍 [HEALTH] Timer iteration \(iteration) about to sleep...")
                 try? await Task.sleep(nanoseconds: UInt64(CONNECTION_HEALTH_CHECK_INTERVAL * 1_000_000_000))
-                print("🔍 [HEALTH] Timer iteration \(iteration) woke up, cancelled=\(Task.isCancelled)")
                 if !Task.isCancelled {
-                    print("🔍 [HEALTH] Calling checkConnectionHealth()...")
+                    // FIX #1273: Suppress log noise when not authenticated
+                    if BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                        print("🔍 [HEALTH] Timer iteration \(iteration) — checking health...")
+                    }
                     await checkConnectionHealth()
                 }
             }
@@ -8095,6 +8113,11 @@ public final class NetworkManager: ObservableObject {
 
     /// Check connection health and trigger recovery if needed
     private func checkConnectionHealth() async {
+        // FIX #1273: Don't run before authentication
+        if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+            return
+        }
+
         // FIX #519: Skip ping checks during header sync - they disrupt the sync!
         if headerSyncInProgress {
             print("🔍 [HEALTH] Header sync in progress - skipping ping checks (would disrupt sync)")
@@ -8165,6 +8188,9 @@ public final class NetworkManager: ObservableObject {
 
     /// Handle network path change with debouncing (like BitChat's 3s cooldown)
     private func handleNetworkPathChange(path: NWPath) async {
+        // FIX #1273: Don't handle network path changes before authentication
+        guard BiometricAuthManager.shared.hasAuthenticatedThisSession else { return }
+
         // FIX #890: Skip network path handling during boost header loading
         // NWPathMonitor callbacks cause thread contention with SQLite bulk inserts
         // This was contributing to the 91-99% stall during Import PK
@@ -8243,6 +8269,14 @@ public final class NetworkManager: ObservableObject {
         // Reconnect to peers with generation check
         let capturedGeneration = newGeneration
         Task {
+            // FIX #1273: Do NOT connect to P2P network before authentication.
+            // NWPathMonitor fires immediately on app launch when network is available,
+            // which would start network connections behind the lock screen.
+            if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+                debugLog(.network, "📶 FIX #1273: Skipping network reconnect — not authenticated yet")
+                return
+            }
+
             // Check if this generation is still current before connecting
             if self.getNetworkGeneration() != capturedGeneration {
                 debugLog(.network, "📶 FIX #268: Stale generation \(capturedGeneration) - aborting reconnection")
@@ -8285,6 +8319,11 @@ public final class NetworkManager: ObservableObject {
 
     /// Ping all connected peers to detect dead connections
     private func performKeepalivePing() async {
+        // FIX #1273: Don't run before authentication
+        if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
+            return
+        }
+
         // FIX #246: Don't run during header sync or active operations
         if isHeaderSyncing || WalletManager.shared.isSyncing {
             return

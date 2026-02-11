@@ -67,13 +67,30 @@ struct RPCSendView: View {
         return nil
     }
 
+    /// FIX #1274: Robust amount normalization — handles comma, spaces, thousands separators
+    private func normalizeAmount(_ input: String) -> String {
+        var s = input.trimmingCharacters(in: .whitespaces)
+        // Remove spaces (thousands separator in some locales: "1 234.56")
+        s = s.replacingOccurrences(of: " ", with: "")
+        // If both comma and period exist, comma is thousands sep: "1,234.56" → "1234.56"
+        // If only comma exists, it's the decimal sep: "2,5" → "2.5"
+        if s.contains(",") && s.contains(".") {
+            // Period is decimal, comma is thousands: "1,234.56" → "1234.56"
+            s = s.replacingOccurrences(of: ",", with: "")
+        } else {
+            // Comma is decimal separator: "2,5" → "2.5"
+            s = s.replacingOccurrences(of: ",", with: ".")
+        }
+        return s
+    }
+
     private var canSend: Bool {
         guard let from = selectedFromAddress else { return false }
         guard !toAddress.isEmpty else { return false }
         guard isValidReceiverAddress else { return false }  // FIX #286: Validate address
-        // FIX #696: Normalize decimal separator for European locales (1,5 → 1.5)
-        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        guard let amountValue = Double(normalizedAmount), amountValue > 0 else { return false }
+        // FIX #1274: Use robust normalization for amount parsing
+        let normalized = normalizeAmount(amount)
+        guard let amountValue = Double(normalized), amountValue > 0 else { return false }
         let amountZatoshis = UInt64(amountValue * 100_000_000)
         return amountZatoshis <= from.balance
     }
@@ -389,14 +406,20 @@ struct RPCSendView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // Amount section
+                    // Amount section — FIX #1274: Show properly formatted amount
                     VStack(alignment: .leading, spacing: 4) {
                         Text("AMOUNT")
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
-                        Text("\(amount) ZCL")
-                            .font(.system(size: 24, weight: .bold, design: .monospaced))
-                            .foregroundColor(theme.primaryColor)
+                        if let val = Double(normalizeAmount(amount)) {
+                            Text(String(format: "%.8f ZCL", val))
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                        } else {
+                            Text("\(amount) ZCL")
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                        }
                     }
 
                     Divider()
@@ -413,15 +436,16 @@ struct RPCSendView: View {
                                     .foregroundColor(theme.primaryColor)
                                     .font(.system(size: 12))
                             }
-                            // FIX #286 v17: Show FULL address - scrollable and selectable
-                            Text(from.address)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(theme.textPrimary)
-                                .textSelection(.enabled)
-                                .padding(8)
-                                .background(theme.backgroundColor)
-                                .cornerRadius(4)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            // FIX #1274: Horizontal scroll prevents wrapping on long z-addresses
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                Text(from.address)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(theme.textPrimary)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(8)
+                            .background(theme.backgroundColor)
+                            .cornerRadius(4)
 
                             Text("Balance: \(formatBalance(from.balance))")
                                 .font(theme.captionFont)
@@ -443,15 +467,16 @@ struct RPCSendView: View {
                                 .foregroundColor(theme.primaryColor)
                                 .font(.system(size: 12))
                         }
-                        // FIX #286 v17: Show FULL address - scrollable and selectable
-                        Text(toAddress)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(theme.textPrimary)
-                            .textSelection(.enabled)
-                            .padding(8)
-                            .background(theme.backgroundColor)
-                            .cornerRadius(4)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        // FIX #1274: Horizontal scroll prevents wrapping on long z-addresses
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            Text(toAddress)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(theme.textPrimary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(8)
+                        .background(theme.backgroundColor)
+                        .cornerRadius(4)
                     }
 
                     Divider()
@@ -467,13 +492,13 @@ struct RPCSendView: View {
                             .foregroundColor(theme.textPrimary)
                     }
 
-                    // Total
+                    // Total — FIX #1274: Use normalized amount (handles comma/space locales)
                     HStack {
                         Text("Total")
                             .font(theme.titleFont)
                             .foregroundColor(theme.textPrimary)
                         Spacer()
-                        if let amountValue = Double(amount) {
+                        if let amountValue = Double(normalizeAmount(amount)) {
                             Text(String(format: "%.8f ZCL", amountValue + 0.0001))
                                 .font(.system(size: 16, weight: .bold, design: .monospaced))
                                 .foregroundColor(theme.errorColor)
@@ -524,7 +549,8 @@ struct RPCSendView: View {
             .padding()
             .background(theme.surfaceColor)
         }
-        .frame(minWidth: 500, minHeight: 450)
+        // FIX #1274: Wider confirmation sheet so z-addresses don't wrap
+        .frame(minWidth: 600, idealWidth: 650, minHeight: 500)
         .background(theme.backgroundColor)
     }
 
@@ -532,8 +558,8 @@ struct RPCSendView: View {
 
     private func sendTransaction() async {
         guard let from = selectedFromAddress else { return }
-        // FIX #696: Normalize decimal separator for European locales (1,5 → 1.5)
-        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
+        // FIX #1274: Use robust amount normalization (handles comma, spaces, thousands seps)
+        let normalizedAmount = normalizeAmount(amount)
         guard let amountValue = Double(normalizedAmount) else {
             await MainActor.run {
                 errorMessage = "Invalid amount"

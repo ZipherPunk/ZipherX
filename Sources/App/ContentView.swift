@@ -13,8 +13,9 @@ struct ContentView: View {
     @State private var isFirstLaunch: Bool = false
     @State private var isInitialSync: Bool = true  // Track initial sync state
     @State private var hasCompletedInitialSync: Bool = false  // Prevent re-running
-    // FIX #1253: Lock screen starts TRUE when biometric enabled — NEVER show wallet before auth
-    @State private var isShowingLockScreen: Bool = BiometricAuthManager.shared.isBiometricEnabled
+    // FIX #1273: Lock screen ALWAYS starts TRUE — auth is mandatory at startup.
+    // The biometric setting controls which auth type (Face ID vs passcode), not whether auth is required.
+    @State private var isShowingLockScreen: Bool = true
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
@@ -42,6 +43,14 @@ struct ContentView: View {
         }
         return walletManager.walletCreationTime ?? appStartupTime
     }
+
+    // FIX #1276: Task id that changes when wallet mode switches (macOS only).
+    // On iOS there's no mode switching, so constant id = task runs once.
+    #if os(macOS)
+    private var startupTaskId: String { modeManager.walletSource.rawValue }
+    #else
+    private var startupTaskId: String { "zipherx" }
+    #endif
 
     // Cypherpunk mode sheet states
     @State private var showCypherpunkSettings = false
@@ -102,7 +111,42 @@ struct ContentView: View {
             // 2. Mnemonic backup is NOT pending (user has confirmed backup)
             if walletManager.isWalletCreated && !walletManager.isMnemonicBackupPending {
                 mainWalletView
-                    .task {
+                    // FIX #1276: Use .task(id:) so this re-runs when switching between
+                    // wallet.dat and ZipherX modes. Without this, if the app starts in
+                    // wallet.dat mode (task returns early), switching to ZipherX mode
+                    // never triggers the P2P startup sequence.
+                    .task(id: startupTaskId) {
+                        // FIX #1273: Skip entire P2P startup in wallet.dat (Full Node) mode.
+                        // FullNodeWalletView has its own .task for RPC-based startup.
+                        // Running P2P tree loading, header sync, etc. is wasteful and causes
+                        // confusing duplicate "Waiting for authentication" log messages.
+                        #if os(macOS)
+                        if modeManager.walletSource == .walletDat {
+                            print("🔐 FIX #1273: wallet.dat mode — skipping P2P startup task")
+                            // FIX #1278: Must clear initial sync state so CypherpunkSyncView doesn't
+                            // overlay on top of FullNodeWalletView (isInitialSync defaults to true).
+                            await MainActor.run {
+                                isInitialSync = false
+                                hasCompletedInitialSync = true
+                            }
+                            return
+                        }
+                        #endif
+
+                        // FIX #1273: SECURITY — Wait for authentication before starting ANY wallet operations.
+                        // The lock screen is a visual overlay, but the .task fires immediately.
+                        // Without this guard, network connections, tree loading, header sync, and
+                        // balance queries all run BEHIND the lock screen before user authenticates.
+                        // Auth is ALWAYS mandatory at startup (not just when biometric is enabled).
+                        if !biometricManager.hasAuthenticatedThisSession {
+                            print("🔐 FIX #1273: Waiting for authentication before starting wallet operations...")
+                            while !biometricManager.hasAuthenticatedThisSession {
+                                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                                if Task.isCancelled { return }
+                            }
+                            print("🔐 FIX #1273: Authentication confirmed — proceeding with startup")
+                        }
+
                         // FIX #881: Startup timing profiler for performance analysis
                         let startupStart = CFAbsoluteTimeGetCurrent()
                         var phaseTimings: [(String, Double)] = []
@@ -2182,10 +2226,8 @@ struct ContentView: View {
                             // Header sync should have completed during initial sync phase
                             networkManager.enableBackgroundProcesses()
 
-                            // FIX #1253: Ensure lock screen shown after initial sync if biometric enabled
-                            // (redundant safety — isShowingLockScreen already starts true via FIX #1253,
-                            //  and overlay also checks hasAuthenticatedThisSession)
-                            if biometricManager.isBiometricEnabled && !biometricManager.hasAuthenticatedThisSession {
+                            // FIX #1273: Ensure lock screen shown after initial sync (redundant safety)
+                            if !biometricManager.hasAuthenticatedThisSession {
                                 isShowingLockScreen = true
                             }
 
@@ -2221,8 +2263,8 @@ struct ContentView: View {
                             // FIX #145: Enable background processes even on early stop
                             networkManager.enableBackgroundProcesses()
 
-                            // FIX #1253: MUST show lock screen on stop sync too — prevents bypass
-                            if biometricManager.isBiometricEnabled && !biometricManager.hasAuthenticatedThisSession {
+                            // FIX #1273: MUST show lock screen on stop sync too — prevents bypass
+                            if !biometricManager.hasAuthenticatedThisSession {
                                 isShowingLockScreen = true
                             }
 
@@ -2318,25 +2360,24 @@ struct ContentView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                // FIX #1253: SECURITY — Lock screen overlay blocks ALL wallet content
-                // Shows when: (A) isShowingLockScreen is true, OR (B) biometric enabled but never authenticated this session
-                // The second condition prevents ANY wallet content from being visible before first auth
-                // NEVER dismiss until LAContext returns .success via BiometricAuthManager
-                // FIX #1266: REMOVED !isInitialSync — lock screen MUST show during startup too.
-                // Without this, the startup/sync window is visible before user authenticates.
-                if biometricManager.isBiometricEnabled &&
-                   (isShowingLockScreen || !biometricManager.hasAuthenticatedThisSession) {
-                    LockScreenView(onUnlock: {
-                        withAnimation {
-                            isShowingLockScreen = false
-                            biometricManager.unlockApp()
-                            lastActivityTime = Date()
-                        }
-                    })
-                    .transition(.opacity)
-                }
             } else {
                 WalletSetupView()
+            }
+
+            // FIX #1276: Lock screen is OUTSIDE the walletManager conditional.
+            // Previously inside the `if isWalletCreated` block — walletManager @Published
+            // property changes after auth caused SwiftUI to recreate the entire block,
+            // giving LockScreenView a new .onAppear → second Touch ID prompt.
+            // Now independent of wallet state changes.
+            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession {
+                LockScreenView(onUnlock: {
+                    withAnimation {
+                        isShowingLockScreen = false
+                        biometricManager.unlockApp()
+                        lastActivityTime = Date()
+                    }
+                })
+                .transition(.opacity)
             }
         }
         .onChange(of: scenePhase) { newPhase in
@@ -2359,26 +2400,21 @@ struct ContentView: View {
             wasInBackground = true
             // Stop inactivity timer when going to background
             stopInactivityTimer()
-            // Lock app when going to background (if biometric enabled)
-            if biometricManager.isBiometricEnabled {
-                biometricManager.lockApp()
-                isShowingLockScreen = true
-            }
+            // FIX #1273: Always lock app when going to background
+            biometricManager.lockApp()
+            isShowingLockScreen = true
 
         case .active:
             // App became active
-            if biometricManager.isBiometricEnabled && hasCompletedInitialSync {
+            if hasCompletedInitialSync {
                 // Check if we need to re-authenticate (inactivity timeout)
-                if biometricManager.isInactivityTimeoutExceeded {
+                if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
                     isShowingLockScreen = true
                     biometricManager.lockApp()
                 } else if biometricManager.isLocked {
                     // Still locked from background - show lock screen
                     isShowingLockScreen = true
                 }
-            } else if !biometricManager.isBiometricEnabled {
-                // Biometric disabled - ensure not locked
-                isShowingLockScreen = false
             }
             // Record activity on app becoming active
             recordUserActivity()
@@ -2422,8 +2458,9 @@ struct ContentView: View {
         // Stop existing timer
         inactivityTimer?.invalidate()
 
-        // Only run timer if biometric is enabled and timeout is not "Never" (0)
-        guard biometricManager.isBiometricEnabled, biometricManager.authTimeout > 0 else {
+        // FIX #1273: Always run inactivity timer (auth is always mandatory).
+        // Only skip if timeout is set to "Never" (0).
+        guard biometricManager.authTimeout > 0 else {
             return
         }
 
@@ -2439,9 +2476,8 @@ struct ContentView: View {
     }
 
     private func checkInactivityTimeout() {
-        // Only check if biometric enabled, app is active, not showing lock screen, and sync done
-        guard biometricManager.isBiometricEnabled,
-              !isShowingLockScreen,
+        // FIX #1273: Check inactivity regardless of biometric setting (auth always mandatory)
+        guard !isShowingLockScreen,
               !isInitialSync,
               biometricManager.isInactivityTimeoutExceeded else {
             return

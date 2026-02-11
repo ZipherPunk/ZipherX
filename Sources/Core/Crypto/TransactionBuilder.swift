@@ -435,17 +435,15 @@ final class TransactionBuilder {
         let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(anchorFromHeader)
         if !anchorOnChain {
             let badAnchorHex = anchorFromHeader.prefix(16).map { String(format: "%02x", $0) }.joined()
-            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
-            if deltaVerified {
-                print("⚠️ FIX #1256: Anchor \(badAnchorHex)... NOT in HeaderStore, but delta VERIFIED — proceeding")
-            } else {
-                print("❌ FIX #1224: Anchor \(badAnchorHex)... NOT FOUND in HeaderStore!")
-                print("   Witness is internally consistent but anchor never existed on blockchain")
-                print("   This would create a phantom TX — REJECTING before Groth16 proof generation")
-                throw TransactionError.anchorNotOnChain
-            }
+            // FIX #1279: NEVER bypass anchor check. FIX #1256 previously let DeltaBundleVerified=true
+            // skip this, but sim wallet proved tree tip root can be correct while witness anchors are
+            // phantom (b6e85eb1... never existed on blockchain). Groth16 proof would be wasted.
+            print("❌ FIX #1279: Anchor \(badAnchorHex)... NOT FOUND in HeaderStore!")
+            print("   Witness is internally consistent but anchor never existed on blockchain")
+            print("   This would create a phantom TX — REJECTING before Groth16 proof generation")
+            throw TransactionError.anchorNotOnChain
         }
-        print("✅ FIX #1224: Anchor verified (HeaderStore or delta verified)")
+        print("✅ FIX #1224: Anchor verified in HeaderStore")
 
         // FIX #1137: CRITICAL - Verify stored CMU matches CMU computed from note parts
         // The Rust FFI recomputes CMU from note parts (diversifier, value, rcm) using Note::from_parts().cmu()
@@ -757,15 +755,11 @@ final class TransactionBuilder {
                 let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(anchor)
                 if !anchorOnChain {
                     let anchorHex = anchor.prefix(16).map { String(format: "%02x", $0) }.joined()
-                    let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
-                    if deltaVerified {
-                        print("⚠️ FIX #1256: Multi-input anchor \(anchorHex)... NOT in HeaderStore, but delta VERIFIED — proceeding")
-                    } else {
-                        print("🚨 FIX #1224: Multi-input common anchor \(anchorHex)... NOT FOUND in HeaderStore!")
-                        print("   All witnesses have matching anchors but anchor never existed on blockchain")
-                        print("   Tree was corrupted when witnesses were created — forcing rebuild")
-                        allValid = false
-                    }
+                    // FIX #1279: NEVER bypass — phantom anchors cause phantom TXs
+                    print("🚨 FIX #1279: Multi-input common anchor \(anchorHex)... NOT FOUND in HeaderStore!")
+                    print("   All witnesses have matching anchors but anchor never existed on blockchain")
+                    print("   Witness computation produces phantom anchors — forcing rebuild")
+                    allValid = false
                 }
             }
 
@@ -1964,17 +1958,13 @@ final class TransactionBuilder {
         // FIX #1224 checks at startup and pre-build, but this checks at CREATION TIME.
         let anchorOnChain = await HeaderStore.shared.containsSaplingRoot(validAnchor)
         if !anchorOnChain {
-            let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
-            if deltaVerified {
-                print("⚠️ FIX #1256: Witness anchor \(rootHex.prefix(16))... NOT in HeaderStore, but delta VERIFIED — saving witnesses")
-            } else {
-                print("🚨 FIX #1226: Witness anchor \(rootHex.prefix(16))... NOT FOUND in HeaderStore!")
-                print("🚨 FIX #1226: Witnesses were created from incomplete/corrupted tree — REJECTING ALL")
-                print("🚨 FIX #1226: This prevents stale witnesses from being saved to database")
-                throw TransactionError.anchorNotOnChain
-            }
+            // FIX #1279: NEVER bypass — phantom witness anchors produce phantom TXs
+            print("🚨 FIX #1279: Witness anchor \(rootHex.prefix(16))... NOT FOUND in HeaderStore!")
+            print("🚨 FIX #1279: Witnesses were created from incomplete/corrupted tree — REJECTING ALL")
+            print("🚨 FIX #1279: This prevents phantom witnesses from being saved to database")
+            throw TransactionError.anchorNotOnChain
         }
-        print("✅ FIX #1226: Witness anchor verified (HeaderStore or delta verified)")
+        print("✅ FIX #1226: Witness anchor verified in HeaderStore")
 
         // FIX #1190: Update delta manifest tree root now that we've computed the anchor
         DeltaCMUManager.shared.updateManifestTreeRoot(validAnchor)

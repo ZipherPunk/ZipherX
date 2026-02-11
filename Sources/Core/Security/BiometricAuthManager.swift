@@ -40,6 +40,9 @@ final class BiometricAuthManager: ObservableObject {
     /// Whether the app is currently locked
     @Published private(set) var isLocked: Bool = true
 
+    /// FIX #1273: Whether authentication is currently in progress (prevents double-prompting)
+    @Published private(set) var isAuthInProgress: Bool = false
+
     /// FIX #1253: Whether app has been authenticated at least once this session
     /// Prevents showing wallet content before first successful auth
     @Published private(set) var hasAuthenticatedThisSession: Bool = false
@@ -339,12 +342,27 @@ final class BiometricAuthManager: ObservableObject {
         }
     }
 
+    /// FIX #1273: Authenticate for sensitive operations (mode switch, key export, etc.)
+    /// ALWAYS requires auth (biometric or passcode) — never bypassed even when biometric is disabled.
+    /// Uses same security level as send authentication (VUL-005).
+    func authenticateForSensitiveOperation(reason: String, completion: @escaping (Bool, Error?) -> Void) {
+        let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        if biometricEnabled {
+            authenticateFresh(reason: reason, completion: completion)
+        } else {
+            authenticateWithPasscode(reason: reason, completion: completion)
+        }
+    }
+
     /// Authenticate for viewing private key / seed
     func authenticateForKeyExport(completion: @escaping (Bool, Error?) -> Void) {
-        authenticate(reason: "Authenticate to export private key", completion: completion)
+        // FIX #1273: Key export MUST always require auth (was using authenticate() which bypasses when biometric disabled)
+        authenticateForSensitiveOperation(reason: "Authenticate to export private key", completion: completion)
     }
 
     /// Authenticate for app unlock
+    /// FIX #1273: App unlock is ALWAYS mandatory — uses biometric if enabled, passcode otherwise.
+    /// Never bypasses, never auto-passes. The app MUST NOT proceed without successful auth.
     func authenticateForAppUnlock(completion: @escaping (Bool, Error?) -> Void) {
         #if DEBUG
         // UAT mode: bypass app unlock for automated testing
@@ -352,18 +370,54 @@ final class BiometricAuthManager: ObservableObject {
         if UserDefaults.standard.bool(forKey: "uatModeEnabled") {
             print("🧪 [UAT] App unlock bypassed (uatModeEnabled=true)")
             unlockApp()
+            isAuthInProgress = false
             completion(true, nil)
             return
         }
         #endif
-        authenticate(reason: "Unlock ZipherX Wallet", completion: completion)
+
+        // FIX #1273: Prevent double-prompting if auth is already in progress
+        // FIX #1281: Call completion with false instead of silently dropping it.
+        // Silent drop left callers with isAuthenticating=true forever.
+        guard !isAuthInProgress else {
+            print("🔐 FIX #1273: Auth already in progress — skipping duplicate call")
+            completion(false, nil)
+            return
+        }
+        isAuthInProgress = true
+
+        // FIX #1281: Safety timeout — if LAContext callback never fires (e.g., screen was off),
+        // reset isAuthInProgress after 30s so user isn't permanently locked out.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            if self?.isAuthInProgress == true {
+                print("🔐 FIX #1281: Auth progress timeout — resetting isAuthInProgress")
+                self?.isAuthInProgress = false
+            }
+        }
+
+        // FIX #1273: Use authenticateForSensitiveOperation instead of authenticate()
+        // authenticate() auto-passes when biometric is disabled — wrong for app unlock.
+        // App unlock must ALWAYS require auth (biometric or passcode).
+        authenticateForSensitiveOperation(reason: "Unlock ZipherX Wallet") { [weak self] success, error in
+            DispatchQueue.main.async {
+                self?.isAuthInProgress = false
+            }
+            if success {
+                self?.unlockApp()
+                self?.hasAuthenticatedThisSession = true
+            }
+            completion(success, error)
+        }
     }
 
     // MARK: - App Lock Management
 
     /// Lock the app (call when going to background or after inactivity)
+    /// FIX #1276: Also resets hasAuthenticatedThisSession so lock screen condition
+    /// (isShowingLockScreen && !hasAuthenticatedThisSession) re-activates.
     func lockApp() {
         isLocked = true
+        hasAuthenticatedThisSession = false
         lastAuthTime = nil
     }
 

@@ -316,16 +316,21 @@ struct RPCTransactionHistoryView: View {
             ? transparentAmber.opacity(0.08)  // Amber tint for transparent
             : theme.surfaceColor               // Normal for shielded
 
+        // FIX #1275: Use explicit green/red — theme.successColor and theme.errorColor
+        // are Color.black in System 7 theme, making the arrow backgrounds grey.
+        let txGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
+        let txRed = Color(red: 0.85, green: 0.15, blue: 0.15)
+
         return HStack(spacing: 12) {
             // Direction icon + address type indicator
             ZStack {
                 Circle()
-                    .fill(tx.type == .received ? theme.successColor.opacity(0.2) : theme.errorColor.opacity(0.2))
+                    .fill(tx.type == .received ? txGreen.opacity(0.2) : txRed.opacity(0.2))
                     .frame(width: 36, height: 36)
 
                 Image(systemName: tx.type == .received ? "arrow.down" : "arrow.up")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(tx.type == .received ? theme.successColor : theme.errorColor)
+                    .foregroundColor(tx.type == .received ? txGreen : txRed)
 
                 // FIX #286 v7: Address type badge
                 if isTAddress {
@@ -377,11 +382,11 @@ struct RPCTransactionHistoryView: View {
 
             Spacer()
 
-            // Amount
+            // Amount — FIX #1275: Use explicit green/red (theme colors are black in System 7)
             VStack(alignment: .trailing, spacing: 4) {
                 Text("\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
                     .font(theme.monoFont)
-                    .foregroundColor(tx.type == .received ? theme.successColor : theme.textPrimary)
+                    .foregroundColor(tx.type == .received ? txGreen : txRed)
 
                 if tx.confirmations > 0 {
                     Text("\(tx.confirmations) conf")
@@ -429,11 +434,13 @@ struct RPCTransactionHistoryView: View {
             // Content
             ScrollView {
                 VStack(spacing: 16) {
-                    // Amount
+                    // Amount — FIX #1275: Explicit green/red
+                    let detailGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
+                    let detailRed = Color(red: 0.85, green: 0.15, blue: 0.15)
                     VStack(spacing: 4) {
                         Text("\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
                             .font(.system(size: 28, weight: .bold, design: .monospaced))
-                            .foregroundColor(tx.type == .received ? theme.successColor : theme.textPrimary)
+                            .foregroundColor(tx.type == .received ? detailGreen : detailRed)
 
                         Text(tx.type == .received ? "Received" : "Sent")
                             .font(theme.bodyFont)
@@ -470,35 +477,52 @@ struct RPCTransactionHistoryView: View {
                 .padding()
             }
         }
-        .frame(minWidth: 450, minHeight: 400)
+        .frame(minWidth: 550, idealWidth: 600, minHeight: 500)
         .background(theme.backgroundColor)
     }
 
+    // FIX #1271: Improved detail row — horizontal scroll for long values, copy button on label line
     private func detailRow(_ label: String, value: String, copyable: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(theme.captionFont)
-                .foregroundColor(theme.textSecondary)
-
             HStack {
-                Text(value)
-                    .font(theme.monoFont)
-                    .foregroundColor(theme.textPrimary)
-                    .lineLimit(2)
+                Text(label)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+
+                Spacer()
 
                 if copyable {
-                    Spacer()
                     Button(action: {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(value, forType: .string)
                     }) {
-                        Image(systemName: "doc.on.doc")
-                            .foregroundColor(theme.primaryColor)
+                        HStack(spacing: 2) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 10))
+                            Text("Copy")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundColor(theme.primaryColor)
                     }
                     .buttonStyle(.plain)
                 }
             }
+
+            if copyable {
+                // FIX #1271: Horizontal scroll for long txids/addresses instead of wrapping
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(value)
+                        .font(theme.monoFont)
+                        .foregroundColor(theme.textPrimary)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Text(value)
+                    .font(theme.monoFont)
+                    .foregroundColor(theme.textPrimary)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Pagination Controls
