@@ -409,7 +409,7 @@ impl<'a, P: consensus::Parameters, R: RngCore + CryptoRng> Builder<'a, P, R> {
     /// [`SaplingMetadata`] generated during the build process.
     pub fn build<FR: FeeRule>(
         self,
-        prover: &impl TxProver,
+        prover: &(impl TxProver + Sync),
         fee_rule: &FR,
     ) -> Result<(Transaction, SaplingMetadata), Error<FR::Error>> {
         let fee = fee_rule
@@ -443,7 +443,7 @@ impl<'a, P: consensus::Parameters, R: RngCore + CryptoRng> Builder<'a, P, R> {
     #[cfg(feature = "zfuture")]
     pub fn build_zfuture<FR: FutureFeeRule>(
         self,
-        prover: &impl TxProver,
+        prover: &(impl TxProver + Sync),
         fee_rule: &FR,
     ) -> Result<(Transaction, SaplingMetadata), Error<FR::Error>> {
         let fee = fee_rule
@@ -464,7 +464,7 @@ impl<'a, P: consensus::Parameters, R: RngCore + CryptoRng> Builder<'a, P, R> {
 
     fn build_internal<FE>(
         self,
-        prover: &impl TxProver,
+        prover: &(impl TxProver + Sync),
         fee: Amount,
     ) -> Result<(Transaction, SaplingMetadata), Error<FE>> {
         let consensus_branch_id = BranchId::for_height(&self.params, self.target_height);

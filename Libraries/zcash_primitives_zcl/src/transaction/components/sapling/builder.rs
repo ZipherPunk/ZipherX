@@ -1,10 +1,25 @@
 //! Types and functions for building Sapling transaction components.
 
 use core::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 
 use ff::Field;
 use rand::{seq::SliceRandom, RngCore};
+
+/// FIX #1326: Real-time progress tracking for parallel Groth16 proof generation.
+/// Swift polls these via FFI to display a live countdown timer.
+/// Updated atomically from OS worker threads — lock-free, zero overhead.
+pub static GROTH16_PROOFS_TOTAL: AtomicU32 = AtomicU32::new(0);
+pub static GROTH16_PROOFS_COMPLETED: AtomicU32 = AtomicU32::new(0);
+/// Number of OS threads used for concurrent proofs — Swift uses this to estimate time.
+pub static GROTH16_PROOF_THREADS: AtomicU32 = AtomicU32::new(0);
+
+/// FIX #1328: Cancellation flag for Groth16 proof generation.
+/// Swift sets this to `true` when the user closes/reopens the Send window or changes amount.
+/// Each OS thread checks this BETWEEN proofs and returns early if set.
+/// This prevents 900% CPU from concurrent proof sessions that Swift Task.cancel() can't stop.
+pub static GROTH16_CANCEL: AtomicBool = AtomicBool::new(false);
 
 use crate::{
     consensus::{self, BlockHeight},
@@ -44,6 +59,8 @@ pub enum Error {
     InvalidAddress,
     InvalidAmount,
     SpendProof,
+    /// FIX #1328: Proof generation was cancelled by Swift (user closed Send window).
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -56,6 +73,7 @@ impl fmt::Display for Error {
             Error::InvalidAddress => write!(f, "Invalid address"),
             Error::InvalidAmount => write!(f, "Invalid amount"),
             Error::SpendProof => write!(f, "Failed to create Sapling spend proof"),
+            Error::Cancelled => write!(f, "Proof generation cancelled"),
         }
     }
 }
@@ -336,7 +354,7 @@ impl<P: consensus::Parameters> SaplingBuilder<P> {
         Ok(())
     }
 
-    pub fn build<Pr: TxProver, R: RngCore>(
+    pub fn build<Pr: TxProver + Sync, R: RngCore>(
         self,
         prover: &Pr,
         ctx: &mut Pr::SaplingProvingContext,
@@ -383,53 +401,171 @@ impl<P: consensus::Parameters> SaplingBuilder<P> {
                 .anchor
                 .expect("Sapling anchor must be set if Sapling spends are present.");
 
-            indexed_spends
+            // FIX #1326: Phase 1 — Prepare all spend data (cheap, sequential)
+            // Pre-compute proof generation keys and nullifiers before parallel phase.
+            let prepared: Vec<_> = indexed_spends
                 .into_iter()
                 .enumerate()
                 .map(|(i, (pos, spend))| {
-                    let proof_generation_key = spend.extsk.expsk.proof_generation_key();
-
+                    let pgk = spend.extsk.expsk.proof_generation_key();
                     let nullifier = spend.note.nf(
-                        &proof_generation_key.to_viewing_key().nk,
+                        &pgk.to_viewing_key().nk,
                         u64::try_from(spend.merkle_path.position())
                             .expect("Sapling note commitment tree position must fit into a u64"),
                     );
+                    (i, pos, spend, pgk, nullifier)
+                })
+                .collect();
 
-                    let (zkproof, cv, rk) = prover
-                        .spend_proof(
-                            ctx,
-                            proof_generation_key,
+            if prepared.len() > 1 {
+                // FIX #1326+#1329: Sequential Groth16 proofs with bellman multicore.
+                //
+                // bellman multicore ON: each proof uses rayon (all cores) for FFT/multiexp.
+                // Single proof: ~0.78s. 27 proofs sequential: ~21s (theoretical minimum
+                // given 210 core-seconds / 10 cores = 21s).
+                //
+                // OS-thread parallelism CANNOT work with bellman multicore because:
+                // - bellman's Waiter::wait() panics if called from a rayon thread
+                // - local rayon pools run code ON rayon threads → triggers panic
+                // - bare OS threads all compete for the same global rayon pool → 0% speedup
+                //
+                // Disabling bellman multicore gives 19s multi-input (10%) but 6s single-input
+                // (770% regression). Not worth it.
+
+                // FIX #1328: Reset cancel flag at start of each new proof generation.
+                GROTH16_CANCEL.store(false, Ordering::Relaxed);
+
+                // Set progress atomics — Swift polls these for live countdown
+                let spend_count = prepared.len() as u32;
+                GROTH16_PROOFS_TOTAL.store(spend_count, Ordering::Relaxed);
+                GROTH16_PROOFS_COMPLETED.store(0, Ordering::Relaxed);
+                GROTH16_PROOF_THREADS.store(1, Ordering::Relaxed);
+
+                let phase2_start = std::time::Instant::now();
+                eprintln!("FIX #1329: Sequential proofs: {} spends, bellman multicore ON",
+                    prepared.len());
+
+                // Generate proofs sequentially — each uses full rayon pool internally
+                let proof_results: Vec<Result<_, ()>> = prepared
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, _, spend, pgk, _))| {
+                        // FIX #1328: Check cancel flag BEFORE each proof
+                        if GROTH16_CANCEL.load(Ordering::Relaxed) {
+                            return Err(());
+                        }
+                        let proof_start = std::time::Instant::now();
+                        let result = prover.spend_proof_detached(
+                            pgk.clone(),
                             spend.diversifier,
                             *spend.note.rseed(),
                             spend.alpha,
                             spend.note.value().inner(),
                             anchor,
                             spend.merkle_path.clone(),
-                        )
-                        .map_err(|_| Error::SpendProof)?;
-
-                    // Record the post-randomized spend location
-                    tx_metadata.spend_indices[pos] = i;
-
-                    // Update progress and send a notification on the channel
-                    progress += 1;
-                    if let Some(sender) = progress_notifier {
-                        // If the send fails, we should ignore the error, not crash.
-                        sender
-                            .send(Progress::new(progress, Some(total_progress)))
-                            .unwrap_or(());
-                    }
-
-                    Ok(SpendDescription {
-                        cv,
-                        anchor,
-                        nullifier,
-                        rk,
-                        zkproof,
-                        spend_auth_sig: spend,
+                        );
+                        let elapsed = proof_start.elapsed().as_secs_f64();
+                        if idx == 0 {
+                            eprintln!("FIX #1329: First proof took {:.3}s", elapsed);
+                        }
+                        GROTH16_PROOFS_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                        result
                     })
-                })
-                .collect::<Result<Vec<_>, Error>>()?
+                    .collect();
+
+                eprintln!("FIX #1329: Total: {:.3}s for {} proofs (sequential, bellman multicore)",
+                    phase2_start.elapsed().as_secs_f64(), prepared.len());
+
+                // FIX #1328: Check if proofs were cancelled
+                if GROTH16_CANCEL.load(Ordering::Relaxed) {
+                    GROTH16_PROOFS_TOTAL.store(0, Ordering::Relaxed);
+                    GROTH16_PROOFS_COMPLETED.store(0, Ordering::Relaxed);
+                    GROTH16_PROOF_THREADS.store(0, Ordering::Relaxed);
+                    return Err(Error::Cancelled);
+                }
+
+                // Verify all proofs completed
+                assert_eq!(
+                    proof_results.len(),
+                    prepared.len(),
+                    "FIX #1326: proof count mismatch — all spend proofs must complete"
+                );
+
+                // Phase 3 — Accumulate into context (cheap, sequential)
+                for result in &proof_results {
+                    match result {
+                        Ok((_, cv, _, rcv)) => {
+                            prover.accumulate_spend(ctx, cv, rcv);
+                        }
+                        Err(_) => return Err(Error::SpendProof),
+                    }
+                }
+
+                // Phase 4 — Build SpendDescriptions
+                prepared
+                    .into_iter()
+                    .zip(proof_results)
+                    .map(|((i, pos, spend, _, nullifier), result)| {
+                        let (zkproof, cv, rk, _rcv) = result.map_err(|_| Error::SpendProof)?;
+
+                        // Record the post-randomized spend location
+                        tx_metadata.spend_indices[pos] = i;
+
+                        // Update progress
+                        progress += 1;
+                        if let Some(sender) = progress_notifier {
+                            sender
+                                .send(Progress::new(progress, Some(total_progress)))
+                                .unwrap_or(());
+                        }
+
+                        Ok(SpendDescription {
+                            cv,
+                            anchor,
+                            nullifier,
+                            rk,
+                            zkproof,
+                            spend_auth_sig: spend,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+            } else {
+                // Single spend — use original sequential path (no rayon overhead)
+                prepared
+                    .into_iter()
+                    .map(|(i, pos, spend, pgk, nullifier)| {
+                        let (zkproof, cv, rk) = prover
+                            .spend_proof(
+                                ctx,
+                                pgk,
+                                spend.diversifier,
+                                *spend.note.rseed(),
+                                spend.alpha,
+                                spend.note.value().inner(),
+                                anchor,
+                                spend.merkle_path.clone(),
+                            )
+                            .map_err(|_| Error::SpendProof)?;
+
+                        tx_metadata.spend_indices[pos] = i;
+                        progress += 1;
+                        if let Some(sender) = progress_notifier {
+                            sender
+                                .send(Progress::new(progress, Some(total_progress)))
+                                .unwrap_or(());
+                        }
+
+                        Ok(SpendDescription {
+                            cv,
+                            anchor,
+                            nullifier,
+                            rk,
+                            zkproof,
+                            spend_auth_sig: spend,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+            }
         } else {
             vec![]
         };

@@ -33,6 +33,11 @@ final class TransactionBuilder {
 
     private var proverInitialized = false
 
+    /// FIX #1328: Static guard prevents concurrent proof generation sessions.
+    /// When user closes/reopens Send window, old build may still be in Rust FFI.
+    /// This flag ensures only ONE buildShieldedTransactionWithProgress runs at a time.
+    private static var isBuilding = false
+
     // MARK: - Prover Initialization
 
     /// Initialize the prover with Sapling parameters
@@ -528,6 +533,17 @@ final class TransactionBuilder {
         cachedChainHeight: UInt64? = nil,  // FIX #600: Cache chain height to avoid multiple network calls
         onProgress: @escaping ProgressCallback
     ) async throws -> (Data, Data) {
+
+        // FIX #1328: Prevent concurrent proof generation sessions.
+        // If another build is already in Rust FFI, cancel it first and wait briefly.
+        if TransactionBuilder.isBuilding {
+            print("⚠️ FIX #1328: Another build in progress — cancelling it first")
+            ZipherXFFI.cancelProofGeneration()
+            // Brief wait for Rust threads to notice the cancel flag
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        TransactionBuilder.isBuilding = true
+        defer { TransactionBuilder.isBuilding = false }
 
         // Initialize prover
         try initializeProver()
@@ -1074,8 +1090,8 @@ final class TransactionBuilder {
                 throw TransactionError.proofGenerationFailed
             }
 
-            // Build multi-input transaction
-            onProgress("building", nil, nil)
+            // Build multi-input transaction — verify witnesses then generate proofs
+            onProgress("building", "Verifying witnesses...", nil)
 
             // Convert preparedSpends to SpendInfoSwift array
             let spends = preparedSpends.map { spend in
@@ -1137,6 +1153,13 @@ final class TransactionBuilder {
             }
             print("✅ FIX #1137: All \(preparedSpends.count) CMUs verified matching")
 
+            // FIX #1329: Signal proof generation phase — triggers Groth16 countdown in UI
+            onProgress("proof", "\(preparedSpends.count) spends", nil)
+
+            // FIX #1329: Timing instrumentation — track parallel Groth16 proof generation
+            let proofStartTime = Date()
+            print("⏱️ FIX #1329: Starting parallel Groth16 proof generation (\(spends.count) spends)...")
+
             guard let result = ZipherXFFI.buildTransactionMultiEncrypted(
                 encryptedSpendingKey: encryptedKey,
                 encryptionKey: encryptionKey,
@@ -1146,15 +1169,17 @@ final class TransactionBuilder {
                 spends: spends,
                 chainHeight: chainHeight
             ) else {
+                let proofElapsed = Date().timeIntervalSince(proofStartTime)
                 // FIX #803: Log detailed error for anchor mismatch debugging
-                print("❌ FIX #803: ANCHOR MISMATCH - FFI multi-input transaction build failed!")
+                print("❌ FIX #803: ANCHOR MISMATCH - FFI multi-input transaction build failed! [⏱️ \(String(format: "%.2f", proofElapsed))s]")
                 print("   Spends: \(spends.count), Chain height: \(chainHeight)")
                 print("   💡 One or more witness merkle paths don't compute to their anchors - witnesses are corrupted")
                 print("   💡 Run 'Settings → Repair Database' to rebuild witnesses")
                 throw TransactionError.proofGenerationFailed
             }
 
-            print("✅ Multi-input transaction built: \(result.txData.count) bytes")
+            let proofElapsed = Date().timeIntervalSince(proofStartTime)
+            print("✅ Multi-input transaction built: \(result.txData.count) bytes [⏱️ Groth16: \(String(format: "%.2f", proofElapsed))s for \(spends.count) spends]")
             print("📝 Spent \(spends.count) notes")
 
             // Return transaction and first nullifier (for tracking)

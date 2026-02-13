@@ -94,6 +94,8 @@ struct SendView: View {
     @State private var preparationTask: Task<Void, Never>? = nil
     @State private var preparationProgress: String = ""
     @State private var preparationError: String? = nil  // FIX #1314: Show error when pre-verification fails
+    @State private var proofCountdownTimer: Timer? = nil  // FIX #1326: Live countdown during proof generation
+    @State private var preBuildStartTime: Date? = nil  // FIX #1327: Track pre-build start for elapsed timer
 
     // FIX #109: Debounce preparation to prevent multiple concurrent builds when typing
     @State private var preparationDebounceTask: Task<Void, Never>? = nil
@@ -510,10 +512,23 @@ struct SendView: View {
             // the final memo. This prevents a wasteful 2-4s Groth16 rebuild
             // every time the user types in the memo field.
         }
+        .onAppear {
+            // FIX #1327: Restore from static cache immediately when Send window opens.
+            // Prevents re-triggering the full pre-build when the view is recreated.
+            if preparedTransaction == nil,
+               let cached = PreparedTransaction.cached,
+               cached.isValid {
+                preparedTransaction = cached
+                print("⚡ FIX #1327: Restored cached TX on appear — no rebuild needed")
+            }
+        }
         .onDisappear {
-            // Cancel any ongoing preparation when view disappears
+            // FIX #1328: Cancel Rust-side proofs FIRST — Swift cancel doesn't stop OS threads
+            ZipherXFFI.cancelProofGeneration()
             preparationTask?.cancel()
             preparationTask = nil
+            proofCountdownTimer?.invalidate()  // FIX #1327: Clean up timer
+            proofCountdownTimer = nil
         }
         #if os(iOS)
         // FIX #1270: "Done" toolbar button for keyboards without a return key (decimalPad)
@@ -1629,10 +1644,17 @@ struct SendView: View {
         // FIX #109: Also cancel debounce task
         preparationDebounceTask?.cancel()
         preparationDebounceTask = nil
+        // FIX #1328: Cancel Rust-side proofs BEFORE cancelling Swift task.
+        // Swift Task.cancel() does NOT stop Rust's std::thread::scope() threads.
+        // Without this, each close/reopen spawns new proof threads while old ones still run → 900% CPU.
+        ZipherXFFI.cancelProofGeneration()
         preparationTask?.cancel()
         preparationTask = nil
         preparedTransaction = nil
         PreparedTransaction.cached = nil  // FIX #1325: Also clear persistent cache
+        proofCountdownTimer?.invalidate()  // FIX #1327
+        proofCountdownTimer = nil
+        preBuildStartTime = nil  // FIX #1327
         isPreparingTransaction = false
         preparationProgress = ""
     }
@@ -1691,13 +1713,16 @@ struct SendView: View {
 
                 // Now actually start preparation
                 await MainActor.run {
-                    // Cancel any existing preparation
+                    // FIX #1328: Cancel Rust proofs BEFORE Swift task — OS threads ignore Task.cancel()
+                    ZipherXFFI.cancelProofGeneration()
                     preparationTask?.cancel()
 
                     // Start new preparation
                     isPreparingTransaction = true
                     preparationProgress = "Initializing..."
                     preparationError = nil  // FIX #1314: Clear previous error
+                    preBuildStartTime = Date()  // FIX #1327: Track start time
+                    startPreBuildElapsedTimer()  // FIX #1327: Show elapsed time
 
                     preparationTask = Task {
                         await prepareTransaction()
@@ -1767,12 +1792,18 @@ struct SendView: View {
                 cachedChainHeight: heightBeforePrep,  // FIX #600: Pass cached chain height to avoid multiple network calls
                 onProgress: { step, detail, _ in
                     Task { @MainActor in
+                        // FIX #1327: Show elapsed time with each step
+                        let elapsed = self.preBuildStartTime.map { Int(Date().timeIntervalSince($0)) } ?? 0
+                        let elapsedStr = elapsed > 0 ? " (\(elapsed)s)" : ""
                         switch step {
-                        case "prover": self.preparationProgress = "Prover ready"
-                        case "notes": self.preparationProgress = "Notes selected"
-                        case "tree": self.preparationProgress = detail ?? "Loading tree..."
-                        case "witness": self.preparationProgress = "Building witness..."
-                        case "proof": self.preparationProgress = "Generating zk-SNARK..."
+                        case "prover": self.preparationProgress = "Loading prover...\(elapsedStr)"
+                        case "notes": self.preparationProgress = "Selecting notes...\(elapsedStr)"
+                        case "tree": self.preparationProgress = (detail ?? "Loading tree...") + elapsedStr
+                        case "witness": self.preparationProgress = "Validating witnesses...\(elapsedStr)"
+                        case "proof":
+                            self.preparationProgress = "Generating zk-SNARK...\(elapsedStr)"
+                            // FIX #1326: Start live countdown timer for parallel proof generation
+                            self.startProofCountdown()
                         default: break
                         }
                     }
@@ -1798,22 +1829,35 @@ struct SendView: View {
                 )
                 self.preparedTransaction = prepared
                 PreparedTransaction.cached = prepared  // FIX #1325: Persist across view lifecycle
+                self.proofCountdownTimer?.invalidate()  // FIX #1326: Stop countdown
+                self.proofCountdownTimer = nil
+                let buildTime = self.preBuildStartTime.map { String(format: "%.1f", Date().timeIntervalSince($0)) } ?? "?"
+                self.preBuildStartTime = nil  // FIX #1327
                 self.isPreparingTransaction = false
                 self.preparationProgress = ""
-                print("⚡ Transaction prepared at height \(heightBeforePrep) - ready for instant send!")
+                print("⚡ Transaction prepared at height \(heightBeforePrep) in \(buildTime)s - ready for instant send!")
             }
         } catch is CancellationError {
             await MainActor.run {
+                proofCountdownTimer?.invalidate()
+                proofCountdownTimer = nil
+                preBuildStartTime = nil  // FIX #1327
                 isPreparingTransaction = false
                 preparationProgress = ""
             }
         } catch {
             await MainActor.run {
+                proofCountdownTimer?.invalidate()
+                proofCountdownTimer = nil
+                preBuildStartTime = nil  // FIX #1327
                 isPreparingTransaction = false
                 preparationProgress = ""
                 // FIX #1314: Show error to user instead of silently failing
                 let errorMsg = error.localizedDescription
-                if errorMsg.contains("Insufficient") {
+                if errorMsg.contains("cancelled") || errorMsg.contains("Cancelled") || errorMsg.contains("Proof generation cancelled") {
+                    // FIX #1328: Proof was cancelled by user action — not a real error
+                    print("ℹ️ FIX #1328: Proof generation cancelled — cleaning up")
+                } else if errorMsg.contains("Insufficient") {
                     preparationError = "Insufficient spendable balance — witnesses may need repair"
                 } else if errorMsg.contains("Anchor not found") || errorMsg.contains("anchorNotOnChain") {
                     preparationError = "Witness anchors invalid — go to Settings → Repair Database"
@@ -1821,6 +1865,102 @@ struct SendView: View {
                     preparationError = "Transaction preparation failed: \(errorMsg)"
                 }
                 print("⚠️ Transaction preparation failed: \(errorMsg)")
+            }
+        }
+    }
+
+    // MARK: - FIX #1326: Groth16 Proof Countdown Timer
+
+    /// Starts a live countdown timer that polls Rust's atomic progress counters.
+    /// The timer fires every 300ms and displays: "Generating zk-SNARK... X/Y (≈Zs remaining)"
+    /// Time estimate is based on ACTUAL observed proof rate, not hardcoded constants.
+    private func startProofCountdown() {
+        // Invalidate any existing timer
+        proofCountdownTimer?.invalidate()
+
+        let startTime = Date()
+        var firstProofTime: Date? = nil  // When the first proof completes (for rate calculation)
+
+        proofCountdownTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [self] timer in
+            let total = ZipherXFFI.getProofTotal()
+            let completed = ZipherXFFI.getProofCompleted()
+
+            // Not started yet or already done
+            guard total > 0 && completed < total else {
+                if total > 0 && completed >= total {
+                    self.preparationProgress = "Finalizing transaction..."
+                    timer.invalidate()
+                    self.proofCountdownTimer = nil
+                }
+                return
+            }
+
+            // Track when first proof completes (for measured rate)
+            if completed > 0 && firstProofTime == nil {
+                firstProofTime = Date()
+            }
+
+            let remaining = total - completed
+            var timeEstimate = ""
+
+            if completed > 0, let firstTime = firstProofTime {
+                // MEASURED rate: use actual time since first proof completed
+                let elapsed = Date().timeIntervalSince(firstTime)
+                // completed-1 because the first proof completion is our baseline
+                if completed > 1 {
+                    let secondsPerProof = elapsed / Double(completed - 1)
+                    let remainingSeconds = Int(ceil(Double(remaining) * secondsPerProof))
+                    timeEstimate = " (\(remainingSeconds)s remaining)"
+                } else {
+                    // Only 1 proof done, use thread-based estimate for remaining
+                    let threads = max(1, ZipherXFFI.getProofThreads())
+                    let batchesRemaining = Int(ceil(Double(remaining) / Double(threads)))
+                    // First batch took this long:
+                    let firstBatchTime = Date().timeIntervalSince(startTime)
+                    let remainingSeconds = Int(ceil(Double(batchesRemaining) * firstBatchTime))
+                    timeEstimate = " (\(remainingSeconds)s remaining)"
+                }
+            } else {
+                // No proofs done yet — use initial estimate
+                // ~1.0s per proof on Apple Silicon, divided by thread count
+                let threads = max(1, ZipherXFFI.getProofThreads())
+                let batches = Int(ceil(Double(total) / Double(threads)))
+                let estimatedTotal = batches  // ~1s per batch
+                timeEstimate = " (\(estimatedTotal)s remaining)"
+            }
+
+            self.preparationProgress = "Generating zk-SNARK \(completed)/\(total)\(timeEstimate)"
+        }
+    }
+
+    // MARK: - FIX #1327: Pre-build elapsed timer
+
+    /// Shows elapsed time during the pre-build steps (prover, tree, witnesses)
+    /// before the Groth16 countdown takes over. Updates every 1s with "Step... (Xs)"
+    private func startPreBuildElapsedTimer() {
+        // Reuse the same proofCountdownTimer slot — proof countdown will replace it when proofs start
+        proofCountdownTimer?.invalidate()
+
+        proofCountdownTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [self] timer in
+            // If proofs have started (total > 0), this timer is replaced by startProofCountdown
+            let total = ZipherXFFI.getProofTotal()
+            if total > 0 {
+                timer.invalidate()
+                return
+            }
+
+            guard let start = self.preBuildStartTime, self.isPreparingTransaction else {
+                timer.invalidate()
+                return
+            }
+
+            let elapsed = Int(Date().timeIntervalSince(start))
+            if elapsed > 0 {
+                // Append elapsed time to current step (don't overwrite the step name)
+                let currentStep = self.preparationProgress.components(separatedBy: " (").first ?? self.preparationProgress
+                if !currentStep.isEmpty {
+                    self.preparationProgress = "\(currentStep) (\(elapsed)s)"
+                }
             }
         }
     }

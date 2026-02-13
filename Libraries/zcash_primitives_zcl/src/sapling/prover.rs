@@ -4,7 +4,7 @@ use crate::{
     sapling::{
         self,
         redjubjub::{PublicKey, Signature},
-        value::ValueCommitment,
+        value::{ValueCommitTrapdoor, ValueCommitment},
     },
     transaction::components::{Amount, GROTH_PROOF_SIZE},
 };
@@ -60,6 +60,43 @@ pub trait TxProver {
         value_balance: Amount,
         sighash: &[u8; 32],
     ) -> Result<Signature, ()>;
+
+    /// FIX #1326: Create a spend proof WITHOUT accumulating into the proving context.
+    ///
+    /// Thread-safe (`&self`) — can be called from multiple rayon threads concurrently.
+    /// Returns `(zkproof, cv, rk, rcv)` where `rcv` is needed for later accumulation
+    /// via [`TxProver::accumulate_spend`].
+    ///
+    /// Default implementation panics — must be overridden by provers that support
+    /// parallel proof generation.
+    #[allow(clippy::too_many_arguments)]
+    fn spend_proof_detached(
+        &self,
+        proof_generation_key: ProofGenerationKey,
+        diversifier: Diversifier,
+        rseed: Rseed,
+        ar: jubjub::Fr,
+        value: u64,
+        anchor: bls12_381::Scalar,
+        merkle_path: sapling::MerklePath,
+    ) -> Result<([u8; GROTH_PROOF_SIZE], ValueCommitment, PublicKey, ValueCommitTrapdoor), ()> {
+        let _ = (proof_generation_key, diversifier, rseed, ar, value, anchor, merkle_path);
+        unimplemented!("spend_proof_detached not available for this prover")
+    }
+
+    /// FIX #1326: Accumulate a detached spend proof's value commitment into the context.
+    ///
+    /// Called sequentially AFTER all parallel `spend_proof_detached()` calls complete.
+    /// EC point addition is commutative — accumulation order doesn't matter.
+    fn accumulate_spend(
+        &self,
+        ctx: &mut Self::SaplingProvingContext,
+        cv: &ValueCommitment,
+        rcv: &ValueCommitTrapdoor,
+    ) {
+        let _ = (ctx, cv, rcv);
+        unimplemented!("accumulate_spend not available for this prover")
+    }
 }
 
 #[cfg(any(test, feature = "test-dependencies"))]

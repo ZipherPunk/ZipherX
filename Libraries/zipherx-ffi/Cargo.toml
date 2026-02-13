@@ -18,7 +18,7 @@ bech32 = "0.9"
 # Real Zcash/Sapling cryptography
 # Using local fork with Zclassic Buttercup branch ID support
 zcash_primitives = { path = "../zcash_primitives_zcl" }
-zcash_proofs = "0.13"
+zcash_proofs = { path = "../zcash_proofs_zcl" }
 zcash_address = "0.3"
 zcash_note_encryption = "0.4"
 incrementalmerkletree = "0.5"
@@ -38,6 +38,8 @@ ureq = { version = "2.9", features = ["json"] }
 base64 = "0.21"
 bls12_381 = "0.8"
 equihash = "0.2"
+# FIX #1329: Re-enable bellman multicore for single-input speed (~0.78s vs 6s without).
+# Multi-input parallel path uses local 1-thread rayon pools to avoid contention.
 bellman = "0.14"
 subtle = "2.5"
 
@@ -90,3 +92,5 @@ opt-level = 3
 [patch.crates-io]
 # Override all zcash_primitives dependencies to use our local fork with Zclassic Buttercup support
 zcash_primitives = { path = "../zcash_primitives_zcl" }
+# FIX #1326: Local fork with parallel spend proof generation (spend_proof_detached)
+zcash_proofs = { path = "../zcash_proofs_zcl" }

@@ -1186,6 +1186,48 @@ pub extern "C" fn zipherx_get_rayon_threads() -> usize {
 }
 
 // =============================================================================
+// FIX #1326: Real-time Groth16 Proof Progress (for UI countdown)
+// =============================================================================
+
+use zcash_primitives::transaction::components::sapling::builder::{
+    GROTH16_CANCEL, GROTH16_PROOFS_COMPLETED, GROTH16_PROOFS_TOTAL, GROTH16_PROOF_THREADS,
+};
+
+/// FIX #1326: Get total number of spend proofs being generated.
+/// Returns 0 when no proof generation is in progress.
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_total() -> u32 {
+    GROTH16_PROOFS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FIX #1326: Get number of spend proofs completed so far.
+/// Swift polls this every ~200ms to update the countdown timer.
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_completed() -> u32 {
+    GROTH16_PROOFS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FIX #1326: Get number of threads in the Groth16 proof pool.
+/// Swift uses: estimatedSeconds = ceil(total / threads) * ~1.0s
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_threads() -> u32 {
+    GROTH16_PROOF_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FIX #1328: Cancel any in-progress Groth16 proof generation.
+/// Sets an atomic flag that each OS thread checks BETWEEN proofs.
+/// Prevents 900% CPU when Swift Task.cancel() can't stop Rust's std::thread::scope().
+/// Safe to call even when no proofs are running — the flag is reset at next proof start.
+#[no_mangle]
+pub extern "C" fn zipherx_cancel_proof_generation() {
+    GROTH16_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Also reset counters so Swift UI doesn't show stale progress
+    GROTH16_PROOFS_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    GROTH16_PROOFS_COMPLETED.store(0, std::sync::atomic::Ordering::Relaxed);
+    GROTH16_PROOF_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// =============================================================================
 // Utility Functions
 // =============================================================================
 

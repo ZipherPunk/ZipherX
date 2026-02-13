@@ -136,6 +136,10 @@ final class WalletManager: ObservableObject {
     private var lastWitnessRebuildTime: Date? = nil
     private let witnessRebuildCooldown: TimeInterval = 30.0  // Minimum 30 seconds between rebuilds
 
+    // FIX #1327: Skip redundant witness re-verification when recently verified
+    private var lastWitnessVerificationAllPassed: Date? = nil
+    private var lastWitnessVerificationTreeSize: UInt64 = 0
+
     // MARK: - FIX #451: Recovery mechanism for stuck repair flag
     /// Force reset the isRepairingDatabase flag if it gets stuck
     /// Call this from Settings or when app detects stuck repair state
@@ -4293,6 +4297,24 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #1327: Skip expensive witness re-verification if ALL witnesses passed recently
+        // AND the tree size hasn't changed (no new CMUs appended since last check).
+        // This prevents the 4+ second re-check that runs after EVERY background sync cycle.
+        // But NEVER skip if there are NULL witnesses (FIX #586 bypass).
+        let currentTreeSize = ZipherXFFI.treeSize()
+        if let lastVerified = lastWitnessVerificationAllPassed,
+           Date().timeIntervalSince(lastVerified) < 60,
+           lastWitnessVerificationTreeSize == currentTreeSize,
+           currentTreeSize > 0 {
+            // Quick check: any unspent notes with empty witnesses?
+            let hasNullUnspent = (try? WalletDatabase.shared.getAllUnspentNotes(accountId: accountId))?.contains { $0.witness.isEmpty } ?? false
+            if !hasNullUnspent {
+                let ago = Int(Date().timeIntervalSince(lastVerified))
+                print("⏩ FIX #1327: All witnesses verified \(ago)s ago (tree unchanged at \(currentTreeSize)) — skipping")
+                return
+            }
+        }
+
         // FIX #557 v15: Prevent concurrent rebuilds
         witnessRebuildLock.lock()
         if isRebuildingWitnesses {
@@ -4761,6 +4783,9 @@ final class WalletManager: ObservableObject {
 
             if notesNeedingRebuild.isEmpty {
                 print("✅ FIX #1022: No corrupted witnesses found - all instant-ready!")
+                // FIX #1327: Record successful verification — skip redundant re-checks for 60s
+                lastWitnessVerificationAllPassed = Date()
+                lastWitnessVerificationTreeSize = UInt64(ZipherXFFI.treeSize())
             }
 
             // Batch update anchors (thread-safe)

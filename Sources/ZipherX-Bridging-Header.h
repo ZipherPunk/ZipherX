@@ -313,6 +313,12 @@ size_t zipherx_try_decrypt_notes_parallel(
 // Get the number of CPU threads Rayon will use for parallel decryption
 size_t zipherx_get_rayon_threads(void);
 
+// FIX #1326: Real-time Groth16 proof progress (for UI countdown timer)
+// Swift polls these every ~200ms during transaction building
+uint32_t zipherx_get_proof_total(void);      // Total spend proofs to generate
+uint32_t zipherx_get_proof_completed(void);  // Proofs completed so far (atomic)
+uint32_t zipherx_get_proof_threads(void);    // Threads in proof pool (for time estimate)
+
 // =============================================================================
 // Equihash Proof-of-Work Verification (for trustless header validation)
 // =============================================================================
@@ -650,6 +656,15 @@ bool zipherx_verify_buttercup_support(void);
 
 /// Get the number of CPU threads Rayon will use for parallel operations
 size_t zipherx_get_rayon_threads(void);
+
+/// FIX #1326: Real-time Groth16 proof progress (for UI countdown timer)
+uint32_t zipherx_get_proof_total(void);
+uint32_t zipherx_get_proof_completed(void);
+uint32_t zipherx_get_proof_threads(void);
+
+/// FIX #1328: Cancel in-progress Groth16 proof generation.
+/// Sets atomic flag checked between proofs — prevents 900% CPU from concurrent sessions.
+void zipherx_cancel_proof_generation(void);
 
 // =============================================================================
 // ZSTD Decompression

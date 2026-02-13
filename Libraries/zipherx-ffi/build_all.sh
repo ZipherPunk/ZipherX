@@ -58,23 +58,23 @@ FAILED=0
 
 wait $PID1
 STATUS1=$?
-if [ $STATUS1 -eq 0 ]; then echo "✅ macOS (arm64) done"; else echo "❌ macOS (arm64) FAILED (exit code: $STATUS1)"; FAILED=1; fi
+if [ $STATUS1 -eq 0 ]; then echo "✅ macOS (arm64) done"; else echo "❌ macOS (arm64) FAILED"; FAILED=1; echo "── Error output ──"; grep "^error" /tmp/build_macos_arm64.log | tail -5; echo "──────────────────"; fi
 
 wait $PID2
 STATUS2=$?
-if [ $STATUS2 -eq 0 ]; then echo "✅ macOS (x86_64) done"; else echo "❌ macOS (x86_64) FAILED (exit code: $STATUS2)"; FAILED=1; fi
+if [ $STATUS2 -eq 0 ]; then echo "✅ macOS (x86_64) done"; else echo "❌ macOS (x86_64) FAILED"; FAILED=1; echo "── Error output ──"; grep "^error" /tmp/build_macos_x86.log | tail -5; echo "──────────────────"; fi
 
 wait $PID3
 STATUS3=$?
-if [ $STATUS3 -eq 0 ]; then echo "✅ iOS Device done"; else echo "❌ iOS Device FAILED (exit code: $STATUS3)"; FAILED=1; fi
+if [ $STATUS3 -eq 0 ]; then echo "✅ iOS Device done"; else echo "❌ iOS Device FAILED"; FAILED=1; echo "── Error output ──"; grep "^error" /tmp/build_ios.log | tail -5; echo "──────────────────"; fi
 
 wait $PID4
 STATUS4=$?
-if [ $STATUS4 -eq 0 ]; then echo "✅ iOS Simulator done"; else echo "❌ iOS Simulator FAILED (exit code: $STATUS4)"; FAILED=1; fi
+if [ $STATUS4 -eq 0 ]; then echo "✅ iOS Simulator done"; else echo "❌ iOS Simulator FAILED"; FAILED=1; echo "── Error output ──"; grep "^error" /tmp/build_sim.log | tail -5; echo "──────────────────"; fi
 
 if [ $FAILED -eq 1 ]; then
     echo ""
-    echo "❌ BUILD FAILED! Check logs:"
+    echo "❌ BUILD FAILED! Full logs:"
     echo "   /tmp/build_macos_arm64.log"
     echo "   /tmp/build_macos_x86.log"
     echo "   /tmp/build_ios.log"

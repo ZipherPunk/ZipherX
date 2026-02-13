@@ -357,6 +357,30 @@ enum ZipherXFFI {
         return Int(zipherx_get_rayon_threads())
     }
 
+    // MARK: - FIX #1326: Groth16 Proof Progress Tracking
+
+    /// Total number of spend proofs being generated (0 when idle)
+    static func getProofTotal() -> UInt32 {
+        return zipherx_get_proof_total()
+    }
+
+    /// Number of spend proofs completed so far (updated atomically by rayon workers)
+    static func getProofCompleted() -> UInt32 {
+        return zipherx_get_proof_completed()
+    }
+
+    /// Number of threads in the Groth16 proof pool
+    static func getProofThreads() -> UInt32 {
+        return zipherx_get_proof_threads()
+    }
+
+    /// FIX #1328: Cancel any in-progress Groth16 proof generation.
+    /// Sets an atomic flag in Rust checked between proofs by each OS thread.
+    /// Call this BEFORE cancelling the Swift Task — Rust threads ignore Task.cancel().
+    static func cancelProofGeneration() {
+        zipherx_cancel_proof_generation()
+    }
+
     /// Batch decrypt multiple shielded outputs in parallel using Rayon
     /// This provides ~6.7x speedup over sequential decryption by using all CPU cores
     ///
