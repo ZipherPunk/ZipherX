@@ -489,6 +489,40 @@ final class HeaderStore {
         return try parseHeaderFromRow(stmt!)
     }
 
+    /// FIX #1287: Batch fetch block hashes for a height range in a single SQL query.
+    /// Replaces per-block getHeader(at:) calls that each do full SELECT with 11 columns
+    /// (128 individual queries with 400-byte solution blob parsing → 1 query returning only hashes).
+    func getBlockHashesInRange(from startHeight: UInt64, count: Int) throws -> [UInt64: Data] {
+        if db == nil { try open() }
+        guard db != nil else { return [:] }
+
+        let endHeight = startHeight + UInt64(count) - 1
+        let sql = "SELECT height, block_hash FROM headers WHERE height >= ? AND height <= ?;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(startHeight))
+        sqlite3_bind_int64(stmt, 2, Int64(endHeight))
+
+        var result: [UInt64: Data] = [:]
+        result.reserveCapacity(count)
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let height = UInt64(sqlite3_column_int64(stmt, 0))
+            if let blobPtr = sqlite3_column_blob(stmt, 1) {
+                let blobLen = Int(sqlite3_column_bytes(stmt, 1))
+                let hash = Data(bytes: blobPtr, count: blobLen)
+                result[height] = hash
+            }
+        }
+
+        return result
+    }
+
     /// Get anchor (finalsaplingroot) for a specific height
     /// This is the critical method for transaction building!
     func getAnchor(at height: UInt64) throws -> Data? {

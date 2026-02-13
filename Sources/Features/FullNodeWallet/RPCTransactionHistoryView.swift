@@ -628,11 +628,15 @@ struct RPCTransactionHistoryView: View {
         return String(format: "%.8f ZCL", zcl)
     }
 
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        return Self.cachedDateFormatter.string(from: date)
     }
 
     // FIX #286 v15: Parse debug.log for real rescan progress

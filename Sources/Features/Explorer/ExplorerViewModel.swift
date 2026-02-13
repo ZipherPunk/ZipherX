@@ -394,12 +394,17 @@ struct BlockInfo {
     let previousHash: String?
     let transactions: [String]
 
+    // Cached DateFormatter — avoid per-call creation (ICU init is expensive)
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .medium
+        return f
+    }()
+
     var timeFormatted: String {
         let date = Date(timeIntervalSince1970: time)
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .medium
-        return formatter.string(from: date)
+        return Self.cachedDateFormatter.string(from: date)
     }
 }
 
@@ -414,13 +419,18 @@ struct TransactionInfo {
     let transparentInputs: [TxIO]
     let transparentOutputs: [TxIO]
 
+    // Cached DateFormatter — avoid per-call creation (ICU init is expensive)
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .medium
+        return f
+    }()
+
     var timeFormatted: String? {
         guard let time = time else { return nil }
         let date = Date(timeIntervalSince1970: time)
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .medium
-        return formatter.string(from: date)
+        return Self.cachedDateFormatter.string(from: date)
     }
 }
 

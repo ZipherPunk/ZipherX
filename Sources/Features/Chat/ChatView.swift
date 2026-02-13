@@ -1140,6 +1140,12 @@ struct DateSeparator: View {
         .padding(.vertical, 12)
     }
 
+    private static let chatDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, yyyy"
+        return f
+    }()
+
     private func formatDate(_ date: Date) -> String {
         let calendar = Calendar.current
         if calendar.isDateInToday(date) {
@@ -1147,9 +1153,7 @@ struct DateSeparator: View {
         } else if calendar.isDateInYesterday(date) {
             return "Yesterday"
         } else {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "MMM d, yyyy"
-            return formatter.string(from: date)
+            return Self.chatDateFormatter.string(from: date)
         }
     }
 }
@@ -1465,10 +1469,14 @@ struct MessageBubble: View {
         return nil
     }
 
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f
+    }()
+
     private func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        return Self.timeFormatter.string(from: date)
     }
 }
 

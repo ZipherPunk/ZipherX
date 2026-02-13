@@ -2684,12 +2684,22 @@ final class WalletDatabase {
         // When history > notes, it could be:
         // 1. Normal accounting difference (change outputs)
         // 2. A note incorrectly marked as spent by a phantom TX (caught by FIX #1169 above)
-        // FIX #1169 already auto-restores phantom-spent notes, so if we reach here
-        // and there's still a difference, it's either already fixed or a minor accounting gap
+        // FIX #1286: If difference persists after FIX #1169/1233/1245 phantom cleanup,
+        // notes are incorrectly marked as spent with valid-looking TX entries.
+        // This is NOT a "minor accounting gap" — it means real funds are hidden.
+        // Flag as invalid so the UI can show a warning.
         if changeInBalance < 0 {
             let diffZCL = Double(-changeInBalance) / 100_000_000.0
-            details.append(String(format: "⚠️ FIX #1130: History shows %.8f ZCL more than notes", diffZCL))
-            details.append("   FIX #1169 phantom check ran above - remaining gap may be accounting difference")
+            // FIX #1286: Threshold — differences > 0.0001 ZCL (10000 zatoshis) are significant.
+            // Tiny differences from fee rounding or change handling are ignorable.
+            if -changeInBalance > 10000 {
+                isValid = false
+                issueFound = String(format: "Notes show %.8f ZCL less than history — possible phantom-spent notes", diffZCL)
+                details.append(String(format: "🚨 FIX #1286: History shows %.8f ZCL more than unspent notes", diffZCL))
+                details.append("   Run Full Resync in Settings to detect and restore incorrectly spent notes")
+            } else {
+                details.append(String(format: "⚠️ FIX #1130: History shows %.8f ZCL more than notes (minor difference)", diffZCL))
+            }
         }
 
         if isValid {
@@ -7568,11 +7578,17 @@ struct TransactionHistoryItem {
         return Double(fee) / 100_000_000.0
     }
 
+    // Cached DateFormatter — creating DateFormatter() per row per frame is extremely expensive (ICU init)
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     /// Formatted date string using REAL block timestamp from blockchain
     var dateString: String? {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
+        let formatter = Self.cachedDateFormatter
 
         // Use actual block timestamp if available (already set by getTransactionHistory)
         if let blockTime = blockTime, blockTime > 0 {

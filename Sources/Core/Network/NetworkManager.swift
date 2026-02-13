@@ -175,6 +175,8 @@ public final class NetworkManager: ObservableObject {
     private let PENDING_TXIDS_KEY = "ZipherX_PendingOutgoingTxids"
 
     // MARK: - Published Properties
+    // CPU OPTIMIZATION: @Published fires Combine objectWillChange on EVERY assignment,
+    // even when value is unchanged. Use updateIfChanged() to suppress duplicate notifications.
     @Published private(set) var connectedPeers: Int = 0
     @Published private(set) var isConnected: Bool = false
     @Published private(set) var syncProgress: Double = 0.0
@@ -321,6 +323,36 @@ public final class NetworkManager: ObservableObject {
     /// Flag to indicate intensive P2P fetch is in progress (blocks, CMUs, etc.)
     /// Used to prevent parallel operations from interfering with bulk P2P fetches
     @Published var isIntensiveP2PFetchInProgress: Bool = false
+
+    /// FIX #1317: Actor-based async semaphore for serializing getBlocksDataP2P calls.
+    /// Only 1 caller at a time may use the shared P2P peers for block fetching.
+    /// Eliminates both client-side dispatcher contention AND server-side cs_main queueing.
+    /// Why actor: NSLock can't span await; DispatchSemaphore.wait() blocks cooperative pool.
+    private actor P2PFetchGate {
+        private var isAcquired = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func acquire() async {
+            if !isAcquired {
+                isAcquired = true
+                return
+            }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                waiters.append(cont)
+            }
+        }
+
+        func release() {
+            if let next = waiters.first {
+                waiters.removeFirst()
+                next.resume()
+            } else {
+                isAcquired = false
+            }
+        }
+    }
+
+    private let p2pFetchGate = P2PFetchGate()
 
     /// FIX #145: Enable background processes (called after initial sync completes)
     func enableBackgroundProcesses() {
@@ -1527,14 +1559,15 @@ public final class NetworkManager: ObservableObject {
     /// This should be called whenever peer states change to keep the UI in sync
     func updatePeerCountsForSettings() {
         DispatchQueue.main.async {
-            // Parked peers count
-            self.parkedPeersCount = PeerManager.shared.getParkedPeers().count
+            // CPU OPTIMIZATION: Only update @Published if value changed (avoids SwiftUI re-render)
+            let newParked = PeerManager.shared.getParkedPeers().count
+            if self.parkedPeersCount != newParked { self.parkedPeersCount = newParked }
 
-            // Reliable peers count (use computed property)
-            self.reliablePeersDisplayCount = self.reliablePeerCount
+            let newReliable = self.reliablePeerCount
+            if self.reliablePeersDisplayCount != newReliable { self.reliablePeersDisplayCount = newReliable }
 
-            // Preferred seeds count (from database)
-            self.preferredSeedsCount = (try? WalletDatabase.shared.getPreferredSeeds().count) ?? 0
+            let newPreferred = (try? WalletDatabase.shared.getPreferredSeeds().count) ?? 0
+            if self.preferredSeedsCount != newPreferred { self.preferredSeedsCount = newPreferred }
         }
     }
 
@@ -6765,13 +6798,18 @@ public final class NetworkManager: ObservableObject {
                 }
 
                 if !blocks.isEmpty {
-                    // FIX #1204: Save finalsaplingroot to HeaderStore for all fetched blocks
+                    // FIX #1287: Batch write sapling roots instead of per-block I/O
+                    var saplingRootsDict: [UInt64: Data] = [:]
+                    var saplingRootEntries: [(height: UInt64, root: Data)] = []
                     for block in blocks {
                         if !block.finalSaplingRoot.isEmpty && !block.finalSaplingRoot.allSatisfy({ $0 == 0 }) {
-                            try? HeaderStore.shared.updateSaplingRoot(at: block.blockHeight, root: block.finalSaplingRoot, timestamp: block.time)
-                            // FIX #1253: Also save to delta sapling roots (survives missing header rows)
-                            DeltaCMUManager.shared.appendSaplingRoot(height: block.blockHeight, root: block.finalSaplingRoot)
+                            saplingRootsDict[block.blockHeight] = block.finalSaplingRoot
+                            saplingRootEntries.append((height: block.blockHeight, root: block.finalSaplingRoot))
                         }
+                    }
+                    if !saplingRootsDict.isEmpty {
+                        try? HeaderStore.shared.updateSaplingRoots(saplingRootsDict)
+                        DeltaCMUManager.shared.appendSaplingRootsBatch(saplingRootEntries)
                     }
                     print("✅ P2P on-demand: Got \(blocks.count) blocks from \(peer.host)")
                     return blocks
@@ -6881,6 +6919,12 @@ public final class NetworkManager: ObservableObject {
     /// Returns: [(height, blockHash, timestamp, txData)]
     /// - Parameter skipPreReconnect: If true, skip pre-reconnection (FIX #1071 - already done at caller level)
     func getBlocksDataP2P(from height: UInt64, count: Int, skipPreReconnect: Bool = false) async throws -> [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] {
+        // FIX #1317: Serialize all P2P block fetches through global gate.
+        // Prevents cs_main lock contention on remote peer and dispatcher FIFO conflicts.
+        // Each operation gets full peer bandwidth (300+ blocks/sec) instead of fighting (12-17).
+        await p2pFetchGate.acquire()
+        defer { Task { [p2pFetchGate] in await p2pFetchGate.release() } }
+
         // FIX #1205: Dispatcher activation moved AFTER reconnection (see below)
         // Old FIX #907 stopped listeners here — removed. FIX #1184 dispatcher needs them running.
 
@@ -6953,48 +6997,63 @@ public final class NetworkManager: ObservableObject {
         // FIX #1205: Activate dispatchers on demand AFTER reconnection
         // Must run after FIX #930 reconnection so listeners start on current connections.
         // FIX #1184 requires dispatcher for all block fetches (no direct reads).
-        var anyDispatcherActive = false
+        // FIX #1285: Check how MANY dispatchers are active, not just "any".
+        // Dispatchers die mid-scan (connection timeout, listener exit). If only 1/5 is alive,
+        // the old code skipped activation entirely → 80% of blocks wasted on dead peers.
+        var activeDispatcherCount = 0
         for peer in availablePeers {
             if await peer.isDispatcherActive {
-                anyDispatcherActive = true
-                break
+                activeDispatcherCount += 1
             }
         }
-        if !anyDispatcherActive {
-            print("🔄 FIX #1205: No dispatcher-active peers — starting block listeners for fetch...")
+        let neededDispatchers = min(3, availablePeers.count)
+        if activeDispatcherCount < neededDispatchers {
+            print("🔄 FIX #1285: Only \(activeDispatcherCount)/\(availablePeers.count) dispatchers active (need \(neededDispatchers)) — restarting block listeners...")
             // Must unblock to allow startBlockListener() to proceed
             if PeerManager.shared.areBlockListenersBlocked() {
                 PeerManager.shared.setBlockListenersBlocked(false)
             }
             // Also clear header sync flag (header sync is done by now)
             await PeerManager.shared.setHeaderSyncInProgress(false)
-            // Start block listeners on available (reconnected) peers
+            // Start block listeners on peers without active dispatchers
             for peer in availablePeers {
-                peer.startBlockListener()
+                if await !peer.isDispatcherActive {
+                    peer.startBlockListener()
+                }
             }
-            // Wait for at least one dispatcher to activate (up to 5s)
+            // FIX #1285: Wait for MULTIPLE dispatchers (not just one).
+            // FIX #1205 original: broke on first active → 1/5 peers active → 20% blocks.
+            // Now: wait until at least 3 dispatchers activate OR 5s timeout.
+            let minDispatchers = min(3, availablePeers.count)
             for i in 0..<50 {
                 try await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                var activated = false
+                var activeCount = 0
                 for peer in availablePeers {
                     if await peer.isDispatcherActive {
-                        activated = true
-                        break
+                        activeCount += 1
                     }
                 }
-                if activated {
-                    print("✅ FIX #1205: Dispatcher activated after \(Double(i + 1) * 0.1)s")
+                if activeCount >= minDispatchers {
+                    print("✅ FIX #1285: \(activeCount) dispatchers activated after \(Double(i + 1) * 0.1)s (needed \(minDispatchers))")
                     break
+                }
+                // FIX #1205 compat: log first activation
+                if i == 9 && activeCount > 0 && activeCount < minDispatchers {
+                    print("⏳ FIX #1285: \(activeCount)/\(minDispatchers) dispatchers after 1.0s — waiting for more...")
                 }
             }
         }
 
-        // FIX #1205: Skip peers with consecutive batch failures (dead peers waste 30s timeout)
-        // FIX #1208: Ensure at least 3 peers remain after filtering.
-        // FIX #1216: Reduced threshold from 2 to 1 — a single timeout (30s wasted) is enough
+        // FIX #1205: Skip peers with consecutive batch failures (dead peers waste 15s timeout)
+        // FIX #1208: Ensure at least 2 peers remain after filtering.
+        // FIX #1216: Reduced threshold from 2 to 1 — a single timeout (15s wasted) is enough
         // to skip the peer. On macOS, peer 77.110.103.38 timed out in BOTH FIX #571 and FIX #1089,
         // wasting 60s total. With threshold=1, the second call skips it immediately.
-        let minPeersToKeep = 3
+        // FIX #1287: Reduced minPeersToKeep from 3 to 2. With 3, FIX #1208 kept resurrecting
+        // dead peers when only 2 dispatcher-active were reliable: dead peer fails → excluded →
+        // "need 3" → given another chance → counter reset → selected again → 15s timeout → repeat.
+        // 2 working peers (256 blocks/round, ~500+ blocks/sec) >> 2 working + 1 dead (17 blocks/sec).
+        let minPeersToKeep = 2
         let reliablePeers = availablePeers.filter { $0.consecutiveBatchFailures < 1 }
         if reliablePeers.count >= minPeersToKeep {
             // Enough reliable peers — skip the bad ones
@@ -7018,93 +7077,140 @@ public final class NetworkManager: ObservableObject {
             print("🔄 FIX #1208: Kept \(peersToKeep.count) peers (min \(minPeersToKeep) needed for parallel fetching)")
         }
 
-        // FIX #712: Use P2P protocol limit of 160 blocks per request for efficiency
-        // Previous bug: Split 500 blocks across 13 peers = ~39 blocks each (slow, many small requests)
-        // Fix: Each peer gets up to 160 blocks, only use as many peers as needed
-        // FIX #928: MAX_BLOCKS_IN_TRANSIT_PER_PEER = 128 (from Zclassic main.h)
-        let maxBlocksPerPeer = 128
-        let peersNeeded = (count + maxBlocksPerPeer - 1) / maxBlocksPerPeer  // Ceiling division
-        let actualPeerCount = min(peersNeeded, availablePeers.count)
-        // FIX #928: CRITICAL - Cap blocksPerPeer at 160 (P2P protocol limit)
-        // Bug: With 500 blocks and 3 peers, blocksPerPeer was 167 (exceeds limit!)
-        // Peers can only return 160 blocks max per request - excess blocks were lost
-        let blocksPerPeer = min(maxBlocksPerPeer, (count + actualPeerCount - 1) / actualPeerCount)
+        // FIX #1285: Filter to dispatcher-active peers BEFORE assigning block ranges.
+        // FIX #1205 starts block listeners and waits for ANY one dispatcher to activate,
+        // but then assigns blocks to ALL availablePeers — including those whose dispatcher
+        // never activated. Those peers return 0 blocks instantly (FIX #1184 fast-return),
+        // wasting their assigned range. Log evidence: 4/5 peers return 0/128 in 0.0s,
+        // only 1 peer delivers → 128/640 = 20% → below FIX #1218 50% threshold.
+        var dispatcherActivePeers: [Peer] = []
+        for peer in availablePeers {
+            if await peer.isDispatcherActive {
+                dispatcherActivePeers.append(peer)
+            }
+        }
+        if !dispatcherActivePeers.isEmpty {
+            if dispatcherActivePeers.count < availablePeers.count {
+                print("📡 FIX #1285: Filtered to \(dispatcherActivePeers.count)/\(availablePeers.count) dispatcher-active peers")
+            }
+            availablePeers = dispatcherActivePeers
+        } else {
+            // No dispatcher-active peers at all — keep all peers and let fetchBlockBatchP2P
+            // handle per-peer failures. getBlocksByHashes will return empty for inactive ones.
+            print("⚠️ FIX #1285: No dispatcher-active peers found — using all \(availablePeers.count) peers")
+        }
+
+        // FIX #1287: Shuffle peers before selection so the same slow peer isn't always picked.
+        // Without shuffle, prefix(3) always takes the first 3 peers in array order,
+        // which may consistently include the slowest peer (e.g., 140.174.189.3 at 280 blocks/sec
+        // instead of peers at 1400+ blocks/sec).
+        availablePeers.shuffle()
+
+        // FIX #1287: Continuous per-peer streaming (Bitcoin Core-inspired).
+        // OLD: Round-based — static ranges per peer, wait for ALL to finish → idle gaps → TCP collapse.
+        // NEW: Shared queue of 32-block chunks. Each peer grabs and fetches continuously.
+        //      Smaller chunks = less data in-flight = TCP windows stay manageable.
+        //      128-block chunks × 4 peers = 512 blocks in-flight → TCP saturation → 773→17 blocks/sec.
+        //      32-block chunks × 4 peers = 128 blocks in-flight → within TCP limits.
+        //      Bitcoin Core uses 16 blocks/peer — 32 is a good middle ground.
+        let chunkSize = 32  // Small chunks prevent TCP window bloat
+        let numChunks = (count + chunkSize - 1) / chunkSize
+        let actualPeerCount = min(numChunks, availablePeers.count)  // Use ALL available peers
 
         // Check if block hashes are available for this range
         let bundledAvailable = BundledBlockHashes.shared.isLoaded && BundledBlockHashes.shared.contains(height: height)
         let headerStoreAvailable = (try? HeaderStore.shared.getHeader(at: height)) != nil
 
         debugLog(.network, "🚀 P2P fetch: \(count) blocks from height \(height), \(availablePeers.count) ready peers, bundled=\(bundledAvailable), headers=\(headerStoreAvailable)")
-        print("🚀 FIX #712: P2P fetch \(count) blocks using \(actualPeerCount) peers (~\(blocksPerPeer) blocks each, max 128)")
+        print("🚀 FIX #1287: Streaming fetch \(count) blocks (\(numChunks) chunks) using \(actualPeerCount) peers")
         let startTime = Date()
 
-        // Each peer gets a DISJOINT range of blocks
-        // Peer 0: [height, height + blocksPerPeer)
-        // Peer 1: [height + blocksPerPeer, height + 2*blocksPerPeer)
-        // etc.
+        // FIX #1287: Shared work queue — each peer grabs chunks continuously, no round boundaries.
+        // Eliminates idle gaps that caused TCP congestion window collapse (1500→100 blocks/sec).
+        actor BlockFetchQueue {
+            private var nextHeight: UInt64
+            private let endHeight: UInt64
+            init(start: UInt64, totalCount: Int) {
+                self.nextHeight = start
+                self.endHeight = start + UInt64(totalCount)
+            }
+            func nextChunk(size: Int) -> (UInt64, Int)? {
+                guard nextHeight < endHeight else { return nil }
+                let count = min(size, Int(endHeight - nextHeight))
+                let start = nextHeight
+                nextHeight += UInt64(count)
+                return (start, count)
+            }
+        }
+        let fetchQueue = BlockFetchQueue(start: height, totalCount: count)
+
         let results = await withTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
             var collected: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
-            // FIX #712: Only use as many peers as needed (not all available peers)
-            for (peerIndex, peer) in availablePeers.prefix(actualPeerCount).enumerated() {
-                let rangeStart = height + UInt64(peerIndex * blocksPerPeer)
-                let rangeEnd = min(rangeStart + UInt64(blocksPerPeer), height + UInt64(count))
-
-                // FIX #498: Check if rangeStart is out of bounds BEFORE subtraction
-                // Prevents UInt64 underflow crash when rangeStart >= rangeEnd
-                if rangeStart >= height + UInt64(count) {
-                    break  // No more blocks to fetch
-                }
-
-                let rangeCount = Int(rangeEnd - rangeStart)
-
-                if rangeCount <= 0 { break }
-
+            // FIX #1315: Each peer runs a continuous fetch loop with ADAPTIVE TCP PACING
+            // Without pacing: peers fire getdata as fast as chunks complete → TCP send buffer
+            // saturation → kernel drops packets → retransmits → throughput collapses (1000→12 blocks/sec)
+            // With pacing: small inter-chunk delay prevents buffer overflow, maintains steady throughput
+            for peer in availablePeers.prefix(actualPeerCount) {
                 group.addTask {
-                    // FIX #713: Per-peer timeout to prevent one slow peer from blocking all
-                    // FIX #1217: Adaptive per-peer timeout based on block count.
-                    // Batch dispatcher timeout is already adaptive (5-15s), but this outer
-                    // timeout must be slightly longer to allow batch timeout to fire first.
-                    // ≤10 blocks → 8s, ≤50 → 13s, >50 → 20s.
+                    var peerResults: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
+                    var consecutiveChunkFailures = 0
                     let peerHost = peer.host
-                    let peerTimeout: UInt64 = rangeCount <= 10 ? 8_000_000_000 : (rangeCount <= 50 ? 13_000_000_000 : 20_000_000_000)
+                    var chunksHandled = 0
 
-                    // FIX #912: Use actor to safely track if data arrived before timeout
-                    // Previous bug: timeout message printed even when peer succeeded
-                    actor TimeoutTracker {
-                        var dataArrived = false
-                        func markDataArrived() { dataArrived = true }
-                        func didDataArrive() -> Bool { return dataArrived }
-                    }
-                    let tracker = TimeoutTracker()
+                    // FIX #1315: Adaptive pacing state per peer
+                    // Start at 0ms (cold start), ramp up on failures, ramp down on success
+                    var pacingDelayMs: UInt64 = 0
+                    var consecutiveFullChunks = 0
 
-                    return await withTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { innerGroup in
-                        innerGroup.addTask {
-                            let result = await self.fetchBlockBatchP2P(peer: peer, startHeight: rangeStart, count: rangeCount)
-                            await tracker.markDataArrived()
-                            return result
+                    while let (chunkStart, chunkCount) = await fetchQueue.nextChunk(size: chunkSize) {
+                        if Task.isCancelled { break }
+
+                        // FIX #1315: Apply pacing delay BEFORE each request (except first)
+                        if chunksHandled > 0 && pacingDelayMs > 0 {
+                            try? await Task.sleep(nanoseconds: pacingDelayMs * 1_000_000)
                         }
 
-                        innerGroup.addTask {
-                            try? await Task.sleep(nanoseconds: peerTimeout)
-                            // FIX #912: Only log timeout if data didn't arrive first
-                            if await !tracker.didDataArrive() {
-                                print("⚠️ FIX #713: Peer \(peerHost) timed out after 20s")
+                        if let blocks = await self.fetchBlockBatchP2P(peer: peer, startHeight: chunkStart, count: chunkCount) {
+                            peerResults.append(contentsOf: blocks)
+                            consecutiveChunkFailures = 0
+
+                            // FIX #1315: Adaptive pacing — adjust based on chunk completeness
+                            if blocks.count >= chunkCount {
+                                // Full chunk received — peer is healthy
+                                consecutiveFullChunks += 1
+                                if consecutiveFullChunks >= 3 && pacingDelayMs > 0 {
+                                    // 3 consecutive full chunks — decrease delay (min 0)
+                                    pacingDelayMs = pacingDelayMs > 25 ? pacingDelayMs - 25 : 0
+                                    consecutiveFullChunks = 0
+                                }
+                            } else {
+                                // Partial chunk — peer is struggling, increase delay
+                                pacingDelayMs = min(pacingDelayMs + 50, 500)
+                                consecutiveFullChunks = 0
                             }
-                            return nil
+                        } else {
+                            consecutiveChunkFailures += 1
+                            consecutiveFullChunks = 0
+                            // Chunk failed — significant backoff
+                            pacingDelayMs = min(pacingDelayMs + 100, 500)
+                            if consecutiveChunkFailures >= 3 {
+                                print("⚠️ FIX #1287: [\(peerHost)] 3 consecutive chunk failures — stopping peer")
+                                break
+                            }
                         }
-
-                        // Return whichever completes first
-                        if let result = await innerGroup.next() {
-                            innerGroup.cancelAll()
-                            return result
-                        }
-                        return nil
+                        chunksHandled += 1
                     }
+
+                    if !peerResults.isEmpty {
+                        let avgDelay = pacingDelayMs
+                        print("📊 FIX #1287: [\(peerHost)] delivered \(peerResults.count) blocks in \(chunksHandled) chunks (final pacing: \(avgDelay)ms)")
+                    }
+                    return peerResults.isEmpty ? nil : peerResults
                 }
             }
 
-            // Collect results from all peers (each with its own timeout)
+            // Collect results from all peers
             for await result in group {
                 if let blocks = result {
                     collected.append(contentsOf: blocks)
@@ -7117,18 +7223,13 @@ public final class NetworkManager: ObservableObject {
         let elapsed = Date().timeIntervalSince(startTime)
         let rate = Double(results.count) / max(elapsed, 0.001)
 
-        // FIX #1218: Raised threshold from 10% to 50%.
-        // Previous bug: 10% threshold meant 11/100 blocks = "success". Callers would
-        // advance their height cursor to batchEnd+1, permanently skipping the other 89 blocks.
-        // Over 16,693 blocks, this cascaded into only 1 CMU fetched instead of ~5,800.
-        // 50% is strict enough to catch massive P2P failures while still tolerating
-        // blocks with no shielded outputs (which are common on Zclassic).
+        // FIX #1218: 50% threshold — catch massive P2P failures
         if results.count < count / 2 {
             print("⚠️ FIX #1218: P2P fetch incomplete: only got \(results.count)/\(count) blocks (\(String(format: "%.0f", Double(results.count) / Double(count) * 100))%) in \(String(format: "%.1f", elapsed))s")
             throw NetworkError.p2pFetchFailed
         }
 
-        print("✅ P2P parallel fetch complete: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
+        print("✅ FIX #1287: Streaming fetch: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
 
         // Sort by height to maintain order
         return results.sorted { $0.0 < $1.0 }
@@ -7149,12 +7250,17 @@ public final class NetworkManager: ObservableObject {
         let maxP2PBlocks = 128
         let effectiveCount = min(count, maxP2PBlocks)
 
+        // FIX #1287: Batch header lookup — single SQL query instead of 128 individual queries
+        // Each getHeader(at:) was doing SELECT with 11 columns (including 400-byte solution blob)
+        // New: SELECT only height + block_hash for the entire range in one query
+        let headerHashes = (try? HeaderStore.shared.getBlockHashesInRange(from: startHeight, count: effectiveCount)) ?? [:]
+
         for i in 0..<effectiveCount {
             let height = startHeight + UInt64(i)
 
-            // First try HeaderStore (synced headers from P2P)
-            if let header = try? HeaderStore.shared.getHeader(at: height) {
-                blockHashes.append((height, header.blockHash))
+            // First try HeaderStore batch results
+            if let hash = headerHashes[height] {
+                blockHashes.append((height, hash))
                 headerStoreCount += 1
             }
             // Then try BundledBlockHashes (for historical blocks)
@@ -7335,12 +7441,15 @@ public final class NetworkManager: ObservableObject {
 
         var results: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])] = []
 
+        // FIX #1287: Collect sapling roots for batch write (was per-block → 128 individual SQLite writes + file I/Os)
+        var saplingRootsDict: [UInt64: Data] = [:]
+        var saplingRootEntries: [(height: UInt64, root: Data)] = []
+
         for (blockHeight, compactBlock) in blocks {
-            // FIX #1204: Save finalsaplingroot to HeaderStore for anchor validation
+            // Collect sapling roots for batch write below
             if !compactBlock.finalSaplingRoot.isEmpty && !compactBlock.finalSaplingRoot.allSatisfy({ $0 == 0 }) {
-                try? HeaderStore.shared.updateSaplingRoot(at: blockHeight, root: compactBlock.finalSaplingRoot, timestamp: compactBlock.time)
-                // FIX #1253: Also save to delta sapling roots (survives missing header rows)
-                DeltaCMUManager.shared.appendSaplingRoot(height: blockHeight, root: compactBlock.finalSaplingRoot)
+                saplingRootsDict[blockHeight] = compactBlock.finalSaplingRoot
+                saplingRootEntries.append((height: blockHeight, root: compactBlock.finalSaplingRoot))
             }
 
             let finalBlockHash = compactBlock.blockHash.map { String(format: "%02x", $0) }.joined()
@@ -7390,6 +7499,14 @@ public final class NetworkManager: ObservableObject {
             }
 
             results.append((blockHeight, finalBlockHash, blockTimestamp, txDataList))
+        }
+
+        // FIX #1287: Batch write sapling roots — 1 SQL transaction + 1 file I/O instead of N per-block ops
+        // FIX #1204: Save finalsaplingroot to HeaderStore for anchor validation
+        if !saplingRootsDict.isEmpty {
+            try? HeaderStore.shared.updateSaplingRoots(saplingRootsDict)
+            // FIX #1253: Also save to delta sapling roots (survives missing header rows)
+            DeltaCMUManager.shared.appendSaplingRootsBatch(saplingRootEntries)
         }
 
         return results
@@ -7663,8 +7780,11 @@ public final class NetworkManager: ObservableObject {
             DispatchQueue.main.async {
                 // BUGFIX: Only count peers with READY connections, not all peers in array
                 let readyPeers = self.peers.filter { $0.isConnectionReady }
-                self.connectedPeers = readyPeers.count
-                self.isConnected = readyPeers.count > 0
+                let newCount = readyPeers.count
+                let newConnected = newCount > 0
+                // CPU OPTIMIZATION: only update @Published if value changed
+                if self.connectedPeers != newCount { self.connectedPeers = newCount }
+                if self.isConnected != newConnected { self.isConnected = newConnected }
             }
         }
     }
@@ -7715,10 +7835,11 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        // Update published state
+        // Update published state (CPU OPTIMIZATION: only if changed)
         DispatchQueue.main.async {
-            self.connectedPeers = readyCount
-            self.isConnected = readyCount > 0
+            let newConnected = readyCount > 0
+            if self.connectedPeers != readyCount { self.connectedPeers = readyCount }
+            if self.isConnected != newConnected { self.isConnected = newConnected }
         }
     }
 
@@ -7995,11 +8116,13 @@ public final class NetworkManager: ObservableObject {
             PeerManager.shared.syncPeers(self.peers)
         }
 
-        // Update UI
+        // Update UI (CPU OPTIMIZATION: only if values changed)
         DispatchQueue.main.async {
             let readyPeers = self.peers.filter { $0.isConnectionReady }
-            self.connectedPeers = readyPeers.count
-            self.isConnected = readyPeers.count > 0
+            let newCount = readyPeers.count
+            let newConnected = newCount > 0
+            if self.connectedPeers != newCount { self.connectedPeers = newCount }
+            if self.isConnected != newConnected { self.isConnected = newConnected }
         }
     }
 
@@ -8080,29 +8203,12 @@ public final class NetworkManager: ObservableObject {
     private let CONNECTION_HEALTH_CHECK_INTERVAL: TimeInterval = 30  // Every 30 seconds
 
     private func setupConnectionHealthMonitoring() {
-        // Cancel any existing timer task
+        // CPU OPTIMIZATION: Disabled duplicate timer — keepalive timer (FIX #246) now handles
+        // Tor SOCKS5 health check + updatePeerCountsForSettings() at end of performKeepalivePing().
+        // Both fired every 30s doing the same work (ping peers, update counts, trigger recovery).
         connectionHealthTimerTask?.cancel()
-
-        print("🔍 [HEALTH] Starting connection health timer (interval: \(CONNECTION_HEALTH_CHECK_INTERVAL)s)")
-
-        // Create new Task-based timer (more reliable than Timer.scheduledTimer)
-        connectionHealthTimerTask = Task { @MainActor in
-            print("🔍 [HEALTH] Timer task started, will run every \(CONNECTION_HEALTH_CHECK_INTERVAL)s")
-            var iteration = 0
-            while !Task.isCancelled {
-                iteration += 1
-                try? await Task.sleep(nanoseconds: UInt64(CONNECTION_HEALTH_CHECK_INTERVAL * 1_000_000_000))
-                if !Task.isCancelled {
-                    // FIX #1273: Suppress log noise when not authenticated
-                    if BiometricAuthManager.shared.hasAuthenticatedThisSession {
-                        print("🔍 [HEALTH] Timer iteration \(iteration) — checking health...")
-                    }
-                    await checkConnectionHealth()
-                }
-            }
-            print("🔍 [HEALTH] Timer task ended (cancelled)")
-        }
-        debugLog(.network, "💓 Connection health monitoring started (every \(CONNECTION_HEALTH_CHECK_INTERVAL)s)")
+        connectionHealthTimerTask = nil
+        debugLog(.network, "💓 Connection health monitoring merged into keepalive timer (CPU optimization)")
     }
 
     /// Stop connection health monitoring
@@ -8504,11 +8610,23 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        // Update UI
+        // Update UI (CPU OPTIMIZATION: only if values changed)
         DispatchQueue.main.async {
             let currentReady = self.peers.filter { $0.isConnectionReady }
-            self.connectedPeers = currentReady.count
-            self.isConnected = currentReady.count > 0
+            let newCount = currentReady.count
+            let newConnected = newCount > 0
+            if self.connectedPeers != newCount { self.connectedPeers = newCount }
+            if self.isConnected != newConnected { self.isConnected = newConnected }
+        }
+
+        // Merge from connection health timer: update settings counts + Tor health
+        updatePeerCountsForSettings()
+        let torMode = await TorManager.shared.mode
+        if torMode == .enabled {
+            let torHealthy = await TorManager.shared.checkSOCKS5Health()
+            if !torHealthy {
+                debugLog(.network, "⚠️ Tor SOCKS5 health check failed during keepalive")
+            }
         }
     }
 
@@ -8661,10 +8779,12 @@ public final class NetworkManager: ObservableObject {
             }
             debugLog(.network, "✅ FIX #246: [\(host)] Reconnected successfully")
 
-            // Update UI
+            // Update UI (CPU OPTIMIZATION: only if changed)
             DispatchQueue.main.async {
-                self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
-                self.isConnected = self.connectedPeers > 0
+                let newCount = self.peers.filter { $0.isConnectionReady }.count
+                if self.connectedPeers != newCount { self.connectedPeers = newCount }
+                let newConnected = newCount > 0
+                if self.isConnected != newConnected { self.isConnected = newConnected }
             }
         } catch {
             debugLog(.network, "❌ FIX #246: [\(host)] Reconnection failed: \(error.localizedDescription)")

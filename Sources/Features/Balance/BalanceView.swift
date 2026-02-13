@@ -48,7 +48,8 @@ struct BalanceView: View {
 
     // Blinking state for "Synced" indicator when syncing in progress
     @State private var syncedTextVisible: Bool = true
-    private let blinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+    // CPU OPTIMIZATION: Was 0.5s (2 re-renders/sec), now 1.0s (1 re-render/sec)
+    private let blinkTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
@@ -874,15 +875,20 @@ struct BalanceView: View {
 
     /// Get real block timestamp from HeaderStore
     /// NEVER estimate - only use actual blockchain timestamps!
+    // Cached DateFormatter — avoid per-call creation (ICU init is expensive)
+    private static let shortDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f
+    }()
+
     private func realBlockDateString(for height: UInt64) -> String {
         // Get real timestamp from HeaderStore (contains blockchain unix timestamps)
         if height > 0 {
             if let blockTime = try? HeaderStore.shared.getBlockTime(at: height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
-                let formatter = DateFormatter()
-                formatter.dateStyle = .short
-                formatter.timeStyle = .short
-                return formatter.string(from: date)
+                return Self.shortDateFormatter.string(from: date)
             }
         }
 

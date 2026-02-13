@@ -1356,6 +1356,9 @@ public final class Peer {
         tcpOptions.keepaliveCount = 2      // Allow 2 missed probes before disconnect (was 4)
         // Total timeout before disconnect: 15s * 2 = 30s (down from 120s)
         tcpOptions.connectionTimeout = 15  // 15 second connection timeout
+        // FIX #1287: Disable Nagle's algorithm — send getdata requests immediately.
+        // Without this, small writes are buffered up to 200ms. Bitcoin Core sets this on all peers.
+        tcpOptions.noDelay = true
 
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         // Don't restrict to wifi - allow any network interface

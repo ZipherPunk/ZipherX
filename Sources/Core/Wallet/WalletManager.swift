@@ -291,6 +291,12 @@ final class WalletManager: ObservableObject {
         overallProgress = 1.0
         currentProgressPhase = .complete
     }
+
+    /// FIX #1283: Set progress directly for verification phase (allows backward movement)
+    @MainActor
+    func setVerificationProgress(_ progress: Double) {
+        overallProgress = max(0.0, min(1.0, progress))
+    }
     @Published private(set) var transactionHistoryVersion: Int = 0  // Increments when tx history changes
 
     /// Timestamp of last sent transaction - used to suppress fireworks for change outputs
@@ -452,6 +458,13 @@ final class WalletManager: ObservableObject {
     /// 2. Tree root matches HeaderStore at delta end height
     /// 3. Delta is up-to-date with current chain height (syncs if behind)
     private func validateAndSyncDeltaBundle() async {
+        // FIX #1290: Skip entire delta validation/sync during Full Rescan
+        let isRepairing = await MainActor.run { WalletManager.shared.isRepairingDatabase }
+        if isRepairing {
+            print("⏩ FIX #1290: Skipping delta validation — Full Rescan in progress")
+            return
+        }
+
         print("📦 Validating delta bundle...")
 
         // FIX #1253: Load delta sapling roots into in-memory cache FIRST.
@@ -507,16 +520,58 @@ final class WalletManager: ObservableObject {
         // If corrupted: user runs Full Resync. No automatic repair loops.
         let deltaVerified = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
         if deltaVerified {
-            print("✅ FIX #1252: Delta bundle VERIFIED — skipping validation/gap-fill (immutable like boost)")
-            print("   Only appending new blocks from chain tip...")
-            await syncDeltaBundleIfNeeded(manifest: manifest, bundledEndHeight: bundledEndHeight)
-            return
+            // FIX #1303: Sanity check — verify tree root still matches blockchain.
+            // An incomplete delta (<50% P2P coverage) can get marked verified when
+            // HeaderStore root was missing/zero at validation time (trusts FFI root blindly).
+            // If root mismatches now, unverify and fall through to gap-fill/rebuild.
+            let rootStillValid = await deltaManager.validateTreeRootAgainstHeaders()
+            if rootStillValid {
+                print("✅ FIX #1252: Delta bundle VERIFIED — skipping validation/gap-fill (immutable like boost)")
+                print("   Only appending new blocks from chain tip...")
+                await syncDeltaBundleIfNeeded(manifest: manifest, bundledEndHeight: bundledEndHeight)
+                return
+            } else {
+                print("🚨 FIX #1303: Verified delta has WRONG tree root — incomplete P2P data!")
+                print("🚨 FIX #1303: Clearing DeltaBundleVerified — will gap-fill to fix tree root")
+                UserDefaults.standard.set(false, forKey: "DeltaBundleVerified")
+                // Fall through to line 530+ validation/gap-fill logic
+            }
         }
 
         // Delta NOT yet verified — run full validation (first build or recovery)
         print("📦 FIX #1252: Delta not yet verified — running full validation...")
 
-        // 2. Validate tree root against HeaderStore (optional - only if headers available)
+        // FIX #1306: Ensure HeaderStore has the header at delta endHeight BEFORE validation.
+        // Without this: HeaderStore lags behind delta tip → validateTreeRootAgainstHeaders returns true
+        // (no header = skip = "pass") → delta marked VERIFIED with wrong tree root → incremental sync
+        // also fails (HeaderStore missing blocks) → tree root mismatch → CRITICAL on every restart.
+        let deltaEndHeight = manifest.endHeight
+        do {
+            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if headerStoreHeight < deltaEndHeight {
+                let headerGap = deltaEndHeight - headerStoreHeight
+                print("🔄 FIX #1306: HeaderStore at \(headerStoreHeight), delta at \(deltaEndHeight) — syncing \(headerGap) headers for validation")
+                // Wait for peers first
+                var readyPeers = 0
+                for attempt in 1...10 {
+                    readyPeers = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
+                    if readyPeers >= 2 { break }
+                    if attempt == 10 { print("⚠️ FIX #1306: Only \(readyPeers) peers — proceeding anyway") }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+                let syncManager = HeaderSyncManager(
+                    headerStore: HeaderStore.shared,
+                    networkManager: NetworkManager.shared
+                )
+                try await syncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headerGap + 50)
+                let newHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                print("✅ FIX #1306: Header sync complete — HeaderStore now at \(newHeight)")
+            }
+        } catch {
+            print("⚠️ FIX #1306: Pre-validation header sync failed: \(error)")
+        }
+
+        // 2. Validate tree root against HeaderStore
         let rootValid = await deltaManager.validateTreeRootAgainstHeaders()
         if !rootValid {
             // FIX #1220: Gap-fill instead of clearing delta!
@@ -541,6 +596,13 @@ final class WalletManager: ObservableObject {
     /// Sync delta bundle if it's behind the current chain height
     /// Fetches missing shielded outputs via P2P and appends to delta
     private func syncDeltaBundleIfNeeded(manifest: DeltaCMUManager.DeltaManifest, bundledEndHeight: UInt64) async {
+        // FIX #1290: Skip delta sync during Full Rescan — FilterScanner handles everything
+        let isRepairing = await MainActor.run { WalletManager.shared.isRepairingDatabase }
+        if isRepairing {
+            print("⏩ FIX #1290: Skipping delta sync — Full Rescan in progress")
+            return
+        }
+
         // Get current chain height
         var chainHeight: UInt64
         do {
@@ -638,11 +700,29 @@ final class WalletManager: ObservableObject {
             // Fetch blocks in batches
             // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
             let peerCountFetch = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-            let batchSize: UInt64 = UInt64(max(peerCountFetch, 2) * 128)  // e.g., 7 peers × 128 = 896
+            // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+            let batchSize: UInt64 = UInt64(max(peerCountFetch, 3) * 256)
+            // FIX #1306: Sync headers to chainHeight BEFORE fetching blocks (same fix as gap-fill).
+            // Without this: HeaderStore at delta tip, chain advanced → blocks beyond HeaderStore fail
+            // ("HeaderStore missing blocks X-Y") → 0% coverage → abort → tree root still wrong.
+            var headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if headerStoreHeight < chainHeight {
+                let headerGap = chainHeight - headerStoreHeight
+                print("🔄 FIX #1306: HeaderStore behind by \(headerGap) headers — syncing before incremental delta fetch")
+                do {
+                    let syncManager = HeaderSyncManager(
+                        headerStore: HeaderStore.shared,
+                        networkManager: NetworkManager.shared
+                    )
+                    try await syncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headerGap + 10)
+                    headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? headerStoreHeight
+                    print("✅ FIX #1306: Header sync complete — HeaderStore now at \(headerStoreHeight)")
+                } catch {
+                    print("⚠️ FIX #1306: Header sync failed: \(error) — will cap to HeaderStore height")
+                }
+            }
+
             // FIX #1262: Don't try to fetch blocks that HeaderStore doesn't have headers for.
-            // Delta sync runs before header sync — HeaderStore may be behind chain tip.
-            // FIX #1234 rejects fetches without headers anyway, but this prevents wasted P2P attempts.
-            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
             if chainHeight > headerStoreHeight && headerStoreHeight > deltaEndHeight {
                 print("📊 FIX #1262: Capping delta sync to HeaderStore height \(headerStoreHeight) (chain tip: \(chainHeight))")
                 chainHeight = headerStoreHeight
@@ -687,16 +767,16 @@ final class WalletManager: ObservableObject {
                     var blockOutputIndex: UInt32 = 0
                     for (_, outputs, _) in txData {
                         for output in outputs {
-                            if let cmuDisplay = Data(hexString: output.cmu),
-                               let epkDisplay = Data(hexString: output.ephemeralKey),
-                               let encCiphertext = Data(hexString: output.encCiphertext),
-                               encCiphertext.count == 580 {
+                            // FIX #1311: ALWAYS store delta entry when CMU is valid
+                            if let cmuDisplay = Data(hexString: output.cmu) {
+                                let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                 let deltaOutput = DeltaCMUManager.DeltaOutput(
                                     height: UInt32(height),
                                     index: blockOutputIndex,
                                     cmu: Data(cmuDisplay.reversed()),
-                                    epk: Data(epkDisplay.reversed()),
-                                    ciphertext: encCiphertext
+                                    epk: epk,
+                                    ciphertext: ciphertext
                                 )
                                 collectedOutputs.append(deltaOutput)
                             }
@@ -929,6 +1009,39 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #1306: Sync headers to chainHeight BEFORE fetching blocks.
+        // getBlocksDataP2P needs block hashes from HeaderStore to construct getdata messages.
+        // If HeaderStore is behind chainHeight, blocks beyond HeaderStore are silently skipped
+        // ("HeaderStore missing blocks X-Y — skipping batch") → tree root mismatch → CRITICAL.
+        // This broke EVERY gap-fill when chain advanced past HeaderStore during app downtime.
+        do {
+            let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if headerStoreHeight < chainHeight {
+                let headerGap = chainHeight - headerStoreHeight
+                print("🔄 FIX #1306: HeaderStore behind by \(headerGap) headers (\(headerStoreHeight) → \(chainHeight))")
+                print("   Syncing headers BEFORE gap-fill block fetch (required for getdata messages)")
+                // Temporarily disable isGapFillingDelta — syncHeaders() checks this flag and refuses
+                // to run during gap-fill (FIX #1220 guard at HeaderSyncManager line 52).
+                // But we NEED headers before gap-fill can fetch blocks. This is safe because:
+                // 1. We're the only code running gap-fill (flag prevents concurrent gap-fills)
+                // 2. syncHeaders stops/restarts block listeners, but we restart dispatchers after
+                // 3. The gap-fill flag is re-set immediately after header sync completes
+                await MainActor.run { self.isGapFillingDelta = false }
+                let syncManager = HeaderSyncManager(
+                    headerStore: HeaderStore.shared,
+                    networkManager: NetworkManager.shared
+                )
+                try await syncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headerGap + 10)
+                await MainActor.run { self.isGapFillingDelta = true }
+                let newHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                print("✅ FIX #1306: Header sync complete — HeaderStore now at \(newHeaderHeight)")
+            }
+        } catch {
+            // Re-set the flag in case header sync threw before we could restore it
+            await MainActor.run { self.isGapFillingDelta = true }
+            print("⚠️ FIX #1306: Header sync failed: \(error) — gap-fill will proceed with partial coverage")
+        }
+
         let startHeight = manifest.startHeight
         let totalBlocksNeeded = chainHeight - startHeight + 1
         print("📦 FIX #1220: Re-fetching \(totalBlocksNeeded) blocks (\(startHeight)-\(chainHeight)) via dispatcher...")
@@ -940,7 +1053,8 @@ final class WalletManager: ObservableObject {
             // Direct reads use withExclusiveAccess which conflicts with block listeners.
             // Dispatcher path is lock-free at 300+ blocks/sec (FIX #1184).
             let peerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-            let batchSize: UInt64 = UInt64(max(peerCount, 2) * 128)
+            // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+            let batchSize: UInt64 = UInt64(max(peerCount, 3) * 256)
             var currentStart = startHeight
             var totalReceivedBlocks: UInt64 = 0
             var consecutiveEmptyBatches = 0
@@ -976,16 +1090,16 @@ final class WalletManager: ObservableObject {
                     var blockOutputIndex: UInt32 = 0
                     for (_, outputs, _) in txData {
                         for output in outputs {
-                            if let cmuDisplay = Data(hexString: output.cmu),
-                               let epkDisplay = Data(hexString: output.ephemeralKey),
-                               let encCiphertext = Data(hexString: output.encCiphertext),
-                               encCiphertext.count == 580 {
+                            // FIX #1311: ALWAYS store delta entry when CMU is valid
+                            if let cmuDisplay = Data(hexString: output.cmu) {
+                                let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                 let deltaOutput = DeltaCMUManager.DeltaOutput(
                                     height: UInt32(height),
                                     index: blockOutputIndex,
                                     cmu: Data(cmuDisplay.reversed()),
-                                    epk: Data(epkDisplay.reversed()),
-                                    ciphertext: encCiphertext
+                                    epk: epk,
+                                    ciphertext: ciphertext
                                 )
                                 collectedOutputs.append(deltaOutput)
                             }
@@ -1058,16 +1172,16 @@ final class WalletManager: ObservableObject {
                             var blockOutputIndex: UInt32 = 0
                             for (_, outputs, _) in txData {
                                 for output in outputs {
-                                    if let cmuDisplay = Data(hexString: output.cmu),
-                                       let epkDisplay = Data(hexString: output.ephemeralKey),
-                                       let encCiphertext = Data(hexString: output.encCiphertext),
-                                       encCiphertext.count == 580 {
+                                    // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                    if let cmuDisplay = Data(hexString: output.cmu) {
+                                        let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                        let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                         let deltaOutput = DeltaCMUManager.DeltaOutput(
                                             height: UInt32(height),
                                             index: blockOutputIndex,
                                             cmu: Data(cmuDisplay.reversed()),
-                                            epk: Data(epkDisplay.reversed()),
-                                            ciphertext: encCiphertext
+                                            epk: epk,
+                                            ciphertext: ciphertext
                                         )
                                         collectedOutputs.append(deltaOutput)
                                     }
@@ -1216,16 +1330,16 @@ final class WalletManager: ObservableObject {
                                 var blockOutputIndex: UInt32 = 0
                                 for (_, outputs, _) in txData {
                                     for output in outputs {
-                                        if let cmuDisplay = Data(hexString: output.cmu),
-                                           let epkDisplay = Data(hexString: output.ephemeralKey),
-                                           let encCiphertext = Data(hexString: output.encCiphertext),
-                                           encCiphertext.count == 580 {
+                                        // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                        if let cmuDisplay = Data(hexString: output.cmu) {
+                                            let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                            let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                             let deltaOutput = DeltaCMUManager.DeltaOutput(
                                                 height: UInt32(height),
                                                 index: blockOutputIndex,
                                                 cmu: Data(cmuDisplay.reversed()),
-                                                epk: Data(epkDisplay.reversed()),
-                                                ciphertext: encCiphertext
+                                                epk: epk,
+                                                ciphertext: ciphertext
                                             )
                                             gapOutputs.append(deltaOutput)
                                         }
@@ -2338,11 +2452,12 @@ final class WalletManager: ObservableObject {
                         print("   Delta file: \(deltaCMUFileCount) CMUs")
                         print("   Expected:     \(expectedSizeWithDelta) CMUs (using max of manifest/file)")
                         print("   Missing:      \(-sizeDifference) CMUs")
-                        print("🔄 FIX #756: Clearing corrupted tree AND delta bundle...")
+                        // FIX #1309: Delta has valid blockchain data — preserve for gap-fill.
+                        // Only clear DB tree state (will reload from boost + preserved delta).
+                        print("📦 FIX #1309: Delta PRESERVED — clearing only DB tree state for reload")
                         // FIX #1210: Only clear tree state, keep witnesses (valid at historical anchors)
                         try? WalletDatabase.shared.clearTreeStateOnly()
-                        deltaManager.clearDeltaBundle()
-                        // Fall through to reload from GitHub
+                        // Fall through to reload from GitHub (boost + delta)
                     } else if sizeDifference > 10 {
                         // FIX #1090: Tree is OVER-sized - this is OK!
                         // Likely delta CMUs were fetched via P2P for witness rebuild but not persisted yet
@@ -2418,11 +2533,11 @@ final class WalletManager: ObservableObject {
                                     print("❌ FIX #790: Tree root doesn't match delta manifest!")
                                     print("   Tree root:     \(treeRoot.prefix(16).hexString)...")
                                     print("   Manifest root: \(manifestRootData.prefix(16).hexString)...")
-                                    print("🔄 FIX #790: DB tree is stale - clearing for rebuild...")
+                                    // FIX #1309: Delta has valid blockchain data — preserve for gap-fill.
+                                    print("📦 FIX #1309: Delta PRESERVED — clearing only DB tree state for reload")
                                     // FIX #1210: Only clear tree state, keep witnesses (valid at historical anchors)
                                     try? WalletDatabase.shared.clearTreeStateOnly()
-                                    deltaManager.clearDeltaBundle()
-                                    // Fall through to reload from boost file
+                                    // Fall through to reload from boost + preserved delta
                                 }
                             } else {
                                 print("⚠️ FIX #790: Invalid manifest root hex, falling back to header validation")
@@ -2439,10 +2554,10 @@ final class WalletManager: ObservableObject {
                                         print("❌ FIX #790: Tree root MISMATCH!")
                                         print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
                                         print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                                        print("🔄 FIX #790: Clearing corrupted tree AND delta bundle...")
+                                        // FIX #1309: Delta has valid blockchain data — preserve for gap-fill.
+                                        print("📦 FIX #1309: Delta PRESERVED — clearing only DB tree state for reload")
                                         // FIX #1210: Only clear tree state, keep witnesses (valid at historical anchors)
                                         try? WalletDatabase.shared.clearTreeStateOnly()
-                                        deltaManager.clearDeltaBundle()
                                     }
                                 }
                             }
@@ -2536,9 +2651,10 @@ final class WalletManager: ObservableObject {
                                                 print("❌ FIX #1204b: Delta tree root MISMATCH at height \(deltaManifest.endHeight)!")
                                                 print("   Tree root:   \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                                                 print("   Header root: \(headerRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                                                print("🗑️ FIX #1204b: Clearing corrupted delta bundle...")
-                                                DeltaCMUManager.shared.clearDeltaBundle()
-                                                break  // Exit delta load
+                                                // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                                // Preserve delta for gap-fill — clearing forces full re-fetch.
+                                                print("📦 FIX #1309: Delta PRESERVED — root mismatch = incomplete P2P data, gap-fill will fix")
+                                                break  // Exit delta load — tree will reload from boost only
                                             }
                                         } else {
                                             print("✅ FIX #1204b: HeaderStore root is zero at \(deltaManifest.endHeight) — trusting delta CMUs")
@@ -2566,10 +2682,11 @@ final class WalletManager: ObservableObject {
                                         print("❌ FIX #755: Tree root MISMATCH after delta load!")
                                         print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
                                         print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                                        print("🗑️ FIX #755/756: Clearing corrupted tree AND delta bundle...")
+                                        // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                        // Preserve delta for gap-fill — clearing forces full re-fetch.
+                                        print("📦 FIX #1309: Delta PRESERVED — root mismatch = incomplete, gap-fill will fix")
                                         // FIX #1210: Only clear tree state, keep witnesses (valid at historical anchors)
                                         try? WalletDatabase.shared.clearTreeStateOnly()
-                                        deltaManager.clearDeltaBundle()
                                         needsBoostReload = true
                                     }
                                 } else {
@@ -2873,8 +2990,11 @@ final class WalletManager: ObservableObject {
                                         print("❌ FIX #1204b: Delta tree root MISMATCH at height \(deltaManifest.endHeight) [boost path]!")
                                         print("   Tree root:   \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                                         print("   Header root: \(headerRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                                        print("🗑️ FIX #1204b: Clearing corrupted delta bundle...")
-                                        DeltaCMUManager.shared.clearDeltaBundle()
+                                        // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                        // Revert tree to boost-only, preserve delta for gap-fill.
+                                        print("📦 FIX #1309: Delta PRESERVED — reverting tree to boost-only")
+                                        ZipherXFFI.treeDeserialize(data: serializedData)
+                                        print("📦 FIX #1309: Tree reverted to \(ZipherXFFI.treeSize()) CMUs (boost only)")
                                         break
                                     }
                                 } else {
@@ -2902,8 +3022,11 @@ final class WalletManager: ObservableObject {
                                 print("❌ FIX #755: Tree root MISMATCH after delta load! (boost path)")
                                 print("   Tree root:   \(treeRoot.prefix(16).hexString)...")
                                 print("   Header root: \(headerRoot.prefix(16).hexString)...")
-                                print("🗑️ FIX #755: Clearing corrupted delta bundle - will trigger PHASE 2 rescan")
-                                deltaManager.clearDeltaBundle()
+                                // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                // Revert tree to boost-only, preserve delta for gap-fill.
+                                print("📦 FIX #1309: Delta PRESERVED — reverting tree to boost-only")
+                                ZipherXFFI.treeDeserialize(data: serializedData)
+                                print("📦 FIX #1309: Tree reverted to \(ZipherXFFI.treeSize()) CMUs (boost only)")
                                 await MainActor.run {
                                     self.pendingDeltaRescan = true
                                 }
@@ -3887,33 +4010,11 @@ final class WalletManager: ObservableObject {
                 await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
             }
 
-            // FIX #1280: Auto Full Rescan when phantom witnesses detected.
-            // preRebuildWitnessesForInstantPayment() sets this flag when witnesses have roots
-            // that don't match the verified FFI tree root (loaded from corrupted DB state).
-            // Automatically trigger Full Rescan to rebuild everything from scratch.
-            if await MainActor.run(body: { self.phantomWitnessAutoRescanNeeded }) {
-                await MainActor.run {
-                    self.phantomWitnessAutoRescanNeeded = false
-                    self.syncStatus = "Repairing corrupted witnesses..."
-                }
-                print("🔄 FIX #1280: AUTO FULL RESCAN — phantom witnesses detected")
-                print("🔄 FIX #1280: Witnesses had roots that don't match blockchain")
-                print("🔄 FIX #1280: Starting automatic Full Rescan to rebuild from correct tree...")
-
-                do {
-                    try await repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                        Task { @MainActor in
-                            self.syncStatus = "Repairing witnesses: \(Int(progress * 100))%"
-                            self.overallProgress = progress
-                        }
-                    }, forceFullRescan: true)
-                    print("✅ FIX #1280: Auto Full Rescan complete — witnesses rebuilt from correct tree")
-                } catch {
-                    print("❌ FIX #1280: Auto Full Rescan failed: \(error.localizedDescription)")
-                    print("   User should manually run Full Rescan from Settings")
-                }
-                return  // backgroundSync complete — Full Rescan handles everything
-            }
+            // FIX #1302: Auto Full Rescan REMOVED. Was FIX #1280's nuclear option that
+            // destroyed corrected balance by re-introducing phantom notes through Phase 2's
+            // partial batch cursor bug. Witnesses are NULLed (safe for balance display).
+            // They will be rebuilt on next preRebuildWitnessesForInstantPayment() call.
+            // Balance always correct via getTotalUnspentBalance() (ignores witness state).
 
             // FIX #1210: Use getTotalUnspentBalance for display (no witness requirement).
             // getUnspentNotes() requires witness IS NOT NULL — shows partial balance when
@@ -4082,28 +4183,10 @@ final class WalletManager: ObservableObject {
             // so the user can send instantly without waiting for witness rebuild
             await preRebuildWitnessesForInstantPayment(accountId: account.accountId)
 
-            // FIX #1280: Auto Full Rescan when phantom witnesses detected at startup.
-            if await MainActor.run(body: { self.phantomWitnessAutoRescanNeeded }) {
-                await MainActor.run {
-                    self.phantomWitnessAutoRescanNeeded = false
-                    self.syncStatus = "Repairing corrupted witnesses..."
-                }
-                print("🔄 FIX #1280: AUTO FULL RESCAN (startup) — phantom witnesses detected")
-                print("🔄 FIX #1280: Starting automatic Full Rescan to rebuild from correct tree...")
-
-                do {
-                    try await repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                        Task { @MainActor in
-                            self.syncStatus = "Repairing witnesses: \(Int(progress * 100))%"
-                            self.overallProgress = progress
-                        }
-                    }, forceFullRescan: true)
-                    print("✅ FIX #1280: Auto Full Rescan complete (startup) — witnesses rebuilt")
-                } catch {
-                    print("❌ FIX #1280: Auto Full Rescan failed (startup): \(error.localizedDescription)")
-                }
-                // Continue to balance refresh below
-            }
+            // FIX #1302: Auto Full Rescan REMOVED from startup path.
+            // Was FIX #1280's auto-trigger that destroyed corrected balance.
+            // Witnesses are NULLed (safe). Balance correct via getTotalUnspentBalance().
+            // Witnesses rebuilt on next preRebuildWitnessesForInstantPayment() cycle.
 
             // FIX #300 + FIX #1210: Refresh balance AFTER witness rebuild.
             // Use getTotalUnspentBalance (no witness requirement) for display balance.
@@ -4188,6 +4271,15 @@ final class WalletManager: ObservableObject {
     /// FIX #557 v18: Added progress callback for UI feedback
     /// FIX #557 v26: Made callback async to ensure UI updates execute
     internal func preRebuildWitnessesForInstantPayment(accountId: Int64, progress: ((String, Int) async -> Void)? = nil) async {
+        // FIX #1290: Abort immediately when Full Rescan is in progress
+        // INSTANT start's witness rebuild + delta sync competes for P2P peers and FFI tree,
+        // adding 2+ minutes of overhead to Full Rescan. The Full Rescan handles everything.
+        let isRepairing = await MainActor.run { WalletManager.shared.isRepairingDatabase }
+        if isRepairing {
+            print("⏩ FIX #1290: Skipping preRebuildWitnesses — Full Rescan in progress")
+            return
+        }
+
         // FIX #1240: Early exit when tree state is corrupted — don't waste time on expensive
         // witness validation (FIX #1224 HeaderStore queries × 24 witnesses × ~300ms each = 7+ seconds).
         // Previous FIX #1238 guard was 300 lines deep (line ~4263), AFTER all the expensive checks.
@@ -4296,14 +4388,51 @@ final class WalletManager: ObservableObject {
                     }
                 }
                 if !foundAuthoritativeRoot {
-                    // FIX #799: HeaderStore root is zero or missing — fall back to FFI tree root
-                    print("⚠️ FIX #799: Height \(fastPathChainHeight) > boost file end \(boostFileEndHeight)")
-                    print("   HeaderStore root zero/missing — using FFI tree root for comparison")
-                    useFFIRootInstead = true
-                    headerTreeRoot = ZipherXFFI.treeRoot()
-                    if let root = headerTreeRoot {
-                        let rootHex = root.prefix(16).map { String(format: "%02x", $0) }.joined()
-                        print("📋 FIX #799: Using FFI tree root: \(rootHex)...")
+                    // FIX #1305: HeaderStore is behind tree tip — sync headers before falling back.
+                    // Without this: witnesses get created → anchor not in HeaderStore → FIX #1279 rejects ALL
+                    // → NULLed → balance shows 0 → can't send. The fix: sync the missing headers FIRST.
+                    let headerStoreHeight = (try? headerStore.getLatestHeight()) ?? 0
+                    let headerGap = fastPathChainHeight > headerStoreHeight ? fastPathChainHeight - headerStoreHeight : 0
+
+                    if headerGap > 0 && headerGap <= 50 {
+                        print("🔄 FIX #1305: HeaderStore behind by \(headerGap) headers (\(headerStoreHeight) → \(fastPathChainHeight))")
+                        print("   Syncing headers BEFORE witness validation (prevents phantom anchor rejection)")
+                        do {
+                            let syncManager = HeaderSyncManager(
+                                headerStore: headerStore,
+                                networkManager: NetworkManager.shared
+                            )
+                            try await syncManager.syncHeaders(from: headerStoreHeight + 1, maxHeaders: headerGap + 10)
+                            print("✅ FIX #1305: Quick header sync complete — retrying root lookup")
+
+                            // Retry HeaderStore lookup after sync
+                            if let header = try? headerStore.getHeader(at: fastPathChainHeight) {
+                                let root = header.hashFinalSaplingRoot
+                                let isZeroRoot = root.allSatisfy { $0 == 0 }
+                                if !isZeroRoot {
+                                    headerTreeRoot = root
+                                    foundAuthoritativeRoot = true
+                                    let rootHex = root.prefix(16).map { String(format: "%02x", $0) }.joined()
+                                    print("✅ FIX #1305: Got authoritative root after sync: \(rootHex)...")
+                                }
+                            }
+                        } catch {
+                            print("⚠️ FIX #1305: Quick header sync failed: \(error) — falling back to FFI root")
+                        }
+                    } else if headerGap > 50 {
+                        print("⚠️ FIX #1305: HeaderStore too far behind (\(headerGap) headers) — skipping quick sync")
+                    }
+
+                    if !foundAuthoritativeRoot {
+                        // FIX #799: HeaderStore root is still zero or missing — fall back to FFI tree root
+                        print("⚠️ FIX #799: Height \(fastPathChainHeight) > boost file end \(boostFileEndHeight)")
+                        print("   HeaderStore root zero/missing — using FFI tree root for comparison")
+                        useFFIRootInstead = true
+                        headerTreeRoot = ZipherXFFI.treeRoot()
+                        if let root = headerTreeRoot {
+                            let rootHex = root.prefix(16).map { String(format: "%02x", $0) }.joined()
+                            print("📋 FIX #799: Using FFI tree root: \(rootHex)...")
+                        }
                     }
                 }
             } else if fastPathChainHeight > 0 {
@@ -4757,23 +4886,19 @@ final class WalletManager: ObservableObject {
                     let toleranceThreshold: UInt64 = 10
 
                     if missing > toleranceThreshold {
-                        // Significant CMUs missing - likely real corruption
-                        print("⚠️ FIX #1063 v3: Tree UNDER-sized! FFI=\(currentTreeSize) vs expected=\(expectedTreeSize) (missing=\(missing))")
-                        print("🔧 FIX #1063 v3: Clearing corrupted FFI tree...")
+                        // FIX #1308: Tree under-sized = FFI didn't load all delta CMUs yet.
+                        // This is a LOADING issue, NOT delta corruption. Delta has valid blockchain data.
+                        // NEVER destroy delta — reload tree from boost + delta instead.
+                        print("⚠️ FIX #1308: Tree UNDER-sized! FFI=\(currentTreeSize) vs expected=\(expectedTreeSize) (missing=\(missing))")
+                        print("🔧 FIX #1308: Reloading FFI tree from boost + delta (PRESERVING delta)")
                         ZipherXFFI.treeInit()
 
-                        // FIX #1254: Only clear delta if NOT verified (immutable).
-                        // Verified delta was built correctly — tree undersize is a LOADING issue, not delta corruption.
-                        if UserDefaults.standard.bool(forKey: "DeltaBundleVerified") {
-                            print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite tree undersize")
-                            print("   Tree will be rebuilt from boost + verified delta on reload")
-                        } else {
-                            print("🔧 FIX #1063 v3: Clearing potentially corrupted delta bundle...")
-                            DeltaCMUManager.shared.clearDeltaBundle()
-                        }
+                        // Delta is ALWAYS preserved — verified or not.
+                        // Delta contains valid blockchain outputs from P2P fetch.
+                        // Clearing it forces a full re-fetch (~2 min) that gets the same data.
+                        print("📦 FIX #1308: Delta PRESERVED (\(deltaCMUCount) outputs) — will reload into tree")
 
-                        print("✅ FIX #1063 v3: FFI tree cleared - will reload from boost file")
-                        // Don't set treeLoaded - will fall through to load from database/boost
+                        // Don't set treeLoaded - will fall through to load from database/boost + delta
                     } else {
                         // FIX #1151: Small discrepancy - delta sync will fix it
                         print("⚠️ FIX #1151: Tree slightly under-sized (missing \(missing) CMUs, tolerance=\(toleranceThreshold)) - delta sync will fix")
@@ -4910,10 +5035,11 @@ final class WalletManager: ObservableObject {
                 await progress?("Fetching delta CMUs...", 70)
 
                 // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
-                // Each peer can fetch 128 blocks in parallel - utilize ALL peers!
+                // FIX #1287: Cap at 3 concurrent peers to prevent TCP congestion collapse
                 let peerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
                 let maxBlocksPerPeer = 128
-                let batchSize: UInt64 = UInt64(max(peerCount, 2) * maxBlocksPerPeer)  // e.g., 7 peers × 128 = 896
+                // FIX #1287: Cap concurrent fetch peers at 3 to prevent TCP congestion collapse
+                let batchSize: UInt64 = UInt64(min(max(peerCount, 2), 3) * maxBlocksPerPeer)
                 print("📊 FIX #1098: Delta CMU fetch using \(peerCount) peers × 128 = \(batchSize) blocks/batch")
                 var currentHeight = startHeight + 1
                 var consecutiveFailures = 0
@@ -4924,6 +5050,14 @@ final class WalletManager: ObservableObject {
                 // putting them AFTER subsequent blocks' CMUs. Tree is order-sensitive — CMUs from
                 // block 100 MUST come before block 101's. Wrong order = wrong tree root = corrupt tree.
                 var deltaCMUsByHeight: [(UInt64, [Data])] = []
+                // FIX #1310: Also collect full DeltaOutput objects during FIRST pass.
+                // Previous bug: first pass collected only CMUs (for tree), then second pass
+                // (FIX #571 Step 2) re-fetched SAME blocks via P2P to get full outputs (for delta).
+                // P2P is unreliable — second fetch missed blocks → delta had fewer outputs than tree
+                // → rebuildWitnessesForNotes built batch tree with wrong CMU count → anchor mismatch
+                // → FIX #1279 rejected ALL witnesses → rebuild loop.
+                // Fix: collect full outputs in FIRST pass → tree and delta always consistent.
+                var collectedDeltaOutputs: [DeltaCMUManager.DeltaOutput] = []
                 let syncStartTime = Date()  // FIX #762: Track overall sync time
                 let maxSyncDuration: TimeInterval = 120  // FIX #762: Max 2 minutes for delta sync
 
@@ -4931,6 +5065,10 @@ final class WalletManager: ObservableObject {
                 // Missing blocks cause incomplete delta CMUs → wrong tree root → TX rejection
                 var allFetchedHeights = Set<UInt64>()
                 var totalMissingBlocks = 0
+
+                // FIX #1310: Cache block data for FilterScanner PHASE 2 reuse (was in FIX #571 second pass)
+                // Now that first pass collects everything, cache here to prevent PHASE 2 triple-fetch.
+                FilterScanner.sharedPrefetchCache = [:]
 
                 while currentHeight <= chainHeight {
                     // FIX #762: Check for overall timeout to prevent infinite hanging
@@ -4957,15 +5095,33 @@ final class WalletManager: ObservableObject {
                                 allFetchedHeights.insert(height)
                                 // FIX #1199: Collect CMUs per height for correct ordering
                                 var heightCMUs: [Data] = []
+                                var blockOutputIndex: UInt32 = 0
                                 for (txid, outputs, _) in txData {
                                     for output in outputs {
                                         if let cmuDisplay = Data(hexString: output.cmu) {
                                             let cmuWire = Data(cmuDisplay.reversed())
                                             heightCMUs.append(cmuWire)
+                                            // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                            // Ensures loadDeltaCMUs() count matches tree CMU count
+                                            // Without this: 18 outputs with non-580-byte ciphertext get CMU in tree
+                                            // but NOT in delta → batch witness tree root mismatch → FIX #1279 rejects all
+                                            let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                            let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
+                                            let deltaOutput = DeltaCMUManager.DeltaOutput(
+                                                height: UInt32(height),
+                                                index: blockOutputIndex,
+                                                cmu: cmuWire,
+                                                epk: epk,
+                                                ciphertext: ciphertext
+                                            )
+                                            collectedDeltaOutputs.append(deltaOutput)
                                         }
+                                        blockOutputIndex += 1
                                     }
                                 }
                                 deltaCMUsByHeight.append((height, heightCMUs))
+                                // FIX #1310: Cache block data for FilterScanner PHASE 2
+                                FilterScanner.sharedPrefetchCache?[height] = txData
                             }
 
                             // FIX #1199: Retry missing blocks WITHIN this batch immediately
@@ -5001,15 +5157,30 @@ final class WalletManager: ObservableObject {
                                         for (h, _, _, txData) in retryBlocks {
                                             allFetchedHeights.insert(h)
                                             var heightCMUs: [Data] = []
+                                            var retryBlockOutputIndex: UInt32 = 0
                                             for (_, outputs, _) in txData {
                                                 for output in outputs {
                                                     if let cmuDisplay = Data(hexString: output.cmu) {
                                                         let cmuWire = Data(cmuDisplay.reversed())
                                                         heightCMUs.append(cmuWire)
+                                                        // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                                        let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                                        let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
+                                                        let deltaOutput = DeltaCMUManager.DeltaOutput(
+                                                            height: UInt32(h),
+                                                            index: retryBlockOutputIndex,
+                                                            cmu: cmuWire,
+                                                            epk: epk,
+                                                            ciphertext: ciphertext
+                                                        )
+                                                        collectedDeltaOutputs.append(deltaOutput)
                                                     }
+                                                    retryBlockOutputIndex += 1
                                                 }
                                             }
                                             deltaCMUsByHeight.append((h, heightCMUs))
+                                            // FIX #1310: Cache retry block data too
+                                            FilterScanner.sharedPrefetchCache?[h] = txData
                                         }
                                     } catch {
                                         // Count all heights in this range as missing
@@ -5048,6 +5219,10 @@ final class WalletManager: ObservableObject {
                         try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms between rounds
                     }
                 }
+
+                // FIX #1310: Log first-pass collection results
+                let cacheSize = FilterScanner.sharedPrefetchCache?.count ?? 0
+                print("📦 FIX #1310: First pass collected \(collectedDeltaOutputs.count) full outputs, cached \(cacheSize) blocks for PHASE 2")
 
                 // FIX #1199: Sort by height and flatten to get CMUs in correct blockchain order
                 // This is CRITICAL — the commitment tree is append-only and order-sensitive.
@@ -5105,6 +5280,25 @@ final class WalletManager: ObservableObject {
 
                     print("✅ FIX #557 v32 + FIX #1182: Delta CMU append complete")
 
+                    // FIX #1310: Save collected full outputs to delta manifest.
+                    // This is the SAME P2P data that was used for tree CMU append — guaranteed consistent.
+                    // Previous bug: FIX #571 Step 2 did a SECOND P2P fetch for delta outputs, which missed
+                    // blocks the first pass got → delta had fewer outputs than tree → batch witness builder
+                    // created wrong root → FIX #1279 rejected all witnesses → rebuild loop.
+                    if !collectedDeltaOutputs.isEmpty {
+                        let treeRootForDelta = ZipherXFFI.treeRoot() ?? Data(count: 32)
+                        let deltaFromHeight = UInt64(boostHeight + 1)
+                        DeltaCMUManager.shared.appendOutputs(collectedDeltaOutputs, fromHeight: deltaFromHeight, toHeight: chainHeight, treeRoot: treeRootForDelta)
+                        print("📦 FIX #1310: Saved \(collectedDeltaOutputs.count) delta outputs from FIRST pass (same P2P data as tree)")
+                        print("   Tree CMUs: \(deltaCMUs.count), Delta outputs: \(collectedDeltaOutputs.count) — CONSISTENT")
+                    } else {
+                        // No outputs but blocks were fetched — update manifest height anyway
+                        let treeRootForDelta = ZipherXFFI.treeRoot() ?? Data(count: 32)
+                        let deltaFromHeight = UInt64(boostHeight + 1)
+                        DeltaCMUManager.shared.appendOutputs([], fromHeight: deltaFromHeight, toHeight: chainHeight, treeRoot: treeRootForDelta)
+                        print("📦 FIX #1310: No shielded outputs in fetched blocks, but updated delta manifest to height \(chainHeight)")
+                    }
+
                     // CRITICAL FIX #557 v35: Verify tree root matches header at chainHeight
                     // FIX #1204b: HeaderStore sapling roots ARE authoritative for post-boost heights.
                     let ourRoot = ZipherXFFI.treeRoot()
@@ -5130,8 +5324,9 @@ final class WalletManager: ObservableObject {
                                         print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite tree root mismatch")
                                         print("   Mismatch is likely from incomplete P2P append, not delta corruption")
                                     } else {
-                                        print("🗑️ FIX #758: Clearing corrupted delta bundle to force re-collection...")
-                                        DeltaCMUManager.shared.clearDeltaBundle()
+                                        // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                        // Preserve delta for gap-fill — clearing forces full re-fetch.
+                                        print("📦 FIX #1309: Delta PRESERVED — root mismatch = incomplete P2P data, gap-fill will fix")
                                     }
                                 }
                             } else {
@@ -5162,9 +5357,9 @@ final class WalletManager: ObservableObject {
                                 print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite tree root mismatch")
                                 print("   Mismatch is likely from incomplete new block append, not delta corruption")
                             } else {
-                                // FIX #758: Clear corrupted delta bundle to force re-collection
-                                print("🗑️ FIX #758: Clearing corrupted delta bundle to force re-collection...")
-                                DeltaCMUManager.shared.clearDeltaBundle()
+                                // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                                // Preserve delta for gap-fill — clearing forces full re-fetch.
+                                print("📦 FIX #1309: Delta PRESERVED — root mismatch = incomplete P2P data, gap-fill will fix")
                             }
                         }
                     } else {
@@ -5337,8 +5532,10 @@ final class WalletManager: ObservableObject {
 
                 let blocksToFetch = blocksToFetchP2P
                 print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
-                // FIX #1214: Initialize shared cache for FilterScanner to reuse
-                FilterScanner.sharedPrefetchCache = [:]
+                // FIX #1214+1310: Initialize shared cache only if not already populated by first pass
+                if FilterScanner.sharedPrefetchCache == nil {
+                    FilterScanner.sharedPrefetchCache = [:]
+                }
                 print("📦 FIX #1214: Caching P2P block data for FilterScanner PHASE 2 reuse")
 
                 // FIX #1056 v2: Stop block listeners before P2P fetch to prevent TCP stream desync
@@ -5386,7 +5583,8 @@ final class WalletManager: ObservableObject {
                 // Previous implementation used fetchTask.cancel() which doesn't interrupt network I/O
                 // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
                 let peerCount2 = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-                let batchSize: UInt64 = UInt64(max(peerCount2, 2) * 128)  // e.g., 7 peers × 128 = 896
+                // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+                let batchSize: UInt64 = UInt64(max(peerCount2, 3) * 256)
                 let maxRetries = 2
                 let batchTimeoutSeconds: UInt64 = 30  // 30 seconds per batch
                 var currentHeight = fetchStartHeight + 1
@@ -5444,18 +5642,15 @@ final class WalletManager: ObservableObject {
                                             let cmuWire = Data(cmuDisplay.reversed())
                                             deltaCMUs.append(cmuWire)
                                             p2pCMUs += 1
-                                        }
-                                        // FIX #1190: Build delta output (wire format for cmu/epk, raw for ciphertext)
-                                        if let cmuDisplay = Data(hexString: output.cmu),
-                                           let epkDisplay = Data(hexString: output.ephemeralKey),
-                                           let encCiphertext = Data(hexString: output.encCiphertext),
-                                           encCiphertext.count == 580 {
+                                            // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                            let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                            let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                             let deltaOutput = DeltaCMUManager.DeltaOutput(
                                                 height: UInt32(height),
                                                 index: blockOutputIndex,
-                                                cmu: Data(cmuDisplay.reversed()),
-                                                epk: Data(epkDisplay.reversed()),
-                                                ciphertext: encCiphertext
+                                                cmu: cmuWire,
+                                                epk: epk,
+                                                ciphertext: ciphertext
                                             )
                                             batchDeltaOutputs.append(deltaOutput)
                                         }
@@ -5567,10 +5762,30 @@ final class WalletManager: ObservableObject {
                 // non-existent tree position → FIX #1280 flags ALL as corrupted → auto Full Rescan.
                 // Only apply NEW CMUs (same ones that were appended to tree in Step 2a).
                 let cmusForWitnesses: [Data]
+                var needFreshWitnesses = false  // FIX #1292
                 if cmusAlreadyInTree >= deltaCMUs.count {
                     // All CMUs already reflected in witnesses from DB, skip
                     cmusForWitnesses = []
                     print("✅ FIX #1281: Step 2b SKIPPED - Witnesses already have all \(deltaCMUs.count) delta CMUs")
+
+                    // FIX #1292: Verify skip was correct — delta sync may have grown the tree
+                    // without updating witnesses (e.g., syncDeltaBundleIfNeeded added 1 CMU
+                    // to delta+tree but witnesses in DB were never updated).
+                    // If witness root != FFI tree root, witnesses are stale → create fresh ones.
+                    if !witnessIndices.isEmpty, let treeRoot = ZipherXFFI.treeRoot() {
+                        let firstIdx = witnessIndices[0].position
+                        if let witnessData = ZipherXFFI.treeGetWitness(index: firstIdx) {
+                            if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessData) {
+                                if witnessRoot != treeRoot {
+                                    print("⚠️ FIX #1292: Witness root mismatch after skip!")
+                                    print("   Witness root: \(witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                    print("   FFI tree root: \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                    print("   Delta sync grew tree without witness update — creating fresh witnesses")
+                                    needFreshWitnesses = true
+                                }
+                            }
+                        }
+                    }
                 } else if cmusAlreadyInTree > 0 {
                     // Witnesses from DB have first N delta CMUs, only apply new ones
                     cmusForWitnesses = Array(deltaCMUs.dropFirst(cmusAlreadyInTree))
@@ -5588,8 +5803,70 @@ final class WalletManager: ObservableObject {
                     }
                     let updatedWitnessCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: cmusForWitnesses.count)
                     print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
+
+                    // FIX #1298: Verify witnesses AFTER applying CMUs — DB witnesses may have been
+                    // corrupted (wrong merkle paths from previous session). updateAllWitnessesBatch
+                    // can only APPEND CMUs to existing witnesses, not fix corrupted base paths.
+                    // If result root != FFI tree root → base was corrupt → need fresh witnesses.
+                    if !needFreshWitnesses && !witnessIndices.isEmpty, let treeRoot = ZipherXFFI.treeRoot() {
+                        let firstIdx = witnessIndices[0].position
+                        if let witnessData = ZipherXFFI.treeGetWitness(index: firstIdx) {
+                            if let witnessRoot = ZipherXFFI.witnessGetRoot(witnessData) {
+                                if witnessRoot != treeRoot {
+                                    print("⚠️ FIX #1298: Witness root mismatch AFTER applying \(cmusForWitnesses.count) CMUs!")
+                                    print("   Witness root: \(witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                    print("   FFI tree root: \(treeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                    print("   DB witnesses had corrupted base paths — creating fresh witnesses")
+                                    needFreshWitnesses = true
+                                }
+                            }
+                        }
+                    }
                 } else {
                     print("✅ FIX #805: Step 2b - Witnesses already current (no update needed)")
+                }
+
+                // FIX #1292: Create fresh witnesses when delta sync grew tree without updating witnesses
+                // This happens when syncDeltaBundleIfNeeded appends CMUs to tree+delta but witnesses
+                // in DB were saved at the previous tree size. FIX #1281's size guard says "skip" but
+                // witnesses are actually 1+ CMUs behind → root mismatch → FIX #1280 NULLs all.
+                // Fix: create fresh witnesses from the current (correct) FFI tree state.
+                if needFreshWitnesses && !witnessIndices.isEmpty {
+                    if let treeData = ZipherXFFI.treeSerialize() {
+                        print("🔧 FIX #1292: Creating \(witnessIndices.count) fresh witnesses from correct tree...")
+                        var freshCount = 0
+                        var updatedIndices: [(note: WalletNote, position: UInt64)] = []
+                        for (note, arrayIndex) in witnessIndices {
+                            let treePosition = ZipherXFFI.witnessGetTreePosition(witnessIndex: arrayIndex)
+                            if treePosition != UInt64.max {
+                                if let result = ZipherXFFI.treeCreateWitnessForPosition(treeData: treeData, position: treePosition) {
+                                    // Load the fresh witness back into FFI — gets new array index
+                                    let newIdx = result.witness.withUnsafeBytes { ptr in
+                                        ZipherXFFI.treeLoadWitness(
+                                            witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                            witnessLen: result.witness.count
+                                        )
+                                    }
+                                    if newIdx != UInt64.max {
+                                        freshCount += 1
+                                        // Use NEW array index so Step 3 extracts the fresh witness
+                                        updatedIndices.append((note: note, position: newIdx))
+                                    } else {
+                                        updatedIndices.append((note: note, position: arrayIndex))
+                                    }
+                                } else {
+                                    updatedIndices.append((note: note, position: arrayIndex))
+                                }
+                            } else {
+                                updatedIndices.append((note: note, position: arrayIndex))
+                            }
+                        }
+                        // Replace witnessIndices so Step 3 extracts fresh witnesses
+                        witnessIndices = updatedIndices
+                        print("✅ FIX #1292: Created \(freshCount)/\(witnessIndices.count) fresh witnesses")
+                    } else {
+                        print("⚠️ FIX #1292: Could not serialize tree — witnesses will be rebuilt by FIX #1280")
+                    }
                 }
 
                 print("✅ FIX #571 + FIX #805: Step 2 complete - Tree AND witnesses now updated!")
@@ -5727,9 +6004,9 @@ final class WalletManager: ObservableObject {
                             print("✅ FIX #1254: Delta is VERIFIED (immutable) — NOT clearing despite tree root mismatch")
                             print("   Tree mismatch is from new blocks, not verified delta corruption")
                         } else {
-                            // FIX #758: Clear corrupted delta bundle to force re-collection
-                            print("🗑️ FIX #758: Clearing corrupted delta bundle...")
-                            DeltaCMUManager.shared.clearDeltaBundle()
+                            // FIX #1309: Delta is INCOMPLETE (P2P missed blocks), not corrupt.
+                            // Preserve delta for gap-fill — clearing forces full re-fetch.
+                            print("📦 FIX #1309: Delta PRESERVED — root mismatch = incomplete P2P data, gap-fill will fix")
                         }
 
                         // Return early - don't corrupt witnesses with wrong anchor
@@ -5763,12 +6040,14 @@ final class WalletManager: ObservableObject {
                 // The witness root MUST match the FFI tree root — if not, the witness is corrupt.
                 var phantomWitnessCount = 0
                 var phantomNoteIds: [Int64] = []  // FIX #1280: Track corrupted note IDs to NULL in DB
+                var staleWitnessCount = 0  // FIX #1322: Witnesses valid at earlier height (not corrupted)
 
                 // FIX #1280: Get the VERIFIED FFI tree root for per-witness validation.
                 // The FFI tree root was already verified against HeaderStore above.
                 // Each extracted witness MUST produce the SAME root as the FFI tree.
                 // If a witness produces a different root, it was loaded from corrupted DB state
                 // and the delta CMU update couldn't fix it (wrong base → wrong extended path).
+                // FIX #1322: OR the witness was created at an earlier tree state (stale, not corrupt).
                 let ffiTreeRootForValidation = ZipherXFFI.treeRoot()
                 if let rootHex = ffiTreeRootForValidation?.prefix(8).map({ String(format: "%02x", $0) }).joined() {
                     print("🔍 FIX #1280: FFI tree root for witness validation: \(rootHex)...")
@@ -5784,27 +6063,48 @@ final class WalletManager: ObservableObject {
                         if let ffiRoot = ffiTreeRootForValidation,
                            let witnessRoot = ZipherXFFI.witnessGetRoot(updatedWitness) {
                             if witnessRoot != ffiRoot && Data(witnessRoot.reversed()) != ffiRoot {
-                                // Witness produces different root than FFI tree — corrupted!
-                                phantomWitnessCount += 1
-                                phantomNoteIds.append(note.id)
-                                if phantomWitnessCount <= 3 {
-                                    let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
-                                    print("🚨 FIX #1280: Note \(note.id) witness root \(witnessRootHex)... ≠ FFI tree root — SKIPPING")
+                                // Witness root ≠ current FFI tree root — could be stale, not corrupt.
+                                // FIX #1322: Check if root is valid at ANY blockchain height in HeaderStore.
+                                // A witness from FIX #1316 batch creation may be valid at an earlier height
+                                // if delta sync appended CMUs to the tree between creation and validation.
+                                let witnessRootValid = await HeaderStore.shared.containsSaplingRoot(witnessRoot)
+                                if !witnessRootValid {
+                                    // Root doesn't match ANY blockchain height — truly corrupted
+                                    phantomWitnessCount += 1
+                                    phantomNoteIds.append(note.id)
+                                    if phantomWitnessCount <= 3 {
+                                        let witnessRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                        print("🚨 FIX #1280: Note \(note.id) witness root \(witnessRootHex)... NOT in HeaderStore — SKIPPING")
+                                    }
+                                    continue  // Don't save this corrupted witness
                                 }
-                                continue  // Don't save this corrupted witness
+                                // FIX #1322: Witness root is valid at an earlier height — stale but usable for spending.
+                                staleWitnessCount += 1
+                                if staleWitnessCount <= 3 {
+                                    let wRootHex = witnessRoot.prefix(8).map { String(format: "%02x", $0) }.joined()
+                                    print("ℹ️ FIX #1322: Note \(note.id) witness root \(wRootHex)... valid at earlier height — saving")
+                                }
                             }
                         }
                         witnessUpdates.append((note.id, updatedWitness))
                         updatedCount += 1
                     }
 
-                    // Only update anchor if witness was valid (not skipped above)
-                    if let currentAnchor = currentTreeAnchor {
-                        // FIX #1280: Only add anchor update if witness was saved
-                        if witnessUpdates.last?.noteId == note.id {
+                    // FIX #1322: Set anchor to witness's OWN root for stale witnesses.
+                    // The anchor must match the witness root for valid TX building.
+                    // Using currentTreeAnchor (FFI tip) for a stale witness → anchor mismatch → "joinsplit requirements not met".
+                    if witnessUpdates.last?.noteId == note.id {
+                        if let lastWitness = witnessUpdates.last?.witness,
+                           let witnessRoot = ZipherXFFI.witnessGetRoot(lastWitness),
+                           let ffiRoot = ffiTreeRootForValidation,
+                           witnessRoot != ffiRoot && Data(witnessRoot.reversed()) != ffiRoot {
+                            // Stale witness — use witness root as anchor (valid on-chain)
+                            positionAnchorUpdates.append((note.id, witnessRoot))
+                        } else if let currentAnchor = currentTreeAnchor {
+                            // Current witness — use FFI tip anchor
                             positionAnchorUpdates.append((note.id, currentAnchor))
-                            anchorFixedCount += 1
                         }
+                        anchorFixedCount += 1
                     }
                 }
 
@@ -5858,24 +6158,18 @@ final class WalletManager: ObservableObject {
 
                 if phantomWitnessCount > 0 && updatedCount == 0 {
                     print("🚨 FIX #1280: ALL \(phantomWitnessCount) witnesses had phantom roots — none saved")
-                    // Only trigger auto-rescan if not already in a Full Rescan
-                    // (repairNotesAfterDownloadedTree calls preRebuildWitnessesForInstantPayment internally)
-                    let alreadyRescanning = await MainActor.run { self.isFullRescan || self.isRepairingDatabase }
-                    if !alreadyRescanning {
-                        print("🚨 FIX #1280: Auto Full Rescan will be triggered to rebuild witnesses")
-                        await MainActor.run { self.phantomWitnessAutoRescanNeeded = true }
-                    } else {
-                        print("⚠️ FIX #1280: Already in Full Rescan — skipping auto-trigger")
-                    }
+                    // FIX #1302: Do NOT auto-trigger Full Rescan. Full Rescan's Phase 2
+                    // has partial batch cursor bug → creates phantom notes → inflated balance.
+                    // Witnesses are NULLed (safe). Balance displays correctly via getTotalUnspentBalance().
+                    // Witnesses will be rebuilt just-in-time when user wants to send.
+                    print("⚠️ FIX #1302: Witnesses NULLed — balance still correct. Rebuild on next sync or send.")
                 } else if phantomWitnessCount > 0 {
                     print("⚠️ FIX #1280: \(updatedCount) valid witnesses saved, \(phantomWitnessCount) phantom witnesses skipped")
-                    let alreadyRescanning = await MainActor.run { self.isFullRescan || self.isRepairingDatabase }
-                    if !alreadyRescanning {
-                        print("🚨 FIX #1280: Auto Full Rescan will be triggered to rebuild corrupted witnesses")
-                        await MainActor.run { self.phantomWitnessAutoRescanNeeded = true }
-                    } else {
-                        print("⚠️ FIX #1280: Already in Full Rescan — skipping auto-trigger")
-                    }
+                    // FIX #1302: Do NOT auto-trigger Full Rescan — just log and continue.
+                    // NULLed witnesses don't affect balance display.
+                    print("⚠️ FIX #1302: \(phantomWitnessCount) witnesses NULLed — balance still correct.")
+                } else if staleWitnessCount > 0 {
+                    print("✅ FIX #1322: Step 3 complete - Saved \(updatedCount) witnesses (\(staleWitnessCount) stale at earlier height, anchors set to witness roots)")
                 } else {
                     print("✅ FIX #569 v2: Step 3 complete - Updated \(updatedCount) witnesses with current tree state")
                     print("✅ FIX #569 v2: Updated \(anchorFixedCount) anchors to CURRENT tree root (chain height \(chainHeight))")
@@ -6941,7 +7235,10 @@ final class WalletManager: ObservableObject {
         // Debug: List all notes in database to diagnose balance discrepancy
         try? database.debugListAllNotes(accountId: account.accountId)
 
-        var unspentNotes = try database.getUnspentNotes(accountId: account.accountId)
+        // FIX #1304: Use getAllUnspentNotes (no witness requirement) instead of getUnspentNotes.
+        // getUnspentNotes requires witness IS NOT NULL → returns 0 when all witnesses are NULL
+        // (which happens after FIX #1280 NULLs phantom witnesses). Balance display doesn't need witnesses.
+        var unspentNotes = try database.getAllUnspentNotes(accountId: account.accountId)
         let totalNotes = unspentNotes.count
 
         // Update with note count
@@ -7323,9 +7620,12 @@ final class WalletManager: ObservableObject {
         } else {
             // Reset all sync state (notes, nullifiers, tree)
             try WalletDatabase.shared.resetSyncState()
-            // Also clear header store to remove any stale/fake P2P headers
-            try? HeaderStore.shared.clearAllHeaders()
-            print("🔄 Reset complete (including headers) - starting full rescan from Sapling activation")
+            // FIX #1307: PRESERVE HeaderStore during Full Rescan.
+            // Headers are blockchain data (not wallet state) — they don't change.
+            // Clearing 2.5M valid headers forces a full P2P re-fetch (~2 min overhead).
+            // HeaderStore is validated by Equihash PoW — no need to re-download.
+            // Only gaps (if any) will be filled by header sync after rescan.
+            print("🔄 Reset complete (headers PRESERVED) - starting full rescan from Sapling activation")
         }
 
         // Create scanner with progress callback
@@ -7901,13 +8201,20 @@ final class WalletManager: ObservableObject {
         treeLoadStatus = "Full Rescan starting..."
         print("✅ FIX #729: FFI tree reset (treeInit + DB cleared + flags reset)")
 
-        // FIX #764: CRITICAL - Clear delta bundle during Full Rescan
-        // The delta manifest retains old endHeight from previous session
-        // Without clearing, delta range becomes backwards (e.g., 2990287-2990286)
-        // This causes tree root mismatch and 10+ minute startup loops
-        // FIX #1254: force:true — Full Rescan is authorized to clear verified delta
-        DeltaCMUManager.shared.clearDeltaBundle(force: true)
-        print("🗑️ FIX #764/#1252: Cleared delta bundle + verified flag")
+        // FIX #1289 v3: PRESERVE delta bundle during Full Rescan
+        // Delta contains valid blockchain data (shielded outputs + nullifiers) from prior sessions.
+        // NOT cleared during Full Rescan — Phase 1b scans delta locally (zero P2P for delta range).
+        // Phase 1b: trial decryption (notes) + nullifier matching (spends) + tree + witnesses.
+        // Phase 2 only processes blocks BEYOND delta tip.
+        let deltaManifest = DeltaCMUManager.shared.getManifest()
+        let deltaPreserved = deltaManifest != nil
+        let deltaHasNullifiers = DeltaCMUManager.shared.hasNullifiers()
+        if deltaPreserved {
+            UserDefaults.standard.set(false, forKey: "DeltaBundleVerified")
+            print("📦 FIX #1289 v3: Delta bundle PRESERVED (\(deltaManifest!.outputCount) outputs, endHeight=\(deltaManifest!.endHeight), nullifiers=\(deltaHasNullifiers))")
+        } else {
+            print("📦 FIX #1289 v3: No delta bundle to preserve")
+        }
 
         onProgress(0.1, 0, 100)
 
@@ -7928,6 +8235,9 @@ final class WalletManager: ObservableObject {
         // Import PK doesn't have all this extra header/tree/hash loading code
         // The scanner handles: boost file, headers, CMU data, PHASE 1/2 scanning
         let scanner = FilterScanner()
+
+        // FIX #1289 v3: Pass delta info to scanner for Phase 1b local processing
+        scanner.preservedDeltaEndHeight = deltaPreserved ? deltaManifest?.endHeight : nil
 
         // FIX #577 v12: CRITICAL - Update WalletManager progress properties so CypherpunkSyncView works
         // The local onProgress callback only updates SettingsView's local variables
@@ -8124,6 +8434,12 @@ final class WalletManager: ObservableObject {
         // FIX #577 v11: Rebuild transaction history after Full Rescan
         // The scanner creates notes but doesn't populate transaction_history table
         // We need to call populateHistoryFromNotes() to create SENT/RECEIVED/CHANGE entries
+        // FIX #1288: MUST clear old history first — old WalletManager-recorded SENT entries
+        // persist with INSERT OR IGNORE, creating historyBalance vs notesBalance mismatch
+        // that triggers false FIX #1286 "Balance Issue" after every full rescan.
+        // (Repair Database path at line ~7783 already does this correctly.)
+        print("📜 FIX #577 v11: Clearing old history before rebuild (FIX #1288)...")
+        try WalletDatabase.shared.clearTransactionHistory()
         print("📜 FIX #577 v11: Rebuilding transaction history after Full Rescan...")
         let historyCount = try WalletDatabase.shared.populateHistoryFromNotes()
         print("📜 FIX #577 v11: Transaction history rebuilt - \(historyCount) entries")
@@ -8199,8 +8515,9 @@ final class WalletManager: ObservableObject {
         // If verification fails, set flag so UI shows "Balance issue" instead of balance amount
         print("🔍 FIX #1098: Performing balance verification after Full Rescan...")
 
-        // Get fresh balance from database
-        let finalBalance = (try? WalletDatabase.shared.getBalance(accountId: account.accountId)) ?? 0
+        // FIX #1304: Use getTotalUnspentBalance (no witness requirement) instead of getBalance.
+        // getBalance requires witness IS NOT NULL → returns 0 when witnesses are NULL.
+        let finalBalance = (try? WalletDatabase.shared.getTotalUnspentBalance(accountId: account.accountId)) ?? 0
         let finalNoteCount = (try? WalletDatabase.shared.getAllUnspentNotes(accountId: account.accountId).count) ?? 0
 
         // Check if balance is reasonable (notes exist but balance is 0 = problem)
@@ -11206,11 +11523,62 @@ final class WalletManager: ObservableObject {
     private static var isVerifyingNullifiers = false
     private static let verifyNullifiersLock = NSLock()
 
+    /// FIX #1319: Match nullifiers locally from delta bundle (no P2P needed for delta-covered range)
+    /// Returns spent nullifiers found in delta and the height range covered by delta.
+    /// Both wire-format and display-format hashes are checked (FIX #1195 dual-format safety).
+    private func matchDeltaNullifiersLocally(
+        hashedNullifiers: Set<Data>
+    ) -> (matches: [(hashedNullifier: Data, spentHeight: UInt64, txid: Data)], deltaRange: ClosedRange<UInt64>?) {
+        guard let manifest = DeltaCMUManager.shared.getManifest(),
+              manifest.endHeight > manifest.startHeight,
+              let deltaNullifiers = DeltaCMUManager.shared.loadNullifiers(),
+              !deltaNullifiers.isEmpty else {
+            return ([], nil)
+        }
+
+        let database = WalletDatabase.shared
+        let deltaRange = manifest.startHeight...manifest.endHeight
+        var matchedKeys = Set<Data>()
+        var matches: [(Data, UInt64, Data)] = []
+
+        for dn in deltaNullifiers {
+            // Delta stores nullifiers in wire format (same as P2P path)
+            let hashedWire = database.hashNullifier(dn.nullifier)
+            if hashedNullifiers.contains(hashedWire) && !matchedKeys.contains(hashedWire) {
+                matches.append((hashedWire, UInt64(dn.height), dn.txid))
+                matchedKeys.insert(hashedWire)
+            }
+            // FIX #1195: Also check reversed (display format)
+            let hashedDisplay = database.hashNullifier(Data(dn.nullifier.reversed()))
+            if hashedNullifiers.contains(hashedDisplay) && !matchedKeys.contains(hashedDisplay) {
+                matches.append((hashedDisplay, UInt64(dn.height), dn.txid))
+                matchedKeys.insert(hashedDisplay)
+            }
+        }
+
+        return (matches, deltaRange)
+    }
+
     /// Verify nullifier spend status for all unspent notes
     /// This is a fallback check that queries the blockchain for each note's nullifier
     /// Called after scan to catch any spent notes that were missed during normal scan
     /// FIX #1084: Runs in background, skips if pending tx, prevents concurrent runs
     func verifyNullifierSpendStatus() async throws {
+        // FIX #1290: Skip during Full Rescan — scan already handles spend detection
+        // Running concurrent verification competes for P2P peers and doubles scan time
+        let isRepairing = await MainActor.run { WalletManager.shared.isRepairingDatabase }
+        if isRepairing {
+            print("⏩ FIX #1290: Skipping FIX #1084 verification — Full Rescan in progress (handles spends)")
+            return
+        }
+
+        // FIX #1318: Gate — skip if intensive P2P already running
+        let isIntensiveP2P = await MainActor.run { NetworkManager.shared.isIntensiveP2PFetchInProgress }
+        if isIntensiveP2P {
+            print("⏭️ FIX #1318: Skipping nullifier verification — intensive P2P fetch in progress")
+            return
+        }
+
         // FIX #1084: Prevent concurrent verification runs
         WalletManager.verifyNullifiersLock.lock()
         guard !WalletManager.isVerifyingNullifiers else {
@@ -11342,6 +11710,22 @@ final class WalletManager: ObservableObject {
             print("🔍 FIX #1106: No valid checkpoint, scanning from oldest note height \(oldestHeight) to chain tip")
         }
 
+        // FIX #1319: Check delta nullifiers locally first — avoid P2P for delta-covered range
+        let (deltaMatches1319, deltaRange1319) = matchDeltaNullifiersLocally(
+            hashedNullifiers: Set(nullifierToNote.keys)
+        )
+        if !deltaMatches1319.isEmpty {
+            print("📦 FIX #1319: Found \(deltaMatches1319.count) spent note(s) in local delta")
+            for (hashedNull, spentHeight, txid) in deltaMatches1319 {
+                try database.markNoteSpentByHashedNullifier(hashedNullifier: hashedNull, txid: txid, spentHeight: spentHeight)
+                nullifierToNote.removeValue(forKey: hashedNull)
+            }
+        }
+        if let range = deltaRange1319, scanStartHeight >= range.lowerBound && scanStartHeight <= range.upperBound {
+            print("📦 FIX #1319: Advancing scan past delta range → \(range.upperBound + 1)")
+            scanStartHeight = range.upperBound + 1
+        }
+
         let blocksToScan = chainHeight - scanStartHeight
 
         // Skip if only a few blocks to scan (already synced)
@@ -11354,16 +11738,16 @@ final class WalletManager: ObservableObject {
         print("🔍 FIX #1093: Scanning \(blocksToScan) blocks (single pass for \(nullifierToNote.count) nullifiers)")
 
         // FIX #1095: Dynamic batch size based on peer capacity
-        // 6 peers × 128 blocks/peer = 768 blocks per round
+        // FIX #1287: Cap at 3 concurrent peers to prevent TCP congestion collapse
         let peerCount = await MainActor.run { networkManager.peers.filter { $0.isConnectionReady }.count }
         let maxBlocksPerPeer = 128
-        let batchSize: UInt64 = UInt64(max(peerCount, 1) * maxBlocksPerPeer)  // e.g., 6 peers × 128 = 768
+        let batchSize: UInt64 = UInt64(min(max(peerCount, 1), 3) * maxBlocksPerPeer)
         print("🔍 FIX #1095: Scanning \(blocksToScan) blocks with \(peerCount) peers (batch=\(batchSize))...")
 
         // Step 3: Scan blocks in batches, check all nullifiers per block
         // FIX #1106: Start from scanStartHeight (checkpoint) instead of oldestHeight
         var batchStart = scanStartHeight
-        var spentCount = 0
+        var spentCount = deltaMatches1319.count
         var blocksScanned: UInt64 = 0
         let startTime = Date()
 
@@ -11468,6 +11852,12 @@ final class WalletManager: ObservableObject {
 
         guard !spentNotes.isEmpty else {
             print("✅ FIX #563 v19: No spent notes to verify")
+            return 0
+        }
+
+        // FIX #1318: Gate — skip if intensive P2P already running
+        if networkManager.isIntensiveP2PFetchInProgress {
+            print("⏭️ FIX #1318: Skipping spent note verification — intensive P2P fetch in progress")
             return 0
         }
 
@@ -11616,9 +12006,10 @@ final class WalletManager: ObservableObject {
         }
 
         // FIX #1095: Dynamic batch size based on peer capacity (was fixed 160)
+        // FIX #1287: Cap at 3 concurrent peers to prevent TCP congestion collapse
         let peerCount = await MainActor.run { networkManager.peers.filter { $0.isConnectionReady }.count }
         let maxBlocksPerPeer = 128
-        let batchSize: UInt64 = UInt64(max(peerCount, 1) * maxBlocksPerPeer)  // e.g., 6 peers × 128 = 768
+        let batchSize: UInt64 = UInt64(min(max(peerCount, 1), 3) * maxBlocksPerPeer)
         print("🔍 FIX #1095: Checking \(blocksToScan) blocks for nullifier \(nullifier.prefix(16))... (batch=\(batchSize))")
 
         var batchStart = startHeight
@@ -11798,7 +12189,8 @@ final class WalletManager: ObservableObject {
         var recoveredCount = 0
         // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
         let peerCountRecovery = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-        let batchSize: UInt64 = UInt64(max(peerCountRecovery, 2) * 128)  // e.g., 7 peers × 128 = 896
+        // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+        let batchSize: UInt64 = UInt64(max(peerCountRecovery, 3) * 256)
 
         var batchStart = startHeight
         while batchStart < chainHeight {
@@ -12374,6 +12766,12 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
+        // FIX #1318: Gate — skip if intensive P2P already running
+        if networkManager.isIntensiveP2PFetchInProgress {
+            print("⏭️ FIX #1318: Skipping unspent note verification — intensive P2P fetch in progress")
+            return 0
+        }
+
         // FIX #1184: Ensure block listeners are RUNNING so dispatcher is active.
         // Previous startup steps (witness validation, delta sync) stop listeners and don't restart.
         // Without active listeners, P2P falls back to "direct reads" with 3s lock timeouts (~76 blocks/s).
@@ -12422,7 +12820,23 @@ final class WalletManager: ObservableObject {
         // This ensures we catch all historical spends ONCE, then use fast checkpoint-based verification
         let minNoteHeight = unspentNotes.map { $0.height }.min() ?? 0
         let storedCheckpoint = (try? database.getVerifiedCheckpointHeight()) ?? 0
-        let hasCompletedFullVerification = UserDefaults.standard.bool(forKey: "FIX1089_FullVerificationComplete")
+        var hasCompletedFullVerification = UserDefaults.standard.bool(forKey: "FIX1089_FullVerificationComplete")
+
+        // FIX #1283/1300: Reset checkpoint on code changes — previous version may have had bugs that
+        // caused missed spends (wrong nullifiers, P2P failures, checkpoint set with bad data).
+        // Forces a full re-scan from oldest note on every code change to catch stale phantom-unspent notes.
+        // FIX #1300: CFBundleVersion is always "1" during development — never triggers FIX #1283.
+        // Use a hardcoded verification version that we bump when spend-related code changes.
+        // This forces re-verification on the next startup after a code fix, catching phantom-unspent notes.
+        let verificationCodeVersion = "1302"  // FIX #1302: Bumped — re-scan after auto Full Rescan created phantom notes
+        let currentBuild = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
+        let lastVerifiedBuild = UserDefaults.standard.string(forKey: "FIX1283_LastVerifiedBuild") ?? ""
+        if hasCompletedFullVerification && currentBuild != lastVerifiedBuild {
+            print("🔄 FIX #1300: Code version changed (\(lastVerifiedBuild) → \(currentBuild)) — forcing full re-verification")
+            hasCompletedFullVerification = false
+            UserDefaults.standard.set(false, forKey: "FIX1089_FullVerificationComplete")
+            UserDefaults.standard.removeObject(forKey: "FIX1195_PartialScanHeight")
+        }
 
         // FIX #1090: Check persistent flag for nullifiers that were fixed (may be set across restarts)
         let needsFullVerificationAfterNullifierFix = UserDefaults.standard.bool(forKey: "FIX1090_NeedsFullVerification")
@@ -12595,8 +13009,14 @@ final class WalletManager: ObservableObject {
         var failedBatches = 0
         var consecutiveFailures = 0
         // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
-        let peerCountVerify = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-        let batchSize: UInt64 = UInt64(max(peerCountVerify, 2) * 128)  // e.g., 7 peers × 128 = 896
+        // FIX #1285: Use DISPATCHER-ACTIVE peer count, not total connected peers.
+        // Connected peers with inactive dispatchers return 0 blocks (FIX #1184 fast-return).
+        // Old code: 5 connected peers → batchSize=640, but only 1 active → 128 delivered →
+        // 20% < FIX #1218 50% threshold → EVERY batch fails → scan aborts → balance wrong.
+        // New: use activeDispatchers count (measured above) for correct sizing.
+        // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+        let effectivePeers = max(activeDispatchers, 1)
+        let batchSize: UInt64 = UInt64(max(effectivePeers, 3) * 256)
 
         // FIX #1252: Proportional timeout based on block count (was hardcoded 360s)
         // Real-world rate: 212 blocks/s (77K blocks in 364s from logs)
@@ -12610,6 +13030,25 @@ final class WalletManager: ObservableObject {
         print("🔍 FIX #1252: Scan timeout set to \(Int(maxScanDuration))s for \(blocksToScan) blocks (est. \(Int(estimatedSeconds))s at 200 blocks/s)")
 
         var batchStart = startHeight
+
+        // FIX #1319: Check delta nullifiers locally first — avoid P2P for delta-covered range
+        let (deltaMatches1319b, deltaRange1319b) = matchDeltaNullifiersLocally(
+            hashedNullifiers: Set(ourNullifiers.keys)
+        )
+        if !deltaMatches1319b.isEmpty {
+            print("📦 FIX #1319: Found \(deltaMatches1319b.count) spent note(s) in local delta")
+            for (hashedNull, spentHeight, txid) in deltaMatches1319b {
+                try database.markNoteSpentByHashedNullifier(hashedNullifier: hashedNull, txid: txid, spentHeight: spentHeight)
+                ourNullifiers.removeValue(forKey: hashedNull)
+                externalSpendsFound += 1
+            }
+        }
+        if let range = deltaRange1319b, batchStart >= range.lowerBound && batchStart <= range.upperBound {
+            print("📦 FIX #1319: Advancing scan past delta range → \(range.upperBound + 1)")
+            batchStart = range.upperBound + 1
+        }
+
+        var totalBlocksProcessed: Int = 0  // FIX #1301: Track actual coverage
         while batchStart < chainHeight {
             // Check total time limit
             if Date().timeIntervalSince(scanStartTime) > maxScanDuration {
@@ -12629,6 +13068,9 @@ final class WalletManager: ObservableObject {
             var batchSuccess = false
             var retries = 0
             let maxRetries = 2
+            // FIX #1301: Track actual coverage for cursor advancement
+            var batchMaxReceivedHeight: UInt64 = 0
+            var batchReceivedCount: Int = 0
 
             while !batchSuccess && retries <= maxRetries {
                 do {
@@ -12657,7 +13099,12 @@ final class WalletManager: ObservableObject {
                     successfulBatches += 1
                     consecutiveFailures = 0
 
+                    // FIX #1301: Track max received height for cursor advancement
+                    // Prevents skipping blocks when P2P returns partial batches
+                    var batchMaxHeight: UInt64 = 0
+
                     for (height, _, _, txData) in blocks {
+                        batchMaxHeight = max(batchMaxHeight, height)
                         for (txidHex, _, spends) in txData {
                             guard let spends = spends, !spends.isEmpty else { continue }
 
@@ -12737,6 +13184,14 @@ final class WalletManager: ObservableObject {
                             }
                         }
                     }
+
+                    // FIX #1301: Store batch coverage info for cursor advancement
+                    batchReceivedCount = blocks.count
+                    batchMaxReceivedHeight = batchMaxHeight
+                    totalBlocksProcessed += batchReceivedCount
+                    if batchReceivedCount < count {
+                        print("⚠️ FIX #1301: Partial batch \(batchReceivedCount)/\(count) blocks — will re-scan gap")
+                    }
                 } catch {
                     retries += 1
                     consecutiveFailures += 1
@@ -12761,15 +13216,46 @@ final class WalletManager: ObservableObject {
                 }
             }
 
-            // FIX #303 v5: Add delay between batches to let Tor circuits recover
-            if successfulBatches % 10 == 0 && successfulBatches > 0 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1s pause every 10 batches
+            // FIX #1284: Inter-batch TCP pacing to prevent congestion collapse.
+            // Without pacing, 3 peers each getting 128-block requests every 0.2s causes
+            // TCP window exhaustion: 1600 blocks/s → 38 blocks/s (42x drop) by batch 47.
+            // FIX #1197 solved this for delta sync with 300ms inter-round delay.
+            // Same pattern here: 150ms per batch gives TCP windows time to drain.
+            // Also ramp up delay for sustained loads (like FIX #1197 adaptive pacing):
+            // Batches 1-5: 100ms (burst), 6-15: 150ms, 16+: 200ms
+            if batchSuccess {
+                let pacingDelay: UInt64
+                if successfulBatches <= 5 {
+                    pacingDelay = 100_000_000  // 100ms - burst phase
+                } else if successfulBatches <= 15 {
+                    pacingDelay = 150_000_000  // 150ms - steady phase
+                } else {
+                    pacingDelay = 200_000_000  // 200ms - sustained phase
+                }
+                try? await Task.sleep(nanoseconds: pacingDelay)
             }
 
-            batchStart += batchSize
+            // FIX #1301: Advance cursor based on ACTUAL blocks received, not batch size.
+            // Previous code: `batchStart += batchSize` — skipped blocks on partial P2P batches.
+            // If P2P returned 400/1280 blocks, cursor jumped past 880 unchecked blocks.
+            // Nullifiers in those skipped blocks were NEVER checked → phantom-unspent notes.
+            if batchSuccess && batchReceivedCount < count && batchMaxReceivedHeight > 0 {
+                // Partial batch — advance to max received height + 1 (don't skip gaps)
+                batchStart = batchMaxReceivedHeight + 1
+            } else {
+                // Full batch or failed batch — advance normally
+                batchStart += batchSize
+            }
         }
 
         onProgress?(blocksToScan, blocksToScan)
+
+        // FIX #1301: Report scan coverage
+        let coveragePercent = blocksToScan > 0 ? (totalBlocksProcessed * 100 / blocksToScan) : 100
+        print("📊 FIX #1301: Scan coverage: \(totalBlocksProcessed)/\(blocksToScan) blocks (\(coveragePercent)%)")
+        if coveragePercent < 95 {
+            print("⚠️ FIX #1301: LOW COVERAGE — \(blocksToScan - totalBlocksProcessed) blocks were NOT checked for nullifiers")
+        }
 
         // Report scan results
         let totalBatches = successfulBatches + failedBatches
@@ -12803,9 +13289,11 @@ final class WalletManager: ObservableObject {
                     message: "Detected \(externalSpendsFound) transaction(s) from another wallet totaling \(String(format: "%.8f", correctedZCL)) ZCL. Your balance has been corrected."
                 )
             }
-        } else if failedBatches > 0 || scanTimedOut {
-            // FIX #1195b: Timed-out scans are NOT complete — don't set checkpoint flag
+        } else if failedBatches > 0 || scanTimedOut || coveragePercent < 95 {
+            // FIX #1195b/#1301: Incomplete scans are NOT complete — don't set checkpoint flag
+            // FIX #1301: Also check coverage percentage — partial P2P batches leave gaps
             print("⚠️ FIX #303: Partial scan - \(successfulBatches)/\(totalBatches) batches succeeded\(scanTimedOut ? " (TIMED OUT)" : "")")
+            print("   Coverage: \(coveragePercent)% (\(totalBlocksProcessed)/\(blocksToScan) blocks)")
             print("   No external spends found in scanned blocks, but scan was incomplete")
             print("   DO NOT mark verification as complete — will retry with smart start next time")
         } else {
@@ -12825,6 +13313,10 @@ final class WalletManager: ObservableObject {
                     // FIX #1089: Mark full verification as complete
                     // Next startup will trust checkpoint instead of re-scanning from oldest note
                     UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                    // FIX #1300: Save code version to detect changes on next startup
+                    let verificationCodeVersion = "1302"
+                    let buildForCheckpoint = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
+                    UserDefaults.standard.set(buildForCheckpoint, forKey: "FIX1283_LastVerifiedBuild")
                     // FIX #1090: Clear the nullifier fix flag now that we've done full verification
                     UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
                     // FIX #1195c: Clear partial scan progress — full scan completed
@@ -12985,15 +13477,25 @@ final class WalletManager: ObservableObject {
     /// Called once at app startup after initial sync completes
     /// FIX #370 v2: Run immediately at startup, then every 30 minutes
     func startPeriodicDeepVerification() {
-        // Run immediately on startup (don't wait 30 minutes!)
+        // FIX #1320: Delay initial deep verification by 120s to avoid startup P2P contention
+        // Multiple concurrent P2P operations (delta sync, witness rebuild, verification) compete
+        // for the same 5 TCP connections, causing cs_main serialization and dispatcher contention.
+        // Delaying verification lets startup-critical operations finish first.
         Task { @MainActor in
-            // FIX #1239: Also check isRebuildingWitnesses to prevent interference during validation
+            print("⏳ FIX #1320: Delaying initial deep verification by 120 seconds...")
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+
+            // FIX #1239: Check isRebuildingWitnesses to prevent interference during validation
             guard !self.isSyncing && !self.isRepairingDatabase && !self.isRebuildingWitnesses else {
-                print("⏭️ FIX #370: Skipping immediate deep verification - sync/repair/rebuild in progress")
+                print("⏭️ FIX #1320: Skipping delayed deep verification - sync/repair/rebuild in progress")
+                return
+            }
+            // FIX #1318: Gate — skip if intensive P2P already running
+            if NetworkManager.shared.isIntensiveP2PFetchInProgress {
+                print("⏭️ FIX #1318+#1320: Skipping delayed deep verification — intensive P2P in progress")
                 return
             }
 
-            // Immediate run at startup
             let found = try? await self.performDeepVerification()
             if let found = found, found > 0 {
                 print("🔔 FIX #370: Startup deep verification found \(found) missed transaction(s)!")
@@ -13013,6 +13515,11 @@ final class WalletManager: ObservableObject {
                 // FIX #1239: Also check isRebuildingWitnesses to prevent interference during validation
                 guard !self.isSyncing && !self.isRepairingDatabase && !self.isRebuildingWitnesses else {
                     print("⏭️ FIX #370: Skipping periodic deep verification - sync/repair/rebuild in progress")
+                    return
+                }
+                // FIX #1318: Gate — skip if intensive P2P already running
+                if NetworkManager.shared.isIntensiveP2PFetchInProgress {
+                    print("⏭️ FIX #1318: Skipping periodic deep verification — intensive P2P in progress")
                     return
                 }
                 let found = try? await self.performDeepVerification()
@@ -13047,6 +13554,11 @@ final class WalletManager: ObservableObject {
                 // Escalation #3 log shows this race condition.
                 guard !self.isSyncing && !self.isRepairingDatabase && !self.isRebuildingWitnesses else {
                     print("⏭️ FIX #603: Skipping periodic witness refresh - sync/repair/rebuild in progress")
+                    return
+                }
+                // FIX #1318: Gate — skip if intensive P2P already running
+                if NetworkManager.shared.isIntensiveP2PFetchInProgress {
+                    print("⏭️ FIX #1318: Skipping periodic witness refresh — intensive P2P in progress")
                     return
                 }
                 let updated = try? await self.refreshAllNoteWitnesses()

@@ -584,7 +584,7 @@ enum ZipherXFFI {
             return nil
         }
 
-        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txOutput = [UInt8](repeating: 0, count: 100000) // FIX #1323: 100KB for multi-input TXs
         var txLen: Int = 0
 
         let memoData = memo ?? Data(repeating: 0, count: 512)
@@ -663,7 +663,7 @@ enum ZipherXFFI {
             }
         }
 
-        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txOutput = [UInt8](repeating: 0, count: 100000) // FIX #1323: 100KB for multi-input TXs
         var txLen: Int = 0
         var nullifiersOutput = [UInt8](repeating: 0, count: 32 * spends.count)
 
@@ -925,7 +925,22 @@ enum ZipherXFFI {
 
     /// Load a witness into memory for tracking/updating
     /// FIX #1177: Returns ARRAY INDEX (not tree position) or UInt64.max on error
+    /// FIX #1313: Pad compact witnesses (838-901 bytes) to 1028 bytes before passing to Rust.
+    /// The FFI tree serializes witnesses in compact format via read/write_incremental_witness,
+    /// but zipherx_tree_load_witness requires >= 1028 bytes. Padding with zeros is safe because
+    /// read_incremental_witness only reads the exact bytes it needs (ignores trailing padding).
+    /// witnessGetRoot already accepts >= 100 bytes and handles these compact witnesses fine.
     static func treeLoadWitness(witnessData: UnsafePointer<UInt8>, witnessLen: Int) -> UInt64 {
+        if witnessLen < 1028 && witnessLen >= 100 {
+            // FIX #1313: Pad compact witness to 1028 bytes
+            var padded = [UInt8](repeating: 0, count: 1028)
+            padded.withUnsafeMutableBufferPointer { buffer in
+                buffer.baseAddress!.update(from: witnessData, count: witnessLen)
+            }
+            return padded.withUnsafeBufferPointer { buffer in
+                zipherx_tree_load_witness(buffer.baseAddress!, 1028)
+            }
+        }
         return zipherx_tree_load_witness(witnessData, witnessLen)
     }
 
@@ -1886,7 +1901,7 @@ enum ZipherXFFI {
             return nil
         }
 
-        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txOutput = [UInt8](repeating: 0, count: 100000) // FIX #1323: 100KB for multi-input TXs
         var txLen: Int = 0
 
         let memoData = memo ?? Data(repeating: 0, count: 512)
@@ -1964,7 +1979,7 @@ enum ZipherXFFI {
             }
         }
 
-        var txOutput = [UInt8](repeating: 0, count: 10000)
+        var txOutput = [UInt8](repeating: 0, count: 100000) // FIX #1323: 100KB for multi-input TXs
         var txLen: Int = 0
         var nullifiersOutput = [UInt8](repeating: 0, count: 32 * spends.count)
 

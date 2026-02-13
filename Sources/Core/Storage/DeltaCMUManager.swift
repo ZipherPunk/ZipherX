@@ -43,10 +43,15 @@ class DeltaCMUManager {
     private let deltaFileName = "shielded_outputs_delta.bin"
     private let manifestFileName = "delta_manifest.json"
     private let saplingRootsFileName = "delta_sapling_roots.bin"  // FIX #1253
+    private let nullifiersFileName = "delta_nullifiers.bin"  // FIX #1289 v3
 
     /// Output record size - MUST match GitHub boost file format exactly
     /// height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) = 652 bytes
     static let OUTPUT_SIZE = 652
+
+    /// FIX #1289 v3: Nullifier record size for spend detection during Full Rescan
+    /// height(4) + txid(32) + nullifier(32) = 68 bytes
+    static let NULLIFIER_RECORD_SIZE = 68
 
     // MARK: - Properties
 
@@ -65,6 +70,11 @@ class DeltaCMUManager {
     // Append-only. Cleared only by clearDeltaBundle(). Immutable when DeltaBundleVerified.
     private var saplingRootsFileURL: URL {
         return AppDirectories.appData.appendingPathComponent(saplingRootsFileName)
+    }
+
+    /// FIX #1289 v3: Delta nullifiers file for local spend detection
+    private var nullifiersFileURL: URL {
+        return AppDirectories.appData.appendingPathComponent(nullifiersFileName)
     }
 
     // Thread safety
@@ -150,6 +160,37 @@ class DeltaCMUManager {
             let ciphertext = data.subdata(in: (offset + 72)..<(offset + 652))
 
             return DeltaOutput(height: height, index: index, cmu: cmu, epk: epk, ciphertext: ciphertext)
+        }
+    }
+
+    /// FIX #1289 v3: Represents a single nullifier (spend) from a delta-range block.
+    /// Stored in delta_nullifiers.bin for local spend detection during Full Rescan.
+    /// When Phase 1b runs, these nullifiers are matched against discovered notes
+    /// to detect spends without P2P block fetching.
+    struct DeltaNullifier {
+        let height: UInt32
+        let txid: Data       // 32 bytes, wire format (reversed byte order)
+        let nullifier: Data  // 32 bytes, wire format
+
+        /// Serialize to 68-byte record
+        func serialize() -> Data {
+            var data = Data(capacity: DeltaCMUManager.NULLIFIER_RECORD_SIZE)
+            var h = height.littleEndian
+            data.append(Data(bytes: &h, count: 4))
+            data.append(txid.count >= 32 ? txid.prefix(32) : txid + Data(count: 32 - txid.count))
+            data.append(nullifier.count >= 32 ? nullifier.prefix(32) : nullifier + Data(count: 32 - nullifier.count))
+            return data
+        }
+
+        /// Parse from 68-byte record
+        static func parse(from data: Data, at offset: Int) -> DeltaNullifier? {
+            guard data.count >= offset + DeltaCMUManager.NULLIFIER_RECORD_SIZE else { return nil }
+            let height = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
+                $0.load(as: UInt32.self).littleEndian
+            }
+            let txid = data.subdata(in: (offset + 4)..<(offset + 36))
+            let nullifier = data.subdata(in: (offset + 36)..<(offset + 68))
+            return DeltaNullifier(height: height, txid: txid, nullifier: nullifier)
         }
     }
 
@@ -450,6 +491,63 @@ class DeltaCMUManager {
         }
     }
 
+    // MARK: - FIX #1289 v3: Delta Nullifier Storage
+
+    /// Append nullifiers (spends) collected during delta sync.
+    /// These enable Phase 1b to detect spends locally during Full Rescan.
+    func appendNullifiers(_ nullifiers: [DeltaNullifier]) {
+        guard !nullifiers.isEmpty else { return }
+        queue.sync {
+            do {
+                var fileData: Data
+                if FileManager.default.fileExists(atPath: nullifiersFileURL.path) {
+                    fileData = try Data(contentsOf: nullifiersFileURL)
+                } else {
+                    fileData = Data()
+                }
+                for nf in nullifiers {
+                    fileData.append(nf.serialize())
+                }
+                try fileData.write(to: nullifiersFileURL)
+                let totalCount = fileData.count / Self.NULLIFIER_RECORD_SIZE
+                print("📦 FIX #1289 v3: Saved \(nullifiers.count) nullifiers (total: \(totalCount))")
+            } catch {
+                print("⚠️ FIX #1289 v3: Failed to save nullifiers: \(error)")
+            }
+        }
+    }
+
+    /// Load all stored nullifiers for local spend detection.
+    /// Returns nil if no nullifiers file exists.
+    func loadNullifiers() -> [DeltaNullifier]? {
+        guard FileManager.default.fileExists(atPath: nullifiersFileURL.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: nullifiersFileURL)
+            guard data.count >= Self.NULLIFIER_RECORD_SIZE else { return nil }
+            let count = data.count / Self.NULLIFIER_RECORD_SIZE
+            var nullifiers: [DeltaNullifier] = []
+            nullifiers.reserveCapacity(count)
+            for i in 0..<count {
+                if let nf = DeltaNullifier.parse(from: data, at: i * Self.NULLIFIER_RECORD_SIZE) {
+                    nullifiers.append(nf)
+                }
+            }
+            print("📦 FIX #1289 v3: Loaded \(nullifiers.count) nullifiers from delta bundle")
+            return nullifiers.isEmpty ? nil : nullifiers
+        } catch {
+            print("⚠️ FIX #1289 v3: Failed to load nullifiers: \(error)")
+            return nil
+        }
+    }
+
+    /// Check if delta bundle has nullifiers stored (for Phase 1b v3 eligibility)
+    func hasNullifiers() -> Bool {
+        guard FileManager.default.fileExists(atPath: nullifiersFileURL.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: nullifiersFileURL.path),
+              let size = attrs[.size] as? UInt64 else { return false }
+        return size >= UInt64(Self.NULLIFIER_RECORD_SIZE)
+    }
+
     /// Replace the entire delta bundle with new data
     func replaceDeltaBundle(outputs: [DeltaOutput], startHeight: UInt64, endHeight: UInt64, treeRoot: Data) {
         queue.sync {
@@ -536,6 +634,7 @@ class DeltaCMUManager {
             try? FileManager.default.removeItem(at: deltaFileURL)
             try? FileManager.default.removeItem(at: manifestFileURL)
             try? FileManager.default.removeItem(at: saplingRootsFileURL)  // FIX #1253
+            try? FileManager.default.removeItem(at: nullifiersFileURL)  // FIX #1289 v3
             cachedOutputCount = 0
             cachedEndHeight = 0
             // FIX #1252: Any delta clear invalidates the verified flag.
@@ -578,6 +677,40 @@ class DeltaCMUManager {
             // Also add to in-memory cache (both byte orders for FIX #1230)
             HeaderStore.shared.deltaSaplingRoots.insert(root)
             HeaderStore.shared.deltaSaplingRoots.insert(Data(root.reversed()))
+        }
+    }
+
+    /// FIX #1287: Batch append multiple sapling roots in a single file I/O operation.
+    /// Replaces per-block appendSaplingRoot() calls that open/seek/write/close for EACH block
+    /// (128 file I/O ops per peer batch → 1 file I/O op).
+    func appendSaplingRootsBatch(_ entries: [(height: UInt64, root: Data)]) {
+        let validEntries = entries.filter { $0.root.count == 32 }
+        guard !validEntries.isEmpty else { return }
+        queue.sync {
+            // Build all entries into one Data buffer (40 bytes each)
+            var allData = Data(capacity: validEntries.count * 40)
+            for (height, root) in validEntries {
+                var h = height
+                withUnsafeBytes(of: &h) { allData.append(contentsOf: $0) }  // 8 bytes LE
+                allData.append(root)  // 32 bytes
+            }
+
+            // Single file write instead of per-block open/seek/write/close
+            if FileManager.default.fileExists(atPath: saplingRootsFileURL.path) {
+                if let handle = try? FileHandle(forWritingTo: saplingRootsFileURL) {
+                    handle.seekToEndOfFile()
+                    handle.write(allData)
+                    handle.closeFile()
+                }
+            } else {
+                try? allData.write(to: saplingRootsFileURL)
+            }
+
+            // Update in-memory cache (both byte orders for FIX #1230)
+            for (_, root) in validEntries {
+                HeaderStore.shared.deltaSaplingRoots.insert(root)
+                HeaderStore.shared.deltaSaplingRoots.insert(Data(root.reversed()))
+            }
         }
     }
 

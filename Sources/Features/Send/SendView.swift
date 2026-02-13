@@ -39,6 +39,12 @@ struct PreparedTransaction {
     var isValid: Bool {
         Date().timeIntervalSince(preparedAt) < 120.0
     }
+
+    // FIX #1325: Static cache persists across SendView lifecycle.
+    // When user closes Send window and reopens with same parameters,
+    // reuse the prepared TX instead of regenerating Groth16 proofs (~25s).
+    // Invalidated by: 2-minute timeout, parameter change, balance change, successful send.
+    static var cached: PreparedTransaction? = nil
 }
 
 /// Send View - Send shielded ZCL transactions (z-to-z only!)
@@ -87,6 +93,7 @@ struct SendView: View {
     @State private var isPreparingTransaction = false
     @State private var preparationTask: Task<Void, Never>? = nil
     @State private var preparationProgress: String = ""
+    @State private var preparationError: String? = nil  // FIX #1314: Show error when pre-verification fails
 
     // FIX #109: Debounce preparation to prevent multiple concurrent builds when typing
     @State private var preparationDebounceTask: Task<Void, Never>? = nil
@@ -150,6 +157,17 @@ struct SendView: View {
                             Text("Transaction ready - instant send enabled")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.successColor)
+                        }
+                        .padding(.vertical, 4)
+                    } else if let error = preparationError, isValidInput {
+                        // FIX #1314: Show error when pre-verification fails
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(theme.warningColor)
+                            Text(error)
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.warningColor)
+                                .lineLimit(2)
                         }
                         .padding(.vertical, 4)
                     }
@@ -230,7 +248,9 @@ struct SendView: View {
                     // FIX #1098: Also disable when balance integrity issue detected
                     // FIX #1139: Disable during pre-build phase - only enable when TX is ready
                     // FIX #1141: Also disable when witnesses are corrupted
-                    .disabled(isSending || !isValidInput || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send) || walletManager.balanceIntegrityIssue || isPreparingTransaction || walletManager.hasCorruptedWitnesses || walletManager.isGapFillingDelta)
+                    // FIX #1314: Send enabled ONLY when transaction preparation succeeds
+                    // Button stays disabled until pre-verification builds the zk-SNARK proof
+                    .disabled(isSending || !isValidInput || preparedTransaction == nil || hasPendingTransaction || walletManager.isCatchingUp || walletManager.isRepairingHistory || networkManager.isFeatureBlocked(.send) || walletManager.balanceIntegrityIssue || walletManager.hasCorruptedWitnesses || walletManager.isGapFillingDelta)
                 }
                 .padding()
             }
@@ -1612,6 +1632,7 @@ struct SendView: View {
         preparationTask?.cancel()
         preparationTask = nil
         preparedTransaction = nil
+        PreparedTransaction.cached = nil  // FIX #1325: Also clear persistent cache
         isPreparingTransaction = false
         preparationProgress = ""
     }
@@ -1641,6 +1662,20 @@ struct SendView: View {
             return
         }
 
+        // FIX #1325: Restore from persistent cache if view was recreated (closed + reopened).
+        // The prepared TX (Groth16 proofs) is still valid if wallet state hasn't changed.
+        // Saves ~25 seconds of proof generation for 27-spend "max" transactions.
+        if preparedTransaction == nil,
+           let cached = PreparedTransaction.cached,
+           cached.isValid,
+           cached.toAddress == recipientAddress,
+           cached.amount == currentZatoshis,
+           cached.memo == (memo.isEmpty ? nil : memo) {
+            preparedTransaction = cached
+            print("⚡ FIX #1325: Restored cached transaction — skipping proof generation!")
+            return
+        }
+
         // FIX #109: Cancel any existing debounce task (user is still typing)
         preparationDebounceTask?.cancel()
 
@@ -1662,6 +1697,7 @@ struct SendView: View {
                     // Start new preparation
                     isPreparingTransaction = true
                     preparationProgress = "Initializing..."
+                    preparationError = nil  // FIX #1314: Clear previous error
 
                     preparationTask = Task {
                         await prepareTransaction()
@@ -1751,7 +1787,7 @@ struct SendView: View {
 
             // Store prepared transaction
             await MainActor.run {
-                self.preparedTransaction = PreparedTransaction(
+                let prepared = PreparedTransaction(
                     rawTx: rawTx,
                     spentNullifier: spentNullifier,
                     toAddress: toAddress,
@@ -1760,6 +1796,8 @@ struct SendView: View {
                     preparedAtHeight: heightBeforePrep,
                     preparedAt: Date()
                 )
+                self.preparedTransaction = prepared
+                PreparedTransaction.cached = prepared  // FIX #1325: Persist across view lifecycle
                 self.isPreparingTransaction = false
                 self.preparationProgress = ""
                 print("⚡ Transaction prepared at height \(heightBeforePrep) - ready for instant send!")
@@ -1773,9 +1811,16 @@ struct SendView: View {
             await MainActor.run {
                 isPreparingTransaction = false
                 preparationProgress = ""
-                // Don't show error - just silently fail preparation
-                // User can still send normally
-                print("⚠️ Transaction preparation failed: \(error.localizedDescription)")
+                // FIX #1314: Show error to user instead of silently failing
+                let errorMsg = error.localizedDescription
+                if errorMsg.contains("Insufficient") {
+                    preparationError = "Insufficient spendable balance — witnesses may need repair"
+                } else if errorMsg.contains("Anchor not found") || errorMsg.contains("anchorNotOnChain") {
+                    preparationError = "Witness anchors invalid — go to Settings → Repair Database"
+                } else {
+                    preparationError = "Transaction preparation failed: \(errorMsg)"
+                }
+                print("⚠️ Transaction preparation failed: \(errorMsg)")
             }
         }
     }

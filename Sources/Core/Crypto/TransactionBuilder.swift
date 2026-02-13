@@ -833,49 +833,82 @@ final class TransactionBuilder {
                 treeIsValid = false
             }
 
-            let anchorMatchesTree = allValid && commonAnchor != nil && commonAnchor == currentTreeRoot && treeIsValid
+            var anchorMatchesTree = allValid && commonAnchor != nil && commonAnchor == currentTreeRoot && treeIsValid
+
+            // FIX #1324: INSTANT mode for stale-but-valid witnesses.
+            // After app restart, delta sync may grow the tree by 1+ CMU, making DB witnesses "stale"
+            // (their anchor ≠ current FFI tree root). But if the anchor IS verified in HeaderStore,
+            // the witnesses are perfectly valid for spending — Sapling allows ANY historical anchor.
+            // This avoids the ~85-second witness rebuild on every first "max" send after restart.
+            var usingStaleButValidWitnesses = false
+            if !anchorMatchesTree && allValid, let staleAnchor = commonAnchor {
+                // Anchor already passed HeaderStore check at line 754 (FIX #1224).
+                // Double-check here for safety.
+                let staleAnchorOnChain = await HeaderStore.shared.containsSaplingRoot(staleAnchor)
+                if staleAnchorOnChain {
+                    let anchorHex = staleAnchor.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("✅ FIX #1324: Stale witnesses with VALID anchor \(anchorHex)... in HeaderStore — INSTANT mode")
+                    print("   Sapling allows historical anchors — no rebuild needed")
+                    anchorMatchesTree = true
+                    usingStaleButValidWitnesses = true
+                }
+            }
 
             if allValid && anchorMatchesTree {
                 // INSTANT MODE: All witnesses are valid with matching anchors that match current tree!
-                print("✅ Multi-input INSTANT mode: All \(selectedNotes.count) notes have valid witnesses with matching anchors!")
-
-                // FIX #557 v46: Ensure tree is loaded and rebuild any stale witnesses
-                if ZipherXFFI.treeSize() == 0 {
-                    print("⚠️ FIX #557 v46: Global tree not loaded, loading from database...")
-                    if let treeState = try? WalletDatabase.shared.getTreeState() {
-                        if ZipherXFFI.treeDeserialize(data: treeState) {
-                            print("✅ FIX #557 v46: Tree state loaded (size: \(ZipherXFFI.treeSize()))")
-                        }
-                    }
+                if usingStaleButValidWitnesses {
+                    print("✅ FIX #1324: Multi-input INSTANT mode: \(selectedNotes.count) notes with STALE-BUT-VALID witnesses")
+                } else {
+                    print("✅ Multi-input INSTANT mode: All \(selectedNotes.count) notes have valid witnesses with matching anchors!")
                 }
 
-                let currentTreeRoot = ZipherXFFI.treeRoot()
-                var rebuildCount = 0
-
-                for note in selectedNotes {
-                    var witnessToUse = note.witness
-
-                    // Check if witness is stale
-                    if let wRoot = ZipherXFFI.witnessGetRoot(note.witness),
-                       let tRoot = currentTreeRoot,
-                       wRoot != tRoot {
-                        print("⚠️ FIX #557 v46: Witness is stale, rebuilding...")
-                        if let cmu = note.cmu, let cachedData = cachedBoostFileData {
-                            if let result = ZipherXFFI.treeCreateWitnessForCMU(
-                                cmuData: cachedData,
-                                targetCMU: cmu
-                            ) {
-                                witnessToUse = result.witness
-                                rebuildCount += 1
+                if usingStaleButValidWitnesses {
+                    // FIX #1324: Witnesses are stale but valid — use as-is with their own anchor.
+                    // Do NOT attempt per-witness rebuild: that would create witnesses at the CURRENT
+                    // tree root while commonAnchor is at the STALE root → anchor mismatch in TX.
+                    for note in selectedNotes {
+                        preparedSpends.append((note: note, witness: note.witness, anchor: commonAnchor!))
+                    }
+                    print("✅ FIX #1324: Using \(preparedSpends.count) stale-but-valid witnesses directly")
+                } else {
+                    // FIX #557 v46: Ensure tree is loaded and rebuild any stale witnesses
+                    if ZipherXFFI.treeSize() == 0 {
+                        print("⚠️ FIX #557 v46: Global tree not loaded, loading from database...")
+                        if let treeState = try? WalletDatabase.shared.getTreeState() {
+                            if ZipherXFFI.treeDeserialize(data: treeState) {
+                                print("✅ FIX #557 v46: Tree state loaded (size: \(ZipherXFFI.treeSize()))")
                             }
                         }
                     }
 
-                    preparedSpends.append((note: note, witness: witnessToUse, anchor: commonAnchor!))
-                }
+                    let currentTreeRoot = ZipherXFFI.treeRoot()
+                    var rebuildCount = 0
 
-                if rebuildCount > 0 {
-                    print("✅ FIX #557 v46: Rebuilt \(rebuildCount)/\(selectedNotes.count) stale witnesses")
+                    for note in selectedNotes {
+                        var witnessToUse = note.witness
+
+                        // Check if witness is stale
+                        if let wRoot = ZipherXFFI.witnessGetRoot(note.witness),
+                           let tRoot = currentTreeRoot,
+                           wRoot != tRoot {
+                            print("⚠️ FIX #557 v46: Witness is stale, rebuilding...")
+                            if let cmu = note.cmu, let cachedData = cachedBoostFileData {
+                                if let result = ZipherXFFI.treeCreateWitnessForCMU(
+                                    cmuData: cachedData,
+                                    targetCMU: cmu
+                                ) {
+                                    witnessToUse = result.witness
+                                    rebuildCount += 1
+                                }
+                            }
+                        }
+
+                        preparedSpends.append((note: note, witness: witnessToUse, anchor: commonAnchor!))
+                    }
+
+                    if rebuildCount > 0 {
+                        print("✅ FIX #557 v46: Rebuilt \(rebuildCount)/\(selectedNotes.count) stale witnesses")
+                    }
                 }
             } else if allValid && commonAnchor != nil && currentTreeRoot != nil {
                 // Check if anchors match but tree validation failed, OR if anchors are actually stale
@@ -1831,7 +1864,7 @@ final class TransactionBuilder {
 
         // FIX #115: Use chainHeight if provided, otherwise fetch current chain height
         // This ensures all witnesses are built to the SAME tree state
-        let targetHeight: UInt64
+        var targetHeight: UInt64
         if let explicitChainHeight = chainHeight {
             targetHeight = explicitChainHeight
             print("📊 Using explicit chain height: \(targetHeight)")
@@ -1863,11 +1896,18 @@ final class TransactionBuilder {
             print("   CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())... at height \(note.height) \(status)")
         }
 
-        // 2. Extract CMUs from boost file in legacy format (fast bulk read)
-        print("📦 Extracting CMUs from boost file...")
-        let boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
-            if Int(progress * 100) % 10 == 0 {
-                print("   Extracting boost CMUs: \(Int(progress * 100))%")
+        // 2. Get boost CMU data — prefer FastWalletCache (in-memory) over file extraction
+        // FIX #1313: FastWalletCache already has boost CMU data loaded (~32MB in RAM)
+        let boostCMUData: Data
+        if let cachedData = await FastWalletCache.shared.getTreeData() {
+            boostCMUData = cachedData
+            print("⚡ FIX #1313: Using boost CMU data from FastWalletCache (instant, ~\(cachedData.count / 1_000_000)MB)")
+        } else {
+            print("📦 Extracting CMUs from boost file...")
+            boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
+                if Int(progress * 100) % 10 == 0 {
+                    print("   Extracting boost CMUs: \(Int(progress * 100))%")
+                }
             }
         }
 
@@ -1876,30 +1916,36 @@ final class TransactionBuilder {
         let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
         print("📊 Boost file has \(boostCMUCount) CMUs up to height \(downloadedTreeHeight)")
 
-        // 3. Fetch delta CMUs from chain (only blocks beyond boost file)
-        // FIX #115: Fetch to targetHeight (chain tip), NOT maxNoteHeight
-        // This ensures witnesses are built to a consistent, current tree state
-        // FIX #1225: Throw error if P2P fetch fails - prevents creating stale witnesses
+        // 3. Get delta CMUs — prefer LOCAL DeltaCMUManager over P2P fetch
+        // FIX #1313: P2P fetching produces wrong tree root because:
+        //   - P2P may return blocks out of order (even with FIX #1199 sorting)
+        //   - P2P may silently miss blocks (incomplete delta, FIX #1185)
+        //   - P2P-fetched CMUs differ from DeltaCMUManager CMUs used to build the global FFI tree
+        // Using DeltaCMUManager ensures the batch tree matches the FFI tree root exactly.
         var deltaCMUs: [Data] = []
         if targetHeight > downloadedTreeHeight {
-            let startHeight = downloadedTreeHeight + 1
-            print("📡 Fetching delta CMUs from blocks \(startHeight) to \(targetHeight)...")
+            // PRIORITY 1: Use local DeltaCMUManager (instant, matches FFI tree)
+            if let localDeltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs(), !localDeltaCMUs.isEmpty {
+                deltaCMUs = localDeltaCMUs
+                if let manifest = DeltaCMUManager.shared.getManifest() {
+                    // Cap target height to what delta actually covers
+                    targetHeight = min(targetHeight, manifest.endHeight)
+                    print("⚡ FIX #1313: Using \(deltaCMUs.count) local delta CMUs (instant! covers up to height \(targetHeight))")
+                } else {
+                    print("⚡ FIX #1313: Using \(deltaCMUs.count) local delta CMUs (no manifest)")
+                }
+            } else {
+                // PRIORITY 2: P2P fetch (only when no local delta exists)
+                let startHeight = downloadedTreeHeight + 1
+                print("📡 FIX #1313: No local delta, fetching CMUs via P2P from \(startHeight) to \(targetHeight)...")
+                deltaCMUs = try await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
+                let blockRange = targetHeight - startHeight + 1
+                print("📊 Fetched \(deltaCMUs.count) delta CMUs from P2P (covering \(blockRange) blocks)")
 
-            // Use batched P2P-first fetching (reduces log spam, works with Tor)
-            // FIX #1225: This now throws if P2P fetch fails with empty CMUs
-            // FIX #1226: Also throws if partial coverage path returns incomplete data
-            deltaCMUs = try await fetchCMUsFromBlocks(startHeight: startHeight, endHeight: targetHeight)
-            let blockRange = targetHeight - startHeight + 1
-            print("📊 Fetched \(deltaCMUs.count) delta CMUs from chain (covering \(blockRange) blocks)")
-
-            // FIX #1226: Sanity check — if we requested thousands of blocks but got 0 CMUs,
-            // the data is suspicious. While some block ranges legitimately have 0 shielded outputs,
-            // ranges >1000 blocks with 0 CMUs almost certainly indicate a fetch failure that
-            // fetchCMUsFromBlocks didn't detect (e.g., blocks returned but CMU extraction failed).
-            if deltaCMUs.isEmpty && blockRange > 1000 {
-                print("🚨 FIX #1226: Got 0 CMUs from \(blockRange) blocks — highly suspicious!")
-                print("🚨 FIX #1226: Refusing to create witnesses with stale boost-only data")
-                throw TransactionError.deltaCMUsFetchFailed(blockRange: blockRange)
+                if deltaCMUs.isEmpty && blockRange > 1000 {
+                    print("🚨 FIX #1226: Got 0 CMUs from \(blockRange) blocks — refusing stale data")
+                    throw TransactionError.deltaCMUsFetchFailed(blockRange: blockRange)
+                }
             }
         }
 
@@ -2148,18 +2194,15 @@ final class TransactionBuilder {
                                         for output in outputs {
                                             if let cmuData = Data(hex: output.cmu) {
                                                 allCMUs.append(cmuData)
-                                            }
-                                            // FIX #1190: Build delta output from P2P remainder
-                                            if let cmuDisplay = Data(hex: output.cmu),
-                                               let epkDisplay = Data(hex: output.ephemeralKey),
-                                               let encCiphertext = Data(hex: output.encCiphertext),
-                                               encCiphertext.count == 580 {
+                                                // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                                let epk = Data(hex: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                                let ciphertext = Data(hex: output.encCiphertext) ?? Data(count: 580)
                                                 let deltaOutput = DeltaCMUManager.DeltaOutput(
                                                     height: UInt32(height),
                                                     index: blockOutputIndex,
-                                                    cmu: Data(cmuDisplay.reversed()),
-                                                    epk: Data(epkDisplay.reversed()),
-                                                    ciphertext: encCiphertext
+                                                    cmu: Data(cmuData.reversed()),
+                                                    epk: epk,
+                                                    ciphertext: ciphertext
                                                 )
                                                 partialDeltaOutputs.append(deltaOutput)
                                             }
@@ -2300,18 +2343,15 @@ final class TransactionBuilder {
                         for output in outputs {
                             if let cmuData = Data(hex: output.cmu) {
                                 allCMUs.append(cmuData)
-                            }
-                            // FIX #1190: Build delta output (wire format for cmu/epk, raw for ciphertext)
-                            if let cmuDisplay = Data(hex: output.cmu),
-                               let epkDisplay = Data(hex: output.ephemeralKey),
-                               let encCiphertext = Data(hex: output.encCiphertext),
-                               encCiphertext.count == 580 {
+                                // FIX #1311: ALWAYS store delta entry when CMU is valid
+                                let epk = Data(hex: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
+                                let ciphertext = Data(hex: output.encCiphertext) ?? Data(count: 580)
                                 let deltaOutput = DeltaCMUManager.DeltaOutput(
                                     height: UInt32(height),
                                     index: blockOutputIndex,
-                                    cmu: Data(cmuDisplay.reversed()),    // display → wire format
-                                    epk: Data(epkDisplay.reversed()),    // display → wire format
-                                    ciphertext: encCiphertext             // raw, no reversal
+                                    cmu: Data(cmuData.reversed()),
+                                    epk: epk,
+                                    ciphertext: ciphertext
                                 )
                                 deltaOutputs.append(deltaOutput)
                             }

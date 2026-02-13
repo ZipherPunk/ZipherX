@@ -331,13 +331,18 @@ final class BlockTimestampManager {
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
     }
 
+    // Cached DateFormatter — avoid per-call creation (ICU init is expensive)
+    private static let cachedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     /// Get formatted date string for height
     func getFormattedDate(at height: UInt64) -> String? {
         guard let date = getDate(at: height) else { return nil }
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        return Self.cachedDateFormatter.string(from: date)
     }
 
     /// Clear runtime cache (e.g., on wallet reset)

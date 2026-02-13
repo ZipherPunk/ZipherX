@@ -592,10 +592,16 @@ struct TransactionDetailView: View {
     /// Format the actual block timestamp for display
     /// Uses the real mined block time stored in the transaction, NOT an estimate
     /// Unified source: HeaderStore (headers table + block_times table from boost)
+    // Cached DateFormatter — avoid per-call creation (ICU init is expensive)
+    private static let mediumDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     private func blockDateString(for transaction: TransactionHistoryItem) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
+        let formatter = Self.mediumDateFormatter
 
         // Priority 1: Use the real block timestamp if already stored in transaction
         if let blockTime = transaction.blockTime, blockTime > 0 {

@@ -1579,7 +1579,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
 /// - note_value: Value of the note being spent
 /// - note_rcm: Note randomness (32 bytes)
 /// - note_diversifier: Note diversifier (11 bytes)
-/// - tx_out: Output buffer for transaction (should be at least 10000 bytes)
+/// - tx_out: Output buffer for transaction (should be at least 100000 bytes)
 /// FIX #230: Now uses safe_slice and safe_lock! for bounds validation
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_build_transaction(
@@ -1932,8 +1932,9 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     debug_log!("✅ Transaction built: {} bytes", tx_bytes.len());
 
     // Copy to output
-    if tx_bytes.len() > 10000 {
-        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
         return false;
     }
 
@@ -1972,7 +1973,7 @@ pub struct SpendInfo {
 /// - spends: array of SpendInfo pointers
 /// - spend_count: number of spends
 /// - chain_height: current chain height for branch ID selection
-/// - tx_out: output buffer (should be at least 10000 bytes)
+/// - tx_out: output buffer (should be at least 100000 bytes)
 /// - tx_out_len: receives actual transaction length
 /// - nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
 ///
@@ -2368,8 +2369,9 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     debug_log!("✅ Multi-input transaction built: {} bytes, {} spends", tx_bytes.len(), spend_count);
 
     // Copy to output
-    if tx_bytes.len() > 10000 {
-        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
         return false;
     }
 
@@ -4426,6 +4428,9 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
     debug_log!("🌳 FIX #557 v24: Total CMUs: {}, max target position: {}", total_cmu_count, max_pos);
 
     // Build tree to max_pos, creating witnesses AFTER each target position
+    // FIX #1316: Update ALL existing witnesses as new nodes are appended!
+    // Without this, witnesses created at earlier positions miss the nodes between
+    // their creation point and max_pos, producing wrong roots.
     for i in 0..=max_pos {
         if offset + 32 > cmu_data_len {
             debug_log!("❌ FIX #557 v24: Offset {} exceeds data length {} at position {}", offset, cmu_data_len, i);
@@ -4451,7 +4456,20 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
 
         tree.append(node).ok();
 
-        // Create witness AFTER appending CMU (witness includes this CMU in path)
+        // FIX #1316: Update ALL previously created witnesses with this new node FIRST
+        // This is CRITICAL — without it, witnesses created at earlier positions
+        // miss intermediate CMU appends between their creation and max_pos,
+        // producing wrong roots. Must happen BEFORE creating new witness at this
+        // position to avoid double-appending node to the just-created witness.
+        for w in witnesses.iter_mut() {
+            if let Some(ref mut witness) = w {
+                witness.append(node).ok();
+            }
+        }
+
+        // Create witness AFTER appending CMU and updating existing witnesses
+        // The new witness is created from the current tree state (includes this node)
+        // and will be updated with subsequent nodes in future iterations
         for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
             if let Some(pos) = pos_opt {
                 if pos == i {
@@ -4469,8 +4487,8 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
     debug_log!("🌳 FIX #557 v24: Continuing from position {} to {}", current_pos, total_cmu_count);
 
     // FIX #950: PERFORMANCE - Collect remaining nodes first, then update witnesses in parallel
-    // Old approach: O(N × witnesses) sequential = 89M operations
-    // New approach: O(N) collect + O(N × witnesses / cores) parallel
+    // FIX #1316: Witnesses are already updated to max_pos+1 during the main loop above.
+    // Only the TAIL nodes (max_pos+1 to total) need to be applied here via Rayon.
     let remaining_count = (total_cmu_count - current_pos) as usize;
     debug_log!("⚡ FIX #950: Collecting {} remaining nodes for parallel witness update...", remaining_count);
 
@@ -6024,7 +6042,7 @@ fn decrypt_spending_key(
 /// - note_rcm: 32-byte note commitment randomness
 /// - note_diversifier: 11-byte diversifier
 /// - chain_height: current chain height for branch ID
-/// - tx_out: output buffer (at least 10000 bytes)
+/// - tx_out: output buffer (at least 100000 bytes)
 /// - tx_out_len: receives actual transaction length
 ///
 /// Returns true on success, false on failure
@@ -6524,8 +6542,10 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     }
 
     // Copy to output
-    if tx_bytes.len() > 10000 {
-        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    // A 27-spend TX is ~12KB, Zcash protocol allows up to 100KB
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
         return false;
     }
 
@@ -6986,8 +7006,9 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         return false;
     }
 
-    if tx_bytes.len() > 10000 {
-        eprintln!("❌ Transaction too large: {} bytes", tx_bytes.len());
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
         return false;
     }
 

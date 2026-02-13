@@ -165,6 +165,10 @@ final class FilterScanner {
     // Solution: Always collect outputs, even when "disabled", then update delta if any found
     private var deltaOutputsFoundInCoveredRange: [DeltaCMUManager.DeltaOutput] = []
 
+    // FIX #1289 v3: Collect nullifiers alongside delta outputs for local spend detection
+    // During Full Rescan, Phase 1b uses these to detect spends without P2P block fetching
+    private var deltaNullifiersCollected: [DeltaCMUManager.DeltaNullifier] = []
+
     /// FIX #1214: Shared prefetch cache to avoid double-fetching blocks
     /// Set by preRebuildWitnessesForInstantPayment (FIX #571), consumed by PHASE 2
     /// When FIX #571 P2P fetches blocks for tree/witness updates, it caches parsed block data here.
@@ -186,6 +190,10 @@ final class FilterScanner {
 
     // FIX #1053: Skip tree modification when delta sync already covered the range
     private var skipTreeModification: Bool = false
+
+    /// FIX #1289: When set, delta outputs are available locally for re-scan (no P2P needed)
+    /// Phase 1b will scan delta outputs from disk, Phase 2 starts from deltaEndHeight + 1
+    var preservedDeltaEndHeight: UInt64? = nil
 
     /// FIX #947: Enable deferred witness computation for faster Import PK
     /// Set this before calling startScan() to skip PHASE 1.5
@@ -274,6 +282,14 @@ final class FilterScanner {
 
         isScanning = true
         FilterScanner.setScanInProgress(true)
+
+        // FIX #1290: Prevent macOS App Nap during sync — keeps P2P connections alive
+        // Without this, screen lock or backgrounding throttles network I/O completely
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: "ZipherX blockchain sync in progress"
+        )
+        defer { ProcessInfo.processInfo.endActivity(activity) }
 
         // FIX #907: Block all block listeners during the entire scan operation
         // Block listeners can only run when app is idle on main screen
@@ -553,8 +569,13 @@ final class FilterScanner {
             print("🔧 FIX #780: pendingDeltaRescan detected - forcing fresh tree from boost file")
         }
 
+        // CRITICAL: Check if tree is already loaded in FFI memory (WalletManager may have loaded it)
+        // This prevents race condition where FilterScanner loads again while WalletManager is loading
+        let existingTreeSize = ZipherXFFI.treeSize()
+
         // Wait for WalletManager to finish loading tree before proceeding
-        if !needsFreshTree {
+        // FIX #1294: Skip when tree already in FFI (catch-up after Full Rescan) or during Full Rescan itself
+        if !needsFreshTree && !isFullScanInProgress && existingTreeSize == 0 {
             let walletManager = WalletManager.shared
             var waitAttempts = 0
             let maxWaitAttempts = 1200 // 120 seconds max wait
@@ -563,10 +584,6 @@ final class FilterScanner {
                 waitAttempts += 1
             }
         }
-
-        // CRITICAL: Check if tree is already loaded in FFI memory (WalletManager may have loaded it)
-        // This prevents race condition where FilterScanner loads again while WalletManager is loading
-        let existingTreeSize = ZipherXFFI.treeSize()
 
         // For imported wallets scanning within downloaded tree range
         _ = scanWithinDownloadedRange  // Used implicitly via effectiveTreeCMUCount
@@ -755,7 +772,8 @@ final class FilterScanner {
             // FIX #1095: Dynamic batch size based on peer capacity
             let peerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
             let maxBlocksPerPeer = 128
-            let batchSize = max(peerCount, 1) * maxBlocksPerPeer  // e.g., 6 peers × 128 = 768
+            // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+            let batchSize = max(peerCount, 3) * 256
 
             // Collect ALL spends during PHASE 1 for later spend detection (PHASE 1.6)
             // Format: (height, txid, nullifierHex)
@@ -1083,6 +1101,182 @@ final class FilterScanner {
             // Use phase1EndHeight (which is cmuDataHeight from GitHub if available)
             // PHASE 2 only needs to scan blocks beyond what we have CMU data for
             currentHeight = phase1EndHeight + 1
+
+            // ═══════════════════════════════════════════════════════════════════
+            // PHASE 1b: Local delta scan with nullifiers (FIX #1289 v3)
+            //
+            // Delta bundle stores BOTH outputs (CMU+epk+ciphertext) AND nullifiers
+            // (spends). This enables complete local processing:
+            // 1. Trial decryption → note discovery (same as boost scan)
+            // 2. Nullifier matching → spend detection (same as Phase 1.6)
+            // 3. Tree building → correct commitment tree
+            // 4. Witness creation → spendable notes
+            //
+            // Requires: Delta nullifiers SUFFICIENT for block range (FIX #1299)
+            // Fallback: If nullifiers absent/insufficient, Phase 2 handles via P2P
+            // ═══════════════════════════════════════════════════════════════════
+            // FIX #1299: Check delta nullifier SUFFICIENCY (not just existence)
+            // hasNullifiers() only checks file exists — could have 1 entry from recent catch-up
+            // Phase 1b needs nullifiers covering the FULL delta range for reliable spend detection
+            // Without sufficient nullifiers: notes found but spends missed → balance inflation (FIX #1289 v3 bug)
+            // Blockchain average: ~1 nullifier per 6 blocks (434K / 2.5M Sapling blocks)
+            // Conservative minimum: 1 per 100 blocks, floor of 5
+            let deltaHasEnoughNullifiers: Bool = {
+                guard let deh = preservedDeltaEndHeight, deh > phase1EndHeight else { return false }
+                guard let nullifiers = DeltaCMUManager.shared.loadNullifiers() else { return false }
+                let rangeCount = nullifiers.filter {
+                    UInt64($0.height) > phase1EndHeight && UInt64($0.height) <= deh
+                }.count
+                let blockCount = Int(deh - phase1EndHeight)
+                let minRequired = max(5, blockCount / 100)
+                if rangeCount < minRequired {
+                    print("⚠️ FIX #1299: Delta nullifiers insufficient (\(rangeCount) in range, need \(minRequired) for \(blockCount) blocks) — skipping Phase 1b, Phase 2 will handle")
+                } else {
+                    print("✅ FIX #1299: Delta nullifiers sufficient (\(rangeCount) in range, need \(minRequired) for \(blockCount) blocks)")
+                }
+                return rangeCount >= minRequired
+            }()
+
+            if let deltaEndHeight = preservedDeltaEndHeight,
+               deltaEndHeight > phase1EndHeight,
+               deltaHasEnoughNullifiers {
+
+                let deltaBlockCount = deltaEndHeight - phase1EndHeight
+                print("⚡ PHASE 1b: Scanning delta locally (\(deltaBlockCount) blocks, \(phase1EndHeight + 1) → \(deltaEndHeight))")
+                let phase1bStart = Date()
+
+                // ── Step 1: Trial decrypt delta outputs (note discovery) ──
+                let boostCMUCount = cmuDataCount
+                var phase1bNotesFound = 0
+                if let deltaOutputs = DeltaCMUManager.shared.getOutputsForParallelDecryption(startGlobalPosition: boostCMUCount),
+                   !deltaOutputs.isEmpty {
+                    var ffiOutputs: [(output: ZipherXFFI.FFIShieldedOutput, height: UInt32, cmu: Data, globalPosition: UInt64)] = []
+                    ffiOutputs.reserveCapacity(deltaOutputs.count)
+                    for item in deltaOutputs {
+                        let ffiOutput = ZipherXFFI.FFIShieldedOutput(epk: item.epk, cmu: item.cmu, ciphertext: item.ciphertext)
+                        ffiOutputs.append((output: ffiOutput, height: item.height, cmu: item.cmu, globalPosition: item.globalPosition))
+                    }
+
+                    if !ffiOutputs.isEmpty {
+                        let baseHeight = UInt64(ffiOutputs.first!.height)
+                        let notesBefore = knownNullifiers.count
+                        try processBoostOutputsParallel(
+                            outputs: ffiOutputs,
+                            accountId: accountId,
+                            spendingKey: spendingKey,
+                            baseHeight: baseHeight
+                        )
+                        phase1bNotesFound = knownNullifiers.count - notesBefore
+                        print("✅ FIX #1289 v3: Phase 1b trial decryption found \(phase1bNotesFound) notes in \(deltaOutputs.count) outputs")
+                    }
+                }
+
+                // ── Step 2: Spend detection using delta nullifiers ──
+                var phase1bSpendsDetected = 0
+                if let deltaNullifiers = DeltaCMUManager.shared.loadNullifiers(), !deltaNullifiers.isEmpty {
+                    for nf in deltaNullifiers {
+                        let nullifierWire = nf.nullifier
+                        let nullifierDisplay = Data(nullifierWire.reversed())
+
+                        let hashedWire = database.hashNullifier(nullifierWire)
+                        let hashedDisplay = database.hashNullifier(nullifierDisplay)
+
+                        let matchesHashedWire = knownNullifiers.contains(hashedWire)
+                        let matchesHashedDisplay = knownNullifiers.contains(hashedDisplay)
+                        let matchesRawWire = knownNullifiers.contains(nullifierWire)
+                        let matchesRawDisplay = knownNullifiers.contains(nullifierDisplay)
+
+                        if matchesHashedWire || matchesHashedDisplay || matchesRawWire || matchesRawDisplay {
+                            let nullifierForDb = (matchesHashedWire || matchesRawWire) ? nullifierWire : nullifierDisplay
+                            try? database.markNoteSpent(nullifier: nullifierForDb, txid: nf.txid, spentHeight: UInt64(nf.height))
+                            phase1bSpendsDetected += 1
+                        }
+                    }
+                    if phase1bSpendsDetected > 0 {
+                        print("💸 FIX #1289 v3: Phase 1b detected \(phase1bSpendsDetected) spends from \(deltaNullifiers.count) nullifiers")
+                    }
+                }
+
+                // ── Step 3: Append delta CMUs to tree + create witnesses ──
+                var phase1bWitnessCount = 0
+                if let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs(), !deltaCMUs.isEmpty {
+                    let treeSize = Int(ZipherXFFI.treeSize())
+                    let boostSize = Int(boostCMUCount)
+                    // FIX #978: Size-based guard — skip CMUs already in tree
+                    let cmusAlreadyBeyondBoost = max(0, treeSize - boostSize)
+                    let cmusToAppend = cmusAlreadyBeyondBoost > 0
+                        ? Array(deltaCMUs.dropFirst(cmusAlreadyBeyondBoost))
+                        : deltaCMUs
+
+                    // Build map of CMU → noteId for delta-range notes (for witness creation)
+                    // Pre-load once before the append loop to avoid repeated DB queries
+                    var cmuToNoteId: [Data: Int64] = [:]
+                    if let account = try? database.getAccount(index: 0) {
+                        let allNotes = try? database.getAllNotes(accountId: account.accountId)
+                        for note in allNotes ?? [] {
+                            if note.height > phase1EndHeight && note.height <= deltaEndHeight,
+                               let cmu = note.cmu, cmu.count == 32 {
+                                cmuToNoteId[cmu] = note.id
+                            }
+                        }
+                    }
+
+                    // Append CMUs and create witnesses inline
+                    var witnessIndices: [(noteId: Int64, witnessIndex: UInt64)] = []
+                    for cmu in cmusToAppend {
+                        _ = ZipherXFFI.treeAppend(cmu: cmu)
+
+                        // When we hit a CMU belonging to a note, register witness
+                        if let noteId = cmuToNoteId[cmu] {
+                            let witnessIndex = ZipherXFFI.treeWitnessCurrent()
+                            if witnessIndex != UInt64.max {
+                                witnessIndices.append((noteId: noteId, witnessIndex: witnessIndex))
+                            }
+                        }
+                    }
+
+                    print("🌳 FIX #1289 v3: Appended \(cmusToAppend.count) delta CMUs (tree size: \(ZipherXFFI.treeSize()))")
+
+                    // ── Step 4: Save witnesses with anchor validation ──
+                    for (noteId, witnessIndex) in witnessIndices {
+                        guard let witnessData = ZipherXFFI.treeGetWitness(index: witnessIndex) else { continue }
+                        // FIX #1280: Validate witness root against FFI tree root
+                        guard let witnessRoot = ZipherXFFI.witnessGetRoot(witnessData),
+                              let treeRoot = ZipherXFFI.treeRoot(),
+                              witnessRoot == treeRoot else {
+                            print("⚠️ FIX #1289 v3: Witness root mismatch for note \(noteId) — skipping")
+                            continue
+                        }
+                        try? database.updateNoteWitness(noteId: noteId, witness: witnessData)
+                        try? database.updateNoteAnchor(noteId: noteId, anchor: treeRoot)
+                        try? database.updateNoteWitnessIndex(noteId: noteId, witnessIndex: witnessIndex)
+                        // Load into FFI for Phase 2 auto-updates
+                        existingWitnessIndices.append((noteId: noteId, witnessIndex: witnessIndex))
+                        phase1bWitnessCount += 1
+                    }
+                    if phase1bWitnessCount > 0 {
+                        print("✅ FIX #1289 v3: Created \(phase1bWitnessCount) witnesses for delta-range notes")
+                    }
+                }
+
+                // ── Step 5: Checkpoint at delta end height ──
+                try? database.updateLastScannedHeight(deltaEndHeight, hash: Data(count: 32))
+                FilterScanner.updateScanProgress()
+                if let treeData = ZipherXFFI.treeSerialize() {
+                    try? database.saveTreeState(treeData, height: deltaEndHeight)
+                }
+                currentHeight = deltaEndHeight + 1
+
+                let phase1bDuration = Date().timeIntervalSince(phase1bStart)
+                print("💾 FIX #1289 v3: Phase 1b complete in \(String(format: "%.2f", phase1bDuration))s — notes: \(phase1bNotesFound), spends: \(phase1bSpendsDetected), witnesses: \(phase1bWitnessCount)")
+                print("   Phase 2 starts from height \(currentHeight) (delta tip + 1)")
+
+            } else if let deltaEndHeight = preservedDeltaEndHeight,
+                      deltaEndHeight > phase1EndHeight {
+                // Delta preserved but nullifiers absent or insufficient (FIX #1299) — Phase 2 handles via P2P
+                // This is the SAFE path: Phase 2 scans blocks and detects spends reliably
+                print("📦 FIX #1299: Delta preserved (\(deltaEndHeight - phase1EndHeight) blocks) but nullifiers insufficient — Phase 2 will process via P2P (safe)")
+            }
         }
 
         // PHASE 2: Continue scanning blocks after bundled tree (tree building mode)
@@ -1396,19 +1590,25 @@ final class FilterScanner {
             cmusAppendedInPhase2 = 0
             print("🌳 FIX #1007: PHASE 2 starting with tree size \(treeSizeAtPhase2Start)")
 
-            // FIX #1053: Check if delta sync already brought tree to target height
+            // FIX #1312: Check if delta sync already brought tree to target height
             // If so, we should NOT modify the tree - just scan for notes
             // This prevents corruption when FIX #370 deep verification runs after delta sync
+            //
+            // FIX #1312: OLD code used block HEIGHTS (~3M) instead of CMU COUNTS (~1M):
+            //   expectedTreeSize = bundledTreeHeight + 1 + (endHeight - boostHeight) = 3,009,425
+            //   treeSizeAtPhase2Start = 1,047,039
+            //   Guard: 1,047,039 >= 3,009,425 → FALSE → NEVER fired!
+            // Result: PHASE 2 appended 15 CMUs already in tree → root mismatch → repair loop
+            // FIX: Use actual CMU counts from boost file (cmuDataCount) and delta manifest (outputCount)
             skipTreeModification = false
             if let manifest = DeltaCMUManager.shared.getManifest() {
-                // Calculate expected tree size: boost CMUs + delta CMUs
-                let boostEndHeight = ZipherXConstants.bundledTreeHeight
-                let deltaCMUCount = manifest.endHeight > boostEndHeight ? Int(manifest.endHeight - boostEndHeight) : 0
-                let expectedTreeSize = Int(ZipherXConstants.bundledTreeHeight) + 1 + deltaCMUCount
+                let boostCMUs = Int(cmuDataCount)  // Actual boost CMU count (e.g. 1045687)
+                let deltaCMUs = Int(manifest.outputCount)  // Actual delta CMU count (e.g. 1352)
+                let expectedTreeSize = boostCMUs + deltaCMUs  // Correct: 1047039
                 if manifest.endHeight >= targetHeight && treeSizeAtPhase2Start >= expectedTreeSize {
                     skipTreeModification = true
-                    print("⚡ FIX #1053: Delta sync already covers target \(targetHeight) - SKIPPING tree modification in PHASE 2")
-                    print("   Delta end: \(manifest.endHeight), Tree size: \(treeSizeAtPhase2Start), Expected: \(expectedTreeSize)")
+                    print("⚡ FIX #1312: Delta already covers target \(targetHeight) - SKIPPING tree modification in PHASE 2")
+                    print("   Delta end: \(manifest.endHeight), Tree: \(treeSizeAtPhase2Start), Expected: \(expectedTreeSize) (boost=\(boostCMUs) + delta=\(deltaCMUs))")
                 }
             }
 
@@ -1480,7 +1680,8 @@ final class FilterScanner {
             // With 6 peers × 128 blocks/peer = 768 blocks per round
             let p2pPeerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
             let maxBlocksPerPeer = 128
-            let prefetchBatchSize = max(p2pPeerCount, 1) * maxBlocksPerPeer  // e.g., 6 peers × 128 = 768
+            // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
+            let prefetchBatchSize = max(p2pPeerCount, 3) * 256
             // FIX #1095: With all peers used per batch, parallel batches cause conflicts
             // One batch uses ALL peers already - no benefit from parallel batches
             let parallelBatches = 1
@@ -1617,8 +1818,9 @@ final class FilterScanner {
 
                         print("🔄 FIX #897: Retry \(retryAttempt)/\(maxRetries) for \(stillMissing.count) blocks...")
 
-                        // Retry in smaller chunks (50 blocks at a time)
-                        let retryChunkSize = 50
+                        // FIX #1287: Retry in 384-block chunks (3 peers × 128) for multi-peer parallelism.
+                        // Previous 50-block chunks used only 1 peer → 250 blocks/sec instead of 1000+.
+                        let retryChunkSize = 384
                         for chunkStart in stride(from: 0, to: stillMissing.count, by: retryChunkSize) {
                             guard isScanning else { break }
                             let chunkEnd = min(chunkStart + retryChunkSize, stillMissing.count)
@@ -1965,6 +2167,14 @@ final class FilterScanner {
                     )
                     print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
 
+                    // FIX #1289 v3: Save collected nullifiers alongside delta outputs
+                    // These enable Phase 1b to detect spends locally during Full Rescan
+                    if !deltaNullifiersCollected.isEmpty {
+                        DeltaCMUManager.shared.appendNullifiers(deltaNullifiersCollected)
+                        print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers with delta bundle")
+                        deltaNullifiersCollected.removeAll()
+                    }
+
                     // Update delta sync status to synced
                     await MainActor.run {
                         WalletManager.shared.updateDeltaSyncStatus(.synced)
@@ -2002,6 +2212,14 @@ final class FilterScanner {
                         treeRoot: treeRoot
                     )
                     print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+
+                    // FIX #1289 v3: Save nullifiers even when no outputs collected
+                    // Blocks can have spends (nullifiers) without outputs to our wallet
+                    if !deltaNullifiersCollected.isEmpty {
+                        DeltaCMUManager.shared.appendNullifiers(deltaNullifiersCollected)
+                        print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers (no-output path)")
+                        deltaNullifiersCollected.removeAll()
+                    }
                 }
             }
             await MainActor.run {
@@ -2083,6 +2301,10 @@ final class FilterScanner {
         // This saves ~76 seconds (73K blocks × 1ms/block = 73 seconds + overhead).
         if await WalletManager.shared.isRepairingDatabase {
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+            // FIX #1300: Save code version after Full Rescan verification
+            let verificationCodeVersion = "1302"
+            let buildForRescan = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
+            UserDefaults.standard.set(buildForRescan, forKey: "FIX1283_LastVerifiedBuild")
             print("✅ FIX #1101: Set FIX1089_FullVerificationComplete=true after Full Rescan (skips redundant 73K block scan)")
             // FIX #1252: Mark delta as verified after Full Rescan — immutable from now on.
             // Full Rescan builds delta with complete P2P scan (same rigor as boost file).
@@ -2120,20 +2342,28 @@ final class FilterScanner {
         // Solution: After scan completes, verify each unspent note's nullifier isn't on-chain
         // This catches any spends that were missed during the scan
         // FIX #1090: Force full verification if we just fixed nullifiers
-        print("🔍 FIX #945: Running post-scan spend verification...")
-        do {
-            let externalSpends = try await WalletManager.shared.verifyAllUnspentNotesOnChain(forceFullVerification: fixedNullifiers > 0)
-            if externalSpends > 0 {
-                print("✅ FIX #945: Detected and fixed \(externalSpends) missed spend(s)")
-                // Refresh balance after fixing missed spends
-                try? await WalletManager.shared.refreshBalance()
-            } else {
-                print("✅ FIX #945: All unspent notes verified - no missed spends")
+        // FIX #1296: Skip during Full Rescan — it already scanned ALL blocks from Sapling activation.
+        // The 79K-block re-verification is redundant and blocks UI transition for 5-10 minutes.
+        // WalletManager.repairDatabase() does its own FIX #1098 balance verification after scan.
+        let isFullRescanActive = await WalletManager.shared.isRepairingDatabase
+        if isFullRescanActive {
+            print("⏭️ FIX #1296: Skipping FIX #945 post-scan verification during Full Rescan (redundant — all blocks already scanned)")
+        } else {
+            print("🔍 FIX #945: Running post-scan spend verification...")
+            do {
+                let externalSpends = try await WalletManager.shared.verifyAllUnspentNotesOnChain(forceFullVerification: fixedNullifiers > 0)
+                if externalSpends > 0 {
+                    print("✅ FIX #945: Detected and fixed \(externalSpends) missed spend(s)")
+                    // Refresh balance after fixing missed spends
+                    try? await WalletManager.shared.refreshBalance()
+                } else {
+                    print("✅ FIX #945: All unspent notes verified - no missed spends")
+                }
+            } catch {
+                print("⚠️ FIX #945: Post-scan verification failed: \(error)")
+                print("   Balance may be incorrect if spends occurred in missed blocks")
+                print("   Use 'Full Resync' in Settings if balance seems wrong")
             }
-        } catch {
-            print("⚠️ FIX #945: Post-scan verification failed: \(error)")
-            print("   Balance may be incorrect if spends occurred in missed blocks")
-            print("   Use 'Full Resync' in Settings if balance seems wrong")
         }
 
         // FIX #1082: CRITICAL - Rebuild witnesses for notes that STILL don't have them!
@@ -2488,85 +2718,77 @@ final class FilterScanner {
                                 print("🔧 FIX #739: Global tree root (correct): \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                             }
 
-                            // FIX #739 v3: After FIX #524 fixes the global tree, sync witnesses with delta CMUs
-                            // The global tree now has the correct root. We need to:
-                            // 1. Load existing witnesses into FFI
-                            // 2. Append delta CMUs to update them
-                            // 3. Save updated witnesses back to database
-                            print("🔧 FIX #739 v3: Syncing witnesses with corrected global tree...")
+                            // FIX #1282: After FIX #524 tree repair, create FRESH witnesses from the repaired tree.
+                            // DO NOT load old witnesses from DB — they may be corrupted (e.g., FIX #1281 double-apply
+                            // from a previous build). Old approach: load DB witnesses → updateAllWitnessesBatch → extract.
+                            // FIX #1281's size guard incorrectly skipped the update because tree size matched, but
+                            // the witnesses in DB were corrupted (wrong merkle paths). updateAllWitnessesBatch can't
+                            // fix corrupted witnesses — it only APPENDS CMUs to existing paths.
+                            // New approach: treeCreateWitnessForPosition() creates FRESH merkle paths from the
+                            // repaired tree. Each witness root = repaired tree root (validated against blockchain).
+                            print("🔧 FIX #1282: Creating fresh witnesses from repaired tree (not loading from DB)...")
 
-                            // FIX #996: Clear WITNESSES array before loading to prevent accumulation
-                            ZipherXFFI.witnessesClear()
-
-                            // Load all witnesses into FFI WITNESSES array
-                            // Track mapping: FFI index -> note ID + height for extraction
-                            // FIX #793: Track height so we can get anchor from HeaderStore
-                            var loadedNotes: [(ffiIndex: UInt64, noteId: Int64)] = []
-                            for noteData in validNotes {
-                                if !noteData.note.witness.isEmpty {
-                                    let index = ZipherXFFI.treeLoadWitness(
-                                        witnessData: noteData.note.witness.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) },
-                                        witnessLen: noteData.note.witness.count
-                                    )
-                                    if index != UInt64.max {
-                                        loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
-                                    }
-                                }
-                            }
-                            print("🔧 FIX #739 v3: Loaded \(loadedNotes.count)/\(validNotes.count) witnesses into FFI")
-
-                            // The global tree already has all CMUs (boost + delta) appended by FIX #524
-                            // Now we need to update witnesses to match the current tree state
-                            // Get delta CMUs and append them to all loaded witnesses
-                            let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
-                            if !deltaCMUs.isEmpty {
-                                // FIX #1281: Apply same size-based guard as FIX #978.
-                                // Witnesses loaded from DB already have some delta CMUs in their
-                                // merkle paths. Only apply NEW CMUs to prevent double-apply corruption.
-                                let currentTreeSize = Int(ZipherXFFI.treeSize())
-                                let boostCMUCount = Int(ZipherXConstants.effectiveTreeCMUCount)
-                                let cmusAlreadyInWitnesses = max(0, currentTreeSize - boostCMUCount)
-
-                                let cmusForWitnesses: [Data]
-                                if cmusAlreadyInWitnesses >= deltaCMUs.count {
-                                    cmusForWitnesses = []
-                                    print("✅ FIX #1281: FIX #739 v3 SKIPPED witness update - all \(deltaCMUs.count) delta CMUs already applied")
-                                } else if cmusAlreadyInWitnesses > 0 {
-                                    cmusForWitnesses = Array(deltaCMUs.dropFirst(cmusAlreadyInWitnesses))
-                                    print("🔧 FIX #1281: FIX #739 v3 - Skipping first \(cmusAlreadyInWitnesses) CMUs, applying \(cmusForWitnesses.count) new CMUs to witnesses")
-                                } else {
-                                    cmusForWitnesses = deltaCMUs
-                                    print("🔧 FIX #739 v3: Appending \(deltaCMUs.count) delta CMUs to all witnesses...")
-                                }
-
-                                if !cmusForWitnesses.isEmpty {
-                                    var packedCMUs = Data()
-                                    for cmu in cmusForWitnesses {
-                                        packedCMUs.append(cmu)
-                                    }
-                                    let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: cmusForWitnesses.count)
-                                    print("🔧 FIX #739 v3: Updated \(updatedCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
-                                } else {
-                                    print("✅ FIX #739 v3: Witnesses already current (no update needed)")
-                                }
-                            }
-
-                            // Extract updated witnesses and save to database using correct FFI indices
                             var rebuiltCount = 0
-                            for (ffiIndex, noteId) in loadedNotes {
-                                if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
-                                    if updatedWitness.count >= 100 {
-                                        try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
-                                        // FIX #804: Use witness root as anchor (what the merkle path computes to)
-                                        if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
-                                            try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+                            if let repairedTreeData = ZipherXFFI.treeSerialize() {
+                                for noteData in validNotes {
+                                    let witnessIndex = noteData.note.witnessIndex
+                                    if let result = ZipherXFFI.treeCreateWitnessForPosition(
+                                        treeData: repairedTreeData,
+                                        position: witnessIndex
+                                    ) {
+                                        if result.witness.count >= 100 {
+                                            try? database.updateNoteWitness(noteId: noteData.note.id, witness: result.witness)
+                                            // FIX #804: Use witness root as anchor
+                                            if let witnessAnchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                                                try? database.updateNoteAnchor(noteId: noteData.note.id, anchor: witnessAnchor)
+                                            }
+                                            rebuiltCount += 1
                                         }
-                                        rebuiltCount += 1
+                                    }
+                                }
+                                print("✅ FIX #1282: Created \(rebuiltCount)/\(validNotes.count) fresh witnesses from repaired tree")
+                            } else {
+                                print("❌ FIX #1282: Failed to serialize repaired tree for witness creation")
+
+                                // Fallback: load witnesses from DB and force-apply ALL delta CMUs
+                                // (bypass FIX #1281 guard since we know repair just happened)
+                                ZipherXFFI.witnessesClear()
+                                var loadedNotes: [(ffiIndex: UInt64, noteId: Int64)] = []
+                                for noteData in validNotes {
+                                    if !noteData.note.witness.isEmpty {
+                                        let index = ZipherXFFI.treeLoadWitness(
+                                            witnessData: noteData.note.witness.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) },
+                                            witnessLen: noteData.note.witness.count
+                                        )
+                                        if index != UInt64.max {
+                                            loadedNotes.append((ffiIndex: index, noteId: noteData.note.id))
+                                        }
+                                    }
+                                }
+
+                                let deltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+                                if !deltaCMUs.isEmpty {
+                                    // FIX #1282 fallback: force ALL delta CMUs (no FIX #1281 guard — repair path)
+                                    var packedCMUs = Data()
+                                    for cmu in deltaCMUs { packedCMUs.append(cmu) }
+                                    let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
+                                    print("🔧 FIX #1282 fallback: Updated \(updatedCount) witnesses with ALL \(deltaCMUs.count) delta CMUs")
+                                }
+
+                                for (ffiIndex, noteId) in loadedNotes {
+                                    if let updatedWitness = ZipherXFFI.treeGetWitness(index: ffiIndex) {
+                                        if updatedWitness.count >= 100 {
+                                            try? database.updateNoteWitness(noteId: noteId, witness: updatedWitness)
+                                            if let witnessAnchor = ZipherXFFI.witnessGetRoot(updatedWitness) {
+                                                try? database.updateNoteAnchor(noteId: noteId, anchor: witnessAnchor)
+                                            }
+                                            rebuiltCount += 1
+                                        }
                                     }
                                 }
                             }
 
-                            print("✅ FIX #524+#739: Rebuilt \(rebuiltCount)/\(loadedNotes.count) witnesses (delta sync mode)")
+                            print("✅ FIX #524+#1282: Rebuilt \(rebuiltCount)/\(validNotes.count) witnesses (delta sync mode)")
 
                             // Save the corrected tree state
                             // FIX #1138: Save tree state WITH HEIGHT
@@ -3080,6 +3302,19 @@ final class FilterScanner {
         // FIX #288: Check for spent notes (nullifier detection) FIRST
         // FIX #1050: Suppress verbose per-TX spend processing log (routine during sync)
         if let spends = spends, !spends.isEmpty {
+            // FIX #1289 v3: Collect nullifiers for delta bundle (enables local spend detection in Phase 1b)
+            if deltaCollectionEnabled, let txidData = Data(hexString: txid) {
+                for spend in spends {
+                    if let nfDisplay = Data(hexString: spend.nullifier) {
+                        deltaNullifiersCollected.append(DeltaCMUManager.DeltaNullifier(
+                            height: UInt32(height),
+                            txid: txidData,
+                            nullifier: nfDisplay.reversedBytes()  // wire format
+                        ))
+                    }
+                }
+            }
+
             // Spend detection happens silently - matches still log via FIX #952
             let txidData = Data(hexString: txid)
             for spend in spends {
@@ -3195,15 +3430,17 @@ final class FilterScanner {
         }
 
         for (outputIndex, output) in outputs.enumerated() {
-            // Convert hex strings to binary data
-            guard let cmuDisplay = Data(hexString: output.cmu),
-                  let epkDisplay = Data(hexString: output.ephemeralKey),
-                  let encCiphertext = Data(hexString: output.encCiphertext) else {
+            // FIX #1311: Only require CMU to parse — use fallbacks for EPK/ciphertext
+            // This ensures every CMU that enters the tree also enters the delta
+            guard let cmuDisplay = Data(hexString: output.cmu) else {
                 continue
             }
 
             // Reverse byte order: display format (big-endian) -> wire format (little-endian)
-            let epk = epkDisplay.reversedBytes()
+            // FIX #1311: Use fallback zeros when EPK/ciphertext hex parsing fails
+            // Trial decryption on zeros returns nil (harmless), but CMU still enters tree
+            let epk = Data(hexString: output.ephemeralKey)?.reversedBytes() ?? Data(count: 32)
+            let encCiphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
             let cmu = cmuDisplay.reversedBytes()
 
             // FIX #786: Calculate per-BLOCK output index (not per-transaction)
@@ -3247,12 +3484,12 @@ final class FilterScanner {
 
             let treePosition: UInt64
             if skipTreeModification {
-                // FIX #1053: Delta sync already brought tree to target - don't modify tree
+                // FIX #1312: Delta sync already brought tree to target - don't modify tree
                 // Just use the expected position for note discovery
                 treePosition = UInt64(expectedTreeSize)
                 // Log once per block to avoid spam
                 if outputIndex == 0 {
-                    print("⏭️ FIX #1053: Skipping treeAppend at height \(height) - delta sync already covered this range")
+                    print("⏭️ FIX #1312: Skipping treeAppend at height \(height) - delta sync already covered this range")
                 }
             } else if currentTreeSize > expectedTreeSize {
                 // FIX #1007: Tree is already larger than expected - Step 2a already appended this CMU

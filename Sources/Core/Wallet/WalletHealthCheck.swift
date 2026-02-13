@@ -756,6 +756,17 @@ final class WalletHealthCheck {
     private func checkTreeRootMatchesHeader() async -> HealthCheckResult {
         print("🔐 FIX #358: Checking tree root matches header's finalsaplingroot...")
 
+        // FIX #1306: Skip tree root validation while gap-fill is in progress.
+        // Gap-fill rebuilds the FFI tree from scratch — during the operation, the tree root
+        // is in a transitional state and WILL mismatch the blockchain. This is expected.
+        // Without this guard: health check runs 5s into 60s gap-fill → sees partial tree
+        // → CRITICAL → "please restart" → user stuck in restart loop.
+        let isGapFilling = await MainActor.run { WalletManager.shared.isGapFillingDelta }
+        if isGapFilling {
+            print("⏳ FIX #1306: Gap-fill in progress — skipping tree root validation (tree being rebuilt)")
+            return .passed("Tree Root Validation", details: "Gap-fill in progress - will verify after completion")
+        }
+
         // Get current tree state
         guard let currentTreeRoot = ZipherXFFI.treeRoot() else {
             return .passed("Tree Root Validation", details: "No tree loaded - will verify after sync")
