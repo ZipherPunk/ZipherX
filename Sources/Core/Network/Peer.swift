@@ -2671,17 +2671,21 @@ public final class Peer {
         switch command {
         case "inv":
             // Parse inv for block announcements AND mempool transactions
-            handleInvMessage(payload: payload)
+            await handleInvMessage(payload: payload)
 
         case "ping":
             // Respond to pings to keep connection alive
             try? await sendMessage(command: "pong", payload: payload)
 
         case "tx":
-            // FIX #883: Transaction in mempool - extract txid and notify
+            // FIX #883 + FIX #1333: Transaction received — fire callbacks for instant detection
             if payload.count >= 4 {
                 let txid = Data(payload.doubleSHA256().reversed())
-                // Notify via dispatcher callback (NetworkManager listens)
+                // FIX #1333: Event-driven mempool detection — pass full raw TX for trial decryption.
+                // This fires when our getdata (sent from handleInvMessage) gets a response.
+                // NetworkManager.processIncomingMempoolTx does trial decrypt → instant notification.
+                onMempoolTxData?(txid, payload)
+                // Legacy callbacks
                 await messageDispatcher.onMempoolTxSeen?(txid)
                 onMempoolTx?(txid)
             }
@@ -2729,6 +2733,19 @@ public final class Peer {
         }
         print("⚠️ FIX #883: [\(host)] Unclaimed REJECT for '\(msgType)': \(codeName)")
     }
+
+    /// FIX #1333: Unsolicited TX inv hashes — captured from unsolicited `inv` MSG_TX
+    /// When a TX enters a peer's mempool, peer sends `inv` MSG_TX to all connections.
+    /// Block listener receives it but handleInvMessage only processed MSG_BLOCK.
+    /// Per Bitcoin P2P protocol, peer marks TX as "announced" → won't re-send via `mempool`.
+    /// FIX: Capture these hashes and merge into getMempoolTransactions() results.
+    private var unsolicitedTxHashes: [Data] = []
+    private let unsolicitedTxLock = NSLock()
+
+    /// FIX #1333: Callback for incoming raw mempool TX (event-driven detection)
+    /// Called with (txid in display format, full raw TX) when a `tx` response arrives
+    /// from our unsolicited inv getdata request. NetworkManager trial-decrypts here.
+    var onMempoolTxData: ((Data, Data) -> Void)?
 
     /// FIX #883: Callback for mempool transaction notification (legacy)
     var onMempoolTx: ((Data) -> Void)?
@@ -2791,8 +2808,9 @@ public final class Peer {
         return nil
     }
 
-    /// Parse inv message and extract block announcements
-    private func handleInvMessage(payload: Data) {
+    /// Parse inv message and extract block announcements + unsolicited TX hashes
+    /// FIX #1333: Now async — sends getdata for unsolicited TX inv for instant mempool detection
+    private func handleInvMessage(payload: Data) async {
         guard payload.count >= 1 else { return }
 
         var offset = 0
@@ -2802,6 +2820,7 @@ public final class Peer {
         offset += countSize
 
         var blockHashes: [Data] = []
+        var txHashes: [Data] = []
 
         for _ in 0..<count {
             guard offset + 36 <= payload.count else { break }
@@ -2817,6 +2836,43 @@ public final class Peer {
             // Collect block announcements (type 2)
             if invType == 2 {
                 blockHashes.append(hash)
+            }
+
+            // FIX #1333: Capture unsolicited TX announcements (type 1)
+            if invType == 1 {
+                txHashes.append(hash)
+            }
+        }
+
+        // FIX #1333: Store unsolicited TX hashes for mempool scanner fallback
+        if !txHashes.isEmpty {
+            unsolicitedTxLock.lock()
+            unsolicitedTxHashes.append(contentsOf: txHashes)
+            unsolicitedTxLock.unlock()
+            print("🔮 FIX #1333: [\(host)] Unsolicited inv with \(txHashes.count) TX hash(es) — requesting full TX via getdata")
+
+            // FIX #1333: Event-driven mempool detection — request full TXs immediately.
+            // The `tx` responses will arrive through the block listener loop and be
+            // handled by `case "tx":` which fires onMempoolTxData for trial decryption.
+            // This is INSTANT vs the old 18-second polling approach.
+            var getdataPayload = Data()
+            // varint count
+            var txCount = UInt64(txHashes.count)
+            if txCount < 253 {
+                getdataPayload.append(UInt8(txCount))
+            } else {
+                getdataPayload.append(0xFD)
+                getdataPayload.append(contentsOf: withUnsafeBytes(of: UInt16(txCount).littleEndian) { Array($0) })
+            }
+            for hash in txHashes {
+                // MSG_TX = 1
+                getdataPayload.append(contentsOf: withUnsafeBytes(of: UInt32(1).littleEndian) { Array($0) })
+                getdataPayload.append(hash)
+            }
+            do {
+                try await sendMessage(command: "getdata", payload: getdataPayload)
+            } catch {
+                print("⚠️ FIX #1333: [\(host)] Failed to send getdata for unsolicited TXs: \(error.localizedDescription)")
             }
         }
 
@@ -5326,11 +5382,32 @@ public final class Peer {
     /// FIX #1004: Use receiveMessageWithTimeout to prevent indefinite blocking
     /// FIX #1005: Empty mempool = no response (Zclassic source: vInv.size() > 0 check)
     /// FIX #1184: Route through dispatcher when active to eliminate orphaned readers
+    /// FIX #1333: Merge unsolicited TX inv hashes with mempool command results
     func getMempoolTransactions() async throws -> [Data] {
+        // FIX #1333: Drain unsolicited TX hashes (captured from unsolicited inv MSG_TX).
+        // Per Bitcoin P2P protocol, once a peer sends inv for a TX, it won't re-send
+        // via the mempool command response. These hashes would otherwise be lost.
+        let unsolicited: [Data]
+        unsolicitedTxLock.lock()
+        unsolicited = unsolicitedTxHashes
+        unsolicitedTxHashes.removeAll()
+        unsolicitedTxLock.unlock()
+
         // FIX #1184: Route through dispatcher when block listener is active
         let dispatcherActive = await messageDispatcher.isActive
         if dispatcherActive {
-            return try await getMempoolTransactionsViaDispatcher()
+            let fromMempool = try await getMempoolTransactionsViaDispatcher()
+
+            // FIX #1333: Merge unsolicited hashes with mempool response (deduplicate)
+            if unsolicited.isEmpty {
+                return fromMempool
+            }
+            var merged = Set(fromMempool)
+            for tx in unsolicited {
+                merged.insert(tx)
+            }
+            print("🔮 FIX #1333: [\(host)] Merged \(unsolicited.count) unsolicited + \(fromMempool.count) mempool = \(merged.count) unique TX hashes")
+            return Array(merged)
         }
 
         // FIX #1184b: Do NOT fall back to direct reads when dispatcher is inactive.
@@ -5338,7 +5415,14 @@ public final class Peer {
         // which leaves orphaned NWConnection readers. When block listeners restart later,
         // the orphaned reader consumes the next header → block listener reads payload data
         // → "invalid magic bytes [253, ...]" → stream desync → peer death.
-        // Mempool will be queried on the next cycle when dispatcher is active.
+
+        // FIX #1333: Even when dispatcher is inactive, return unsolicited hashes if we have them.
+        // These were captured by the block listener before it stopped.
+        if !unsolicited.isEmpty {
+            print("🔮 FIX #1333: [\(host)] Returning \(unsolicited.count) unsolicited TX hash(es) (dispatcher inactive)")
+            return unsolicited
+        }
+
         print("🔮 FIX #1184b: Skipping mempool query (dispatcher inactive, avoiding orphaned readers)")
         return []
     }

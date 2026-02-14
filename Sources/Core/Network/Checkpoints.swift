@@ -28,6 +28,10 @@ enum ZclassicCheckpoints {
         2926122: "0000016061285387595f9453c2e3d33f99120aa67acd256fd05a79491528d5cd",
         // Recent checkpoint for header sync (Dec 10, 2025)
         2938700: "000006ef36df7868360159dd79ce43665569229485abace3864b2bdd98d7202e",
+        // FIX #1342: Boost file end height checkpoint — prevents 50K extra header sync
+        // when boost headers are deferred (FIX #1341). Without this, buildGetHeadersPayload
+        // falls back to 2938700 (50K blocks earlier) because HeaderStore is empty.
+        2988797: "0000003b3ee79346b4f6cc029128665b743057e3ea874b27fc22a1d0e0d2e367",
     ]
 
     /// Sapling activation height on Zclassic mainnet

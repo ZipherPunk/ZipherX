@@ -1220,12 +1220,61 @@ extension SecureKeyStorage {
             throw SecureStorageError.keyNotFound
         }
 
-        // Verify correct length (should be 197 bytes)
-        guard encryptedData.count == 197 else {
+        // FIX #1347: Handle Secure Enclave ECIES format (250 bytes) on real iOS devices.
+        // Key stored via storeKeyWithSecureEnclave() uses ECIES encryption → ~250 bytes.
+        // VUL-002 FFI needs AES-GCM format (197 bytes). Convert: decrypt with SE, re-encrypt with AES-GCM.
+        if encryptedData.count == 197 {
+            // Already in AES-GCM format — pass directly to Rust
+            return encryptedData
+        } else if encryptedData.count > 169 {
+            // Secure Enclave ECIES format — decrypt and re-encrypt for Rust FFI
+            print("📱 FIX #1347: iOS key in Secure Enclave ECIES format (\(encryptedData.count) bytes), converting to AES-GCM")
+
+            // Get the Secure Enclave private key
+            let keyQuery: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrApplicationTag as String: encryptionKeyTag.data(using: .utf8)!,
+                kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                kSecReturnRef as String: true
+            ]
+
+            var keyRef: AnyObject?
+            let keyStatus = SecItemCopyMatching(keyQuery as CFDictionary, &keyRef)
+
+            guard keyStatus == errSecSuccess else {
+                print("⚠️ FIX #1347: Secure Enclave key not found (status: \(keyStatus))")
+                throw SecureStorageError.secureEnclaveKeyNotFound
+            }
+
+            // Decrypt with Secure Enclave
+            let privateKey = keyRef as! SecKey
+            var decryptError: Unmanaged<CFError>?
+            guard let decryptedData = SecKeyCreateDecryptedData(
+                privateKey,
+                .eciesEncryptionCofactorVariableIVX963SHA256AESGCM,
+                encryptedData as CFData,
+                &decryptError
+            ) else {
+                let errorMsg = decryptError?.takeRetainedValue().localizedDescription ?? "Unknown error"
+                print("⚠️ FIX #1347: Secure Enclave decryption failed: \(errorMsg)")
+                throw SecureStorageError.decryptionFailed(errorMsg)
+            }
+
+            let decryptedKey = decryptedData as Data
+            print("📱 FIX #1347: Decrypted key (\(decryptedKey.count) bytes), re-encrypting with AES-GCM")
+
+            // Re-encrypt with AES-GCM for Rust FFI
+            let encryptionKey = try getSimulatorEncryptionKey()
+            let sealedBox = try AES.GCM.seal(decryptedKey, using: encryptionKey)
+            guard let reEncrypted = sealedBox.combined else {
+                throw SecureStorageError.encryptionFailed("Failed to re-encrypt key for FFI")
+            }
+            print("📱 FIX #1347: Re-encrypted to AES-GCM format (\(reEncrypted.count) bytes)")
+            return reEncrypted
+        } else {
+            print("⚠️ FIX #1347: Unexpected encrypted key size: \(encryptedData.count)")
             throw SecureStorageError.keyNotFound
         }
-
-        return encryptedData
     }
 
     /// Get the raw encryption key bytes for passing to Rust FFI (32 bytes)

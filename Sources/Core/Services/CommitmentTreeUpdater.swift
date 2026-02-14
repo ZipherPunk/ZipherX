@@ -112,21 +112,39 @@ actor CommitmentTreeUpdater {
             format == "zipherx_boost_v2_three_part" || format == "zipherx_boost_v2_core_only" || version >= 3
         }
 
+        /// FIX #1349: Check if boost file is split into multiple parts for download
+        var isSplitFormat: Bool {
+            if let parts = files.split_parts, parts.count >= 2 { return true }
+            return false
+        }
+
         struct ManifestFiles: Codable {
             let uncompressed: FileInfo
             // Three-part format (v3+)
             let core: FileInfo?
             let equihash: FileInfo?
+            // FIX #1349: Split-part download support
+            let compressed: FileInfo?
+            let split_parts: [FileInfo]?
+            let split_count: Int?
 
             // For backward compatibility with single-file format
             private enum CodingKeys: String, CodingKey {
                 case uncompressed
+                case compressed
                 case core
                 case equihash
+                case split_parts
+                case split_count
             }
 
             init(from decoder: Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
+
+                // FIX #1349: Decode split-part fields (present in all formats)
+                self.compressed = try? container.decode(FileInfo.self, forKey: .compressed)
+                self.split_parts = try? container.decode([FileInfo].self, forKey: .split_parts)
+                self.split_count = try? container.decode(Int.self, forKey: .split_count)
 
                 // Check if core exists (three-part or core-only format v3+)
                 if let core = try? container.decode(FileInfo.self, forKey: .core) {
@@ -149,6 +167,10 @@ actor CommitmentTreeUpdater {
 
             func encode(to encoder: Encoder) throws {
                 var container = encoder.container(keyedBy: CodingKeys.self)
+                // FIX #1349: Encode split-part fields
+                try container.encodeIfPresent(compressed, forKey: .compressed)
+                try container.encodeIfPresent(split_parts, forKey: .split_parts)
+                try container.encodeIfPresent(split_count, forKey: .split_count)
                 if let core = core, let equihash = equihash {
                     try container.encode(core, forKey: .core)
                     try container.encode(equihash, forKey: .equihash)
@@ -429,8 +451,17 @@ actor CommitmentTreeUpdater {
 
         let activePath = getActiveBoostPath(for: remoteManifest)
         let isThreePart = remoteManifest.isThreePartFormat
-        let coreSize = isThreePart ? (remoteManifest.files.core?.size ?? remoteManifest.files.uncompressed.size) : remoteManifest.files.uncompressed.size
-        let fileSizeMB = coreSize / 1024 / 1024
+
+        // FIX #1339: Use actual download size (compressed .zst) not uncompressed size for progress display.
+        // FIX #1349: For split format, sum all part sizes for total download display.
+        let fileSizeMB: Int
+        if remoteManifest.isSplitFormat, let splitParts = remoteManifest.files.split_parts {
+            fileSizeMB = splitParts.reduce(0) { $0 + $1.size } / 1_000_000
+        } else {
+            let downloadAsset = cachedReleaseInfo?.assets.first(where: { $0.name.hasSuffix(".zst") || $0.name == Self.boostFileName })
+            let coreSize = isThreePart ? (remoteManifest.files.core?.size ?? remoteManifest.files.uncompressed.size) : remoteManifest.files.uncompressed.size
+            fileSizeMB = (downloadAsset?.size ?? coreSize) / 1_000_000
+        }
 
         print("🚀 Downloading boost file from GitHub (height \(remoteManifest.chain_height), three-part: \(isThreePart))...")
         onProgress?(0.1, "Downloading \(fileSizeMB) MB...")
@@ -1378,6 +1409,11 @@ actor CommitmentTreeUpdater {
         throw lastError ?? BoostFileError.networkError("Max retries exceeded")
     }
 
+    /// FIX #1354: Public wrapper for boost update check
+    func fetchRemoteManifestPublic() async throws -> BoostManifest {
+        return try await fetchRemoteManifest()
+    }
+
     private func fetchRemoteManifest() async throws -> BoostManifest {
         // FIX #526: Clear cached release info to ensure we get fresh data from GitHub
         // Without this, we might get old manifest data from a cached release
@@ -1641,6 +1677,15 @@ actor CommitmentTreeUpdater {
                 print("ℹ️ Three-part format: No equihash file in manifest (optional)")
             }
 
+        } else if manifest.isSplitFormat, let splitParts = manifest.files.split_parts {
+            // FIX #1349: Split-file format — download parts in parallel, concatenate, decompress
+            print("🚀 FIX #1349: Split format detected — \(splitParts.count) parts, downloading in parallel from release \(release.tag_name)")
+            try await downloadSplitPartsAndAssemble(
+                manifest: manifest,
+                release: release,
+                splitParts: splitParts,
+                onProgress: onProgress
+            )
         } else {
             // Single-file format (v1/v2)
             guard let boostAsset = release.assets.first(where: { $0.name == Self.boostFileName || $0.name == Self.boostFileName + ".zst" }) else {
@@ -1677,10 +1722,22 @@ actor CommitmentTreeUpdater {
         let resumeFrom: UInt64
         if FileManager.default.fileExists(atPath: destPath) {
             let currentSize = (try? FileManager.default.attributesOfItem(atPath: destPath)[.size] as? UInt64) ?? 0
-            // Only resume if file exists and is smaller than expected
-            resumeFrom = currentSize < expectedSize ? currentSize : 0
-            if resumeFrom > 0 {
+            if currentSize < expectedSize {
+                // Partial download — resume from where we left off
+                resumeFrom = currentSize
                 print("📂 Resuming from byte \(resumeFrom)...")
+            } else if currentSize == expectedSize {
+                // File already complete — skip download
+                print("📂 File already downloaded (\(currentSize) bytes = expected)")
+                resumeFrom = 0
+                // Fall through to let Rust verify, or return early
+            } else {
+                // FIX #1335: File is LARGER than expected — different boost version on disk.
+                // Rust reads actual file size and sends Range header beyond expected → 416 error.
+                // Must delete stale file before starting fresh download.
+                print("📂 FIX #1335: Existing file (\(currentSize) bytes) larger than expected (\(expectedSize) bytes) — deleting stale file")
+                try? FileManager.default.removeItem(atPath: destPath)
+                resumeFrom = 0
             }
         } else {
             resumeFrom = 0
@@ -1786,6 +1843,199 @@ actor CommitmentTreeUpdater {
             // Remove compressed file after successful decompression
             try? FileManager.default.removeItem(atPath: destPath)
             print("✅ Decompressed to: \(URL(fileURLWithPath: uncompressedPath).lastPathComponent)")
+        }
+    }
+
+    /// FIX #1349: Download split parts in parallel using Rust FFI, concatenate, and decompress
+    /// Uses DispatchQueue for parallel Rust FFI calls, file-size polling for progress
+    private func downloadSplitPartsAndAssemble(
+        manifest: BoostManifest,
+        release: GitHubRelease,
+        splitParts: [BoostManifest.FileInfo],
+        onProgress: ((Double) -> Void)?
+    ) async throws {
+        let partPaths: [URL] = splitParts.map { part in
+            boostCacheDirectory.appendingPathComponent(part.name)
+        }
+
+        // 1. Find GitHub assets for each part
+        var partAssets: [(asset: GitHubAsset, info: BoostManifest.FileInfo, path: URL)] = []
+        for (index, part) in splitParts.enumerated() {
+            guard let asset = release.assets.first(where: { $0.name == part.name }) else {
+                throw BoostFileError.networkError("FIX #1349: Split part '\(part.name)' not found in release \(release.tag_name)")
+            }
+            partAssets.append((asset: asset, info: part, path: partPaths[index]))
+        }
+
+        let totalSize = Int64(partAssets.reduce(0) { $0 + $1.info.size })
+        print("📥 FIX #1349: Downloading \(partAssets.count) parts (\(totalSize / 1_000_000) MB total)")
+
+        // 2. Download all parts in parallel using DispatchQueue + Rust FFI
+        //    Progress tracked by polling file sizes (Rust global progress API not safe for parallel use)
+        let lock = NSLock()
+        var downloadErrors: [Int: Error] = [:]
+        var completedParts: Set<Int> = []
+
+        let group = DispatchGroup()
+        for (index, partInfo) in partAssets.enumerated() {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let destPath = partInfo.path.path
+                let expectedSize = UInt64(partInfo.info.size)
+
+                // Check for existing partial/complete download
+                if FileManager.default.fileExists(atPath: destPath) {
+                    let currentSize = (try? FileManager.default.attributesOfItem(atPath: destPath)[.size] as? UInt64) ?? 0
+                    if currentSize >= expectedSize {
+                        print("📂 FIX #1349: Part \(index + 1) already downloaded (\(currentSize) bytes)")
+                        lock.lock()
+                        completedParts.insert(index)
+                        lock.unlock()
+                        group.leave()
+                        return
+                    }
+                }
+
+                let resumeFrom: UInt64 = {
+                    guard FileManager.default.fileExists(atPath: destPath) else { return 0 }
+                    return (try? FileManager.default.attributesOfItem(atPath: destPath)[.size] as? UInt64) ?? 0
+                }()
+
+                print("📥 FIX #1349: Starting part \(index + 1)/\(partAssets.count) download: \(partInfo.info.name) (\(expectedSize / 1_000_000) MB)")
+
+                let result = ZipherXFFI.downloadFile(
+                    url: partInfo.asset.browser_download_url,
+                    destPath: destPath,
+                    resumeFrom: resumeFrom,
+                    expectedSize: expectedSize
+                )
+
+                lock.lock()
+                if result == 0 {
+                    completedParts.insert(index)
+                    print("✅ FIX #1349: Part \(index + 1) download complete")
+                } else {
+                    let errorMsg = ["Success", "Network error", "File error", "Cancelled", "Other error"]
+                    let msg = errorMsg[Int(min(abs(result), 4))]
+                    downloadErrors[index] = BoostFileError.networkError("FIX #1349: Part \(index + 1) failed: \(msg) (code: \(result))")
+                    print("❌ FIX #1349: Part \(index + 1) download failed (code: \(result))")
+                }
+                lock.unlock()
+                group.leave()
+            }
+        }
+
+        // 3. Poll file sizes for combined progress while downloads run
+        let progressTask = Task { @Sendable in
+            while true {
+                lock.lock()
+                let done = completedParts.count >= partAssets.count || !downloadErrors.isEmpty
+                lock.unlock()
+                if done { break }
+
+                var totalDownloaded: Int64 = 0
+                for partInfo in partAssets {
+                    let size = (try? FileManager.default.attributesOfItem(atPath: partInfo.path.path)[.size] as? Int64) ?? 0
+                    totalDownloaded += size
+                }
+                let progress = totalSize > 0 ? Double(totalDownloaded) / Double(totalSize) : 0
+                await MainActor.run { onProgress?(progress) }
+                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            }
+        }
+
+        // Wait for all downloads to complete
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            group.notify(queue: .global()) { continuation.resume() }
+        }
+        progressTask.cancel()
+
+        // Check for errors
+        if let firstError = downloadErrors.values.first {
+            throw firstError
+        }
+
+        // 4. Verify each part's size
+        for (index, partInfo) in partAssets.enumerated() {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: partInfo.path.path)
+            let actualSize = attrs?[.size] as? Int ?? 0
+            guard actualSize == partInfo.info.size else {
+                throw BoostFileError.networkError("FIX #1349: Part \(index + 1) size mismatch: got \(actualSize), expected \(partInfo.info.size)")
+            }
+        }
+
+        // 5. Verify each part's SHA256 (if available)
+        for (index, partInfo) in partAssets.enumerated() {
+            if !partInfo.info.sha256.isEmpty {
+                onProgress?(0.92 + Double(index) * 0.02)
+                let match = verifySHA256(file: partInfo.path, expected: partInfo.info.sha256)
+                guard match else {
+                    print("❌ FIX #1349: Part \(index + 1) SHA256 mismatch!")
+                    // Delete corrupted part so it will be re-downloaded on retry
+                    try? FileManager.default.removeItem(at: partInfo.path)
+                    throw BoostFileError.checksumMismatch
+                }
+                print("✅ FIX #1349: Part \(index + 1) SHA256 verified")
+            }
+        }
+
+        // 6. Concatenate parts into full .zst file
+        onProgress?(0.96)
+        let compressedPath = boostCacheDirectory.appendingPathComponent("zipherx_boost_v1.bin.zst")
+        try concatenateFiles(parts: partPaths, output: compressedPath)
+        print("✅ FIX #1349: Concatenated \(partAssets.count) parts → \(compressedPath.lastPathComponent)")
+
+        // 6b. Delete parts immediately after concatenation to reduce peak disk usage
+        // (parts 2GB + .zst 2GB + .bin 2.3GB = 6.3GB peak → .zst 2GB + .bin 2.3GB = 4.3GB)
+        for partPath in partPaths {
+            try? FileManager.default.removeItem(at: partPath)
+        }
+
+        // 7. Decompress .zst → .bin
+        onProgress?(0.97)
+        let decompressedPath = cachedBoostPath.path
+        print("📦 FIX #1349: Decompressing \(compressedPath.lastPathComponent)...")
+        let decompressResult = ZipherXFFI.decompressZst(
+            source: compressedPath.path,
+            target: decompressedPath
+        )
+        guard decompressResult else {
+            throw BoostFileError.networkError("FIX #1349: ZSTD decompression failed")
+        }
+        print("✅ FIX #1349: Decompressed to \(cachedBoostPath.lastPathComponent)")
+
+        // 8. Cleanup: remove .zst after successful decompression
+        try? FileManager.default.removeItem(at: compressedPath)
+        print("🗑️ FIX #1349: Cleaned up .zst file")
+    }
+
+    /// FIX #1349: Concatenate split part files into a single output file
+    /// Uses 8MB chunked reads to avoid memory pressure on iOS
+    private func concatenateFiles(parts: [URL], output: URL) throws {
+        // Remove existing output if present
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+
+        // Create output file
+        FileManager.default.createFile(atPath: output.path, contents: nil)
+        let outputHandle = try FileHandle(forWritingTo: output)
+        defer { outputHandle.closeFile() }
+
+        let chunkSize = 8 * 1024 * 1024 // 8MB chunks
+
+        for (index, partURL) in parts.enumerated() {
+            let inputHandle = try FileHandle(forReadingFrom: partURL)
+            defer { inputHandle.closeFile() }
+
+            while autoreleasepool(invoking: {
+                let chunk = inputHandle.readData(ofLength: chunkSize)
+                if chunk.isEmpty { return false }
+                outputHandle.write(chunk)
+                return true
+            }) {}
+
+            print("📎 FIX #1349: Appended part \(index + 1)/\(parts.count)")
         }
     }
 

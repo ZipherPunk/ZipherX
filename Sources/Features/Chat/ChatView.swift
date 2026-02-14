@@ -31,7 +31,7 @@ struct ChatView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #243: Minimum peers required for stable chat
-    private let minimumPeersForChat = 4
+    private let minimumPeersForChat = 3
 
     /// Check if we have enough peers for stable chat
     private var hasEnoughPeers: Bool {
@@ -789,7 +789,7 @@ struct ConversationView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #243: Minimum peers required for stable chat
-    private let minimumPeersForChat = 4
+    private let minimumPeersForChat = 3
     private var hasEnoughPeers: Bool { networkManager.connectedPeers >= minimumPeersForChat }
 
     var body: some View {

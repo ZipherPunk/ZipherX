@@ -174,6 +174,9 @@ public final class NetworkManager: ObservableObject {
     // FIX #849: UserDefaults key for persisting pending outgoing txids across app restart
     private let PENDING_TXIDS_KEY = "ZipherX_PendingOutgoingTxids"
 
+    // FIX #1348: Suppress verbose logging for pre-production build
+    private let verbose = false
+
     // MARK: - Published Properties
     // CPU OPTIMIZATION: @Published fires Combine objectWillChange on EVERY assignment,
     // even when value is unchanged. Use updateIfChanged() to suppress duplicate notifications.
@@ -357,6 +360,7 @@ public final class NetworkManager: ObservableObject {
     /// FIX #145: Enable background processes (called after initial sync completes)
     func enableBackgroundProcesses() {
         backgroundProcessesEnabled = true
+        hasLoggedPathChangeSuppression = false  // FIX #1352: Reset for future syncs
         // FIX #286 v18: Also ensure suppressBackgroundSync is false
         // Belt-and-suspenders approach to fix mempool scanning not running
         if suppressBackgroundSync {
@@ -879,6 +883,8 @@ public final class NetworkManager: ObservableObject {
     /// Debounce network change recovery (3 second cooldown like BitChat)
     private var lastPathChangeTime: Date?
     private let PATH_CHANGE_DEBOUNCE: TimeInterval = 3.0
+    /// FIX #1352: Track if we already logged the suppression message
+    private var hasLoggedPathChangeSuppression = false
 
     // Address Manager
     private var knownAddresses: [String: AddressInfo] = [:] // host:port -> info
@@ -911,7 +917,9 @@ public final class NetworkManager: ObservableObject {
     private func getTrustedPeersForBootstrap() -> [String] {
         // Try to get trusted peers from database
         if let peers = try? WalletDatabase.shared.getTrustedPeers() {
-            print("📡 FIX #926: Loaded \(peers.count) trusted peers from database")
+            if verbose {
+                print("📡 FIX #926: Loaded \(peers.count) trusted peers from database")
+            }
             return peers.map { "\($0.host):\($0.port)" }
         }
         // Fallback if database not available (shouldn't happen)
@@ -1725,7 +1733,9 @@ public final class NetworkManager: ObservableObject {
 
         // Debug: Log Tor peer status
         if torCount > 0 || onionConnected > 0 {
-            print("🧅 Tor peers: \(torCount) via SOCKS5, \(onionConnected) .onion connected, \(onionCount) .onion discovered")
+            if verbose {
+                print("🧅 Tor peers: \(torCount) via SOCKS5, \(onionConnected) .onion connected, \(onionCount) .onion discovered")
+            }
         }
 
         await MainActor.run {
@@ -1873,8 +1883,10 @@ public final class NetworkManager: ObservableObject {
         let consensusIsStrong = preliminaryConsensusCount >= 3
 
         if consensusIsAboveThreshold && consensusIsStrong {
-            print("📡 FIX #290: Strong consensus (\(preliminaryConsensusCount) peers) at height \(preliminaryConsensusHeight) above threshold \(sybilThreshold)")
-            print("📡 FIX #290: NOT banning - wallet was likely offline while chain advanced \(preliminaryConsensusHeight - headerStoreHeightForValidation) blocks")
+            if verbose {
+                print("📡 FIX #290: Strong consensus (\(preliminaryConsensusCount) peers) at height \(preliminaryConsensusHeight) above threshold \(sybilThreshold)")
+                print("📡 FIX #290: NOT banning - wallet was likely offline while chain advanced \(preliminaryConsensusHeight - headerStoreHeightForValidation) blocks")
+            }
             // Don't ban anyone - the chain legitimately advanced while we were offline
         } else if !peersAboveThreshold.isEmpty {
             // FIX #111/159: Only ban when there's NO strong consensus at the high height
@@ -1997,7 +2009,9 @@ public final class NetworkManager: ObservableObject {
                 self.chainHeight = newHeight
                 // Cache for fast start mode (consecutive app launches)
                 UserDefaults.standard.set(Int(newHeight), forKey: "cachedChainHeight")
-                print("📊 Chain height updated: \(newHeight)")
+                if verbose {
+                    print("📊 Chain height updated: \(newHeight)")
+                }
             }
 
             // CRITICAL: Trigger background sync if wallet is behind
@@ -2126,9 +2140,13 @@ public final class NetworkManager: ObservableObject {
         if skippedInvalid > 0 { skipInfo.append("\(skippedInvalid) invalid") }
 
         if skipInfo.isEmpty {
-            print("📡 Loaded \(loadedCount) persisted peer addresses")
+            if verbose {
+                print("📡 Loaded \(loadedCount) persisted peer addresses")
+            }
         } else {
-            print("📡 Loaded \(loadedCount) persisted peer addresses (skipped \(skipInfo.joined(separator: ", ")))")
+            if verbose {
+                print("📡 Loaded \(loadedCount) persisted peer addresses (skipped \(skipInfo.joined(separator: ", ")))")
+            }
         }
     }
 
@@ -2163,7 +2181,9 @@ public final class NetworkManager: ObservableObject {
 
         if let data = try? JSONEncoder().encode(Array(addresses)) {
             UserDefaults.standard.set(data, forKey: persistedAddressesKey)
-            print("📡 Persisted \(addresses.count) peer addresses")
+            if verbose {
+                print("📡 Persisted \(addresses.count) peer addresses")
+            }
         }
     }
 
@@ -2208,7 +2228,9 @@ public final class NetworkManager: ObservableObject {
             loadedCount += 1
         }
 
-        print("📡 Loaded \(loadedCount) bundled peer addresses")
+        if verbose {
+            print("📡 Loaded \(loadedCount) bundled peer addresses")
+        }
     }
 
     // MARK: - GitHub Peer Download
@@ -2219,7 +2241,9 @@ public final class NetworkManager: ObservableObject {
     /// Download and load reliable peers from GitHub
     /// Call this at startup to get the latest peer list
     func downloadReliablePeersFromGitHub() async -> Int {
-        print("📡 Checking GitHub for reliable peers...")
+        if verbose {
+            print("📡 Checking GitHub for reliable peers...")
+        }
 
         guard let url = URL(string: Self.GITHUB_PEERS_URL) else {
             print("❌ Invalid GitHub peers URL")
@@ -2234,7 +2258,9 @@ public final class NetworkManager: ObservableObject {
             }
 
             let bundledPeers = try JSONDecoder().decode([BundledPeer].self, from: data)
-            print("📡 Downloaded \(bundledPeers.count) peers from GitHub")
+            if verbose {
+                print("📡 Downloaded \(bundledPeers.count) peers from GitHub")
+            }
 
             addressLock.lock()
             defer { addressLock.unlock() }
@@ -2384,7 +2410,9 @@ public final class NetworkManager: ObservableObject {
 
         // Discover peers via DNS seeds
         var discoveredPeers = await discoverPeers()
-        print("📡 DNS discovery found \(discoveredPeers.count) peers")
+        if verbose {
+            print("📡 DNS discovery found \(discoveredPeers.count) peers")
+        }
 
         // FIX #229: Add trusted peers from database for eclipse attack resistance
         for peer in getTrustedPeersForBootstrap() {
@@ -2561,11 +2589,15 @@ public final class NetworkManager: ObservableObject {
                         }
 
                         do {
-                            print("🔄 Trying \(address.host):\(address.port)...")
+                            if self.verbose {
+                                print("🔄 Trying \(address.host):\(address.port)...")
+                            }
                             let connectStart = Date()
                             let peer = try await self.connectToPeer(address)
                             let responseTimeMs = Int(Date().timeIntervalSince(connectStart) * 1000)
-                            print("✅ Connected to \(address.host):\(address.port) (\(responseTimeMs)ms)")
+                            if self.verbose {
+                                print("✅ Connected to \(address.host):\(address.port) (\(responseTimeMs)ms)")
+                            }
                             // FIX #284: Unpark peer on successful connection
                             // FIX #908: Reset handshake failures on successful connection
                             // FIX #1115: Record success to database for peer scoring
@@ -2672,7 +2704,9 @@ public final class NetworkManager: ObservableObject {
                         // Set flag to exit OUTER loop since withTaskGroup waits for all tasks
                         if connectedCount >= minPeersForEarlyReturn {
                             let elapsedInLoop = Date().timeIntervalSince(connectStartTime)
-                            print("⚡ FIX #1112 v4: Early exit - \(connectedCount) peers in \(String(format: "%.2f", elapsedInLoop))s")
+                            if verbose {
+                                print("⚡ FIX #1112 v4: Early exit - \(connectedCount) peers in \(String(format: "%.2f", elapsedInLoop))s")
+                            }
                             shouldExitEarly = true
                             group.cancelAll()
                             break
@@ -2683,25 +2717,33 @@ public final class NetworkManager: ObservableObject {
 
             // FIX #1112 v4: If early exit flag set, skip to end immediately
             if shouldExitEarly {
-                print("📊 FIX #1112 v4: Skipping to end - \(connectedCount) peers ready")
+                if verbose {
+                    print("📊 FIX #1112 v4: Skipping to end - \(connectedCount) peers ready")
+                }
                 break
             }
 
             // Log progress
-            print("📊 Connected \(connectedCount)/\(targetPeers) peers (tried \(peerIndex)/\(validPeers.count))")
+            if verbose {
+                print("📊 Connected \(connectedCount)/\(targetPeers) peers (tried \(peerIndex)/\(validPeers.count))")
+            }
 
             // FIX #547: Check for early return AFTER batch completes too
             // FIX #1112: Reduced from 3.0s to 1.5s - don't wait for slow peers when we have enough
             let elapsedAfterBatch = Date().timeIntervalSince(connectStartTime)
             if elapsedAfterBatch > 1.5 && connectedCount >= minPeersForEarlyReturn {
-                print("⏱️ FIX #1112: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
+                if verbose {
+                    print("⏱️ FIX #1112: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
+                }
                 break
             }
         }
 
         // Persist after successful connections
         persistAddresses()
-        print("📊 Final: Connected to \(connectedCount)/\(targetPeers) target peers")
+        if verbose {
+            print("📊 Final: Connected to \(connectedCount)/\(targetPeers) target peers")
+        }
 
         // FIX #429: If we exited early due to timeout, continue connecting in background
         let remainingPeers = Array(validPeers[peerIndex...])
@@ -3095,18 +3137,24 @@ public final class NetworkManager: ObservableObject {
             // FIX #402: Debug peer heights
             // FIX #434: Only use valid Zclassic peers (170002-170012)
             let readyPeers = peers.filter { $0.isConnectionReady && $0.isValidZclassicPeer }
-            print("📊 FIX #402+#434: \(readyPeers.count) valid Zclassic peers, checking heights...")
+            if verbose {
+                print("📊 FIX #402+#434: \(readyPeers.count) valid Zclassic peers, checking heights...")
+            }
 
             for peer in peers {
                 // SECURITY: Skip banned peers, negative heights, and non-Zclassic peers
                 guard !isBanned(peer.host), peer.peerStartHeight > 0, peer.isValidZclassicPeer else {
                     if peer.isConnectionReady && !peer.isValidZclassicPeer {
-                        print("⚠️ FIX #434: Skipping non-Zclassic peer \(peer.host) version \(peer.peerVersion)")
+                        if verbose {
+                            print("⚠️ FIX #434: Skipping non-Zclassic peer \(peer.host) version \(peer.peerVersion)")
+                        }
                     }
                     continue
                 }
                 let h = UInt64(peer.peerStartHeight)
-                print("📊 FIX #402: Peer \(peer.host) reports height \(h)")
+                if verbose {
+                    print("📊 FIX #402: Peer \(peer.host) reports height \(h)")
+                }
                 peerHeights[h, default: 0] += 1
                 peerMaxHeight = max(peerMaxHeight, h)
             }
@@ -3139,14 +3187,20 @@ public final class NetworkManager: ObservableObject {
                         let peersAtMax = peerHeights[peerMaxHeight, default: 0]
                         if peersAtMax >= 1 {
                             currentChainHeight = peerMaxHeight
-                            print("📡 FIX #1265: Using max peer height \(peerMaxHeight) (consensus: \(peerConsensusHeight), \(peersAtMax) peer(s) at max)")
+                            if verbose {
+                                print("📡 FIX #1265: Using max peer height \(peerMaxHeight) (consensus: \(peerConsensusHeight), \(peersAtMax) peer(s) at max)")
+                            }
                         } else {
                             currentChainHeight = peerConsensusHeight
-                            print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                            if verbose {
+                                print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                            }
                         }
                     } else {
                         currentChainHeight = peerConsensusHeight
-                        print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                        if verbose {
+                            print("📡 FIX #381: Using P2P consensus: \(currentChainHeight) (\(consensusCount) peers)")
+                        }
                     }
                 } else {
                     print("🚨 FIX #381: Rejecting suspicious consensus \(peerConsensusHeight) (HeaderStore: \(headerStoreHeight))")
@@ -3156,17 +3210,23 @@ public final class NetworkManager: ObservableObject {
                 // FIX #402: Use peer height if HIGHER than HeaderStore
                 // HeaderStore may be stale - peer has newer chain tip
                 currentChainHeight = peerMaxHeight
-                print("📡 FIX #402: Using peer height (ahead of headers): \(currentChainHeight) (HeaderStore: \(headerStoreHeight))")
+                if verbose {
+                    print("📡 FIX #402: Using peer height (ahead of headers): \(currentChainHeight) (HeaderStore: \(headerStoreHeight))")
+                }
             } else if headerStoreHeight > 0 {
                 // 3. Fallback to HeaderStore (peer height not higher)
                 // FIX #404: But prefer cached height if it's higher (HeaderStore is stale)
                 let cachedHeight = UInt64(UserDefaults.standard.integer(forKey: "cachedChainHeight"))
                 if cachedHeight > headerStoreHeight {
                     currentChainHeight = cachedHeight
-                    print("📡 FIX #404: Using cached height (HeaderStore stale): \(cachedHeight) vs headers \(headerStoreHeight)")
+                    if verbose {
+                        print("📡 FIX #404: Using cached height (HeaderStore stale): \(cachedHeight) vs headers \(headerStoreHeight)")
+                    }
                 } else {
                     currentChainHeight = headerStoreHeight
-                    print("📡 FIX #381: Using HeaderStore (no P2P consensus): \(currentChainHeight)")
+                    if verbose {
+                        print("📡 FIX #381: Using HeaderStore (no P2P consensus): \(currentChainHeight)")
+                    }
                 }
             } else if peerMaxHeight > 0 {
                 // 4. Last resort - single peer height (less secure)
@@ -3193,7 +3253,9 @@ public final class NetworkManager: ObservableObject {
         // FIX #400: NEVER downgrade chainHeight - this causes TX history to show "Pending"
         if currentChainHeight > 0 && currentChainHeight > chainHeight {
             await MainActor.run {
-                print("📊 Chain height: \(currentChainHeight)")
+                if verbose {
+                    print("📊 Chain height: \(currentChainHeight)")
+                }
                 self.chainHeight = currentChainHeight
                 // Cache for fast start mode (consecutive app launches)
                 UserDefaults.standard.set(Int(currentChainHeight), forKey: "cachedChainHeight")
@@ -3243,18 +3305,12 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        // MEMPOOL SCAN: Check for incoming unconfirmed transactions
-        // Uses message queue to prevent stream conflicts
-        // SKIP mempool scan during initial sync to avoid interfering with header sync
-        if !suppressBackgroundSync {
-            Task {
-                await scanMempoolForIncoming()
-            }
-        } else {
-            // FIX #286 v18: Log when mempool scan is suppressed (debugging)
-            // This log should only appear briefly during startup
-            print("🔮 Mempool scan suppressed (initial sync)")
-        }
+        // FIX #1336: Periodic mempool polling REMOVED.
+        // Incoming TX detection is now event-driven:
+        //   1. Peer sends unsolicited `inv` MSG_TX → handleInvMessage → getdata → trial decrypt (instant)
+        //   2. One-time `mempool` command sent on peer connection (catches pre-existing TXs)
+        // The old scanMempoolForIncoming() polled every ~18s but always got 0 results because
+        // peers marked TXs as "already announced" after sending unsolicited inv.
 
         // ALWAYS check if any pending txs have been confirmed
         // (even during initial sync - user wants to see when their tx confirms)
@@ -3278,13 +3334,13 @@ public final class NetworkManager: ObservableObject {
     /// Phase 1: Peer accepted (set when first peer accepts broadcast)
     /// Phase 2: Mempool verified (set when tx confirmed in mempool)
     @Published private(set) var pendingBroadcastAmount: UInt64 = 0
+    @Published private(set) var pendingBroadcastFee: UInt64 = 0  // FIX #1356: Track fee separately
     @Published private(set) var pendingBroadcastTxid: String? = nil
     @Published private(set) var isMempoolVerified: Bool = false
 
     /// Published when a transaction is confirmed (for showing "Settlement" celebration)
-    /// Contains (txid, amount, isOutgoing, clearingTime, settlementTime) - cleared after UI handles it
-    /// clearingTime: seconds from send click to mempool, settlementTime: seconds from send click to 1st confirmation
-    @Published var justConfirmedTx: (txid: String, amount: UInt64, isOutgoing: Bool, clearingTime: TimeInterval?, settlementTime: TimeInterval?)? = nil
+    /// FIX #1356: amount = user-sent amount (excluding fee), fee = separate
+    @Published var justConfirmedTx: (txid: String, amount: UInt64, fee: UInt64, isOutgoing: Bool, clearingTime: TimeInterval?, settlementTime: TimeInterval?)? = nil
 
     /// Published when incoming ZCL is detected in mempool (for showing "Clearing" celebration)
     /// Contains (txid, amount, clearingTime) - cleared after UI handles it
@@ -3292,8 +3348,8 @@ public final class NetworkManager: ObservableObject {
     @Published var justDetectedIncomingMempool: (txid: String, amount: UInt64, clearingTime: TimeInterval?)? = nil
 
     /// Published when sender's tx is verified in mempool (for showing "Clearing" celebration on sender side)
-    /// Contains (txid, amount, clearingTime) - cleared after UI handles it
-    @Published var justClearedOutgoing: (txid: String, amount: UInt64, clearingTime: TimeInterval)? = nil
+    /// FIX #1356: amount = user-sent amount (excluding fee), fee = separate
+    @Published var justClearedOutgoing: (txid: String, amount: UInt64, fee: UInt64, clearingTime: TimeInterval)? = nil
 
     /// Counter to trigger onChange when outgoing clearing is detected
     @Published var outgoingClearingTrigger: Int = 0
@@ -3312,9 +3368,10 @@ public final class NetworkManager: ObservableObject {
     /// ALSO adds txid to pendingOutgoingTxidSet so FilterScanner can detect change outputs
     /// AND tracks in the actor so checkPendingOutgoingConfirmations works
     @MainActor
-    func setPendingBroadcast(txid: String, amount: UInt64) {
+    func setPendingBroadcast(txid: String, amount: UInt64, fee: UInt64 = 10000) {
         pendingBroadcastTxid = txid
         pendingBroadcastAmount = amount
+        pendingBroadcastFee = fee  // FIX #1356
         isMempoolVerified = false
 
         // CRITICAL: Add to pendingOutgoingTxidSet IMMEDIATELY so FilterScanner
@@ -3356,9 +3413,9 @@ public final class NetworkManager: ObservableObject {
             if let sendTime = WalletManager.shared.lastSendTimestamp {
                 clearingTime = Date().timeIntervalSince(sendTime)
             }
-            justClearedOutgoing = (txid: txid, amount: pendingBroadcastAmount, clearingTime: clearingTime)
+            justClearedOutgoing = (txid: txid, amount: pendingBroadcastAmount, fee: pendingBroadcastFee, clearingTime: clearingTime)
             outgoingClearingTrigger += 1
-            print("🏦 CLEARING! Outgoing tx \(txid.prefix(12))... verified in mempool after \(String(format: "%.1f", clearingTime))s")
+            print("🏦 CLEARING! Outgoing tx \(txid.prefix(12))... verified in mempool after \(String(format: "%.1f", clearingTime))s (amount: \(pendingBroadcastAmount), fee: \(pendingBroadcastFee))")
         }
     }
 
@@ -3367,6 +3424,7 @@ public final class NetworkManager: ObservableObject {
     func clearPendingBroadcast() {
         pendingBroadcastTxid = nil
         pendingBroadcastAmount = 0
+        pendingBroadcastFee = 0  // FIX #1356
         isMempoolVerified = false
         // Also clear mempoolOutgoing so "awaiting confirmation" message disappears
         mempoolOutgoing = 0
@@ -3587,11 +3645,17 @@ public final class NetworkManager: ObservableObject {
                 }
 
                 // Publish confirmation for UI celebration (Settlement!)
-                let amount = pendingTx.amount + pendingTx.fee
-                self.justConfirmedTx = (txid: txid, amount: amount, isOutgoing: true, clearingTime: clearingTime, settlementTime: settlementTime)
+                // FIX #1356: Display user-sent amount and fee separately (not combined)
+                self.justConfirmedTx = (txid: txid, amount: pendingTx.amount, fee: pendingTx.fee, isOutgoing: true, clearingTime: clearingTime, settlementTime: settlementTime)
                 self.settlementCelebrationTrigger += 1
 
                 print("⛏️ SETTLEMENT! Outgoing tx confirmed: \(txid.prefix(12))... after \(String(format: "%.1f", settlementTime ?? 0))s (remaining pending: \(result.total), mempoolOutgoing now: \(self.mempoolOutgoing), trigger=\(self.settlementCelebrationTrigger))")
+
+                // FIX #1331: Post transactionHistoryUpdated so UI cache refreshes.
+                // Without this, BalanceView's cached TX list still shows "awaiting confirmation"
+                // even though the DB has the confirmed TX.
+                NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                print("📜 FIX #1331: Posted transactionHistoryUpdated after outgoing TX confirmation")
             }
         } else {
             // Even if not tracked, clear pending broadcast in case it was set
@@ -3682,12 +3746,18 @@ public final class NetworkManager: ObservableObject {
         await MainActor.run {
             // Publish confirmation for UI celebration (Settlement for receiver!)
             // Receiver doesn't have send click time, so clearingTime/settlementTime are nil
-            self.justConfirmedTx = (txid: txid, amount: finalAmount, isOutgoing: false, clearingTime: nil, settlementTime: nil)
+            self.justConfirmedTx = (txid: txid, amount: finalAmount, fee: 0, isOutgoing: false, clearingTime: nil, settlementTime: nil)
             self.settlementCelebrationTrigger += 1  // Increment to trigger onChange
             print("⛏️ Confirmed: +\(Double(finalAmount) / 100_000_000.0) ZCL")
 
             // Also send system notification
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
+
+            // FIX #1331: Post transactionHistoryUpdated so UI cache refreshes.
+            // Without this, BalanceView's cached TX list still shows "awaiting confirmation"
+            // even though the TX is confirmed.
+            NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+            print("📜 FIX #1331: Posted transactionHistoryUpdated after incoming TX confirmation")
         }
 
         // FIX #286 v19: REMOVED verified_checkpoint update from here!
@@ -3912,9 +3982,13 @@ public final class NetworkManager: ObservableObject {
             // Check if this tx exists in our transaction history (means it was confirmed during sync)
             let historyItems = (try? WalletDatabase.shared.getTransactionHistory(limit: 50, offset: 0)) ?? []
             let txExists = historyItems.contains { item in
-                // Check if txid matches (compare hex strings)
-                let itemTxidHex = item.txid.map { String(format: "%02x", $0) }.joined()
-                return itemTxidHex == txid
+                // FIX #1331: Compare BOTH wire and display format hex.
+                // Pending txids are tracked in DISPLAY format (reversed, line 4152)
+                // but DB stores txids in WIRE format (little-endian).
+                // Must check both to handle the format mismatch.
+                let itemWireHex = item.txid.map { String(format: "%02x", $0) }.joined()
+                let itemDisplayHex = Data(item.txid.reversed()).map { String(format: "%02x", $0) }.joined()
+                return itemWireHex == txid || itemDisplayHex == txid
             }
 
             if txExists {
@@ -4343,6 +4417,108 @@ public final class NetworkManager: ObservableObject {
             if incomingAmount > 0 {
                 print("🔮 Mempool incoming: \(incomingAmount) zatoshis (\(incomingCount) tx)")
             }
+        }
+    }
+
+    /// FIX #1333: Event-driven mempool detection — process a single TX received from unsolicited inv.
+    /// Called from Peer.onMempoolTxData callback when block listener receives a `tx` response
+    /// after our getdata request triggered by unsolicited `inv` MSG_TX.
+    /// This is INSTANT (within seconds) vs the old 18-second polling approach.
+    private func processIncomingMempoolTx(txid: Data, rawTx: Data, fromPeer: String) async {
+        // Skip if background processes disabled (initial sync in progress)
+        guard backgroundProcessesEnabled else {
+            print("🔮 FIX #1333: Skipping instant mempool TX (initial sync in progress)")
+            return
+        }
+
+        // Get spending key for trial decryption
+        guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+            print("🔮 FIX #1333: Could not retrieve spending key — skipping")
+            return
+        }
+
+        // txid from doubleSHA256().reversed() is DISPLAY format (big-endian, human-readable)
+        let txidDisplayHex = txid.map { String(format: "%02x", $0) }.joined()
+        // Wire format (little-endian) for DB storage — matches block-scanned txids
+        let txidWire = Data(txid.reversed())
+
+        // Skip our own pending outgoing transactions (change outputs)
+        let pendingOutgoingTxids = await txTrackingState.getAllPendingOutgoingTxids()
+        if pendingOutgoingTxids.contains(txidDisplayHex) || isPendingOutgoingSync(txid: txidDisplayHex) {
+            print("🔮 FIX #1333: Skipping \(txidDisplayHex.prefix(12))... (our pending outgoing)")
+            return
+        }
+
+        // Skip if sent recently (change output)
+        if let lastSend = WalletManager.shared.lastSendTimestamp,
+           Date().timeIntervalSince(lastSend) < 120.0 {
+            print("🔮 FIX #1333: Skipping \(txidDisplayHex.prefix(12))... (recent send — likely change)")
+            return
+        }
+
+        // Skip if we have pending outgoing (any mempool TX during send is likely change)
+        if mempoolOutgoing > 0 {
+            print("🔮 FIX #1333: Skipping \(txidDisplayHex.prefix(12))... (mempoolOutgoing > 0 — likely change)")
+            return
+        }
+
+        // Parse and trial decrypt shielded outputs
+        guard let outputs = parseShieldedOutputs(from: rawTx) else {
+            print("🔮 FIX #1333: No shielded outputs in \(txidDisplayHex.prefix(12))...")
+            return
+        }
+
+        var txIncomingAmount: UInt64 = 0
+        for output in outputs {
+            if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
+                spendingKey: spendingKey,
+                epk: output.epk,
+                cmu: output.cmu,
+                ciphertext: output.ciphertext
+            ) {
+                if decrypted.count >= 19 {
+                    let valueBytes = Data(decrypted[11..<19])
+                    let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                    txIncomingAmount += value
+                    print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value) zatoshis in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
+                }
+            }
+        }
+
+        guard txIncomingAmount > 0 else { return }
+
+        // Skip if already confirmed in DB
+        let alreadyConfirmed = (try? WalletDatabase.shared.transactionExists(txid: txidWire, type: .received)) ?? false
+        if alreadyConfirmed {
+            print("🔮 FIX #1333: Skipping already-confirmed TX \(txidDisplayHex.prefix(12))...")
+            return
+        }
+
+        // Check if this is a NEW TX we haven't notified about
+        let isNewTx = await txTrackingState.checkAndMarkNotified(txid: txidDisplayHex)
+        guard isNewTx else {
+            print("🔮 FIX #1333: Already notified for TX \(txidDisplayHex.prefix(12))... — updating amount only")
+            await MainActor.run {
+                self.mempoolIncoming = txIncomingAmount
+                self.mempoolTxCount = 1
+            }
+            return
+        }
+
+        // NEW incoming TX — send notification and celebrate!
+        print("🔔 FIX #1333: 🎉 INSTANT MEMPOOL NOTIFICATION — \(txIncomingAmount) zatoshis in TX \(txidDisplayHex.prefix(12))... (event-driven, no polling!)")
+        NotificationManager.shared.notifyReceived(amount: txIncomingAmount, txid: txidDisplayHex)
+
+        // Track incoming TX
+        await txTrackingState.trackIncoming(txid: txidDisplayHex, amount: txIncomingAmount)
+
+        // Update UI
+        await MainActor.run {
+            self.mempoolIncoming = txIncomingAmount
+            self.mempoolTxCount = 1
+            self.justDetectedIncomingMempool = (txid: txidDisplayHex, amount: txIncomingAmount, clearingTime: nil)
+            self.mempoolIncomingCelebrationTrigger += 1
+            print("🏦 FIX #1333: CLEARING! Instant mempool detection: txid=\(txidDisplayHex.prefix(12))..., amount=\(txIncomingAmount)")
         }
     }
 
@@ -4880,6 +5056,37 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
+        // FIX #1333: Event-driven mempool detection — process unsolicited TX instantly
+        // When a peer's mempool gets a new TX, it sends `inv` MSG_TX → block listener
+        // requests getdata → peer sends full `tx` → this callback fires.
+        // Trial decrypt here for INSTANT incoming TX detection (vs 18s polling).
+        peer.onMempoolTxData = { [weak self] txid, rawTx in
+            guard let self = self else { return }
+            let txidHex = txid.map { String(format: "%02x", $0) }.joined()
+            print("🔮 FIX #1333: [\(peer.host)] Received full TX \(txidHex.prefix(16))... from unsolicited inv — trial decrypting...")
+            Task {
+                await self.processIncomingMempoolTx(txid: txid, rawTx: rawTx, fromPeer: peer.host)
+            }
+        }
+
+        // FIX #1336: One-time mempool query on peer connection.
+        // Send `mempool` command ONCE — the response arrives as `inv` through the block listener,
+        // which triggers handleInvMessage → getdata → case "tx": → onMempoolTxData → trial decrypt.
+        // This catches TXs already in the peer's mempool before we connected.
+        // After this, all new TXs are detected instantly via unsolicited `inv` — no polling needed.
+        Task { [weak self] in
+            // Wait for block listener to start (it's the TCP reader that processes responses)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self = self, peer.isConnectionReady else { return }
+            guard self.backgroundProcessesEnabled else { return }
+            do {
+                try await peer.sendMessage(command: "mempool", payload: Data())
+                print("🔮 FIX #1336: [\(peer.host)] Sent one-time mempool query (existing TXs)")
+            } catch {
+                print("⚠️ FIX #1336: [\(peer.host)] One-time mempool query failed: \(error.localizedDescription)")
+            }
+        }
+
         // FIX #509: DO NOT auto-start block listener here!
         // Block listeners are now started only:
         // 1. After header sync completes (resumeAllBlockListeners)
@@ -4970,7 +5177,9 @@ public final class NetworkManager: ObservableObject {
     /// VUL-002: Returns BroadcastResult with mempoolVerified flag - CRITICAL for database writes
     /// NEW: Pass amount to enable instant UI feedback when first peer accepts
     func broadcastTransactionWithProgress(_ rawTx: Data, amount: UInt64 = 0, onProgress: BroadcastProgressCallback? = nil) async throws -> BroadcastResult {
-        print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
+        if verbose {
+            print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
+        }
 
         // FIX #841: Block background sync during broadcast to prevent peer lock conflicts
         // Background sync triggers header sync which holds peer locks, causing broadcast timeouts
@@ -4986,7 +5195,9 @@ public final class NetworkManager: ObservableObject {
         defer {
             isBroadcasting = false
         }
-        print("📡 FIX #841+#1184: isBroadcasting = true, block listeners KEPT RUNNING (dispatcher active)")
+        if verbose {
+            print("📡 FIX #841+#1184: isBroadcasting = true, block listeners KEPT RUNNING (dispatcher active)")
+        }
 
         // ============================================================================
         // VUL-002 FIX: Validate Sapling proofs LOCALLY before broadcasting
@@ -5156,7 +5367,9 @@ public final class NetworkManager: ObservableObject {
         // with orphan-prone receiveMessageWithTimeout — root cause of false SETTLEMENT.
         // With FIX #1184, broadcast uses the dispatcher path (lock-free, no orphaned readers).
         // isBroadcasting=true prevents header sync from stopping block listeners during broadcast.
-        print("📡 FIX #1184: Block listeners RUNNING — broadcast will use dispatcher path")
+        if verbose {
+            print("📡 FIX #1184: Block listeners RUNNING — broadcast will use dispatcher path")
+        }
 
         // FIX #160: Compute TX ID upfront - even if timeout occurs, we know what was sent
         let computedTxId = rawTx.doubleSHA256().reversed().map { String(format: "%02x", $0) }.joined()
@@ -5462,7 +5675,9 @@ public final class NetworkManager: ObservableObject {
                             timeoutGroup.cancelAll()
                             return result
                         }
-                        print("✅ Peer \(peerHost) accepted tx: \(id)")
+                        if self.verbose {
+                            print("✅ Peer \(peerHost) accepted tx: \(id)")
+                        }
                         let result = await state.recordSuccess(id)
 
                         // On FIRST peer acceptance, immediately set pending broadcast for instant UI feedback
@@ -5486,7 +5701,9 @@ public final class NetworkManager: ObservableObject {
                         await state.recordDuplicate(computedTxId)
                         let dupCount = await state.getDuplicateCount()
                         let successCount = await state.getSuccessCount()
-                        print("⚠️ FIX #935 v3: Peer \(peerHost) returned DUPLICATE (count: \(dupCount), accepts: \(successCount))")
+                        if self.verbose {
+                            print("⚠️ FIX #935 v3: Peer \(peerHost) returned DUPLICATE (count: \(dupCount), accepts: \(successCount))")
+                        }
 
                         // FIX #935 v3: Only set pending broadcast from DUPLICATE if we ALSO have accepts
                         // DUPLICATE alone is NOT reliable - can mask rejection errors!
@@ -5496,12 +5713,18 @@ public final class NetworkManager: ObservableObject {
                                 self.setPendingBroadcast(txid: computedTxId, amount: broadcastAmount)
                             }
                             await state.markPendingBroadcastSet()
-                            print("✅ FIX #935 v3: Set pending broadcast (DUPLICATE + \(successCount) accepts)")
+                            if self.verbose {
+                                print("✅ FIX #935 v3: Set pending broadcast (DUPLICATE + \(successCount) accepts)")
+                            }
                         } else if successCount == 0 {
-                            print("⚠️ FIX #935 v3: NOT setting pending broadcast - 0 accepts, DUPLICATE alone is unreliable")
+                            if self.verbose {
+                                print("⚠️ FIX #935 v3: NOT setting pending broadcast - 0 accepts, DUPLICATE alone is unreliable")
+                            }
                         }
                     } catch {
-                        print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
+                        if self.verbose {
+                            print("⚠️ Peer \(peerHost) broadcast failed: \(error)")
+                        }
                     }
                 }
             }
@@ -5549,6 +5772,25 @@ public final class NetworkManager: ObservableObject {
                 // VUL-002: Verify TX propagation via P2P peers instead of centralized API
                 // If multiple peers accepted without reject message, TX is considered valid
                 // ============================================================================
+
+                // FIX #1357: Start block listeners/dispatchers BEFORE mempool verification.
+                // After direct-path broadcast, TCP streams may contain leftover data
+                // (inv/tx echo responses) that cause "Invalid magic bytes" on next read.
+                // Starting dispatchers lets them consume dirty data from the broadcast,
+                // so requestTransaction uses the clean dispatcher path instead of direct reads.
+                var anyDispatcherActive = false
+                for peer in self.peers.filter({ $0.isConnectionReady }) {
+                    if await peer.isDispatcherActive {
+                        anyDispatcherActive = true
+                        break
+                    }
+                }
+                if !anyDispatcherActive {
+                    print("📡 FIX #1357: No active dispatchers after broadcast — starting block listeners for clean mempool verification")
+                    await self.startBlockListenersOnMainScreen()
+                    try? await Task.sleep(nanoseconds: 300_000_000) // 300ms for dispatchers to activate
+                }
+
                 onProgress?("verify", "Verifying P2P propagation...", 0.6)
 
                 // FIX #247: Use P2P verification - request TX from peers via getdata
@@ -6792,7 +7034,9 @@ public final class NetworkManager: ObservableObject {
         var lastError: Error = NetworkError.p2pFetchFailed
         for peer in availablePeers.shuffled() {
             do {
-                print("📡 P2P on-demand: Trying peer \(peer.host)...")
+                if verbose {
+                    print("📡 P2P on-demand: Trying peer \(peer.host)...")
+                }
                 let blocks = try await withTimeout(seconds: 30) {
                     try await peer.getFullBlocks(from: height, count: count)
                 }
@@ -7008,7 +7252,9 @@ public final class NetworkManager: ObservableObject {
         }
         let neededDispatchers = min(3, availablePeers.count)
         if activeDispatcherCount < neededDispatchers {
-            print("🔄 FIX #1285: Only \(activeDispatcherCount)/\(availablePeers.count) dispatchers active (need \(neededDispatchers)) — restarting block listeners...")
+            if verbose {
+                print("🔄 FIX #1285: Only \(activeDispatcherCount)/\(availablePeers.count) dispatchers active (need \(neededDispatchers)) — restarting block listeners...")
+            }
             // Must unblock to allow startBlockListener() to proceed
             if PeerManager.shared.areBlockListenersBlocked() {
                 PeerManager.shared.setBlockListenersBlocked(false)
@@ -7034,12 +7280,16 @@ public final class NetworkManager: ObservableObject {
                     }
                 }
                 if activeCount >= minDispatchers {
-                    print("✅ FIX #1285: \(activeCount) dispatchers activated after \(Double(i + 1) * 0.1)s (needed \(minDispatchers))")
+                    if verbose {
+                        print("✅ FIX #1285: \(activeCount) dispatchers activated after \(Double(i + 1) * 0.1)s (needed \(minDispatchers))")
+                    }
                     break
                 }
                 // FIX #1205 compat: log first activation
                 if i == 9 && activeCount > 0 && activeCount < minDispatchers {
-                    print("⏳ FIX #1285: \(activeCount)/\(minDispatchers) dispatchers after 1.0s — waiting for more...")
+                    if verbose {
+                        print("⏳ FIX #1285: \(activeCount)/\(minDispatchers) dispatchers after 1.0s — waiting for more...")
+                    }
                 }
             }
         }
@@ -7091,7 +7341,9 @@ public final class NetworkManager: ObservableObject {
         }
         if !dispatcherActivePeers.isEmpty {
             if dispatcherActivePeers.count < availablePeers.count {
-                print("📡 FIX #1285: Filtered to \(dispatcherActivePeers.count)/\(availablePeers.count) dispatcher-active peers")
+                if verbose {
+                    print("📡 FIX #1285: Filtered to \(dispatcherActivePeers.count)/\(availablePeers.count) dispatcher-active peers")
+                }
             }
             availablePeers = dispatcherActivePeers
         } else {
@@ -7122,7 +7374,9 @@ public final class NetworkManager: ObservableObject {
         let headerStoreAvailable = (try? HeaderStore.shared.getHeader(at: height)) != nil
 
         debugLog(.network, "🚀 P2P fetch: \(count) blocks from height \(height), \(availablePeers.count) ready peers, bundled=\(bundledAvailable), headers=\(headerStoreAvailable)")
-        print("🚀 FIX #1287: Streaming fetch \(count) blocks (\(numChunks) chunks) using \(actualPeerCount) peers")
+        if verbose {
+            print("🚀 FIX #1287: Streaming fetch \(count) blocks (\(numChunks) chunks) using \(actualPeerCount) peers")
+        }
         let startTime = Date()
 
         // FIX #1287: Shared work queue — each peer grabs chunks continuously, no round boundaries.
@@ -7195,7 +7449,9 @@ public final class NetworkManager: ObservableObject {
                             // Chunk failed — significant backoff
                             pacingDelayMs = min(pacingDelayMs + 100, 500)
                             if consecutiveChunkFailures >= 3 {
-                                print("⚠️ FIX #1287: [\(peerHost)] 3 consecutive chunk failures — stopping peer")
+                                if self.verbose {
+                                    print("⚠️ FIX #1287: [\(peerHost)] 3 consecutive chunk failures — stopping peer")
+                                }
                                 break
                             }
                         }
@@ -7204,7 +7460,9 @@ public final class NetworkManager: ObservableObject {
 
                     if !peerResults.isEmpty {
                         let avgDelay = pacingDelayMs
-                        print("📊 FIX #1287: [\(peerHost)] delivered \(peerResults.count) blocks in \(chunksHandled) chunks (final pacing: \(avgDelay)ms)")
+                        if self.verbose {
+                            print("📊 FIX #1287: [\(peerHost)] delivered \(peerResults.count) blocks in \(chunksHandled) chunks (final pacing: \(avgDelay)ms)")
+                        }
                     }
                     return peerResults.isEmpty ? nil : peerResults
                 }
@@ -7229,7 +7487,9 @@ public final class NetworkManager: ObservableObject {
             throw NetworkError.p2pFetchFailed
         }
 
-        print("✅ FIX #1287: Streaming fetch: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
+        if verbose {
+            print("✅ FIX #1287: Streaming fetch: \(results.count)/\(count) blocks in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rate)) blocks/sec)")
+        }
 
         // Sort by height to maintain order
         return results.sorted { $0.0 < $1.0 }
@@ -7345,7 +7605,9 @@ public final class NetworkManager: ObservableObject {
                             // FIX #288: Debug log spends fetched
                             let spendCount = shieldedSpends?.count ?? 0
                             if spendCount > 0 {
-                                print("🔍 FIX #288: P2P block \(block.blockHeight) tx \(txidHex.prefix(16))... has \(spendCount) spends, \(shieldedOutputs.count) outputs")
+                                if verbose {
+                                    print("🔍 FIX #288: P2P block \(block.blockHeight) tx \(txidHex.prefix(16))... has \(spendCount) spends, \(shieldedOutputs.count) outputs")
+                                }
                             }
                             txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
                         }
@@ -7383,7 +7645,9 @@ public final class NetworkManager: ObservableObject {
         do {
             // Extract just the hashes for batch request
             let hashes = blockHashes.map { $0.1 }
-            print("🚀 FIX #939: [\(peer.host)] Batch fetching \(hashes.count) blocks...")
+            if verbose {
+                print("🚀 FIX #939: [\(peer.host)] Batch fetching \(hashes.count) blocks...")
+            }
             let batchStartTime = Date()
 
             // FIX #939: Use getBlocksByHashes for efficient batch retrieval
@@ -7391,7 +7655,9 @@ public final class NetworkManager: ObservableObject {
 
             let batchDuration = Date().timeIntervalSince(batchStartTime)
             let batchRate = Double(fetchedBlocks.count) / max(batchDuration, 0.001)
-            print("✅ FIX #939: [\(peer.host)] Batch fetched \(fetchedBlocks.count)/\(hashes.count) blocks in \(String(format: "%.1f", batchDuration))s (\(String(format: "%.0f", batchRate)) blocks/sec)")
+            if verbose {
+                print("✅ FIX #939: [\(peer.host)] Batch fetched \(fetchedBlocks.count)/\(hashes.count) blocks in \(String(format: "%.1f", batchDuration))s (\(String(format: "%.0f", batchRate)) blocks/sec)")
+            }
 
             // Match fetched blocks to their heights
             // getBlocksByHashes returns blocks in order of the hashes we sent
@@ -7405,7 +7671,9 @@ public final class NetworkManager: ObservableObject {
             // FIX #939: On batch failure, fall back to sequential fetch (one block at a time)
             // This handles peers that don't respond well to large batch requests
             if !(error is CancellationError) {
-                print("⚠️ FIX #939: [\(peer.host)] Batch fetch failed (\(error.localizedDescription)), falling back to sequential...")
+                if verbose {
+                    print("⚠️ FIX #939: [\(peer.host)] Batch fetch failed (\(error.localizedDescription)), falling back to sequential...")
+                }
             }
 
             // Sequential fallback
@@ -8175,10 +8443,13 @@ public final class NetworkManager: ObservableObject {
             let isExpensive = path.isExpensive  // true = cellular
             let isConstrained = path.isConstrained
 
-            debugLog(.network, "📶 FIX #268: Network path changed - status=\(pathStatus), expensive=\(isExpensive), constrained=\(isConstrained)")
-
             // Handle path change on main thread
             Task { @MainActor in
+                // FIX #1352: Only log path changes when background processes are enabled
+                // (suppresses ~53 noisy lines during initial sync — iOS cellular fires every 3-6s)
+                if self.backgroundProcessesEnabled {
+                    debugLog(.network, "📶 FIX #268: Network path changed - status=\(pathStatus), expensive=\(isExpensive), constrained=\(isConstrained)")
+                }
                 await self.handleNetworkPathChange(path: path)
             }
         }
@@ -8232,12 +8503,16 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        print("🔍 [HEALTH] checkConnectionHealth() called at \(Date())")
+        if verbose {
+            print("🔍 [HEALTH] checkConnectionHealth() called at \(Date())")
+        }
 
         let connectedCount = connectedPeers
         let aliveCount = await countAlivePeers()
 
-        print("💓 Connection health: \(connectedCount) connected, \(aliveCount) alive")
+        if verbose {
+            print("💓 Connection health: \(connectedCount) connected, \(aliveCount) alive")
+        }
 
         // FIX #455: Update reactive peer counts for Settings UI
         updatePeerCountsForSettings()
@@ -8250,17 +8525,25 @@ public final class NetworkManager: ObservableObject {
 
         // Also check Tor SOCKS5 health if Tor is enabled
         let torMode = await TorManager.shared.mode
-        print("🔍 [HEALTH] Tor mode: \(torMode.rawValue)")
+        if verbose {
+            print("🔍 [HEALTH] Tor mode: \(torMode.rawValue)")
+        }
         if torMode == .enabled {
-            print("🔍 [HEALTH] Tor enabled - calling SOCKS5 health check...")
+            if verbose {
+                print("🔍 [HEALTH] Tor enabled - calling SOCKS5 health check...")
+            }
             let torHealthy = await TorManager.shared.checkSOCKS5Health()
             if !torHealthy {
                 print("⚠️ Tor SOCKS5 health check failed - will trigger restart if continues")
             } else {
-                print("✅ Tor SOCKS5 health check PASSED")
+                if verbose {
+                    print("✅ Tor SOCKS5 health check PASSED")
+                }
             }
         } else {
-            print("🔍 [HEALTH] Tor NOT enabled - skipping SOCKS5 health check")
+            if verbose {
+                print("🔍 [HEALTH] Tor NOT enabled - skipping SOCKS5 health check")
+            }
         }
     }
 
@@ -8302,6 +8585,22 @@ public final class NetworkManager: ObservableObject {
         // This was contributing to the 91-99% stall during Import PK
         if isLoadingHeaders {
             debugLog(.network, "📶 FIX #890: Suppressing path change during header load")
+            return
+        }
+
+        // FIX #1344: Suppress ALL reconnections during initial sync (boost download + scan phases).
+        // On iOS cellular, NWPathMonitor fires every 3-6s (LTE↔5G transitions), triggering
+        // 26+ reconnection cycles during import. Each cycle: disconnect all peers → DNS → 8 TCP
+        // connections → handshakes → 16 DB writes = massive CPU/radio drain → phone overheats.
+        // During initial sync: boost download uses Rust reqwest (not P2P), PHASE 1/1.5 are
+        // computation only, PHASE 2 manages its own connections. P2P reconnections are HARMFUL
+        // (they kill active header sync connections mid-stream).
+        if !backgroundProcessesEnabled {
+            // FIX #1352: Only log first suppression (was 53 messages in iOS import log)
+            if !hasLoggedPathChangeSuppression {
+                hasLoggedPathChangeSuppression = true
+                debugLog(.network, "📶 FIX #1344: Suppressing path changes during initial sync (further suppressed)")
+            }
             return
         }
 

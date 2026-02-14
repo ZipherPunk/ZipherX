@@ -34,6 +34,7 @@ struct BalanceView: View {
     // Settlement celebration state (for confirmed transactions)
     @State private var showSettlementCelebration = false
     @State private var settlementTxAmount: Double = 0
+    @State private var settlementTxFee: Double = 0  // FIX #1356
     @State private var settlementTxId: String = ""
     @State private var settlementIsOutgoing: Bool = true
     @State private var settlementClearingTime: TimeInterval? = nil
@@ -42,6 +43,7 @@ struct BalanceView: View {
     // Clearing celebration state (for mempool/unconfirmed tx)
     @State private var showClearingCelebration = false
     @State private var clearingTxAmount: Double = 0
+    @State private var clearingTxFee: Double = 0  // FIX #1356
     @State private var clearingTxId: String = ""
     @State private var clearingTime: TimeInterval? = nil
     @State private var clearingIsOutgoing: Bool = false  // true for sender, false for receiver
@@ -61,6 +63,22 @@ struct BalanceView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(errorMessage)
+            }
+            // FIX #1354: Prompt user when newer boost file is available
+            .alert("Boost Update Available", isPresented: Binding(
+                get: { walletManager.newerBoostAvailable != nil },
+                set: { if !$0 { walletManager.newerBoostAvailable = nil } }
+            )) {
+                Button("Download") {
+                    walletManager.downloadBoostUpdate()
+                }
+                Button("Later", role: .cancel) {
+                    walletManager.newerBoostAvailable = nil
+                }
+            } message: {
+                if let info = walletManager.newerBoostAvailable {
+                    Text("A newer boost file is available (height \(info.remoteHeight) vs \(info.cachedHeight)). Download for faster sync operations?")
+                }
             }
             .sheet(isPresented: $showTransactionDetail) {
                 if let tx = selectedTransaction {
@@ -120,6 +138,7 @@ struct BalanceView: View {
                 SettlementCelebrationView(
                     isShowing: $showSettlementCelebration,
                     amount: settlementTxAmount,
+                    fee: settlementTxFee,
                     txid: settlementTxId,
                     isOutgoing: settlementIsOutgoing,
                     clearingTime: settlementClearingTime,
@@ -134,6 +153,7 @@ struct BalanceView: View {
                 ClearingCelebrationView(
                     isShowing: $showClearingCelebration,
                     amount: clearingTxAmount,
+                    fee: clearingTxFee,
                     txid: clearingTxId,
                     clearingTime: clearingTime,
                     isOutgoing: clearingIsOutgoing
@@ -161,6 +181,7 @@ struct BalanceView: View {
             print("📜 BALANCEVIEW: Found pending Clearing celebration on appear - triggering now!")
             clearingTxId = mempool.txid
             clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+            clearingTxFee = 0  // FIX #1356: Receiver doesn't pay fee
             clearingTime = mempool.clearingTime
             clearingIsOutgoing = false  // Receiver side
             withAnimation {
@@ -179,12 +200,13 @@ struct BalanceView: View {
             print("📜 BALANCEVIEW: Found pending sender Clearing celebration on appear - triggering now!")
             clearingTxId = cleared.txid
             clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+            clearingTxFee = Double(cleared.fee) / 100_000_000.0  // FIX #1356
             clearingTime = cleared.clearingTime
             clearingIsOutgoing = true  // Sender side
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+            print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -197,13 +219,14 @@ struct BalanceView: View {
             print("📜 BALANCEVIEW: Found pending Settlement celebration on appear - triggering now!")
             settlementTxId = confirmed.txid
             settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+            settlementTxFee = Double(confirmed.fee) / 100_000_000.0  // FIX #1356
             settlementIsOutgoing = confirmed.isOutgoing
             settlementClearingTime = confirmed.clearingTime
             settlementTime = confirmed.settlementTime
             withAnimation {
                 showSettlementCelebration = true
             }
-            print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL")
+            print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
 
             // When outgoing tx is confirmed, clear balance tracking
             if confirmed.isOutgoing {
@@ -338,13 +361,14 @@ struct BalanceView: View {
         if let confirmed = networkManager.justConfirmedTx {
             settlementTxId = confirmed.txid
             settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+            settlementTxFee = Double(confirmed.fee) / 100_000_000.0  // FIX #1356
             settlementIsOutgoing = confirmed.isOutgoing
             settlementClearingTime = confirmed.clearingTime
             settlementTime = confirmed.settlementTime
             withAnimation {
                 showSettlementCelebration = true
             }
-            print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
+            print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee)) in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
 
             // When outgoing tx is confirmed, clear balance tracking
             // This happens AFTER change output is detected and added to balance
@@ -365,6 +389,7 @@ struct BalanceView: View {
         if let mempool = networkManager.justDetectedIncomingMempool {
             clearingTxId = mempool.txid
             clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+            clearingTxFee = 0  // FIX #1356: Receiver doesn't pay fee
             clearingTime = mempool.clearingTime
             clearingIsOutgoing = false  // Receiver side
             withAnimation {
@@ -384,12 +409,13 @@ struct BalanceView: View {
         if let cleared = networkManager.justClearedOutgoing {
             clearingTxId = cleared.txid
             clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+            clearingTxFee = Double(cleared.fee) / 100_000_000.0  // FIX #1356
             clearingTime = cleared.clearingTime
             clearingIsOutgoing = true  // Sender side
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL in \(String(format: "%.1f", cleared.clearingTime))s")
+            print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

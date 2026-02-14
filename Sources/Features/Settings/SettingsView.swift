@@ -197,16 +197,19 @@ struct SettingsView: View {
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
 
+    // FIX #1334: Flattened alert chain to prevent iOS stack overflow (EXC_BAD_ACCESS code=2).
+    // Previously 8 levels of computed properties (body → contentWithAlerts → mainContent →
+    // scrollViewContent → settingsScrollView → framedContent → baseContent → deletableContent)
+    // each adding .alert() modifiers. Each level added generic type frames to the stack.
+    // iOS main thread stack is 1MB (vs 8MB macOS) → stack overflow at networkSection.
+    // Fix: all alerts/sheets applied at body level → 2 levels instead of 8.
     var body: some View {
-        contentWithAlerts
-    }
-
-    private var contentWithAlerts: some View {
-        mainContent
+        deletableContent
             .onAppear {
                 checkBiometricAvailability()
                 networkManager.updatePeerCountsForSettings()
             }
+            // Sheets
             .sheet(isPresented: $showPINSetup) {
                 pinSetupSheet
                     #if os(macOS)
@@ -219,14 +222,7 @@ struct SettingsView: View {
                     .frame(minWidth: 450, idealWidth: 500, minHeight: 300, idealHeight: 350)
                     #endif
             }
-    }
-
-    // MARK: - Alert Helpers
-    // Group alerts to avoid type-check timeout
-
-    @ViewBuilder
-    private var mainContent: some View {
-        scrollViewContent
+            // Export & error alerts
             .alert("Export Private Key", isPresented: $showExportAlert) {
                 Button("Copy to Clipboard") { copyToClipboard(exportedKey) }
                 Button("Cancel", role: .cancel) {}
@@ -243,10 +239,7 @@ struct SettingsView: View {
             } message: {
                 Text(recoveryMessage)
             }
-    }
-
-    private var scrollViewContent: some View {
-        settingsScrollView
+            // Rescan alerts
             .alert("Full Blockchain Rescan", isPresented: $showRescanWarning) {
                 Button("Cancel", role: .cancel) {}
                 Button("Rescan", role: .destructive) { startFullRescan() }
@@ -283,10 +276,7 @@ struct SettingsView: View {
             } message: {
                 Text("Enter block height to start full rescan.\n\nThis rebuilds the commitment tree and creates proper witnesses so notes can be SPENT.\n\nExample: 2918000")
             }
-    }
-
-    private var settingsScrollView: some View {
-        framedContent
+            // Repair alerts
             .alert("Rebuild Witnesses", isPresented: $showRebuildWitnessesWarning) {
                 Button("Cancel", role: .cancel) {}
                 Button("Rebuild", role: .destructive) { startRebuildWitnesses() }
@@ -305,10 +295,7 @@ struct SettingsView: View {
             } message: {
                 Text("🔴 NUCLEAR OPTION 🔴\n\nThis performs a COMPLETE blockchain rescan:\n\n• DELETES all notes from database\n• DELETES all transaction history\n• Clears ALL cached data\n• Re-downloads boost file from GitHub\n• Rescans ENTIRE blockchain from Sapling activation\n\nThis is the same as importing a private key - everything is rebuilt from scratch.\n\n⚠️ Tor will be disabled during resync\n⚠️ Takes 10-30 minutes\n⚠️ Uses significant data/bandwidth\n\nUse ONLY if regular Repair doesn't fix balance.\n\nContinue?")
             }
-    }
-
-    private var framedContent: some View {
-        baseContent
+            // Scan & rebuild alerts
             .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
                 Button("Cancel", role: .cancel) {}
                 Button("Scan Now", role: .destructive) { startScanForUnrecordedTx() }
@@ -326,10 +313,7 @@ struct SettingsView: View {
             } message: {
                 Text(scanUnrecordedResultMessage)
             }
-    }
-
-    private var baseContent: some View {
-        deletableContent
+            // Delete wallet alerts
             .alert("DANGER - DELETE WALLET", isPresented: $showDeleteWalletWarning) {
                 Button("Cancel - Keep Wallet", role: .cancel) {}
                 Button("I Understand, Delete", role: .destructive) { showDeleteWalletConfirm = true }
@@ -3210,6 +3194,8 @@ Both binaries must be installed to /usr/local/bin:
         // Load saved preferences
         useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
         usePINCode = UserDefaults.standard.string(forKey: "walletPIN") != nil
+        // FIX #1346: Reload timeout from persisted value — @State only initializes once at view creation
+        selectedTimeout = BiometricAuthManager.shared.authTimeout
     }
 
     private func getBiometricName() -> String {

@@ -680,6 +680,15 @@ int32_t zipherx_zstd_decompress(
     size_t *out_len
 );
 
+/// FIX #1338: Streaming file-to-file ZSTD decompression (no memory loading)
+/// Returns: 0 = success, 1 = invalid input, 2 = source error, 3 = dest error, 4 = decompress error
+int32_t zipherx_zstd_decompress_file(
+    const uint8_t *source_path_ptr,
+    size_t source_path_len,
+    const uint8_t *dest_path_ptr,
+    size_t dest_path_len
+);
+
 /// Free a buffer allocated by Rust FFI
 void zipherx_free_buffer(uint8_t *ptr);
 

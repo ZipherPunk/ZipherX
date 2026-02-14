@@ -174,6 +174,14 @@ async fn download_file_async(
             resume_from
         };
 
+        // FIX #1335: If file already >= expected size, download is complete.
+        // Sending Range: bytes=N- where N >= total causes 416 Range Not Satisfiable.
+        if expected_size > 0 && current_size >= expected_size {
+            DOWNLOAD_BYTES.store(current_size, Ordering::Relaxed);
+            DOWNLOAD_TOTAL.store(expected_size, Ordering::Relaxed);
+            return Ok(());
+        }
+
         // Build request with Range header for resume
         let mut request = client.get(url).header("User-Agent", "ZipherX/1.0");
 

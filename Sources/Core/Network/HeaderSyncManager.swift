@@ -9,6 +9,9 @@ final class HeaderSyncManager {
     private let headerStore: HeaderStore
     private let networkManager: NetworkManager
 
+    // FIX #1348: Verbose logging flag for pre-production build
+    private let verbose = false
+
     // Consensus parameters
     // SECURITY: Chain height consensus uses InsightAPI + P2P peers with auto-banning
     // Header sync needs fewer peers since headers are verified by chain continuity + PoW
@@ -95,7 +98,9 @@ final class HeaderSyncManager {
                 networkManager.peers.filter { $0.isListening }.count
             }
             hadListenersBefore = peerManagerListeners || networkManagerListeners > 0
-            print("📊 FIX #904: Block listeners before stop - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
+            if verbose {
+                print("📊 FIX #904: Block listeners before stop - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
+            }
             await networkManager.stopAllBlockListeners()
             // FIX #900: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
         // Problem: stopAllBlockListeners() has a 5s timeout and "proceeds anyway" if not done
@@ -112,7 +117,9 @@ final class HeaderSyncManager {
         //   This adds ~500ms+ unnecessary delay on EVERY header sync startup!
         //   Solution: Only verify/wait when listeners were actually running
         if hadListenersBefore {  // FIX #1010: Only verify when there were actually listeners to stop
-            print("⏳ FIX #900: Verifying all block listeners are stopped...")
+            if verbose {
+                print("⏳ FIX #900: Verifying all block listeners are stopped...")
+            }
             let verifyStartTime = Date()
             let maxVerifyWait: Double = 30.0  // 30 seconds max wait
             var lastListeningCount = 0
@@ -131,13 +138,17 @@ final class HeaderSyncManager {
                 let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
 
                 if stillListening == 0 && !peerManagerListening {
-                    print("✅ FIX #900: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
+                    if verbose {
+                        print("✅ FIX #900: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
+                    }
                     break
                 }
 
                 // Log progress every time count changes
                 if stillListening != lastListeningCount {
-                    print("⏳ FIX #900: Still waiting for \(stillListening) block listeners to stop...")
+                    if verbose {
+                        print("⏳ FIX #900: Still waiting for \(stillListening) block listeners to stop...")
+                    }
                     lastListeningCount = stillListening
                 }
 
@@ -146,12 +157,16 @@ final class HeaderSyncManager {
             }
 
             // FIX #813: Additional 200ms for any in-flight receives
-            print("⏳ FIX #813: Waiting 200ms for in-flight receives to complete...")
+            if verbose {
+                print("⏳ FIX #813: Waiting 200ms for in-flight receives to complete...")
+            }
             try? await Task.sleep(nanoseconds: 200_000_000)
         } else {
             // FIX #1010: No listeners were running - skip verification entirely
+            if verbose {
                 print("⚡ FIX #1010: No block listeners were running - skipping verification (FAST PATH)")
             }
+        }
 
             // FIX #1206: Reconnect peers whose connections were killed by FIX #1184b.
         // FIX #1227: Reconnect REGARDLESS of hadListenersBefore - connections may have been killed
@@ -163,7 +178,9 @@ final class HeaderSyncManager {
             networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
         }
         if !deadPeers.isEmpty {
-            print("🔄 FIX #1227: Reconnecting \(deadPeers.count) peers with dead connections...")
+            if verbose {
+                print("🔄 FIX #1227: Reconnecting \(deadPeers.count) peers with dead connections...")
+            }
             // FIX #1235: Track reconnected peers to prevent duplicate reconnections in same batch.
             // isConnectionReady is a computed property checking connection?.state == .ready.
             // NWConnection state transitions asynchronously (connecting→ready takes time).
@@ -174,19 +191,25 @@ final class HeaderSyncManager {
             for peer in deadPeers {
                 // Skip if we already reconnected this peer in this batch
                 if reconnectedHosts.contains(peer.host) {
-                    print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
+                    if verbose {
+                        print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
+                    }
                     continue
                 }
                 do {
                     try await peer.ensureConnected()
                     reconnectedHosts.insert(peer.host)
-                    print("✅ FIX #1227: [\(peer.host)] Reconnected for header sync")
+                    if verbose {
+                        print("✅ FIX #1227: [\(peer.host)] Reconnected for header sync")
+                    }
                 } catch {
                     print("⚠️ FIX #1227: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
                 }
             }
         } else {
-            print("✅ FIX #1227: No dead connections found - all peers ready")
+            if verbose {
+                print("✅ FIX #1227: No dead connections found - all peers ready")
+            }
         }
 
         // FIX #1244: Wait for NWConnection states to become .ready after peer reconnection.
@@ -202,14 +225,18 @@ final class HeaderSyncManager {
             networkManager.peers.filter { $0.isConnectionReady }
         }
         if readyPeers.count < minPeers {
-            print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (currently \(readyPeers.count))...")
+            if verbose {
+                print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (currently \(readyPeers.count))...")
+            }
             for waitStep in 1...10 {  // Up to 5s (10 × 500ms)
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 let currentReady = await MainActor.run {
                     networkManager.peers.filter { $0.isConnectionReady }.count
                 }
                 if currentReady >= minPeers {
-                    print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms")
+                    if verbose {
+                        print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms")
+                    }
                     break
                 }
                 if waitStep == 10 {
@@ -217,20 +244,28 @@ final class HeaderSyncManager {
                 }
             }
         } else {
-            print("✅ FIX #1244: \(readyPeers.count) peers already in .ready state - no wait needed")
+            if verbose {
+                print("✅ FIX #1244: \(readyPeers.count) peers already in .ready state - no wait needed")
+            }
         }
         } else {
             // FIX #1243: Caller already stopped listeners + verified + reconnected
-            print("⚡ FIX #1243: Block listeners already stopped by caller - skipping redundant stop/verify/reconnect (FAST PATH)")
+            if verbose {
+                print("⚡ FIX #1243: Block listeners already stopped by caller - skipping redundant stop/verify/reconnect (FAST PATH)")
+            }
         }
 
         defer {
             // FIX #811 + FIX #907: Resume block listeners ONLY if not blocked by operations
             Task {
                 if PeerManager.shared.areBlockListenersBlocked() {
-                    print("🛑 FIX #907: Block listeners still BLOCKED - skipping FIX #811 resume")
+                    if verbose {
+                        print("🛑 FIX #907: Block listeners still BLOCKED - skipping FIX #811 resume")
+                    }
                 } else {
-                    print("▶️ FIX #811: Resuming block listeners after header sync...")
+                    if verbose {
+                        print("▶️ FIX #811: Resuming block listeners after header sync...")
+                    }
                     await networkManager.startBlockListenersOnMainScreen()
                 }
             }
@@ -251,7 +286,9 @@ final class HeaderSyncManager {
         }
 
         var chainTip = consensusHeight
-        print("🎯 Consensus chain tip: \(chainTip)")
+        if verbose {
+            print("🎯 Consensus chain tip: \(chainTip)")
+        }
 
         // FIX #753: If startHeight is already beyond consensus, we're ahead of the network
         // This happens when HeaderStore has headers that peers don't (yet)
@@ -276,10 +313,14 @@ final class HeaderSyncManager {
             // FIX #946: Cap targetTip at consensusHeight - can't sync blocks that don't exist
             let cappedTarget = min(targetTip, consensusHeight)
             if cappedTarget > chainTip {
-                print("📊 FIX #180/747/946: Adjusting chainTip from \(chainTip) to \(cappedTarget) (requested \(targetTip), capped at consensus \(consensusHeight))")
+                if verbose {
+                    print("📊 FIX #180/747/946: Adjusting chainTip from \(chainTip) to \(cappedTarget) (requested \(targetTip), capped at consensus \(consensusHeight))")
+                }
                 chainTip = cappedTarget
             } else if cappedTarget < chainTip {
-                print("📊 FIX #180: Limiting chainTip from \(chainTip) to \(cappedTarget) based on maxHeaders (\(maxHeaders))")
+                if verbose {
+                    print("📊 FIX #180: Limiting chainTip from \(chainTip) to \(cappedTarget) based on maxHeaders (\(maxHeaders))")
+                }
                 chainTip = cappedTarget
             }
         }
@@ -306,9 +347,11 @@ final class HeaderSyncManager {
                 return
             }
 
-            print("📋 FIX #141: Already have headers up to \(maxStoredHeight)")
-            print("📋 FIX #141: Starting sync from \(effectiveStartHeight) instead of \(startHeight)")
-            print("📋 FIX #141: This saves syncing \(effectiveStartHeight - startHeight) headers we already have!")
+            if verbose {
+                print("📋 FIX #141: Already have headers up to \(maxStoredHeight)")
+                print("📋 FIX #141: Starting sync from \(effectiveStartHeight) instead of \(startHeight)")
+                print("📋 FIX #141: This saves syncing \(effectiveStartHeight - startHeight) headers we already have!")
+            }
         }
 
         // FIX #1249: Off-by-one in header count calculation causes infinite retry loop
@@ -319,7 +362,9 @@ final class HeaderSyncManager {
         // Correct calculation: We need headers FROM effectiveStartHeight TO chainTip INCLUSIVE
         //   totalHeaders = chainTip - effectiveStartHeight + 1 = 3006260 - 3006260 + 1 = 1 header
         let totalHeaders = Int(chainTip - effectiveStartHeight + 1)
-        print("📥 Need to sync \(totalHeaders) headers (from \(effectiveStartHeight) to \(chainTip))")
+        if verbose {
+            print("📥 Need to sync \(totalHeaders) headers (from \(effectiveStartHeight) to \(chainTip))")
+        }
 
         // FIX #1251: Early return when totalHeaders = 0 to avoid wasting 4-5 seconds
         // This happens when HeaderStore is already at chainTip (effectiveStartHeight > chainTip).
@@ -350,7 +395,9 @@ final class HeaderSyncManager {
         // This is important when parallel sync has chain discontinuity errors
         let gapsFilled = try await fillHeaderGaps()
         if gapsFilled > 0 {
-            print("📋 Filled \(gapsFilled) header gaps after main sync")
+            if verbose {
+                print("📋 Filled \(gapsFilled) header gaps after main sync")
+            }
         }
 
         print("🎉 Header sync complete! Synced to height \(chainTip)")
@@ -382,7 +429,9 @@ final class HeaderSyncManager {
             return 0
         }
 
-        print("🔍 Checking for header gaps...")
+        if verbose {
+            print("🔍 Checking for header gaps...")
+        }
 
         // FIX #1251: Quick check if gaps exist BEFORE stopping listeners (save 2-5s overhead)
         // The gap detection logic (lines 496-547) is FAST (SQL queries), but the peer management
@@ -414,7 +463,9 @@ final class HeaderSyncManager {
                 return 0
             }
 
-            print("📊 FIX #1251: Gaps detected in quick check (\(actualCount)/\(expectedCount) headers, missing \(expectedCount - actualCount)) - proceeding with full sync")
+            if verbose {
+                print("📊 FIX #1251: Gaps detected in quick check (\(actualCount)/\(expectedCount) headers, missing \(expectedCount - actualCount)) - proceeding with full sync")
+            }
         } catch {
             // If quick check fails, continue with full gap filling logic
             print("⚠️ FIX #1251: Quick gap check failed: \(error.localizedDescription) - proceeding with full sync")
@@ -429,10 +480,14 @@ final class HeaderSyncManager {
             networkManager.peers.filter { $0.isListening }.count
         }
         let hadListenersBefore = peerManagerListeners || networkManagerListeners > 0
-        print("📊 FIX #904: Block listeners before gap fill - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
+        if verbose {
+            print("📊 FIX #904: Block listeners before gap fill - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
+        }
 
         // FIX #904: ALWAYS stop and verify - stopAllBlockListeners is fast if no listeners
-        print("⏸️ FIX #898: Stopping block listeners before gap filling...")
+        if verbose {
+            print("⏸️ FIX #898: Stopping block listeners before gap filling...")
+        }
         await networkManager.stopAllBlockListeners()
 
         // FIX #902: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
@@ -440,7 +495,9 @@ final class HeaderSyncManager {
         if true { // Always verify
             // FIX #898's 200ms wait was not enough - block listeners can take 20+ seconds to stop
             // Without verification, syncHeadersSimple times out on lock acquisition
-            print("⏳ FIX #902: Verifying all block listeners are stopped...")
+            if verbose {
+                print("⏳ FIX #902: Verifying all block listeners are stopped...")
+            }
             let verifyStartTime = Date()
             let maxVerifyWait: Double = 30.0  // 30 seconds max wait
             var lastListeningCount = 0
@@ -458,19 +515,25 @@ final class HeaderSyncManager {
                 let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
 
                 if stillListening == 0 && !peerManagerListening {
-                    print("✅ FIX #902: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
+                    if verbose {
+                        print("✅ FIX #902: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
+                    }
                     break
                 }
 
                 if stillListening != lastListeningCount {
-                    print("⏳ FIX #902: Still waiting for \(stillListening) block listeners to stop...")
+                    if verbose {
+                        print("⏳ FIX #902: Still waiting for \(stillListening) block listeners to stop...")
+                    }
                     lastListeningCount = stillListening
                 }
 
                 try? await Task.sleep(nanoseconds: 500_000_000)  // Check every 500ms
             }
 
-            print("⏳ FIX #902: Waiting 200ms for in-flight receives to complete...")
+            if verbose {
+                print("⏳ FIX #902: Waiting 200ms for in-flight receives to complete...")
+            }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
@@ -480,24 +543,32 @@ final class HeaderSyncManager {
             networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
         }
         if !deadPeersGapFill.isEmpty {
-            print("🔄 FIX #1227: Reconnecting \(deadPeersGapFill.count) peers with dead connections (gap fill)...")
+            if verbose {
+                print("🔄 FIX #1227: Reconnecting \(deadPeersGapFill.count) peers with dead connections (gap fill)...")
+            }
             // FIX #1235: Track reconnected peers (same pattern as header sync path above)
             var reconnectedHostsGapFill = Set<String>()
             for peer in deadPeersGapFill {
                 if reconnectedHostsGapFill.contains(peer.host) {
-                    print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
+                    if verbose {
+                        print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
+                    }
                     continue
                 }
                 do {
                     try await peer.ensureConnected()
                     reconnectedHostsGapFill.insert(peer.host)
-                    print("✅ FIX #1227: [\(peer.host)] Reconnected for gap fill")
+                    if verbose {
+                        print("✅ FIX #1227: [\(peer.host)] Reconnected for gap fill")
+                    }
                 } catch {
                     print("⚠️ FIX #1227: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
                 }
             }
         } else {
-            print("✅ FIX #1227: No dead connections found - all peers ready (gap fill)")
+            if verbose {
+                print("✅ FIX #1227: No dead connections found - all peers ready (gap fill)")
+            }
         }
 
         // FIX #1244: Wait for NWConnection states to become .ready (same fix as syncHeaders path).
@@ -508,14 +579,18 @@ final class HeaderSyncManager {
             networkManager.peers.filter { $0.isConnectionReady }
         }
         if readyPeersGapFill.count < minPeers {
-            print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (gap fill, currently \(readyPeersGapFill.count))...")
+            if verbose {
+                print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (gap fill, currently \(readyPeersGapFill.count))...")
+            }
             for waitStep in 1...10 {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 let currentReady = await MainActor.run {
                     networkManager.peers.filter { $0.isConnectionReady }.count
                 }
                 if currentReady >= minPeers {
-                    print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms (gap fill)")
+                    if verbose {
+                        print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms (gap fill)")
+                    }
                     break
                 }
                 if waitStep == 10 {
@@ -523,14 +598,18 @@ final class HeaderSyncManager {
                 }
             }
         } else {
-            print("✅ FIX #1244: \(readyPeersGapFill.count) peers already in .ready state (gap fill) - no wait needed")
+            if verbose {
+                print("✅ FIX #1244: \(readyPeersGapFill.count) peers already in .ready state (gap fill) - no wait needed")
+            }
         }
 
         defer {
             // FIX #898: Resume block listeners after gap filling completes (or fails)
             if hadListenersBefore {
                 Task {
-                    print("▶️ FIX #898: Resuming block listeners after gap filling...")
+                    if verbose {
+                        print("▶️ FIX #898: Resuming block listeners after gap filling...")
+                    }
                     await networkManager.startBlockListenersOnMainScreen()
                 }
             }
@@ -549,7 +628,9 @@ final class HeaderSyncManager {
         let chainTip: UInt64
         do {
             chainTip = try await networkManager.getChainHeight()
-            print("📊 FIX #937/#1247: Chain tip = \(chainTip), HeaderStore max = \(storeMaxHeight)")
+            if verbose {
+                print("📊 FIX #937/#1247: Chain tip = \(chainTip), HeaderStore max = \(storeMaxHeight)")
+            }
         } catch {
             print("⚠️ FIX #937: Could not get chain tip, using HeaderStore max: \(error)")
             chainTip = storeMaxHeight
@@ -608,11 +689,15 @@ final class HeaderSyncManager {
 
             let gapEnd = currentHeight - 1
             gaps.append((start: gapStart, end: gapEnd))
-            print("📍 Gap found: \(gapStart) - \(gapEnd) (\(gapEnd - gapStart + 1) headers)")
+            if verbose {
+                print("📍 Gap found: \(gapStart) - \(gapEnd) (\(gapEnd - gapStart + 1) headers)")
+            }
         }
 
         if gaps.isEmpty {
-            print("✅ No gaps found on detailed check")
+            if verbose {
+                print("✅ No gaps found on detailed check")
+            }
             return 0
         }
 
@@ -622,7 +707,9 @@ final class HeaderSyncManager {
         for (gapStart, gapEnd) in gaps {
             // FIX #802: Skip gaps entirely below Sapling activation
             if gapEnd < saplingActivation {
-                print("⏭️ FIX #802: Skipping pre-Sapling gap \(gapStart) - \(gapEnd) (not needed for shielded wallet)")
+                if verbose {
+                    print("⏭️ FIX #802: Skipping pre-Sapling gap \(gapStart) - \(gapEnd) (not needed for shielded wallet)")
+                }
                 continue
             }
 
@@ -632,16 +719,22 @@ final class HeaderSyncManager {
             // FIX #937: Cap gap end at chain tip (safety check - should already be capped above)
             let effectiveGapEnd = min(gapEnd, chainTip)
             if gapEnd > chainTip {
-                print("📊 FIX #937: Capping gap end at chain tip \(chainTip) (was \(gapEnd))")
+                if verbose {
+                    print("📊 FIX #937: Capping gap end at chain tip \(chainTip) (was \(gapEnd))")
+                }
             }
 
             // FIX #937: Skip gaps entirely beyond chain tip
             if effectiveGapStart > chainTip {
-                print("⏭️ FIX #937: Skipping gap \(effectiveGapStart) - \(gapEnd) (beyond chain tip \(chainTip))")
+                if verbose {
+                    print("⏭️ FIX #937: Skipping gap \(effectiveGapStart) - \(gapEnd) (beyond chain tip \(chainTip))")
+                }
                 continue
             }
 
-            print("🔧 Filling gap \(effectiveGapStart) - \(effectiveGapEnd)...")
+            if verbose {
+                print("🔧 Filling gap \(effectiveGapStart) - \(effectiveGapEnd)...")
+            }
 
             do {
                 // We need to sync from effectiveGapStart using the header at effectiveGapStart-1 as locator
@@ -654,14 +747,18 @@ final class HeaderSyncManager {
                 }.count
 
                 totalFilled += filledCount
-                print("✅ Filled \(filledCount) headers for gap \(effectiveGapStart) - \(effectiveGapEnd)")
+                if verbose {
+                    print("✅ Filled \(filledCount) headers for gap \(effectiveGapStart) - \(effectiveGapEnd)")
+                }
 
             } catch {
                 print("⚠️ Failed to fill gap \(effectiveGapStart) - \(effectiveGapEnd): \(error)")
             }
         }
 
-        print("🎉 Gap filling complete: \(totalFilled) headers filled")
+        if verbose {
+            print("🎉 Gap filling complete: \(totalFilled) headers filled")
+        }
         return totalFilled
     }
 
@@ -697,7 +794,9 @@ final class HeaderSyncManager {
         // FIX #501: Much longer total timeout - we'll try many peers
         let headersNeeded = chainTip - currentHeight
         let maxSyncDuration: TimeInterval = 300.0  // 5 minutes to try all peers
-        print("📊 FIX #502: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        if verbose {
+            print("📊 FIX #502: Header sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        }
 
         // FIX #1097: Use isPreferredForDownload from Peer (matches Zclassic fPreferredDownload)
         // Preferred peers (hardcoded seeds) get +1000 bonus in performance score
@@ -731,7 +830,9 @@ final class HeaderSyncManager {
                 // Performance score includes +1000 for isPreferredForDownload peers
                 let sorted = allPeers.sorted { $0.getPerformanceScore() > $1.getPerformanceScore() }
                 if let best = sorted.first {
-                    print("📊 FIX #1097: Best peer for headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
+                    if verbose {
+                        print("📊 FIX #1097: Best peer for headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
+                    }
                 }
                 return sorted
             }
@@ -750,9 +851,11 @@ final class HeaderSyncManager {
                 }
                 // FIX #502: Suggest adding localhost if no peers available
                 print("⚠️ FIX #502: No ready peers with valid heights, waiting 2s...")
-                print("   📊 FIX #905 Debug: total=\(debugInfo.total), ready=\(debugInfo.ready), handshake=\(debugInfo.handshake), height=\(debugInfo.height), notFailed=\(debugInfo.notFailed)")
-                print("   💡 TIP: Start your local Zclassic node: zclassicd -daemon -listen=1 -listenonion=0")
-                print("   💡 Or add custom node: Settings → Network → Add Node (127.0.0.1:8033)")
+                if verbose {
+                    print("   📊 FIX #905 Debug: total=\(debugInfo.total), ready=\(debugInfo.ready), handshake=\(debugInfo.handshake), height=\(debugInfo.height), notFailed=\(debugInfo.notFailed)")
+                    print("   💡 TIP: Start your local Zclassic node: zclassicd -daemon -listen=1 -listenonion=0")
+                    print("   💡 Or add custom node: Settings → Network → Add Node (127.0.0.1:8033)")
+                }
                 try await Task.sleep(nanoseconds: 2_000_000_000)
 
                 // FIX #477: Check timeout AFTER sleep to prevent infinite loop
@@ -792,7 +895,9 @@ final class HeaderSyncManager {
                             receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
                         } else {
                             // FIX #925: Log non-header messages for debugging
-                            print("🔍 FIX #925: [\(peer.host)] Got '\(command)' (\(response.count) bytes) instead of headers, attempt \(attempts)/5")
+                            if verbose {
+                                print("🔍 FIX #925: [\(peer.host)] Got '\(command)' (\(response.count) bytes) instead of headers, attempt \(attempts)/5")
+                            }
                         }
                     }
 
@@ -811,7 +916,9 @@ final class HeaderSyncManager {
                 let originalCount = headers.count
                 let headersToStore = headers.filter { $0.height <= chainTip }
                 if headersToStore.count < originalCount {
-                    print("🔍 FIX #1250: Peer \(peer.host) sent \(originalCount) headers, truncating to \(headersToStore.count) (chainTip=\(chainTip))")
+                    if verbose {
+                        print("🔍 FIX #1250: Peer \(peer.host) sent \(originalCount) headers, truncating to \(headersToStore.count) (chainTip=\(chainTip))")
+                    }
                 }
 
                 // FIX #133: Verify chain starting at correct height
@@ -837,7 +944,9 @@ final class HeaderSyncManager {
 
                 // FIX #707: Only log every 1000 headers or at 100%
                 if peer.score.headersProvided % 1000 < 160 || progress.percentComplete == 100 {
-                    print("📡 Synced to \(actualEndHeight) (\(progress.percentComplete)%) - \(peer.score.headersProvided) headers from \(peer.host)")
+                    if verbose {
+                        print("📡 Synced to \(actualEndHeight) (\(progress.percentComplete)%) - \(peer.score.headersProvided) headers from \(peer.host)")
+                    }
                 }
 
                 // Clear failed peers on success - a working peer might recover
@@ -846,7 +955,9 @@ final class HeaderSyncManager {
             } catch {
                 // FIX #746: Handle headers restart needed - update currentHeight and retry
                 if case SyncError.headersRestartNeeded(let newStartHeight, let failedPeerHost) = error {
-                    print("🔄 FIX #746: Restarting header sync from height \(newStartHeight)")
+                    if verbose {
+                        print("🔄 FIX #746: Restarting header sync from height \(newStartHeight)")
+                    }
                     // FIX #1246: Add the peer that caused chain mismatch to failedPeers
                     // This forces next iteration to try a different peer, breaking infinite loop
                     if let peerHost = failedPeerHost {
@@ -877,9 +988,11 @@ final class HeaderSyncManager {
 
         // FIX: Timing summary
         let totalDuration = Date().timeIntervalSince(syncStartTime)
-        print("⏱️ FIX #502: Header sync timing summary:")
-        print("   Total duration: \(String(format: "%.2f", totalDuration))s")
-        print("   Headers per second: \(String(format: "%.1f", Double(headersNeeded) / totalDuration))")
+        if verbose {
+            print("⏱️ FIX #502: Header sync timing summary:")
+            print("   Total duration: \(String(format: "%.2f", totalDuration))s")
+            print("   Headers per second: \(String(format: "%.1f", Double(headersNeeded) / totalDuration))")
+        }
     }
 
     /// FIX #141: PARALLEL header requests - request from ALL peers, take first response
@@ -909,7 +1022,9 @@ final class HeaderSyncManager {
             // FIX #1097: Simple sort by performance score - preferred peers naturally first
             let sorted = allPeers.sorted { $0.getPerformanceScore() > $1.getPerformanceScore() }
             if let best = sorted.first {
-                print("📊 FIX #1097: Best peer for parallel headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
+                if verbose {
+                    print("📊 FIX #1097: Best peer for parallel headers: \(best.host) (score: \(String(format: "%.1f", best.getPerformanceScore())), preferred: \(best.isPreferredForDownload))")
+                }
             }
             return sorted
         }
@@ -925,7 +1040,9 @@ final class HeaderSyncManager {
         )
         onProgress?(initialProgress)
 
-        print("📊 FIX #502: Requesting headers from \(peers.count) peers (localhost first, then trusted)")
+        if verbose {
+            print("📊 FIX #502: Requesting headers from \(peers.count) peers (localhost first, then trusted)")
+        }
 
         var currentHeight = startHeight
         var totalSynced = 0
@@ -938,10 +1055,21 @@ final class HeaderSyncManager {
         // FIX #1249: Include +1 for accurate count
         let headersNeeded = chainTip - startHeight + 1
         let maxSyncDuration: TimeInterval = 300.0  // 5 minutes
-        print("⏱️ FIX #502: Parallel sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        if verbose {
+            print("⏱️ FIX #502: Parallel sync timeout set to \(Int(maxSyncDuration))s for \(headersNeeded) headers")
+        }
 
         // FIX #1249: Changed `<` to `<=` to fetch header at chainTip height
         while currentHeight <= chainTip {
+            // FIX #1342: Early termination — if HeaderStore already covers chainTip
+            // (e.g. from concurrent background loading or locator caught up), stop immediately
+            if let storedHeight = try? headerStore.getLatestHeight(), storedHeight >= chainTip {
+                if verbose {
+                    print("✅ FIX #1342: HeaderStore (\(storedHeight)) already covers chainTip (\(chainTip)) — done")
+                }
+                break
+            }
+
             // FIX #501: Check for timeout
             let totalElapsed = Date().timeIntervalSince(startTime)
             if totalElapsed > maxSyncDuration {
@@ -1020,7 +1148,9 @@ final class HeaderSyncManager {
                                 receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
                             } else if attempts < 5 {
                                 // Log non-headers message and continue retry
-                                print("🔍 FIX #1236: [\(peer.host)] Got '\(command)' instead of headers, attempt \(attempts)/5")
+                                if verbose {
+                                    print("🔍 FIX #1236: [\(peer.host)] Got '\(command)' instead of headers, attempt \(attempts)/5")
+                                }
                             }
                         }
 
@@ -1029,22 +1159,24 @@ final class HeaderSyncManager {
 
                     if !result.isEmpty {
                         // Success!
-                        print("✅ FIX #502: Got \(result.count) headers from \(peer.host)")
+                        if verbose {
+                            print("✅ FIX #502: Got \(result.count) headers from \(peer.host)")
 
-                        // FIX #535: Log first few block hashes to trace which peer sent which chain
-                        // This helps identify when peers are on different forks
-                        if !result.isEmpty {
-                            let firstHeader = result[0]
-                            let blockHashHex = firstHeader.blockHash.map { String(format: "%02x", $0) }.joined()
-                            print("🔍 FIX #535: [\(peer.host)] First header at height \(firstHeader.height):")
-                            print("   blockHash: \(blockHashHex.prefix(32))...")
-                            print("   prevHash:  \(firstHeader.hashPrevBlock.map { String(format: "%02x", $0) }.joined().prefix(32))...")
+                            // FIX #535: Log first few block hashes to trace which peer sent which chain
+                            // This helps identify when peers are on different forks
+                            if !result.isEmpty {
+                                let firstHeader = result[0]
+                                let blockHashHex = firstHeader.blockHash.map { String(format: "%02x", $0) }.joined()
+                                print("🔍 FIX #535: [\(peer.host)] First header at height \(firstHeader.height):")
+                                print("   blockHash: \(blockHashHex.prefix(32))...")
+                                print("   prevHash:  \(firstHeader.hashPrevBlock.map { String(format: "%02x", $0) }.joined().prefix(32))...")
 
-                            if result.count > 1 {
-                                let lastHeader = result[result.count - 1]
-                                let lastBlockHashHex = lastHeader.blockHash.map { String(format: "%02x", $0) }.joined()
-                                print("🔍 FIX #535: [\(peer.host)] Last header at height \(lastHeader.height):")
-                                print("   blockHash: \(lastBlockHashHex.prefix(32))...")
+                                if result.count > 1 {
+                                    let lastHeader = result[result.count - 1]
+                                    let lastBlockHashHex = lastHeader.blockHash.map { String(format: "%02x", $0) }.joined()
+                                    print("🔍 FIX #535: [\(peer.host)] Last header at height \(lastHeader.height):")
+                                    print("   blockHash: \(lastBlockHashHex.prefix(32))...")
+                                }
                             }
                         }
 
@@ -1057,7 +1189,9 @@ final class HeaderSyncManager {
                 } catch {
                     // FIX #746: Handle headers restart needed - update currentHeight and retry
                     if case SyncError.headersRestartNeeded(let newStartHeight, let failedPeerHost) = error {
-                        print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight)")
+                        if verbose {
+                            print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight)")
+                        }
                         // FIX #1246: Add the peer that caused chain mismatch to failedPeers
                         if let peerHost = failedPeerHost {
                             failedPeers.insert(peerHost)
@@ -1095,7 +1229,9 @@ final class HeaderSyncManager {
             let originalCount = headers.count
             let headersToStore = headers.filter { $0.height <= chainTip }
             if headersToStore.count < originalCount {
-                print("🔍 FIX #1250: Peer \(successPeerHost ?? "unknown") sent \(originalCount) headers, truncating to \(headersToStore.count) (chainTip=\(chainTip))")
+                if verbose {
+                    print("🔍 FIX #1250: Peer \(successPeerHost ?? "unknown") sent \(originalCount) headers, truncating to \(headersToStore.count) (chainTip=\(chainTip))")
+                }
             }
 
             // FIX #133: Verify chain continuity with correct starting height
@@ -1103,7 +1239,9 @@ final class HeaderSyncManager {
             do {
                 try verifyHeaderChain(headersToStore, startingAt: headersStartHeight, fromPeer: successPeerHost ?? "unknown")
             } catch SyncError.headersRestartNeeded(let newStartHeight, let failedPeerHost) {
-                print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight) (post-fetch)")
+                if verbose {
+                    print("🔄 FIX #746: Restarting parallel header sync from height \(newStartHeight) (post-fetch)")
+                }
                 // FIX #1246: Add the peer that caused chain mismatch to failedPeers
                 if let peerHost = failedPeerHost {
                     failedPeers.insert(peerHost)
@@ -1122,7 +1260,9 @@ final class HeaderSyncManager {
                     peer.recordSuccess()
                     peer.score.headersProvided += headersToStore.count  // FIX #1250: Use truncated count
                     // Response time is tracked implicitly via success rate in performance score
-                    print("✅ FIX #535: Updated \(successHost) performance - now at \(peer.score.headersProvided) headers provided")
+                    if verbose {
+                        print("✅ FIX #535: Updated \(successHost) performance - now at \(peer.score.headersProvided) headers provided")
+                    }
                 }
             }
 
@@ -1140,10 +1280,14 @@ final class HeaderSyncManager {
             // FIX #133: Use actual header end height for next iteration
             currentHeight = headersStartHeight + UInt64(headersToStore.count)
 
-            let percent = totalSynced * 100 / max(totalNeeded, 1)
+            // FIX #1342: Cap progress at 100% — locator fallback can cause actual range
+            // to be larger than totalNeeded (e.g. checkpoint 50K before target)
+            let percent = min(totalSynced * 100 / max(totalNeeded, 1), 100)
             let elapsed = Date().timeIntervalSince(startTime)
             let rate = elapsed > 0 ? Double(totalSynced) / elapsed : 0
-            print("✅ Synced \(totalSynced)/\(totalNeeded) headers (\(percent)%) - \(Int(rate)) headers/sec")
+            if verbose {
+                print("✅ Synced \(totalSynced)/\(totalNeeded) headers (\(percent)%) - \(Int(rate)) headers/sec")
+            }
 
             // Report progress
             let progress = HeaderSyncProgress(
@@ -1226,7 +1370,9 @@ final class HeaderSyncManager {
         #if os(macOS)
         if await WalletModeManager.shared.currentMode == .fullNode {
             if let rpcHeight = await FullNodeManager.shared.getBlockHeight() {
-                print("📡 [RPC] Full Node daemon height: \(rpcHeight) (TRUSTED)")
+                if verbose {
+                    print("📡 [RPC] Full Node daemon height: \(rpcHeight) (TRUSTED)")
+                }
                 return rpcHeight
             }
         }
@@ -1239,7 +1385,9 @@ final class HeaderSyncManager {
         var headerStoreHeight: UInt64 = 0
         if let headerHeight = try? headerStore.getLatestHeight() {
             headerStoreHeight = headerHeight
-            print("📡 [LOCAL] HeaderStore height: \(headerStoreHeight) (Equihash verified)")
+            if verbose {
+                print("📡 [LOCAL] HeaderStore height: \(headerStoreHeight) (Equihash verified)")
+            }
         }
 
         // 2. SECONDARY: Get P2P peer heights and compute consensus (median)
@@ -1264,11 +1412,15 @@ final class HeaderSyncManager {
             // Use median for Byzantine fault tolerance
             let sorted = peerHeights.sorted()
             p2pConsensusHeight = sorted[sorted.count / 2]
-            print("📡 [P2P] Consensus height (median of \(peerHeights.count) peers): \(p2pConsensusHeight)")
+            if verbose {
+                print("📡 [P2P] Consensus height (median of \(peerHeights.count) peers): \(p2pConsensusHeight)")
+            }
         } else if !peerHeights.isEmpty {
             // Not enough peers for median, use max with caution
             p2pConsensusHeight = peerHeights.max() ?? 0
-            print("📡 [P2P] Height from \(peerHeights.count) peer(s): \(p2pConsensusHeight) (insufficient for median)")
+            if verbose {
+                print("📡 [P2P] Height from \(peerHeights.count) peer(s): \(p2pConsensusHeight) (insufficient for median)")
+            }
         }
 
         // 3. Determine chain tip using P2P-first logic
@@ -1285,7 +1437,9 @@ final class HeaderSyncManager {
                     // Trust it cautiously but cap at reasonable drift from verified headers
                     print("⚠️ P2P \(p2pConsensusHeight - headerStoreHeight) blocks ahead of local store")
                     maxHeight = headerStoreHeight + maxHeightDrift
-                    print("📡 Capping at \(maxHeight) until headers are synced")
+                    if verbose {
+                        print("📡 Capping at \(maxHeight) until headers are synced")
+                    }
                 } else if p2pConsensusHeight > headerStoreHeight {
                     // P2P slightly ahead - accept (new blocks since last sync)
                     maxHeight = p2pConsensusHeight
@@ -1294,7 +1448,9 @@ final class HeaderSyncManager {
         } else if p2pConsensusHeight > 0 {
             // No local headers, use P2P consensus
             maxHeight = p2pConsensusHeight
-            print("📡 Using P2P consensus (no local headers)")
+            if verbose {
+                print("📡 Using P2P consensus (no local headers)")
+            }
         }
 
         // FIX #120: InsightAPI commented out - P2P only
@@ -1314,7 +1470,9 @@ final class HeaderSyncManager {
         }
 
         if maxHeight > 0 {
-            print("📡 Using chain tip: \(maxHeight)")
+            if verbose {
+                print("📡 Using chain tip: \(maxHeight)")
+            }
             return maxHeight
         }
 
@@ -1335,7 +1493,9 @@ final class HeaderSyncManager {
 
         // If we don't have enough peers, try to connect more
         if allPeers.count < minPeersToTry {
-            print("🔄 Only \(allPeers.count) peers, attempting to connect more...")
+            if verbose {
+                print("🔄 Only \(allPeers.count) peers, attempting to connect more...")
+            }
             try? await networkManager.connect()
 
             // FIX #120: Wait for peers to actually connect (up to 15 seconds)
@@ -1348,12 +1508,16 @@ final class HeaderSyncManager {
                 waitAttempts += 1
                 peerCount = await MainActor.run { networkManager.connectedPeers }
                 if waitAttempts % 4 == 0 { // Log every 2 seconds
-                    print("⏳ Waiting for peers to connect... (\(peerCount)/\(minPeers) ready, waited \(waitAttempts / 2)s)")
+                    if verbose {
+                        print("⏳ Waiting for peers to connect... (\(peerCount)/\(minPeers) ready, waited \(waitAttempts / 2)s)")
+                    }
                 }
             }
 
             allPeers = await MainActor.run { networkManager.peers }
-            print("📡 After waiting: \(allPeers.count) peers connected")
+            if verbose {
+                print("📡 After waiting: \(allPeers.count) peers connected")
+            }
         }
 
         guard allPeers.count >= minPeers else {
@@ -1376,7 +1540,9 @@ final class HeaderSyncManager {
             }
             triedPeersCount += peersToTry.count
 
-            print("🌐 Trying \(peersToTry.count) peers (total tried: \(triedPeersCount), need \(consensusThreshold - successfulHeaders.count) more)")
+            if verbose {
+                print("🌐 Trying \(peersToTry.count) peers (total tried: \(triedPeersCount), need \(consensusThreshold - successfulHeaders.count) more)")
+            }
 
             // Request headers from this batch in parallel
             await withTaskGroup(of: (String, [ZclassicBlockHeader]?).self) { group in
@@ -1412,13 +1578,17 @@ final class HeaderSyncManager {
                 for await (host, headers) in group {
                     if let headers = headers {
                         successfulHeaders.append(headers)
-                        print("📊 Consensus: \(successfulHeaders.count)/\(self.consensusThreshold) peers (\(host))")
+                        if verbose {
+                            print("📊 Consensus: \(successfulHeaders.count)/\(self.consensusThreshold) peers (\(host))")
+                        }
                         if successfulHeaders.count >= self.consensusThreshold {
                             group.cancelAll()
                             break
                         }
                     } else {
-                        print("⚠️ Peer \(host) failed, \(remainingPeers.count) peers remaining")
+                        if verbose {
+                            print("⚠️ Peer \(host) failed, \(remainingPeers.count) peers remaining")
+                        }
                     }
                 }
             }
@@ -1445,7 +1615,9 @@ final class HeaderSyncManager {
         // Use actual peer count as the effective threshold for consensus verification
         let effectiveThreshold = min(successfulHeaders.count, consensusThreshold)
 
-        print("📊 Received headers from \(peerHeaders.count) peers")
+        if verbose {
+            print("📊 Received headers from \(peerHeaders.count) peers")
+        }
 
         // Verify consensus - all peers should return same headers
         let consensusHeaders = try verifyHeaderConsensus(peerHeaders, threshold: effectiveThreshold)
@@ -1484,10 +1656,14 @@ final class HeaderSyncManager {
                 if command == "headers" {
                     // FIX #133: Use correct starting height from actual locator
                     receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
-                    print("✅ Received \(receivedHeaders?.count ?? 0) headers from \(peer.host) (starting at height \(headersStartHeight))")
+                    if verbose {
+                        print("✅ Received \(receivedHeaders?.count ?? 0) headers from \(peer.host) (starting at height \(headersStartHeight))")
+                    }
                 } else {
                     // Ignore other messages (inv, addr, ping, etc.)
-                    print("📭 FIX #1236: Peer sent '\(command)' message, waiting for headers (attempt \(attempts)/\(maxAttempts))...")
+                    if verbose {
+                        print("📭 FIX #1236: Peer sent '\(command)' message, waiting for headers (attempt \(attempts)/\(maxAttempts))...")
+                    }
                 }
             }
 
@@ -1577,7 +1753,9 @@ final class HeaderSyncManager {
                 // Boost file headers are ALWAYS present up to effectiveTreeHeight, so use that first
                 let boostFileEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
 
-                if locatorHeight > boostFileEndHeight {
+                // FIX #1342: Fixed off-by-one (was `>`, should be `>=`)
+                // When locatorHeight == boostFileEndHeight, we still need the fallback
+                if locatorHeight >= boostFileEndHeight {
                     // Try boost file end first - it's the closest reliable header
                     if let boostEndHeader = try? HeaderStore.shared.getHeader(at: boostFileEndHeight) {
                         locatorHash = boostEndHeader.blockHash  // Already in wire format

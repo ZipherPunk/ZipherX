@@ -2413,18 +2413,22 @@ enum ZipherXFFI {
     ///   - target: Path for decompressed output
     /// - Returns: true if successful, false otherwise
     static func decompressZst(source: String, target: String) -> Bool {
-        let sourceURL = URL(fileURLWithPath: source)
-        guard let compressedData = try? Data(contentsOf: sourceURL),
-              let decompressedData = decompressZstData(compressedData) else {
-            return false
+        // FIX #1338: Streaming file-to-file decompression.
+        // Old approach loaded entire 2GB file into memory (6.2GB peak) → iOS crash.
+        // New approach streams through Rust with ~512KB buffers.
+        let result = source.withCString { srcPtr in
+            target.withCString { dstPtr in
+                zipherx_zstd_decompress_file(
+                    UnsafeRawPointer(srcPtr).assumingMemoryBound(to: UInt8.self),
+                    strlen(srcPtr),
+                    UnsafeRawPointer(dstPtr).assumingMemoryBound(to: UInt8.self),
+                    strlen(dstPtr)
+                )
+            }
         }
-
-        let targetURL = URL(fileURLWithPath: target)
-        do {
-            try decompressedData.write(to: targetURL)
-            return true
-        } catch {
-            return false
+        if result != 0 {
+            print("FIX #1338: Streaming decompress failed with code \(result)")
         }
+        return result == 0
     }
 }

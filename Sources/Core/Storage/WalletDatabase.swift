@@ -2799,6 +2799,23 @@ final class WalletDatabase {
         print("✅ FIX #1099: lastScannedHeight and checkpoint forced to 0")
     }
 
+    /// FIX #1355: Reset lastScannedHeight to a specific height after downloading a new boost file.
+    /// When a new boost is downloaded, lastScannedHeight may be AHEAD of the new boost end height.
+    /// This creates an 82-block gap where PHASE 2 skips CMU collection → tree root mismatch.
+    func resetLastScannedHeightToBoostHeight(_ boostHeight: UInt64) throws {
+        let sql = "UPDATE sync_state SET last_scanned_height = ? WHERE id = 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, Int64(boostHeight))
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("✅ FIX #1355: lastScannedHeight reset to \(boostHeight)")
+    }
+
     /// FIX #1075: NEVER allow regression below checkpoint
     /// Requires peer consensus validation before accepting any height update
     func updateLastScannedHeight(_ height: UInt64, hash: Data) throws {

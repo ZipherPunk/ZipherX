@@ -60,6 +60,9 @@ final class WalletManager: ObservableObject {
     @Published private(set) var zAddress: String = ""
     @Published private(set) var syncProgress: Double = 0.0
     @Published private(set) var isSyncing: Bool = false
+    /// FIX #1354: Set when a newer boost file is available on GitHub (height > cached height)
+    @Published var newerBoostAvailable: (remoteHeight: UInt64, cachedHeight: UInt64)? = nil
+    @Published var isDownloadingBoostUpdate: Bool = false
     // FIX #1220: True when gap-fill is running in background — sending disabled until tree is valid
     @Published private(set) var isGapFillingDelta: Bool = false
     @Published private(set) var isConnecting: Bool = false
@@ -135,6 +138,9 @@ final class WalletManager: ObservableObject {
     @Published private(set) var isRebuildingWitnesses: Bool = false
     private var lastWitnessRebuildTime: Date? = nil
     private let witnessRebuildCooldown: TimeInterval = 30.0  // Minimum 30 seconds between rebuilds
+
+    // FIX #1348: Verbose logging control (set to true for detailed debugging)
+    private let verbose = false
 
     // FIX #1327: Skip redundant witness re-verification when recently verified
     private var lastWitnessVerificationAllPassed: Date? = nil
@@ -262,11 +268,19 @@ final class WalletManager: ObservableObject {
     /// - Parameters:
     ///   - phase: Current phase
     ///   - phaseProgress: Progress within this phase (0.0 to 1.0)
+    /// FIX #1351: Track last logged backward phase to suppress spam (161 msgs in iOS log)
+    private var lastLoggedBackwardPhase: (ProgressPhase, ProgressPhase)? = nil
+
     @MainActor
     func updateOverallProgress(phase: ProgressPhase, phaseProgress: Double) {
         // Only allow moving to same or later phase
         guard phase >= currentProgressPhase else {
-            print("⚠️ Progress: Ignoring backward phase change \(phase) < \(currentProgressPhase)")
+            // FIX #1351: Only log each backward phase combo once (was 161 messages in iOS import)
+            let combo = (phase, currentProgressPhase)
+            if lastLoggedBackwardPhase?.0 != combo.0 || lastLoggedBackwardPhase?.1 != combo.1 {
+                lastLoggedBackwardPhase = combo
+                print("⚠️ Progress: Ignoring backward phase change \(phase) < \(currentProgressPhase) (further suppressed)")
+            }
             return
         }
 
@@ -287,6 +301,7 @@ final class WalletManager: ObservableObject {
     func resetProgress() {
         overallProgress = 0.0
         currentProgressPhase = .idle
+        lastLoggedBackwardPhase = nil  // FIX #1351: Reset suppression tracker
     }
 
     /// Complete progress (jump to 100%)
@@ -753,7 +768,9 @@ final class WalletManager: ObservableObject {
                     blocks = try await NetworkManager.shared.getBlocksDataP2P(from: currentStart, count: count)
                 } catch {
                     consecutiveBatchFailures += 1
-                    print("⚠️ FIX #1220: Incremental sync batch failed: \(error.localizedDescription) (failure \(consecutiveBatchFailures)/\(maxConsecutiveBatchFailures))")
+                    if verbose {
+                        print("⚠️ FIX #1220: Incremental sync batch failed: \(error.localizedDescription) (failure \(consecutiveBatchFailures)/\(maxConsecutiveBatchFailures))")
+                    }
                     if consecutiveBatchFailures >= maxConsecutiveBatchFailures {
                         print("🛑 FIX #1220: \(maxConsecutiveBatchFailures) consecutive failures — aborting delta sync")
                         break
@@ -796,7 +813,9 @@ final class WalletManager: ObservableObject {
                 if batchReceivedHeights.isEmpty {
                     // Got 0 blocks — don't advance at all, abort this sync attempt
                     consecutiveBatchFailures += 1
-                    print("⚠️ FIX #1218: Batch \(currentStart)-\(batchEnd) returned 0 blocks (failure \(consecutiveBatchFailures)/\(maxConsecutiveBatchFailures))")
+                    if verbose {
+                        print("⚠️ FIX #1218: Batch \(currentStart)-\(batchEnd) returned 0 blocks (failure \(consecutiveBatchFailures)/\(maxConsecutiveBatchFailures))")
+                    }
                     if consecutiveBatchFailures >= maxConsecutiveBatchFailures {
                         print("🛑 FIX #1218: \(maxConsecutiveBatchFailures) consecutive empty batches — aborting delta sync (P2P unreliable)")
                         break
@@ -811,7 +830,9 @@ final class WalletManager: ObservableObject {
                     if batchReceivedHeights.count < count / 2 {
                         // FIX #1218: Less than 50% coverage — incomplete fetch.
                         // Only advance to the highest received height + 1 so we retry the gap.
-                        print("⚠️ FIX #1218: Batch \(currentStart)-\(batchEnd): only \(batchReceivedHeights.count)/\(count) blocks (\(String(format: "%.0f", coverage))%). Advancing to \(maxReceivedHeight + 1) (not \(batchEnd + 1))")
+                        if verbose {
+                            print("⚠️ FIX #1218: Batch \(currentStart)-\(batchEnd): only \(batchReceivedHeights.count)/\(count) blocks (\(String(format: "%.0f", coverage))%). Advancing to \(maxReceivedHeight + 1) (not \(batchEnd + 1))")
+                        }
                         currentStart = maxReceivedHeight + 1
                     } else {
                         // Good coverage — advance past the batch
@@ -823,7 +844,9 @@ final class WalletManager: ObservableObject {
             // FIX #1218: Log overall coverage and warn if incomplete
             if totalExpectedBlocks > 0 {
                 let overallCoverage = Double(totalReceivedBlocks) / Double(totalExpectedBlocks) * 100.0
-                print("📊 FIX #1218: Delta sync coverage: \(totalReceivedBlocks)/\(totalExpectedBlocks) blocks (\(String(format: "%.1f", overallCoverage))%)")
+                if verbose {
+                    print("📊 FIX #1218: Delta sync coverage: \(totalReceivedBlocks)/\(totalExpectedBlocks) blocks (\(String(format: "%.1f", overallCoverage))%)")
+                }
                 if totalReceivedBlocks < totalExpectedBlocks / 2 {
                     print("🛑 FIX #1218: Severely incomplete delta sync (<50% blocks received). Tree root WILL be wrong.")
                     print("   FIX #1194 will rollback tree to pre-sync state.")
@@ -1079,7 +1102,9 @@ final class WalletManager: ObservableObject {
                         print("⚠️ FIX #1220: 3 consecutive batch failures — aborting gap-fill")
                         break
                     }
-                    print("⚠️ FIX #1220: Batch \(currentStart)-\(batchEnd) failed (\(error.localizedDescription)) — waiting 2s for peer recovery (attempt \(consecutiveEmptyBatches)/3)")
+                    if verbose {
+                        print("⚠️ FIX #1220: Batch \(currentStart)-\(batchEnd) failed (\(error.localizedDescription)) — waiting 2s for peer recovery (attempt \(consecutiveEmptyBatches)/3)")
+                    }
                     try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s for reconnection
                     continue  // Retry same range
                 }
@@ -1622,10 +1647,10 @@ final class WalletManager: ObservableObject {
                 try WalletDatabase.shared.unmarkNoteAsSpentById(noteId: 6178)
                 UserDefaults.standard.set(true, forKey: fix1110Key)
                 print("✅ FIX #1110: One-time repair complete - unmarked note 6178")
-                // Refresh balance
-                Task {
-                    try? await self.refreshBalance()
-                }
+                // FIX #1343: Removed fire-and-forget refreshBalance() here.
+                // On fresh import, this fires during preloadCommitmentTree() while the boost
+                // file is downloading → starts a SECOND concurrent scan + download → both stall at 0%.
+                // Balance is always refreshed by the normal startup flow immediately after tree load.
             } catch {
                 print("⚠️ FIX #1110: One-time repair failed: \(error)")
             }
@@ -2949,6 +2974,25 @@ final class WalletManager: ObservableObject {
             if let serializedTree = ZipherXFFI.treeSerialize() {
                 try? WalletDatabase.shared.saveTreeState(serializedTree, height: downloadedTreeHeight)
                 print("💾 FIX #1029: Tree state saved with height \(downloadedTreeHeight)")
+            }
+
+            // FIX #1355: After downloading a NEW boost file, reset lastScannedHeight to boost height.
+            // Without this: lastScannedHeight stays at old value (e.g., 3011333) while the new boost
+            // ends at 3011251. PHASE 2 starts from lastScannedHeight+1=3011334, SKIPPING 82 blocks
+            // of CMUs (3011252-3011333). Tree root mismatch → TreeRepairExhausted → witnesses NULLed.
+            let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+            if currentLastScanned > downloadedTreeHeight {
+                print("🔄 FIX #1355: Resetting lastScannedHeight from \(currentLastScanned) to \(downloadedTreeHeight)")
+                print("   New boost ends at \(downloadedTreeHeight), old scan was at \(currentLastScanned)")
+                print("   PHASE 2 will now scan \(currentLastScanned - downloadedTreeHeight) missed blocks")
+                try? WalletDatabase.shared.resetLastScannedHeightToBoostHeight(downloadedTreeHeight)
+                // Also reset verification checkpoints — they're stale after boost update
+                UserDefaults.standard.removeObject(forKey: "FIX1089_FullVerificationComplete")
+                UserDefaults.standard.removeObject(forKey: "FIX1106_NullifierVerificationCheckpoint")
+                // Reset TreeRepairExhausted — new boost may fix the tree
+                UserDefaults.standard.removeObject(forKey: "TreeRepairExhausted")
+                UserDefaults.standard.removeObject(forKey: "FIX782_GlobalDeltaRepairAttempts")
+                print("✅ FIX #1355: Reset lastScannedHeight + cleared stale checkpoints + repair flags")
             }
 
             // FIX #558 v2: Load delta CMUs to complete the tree (boost file path)
@@ -4506,12 +4550,16 @@ final class WalletManager: ObservableObject {
                 // FIX #563 v33: Skip witness root check if we've had crashes before
                 if !skipWitnessRootCheck && !note.witness.isEmpty {
                     // FIX #563 v32: Add detailed logging to identify which note causes crash
-                    print("🔍 [WITNESS \(index + 1)/\(notesForWitnessCheck.count)] Checking note ID=\(note.id) height=\(note.height ?? 0) witness_len=\(note.witness.count)")
+                    if verbose {
+                        print("🔍 [WITNESS \(index + 1)/\(notesForWitnessCheck.count)] Checking note ID=\(note.id) height=\(note.height ?? 0) witness_len=\(note.witness.count)")
+                    }
 
                     // Validate witness data length before calling FFI
                     // Witness should be at least 100 bytes (minimum for IncrementalWitness)
                     guard note.witness.count >= 100 else {
-                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has invalid witness length: \(note.witness.count) bytes")
+                        if verbose {
+                            print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has invalid witness length: \(note.witness.count) bytes")
+                        }
                         corruptedWitnesses.append((note.id, note.height ?? 0))
                         // Force rebuild for this note
                         if let cmu = note.cmu, !cmu.isEmpty {
@@ -4524,7 +4572,9 @@ final class WalletManager: ObservableObject {
                     // A corrupted witness can cause witness.root() to crash in the Rust FFI
                     // FIX #563 v33: Try-catch this - if it crashes, we'll rebuild all witnesses next time
                     if !ZipherXFFI.witnessPathIsValid(note.witness) {
-                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has corrupted witness path - forcing rebuild")
+                        if verbose {
+                            print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has corrupted witness path - forcing rebuild")
+                        }
                         corruptedWitnesses.append((note.id, note.height ?? 0))
                         // Force rebuild for this note
                         if let cmu = note.cmu, !cmu.isEmpty {
@@ -4538,8 +4588,10 @@ final class WalletManager: ObservableObject {
                     // that computes to a different root than witness.root()
                     if let cmu = note.cmu, !cmu.isEmpty {
                         if !ZipherXFFI.witnessVerifyAnchor(note.witness, cmu: cmu) {
-                            print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has anchor mismatch - forcing rebuild")
-                            print("   FIX #827: witness.root() != merkle_path.root(cmu)")
+                            if verbose {
+                                print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) has anchor mismatch - forcing rebuild")
+                                print("   FIX #827: witness.root() != merkle_path.root(cmu)")
+                            }
                             corruptedWitnesses.append((note.id, note.height ?? 0))
                             notesNeedingRebuild.append((note: note, cmu: cmu))
                             continue
@@ -4557,7 +4609,9 @@ final class WalletManager: ObservableObject {
                     }
 
                     if let witnessAnchor = ZipherXFFI.witnessGetRoot(note.witness) {
-                        print("✅ [WITNESS \(index + 1)] Note ID=\(note.id) root extracted successfully")
+                        if verbose {
+                            print("✅ [WITNESS \(index + 1)] Note ID=\(note.id) root extracted successfully")
+                        }
 
                         // FIX #1224: Verify witness anchor EXISTS on blockchain (not just internally consistent)
                         // A witness from a corrupted/incomplete tree can pass witnessPathIsValid AND
@@ -4596,7 +4650,9 @@ final class WalletManager: ObservableObject {
                         // The correct anchor is always the witness root.
                         if note.anchor != witnessAnchor {
                             anchorUpdates.append((note.id, witnessAnchor))
-                            print("   🔧 FIX #804: Note \(note.id) anchor updated to witness root")
+                            if verbose {
+                                print("   🔧 FIX #804: Note \(note.id) anchor updated to witness root")
+                            }
                         }
 
                         // FIX #1209: REMOVED FIX #1157 proactive rebuild trigger entirely.
@@ -4607,7 +4663,9 @@ final class WalletManager: ObservableObject {
                         // full rebuild on mismatch. At startup, tree only has boost CMUs → EVERY witness
                         // mismatched → ALL rebuilt = 60s+ delay on EVERY startup. Removed.
                     } else {
-                        print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) witnessGetRoot returned nil")
+                        if verbose {
+                            print("⚠️ [WITNESS \(index + 1)] Note ID=\(note.id) witnessGetRoot returned nil")
+                        }
                     }
                 }
 
@@ -4624,8 +4682,10 @@ final class WalletManager: ObservableObject {
             // Log corrupted witness summary
             if !corruptedWitnesses.isEmpty {
                 print("⚠️ Pre-witness: Found \(corruptedWitnesses.count) corrupted witnesses, will rebuild")
-                for (noteId, height) in corruptedWitnesses {
-                    print("   - Note ID=\(noteId) at height=\(height)")
+                if verbose {
+                    for (noteId, height) in corruptedWitnesses {
+                        print("   - Note ID=\(noteId) at height=\(height)")
+                    }
                 }
             }
 
@@ -5065,7 +5125,9 @@ final class WalletManager: ObservableObject {
                 let maxBlocksPerPeer = 128
                 // FIX #1287: Cap concurrent fetch peers at 3 to prevent TCP congestion collapse
                 let batchSize: UInt64 = UInt64(min(max(peerCount, 2), 3) * maxBlocksPerPeer)
-                print("📊 FIX #1098: Delta CMU fetch using \(peerCount) peers × 128 = \(batchSize) blocks/batch")
+                if verbose {
+                    print("📊 FIX #1098: Delta CMU fetch using \(peerCount) peers × 128 = \(batchSize) blocks/batch")
+                }
                 var currentHeight = startHeight + 1
                 var consecutiveFailures = 0
                 let maxConsecutiveFailures = 3
@@ -5174,7 +5236,9 @@ final class WalletManager: ObservableObject {
                                 }
                                 retryRanges.append((start: rStart, count: Int(rEnd - rStart) + 1))
 
-                                print("🔄 FIX #1213b: Batch retrying \(missingHeights.count) missing blocks in \(retryRanges.count) ranges (was \(missingHeights.count) individual requests)")
+                                if verbose {
+                                    print("🔄 FIX #1213b: Batch retrying \(missingHeights.count) missing blocks in \(retryRanges.count) ranges (was \(missingHeights.count) individual requests)")
+                                }
 
                                 for range in retryRanges {
                                     do {
@@ -5508,13 +5572,17 @@ final class WalletManager: ObservableObject {
 
             // Get the local delta bundle end height (what we have cached locally)
             let deltaBundleEndHeight = DeltaCMUManager.shared.getDeltaEndHeight() ?? boostHeight
-            print("🔧 FIX #571: Local delta bundle ends at height: \(deltaBundleEndHeight)")
+            if verbose {
+                print("🔧 FIX #571: Local delta bundle ends at height: \(deltaBundleEndHeight)")
+            }
 
             // Calculate where to start fetching from:
             // - If we have local delta bundle, start from its end
             // - Otherwise start from boost file end
             let fetchStartHeight = max(boostHeight, deltaBundleEndHeight)
-            print("🔧 FIX #571: Will fetch blocks from height \(fetchStartHeight) to \(chainHeight)")
+            if verbose {
+                print("🔧 FIX #571: Will fetch blocks from height \(fetchStartHeight) to \(chainHeight)")
+            }
 
             var deltaCMUs: [Data] = []
             var localCMUs = 0
@@ -5534,7 +5602,9 @@ final class WalletManager: ObservableObject {
                     }
 
                     localCMUs = localDeltaCMUs.count
-                    print("🔧 FIX #571: Loaded \(localCMUs) CMUs from local delta bundle (instant!)")
+                    if verbose {
+                        print("🔧 FIX #571: Loaded \(localCMUs) CMUs from local delta bundle (instant!)")
+                    }
                 }
             }
 
@@ -5556,12 +5626,16 @@ final class WalletManager: ObservableObject {
                 await progress?("Fetching remaining blocks via P2P...", 80)
 
                 let blocksToFetch = blocksToFetchP2P
-                print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
+                if verbose {
+                    print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
+                }
                 // FIX #1214+1310: Initialize shared cache only if not already populated by first pass
                 if FilterScanner.sharedPrefetchCache == nil {
                     FilterScanner.sharedPrefetchCache = [:]
                 }
-                print("📦 FIX #1214: Caching P2P block data for FilterScanner PHASE 2 reuse")
+                if verbose {
+                    print("📦 FIX #1214: Caching P2P block data for FilterScanner PHASE 2 reuse")
+                }
 
                 // FIX #1056 v2: Stop block listeners before P2P fetch to prevent TCP stream desync
                 // Block listeners can consume P2P responses causing "Invalid magic bytes" errors
@@ -5640,7 +5714,9 @@ final class WalletManager: ObservableObject {
                                 // Task 2: Timeout - returns nil after delay
                                 group.addTask {
                                     try await Task.sleep(nanoseconds: batchTimeoutSeconds * 1_000_000_000)
-                                    print("⚠️ FIX #710 v2: Batch \(fetchHeight)-\(fetchHeight + UInt64(fetchCount) - 1) timed out after \(batchTimeoutSeconds)s")
+                                    if self.verbose {
+                                        print("⚠️ FIX #710 v2: Batch \(fetchHeight)-\(fetchHeight + UInt64(fetchCount) - 1) timed out after \(batchTimeoutSeconds)s")
+                                    }
                                     return nil
                                 }
 
@@ -5692,7 +5768,9 @@ final class WalletManager: ObservableObject {
                             if !batchDeltaOutputs.isEmpty {
                                 let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
                                 DeltaCMUManager.shared.appendOutputs(batchDeltaOutputs, fromHeight: deltaFromHeight, toHeight: endHeight, treeRoot: existingRoot)
-                                print("📦 FIX #1190: Appended \(batchDeltaOutputs.count) delta outputs from FIX #571 P2P batch")
+                                if verbose {
+                                    print("📦 FIX #1190: Appended \(batchDeltaOutputs.count) delta outputs from FIX #571 P2P batch")
+                                }
                             } else if fetchedBlocks.count > 0 {
                                 let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
                                 DeltaCMUManager.shared.appendOutputs([], fromHeight: deltaFromHeight, toHeight: endHeight, treeRoot: existingRoot)
@@ -5707,16 +5785,22 @@ final class WalletManager: ObservableObject {
                                 FilterScanner.sharedPrefetchCache?[height] = txData
                             }
 
-                            print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
+                            if verbose {
+                                print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
+                            }
                             batchSuccess = true
                             consecutiveFailures = 0
                             break  // Success, exit retry loop
                         } catch {
                             if attempt < maxRetries {
-                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                                if verbose {
+                                    print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                                }
                                 try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s backoff
                             } else {
-                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
+                                if verbose {
+                                    print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
+                                }
                             }
                         }
                     }
@@ -5733,9 +5817,13 @@ final class WalletManager: ObservableObject {
                     currentHeight = endHeight + 1
                 }
 
-                print("🔧 FIX #571: Fetched \(p2pCMUs) CMUs via P2P")
+                if verbose {
+                    print("🔧 FIX #571: Fetched \(p2pCMUs) CMUs via P2P")
+                }
                 let cacheSize = FilterScanner.sharedPrefetchCache?.count ?? 0
-                print("📦 FIX #1214: Cached \(cacheSize) blocks for FilterScanner PHASE 2 (saves ~\(cacheSize / 5)s of P2P fetch)")
+                if verbose {
+                    print("📦 FIX #1214: Cached \(cacheSize) blocks for FilterScanner PHASE 2 (saves ~\(cacheSize / 5)s of P2P fetch)")
+                }
             }
 
             // PART 3: Append all delta CMUs to update tree AND witnesses
@@ -5758,22 +5846,30 @@ final class WalletManager: ObservableObject {
                 // FIX #978: Skip CMUs that are already in tree, only append NEW ones
                 if cmusAlreadyInTree >= deltaCMUs.count {
                     // All CMUs already in tree, skip completely
-                    print("✅ FIX #978: Step 2a SKIPPED - All \(deltaCMUs.count) delta CMUs already in tree (size=\(currentTreeSize))")
-                    print("✅ FIX #978: This prevents double-append bug that caused anchor mismatch!")
+                    if verbose {
+                        print("✅ FIX #978: Step 2a SKIPPED - All \(deltaCMUs.count) delta CMUs already in tree (size=\(currentTreeSize))")
+                        print("✅ FIX #978: This prevents double-append bug that caused anchor mismatch!")
+                    }
                 } else if cmusAlreadyInTree > 0 {
                     // Some CMUs already in tree from INSTANT START, only append NEW ones
                     let cmusToAppend = Array(deltaCMUs.dropFirst(cmusAlreadyInTree))
-                    print("🔧 FIX #978: Skipping first \(cmusAlreadyInTree) CMUs (already in tree), appending \(cmusToAppend.count) new CMUs...")
+                    if verbose {
+                        print("🔧 FIX #978: Skipping first \(cmusAlreadyInTree) CMUs (already in tree), appending \(cmusToAppend.count) new CMUs...")
+                    }
                     for cmu in cmusToAppend {
                         _ = ZipherXFFI.treeAppend(cmu: cmu)
                     }
-                    print("✅ FIX #978: Step 2a - Appended \(cmusToAppend.count) NEW CMUs to tree (new size: \(ZipherXFFI.treeSize()))")
+                    if verbose {
+                        print("✅ FIX #978: Step 2a - Appended \(cmusToAppend.count) NEW CMUs to tree (new size: \(ZipherXFFI.treeSize()))")
+                    }
                 } else {
                     // No CMUs in tree yet, append all
                     for cmu in deltaCMUs {
                         _ = ZipherXFFI.treeAppend(cmu: cmu)
                     }
-                    print("✅ FIX #571: Step 2a - Appended \(deltaCMUs.count) CMUs to tree (new size: \(ZipherXFFI.treeSize()))")
+                    if verbose {
+                        print("✅ FIX #571: Step 2a - Appended \(deltaCMUs.count) CMUs to tree (new size: \(ZipherXFFI.treeSize()))")
+                    }
                 }
 
                 // FIX #805: Step 2b - ALSO update WITNESSES with the same CMUs!
@@ -5791,7 +5887,9 @@ final class WalletManager: ObservableObject {
                 if cmusAlreadyInTree >= deltaCMUs.count {
                     // All CMUs already reflected in witnesses from DB, skip
                     cmusForWitnesses = []
-                    print("✅ FIX #1281: Step 2b SKIPPED - Witnesses already have all \(deltaCMUs.count) delta CMUs")
+                    if verbose {
+                        print("✅ FIX #1281: Step 2b SKIPPED - Witnesses already have all \(deltaCMUs.count) delta CMUs")
+                    }
 
                     // FIX #1292: Verify skip was correct — delta sync may have grown the tree
                     // without updating witnesses (e.g., syncDeltaBundleIfNeeded added 1 CMU
@@ -5814,11 +5912,15 @@ final class WalletManager: ObservableObject {
                 } else if cmusAlreadyInTree > 0 {
                     // Witnesses from DB have first N delta CMUs, only apply new ones
                     cmusForWitnesses = Array(deltaCMUs.dropFirst(cmusAlreadyInTree))
-                    print("🔧 FIX #1281: Step 2b - Skipping first \(cmusAlreadyInTree) CMUs (already in witnesses), applying \(cmusForWitnesses.count) new CMUs")
+                    if verbose {
+                        print("🔧 FIX #1281: Step 2b - Skipping first \(cmusAlreadyInTree) CMUs (already in witnesses), applying \(cmusForWitnesses.count) new CMUs")
+                    }
                 } else {
                     // Witnesses at boost boundary, apply all delta CMUs
                     cmusForWitnesses = deltaCMUs
-                    print("🔧 FIX #805: Step 2b - Applying all \(deltaCMUs.count) delta CMUs to witnesses")
+                    if verbose {
+                        print("🔧 FIX #805: Step 2b - Applying all \(deltaCMUs.count) delta CMUs to witnesses")
+                    }
                 }
 
                 if !cmusForWitnesses.isEmpty {
@@ -5827,7 +5929,9 @@ final class WalletManager: ObservableObject {
                         packedCMUs.append(cmu)
                     }
                     let updatedWitnessCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: cmusForWitnesses.count)
-                    print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
+                    if verbose {
+                        print("✅ FIX #805: Step 2b - Updated \(updatedWitnessCount) witnesses with \(cmusForWitnesses.count) delta CMUs")
+                    }
 
                     // FIX #1298: Verify witnesses AFTER applying CMUs — DB witnesses may have been
                     // corrupted (wrong merkle paths from previous session). updateAllWitnessesBatch
@@ -6737,11 +6841,18 @@ final class WalletManager: ObservableObject {
             }
         }
 
+        // FIX #1353: Only show "Syncing..." UI during INITIAL sync, not background refreshes
+        // After initial sync, backgroundProcessesEnabled=true. Subsequent refreshBalance() calls
+        // (from send flow, background sync, etc.) should NOT show the syncing banner.
+        let isInitialSync = await MainActor.run { !NetworkManager.shared.backgroundProcessesEnabled }
+
         // Initialize sync tasks
         await MainActor.run {
-            self.isSyncing = true
-            self.syncProgress = 0.0
-            self.syncStatus = "Initializing privacy shield..."
+            if isInitialSync {
+                self.isSyncing = true
+                self.syncProgress = 0.0
+                self.syncStatus = "Initializing privacy shield..."
+            }
             // Move to connecting phase (tree loading should already be done)
             self.updateOverallProgress(phase: .connecting, phaseProgress: 0.0)
             // FIX #558: Add FAST START task IDs that ContentView updates
@@ -6776,8 +6887,11 @@ final class WalletManager: ObservableObject {
         }
 
         defer {
-            DispatchQueue.main.async {
-                self.isSyncing = false
+            // FIX #1353: Only reset isSyncing if we set it (initial sync only)
+            if isInitialSync {
+                DispatchQueue.main.async {
+                    self.isSyncing = false
+                }
             }
             // Always re-enable notifications on exit (success or failure)
             if wasImported {
@@ -6891,22 +7005,33 @@ final class WalletManager: ObservableObject {
         // Headers will be synced in background later or on first transaction
         let shouldSkipHeaderSync = wasImported
 
-        // FIX #522: Load bundled headers from boost file even during import (instant, no P2P needed)
-        // This ensures HeaderStore is populated for timestamps and tree root validation
-        // FIX #951: PERFORMANCE - Run header loading AND CMU pre-extraction IN PARALLEL
-        // On fresh import, this saves ~25s by overlapping the two I/O operations
-        if wasImported {
+        // FIX #1341: On first import, DEFER boost header loading to background (saves 207s on iOS).
+        // Boost headers (476969-2988797) are NOT needed for import scanning:
+        // - PHASE 1 uses local boost shielded output data (trial decryption)
+        // - PHASE 1.5 computes witnesses from in-memory tree
+        // - PHASE 2 fetches P2P headers for delta range (2988798+) only
+        // Headers load in background after import for timestamps and anchor validation.
+        //
+        // FIX #522/951 (original): Load bundled headers in parallel with CMU pre-extraction.
+        // Still used for non-first-import cases (when headers are already loaded, returns instantly).
+        let headerStoreHeight1341 = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+        let boostHeadersAlreadyLoaded = headerStoreHeight1341 > 2_900_000
+        if wasImported && !boostHeadersAlreadyLoaded {
+            // FIX #1341: First import — skip blocking 207s header load
+            print("⏭️ FIX #1341: Deferring 2.5M boost header loading to background (saves 207s on iOS)")
+            // Still pre-load CMU cache (instant)
+            if let cmuPath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath() {
+                print("✅ FIX #1341: CMU cache path ready")
+            } else {
+                print("⚠️ FIX #1341: CMU cache path not available")
+            }
+        } else if wasImported {
             print("⚡ FIX #951: Starting PARALLEL header loading + CMU pre-extraction...")
             let parallelStartTime = Date()
 
-            // FIX #951: Run both operations in parallel using async let
-            // Headers: ~78s (with FIX #948 batch commits)
-            // CMU extraction: ~25s (or instant if cached)
-            // Result: max(78s, 25s) = 78s instead of sequential 78s + 25s = 103s
             async let headerLoadTask = loadHeadersFromBoostFile()
             async let cmuPreloadTask: URL? = CommitmentTreeUpdater.shared.getCachedCMUFilePath()
 
-            // Wait for both tasks to complete
             let (loadedBundledHeaders, boostHeaderEndHeight) = await headerLoadTask
             let cmuCachePath = await cmuPreloadTask
 
@@ -8700,7 +8825,9 @@ final class WalletManager: ObservableObject {
 
         // FAST PATH: Try to rebuild witnesses using stored CMUs and downloaded tree
         let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: account.accountId)
-        print("📝 Found \(notes.count) notes to rebuild witnesses for")
+        if verbose {
+            print("📝 Found \(notes.count) notes to rebuild witnesses for")
+        }
 
         // Load CMU data from GitHub cache
         guard let cmuFilePath = await CommitmentTreeUpdater.shared.getCachedCMUFilePath(),
@@ -9182,7 +9309,9 @@ final class WalletManager: ObservableObject {
                 return 0
             }
             let accountId = account.accountId
-            print("   📋 Using account ID: \(accountId)")
+            if verbose {
+                print("   📋 Using account ID: \(accountId)")
+            }
 
             // Get all unspent notes with CMU
             let notes = try WalletDatabase.shared.getAllUnspentNotes(accountId: accountId)
@@ -9193,7 +9322,9 @@ final class WalletManager: ObservableObject {
                 return 0
             }
 
-            print("   Found \(notesWithCMU.count) notes to rebuild")
+            if verbose {
+                print("   Found \(notesWithCMU.count) notes to rebuild")
+            }
 
             // Collect targets: CMU + position for each note
             let saplingActivation: UInt64 = 476969
@@ -9211,12 +9342,14 @@ final class WalletManager: ObservableObject {
             let maxHeight = targets.map { $0.height }.max() ?? 0
             let minHeight = targets.map { $0.height }.min() ?? saplingActivation
 
-            print("   Position range: 0 to \(maxPosition) (height \(saplingActivation) to \(maxHeight))")
+            if verbose {
+                print("   Position range: 0 to \(maxPosition) (height \(saplingActivation) to \(maxHeight))")
+            }
 
             // 1. Get CMUs from boost file
             print("   📦 Loading boost file CMUs...")
-            let boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { progress in
-                if Int(progress * 100) % 10 == 0 {
+            let boostCMUData = try await CommitmentTreeUpdater.shared.extractCMUsInLegacyFormat { [self] progress in
+                if verbose && Int(progress * 100) % 10 == 0 {
                     print("      Extracting boost CMUs: \(Int(progress * 100))%")
                 }
             }
@@ -9227,20 +9360,28 @@ final class WalletManager: ObservableObject {
                 return 0
             }
             let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
-            print("   📊 Boost file has \(boostCMUCount) CMUs (up to position \(boostCMUCount - 1))")
+            if verbose {
+                print("   📊 Boost file has \(boostCMUCount) CMUs (up to position \(boostCMUCount - 1))")
+            }
 
             let boostMaxHeight = saplingActivation + boostCMUCount - 1
-            print("   📊 Boost file covers height \(saplingActivation) to \(boostMaxHeight)")
+            if verbose {
+                print("   📊 Boost file covers height \(saplingActivation) to \(boostMaxHeight)")
+            }
 
             // 2. Fetch delta CMUs from blocks beyond boost file
             var deltaCMUs: [Data] = []
             if maxHeight > boostMaxHeight {
                 let startHeight = boostMaxHeight + 1
-                print("   📡 Fetching delta CMUs from blocks \(startHeight) to \(maxHeight)...")
+                if verbose {
+                    print("   📡 Fetching delta CMUs from blocks \(startHeight) to \(maxHeight)...")
+                }
 
                 let txBuilder = TransactionBuilder()
                 deltaCMUs = try await txBuilder.fetchCMUsFromBlocks(startHeight: startHeight, endHeight: maxHeight)
-                print("   📊 Fetched \(deltaCMUs.count) delta CMUs")
+                if verbose {
+                    print("   📊 Fetched \(deltaCMUs.count) delta CMUs")
+                }
             }
 
             // 3. Build combined CMU data
@@ -9261,10 +9402,14 @@ final class WalletManager: ObservableObject {
                 combinedCMUData.append(cmu)
             }
 
-            print("   📊 Combined CMU data: \(totalCMUCount) CMUs (\(combinedCMUData.count) bytes)")
+            if verbose {
+                print("   📊 Combined CMU data: \(totalCMUCount) CMUs (\(combinedCMUData.count) bytes)")
+            }
 
             // 4. Rebuild witnesses at specific positions using FFI
-            print("   🔧 Rebuilding witnesses at specific positions...")
+            if verbose {
+                print("   🔧 Rebuilding witnesses at specific positions...")
+            }
 
             // Prepare targets for FFI: separate arrays for CMUs and positions
             var targetCMUs: [Data] = []
@@ -9817,12 +9962,12 @@ final class WalletManager: ObservableObject {
             throw WalletError.insufficientFunds
         }
 
-        // FIX #596: CRITICAL - Update witnesses with CURRENT anchor BEFORE building transaction!
-        // If we build with OLD anchor from DB, transaction will be rejected with "joinsplit requirements not met"
-        // The witness update ensures all witnesses have the latest tree root as anchor
-        onProgress("verify", "Updating witnesses...", 0.0)
-        await preRebuildWitnessesForInstantPayment(accountId: 1)
-        onProgress("verify", "Witnesses updated", 0.5)
+        // FIX #1330: Witness-on-demand — do NOT rebuild ALL witnesses here.
+        // TransactionBuilder rebuilds witnesses for ONLY the selected notes (1-2 for small sends).
+        // Before FIX #1330: preRebuildWitnessesForInstantPayment() rebuilt ALL 43 corrupted witnesses (~90s)
+        // even for a 0.0015 ZCL send that only needs 1 witness.
+        // preRebuildWitnessesForInstantPayment() still runs in background (FAST START).
+        onProgress("verify", "Preparing witnesses...", 0.5)
 
         // Record balance BEFORE send - used to detect change vs real incoming
         // Also set lastSendTimestamp EARLY so clearingTime calculation works
@@ -11751,6 +11896,14 @@ final class WalletManager: ObservableObject {
             scanStartHeight = range.upperBound + 1
         }
 
+        // FIX #1350: Guard against UInt64 underflow when scanStartHeight > chainHeight
+        // (FIX #1319 can advance scanStartHeight past chainHeight when delta covers tip)
+        guard scanStartHeight < chainHeight else {
+            print("✅ FIX #1350: Scan start (\(scanStartHeight)) >= chain height (\(chainHeight)) - already verified, saving checkpoint")
+            UserDefaults.standard.set(Int(chainHeight), forKey: "FIX1106_NullifierVerificationCheckpoint")
+            return
+        }
+
         let blocksToScan = chainHeight - scanStartHeight
 
         // Skip if only a few blocks to scan (already synced)
@@ -13561,6 +13714,70 @@ final class WalletManager: ObservableObject {
             }
         }
         print("⏰ FIX #370: Deep verification + auto-recovery: ran at startup, then every 30 min")
+    }
+
+    /// FIX #1354: Check if a newer boost file is available on GitHub
+    /// Called after startup completes. If newer boost exists, sets newerBoostAvailable
+    /// so the UI can prompt the user to download it.
+    func checkForBoostUpdate() {
+        Task.detached(priority: .background) {
+            // Wait 10s after startup to avoid contention with initial sync
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+
+            let updater = CommitmentTreeUpdater.shared
+            let cachedManifest = await updater.loadCachedManifest()
+            let cachedHeight = cachedManifest?.chain_height ?? 0
+
+            guard cachedHeight > 0 else {
+                print("⏭️ FIX #1354: No cached boost manifest — skipping update check")
+                return
+            }
+
+            do {
+                let remoteManifest = try await updater.fetchRemoteManifestPublic()
+                let remoteHeight = remoteManifest.chain_height
+
+                if remoteHeight > cachedHeight + 10000 {
+                    // Only prompt if significantly newer (>10K blocks ≈ 7 days)
+                    print("📦 FIX #1354: Newer boost available! Remote=\(remoteHeight) vs cached=\(cachedHeight) (+\(remoteHeight - cachedHeight) blocks)")
+                    await MainActor.run {
+                        WalletManager.shared.newerBoostAvailable = (remoteHeight: remoteHeight, cachedHeight: cachedHeight)
+                    }
+                } else {
+                    print("✅ FIX #1354: Boost file is up-to-date (cached=\(cachedHeight), remote=\(remoteHeight))")
+                }
+            } catch {
+                print("⏭️ FIX #1354: Could not check for boost update: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// FIX #1354: Download the newer boost file (called when user accepts the prompt)
+    func downloadBoostUpdate() {
+        guard !isDownloadingBoostUpdate else { return }
+        Task { @MainActor in
+            self.isDownloadingBoostUpdate = true
+            self.newerBoostAvailable = nil
+        }
+
+        Task.detached {
+            defer {
+                Task { @MainActor in
+                    WalletManager.shared.isDownloadingBoostUpdate = false
+                }
+            }
+
+            do {
+                let updater = CommitmentTreeUpdater.shared
+                let (_, height, outputs) = try await updater.getBestAvailableBoostFile(onProgress: { progress, status in
+                    print("📦 FIX #1354: Boost update \(Int(progress * 100))% - \(status)")
+                })
+                print("✅ FIX #1354: Boost file updated to height \(height) (\(outputs) outputs)")
+                print("📦 FIX #1354: Restart app to use the new boost file")
+            } catch {
+                print("❌ FIX #1354: Boost update failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// FIX #603: Start periodic witness refresh timer

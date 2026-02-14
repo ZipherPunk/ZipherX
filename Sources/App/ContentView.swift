@@ -195,6 +195,13 @@ struct ContentView: View {
                         // Check if this is first launch (tree not yet cached)
                         isFirstLaunch = !walletManager.isTreeLoaded && walletManager.treeLoadProgress < 1.0
 
+                        // FIX #1341: On first import, start P2P connection early (parallel with tree loading).
+                        // Tree takes ~24s (ZSTD + deserialize), peers need ~5-10s.
+                        // By connecting now, peers are ready when FULL START needs them — saves 10s.
+                        if isFirstLaunch {
+                            Task { try? await networkManager.connect() }
+                        }
+
                         // Trigger tree loading if not already loaded
                         // This handles the case where wallet was just created/imported
                         if !walletManager.isTreeLoaded {
@@ -260,7 +267,12 @@ struct ContentView: View {
                         print("📍 FIX #535: HeaderStore height at startup: \(headerStoreHeight), LastScanned: \(lastScannedHeight)")
 
                         // Load bundled headers from boost file FIRST (instant)
-                        if headerStoreHeight < 2964000 {
+                        // FIX #1341: Skip on first import (lastScannedHeight=0) — saves 207s on iOS.
+                        // Boost headers (476969-2988797) are NOT needed for PHASE 1/2 scanning:
+                        // - PHASE 1 uses local boost shielded outputs (trial decryption)
+                        // - PHASE 2 fetches P2P headers for delta range (2988798+) only
+                        // Headers load in background after import completes.
+                        if headerStoreHeight < 2964000 && lastScannedHeight > 0 {
                             print("📦 FIX #535: Loading bundled headers from boost file...")
                             await MainActor.run {
                                 walletManager.setConnecting(true, status: "Loading block headers...")
@@ -269,11 +281,14 @@ struct ContentView: View {
                             if loadedBoost {
                                 print("✅ FIX #535: Loaded bundled headers up to \(boostEndHeight)")
                             }
+                        } else if lastScannedHeight == 0 {
+                            print("⏭️ FIX #1341: Skipping boost header loading on first import (saves 207s)")
                         }
 
                         // Connect to P2P network for delta header sync
-                        // Only sync if: HeaderStore is empty OR wallet has data that needs headers
-                        let needsHeaderSync = headerStoreHeight < 2964000 || lastScannedHeight > 0
+                        // FIX #1341: Skip on first import — FULL START handles its own P2P connection
+                        // and PHASE 2 fetches delta headers via P2P internally.
+                        let needsHeaderSync = lastScannedHeight > 0
                         if needsHeaderSync {
                             print("🔗 FIX #535: Connecting to P2P network for header sync...")
                             do {
@@ -881,6 +896,9 @@ struct ContentView: View {
 
                                     // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
                                     walletManager.startPeriodicDeepVerification()
+
+                                    // FIX #1354: Check if newer boost file available on GitHub
+                                    walletManager.checkForBoostUpdate()
                                 }
 
                                 // FIX #1128: Run delta bundle compaction in background (non-blocking)
@@ -1636,6 +1654,9 @@ struct ContentView: View {
                             // Runs every 30 minutes to catch missed transactions (including those from broadcast bugs)
                             walletManager.startPeriodicDeepVerification()
 
+                            // FIX #1354: Check if newer boost file available on GitHub
+                            walletManager.checkForBoostUpdate()
+
                             // FIX #1128: Run delta bundle compaction in background (non-blocking)
                             // This removes duplicate CMUs that accumulate over time from re-scans
                             Task.detached(priority: .background) {
@@ -1768,13 +1789,22 @@ struct ContentView: View {
                         // Health check verifies latest 100 headers which proves chain validity
 
                         // Brief pause for UI feedback
-                        print("DEBUGZIPHERX: 📡 Task: Waiting 0.5s...")
-                        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
+                        // FIX #1341: Skip on first import — every second counts
+                        if !isFirstLaunch {
+                            print("DEBUGZIPHERX: 📡 Task: Waiting 0.5s...")
+                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec
+                        }
 
                         // Now fetch stats
-                        print("DEBUGZIPHERX: 📡 Task: Fetching network stats...")
-                        await networkManager.fetchNetworkStats()
-                        print("DEBUGZIPHERX: 📡 Task: Network stats fetched")
+                        // FIX #1341: Skip on first import — chainHeight already set by connect() peer consensus (FIX #431).
+                        // fetchNetworkStats updates UI info but blocks 2-3s. On first import, scan starts immediately.
+                        if !isFirstLaunch {
+                            print("DEBUGZIPHERX: 📡 Task: Fetching network stats...")
+                            await networkManager.fetchNetworkStats()
+                            print("DEBUGZIPHERX: 📡 Task: Network stats fetched")
+                        } else {
+                            print("⏭️ FIX #1341: Skipping fetchNetworkStats on first import (chainHeight from peer consensus)")
+                        }
 
                         // Auto-sync on launch (downloads params if needed, syncs blockchain)
                         if networkManager.isConnected {
@@ -1830,6 +1860,24 @@ struct ContentView: View {
 
                             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                             syncCompleteWait += 1
+                        }
+
+                        // FIX #1341: Load boost headers in background now that import scan is complete.
+                        // These were deferred during first import to save 207s on the critical path.
+                        // Needed for: transaction timestamps, anchor validation, health checks.
+                        // Runs as fire-and-forget — doesn't block height verification or UI.
+                        if isFirstLaunch {
+                            Task {
+                                print("📜 FIX #1341: Loading 2.5M boost headers in background (deferred from import)...")
+                                let (loaded, endHeight) = await walletManager.loadHeadersFromBoostFile()
+                                if loaded {
+                                    print("✅ FIX #1341: Boost headers loaded in background (to height \(endHeight))")
+                                    // Update timestamps for transaction history
+                                    await walletManager.ensureHeaderTimestamps()
+                                    // Notify UI to refresh history with real timestamps
+                                    NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                                }
+                            }
                         }
 
                         // ALSO wait for wallet height to match chain height
@@ -2321,6 +2369,9 @@ struct ContentView: View {
 
                             // FIX #370 + FIX #681: Start periodic deep verification and auto-recovery
                             walletManager.startPeriodicDeepVerification()
+
+                            // FIX #1354: Check if newer boost file available on GitHub
+                            walletManager.checkForBoostUpdate()
 
                             // FIX #1128: Run delta bundle compaction in background (non-blocking)
                             Task.detached(priority: .background) {

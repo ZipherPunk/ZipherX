@@ -146,23 +146,15 @@ final class TransactionBuilder {
         // FIX #580: Debug branch ID before building transaction
         ZipherXFFI.debugBranchId(chainHeight: chainHeight)
 
-        // Get notes from database - requires valid witnesses
-        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        // FIX #1330: Include notes with NULL witnesses — rebuilt on-demand during TX build
+        var dbNotes = try database.getAllUnspentNotes(accountId: account.accountId)
 
-        // If no notes with witnesses, check for notes without witnesses that need rebuild
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
-            if allNotes.isEmpty {
-                print("📝 No notes found in database")
-                throw TransactionError.insufficientFunds
-            }
-
-            print("📝 Found \(allNotes.count) notes without valid witnesses")
-            print("⚠️ Notes need witness rebuild - please use 'Rebuild Witnesses' button in Settings first")
-            throw TransactionError.proofGenerationFailed
+            print("📝 No notes found in database")
+            throw TransactionError.insufficientFunds
         }
 
-        print("📝 Found \(dbNotes.count) notes with valid witnesses")
+        print("📝 Found \(dbNotes.count) unspent notes (witnesses rebuilt on-demand)")
 
         // Use downloaded tree height from GitHub
         let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
@@ -592,14 +584,14 @@ final class TransactionBuilder {
                 chainHeight = try await NetworkManager.shared.getChainHeight()
             }
         }
-        var dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        // FIX #1330: Use ALL unspent notes (including those with NULL witnesses).
+        // TransactionBuilder rebuilds witnesses on-demand for only the selected notes.
+        // getUnspentNotes() required `witness IS NOT NULL` which excluded notes needing
+        // witness rebuild — forcing the slow preRebuildWitnessesForInstantPayment().
+        var dbNotes = try database.getAllUnspentNotes(accountId: account.accountId)
 
         if dbNotes.isEmpty {
-            let allNotes = try database.getAllUnspentNotes(accountId: account.accountId)
-            if allNotes.isEmpty {
-                throw TransactionError.insufficientFunds
-            }
-            throw TransactionError.proofGenerationFailed
+            throw TransactionError.insufficientFunds
         }
 
         // Use downloaded tree height from GitHub
@@ -1463,7 +1455,8 @@ final class TransactionBuilder {
             print("📝 No account found in database")
             return []
         }
-        let dbNotes = try database.getUnspentNotes(accountId: account.accountId)
+        // FIX #1330: Include notes with NULL witnesses — rebuilt on-demand during TX build
+        let dbNotes = try database.getAllUnspentNotes(accountId: account.accountId)
 
         print("📝 Database returned \(dbNotes.count) unspent notes")
 

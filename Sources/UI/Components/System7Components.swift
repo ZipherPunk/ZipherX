@@ -1844,6 +1844,23 @@ struct CypherpunkMainView: View {
     @State private var showQuote = false
     @State private var currentQuote: (quote: String, author: String) = ("", "")
 
+    // FIX #1337: Clearing celebration state (mempool/unconfirmed tx detection)
+    @State private var showClearingCelebration = false
+    @State private var clearingTxAmount: Double = 0
+    @State private var clearingTxFee: Double = 0  // FIX #1356
+    @State private var clearingTxId: String = ""
+    @State private var clearingTime: TimeInterval? = nil
+    @State private var clearingIsOutgoing: Bool = false
+
+    // FIX #1337: Settlement celebration state (confirmed/mined tx)
+    @State private var showSettlementCelebration = false
+    @State private var settlementTxAmount: Double = 0
+    @State private var settlementTxFee: Double = 0  // FIX #1356
+    @State private var settlementTxId: String = ""
+    @State private var settlementIsOutgoing: Bool = true
+    @State private var settlementClearingTime: TimeInterval? = nil
+    @State private var settlementTime: TimeInterval? = nil
+
     // Matrix green colors (primary = orange on macOS, green on iOS)
     private let matrixGreen = NeonColors.primary
     private let matrixGreenDark = NeonColors.primaryDark
@@ -1915,6 +1932,35 @@ struct CypherpunkMainView: View {
                     .transition(.opacity)
                     .zIndex(100)
             }
+
+            // FIX #1337: Settlement celebration overlay (confirmed/mined tx)
+            if showSettlementCelebration {
+                SettlementCelebrationView(
+                    isShowing: $showSettlementCelebration,
+                    amount: settlementTxAmount,
+                    fee: settlementTxFee,
+                    txid: settlementTxId,
+                    isOutgoing: settlementIsOutgoing,
+                    clearingTime: settlementClearingTime,
+                    settlementTime: settlementTime
+                )
+                .transition(.opacity)
+                .zIndex(101)
+            }
+
+            // FIX #1337: Clearing celebration overlay (mempool/unconfirmed tx)
+            if showClearingCelebration {
+                ClearingCelebrationView(
+                    isShowing: $showClearingCelebration,
+                    amount: clearingTxAmount,
+                    fee: clearingTxFee,
+                    txid: clearingTxId,
+                    clearingTime: clearingTime,
+                    isOutgoing: clearingIsOutgoing
+                )
+                .transition(.opacity)
+                .zIndex(102)
+            }
         }
         .sheet(item: $selectedTransaction) { transaction in
             TransactionDetailView(transaction: transaction)
@@ -1924,6 +1970,46 @@ struct CypherpunkMainView: View {
         .onAppear {
             previousBalance = walletManager.shieldedBalance
             loadTransactionHistory()
+
+            // FIX #1337: Check for pending celebrations on appear
+            if let mempool = networkManager.justDetectedIncomingMempool {
+                clearingTxId = mempool.txid
+                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+                clearingTxFee = 0  // FIX #1356: Receiver doesn't pay fee
+                clearingTime = mempool.clearingTime
+                clearingIsOutgoing = false
+                withAnimation { showClearingCelebration = true }
+                print("🏦 FIX #1337 (onAppear): Incoming \(clearingTxAmount) ZCL")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justDetectedIncomingMempool = nil
+                }
+            }
+            if let cleared = networkManager.justClearedOutgoing {
+                clearingTxId = cleared.txid
+                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+                clearingTxFee = Double(cleared.fee) / 100_000_000.0  // FIX #1356
+                clearingTime = cleared.clearingTime
+                clearingIsOutgoing = true
+                withAnimation { showClearingCelebration = true }
+                print("🏦 FIX #1337 (onAppear): Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee))")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justClearedOutgoing = nil
+                }
+            }
+            if let confirmed = networkManager.justConfirmedTx {
+                settlementTxId = confirmed.txid
+                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+                settlementTxFee = Double(confirmed.fee) / 100_000_000.0  // FIX #1356
+                settlementIsOutgoing = confirmed.isOutgoing
+                settlementClearingTime = confirmed.clearingTime
+                settlementTime = confirmed.settlementTime
+                withAnimation { showSettlementCelebration = true }
+                print("⛏️ FIX #1337 (onAppear): \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
+                if confirmed.isOutgoing { walletManager.clearBalanceBeforeLastSend() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justConfirmedTx = nil
+                }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
             // FIX #462 v2: Force reload when repair completes
@@ -2016,6 +2102,59 @@ struct CypherpunkMainView: View {
             if networkManager.isConnected && !walletManager.isSyncing {
                 Task {
                     await networkManager.fetchNetworkStats()
+                }
+            }
+        }
+        // FIX #1337: Celebration triggers — same as BalanceView
+        .onChange(of: networkManager.mempoolIncomingCelebrationTrigger) { _ in
+            if let mempool = networkManager.justDetectedIncomingMempool {
+                clearingTxId = mempool.txid
+                clearingTxAmount = Double(mempool.amount) / 100_000_000.0
+                clearingTxFee = 0  // FIX #1356: Receiver doesn't pay fee
+                clearingTime = mempool.clearingTime
+                clearingIsOutgoing = false
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 FIX #1337: CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justDetectedIncomingMempool = nil
+                }
+            }
+        }
+        .onChange(of: networkManager.outgoingClearingTrigger) { _ in
+            if let cleared = networkManager.justClearedOutgoing {
+                clearingTxId = cleared.txid
+                clearingTxAmount = Double(cleared.amount) / 100_000_000.0
+                clearingTxFee = Double(cleared.fee) / 100_000_000.0  // FIX #1356
+                clearingTime = cleared.clearingTime
+                clearingIsOutgoing = true
+                withAnimation {
+                    showClearingCelebration = true
+                }
+                print("🏦 FIX #1337: CLEARING! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justClearedOutgoing = nil
+                }
+            }
+        }
+        .onChange(of: networkManager.settlementCelebrationTrigger) { _ in
+            if let confirmed = networkManager.justConfirmedTx {
+                settlementTxId = confirmed.txid
+                settlementTxAmount = Double(confirmed.amount) / 100_000_000.0
+                settlementTxFee = Double(confirmed.fee) / 100_000_000.0  // FIX #1356
+                settlementIsOutgoing = confirmed.isOutgoing
+                settlementClearingTime = confirmed.clearingTime
+                settlementTime = confirmed.settlementTime
+                withAnimation {
+                    showSettlementCelebration = true
+                }
+                print("⛏️ FIX #1337: SETTLEMENT! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
+                if confirmed.isOutgoing {
+                    walletManager.clearBalanceBeforeLastSend()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    networkManager.justConfirmedTx = nil
                 }
             }
         }
@@ -3047,7 +3186,8 @@ struct MinedCelebrationView: View {
 /// Celebration when transaction enters mempool (unconfirmed) - for both sender and receiver
 struct ClearingCelebrationView: View {
     @Binding var isShowing: Bool
-    let amount: Double // Amount in ZCL
+    let amount: Double // Amount in ZCL (user-sent amount, excluding fee)
+    let fee: Double // FIX #1356: Fee in ZCL (displayed separately)
     let txid: String
     let clearingTime: TimeInterval? // Time from send click to mempool detection
     let isOutgoing: Bool // true = sender, false = receiver
@@ -3108,6 +3248,13 @@ struct ClearingCelebrationView: View {
                         .font(.system(size: 32, weight: .bold, design: .monospaced))
                         .foregroundColor(isOutgoing ? .orange : .green)
                         .shadow(color: isOutgoing ? .orange.opacity(0.5) : .green.opacity(0.5), radius: 5)
+
+                    // FIX #1356: Fee display (only for outgoing)
+                    if isOutgoing && fee > 0 {
+                        Text("fee: \(String(format: "%.8f", fee)) ZCL")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
 
                     // Success message based on direction
                     Text(isOutgoing ? "Successfully sent in" : "Successfully received in")
@@ -3206,7 +3353,8 @@ struct ClearingCelebrationView: View {
 /// Celebration when transaction is mined (confirmed) - for both sender and receiver
 struct SettlementCelebrationView: View {
     @Binding var isShowing: Bool
-    let amount: Double // Amount in ZCL
+    let amount: Double // Amount in ZCL (user-sent amount, excluding fee)
+    let fee: Double // FIX #1356: Fee in ZCL (displayed separately)
     let txid: String
     let isOutgoing: Bool // true = sender, false = receiver
     let clearingTime: TimeInterval? // Time to mempool
@@ -3272,6 +3420,13 @@ struct SettlementCelebrationView: View {
                         .font(.system(size: 30, weight: .bold, design: .monospaced))
                         .foregroundColor(isOutgoing ? .orange : .green)
                         .shadow(color: isOutgoing ? .orange.opacity(0.5) : .green.opacity(0.5), radius: 5)
+
+                    // FIX #1356: Fee display (only for outgoing)
+                    if isOutgoing && fee > 0 {
+                        Text("fee: \(String(format: "%.8f", fee)) ZCL")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
 
                     // Success message based on direction
                     Text(isOutgoing ? "Successfully sent in" : "Successfully received in")

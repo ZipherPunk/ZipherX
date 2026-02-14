@@ -9,6 +9,9 @@ final class FilterScanner {
     private let rustBridge: RustBridge
     // FIX #896: Removed InsightAPI - ZipherX is a cypherpunk P2P-only wallet, no centralized explorer dependency
 
+    // FIX #1348: Verbose logging control (suppress high-volume per-block/per-output logs)
+    private let verbose = false
+
     // Scanning parameters
     private let batchSize = 500 // Larger batches for faster sync
     private var isScanning = false
@@ -412,10 +415,12 @@ final class FilterScanner {
             let isFullRescan = lastScanned == 0 && (treeExists || hasDownloadedTree) && (!isImportedWallet || isRepairing)
 
             // FIX #728: Debug logging to diagnose why PHASE 1 might be skipped
-            print("🔍 FIX #728: Start height determination:")
-            print("   lastScanned=\(lastScanned), treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree)")
-            print("   isImportedWallet=\(isImportedWallet), isRepairing=\(isRepairing), isFullRescan=\(isFullRescan)")
-            print("   effectiveTreeHeight=\(effectiveTreeHeight)")
+            if verbose {
+                print("🔍 FIX #728: Start height determination:")
+                print("   lastScanned=\(lastScanned), treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree)")
+                print("   isImportedWallet=\(isImportedWallet), isRepairing=\(isRepairing), isFullRescan=\(isFullRescan)")
+                print("   effectiveTreeHeight=\(effectiveTreeHeight)")
+            }
 
             if isFullRescan {
                 // FIX #726: CRITICAL - Full Rescan must start from Sapling activation
@@ -436,7 +441,9 @@ final class FilterScanner {
                     self.cmuDataForPositionLookup = cmuData
                     self.cmuDataHeight = boostHeight
                     self.cmuDataCount = boostOutputCount
-                    print("📦 FIX #726: Loaded CMU data for PHASE 1 - \(boostOutputCount) CMUs up to height \(boostHeight)")
+                    if verbose {
+                        print("📦 FIX #726: Loaded CMU data for PHASE 1 - \(boostOutputCount) CMUs up to height \(boostHeight)")
+                    }
                 }
 
                 // Load block hashes if not already loaded
@@ -450,7 +457,9 @@ final class FilterScanner {
                 // without tree building. Without this, PHASE 1 is skipped and notes are lost!
                 if startHeight <= effectiveTreeHeight && hasDownloadedTree {
                     scanWithinDownloadedRange = true
-                    print("📋 FIX #178: Enabling PHASE 1 scan for consecutive startup (lastScanned=\(lastScanned), startHeight=\(startHeight), effectiveTreeHeight=\(effectiveTreeHeight))")
+                    if verbose {
+                        print("📋 FIX #178: Enabling PHASE 1 scan for consecutive startup (lastScanned=\(lastScanned), startHeight=\(startHeight), effectiveTreeHeight=\(effectiveTreeHeight))")
+                    }
                 }
             } else if isImportedWallet {
                 if let customHeight = customScanHeight, customHeight > ZclassicCheckpoints.saplingActivationHeight {
@@ -491,7 +500,9 @@ final class FilterScanner {
                 // 2. We just downloaded the tree from boost file (new wallet setup)
                 // If tree EXISTS in database, this is likely an existing wallet - NEED trial decryption
                 isNewWalletInitialSync = !treeExists && hasDownloadedTree
-                print("🔍 FIX #960: isNewWalletInitialSync=\(isNewWalletInitialSync) (treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree))")
+                if verbose {
+                    print("🔍 FIX #960: isNewWalletInitialSync=\(isNewWalletInitialSync) (treeExists=\(treeExists), hasDownloadedTree=\(hasDownloadedTree))")
+                }
             } else {
                 // No tree downloaded yet - must download first
                 startHeight = ZclassicCheckpoints.saplingActivationHeight
@@ -534,10 +545,12 @@ final class FilterScanner {
         // Load known nullifiers from database for spend detection
         knownNullifiers = try database.getAllNullifiers()
         // FIX #288: Debug - show loaded nullifiers
-        print("🔍 FIX #288: Loaded \(knownNullifiers.count) nullifiers from DB for spend detection")
-        for (idx, nf) in knownNullifiers.enumerated().prefix(5) {
-            let shortNf = nf.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("🔍 FIX #288: knownNullifier[\(idx)] = \(shortNf)...")
+        if verbose {
+            print("🔍 FIX #288: Loaded \(knownNullifiers.count) nullifiers from DB for spend detection")
+            for (idx, nf) in knownNullifiers.enumerated().prefix(5) {
+                let shortNf = nf.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("🔍 FIX #288: knownNullifier[\(idx)] = \(shortNf)...")
+            }
         }
 
         // NOTE: Existing witnesses are loaded AFTER tree is ready (see below)
@@ -756,12 +769,14 @@ final class FilterScanner {
         let phase1EndHeight = cmuDataHeight > 0 ? cmuDataHeight : effectiveTreeHeight
 
         // FIX #1097: Debug logging to understand why PHASE 1 might be skipped
-        print("🔍 FIX #1097: PHASE 1 check - scanWithinDownloadedRange=\(scanWithinDownloadedRange), startHeight=\(startHeight), phase1EndHeight=\(phase1EndHeight)")
-        print("🔍 FIX #1097: cmuDataHeight=\(cmuDataHeight), effectiveTreeHeight=\(effectiveTreeHeight), targetHeight=\(targetHeight)")
-        if !scanWithinDownloadedRange {
-            print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - scanWithinDownloadedRange is FALSE")
-        } else if startHeight > phase1EndHeight {
-            print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - startHeight (\(startHeight)) > phase1EndHeight (\(phase1EndHeight))")
+        if verbose {
+            print("🔍 FIX #1097: PHASE 1 check - scanWithinDownloadedRange=\(scanWithinDownloadedRange), startHeight=\(startHeight), phase1EndHeight=\(phase1EndHeight)")
+            print("🔍 FIX #1097: cmuDataHeight=\(cmuDataHeight), effectiveTreeHeight=\(effectiveTreeHeight), targetHeight=\(targetHeight)")
+            if !scanWithinDownloadedRange {
+                print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - scanWithinDownloadedRange is FALSE")
+            } else if startHeight > phase1EndHeight {
+                print("⚠️ FIX #1097: PHASE 1 will be SKIPPED - startHeight (\(startHeight)) > phase1EndHeight (\(phase1EndHeight))")
+            }
         }
 
         if scanWithinDownloadedRange && startHeight <= phase1EndHeight {
@@ -898,7 +913,9 @@ final class FilterScanner {
 
                     // FIX #294: Retry failed block fetches with exponential backoff
                     if !failedHeights.isEmpty && isScanning {
-                        print("⚠️ FIX #294: \(failedHeights.count) blocks failed, retrying...")
+                        if verbose {
+                            print("⚠️ FIX #294: \(failedHeights.count) blocks failed, retrying...")
+                        }
 
                         for attempt in 1...maxRetries {
                             guard isScanning && !failedHeights.isEmpty else { break }
@@ -929,7 +946,9 @@ final class FilterScanner {
                                 }
                                 ranges.append((start: rangeStart, count: Int(rangeEnd - rangeStart) + 1))
 
-                                print("🔄 FIX #1213: Retrying \(sortedFailed.count) failed heights in \(ranges.count) batches (was \(sortedFailed.count) individual requests)")
+                                if verbose {
+                                    print("🔄 FIX #1213: Retrying \(sortedFailed.count) failed heights in \(ranges.count) batches (was \(sortedFailed.count) individual requests)")
+                                }
 
                                 for range in ranges {
                                     do {
@@ -956,10 +975,14 @@ final class FilterScanner {
                             failedHeights = stillFailed
 
                             if failedHeights.isEmpty {
-                                print("✅ FIX #294: All blocks recovered on retry \(attempt)")
+                                if verbose {
+                                    print("✅ FIX #294: All blocks recovered on retry \(attempt)")
+                                }
                                 break
                             } else if attempt < maxRetries {
-                                print("⚠️ FIX #294: Retry \(attempt)/\(maxRetries) - \(failedHeights.count) blocks still failing")
+                                if verbose {
+                                    print("⚠️ FIX #294: Retry \(attempt)/\(maxRetries) - \(failedHeights.count) blocks still failing")
+                                }
                             }
                         }
 
@@ -1167,7 +1190,9 @@ final class FilterScanner {
                             baseHeight: baseHeight
                         )
                         phase1bNotesFound = knownNullifiers.count - notesBefore
-                        print("✅ FIX #1289 v3: Phase 1b trial decryption found \(phase1bNotesFound) notes in \(deltaOutputs.count) outputs")
+                        if verbose {
+                            print("✅ FIX #1289 v3: Phase 1b trial decryption found \(phase1bNotesFound) notes in \(deltaOutputs.count) outputs")
+                        }
                     }
                 }
 
@@ -1193,7 +1218,9 @@ final class FilterScanner {
                         }
                     }
                     if phase1bSpendsDetected > 0 {
-                        print("💸 FIX #1289 v3: Phase 1b detected \(phase1bSpendsDetected) spends from \(deltaNullifiers.count) nullifiers")
+                        if verbose {
+                            print("💸 FIX #1289 v3: Phase 1b detected \(phase1bSpendsDetected) spends from \(deltaNullifiers.count) nullifiers")
+                        }
                     }
                 }
 
@@ -1235,7 +1262,9 @@ final class FilterScanner {
                         }
                     }
 
-                    print("🌳 FIX #1289 v3: Appended \(cmusToAppend.count) delta CMUs (tree size: \(ZipherXFFI.treeSize()))")
+                    if verbose {
+                        print("🌳 FIX #1289 v3: Appended \(cmusToAppend.count) delta CMUs (tree size: \(ZipherXFFI.treeSize()))")
+                    }
 
                     // ── Step 4: Save witnesses with anchor validation ──
                     for (noteId, witnessIndex) in witnessIndices {
@@ -1255,7 +1284,9 @@ final class FilterScanner {
                         phase1bWitnessCount += 1
                     }
                     if phase1bWitnessCount > 0 {
-                        print("✅ FIX #1289 v3: Created \(phase1bWitnessCount) witnesses for delta-range notes")
+                        if verbose {
+                            print("✅ FIX #1289 v3: Created \(phase1bWitnessCount) witnesses for delta-range notes")
+                        }
                     }
                 }
 
@@ -1290,8 +1321,10 @@ final class FilterScanner {
         let continueAfterBundledRange = currentHeight <= targetHeight && currentHeight > phase1EndHeight
 
         // FIX #362: Log all conditions for debugging
-        print("🔍 FIX #362: PHASE 2 check - currentHeight=\(currentHeight), targetHeight=\(targetHeight), phase1EndHeight=\(phase1EndHeight)")
-        print("🔍 FIX #362: continueAfterBundledRange=\(continueAfterBundledRange), scanWithinDownloadedRange=\(scanWithinDownloadedRange)")
+        if verbose {
+            print("🔍 FIX #362: PHASE 2 check - currentHeight=\(currentHeight), targetHeight=\(targetHeight), phase1EndHeight=\(phase1EndHeight)")
+            print("🔍 FIX #362: continueAfterBundledRange=\(continueAfterBundledRange), scanWithinDownloadedRange=\(scanWithinDownloadedRange)")
+        }
 
         // Quick scan is ONLY safe when scanning WITHIN CMU data range where positions are known
         // If starting AFTER CMU data, we MUST use sequential mode for correct nullifier computation
@@ -1300,7 +1333,9 @@ final class FilterScanner {
         // If custom start is AFTER CMU data height, force sequential mode
         let forceSequentialAfterBundled = customStartHeight != nil && customStartHeight! > phase1EndHeight
 
-        print("🔍 FIX #362: isQuickScanOnly=\(isQuickScanOnly), forceSequentialAfterBundled=\(forceSequentialAfterBundled)")
+        if verbose {
+            print("🔍 FIX #362: isQuickScanOnly=\(isQuickScanOnly), forceSequentialAfterBundled=\(forceSequentialAfterBundled)")
+        }
 
         if continueAfterBundledRange || forceSequentialAfterBundled {
             print("⚡ PHASE 2: \(currentHeight) → \(targetHeight) (\(targetHeight - currentHeight + 1) blocks)")
@@ -1394,12 +1429,20 @@ final class FilterScanner {
             // FIX #413: Load bundled headers from boost file FIRST (instant vs P2P timeout!)
             // The boost file contains 2.4M+ pre-verified headers - loading them is instant
             // This avoids P2P sync timeout issues with block listeners consuming responses
-            print("📜 FIX #413: Loading bundled headers from boost file before PHASE 2...")
-            let (loadedBundledHeaders, boostHeaderEndHeight) = await WalletManager.shared.loadHeadersFromBoostFile()
-            if loadedBundledHeaders {
-                print("✅ FIX #413: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load!")
+            // FIX #1341: Skip on first import (headers not loaded yet = 207s block).
+            // PHASE 2 only needs P2P headers for delta range (2988798+), not boost headers.
+            let headerStoreHeight1341 = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if headerStoreHeight1341 > 2_900_000 {
+                // Headers already loaded (subsequent launch) — fast check
+                print("📜 FIX #413: Loading bundled headers from boost file before PHASE 2...")
+                let (loadedBundledHeaders, boostHeaderEndHeight) = await WalletManager.shared.loadHeadersFromBoostFile()
+                if loadedBundledHeaders {
+                    print("✅ FIX #413: Loaded bundled headers up to \(boostHeaderEndHeight) - instant header load!")
+                } else {
+                    print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
+                }
             } else {
-                print("⚠️ FIX #413: Could not load bundled headers, will use P2P sync")
+                print("⏭️ FIX #1341: Skipping boost header loading in PHASE 2 (deferred to background)")
             }
 
             // FIX #525: NEVER skip header sync during PHASE 2!
@@ -1451,7 +1494,9 @@ final class FilterScanner {
                 }
 
                 if stillListening != lastListeningCount {
-                    print("⏳ FIX #903: Still waiting for \(stillListening) block listeners to stop...")
+                    if verbose {
+                        print("⏳ FIX #903: Still waiting for \(stillListening) block listeners to stop...")
+                    }
                     lastListeningCount = stillListening
                 }
 
@@ -1489,7 +1534,9 @@ final class FilterScanner {
 
                 if headerStoreHeight >= targetHeight {
                     headersAvailable = true
-                    print("✅ FIX #406: Headers available up to \(headerStoreHeight) (target: \(targetHeight))")
+                    if verbose {
+                        print("✅ FIX #406: Headers available up to \(headerStoreHeight) (target: \(targetHeight))")
+                    }
                     break
                 }
 
@@ -1499,8 +1546,10 @@ final class FilterScanner {
                 let effectiveHeaderHeight: UInt64
                 if headerStoreHeight <= bundledEndHeight && bundledEndHeight > 0 {
                     effectiveHeaderHeight = bundledEndHeight
-                    print("📋 FIX #440: HeaderStore (\(headerStoreHeight)) <= bundled end (\(bundledEndHeight))")
-                    print("📋 FIX #440: Will sync headers from bundled end + 1 = \(bundledEndHeight + 1)")
+                    if verbose {
+                        print("📋 FIX #440: HeaderStore (\(headerStoreHeight)) <= bundled end (\(bundledEndHeight))")
+                        print("📋 FIX #440: Will sync headers from bundled end + 1 = \(bundledEndHeight + 1)")
+                    }
                 } else {
                     effectiveHeaderHeight = headerStoreHeight
                 }
@@ -1535,7 +1584,9 @@ final class FilterScanner {
                         try await headerSyncManager.syncHeaders(from: effectiveHeaderHeight + 1, maxHeaders: headersBehind)
                     }
                     let newHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
-                    print("✅ FIX #406: Header sync complete, now at height \(newHeaderHeight)")
+                    if verbose {
+                        print("✅ FIX #406: Header sync complete, now at height \(newHeaderHeight)")
+                    }
 
                     if newHeaderHeight >= targetHeight {
                         headersAvailable = true
@@ -1751,7 +1802,9 @@ final class FilterScanner {
                 let fetchProgress = Double(prefetchedBlocks.count) / Double(totalBlocksToFetch)
                 let fetchPercent = Int(fetchProgress * 100)
                 let batchCount = batchTasks.count
-                print("📥 FIX #897: Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches from height \(prefetchHeight)...")
+                if verbose {
+                    print("📥 FIX #897: Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) (\(fetchPercent)%) - \(batchCount) parallel batches from height \(prefetchHeight)...")
+                }
                 onStatusUpdate?("prefetch", "📥 Fetching \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks...")
                 reportPhase2Progress(fetchProgress * 0.5, height: prefetchHeight, maxHeight: targetHeight)
                 FilterScanner.updateScanProgress()  // FIX #1074: Update progress time during block prefetch
@@ -1773,7 +1826,9 @@ final class FilterScanner {
                                     try await self.fetchBlocksData(heights: task.heights, skipPreReconnect: true)
                                 }
                             } catch {
-                                print("⚠️ FIX #897: Batch \(task.start)-\(task.end) failed: \(error)")
+                                if self.verbose {
+                                    print("⚠️ FIX #897: Batch \(task.start)-\(task.end) failed: \(error)")
+                                }
                                 return nil
                             }
                         }
@@ -1806,7 +1861,9 @@ final class FilterScanner {
                 }
 
                 if !missingHeights.isEmpty {
-                    print("⚠️ FIX #897: \(missingHeights.count) blocks missing from batch, retrying...")
+                    if verbose {
+                        print("⚠️ FIX #897: \(missingHeights.count) blocks missing from batch, retrying...")
+                    }
 
                     // Retry missing blocks in smaller sequential batches
                     for retryAttempt in 1...maxRetries {
@@ -1816,7 +1873,9 @@ final class FilterScanner {
                         let stillMissing = missingHeights.filter { prefetchedBlocks[$0] == nil }
                         if stillMissing.isEmpty { break }
 
-                        print("🔄 FIX #897: Retry \(retryAttempt)/\(maxRetries) for \(stillMissing.count) blocks...")
+                        if verbose {
+                            print("🔄 FIX #897: Retry \(retryAttempt)/\(maxRetries) for \(stillMissing.count) blocks...")
+                        }
 
                         // FIX #1287: Retry in 384-block chunks (3 peers × 128) for multi-peer parallelism.
                         // Previous 50-block chunks used only 1 peer → 250 blocks/sec instead of 1000+.
@@ -1835,7 +1894,9 @@ final class FilterScanner {
                                     batchBlocksFetched += 1
                                 }
                             } catch {
-                                print("⚠️ FIX #897: Retry chunk \(chunkHeights.first ?? 0)-\(chunkHeights.last ?? 0) failed: \(error)")
+                                if verbose {
+                                    print("⚠️ FIX #897: Retry chunk \(chunkHeights.first ?? 0)-\(chunkHeights.last ?? 0) failed: \(error)")
+                                }
                             }
                         }
 
@@ -1848,16 +1909,22 @@ final class FilterScanner {
                     // Log final status for this batch
                     let finalMissing = missingHeights.filter { prefetchedBlocks[$0] == nil }
                     if !finalMissing.isEmpty {
-                        print("❌ FIX #897: \(finalMissing.count) blocks still missing after \(maxRetries) retries (heights: \(finalMissing.prefix(5).map { String($0) }.joined(separator: ", "))...)")
+                        if verbose {
+                            print("❌ FIX #897: \(finalMissing.count) blocks still missing after \(maxRetries) retries (heights: \(finalMissing.prefix(5).map { String($0) }.joined(separator: ", "))...)")
+                        }
                     } else {
-                        print("✅ FIX #897: All missing blocks recovered after retry")
+                        if verbose {
+                            print("✅ FIX #897: All missing blocks recovered after retry")
+                        }
                     }
                 }
 
                 // FIX #897: Track consecutive empty fetches to detect persistent network issues
                 if batchBlocksFetched == 0 {
                     consecutiveEmptyFetches += 1
-                    print("⚠️ FIX #897: Empty fetch round \(consecutiveEmptyFetches)/\(maxConsecutiveEmpty)")
+                    if verbose {
+                        print("⚠️ FIX #897: Empty fetch round \(consecutiveEmptyFetches)/\(maxConsecutiveEmpty)")
+                    }
                     if consecutiveEmptyFetches >= maxConsecutiveEmpty {
                         print("❌ FIX #897: \(maxConsecutiveEmpty) consecutive empty fetches - network may be down, aborting prefetch")
                         break
@@ -1871,7 +1938,9 @@ final class FilterScanner {
                 // Move to next set of parallel batches
                 prefetchHeight = batchEndHeight + 1
 
-                print("✅ FIX #897: Batch complete - \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks cached")
+                if verbose {
+                    print("✅ FIX #897: Batch complete - \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks cached")
+                }
             }
 
             let prefetchDuration = Date().timeIntervalSince(prefetchStartTime)
@@ -1888,8 +1957,10 @@ final class FilterScanner {
                     }
                 }
             }
-            print("✅ FIX #897: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
-            print("📊 FIX #789: Fetched \(totalOutputsFetched) shielded outputs across \(blocksWithOutputs) blocks")
+            if verbose {
+                print("✅ FIX #897: Pre-fetched \(prefetchedBlocks.count)/\(totalBlocksToFetch) blocks in \(String(format: "%.1f", prefetchDuration))s (\(String(format: "%.0f", fetchRate)) blocks/sec)")
+                print("📊 FIX #789: Fetched \(totalOutputsFetched) shielded outputs across \(blocksWithOutputs) blocks")
+            }
 
             // FIX #910: CRITICAL - Detect network failure and throw error to trigger retry
             // If we fetched less than 50% of needed blocks and network failed (consecutive empty),
@@ -1954,7 +2025,9 @@ final class FilterScanner {
                     // FIX #1203: Block not in cache — fetch failed, DO NOT treat as empty.
                     // Missing blocks could contain our transactions (outputs + nullifiers).
                     // Skip processing but do NOT advance lastScannedHeight past this gap.
-                    print("⚠️ FIX #1203: Block \(currentHeight) missing from cache — skipping (will re-scan)")
+                    if verbose {
+                        print("⚠️ FIX #1203: Block \(currentHeight) missing from cache — skipping (will re-scan)")
+                    }
                     currentHeight += 1
                     continue
                 }
@@ -1991,7 +2064,9 @@ final class FilterScanner {
                                 // FIX #786: Increment by number of outputs processed
                                 blockOutputIndex += UInt32(outputs.count)
                             } catch {
-                                print("⚠️ Error processing tx \(txid): \(error)")
+                                if verbose {
+                                    print("⚠️ Error processing tx \(txid): \(error)")
+                                }
                             }
                         }
                     }
@@ -2004,7 +2079,9 @@ final class FilterScanner {
                     if processedCount % prefetchBatchSize == 0 || processedCount == 1 {
                         let processProgress = Double(processedCount) / Double(totalBlocksToFetch)
                         let processPercent = Int(processProgress * 100)
-                        print("🔧 FIX #190: Processing blocks \(processedCount)/\(totalBlocksToFetch) (\(processPercent)%)...")
+                        if verbose {
+                            print("🔧 FIX #190: Processing blocks \(processedCount)/\(totalBlocksToFetch) (\(processPercent)%)...")
+                        }
                         onStatusUpdate?("phase2", "🔧 Processing \(processedCount)/\(totalBlocksToFetch) blocks...")
                         reportPhase2Progress(0.5 + processProgress * 0.5, height: height, maxHeight: targetHeight)
                     }
@@ -2029,7 +2106,9 @@ final class FilterScanner {
             // FIX #190: Log total processing time
             let processDuration = Date().timeIntervalSince(processStartTime)
             let processRate = Double(scannedBlocks) / max(processDuration, 0.001)
-            print("✅ FIX #190: Processed \(scannedBlocks) blocks in \(String(format: "%.1f", processDuration))s (\(String(format: "%.0f", processRate)) blocks/sec)")
+            if verbose {
+                print("✅ FIX #190: Processed \(scannedBlocks) blocks in \(String(format: "%.1f", processDuration))s (\(String(format: "%.0f", processRate)) blocks/sec)")
+            }
 
             // FIX #206 + FIX #1203: Save FINAL lastScannedHeight after PHASE 2 completes
             // FIX #1203: Use lastActuallyScannedHeight instead of targetHeight
@@ -2136,7 +2215,9 @@ final class FilterScanner {
         // DELTA BUNDLE: Save collected outputs for instant witness generation
         // FIX #558 v4: Debug logging
         // FIX #789: Enhanced logging for delta collection debugging
-        print("📦 FIX #789: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count), startHeight=\(deltaCollectionStartHeight)")
+        if verbose {
+            print("📦 FIX #789: Delta save check - enabled=\(deltaCollectionEnabled), collected=\(deltaOutputsCollected.count), startHeight=\(deltaCollectionStartHeight)")
+        }
         if deltaOutputsCollected.isEmpty && deltaCollectionEnabled {
             print("⚠️ FIX #789: WARNING - Delta collection was enabled but NO outputs collected!")
             print("⚠️ FIX #789: This could mean P2P fetch failed or blocks had no shielded outputs")
@@ -2165,13 +2246,17 @@ final class FilterScanner {
                         toHeight: lastScanned,
                         treeRoot: treeRoot
                     )
-                    print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
+                    if verbose {
+                        print("📦 DeltaCMU: Saved \(deltaOutputsCollected.count) outputs to delta bundle (height \(deltaCollectionStartHeight)-\(lastScanned))")
+                    }
 
                     // FIX #1289 v3: Save collected nullifiers alongside delta outputs
                     // These enable Phase 1b to detect spends locally during Full Rescan
                     if !deltaNullifiersCollected.isEmpty {
                         DeltaCMUManager.shared.appendNullifiers(deltaNullifiersCollected)
-                        print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers with delta bundle")
+                        if verbose {
+                            print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers with delta bundle")
+                        }
                         deltaNullifiersCollected.removeAll()
                     }
 
@@ -2211,13 +2296,17 @@ final class FilterScanner {
                         toHeight: lastScanned,
                         treeRoot: treeRoot
                     )
-                    print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+                    if verbose {
+                        print("📦 DeltaCMU: Updated manifest to height \(deltaCollectionStartHeight)-\(lastScanned) (no new outputs)")
+                    }
 
                     // FIX #1289 v3: Save nullifiers even when no outputs collected
                     // Blocks can have spends (nullifiers) without outputs to our wallet
                     if !deltaNullifiersCollected.isEmpty {
                         DeltaCMUManager.shared.appendNullifiers(deltaNullifiersCollected)
-                        print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers (no-output path)")
+                        if verbose {
+                            print("📦 FIX #1289 v3: Saved \(deltaNullifiersCollected.count) nullifiers (no-output path)")
+                        }
                         deltaNullifiersCollected.removeAll()
                     }
                 }
@@ -2346,8 +2435,21 @@ final class FilterScanner {
         // The 79K-block re-verification is redundant and blocks UI transition for 5-10 minutes.
         // WalletManager.repairDatabase() does its own FIX #1098 balance verification after scan.
         let isFullRescanActive = await WalletManager.shared.isRepairingDatabase
+        // FIX #1340 + FIX #1345: Skip nullifier verification during entire initial sync session.
+        // On first import: PHASE 1 found notes via trial decryption, PHASE 2 scanned all post-boost
+        // blocks for spends. Nullifiers are guaranteed correct. The redundant 86K-block P2P scan
+        // (from oldest note height to chain tip) wastes 10+ minutes on iOS.
+        // FIX #1345: Changed from one-shot UserDefaults flag to session-scoped check.
+        // Bug: FIX #1340 set FIX1340_FirstScanComplete=true after first PHASE 2 pass, then
+        // catch-up PHASE 2 (4 new blocks) saw isFirstImport=false → triggered full 86K scan anyway.
+        // Fix: Use backgroundProcessesEnabled (false during entire initial sync, true only after).
+        let isInitialSyncSession = await !NetworkManager.shared.backgroundProcessesEnabled
         if isFullRescanActive {
             print("⏭️ FIX #1296: Skipping FIX #945 post-scan verification during Full Rescan (redundant — all blocks already scanned)")
+        } else if isInitialSyncSession {
+            print("⏭️ FIX #1345: Skipping FIX #945 verification during initial sync — PHASE 2 already verified all blocks")
+            // Set FIX #1089 checkpoint so future startups don't trigger the full 86K scan either
+            UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
         } else {
             print("🔍 FIX #945: Running post-scan spend verification...")
             do {
@@ -2608,7 +2710,9 @@ final class FilterScanner {
         // Do NOT use legacy CMU file - it might be cached from old boost file!
         do {
             let serializedTree = try await CommitmentTreeUpdater.shared.extractSerializedTree()
-            print("🔧 FIX #524: Extracted serialized tree from boost file: \(serializedTree.count) bytes")
+            if verbose {
+                print("🔧 FIX #524: Extracted serialized tree from boost file: \(serializedTree.count) bytes")
+            }
 
             // Reset FFI tree
             _ = ZipherXFFI.treeInit()
@@ -2621,12 +2725,16 @@ final class FilterScanner {
                 // FIX #744: Diagnostic - check tree root immediately after deserialize
                 if let boostTreeRoot = ZipherXFFI.treeRoot() {
                     let rootHex = boostTreeRoot.map { String(format: "%02x", $0) }.joined()
-                    print("🔍 FIX #744: Tree root AFTER deserialize (before delta): \(rootHex.prefix(32))...")
+                    if verbose {
+                        print("🔍 FIX #744: Tree root AFTER deserialize (before delta): \(rootHex.prefix(32))...")
+                    }
 
                     // Check against expected boost file root
                     if let header = try? HeaderStore.shared.getHeader(at: effectiveHeight) {
                         let headerRootHex = header.hashFinalSaplingRoot.map { String(format: "%02x", $0) }.joined()
-                        print("🔍 FIX #744: Expected header root at \(effectiveHeight): \(headerRootHex.prefix(32))...")
+                        if verbose {
+                            print("🔍 FIX #744: Expected header root at \(effectiveHeight): \(headerRootHex.prefix(32))...")
+                        }
                         if boostTreeRoot == header.hashFinalSaplingRoot {
                             print("✅ FIX #744: Boost tree root MATCHES header at \(effectiveHeight)!")
                         } else {
@@ -2638,8 +2746,10 @@ final class FilterScanner {
                 // Step 3: If we scanned beyond boost file, append delta CMUs
                 if lastScannedHeight > effectiveHeight {
                     let blockRange = lastScannedHeight - effectiveHeight
-                    print("🔧 FIX #524: Appending delta CMUs from height \(effectiveHeight + 1) to \(lastScannedHeight)...")
-                    print("🔧 FIX #765: Block range spans \(blockRange) blocks - checking for missing CMUs...")
+                    if verbose {
+                        print("🔧 FIX #524: Appending delta CMUs from height \(effectiveHeight + 1) to \(lastScannedHeight)...")
+                        print("🔧 FIX #765: Block range spans \(blockRange) blocks - checking for missing CMUs...")
+                    }
 
                     // FIX #739 v4: Get delta CMUs from Rust memory (DELTA_CMUS array)
                     // This contains ALL CMUs appended via treeAppend() during this session,
@@ -2654,16 +2764,22 @@ final class FilterScanner {
                     )
                     let fileCount = fileDeltaCMUs?.count ?? 0
 
-                    print("🔧 FIX #524 v4: Delta CMUs - memory: \(memoryCount), file: \(fileCount)")
+                    if verbose {
+                        print("🔧 FIX #524 v4: Delta CMUs - memory: \(memoryCount), file: \(fileCount)")
+                    }
 
                     // Use whichever source has more CMUs (memory is usually more complete)
                     let deltaCMUs: [Data]
                     if memoryCount >= fileCount && memoryCount > 0 {
                         deltaCMUs = memoryDeltaCMUs
-                        print("🔧 FIX #524 v4: Using memory delta CMUs (\(memoryCount))")
+                        if verbose {
+                            print("🔧 FIX #524 v4: Using memory delta CMUs (\(memoryCount))")
+                        }
                     } else if let fileCMUs = fileDeltaCMUs, !fileCMUs.isEmpty {
                         deltaCMUs = fileCMUs
-                        print("🔧 FIX #524 v4: Using file delta CMUs (\(fileCount))")
+                        if verbose {
+                            print("🔧 FIX #524 v4: Using file delta CMUs (\(fileCount))")
+                        }
                     } else {
                         deltaCMUs = []
                     }
@@ -2676,7 +2792,9 @@ final class FilterScanner {
                                 appendedCount += 1
                             }
                         }
-                        print("🔧 FIX #524: Appended \(appendedCount) delta CMUs")
+                        if verbose {
+                            print("🔧 FIX #524: Appended \(appendedCount) delta CMUs")
+                        }
                     } else {
                         print("⚠️ FIX #524: No delta CMUs found for range \(effectiveHeight + 1)-\(lastScannedHeight)")
                     }
@@ -2685,8 +2803,10 @@ final class FilterScanner {
                 // Step 4: Verify tree root now matches
                 if let newTreeRoot = ZipherXFFI.treeRoot() {
                     let treeSize = ZipherXFFI.treeSize()
-                    print("🔧 FIX #524: New tree root: \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                    print("🔧 FIX #524: New tree size: \(treeSize) CMUs")
+                    if verbose {
+                        print("🔧 FIX #524: New tree root: \(newTreeRoot.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        print("🔧 FIX #524: New tree size: \(treeSize) CMUs")
+                    }
 
                     // Try to validate against last scanned height
                     if let header = try? HeaderStore.shared.getHeader(at: lastScannedHeight) {
@@ -2710,12 +2830,16 @@ final class FilterScanner {
                                 }
                             }
 
-                            print("🔧 FIX #739: Processing \(validNotes.count) notes using GLOBAL tree...")
+                            if verbose {
+                                print("🔧 FIX #739: Processing \(validNotes.count) notes using GLOBAL tree...")
+                            }
 
                             // Get the global tree's correct root for verification
                             let globalTreeRoot = ZipherXFFI.treeRoot()
                             if let root = globalTreeRoot {
-                                print("🔧 FIX #739: Global tree root (correct): \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                if verbose {
+                                    print("🔧 FIX #739: Global tree root (correct): \(root.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                                }
                             }
 
                             // FIX #1282: After FIX #524 tree repair, create FRESH witnesses from the repaired tree.
@@ -2772,7 +2896,9 @@ final class FilterScanner {
                                     var packedCMUs = Data()
                                     for cmu in deltaCMUs { packedCMUs.append(cmu) }
                                     let updatedCount = ZipherXFFI.updateAllWitnessesBatch(cmus: packedCMUs, count: deltaCMUs.count)
-                                    print("🔧 FIX #1282 fallback: Updated \(updatedCount) witnesses with ALL \(deltaCMUs.count) delta CMUs")
+                                    if verbose {
+                                        print("🔧 FIX #1282 fallback: Updated \(updatedCount) witnesses with ALL \(deltaCMUs.count) delta CMUs")
+                                    }
                                 }
 
                                 for (ffiIndex, noteId) in loadedNotes {
@@ -2846,8 +2972,10 @@ final class FilterScanner {
                             globalAttempts += 1  // FIX #782
                             UserDefaults.standard.set(repairAttempts, forKey: deltaRepairKey)
                             UserDefaults.standard.set(globalAttempts, forKey: globalRepairKey)  // FIX #782
-                            print("🔧 FIX #779: Delta repair attempt \(repairAttempts)/\(maxRepairAttempts) this session")
-                            print("🔧 FIX #782: Global repair attempt \(globalAttempts)/\(maxGlobalAttempts) total")
+                            if verbose {
+                                print("🔧 FIX #779: Delta repair attempt \(repairAttempts)/\(maxRepairAttempts) this session")
+                                print("🔧 FIX #782: Global repair attempt \(globalAttempts)/\(maxGlobalAttempts) total")
+                            }
 
                             // FIX #1219: Distinguish INCOMPLETE delta from CORRUPT delta.
                             // Previous bug: always cleared delta on mismatch, even when the delta
@@ -3234,7 +3362,9 @@ final class FilterScanner {
                     // We must reverse tx.txHash to match the display format for comparison
                     let txidDisplayFormat = tx.txHash.reversed().map { String(format: "%02x", $0) }.joined()
                     if await NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
-                        print("📤 FIX #859: Our pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        if verbose {
+                            print("📤 FIX #859: Our pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        }
                         // FIX #1264: Pass actual block height for accurate DB recording
                         await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                     }
@@ -3319,7 +3449,9 @@ final class FilterScanner {
             let txidData = Data(hexString: txid)
             for spend in spends {
                 guard let nullifierDisplay = Data(hexString: spend.nullifier) else {
-                    print("⚠️ FIX #288: Failed to parse nullifier hex")
+                    if verbose {
+                        print("⚠️ FIX #288: Failed to parse nullifier hex")
+                    }
                     continue
                 }
                 let nullifierWire = nullifierDisplay.reversedBytes()
@@ -3367,7 +3499,9 @@ final class FilterScanner {
 
                 if nullifierMatched {
                     let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    print("💸 FIX #1079: MATCH! Nullifier \(shortNf)... found (\(matchFormat)) - marking note as spent")
+                    if verbose {
+                        print("💸 FIX #1079: MATCH! Nullifier \(shortNf)... found (\(matchFormat)) - marking note as spent")
+                    }
 
                     // FIX #1031: Get note value BEFORE marking spent!
                     // Bug: getNoteByNullifier has "AND is_spent = 0" filter
@@ -3395,7 +3529,9 @@ final class FilterScanner {
                         txidDisplayFormat = txid  // Fallback if parsing fails
                     }
                     if NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
-                        print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        if verbose {
+                            print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        }
                         Task {
                             await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                         }
@@ -3411,9 +3547,11 @@ final class FilterScanner {
                             if !alreadyRecorded {
                                 // FIX #1031: Use the note info we got BEFORE marking spent
                                 if let spentNote = spentNoteInfo {
-                                    print("💸 FIX #843: External/restart spend detected")
-                                    print("   TX: \(txid.prefix(16))... at height \(height)")
-                                    print("   Note value: \(spentNote.value) zatoshis")
+                                    if verbose {
+                                        print("💸 FIX #843: External/restart spend detected")
+                                        print("   TX: \(txid.prefix(16))... at height \(height)")
+                                        print("   Note value: \(spentNote.value) zatoshis")
+                                    }
                                     // Track this TX for reconciliation when we find the change output
                                     externalSpendTxids.insert(txid)
                                     externalSpendNoteValue = spentNote.value
@@ -3464,7 +3602,9 @@ final class FilterScanner {
 
                 // FIX #789: Log delta collection progress every 100 outputs
                 if deltaOutputsCollected.count % 100 == 1 || deltaOutputsCollected.count == 1 {
-                    print("📦 FIX #789: Collecting delta output \(deltaOutputsCollected.count) at height \(height)")
+                    if verbose {
+                        print("📦 FIX #789: Collecting delta output \(deltaOutputsCollected.count) at height \(height)")
+                    }
                 }
             } else if height > ZipherXConstants.bundledTreeHeight {
                 // FIX #874: Collect outputs even when delta is "disabled" (manifest says it covers range)
@@ -3489,7 +3629,9 @@ final class FilterScanner {
                 treePosition = UInt64(expectedTreeSize)
                 // Log once per block to avoid spam
                 if outputIndex == 0 {
-                    print("⏭️ FIX #1312: Skipping treeAppend at height \(height) - delta sync already covered this range")
+                    if verbose {
+                        print("⏭️ FIX #1312: Skipping treeAppend at height \(height) - delta sync already covered this range")
+                    }
                 }
             } else if currentTreeSize > expectedTreeSize {
                 // FIX #1007: Tree is already larger than expected - Step 2a already appended this CMU
@@ -3497,7 +3639,9 @@ final class FilterScanner {
                 treePosition = UInt64(expectedTreeSize)
                 // Log once per block to avoid spam
                 if outputIndex == 0 {
-                    print("⏭️ FIX #1007: Skipping treeAppend at height \(height) - CMU already in tree (size \(currentTreeSize) > expected \(expectedTreeSize))")
+                    if verbose {
+                        print("⏭️ FIX #1007: Skipping treeAppend at height \(height) - CMU already in tree (size \(currentTreeSize) > expected \(expectedTreeSize))")
+                    }
                 }
             } else {
                 // Tree at expected size - append normally
@@ -3512,7 +3656,9 @@ final class FilterScanner {
             if isNewWalletInitialSync {
                 // FIX #960: Log when skipping to help debug note detection issues
                 if outputIndex == 0 {
-                    print("⏭️ FIX #960: Skipping trial decryption (isNewWalletInitialSync=true) at height \(height)")
+                    if verbose {
+                        print("⏭️ FIX #960: Skipping trial decryption (isNewWalletInitialSync=true) at height \(height)")
+                    }
                 }
                 _ = treePosition  // Silence unused variable warning
                 continue  // Skip decryption, just append CMUs to tree
@@ -3556,13 +3702,15 @@ final class FilterScanner {
             )
 
             // FIX #953: DEBUG - Log nullifier details when adding to knownNullifiers
-            let nfShort = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("🔑 FIX #953: Adding nullifier to knownNullifiers at height \(height)")
-            print("   Position: \(treePosition), Value: \(value) zatoshis")
-            print("   Nullifier (wire): \(nfShort)...")
             let hashedNf = database.hashNullifier(nullifier)
-            let hashedNfShort = hashedNf.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("   Hashed nullifier: \(hashedNfShort)...")
+            if verbose {
+                let nfShort = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("🔑 FIX #953: Adding nullifier to knownNullifiers at height \(height)")
+                print("   Position: \(treePosition), Value: \(value) zatoshis")
+                print("   Nullifier (wire): \(nfShort)...")
+                let hashedNfShort = hashedNf.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("   Hashed nullifier: \(hashedNfShort)...")
+            }
 
             // FIX #367: Insert HASHED nullifier to match getAllNullifiers() and DB storage
             knownNullifiers.insert(hashedNf)
@@ -3589,21 +3737,27 @@ final class FilterScanner {
                     cmuToStore = cmu
                 } else if computedCMU == cmuReversed {
                     // Byte order mismatch - use computed CMU (transaction building format)
-                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
-                    print("   Blockchain CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-                    print("   Computed CMU:   \(computedCMU.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    if verbose {
+                        print("⚠️ FIX #1138: CMU byte order mismatch at height \(height) - using computed CMU")
+                        print("   Blockchain CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                        print("   Computed CMU:   \(computedCMU.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                    }
                     cmuToStore = computedCMU
                 } else {
                     // Complete mismatch - use computed CMU for safety
-                    print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
-                    print("   Blockchain CMU: \(cmu.map { String(format: "%02x", $0) }.joined())")
-                    print("   Reversed:       \(cmuReversed.map { String(format: "%02x", $0) }.joined())")
-                    print("   Computed CMU:   \(computedCMU.map { String(format: "%02x", $0) }.joined())")
+                    if verbose {
+                        print("❌ FIX #1138: CMU MISMATCH at height \(height)!")
+                        print("   Blockchain CMU: \(cmu.map { String(format: "%02x", $0) }.joined())")
+                        print("   Reversed:       \(cmuReversed.map { String(format: "%02x", $0) }.joined())")
+                        print("   Computed CMU:   \(computedCMU.map { String(format: "%02x", $0) }.joined())")
+                    }
                     cmuToStore = computedCMU
                 }
             } else {
                 // Failed to compute CMU - fallback to blockchain CMU
-                print("⚠️ FIX #1138: Could not compute CMU at height \(height) - using blockchain CMU")
+                if verbose {
+                    print("⚠️ FIX #1138: Could not compute CMU at height \(height) - using blockchain CMU")
+                }
                 cmuToStore = cmu
             }
 
@@ -3661,11 +3815,13 @@ final class FilterScanner {
                 let sentAmount = externalSpendNoteValue > (changeValue + fee) ?
                     externalSpendNoteValue - changeValue - fee : 0
 
-                print("💸 FIX #843: Recording external spend as SENT transaction")
-                print("   Input note: \(externalSpendNoteValue) zatoshis")
-                print("   Change output: \(changeValue) zatoshis")
-                print("   Sent amount: \(sentAmount) zatoshis")
-                print("   Fee: \(fee) zatoshis")
+                if verbose {
+                    print("💸 FIX #843: Recording external spend as SENT transaction")
+                    print("   Input note: \(externalSpendNoteValue) zatoshis")
+                    print("   Change output: \(changeValue) zatoshis")
+                    print("   Sent amount: \(sentAmount) zatoshis")
+                    print("   Fee: \(fee) zatoshis")
+                }
 
                 _ = try database.recordSentTransactionAtomic(
                     hashedNullifier: Data(),  // We don't have it here, note already marked spent
@@ -3703,6 +3859,19 @@ final class FilterScanner {
                     value: value,
                     memo: memoText
                 )
+
+                // FIX #1332: Notify UI when incoming TX discovered in a block.
+                // Without this: mempool detection can miss short-lived TXs (mined within 1 scan interval).
+                // Note is saved to DB but UI never refreshes TX history and no notification is sent.
+                // Bug: user sent from sim→macOS, TX mined before mempool scan, macOS showed no notification.
+                let blockValue = value
+                let blockTxid = txid
+                NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                print("📜 FIX #1332: Posted transactionHistoryUpdated after incoming note discovered in block \(height)")
+
+                // Send system notification so user sees incoming TX even if app is in background
+                NotificationManager.shared.notifyReceived(amount: blockValue, txid: blockTxid)
+                print("🔔 FIX #1332: System notification sent for incoming \(blockValue) zatoshis in block \(height)")
             }
 
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
@@ -3716,10 +3885,12 @@ final class FilterScanner {
                     let fee: UInt64 = 10000
                     let sentAmount = externalSpendNoteValue > fee ? externalSpendNoteValue - fee : 0
 
-                    print("💸 FIX #843: Recording external spend (no change) as SENT transaction")
-                    print("   TX: \(externalTxid.prefix(16))...")
-                    print("   Input note: \(externalSpendNoteValue) zatoshis")
-                    print("   Sent amount: \(sentAmount) zatoshis (no change output)")
+                    if verbose {
+                        print("💸 FIX #843: Recording external spend (no change) as SENT transaction")
+                        print("   TX: \(externalTxid.prefix(16))...")
+                        print("   Input note: \(externalSpendNoteValue) zatoshis")
+                        print("   Sent amount: \(sentAmount) zatoshis (no change output)")
+                    }
 
                     _ = try database.recordSentTransactionAtomic(
                         hashedNullifier: Data(),
@@ -3766,7 +3937,9 @@ final class FilterScanner {
         // Skip if new wallet (no notes to find)
         // FIX #960: Only skip for truly new wallets (see line 369)
         guard !isNewWalletInitialSync else {
-            print("⏭️ FIX #960: Skipping batch parallel processing (isNewWalletInitialSync=true)")
+            if verbose {
+                print("⏭️ FIX #960: Skipping batch parallel processing (isNewWalletInitialSync=true)")
+            }
             return
         }
 
@@ -3885,10 +4058,14 @@ final class FilterScanner {
                 if computedCMU == cmu {
                     cmuToStore = cmu
                 } else if computedCMU == cmuReversed {
-                    print("⚠️ FIX #1138: CMU byte order mismatch at height \(info.height) - using computed CMU")
+                    if verbose {
+                        print("⚠️ FIX #1138: CMU byte order mismatch at height \(info.height) - using computed CMU")
+                    }
                     cmuToStore = computedCMU
                 } else {
-                    print("❌ FIX #1138: CMU MISMATCH at height \(info.height)!")
+                    if verbose {
+                        print("❌ FIX #1138: CMU MISMATCH at height \(info.height)!")
+                    }
                     cmuToStore = computedCMU
                 }
             } else {
@@ -4202,7 +4379,9 @@ final class FilterScanner {
                         txidDisplayFormat = txid  // Fallback
                     }
                     if NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat) {
-                        print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        if verbose {
+                            print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                        }
                         Task {
                             await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                         }
@@ -4228,7 +4407,9 @@ final class FilterScanner {
             // No notes can exist for a brand new address that was just created
             // FIX #960: Only skip for truly new wallets (see line 369)
             if isNewWalletInitialSync {
-                print("⏭️ FIX #960: Skipping trial decryption in boost path (isNewWalletInitialSync=true)")
+                if verbose {
+                    print("⏭️ FIX #960: Skipping trial decryption in boost path (isNewWalletInitialSync=true)")
+                }
                 continue  // Skip decryption entirely
             }
 
@@ -4383,7 +4564,9 @@ final class FilterScanner {
             guard let cmuDisplay = Data(hexString: output.cmu),
                   let epkDisplay = Data(hexString: output.ephemeralKey),
                   let encCiphertext = Data(hexString: output.encCiphertext) else {
-                print("⚠️ Failed to parse output \(index) hex data")
+                if verbose {
+                    print("⚠️ Failed to parse output \(index) hex data")
+                }
                 continue
             }
 
@@ -4394,7 +4577,9 @@ final class FilterScanner {
             // Append CMU to commitment tree (must be done for ALL outputs, not just ours)
             let treePosition = ZipherXFFI.treeAppend(cmu: cmu)
             if treePosition == UInt64.max {
-                print("⚠️ Failed to append CMU to tree at height \(height)")
+                if verbose {
+                    print("⚠️ Failed to append CMU to tree at height \(height)")
+                }
             }
 
             // Try to decrypt with spending key (uses zcash_primitives internally for IVK derivation)
@@ -4680,7 +4865,9 @@ final class FilterScanner {
             }
 
             if attempt < maxRetries {
-                print("⏳ [FIX #228] Waiting for peers: \(connectedPeers)/\(minPeersForConsensus) (attempt \(attempt)/\(maxRetries))")
+                if verbose {
+                    print("⏳ [FIX #228] Waiting for peers: \(connectedPeers)/\(minPeersForConsensus) (attempt \(attempt)/\(maxRetries))")
+                }
                 try await Task.sleep(nanoseconds: retryDelay)
 
                 // Try to connect to more peers
@@ -4852,14 +5039,18 @@ final class FilterScanner {
                 return
             }
 
-            print("🔧 PHASE 1.5: \(notesNeedingWitness.count) witnesses to compute")
+            if verbose {
+                print("🔧 PHASE 1.5: \(notesNeedingWitness.count) witnesses to compute")
+            }
             reportPhase15Progress(0.05, current: 0, total: notesNeedingWitness.count)
 
             // FIX #1109: Clear WITNESSES array before creating new witnesses
             // Without this, witnesses accumulate across rebuild cycles
             let clearedCount = ZipherXFFI.witnessesClear()
             if clearedCount > 0 {
-                print("🧹 FIX #1109: Cleared \(clearedCount) stale witnesses from FFI array")
+                if verbose {
+                    print("🧹 FIX #1109: Cleared \(clearedCount) stale witnesses from FFI array")
+                }
             }
 
             for (index, note) in notesNeedingWitness.enumerated() {
@@ -4929,7 +5120,9 @@ final class FilterScanner {
                 return
             }
 
-            print("🔧 FIX #197 PHASE 1.5: Computing \(targetCMUs.count) witnesses (combined load+witness)")
+            if verbose {
+                print("🔧 FIX #197 PHASE 1.5: Computing \(targetCMUs.count) witnesses (combined load+witness)")
+            }
             onStatusUpdate?("phase1.5", "Loading tree + \(targetCMUs.count) witnesses...")
             reportPhase15Progress(0.05, current: 0, total: 1)
             let startTime = Date()
@@ -4996,7 +5189,9 @@ final class FilterScanner {
             }
 
             reportPhase15Progress(1.0, current: successCount, total: targetCMUs.count)
-            print("✅ FIX #197 PHASE 1.5: \(successCount)/\(targetCMUs.count) witnesses in \(String(format: "%.1f", elapsed))s (3-4x faster!)")
+            if verbose {
+                print("✅ FIX #197 PHASE 1.5: \(successCount)/\(targetCMUs.count) witnesses in \(String(format: "%.1f", elapsed))s (3-4x faster!)")
+            }
 
             // FIX #469: If witness creation failed completely, invalidate CMU cache and retry
             // This handles the case where cached CMU file doesn't match database notes

@@ -7773,6 +7773,66 @@ pub extern "C" fn zipherx_zstd_decompress(
     1
 }
 
+/// FIX #1338: Streaming file-to-file ZSTD decompression
+/// Decompresses directly from source file to destination file without loading into memory.
+/// Peak memory: ~512KB (zstd internal buffers + I/O buffers) vs ~6.2GB for in-memory approach.
+///
+/// Returns: 0 = success, 1 = invalid input, 2 = source file error, 3 = dest file error, 4 = decompress error
+#[no_mangle]
+pub extern "C" fn zipherx_zstd_decompress_file(
+    source_path_ptr: *const u8,
+    source_path_len: usize,
+    dest_path_ptr: *const u8,
+    dest_path_len: usize,
+) -> i32 {
+    use std::io::BufReader;
+    use std::io::BufWriter;
+
+    // Parse source path
+    let source_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(source_path_ptr, source_path_len)) } {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    // Parse dest path
+    let dest_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(dest_path_ptr, dest_path_len)) } {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    // Open source file with buffered reader
+    let source_file = match std::fs::File::open(source_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("FIX #1338: Failed to open source: {}", e);
+            return 2;
+        }
+    };
+    let reader = BufReader::with_capacity(256 * 1024, source_file);
+
+    // Create dest file with buffered writer
+    let dest_file = match std::fs::File::create(dest_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("FIX #1338: Failed to create dest: {}", e);
+            return 3;
+        }
+    };
+    let writer = BufWriter::with_capacity(256 * 1024, dest_file);
+
+    // Stream decompress: reads chunks from source, decompresses, writes to dest
+    match zstd::stream::copy_decode(reader, writer) {
+        Ok(_) => {
+            eprintln!("✅ FIX #1338: Streaming ZSTD decompress complete");
+            0
+        }
+        Err(e) => {
+            eprintln!("FIX #1338: Decompress failed: {}", e);
+            4
+        }
+    }
+}
+
 /// FIX #577: Verify that stored CMU matches computed CMU from note components
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_verify_note_cmu(
