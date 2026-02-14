@@ -5181,6 +5181,14 @@ public final class NetworkManager: ObservableObject {
             print("📡 Starting broadcast, connected: \(isConnected), peers: \(peers.count)")
         }
 
+        // FIX #1357: Ensure block listeners/dispatchers are active BEFORE broadcast.
+        // If dispatchers are inactive, requestTransaction falls back to direct TCP reads
+        // which are vulnerable to stream desync after broadcast (dirty bytes from inv/tx echo).
+        // With dispatchers active, all reads go through the clean dispatcher path.
+        // Must start BEFORE isBroadcasting=true (which blocks startBlockListenersOnMainScreen).
+        await startBlockListenersOnMainScreen()
+        try? await Task.sleep(nanoseconds: 300_000_000) // 300ms for dispatchers to activate
+
         // FIX #841: Block background sync during broadcast to prevent peer lock conflicts
         // Background sync triggers header sync which holds peer locks, causing broadcast timeouts
         isBroadcasting = true
@@ -5772,25 +5780,6 @@ public final class NetworkManager: ObservableObject {
                 // VUL-002: Verify TX propagation via P2P peers instead of centralized API
                 // If multiple peers accepted without reject message, TX is considered valid
                 // ============================================================================
-
-                // FIX #1357: Start block listeners/dispatchers BEFORE mempool verification.
-                // After direct-path broadcast, TCP streams may contain leftover data
-                // (inv/tx echo responses) that cause "Invalid magic bytes" on next read.
-                // Starting dispatchers lets them consume dirty data from the broadcast,
-                // so requestTransaction uses the clean dispatcher path instead of direct reads.
-                // FIX #1357: Force-reconnect broadcast peers before mempool verification.
-                // After direct-path broadcast, TCP streams contain leftover data
-                // (inv/tx echo responses) that cause "Invalid magic bytes" on next read.
-                // Disconnecting and reconnecting gives clean TCP sockets for verification.
-                let broadcastPeers: [Peer] = await MainActor.run { Array(self.peers.filter { $0.isConnectionReady }.prefix(3)) }
-                for peer in broadcastPeers {
-                    peer.disconnect()
-                }
-                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms for disconnect
-                for peer in broadcastPeers {
-                    try? await peer.ensureConnected()
-                }
-                try? await Task.sleep(nanoseconds: 300_000_000) // 300ms for connections to stabilize
 
                 onProgress?("verify", "Verifying P2P propagation...", 0.6)
 
