@@ -5779,9 +5779,8 @@ public final class NetworkManager: ObservableObject {
                 // Starting dispatchers lets them consume dirty data from the broadcast,
                 // so requestTransaction uses the clean dispatcher path instead of direct reads.
                 var anyDispatcherActive = false
-                let readyPeers = self.peers.filter({ $0.isConnectionReady })
-                for peer in readyPeers {
-                    if await peer.isDispatcherActive {
+                for peer in self.peers {
+                    if peer.isConnectionReady, await peer.isDispatcherActive {
                         anyDispatcherActive = true
                         break
                     }
