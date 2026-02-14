@@ -5778,18 +5778,19 @@ public final class NetworkManager: ObservableObject {
                 // (inv/tx echo responses) that cause "Invalid magic bytes" on next read.
                 // Starting dispatchers lets them consume dirty data from the broadcast,
                 // so requestTransaction uses the clean dispatcher path instead of direct reads.
-                var anyDispatcherActive = false
-                for peer in self.peers {
-                    if peer.isConnectionReady, await peer.isDispatcherActive {
-                        anyDispatcherActive = true
-                        break
-                    }
+                // FIX #1357: Force-reconnect broadcast peers before mempool verification.
+                // After direct-path broadcast, TCP streams contain leftover data
+                // (inv/tx echo responses) that cause "Invalid magic bytes" on next read.
+                // Disconnecting and reconnecting gives clean TCP sockets for verification.
+                let broadcastPeers: [Peer] = await MainActor.run { Array(self.peers.filter { $0.isConnectionReady }.prefix(3)) }
+                for peer in broadcastPeers {
+                    peer.disconnect()
                 }
-                if !anyDispatcherActive {
-                    print("📡 FIX #1357: No active dispatchers after broadcast — starting block listeners for clean mempool verification")
-                    await self.startBlockListenersOnMainScreen()
-                    try? await Task.sleep(nanoseconds: 300_000_000) // 300ms for dispatchers to activate
+                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms for disconnect
+                for peer in broadcastPeers {
+                    try? await peer.ensureConnected()
                 }
+                try? await Task.sleep(nanoseconds: 300_000_000) // 300ms for connections to stabilize
 
                 onProgress?("verify", "Verifying P2P propagation...", 0.6)
 
