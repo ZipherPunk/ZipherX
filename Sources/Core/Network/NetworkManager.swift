@@ -760,6 +760,28 @@ public final class NetworkManager: ObservableObject {
 
         print("▶️ FIX #509: Starting block listeners on main balance screen...")
 
+        // FIX #1358: Reconnect dead peers BEFORE starting block listeners.
+        // After header sync stops listeners, NWConnections are cancelled (error 57).
+        // Without reconnection, block listeners start on dead sockets and die immediately,
+        // leaving all dispatchers inactive → no blocks fetched → no TX confirmation.
+        var reconnectedHosts = Set<String>()
+        for peer in peers {
+            if peer.isHandshakeComplete && !peer.isConnectionReady {
+                if reconnectedHosts.contains(peer.host) { continue }
+                reconnectedHosts.insert(peer.host)
+                do {
+                    try await peer.ensureConnected()
+                } catch {
+                    print("⚠️ FIX #1358: Failed to reconnect \(peer.host): \(error.localizedDescription)")
+                }
+            }
+        }
+        if !reconnectedHosts.isEmpty {
+            print("🔄 FIX #1358: Reconnected \(reconnectedHosts.count) dead peers before starting block listeners")
+            // Wait for connections to stabilize
+            try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+        }
+
         // Start local peers
         for peer in peers {
             peer.startBlockListener()
